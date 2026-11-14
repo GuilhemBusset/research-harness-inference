@@ -156,6 +156,15 @@ bubblewrap that may create namespaces; `.github/workflows/ci.yml` prepares one. 
 scanner would refuse (an account ID, a token, an address) are put together at run time, so that
 no line of a test file holds one.
 
+The `Real…` tests are hermetic about the host they run on. A host that names its own configuration
+directory (`XDG_CONFIG_HOME` or `GH_CONFIG_DIR`, as GitHub's runners do) would point the canary at
+its real `gh` login instead of the fake home's, so the tests unset both. The variables the host
+itself sets under `GH_` or `GITHUB_` that the scrub keeps by design (a runner's `GITHUB_ACTION`,
+`GITHUB_REPOSITORY`, ...) are expected inside, and the planted credentials are still asserted
+absent. `/run` inside holds the path to `resolv.conf` when the host keeps it there (Ubuntu's
+systemd-resolved), which the sandbox binds back on purpose, and nothing else. No assertion about
+what the sandbox hides or drops was removed.
+
 ## Kept as recorded
 
 `tests/fixtures/epic10.json` is a recording of GitHub's answers for epic #10 of the upstream

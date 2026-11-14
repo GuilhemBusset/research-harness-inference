@@ -749,6 +749,11 @@ class RealSandboxTests(SandboxCase):
                                                "GH_TOKEN": "canary", "AWS_PROFILE": "canary"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The gh login is looked for where the launching environment says (secret_paths): a host
+        # that names its own configuration directory, as GitHub's runners do with XDG_CONFIG_HOME,
+        # would point the canary away from the fake home. patch.dict restores both on stop.
+        for var in ("XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+            os.environ.pop(var, None)
 
     def run_in(self, script: str, vendor=None, mounts=None) -> subprocess.CompletedProcess:
         mounts = mounts or sandbox.Mounts(readable=(self.engine,), writable=(self.worktree,))
@@ -765,9 +770,16 @@ class RealSandboxTests(SandboxCase):
     def test_no_credential_can_be_listed_or_read(self):
         proc = self.run_in('for p in .aws .aws/credentials .ssh .config/gh .config .claude .codex/auth.json; do '
                            'ls "$HOME/$p" >/dev/null 2>&1 && echo "visible: $p"; done; env | grep -E "^(AWS|GH|GITHUB)_" | sort')
-        self.assertEqual(proc.stdout.splitlines(), ["AWS_CONFIG_FILE=/dev/null", "AWS_EC2_METADATA_DISABLED=true",
-                                                    "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
-                                                    f"GH_CONFIG_DIR={self.tmp / 'no-gh'}"])
+        # What the host itself sets under GH_ or GITHUB_ and is no credential (a CI runner's
+        # GITHUB_ACTION, GITHUB_REPOSITORY, ...) passes the scrub by design; nothing else may.
+        host = {f"{k}={v}" for k, v in os.environ.items()
+                if k.startswith(("GH_", "GITHUB_")) and k != "GH_CONFIG_DIR" and not sandbox.dropped(k, None, v)}
+        self.assertEqual(set(proc.stdout.splitlines()), {"AWS_CONFIG_FILE=/dev/null", "AWS_EC2_METADATA_DISABLED=true",
+                                                         "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
+                                                         f"GH_CONFIG_DIR={self.tmp / 'no-gh'}"} | host)
+        self.assertNotIn("visible:", proc.stdout)
+        self.assertFalse([line for line in proc.stdout.splitlines()
+                          if line.split("=", 1)[0] in ("GH_TOKEN", "GITHUB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_PROFILE")])
 
     def test_only_the_worktree_is_writable(self):
         proc = self.run_in(f'echo kept > made-inside; echo x > "{self.engine}/plugin.py" 2>/dev/null || echo engine-refused; '
@@ -782,9 +794,15 @@ class RealSandboxTests(SandboxCase):
     def test_the_sandbox_has_its_own_tmp_and_its_own_processes(self):
         outside = self.tmp / "outside-file"
         outside.write_text("x")
-        proc = self.run_in(f'ls "{outside}" 2>/dev/null || echo hidden; ls /proc | grep -c "^[0-9]"; ls /run | wc -l')
-        hidden, pids, run_entries = proc.stdout.split()
-        self.assertEqual((hidden, run_entries), ("hidden", "0"))
+        proc = self.run_in(f'ls "{outside}" 2>/dev/null || echo hidden; ls /proc | grep -c "^[0-9]"; echo /run:; ls /run')
+        hidden, pids, marker, *run_entries = proc.stdout.split()
+        self.assertEqual((hidden, marker), ("hidden", "/run:"))
+        # /run is emptied, except for the path to resolv.conf when the host keeps it there (Ubuntu's
+        # systemd-resolved links /etc/resolv.conf into /run/systemd/resolve): the sandbox binds that
+        # one file back so that names resolve.
+        resolv = Path("/etc/resolv.conf").resolve()
+        expected = [resolv.relative_to("/run").parts[0]] if Path("/run") in resolv.parents else []
+        self.assertEqual(run_entries, expected)
         self.assertLess(int(pids), 6, "only the sandbox's own processes are visible")
 
     def test_a_vendor_call_sees_its_login_and_nothing_else_of_its_directory(self):

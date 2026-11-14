@@ -165,10 +165,12 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
 
-      # A verifier test runs pytest through `uv run --offline`: uv's cache must already hold the
-      # pinned pytest, or that test skips.
+      # A verifier test runs pytest through `uv run --offline --no-project` at the repository's
+      # root, where uv picks the interpreter `.python-version` names: that interpreter and the
+      # pinned pytest must already be in uv's cache, or that test skips. So the cache is warmed
+      # the same way, with no `--python`.
       - name: Warm uv's cache with the pinned pytest
-        run: uv run --no-project --python 3.12 --with pytest==8.3.5 python -c 'import pytest'
+        run: uv run --no-project --with pytest==8.3.5 python -c 'import pytest'
 
       # The engine runs agents and check commands inside bubblewrap. Ubuntu 24.04 restricts
       # unprivileged user namespaces, which bubblewrap needs; the runner is a throwaway machine,
