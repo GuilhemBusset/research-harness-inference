@@ -41,6 +41,12 @@ _NOT_SENT = re.compile(r"could not resolve host|no such host|error connecting to
                        re.IGNORECASE)
 # The connection broke or timed out: the request may or may not have reached GitHub.
 _NETWORK = re.compile(r"connection reset|timeout|timed out|\bEOF\b", re.IGNORECASE)
+# A pull request's review decision, as GitHub's GraphQL API gives it: APPROVED, CHANGES_REQUESTED,
+# REVIEW_REQUIRED, or null where no review is asked for. The REST API has no such field.
+REVIEW_DECISION_QUERY = ("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) "
+                         "{ pullRequest(number: $number) { reviewDecision } } }")
+# The decisions with which GitHub refuses a merge for want of a person: a review is owed, or one asks for changes.
+REVIEW_OWED = ("REVIEW_REQUIRED", "CHANGES_REQUESTED")
 
 
 class GitHubError(RuntimeError):
@@ -86,6 +92,7 @@ class GitHub(Protocol):
     def required_check_run(self, sha: str, name: str) -> dict | None: ...
     def deploy_status(self, sha: str, context: str) -> dict | None: ...
     def find_issue(self, label: str, marker: str) -> int | None: ...
+    def review_decision(self, n: int) -> str: ...
     # writes
     def create_comment(self, n: int, body: str) -> dict: ...
     def update_comment(self, comment_id: int, body: str) -> dict: ...
@@ -113,12 +120,13 @@ class GhCli:
         self.retry_delays = tuple(retry_delays)
 
     def _api(self, path: str, method: str = "GET", payload: dict | None = None, ok_codes: tuple[int, ...] = (),
-             idempotent: bool | None = None) -> Any:
+             idempotent: bool | None = None, fields: tuple[str, ...] = ()) -> Any:
         """One REST call. An HTTP error in `ok_codes` means "nothing to do" and returns None.
         `idempotent` says whether repeating the call is harmless; by default every method but POST
-        is. What is retried, and what is raised, is in the module docstring."""
+        is. What is retried, and what is raised, is in the module docstring. `fields` are `gh api`
+        field flags, added as they are: how a GraphQL query and its variables are given."""
         args = ["gh", "api", "--method", method, "-H", f"X-GitHub-Api-Version: {self.api_version}",
-                "-H", "Accept: application/vnd.github+json", path]
+                "-H", "Accept: application/vnd.github+json", path, *fields]
         if payload is not None:
             args += ["--input", "-"]
         repeatable = method != "POST" if idempotent is None else idempotent
@@ -212,6 +220,19 @@ class GhCli:
             if marker in (issue.get("body") or "") and "pull_request" not in issue:
                 return issue["number"]
         return None
+
+    def review_decision(self, n):
+        """The review decision of pull request `n`: the field `reviewDecision` of GitHub's GraphQL
+        API, read with `gh api graphql`. APPROVED, CHANGES_REQUESTED or REVIEW_REQUIRED; empty where
+        GitHub gives none (no review is asked for). A query changes nothing, so it is retried
+        like a read."""
+        owner, _, name = self.repo.partition("/")
+        answer = self._api("graphql", "POST", idempotent=True, fields=(
+            "-f", f"query={REVIEW_DECISION_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={int(n)}"))
+        pull = (((answer or {}).get("data") or {}).get("repository") or {}).get("pullRequest")
+        if not isinstance(pull, dict):
+            raise GitHubError(f"gh api graphql gave no pull request {n} of {self.repo}")
+        return str(pull.get("reviewDecision") or "")
 
     def create_comment(self, n, body):
         return self._api(self._r(f"issues/{n}/comments"), "POST", {"body": body})
@@ -380,6 +401,7 @@ class FakeGitHub:
         self._run_ids = iter(range(1, 10**9))
         self.reruns: list[str] = []
         self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
+        self.default_review: str = ""   # the review decision of a pull request when it is opened: none is asked for
         self.calls: list[tuple] = []
         self.owner = owner
         self.on_merge = on_merge
@@ -450,6 +472,11 @@ class FakeGitHub:
                 return n
         return None
 
+    def review_decision(self, n):
+        if n not in self.prs:
+            raise GitHubError(f"pull request {n} not found")
+        return self.prs[n].get("review_decision") or ""
+
     # writes
     def create_comment(self, n, body):
         c = {"id": self._id(), "body": body, "html_url": f"https://github.test/issues/{n}#issuecomment-{self._next_id}"}
@@ -493,7 +520,8 @@ class FakeGitHub:
     def create_pr(self, head, base, title, body):
         n = 5000 + len(self.prs) + 1
         pr = {"number": n, "head": {"ref": head}, "base": {"ref": base}, "title": title, "body": body,
-              "state": "open", "merged": False, "html_url": f"https://github.test/pull/{n}", "labels": []}
+              "state": "open", "merged": False, "html_url": f"https://github.test/pull/{n}", "labels": [],
+              "review_decision": self.default_review}
         self.prs[n] = pr
         self.calls.append(("create_pr", head))
         return pr
@@ -506,6 +534,8 @@ class FakeGitHub:
         pr = self.prs[n]
         if pr.get("head_sha") and pr["head_sha"] != sha:
             raise GitHubError("Head branch was modified. Review and try the merge again.")
+        if pr.get("review_decision") in REVIEW_OWED:   # as a ruleset that asks for the owner's review refuses it
+            raise GitHubError("Repository rule violations found: a review is required")
         merge_sha = self.on_merge(pr["head"]["ref"], sha) if self.on_merge else f"merged-{sha}"
         pr.update(state="closed", merged=True, merge_commit_sha=merge_sha)
         pr["head"]["sha"] = sha

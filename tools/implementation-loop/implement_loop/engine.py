@@ -118,6 +118,12 @@ try:   # the wait for the owner's push and merge arrives with its kind, and with
 except ImportError:   # pragma: no cover - older model.py: its issue state has no record, so nothing waits
     WAIT_OWNER_LANDING = "owner_landing"
 
+try:   # the wait for the owner's review arrives with its kind in model.py, and with the decisions that owe one in github.py
+    from .github import REVIEW_OWED
+    from .model import WAIT_OWNER_REVIEW
+except ImportError:   # pragma: no cover - older github.py and model.py: their client reads no review decision, so nothing waits
+    REVIEW_OWED, WAIT_OWNER_REVIEW = ("REVIEW_REQUIRED", "CHANGES_REQUESTED"), "owner_review"
+
 try:   # the scan with the owner's local values arrives with its commands in config.py
     from .config import LOCAL_VALUES_ENV, local_value_checks, local_values_file
 except ImportError:   # pragma: no cover - older config.py: it names no list and no scan, so none runs
@@ -173,12 +179,17 @@ report.WAIT_HINT.setdefault(WAIT_OWNER_APPROVAL, ("The deployment waits for the 
 report.WAIT_HINT.setdefault(WAIT_OWNER_LANDING, ("The loop never pushes a change to a workflow file: the owner pushes "
                                                  "the certified head and merges the pull request the loop then opens; "
                                                  "the supervisor looks again."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_REVIEW, ("GitHub merges this pull request only with the owner's approving "
+                                                "review; the supervisor reads the review decision again, and the "
+                                                "loop merges the certified head once it is approved."))
 # The folder whose files the engine never pushes a change to, whatever identity it runs as (ADR 0001,
 # amendment 2): the factory cannot change its own gates. A branch whose commits change one is landed
 # by the owner (`Engine._owner_lands`), and so is a revert of such a change (`Engine._revert`).
 WORKFLOWS = ".github/workflows/"
 # The comment that hands a certified head to the owner: one per head, found again by its marker.
 OWNER_LANDING_MARKER = "<!-- implement-loop:owner-landing:{} -->"
+# The comment that says, on a pull request, that its certified head waits for the owner's review: one per head.
+OWNER_REVIEW_MARKER = "<!-- implement-loop:owner-review:{} -->"
 # Output that means the host cannot run a check, whatever the implementation does.
 ENVIRONMENT_FAILURE = re.compile(
     r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
@@ -463,6 +474,7 @@ class Engine:
         resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite",
                            WAIT_DEPLOY, WAIT_OWNER_APPROVAL,   # each run reads the merge commit's statuses again
                            WAIT_OWNER_LANDING)                 # and the remote branch and its pull request
+                  or (kind == WAIT_OWNER_REVIEW and not self._review_owed(st, w))
                   or (kind == WAIT_ENVIRONMENT and (self.env_fingerprint is None or w.get("env") != self.env_fingerprint))
                   or (kind == WAIT_ENGINE and w.get("version") != VERSION))
         if not resume:
@@ -472,6 +484,29 @@ class Engine:
             st.phase = Phase.PENDING
         st.wait = None
         self.store.event("resumed", issue=st.number, wait=kind, phase=st.phase.value)
+
+    def _review_owed(self, st: IssueState, w: dict) -> bool:
+        """Whether an issue that waits for the owner's review (`WAIT_OWNER_REVIEW`) still does. It
+        does while its pull request is open at the head the wait is for and the review decision
+        is one that owes a review; and while GitHub cannot be read, which says nothing. Then
+        nothing is run for the issue: no land step, so no verification and no merge queue. It no
+        longer does once the decision is APPROVED (or none is asked for any more): the land step
+        tries the merge of that head again. Nor once the pull request is merged or closed, or has
+        another head: the land step reads that as it always did, and a head that moved is verified
+        again before anything lands."""
+        pr, head = w.get("pr"), w.get("head")
+        try:
+            pull = (self.gh.find_pr(st.branch) if st.branch else None) or {}
+            if (pull.get("number") != pr or pull.get("state") != "open" or not head or head != st.certified_sha
+                    or (pull.get("head") or {}).get("sha", head) != head):
+                return False
+            decision = self._review_decision(pull["number"])
+            if decision in REVIEW_OWED:
+                self._say_review_owed(pull["number"], head, decision)   # where GitHub did not take the comment before
+        except (GitHubError, OSError) as e:
+            self.store.event("github_call_failed", call="_review_owed", issue=st.number, error=str(e)[:300])
+            return True
+        return decision in REVIEW_OWED
 
     def _maybe_revive(self, st: IssueState) -> None:
         """A failed issue resumes once, with a fresh ceiling, on a new engine version: the loop
@@ -2407,6 +2442,15 @@ class Engine:
                 if (again.get("merged") or again.get("merged_at")) and (again.get("head") or {}).get("sha", head) == head:
                     self.store.event("merged", issue=n, pr=st.pr, head=head, note="the merge answer was lost")
                     return self._merged(n, again.get("merge_commit_sha"))
+                # Why GitHub refused is read from the pull request's review decision, never from the
+                # words of the refusal. With a review owed on this very head, what is missing is a
+                # person: no refusal is counted and nothing is verified again. A pull request whose
+                # head is another one was refused for that, and is handled as every other refusal.
+                decision = ""
+                if (again.get("head") or {}).get("sha", head) == head:
+                    decision = self._safe(self._review_decision, st.pr) or ""
+                if decision in REVIEW_OWED:
+                    return self._owner_reviews(n, st.pr, head, decision)
                 st = self.store.issue(n)
                 st.merge_refusals += 1
                 self.store.put(st)
@@ -2419,6 +2463,44 @@ class Engine:
             self._merged(n, (merge or {}).get("sha"))
         finally:
             self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _review_decision(self, pr: int) -> str:
+        """The review decision of pull request `pr` (`reviewDecision` in GitHub's GraphQL API):
+        APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or empty where GitHub gives none, and where the
+        client cannot read one (an older `github.py`)."""
+        read = getattr(self.gh, "review_decision", None)
+        return (read(pr) or "") if read else ""
+
+    def _say_review_owed(self, pr: int, head: str, decision: str) -> None:
+        """Say on pull request `pr`, once for the certified head `head`, that the loop waits for the
+        owner's review. The comment is found again by its marker, which carries the head: a second
+        refusal, or a resumed run, writes no second one, and a later certified head gets its own.
+        Where the comments cannot be listed, none is written."""
+        marker = OWNER_REVIEW_MARKER.format(head)
+        comments = self._safe(self.gh.list_comments, pr)
+        if comments is None or any(marker in (c.get("body") or "") for c in comments):
+            return
+        self._safe(self.gh.create_comment, pr, (
+            f"{marker}\n**implement loop**: this pull request waits for the owner's review. Its head `{head}` is "
+            f"certified by {self.other} and the required check is green on it, and GitHub refused the merge while the "
+            f"pull request's review decision is `{decision}`. Nothing is verified again meanwhile. Once the pull request "
+            f"is approved, the loop merges this head at its next run. A push to this branch makes another head, which "
+            f"the loop verifies and has certified again before it lands.\n"))
+
+    def _owner_reviews(self, n: int, pr: int, head: str, decision: str) -> None:
+        """GitHub refused to merge the certified head `head` of issue `n`, on which the required
+        check is green, and the review decision of its pull request `pr` owes a review
+        (`REVIEW_OWED`): a pull request that touches a protected path needs the owner's approving
+        review (ADR 0001, amendment 3). That is no merge refusal to count and nothing to verify
+        again: the pull request says so, once, and the issue waits (`WAIT_OWNER_REVIEW`) with no
+        landing claim, the land step that calls this releasing the merge queue. `_maybe_resume`
+        reads the decision again at each run (`_review_owed`) and resumes the land step only
+        once there is something for it to do."""
+        self.store.event("owner_review_owed", issue=n, pr=pr, head=head, decision=decision)
+        self._say_review_owed(pr, head, decision)
+        self._wait(n, WAIT_OWNER_REVIEW, f"pull request #{pr} is certified at `{head[:12]}` with the required check green, "
+                                         f"and GitHub merges it only with the owner's approving review (review decision: "
+                                         f"{decision})", resume=Phase.LAND, pr=pr, head=head)
 
     def _open_pull(self, n: int, st: IssueState, head: str) -> dict:
         """Open the pull request of the issue's branch, or update the open one, and write its
