@@ -1,0 +1,50 @@
+# What the hygiene scanner (scan.py) accepts. This file holds documented placeholders and path
+# excludes only: the rules are code. It is a protected path and part of the safety surface
+# (docs/adr/0001-software-factory.md, decision 10), so a change here is reviewed as a change to
+# the gate. An unknown table or key is an error.
+#
+# To let one line through, do not add to this file: write `hygiene: allow <rule> (<reason>)` on
+# that line (README.md, "Allowing one line").
+
+[placeholders]
+# The account IDs of AWS's own documentation. They are the only ones the repository may contain,
+# bare or inside an ARN.
+account_ids = ["123456789012", "111122223333"]
+
+# Addresses under these domains (and their subdomains) identify nobody: the names RFC 2606 and
+# RFC 6761 reserve for documentation and tests, and GitHub's no-reply addresses for commit trailers.
+email_domains = [
+    "example.com", "example.org", "example.net",
+    "example", "invalid", "test", "localhost",
+    "users.noreply.github.com",
+]
+
+# Exact addresses: the co-author trailer of agent commits; the user name of every SSH remote on
+# GitHub, which only looks like an address; the committer GitHub records on a merge it makes, and
+# the sign-off of Dependabot's commits (both are in the history, which `--history` reads).
+emails = ["noreply@anthropic.com", "git@github.com", "noreply@github.com", "support@github.com"]
+
+# Home directories that name no person: generic examples, GitHub's runners, and the default users
+# of the public machine images the fleet is built from.
+home_users = ["user", "runner", "ec2-user", "ubuntu"]
+
+# The hexadecimal part of the resource IDs AWS's documentation uses (`i-`, `vpc-`, `ami-` and so on).
+resource_ids = ["1234567890abcdef0", "0abcdef1234567890"]
+
+# Exact strings from AWS's documentation: the example access key and secret key, and the example
+# CloudFront host.
+strings = [
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "d111111abcdef8.cloudfront.net",
+]
+
+[lockfiles]
+# Generated files full of hashes, sizes and timestamps: the account-id rule is not applied to
+# them. Every other rule is.
+paths = ["**/uv.lock", "**/package-lock.json"]
+
+[exclude]
+# Files no rule reads, each with the reason on its line. Only recorded test fixtures that their
+# owner names belong here; anything else is fixed, or allowed on its line.
+paths = []

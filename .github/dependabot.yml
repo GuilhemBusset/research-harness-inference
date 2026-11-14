@@ -1,0 +1,43 @@
+# Dependabot proposes version bumps as pull requests; they pass the same `required` check as any
+# other change and are merged like any other change. Every update waits a week after a release
+# (cooldown), so a compromised release has time to be noticed and pulled before it is proposed
+# here. Security updates are not delayed.
+version: 2
+
+updates:
+  # The actions pinned by commit SHA in .github/workflows/. Dependabot moves the SHA and the
+  # version comment together. The tools those workflows download by URL (gitleaks, actionlint)
+  # and the uv version are pinned in ci.yml itself and are bumped by hand, with their checksums.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    labels: []
+
+  # The Python dependencies locked in uv.lock (pyproject.toml).
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    labels: []
+    ignore:
+      # Pinned in more than one place; bumped by hand, everywhere at once:
+      #   ruff     also `required-version` in ruff.toml
+      #   pytest   also the engine tests command (scripts/check.sh, ci.yml) and the pin the
+      #            implement loop's verifier runs tests with (tools/implementation-loop/)
+      - dependency-name: ruff
+      - dependency-name: pytest
+      - dependency-name: pytest-xdist
+
+# When the backlog adds them, add: `npm` for the CDK CLI pinned in package.json, and `docker`
+# for the image digests under services/.

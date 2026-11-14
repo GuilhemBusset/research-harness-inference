@@ -1,0 +1,27 @@
+# ty (https://docs.astral.sh/ty/) for the repository's Python: today the implement loop engine,
+# the hygiene scanner and the backlog tooling. From the repository root:
+#
+#   uv run --locked ty check
+#
+# scripts/check.sh fast runs exactly that, locally and in CI's `required` check. ty and the pytest
+# it resolves the tests' imports against are pinned in pyproject.toml and uv.lock. ty is beta and
+# changes diagnostics between releases, so the pin is exact and a bump is its own pull request.
+
+[environment]
+# The oldest Python the repository supports (pyproject.toml), on the one platform it runs on.
+python-version = "3.12"
+python-platform = "linux"
+# The project environment `uv sync --locked` creates.
+python = ".venv"
+# The folders these programs and tests put on sys.path for their imports.
+root = [
+    "tools/implementation-loop", "tools/implementation-loop/tests",
+    "tools/hygiene",
+    "tools/backlog", "tools/backlog/tests",
+]
+
+[src]
+include = ["tools/implementation-loop", "tools/hygiene", "tools/backlog"]
+
+[terminal]
+error-on-warning = true
