@@ -1,6 +1,6 @@
 # System design: a scale-to-zero inference endpoint for the coding-agent cursus
 
-- **Status:** Proposed. The decisions that wait for the owner are in section 15.
+- **Status:** Accepted ([ADR 0002](../adr/0002-accept-the-system-design.md)). Section 15 lists the decisions that are the owner's.
 - **Date:** 2026-11-13
 - **Evidence:** a claim marked `[E n]` is traced in [`evidence.md`](evidence.md), with its source and how far it was verified. A claim marked `[S n]` is an assumption that a named validation spike must confirm (section 12).
 
