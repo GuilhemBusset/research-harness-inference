@@ -160,6 +160,9 @@ CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
 # `tests/container/` (ADR 0001, amendment 5). The folder alone names no test.
 CONTAINER_TEST = re.compile(r"(?<![\w./-])tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
 CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item a CI job's check run proved
+# A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
+# check run's own page is `runs/<id>` under the same repository page.
+PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
 
 
@@ -2499,26 +2502,26 @@ class Engine:
         self._set_phase(n, Phase.DONE)
         self._close_trackers(n)
 
-    def _merged_head(self, st: IssueState) -> str | None:
-        """The head commit of the pull request this round merged, as GitHub records it: the commit
-        the required check was read on. None when the round merged no pull request (nothing was
-        left to land) or GitHub does not name the commit."""
+    def _merged_pull(self, st: IssueState) -> dict:
+        """The pull request this round merged, as GitHub records it. Empty when the round merged
+        none (nothing was left to land) or GitHub does not show it merged."""
         if not st.pr or not st.branch:
-            return None
+            return {}
         pr = self._safe(self.gh.find_pr, st.branch) or {}
-        if pr.get("number") != st.pr or not (pr.get("merged") or pr.get("merged_at")):
-            return None
-        return (pr.get("head") or {}).get("sha") or None
+        return pr if pr.get("number") == st.pr and (pr.get("merged") or pr.get("merged_at")) else {}
 
     def _ci_discharged(self, n: int, st: IssueState) -> dict[str, dict]:
         """The owner items a CI job proves on the head that was merged (ADR 0001, amendment 5), each
         with its evidence record. An item is one when all of this holds: the plan gives it to the
         owner for a capability that `[host] ci_jobs` maps to a job; its text names a test under
         `tests/container/`; and the check run of that job's name on the merged pull request's head
-        is completed with the conclusion `success` and has an address, which the record carries
-        (`address`). Anything less discharges nothing and the obligation stays the owner's: no
-        mapping, no such test, no merged head, no check run, one that is not completed, was skipped
-        or failed, one without an address, or a read GitHub did not answer.
+        (the commit the required check was read on) is completed with the conclusion `success`.
+        The record carries the check run's address (`address`): the page of that check run in the
+        repository, `runs/<id>` beside the pull request's own page, since the client returns a
+        check run's id and not its address. Anything less discharges nothing and the obligation
+        stays the owner's: no mapping, no such test, no merged pull request with a head and an
+        address, no check run, one that is not completed, was skipped or failed, one without an
+        id, or a read GitHub did not answer.
 
         The plan is read, not `obligations`: this step runs again when a publication ends it, and
         the second pass, which finds the obligation already removed, records the same evidence."""
@@ -2526,16 +2529,18 @@ class Engine:
         jobs = {i["id"]: self.ci_jobs[i["capability"]] for i in self._items(st)
                 if i["proof"] == "owner" and i.get("capability") in self.ci_jobs
                 and CONTAINER_TEST.search(texts.get(i["id"], ""))}
-        head = self._merged_head(st) if jobs else None
-        if not head:
+        pr = self._merged_pull(st) if jobs else {}
+        head = (pr.get("head") or {}).get("sha")
+        home = PULL_ADDRESS.match(pr.get("html_url") or "")
+        if not head or not home:
             return {}
         runs = {job: self._safe(self.gh.required_check_run, head, job) or {} for job in sorted(set(jobs.values()))}
         out = {}
         for item, job in jobs.items():
             run = runs[job]
-            address = run.get("html_url") or ""
-            if run.get("status") != "completed" or run.get("conclusion") != "success" or not address:
+            if run.get("status") != "completed" or run.get("conclusion") != "success" or not run.get("id"):
                 continue
+            address = f"{home.group(1)}/runs/{run['id']}"
             record = Evidence(criterion=item, kind=CHECK_RUN_EVIDENCE, command=None, cwd=".", head_sha=head,
                               exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
                               note=f"the check run `{job}` succeeded on the merged head `{head[:12]}`: {address}",

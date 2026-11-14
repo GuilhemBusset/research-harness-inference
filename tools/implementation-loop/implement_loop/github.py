@@ -184,15 +184,14 @@ class GhCli:
         return run["conclusion"] if run["status"] == "completed" else "pending"
 
     def required_check_run(self, sha, name):
-        """The latest check run called `name` on `sha`: its id (a re-run gets a new one), status,
-        conclusion and address (`html_url`, the page of the run; empty when GitHub gives none)."""
+        """The latest check run called `name` on `sha`: its id (a re-run gets a new one), status
+        and conclusion."""
         data = self._api(self._r(f"commits/{sha}/check-runs?check_name={urllib.parse.quote(name)}&filter=latest")) or {}
         runs = data.get("check_runs", [])
         if not runs:
             return None
         run = max(runs, key=lambda r: r.get("id", 0))
-        return {"id": run.get("id"), "status": run.get("status"), "conclusion": run.get("conclusion"),
-                "html_url": run.get("html_url") or ""}
+        return {"id": run.get("id"), "status": run.get("status"), "conclusion": run.get("conclusion")}
 
     def deploy_status(self, sha, context):
         """The latest commit status called `context` on the commit `sha`: its state (`pending`,
@@ -379,11 +378,6 @@ class FakeGitHub:
         self.check_script: list[str | None] = []   # conclusions handed out in order, one per head looked at
         self._check_seen: dict[str, dict] = {}  # sha -> the latest check run handed out
         self._run_ids = iter(range(1, 10**9))
-        # What is above plays the check run of this name. A check run of any other name exists only
-        # when a test lists it here: a CI job's name -> its conclusion, the same on every head.
-        self.required_name = "required"
-        self.job_checks: dict[str, str] = {}
-        self._job_seen: dict[tuple[str, str], int] = {}   # (sha, job name) -> the id of its check run
         self.reruns: list[str] = []
         self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
         self.calls: list[tuple] = []
@@ -438,14 +432,6 @@ class FakeGitHub:
         return None if run is None else run["conclusion"]
 
     def required_check_run(self, sha, name):
-        if name != self.required_name:
-            if name not in self.job_checks:
-                return None
-            if (sha, name) not in self._job_seen:
-                self._job_seen[sha, name] = next(self._run_ids)
-            run_id = self._job_seen[sha, name]
-            return {"id": run_id, "status": "completed", "conclusion": self.job_checks[name],
-                    "html_url": f"https://github.test/runs/{run_id}"}
         if sha in self.checks:
             return {"id": 0, "status": "completed", "conclusion": self.checks[sha]}
         if sha not in self._check_seen:

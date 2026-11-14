@@ -5,8 +5,6 @@ by the check run `container-tests` on the head that was merged.
 The engine runs are real (git, the verifier, squash merges into a local remote). The agents and
 GitHub are fakes; the fake GitHub also plays CI, with the check run a test gives the job."""
 
-import json
-import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,36 +40,37 @@ class Agents(L.agents.FakeAgents):
 
 
 class CI(L.github.FakeGitHub):
-    """The fake GitHub, which notes every read of a check run other than the required one."""
+    """The fake GitHub with one more check run on every head: the CI job's, with the conclusion a
+    test gives it (`job`), or none at all (None). The fake it extends answers every name with the
+    required check's verdict; this one answers by name, as GitHub does, and notes each read of a
+    check run other than the required one."""
+
+    job: str | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.job_reads: list[tuple[str, str]] = []
+        self.job_runs: dict[str, int] = {}   # head -> the id of the job's check run on it
 
     def required_check_run(self, sha, name):
-        if name != self.required_name:
-            self.job_reads.append((sha, name))
-        return super().required_check_run(sha, name)
-
-
-class NoAddress(CI):
-    """A GitHub whose check runs come without their address."""
-
-    def required_check_run(self, sha, name):
-        run = super().required_check_run(sha, name)
-        return run and {k: v for k, v in run.items() if k != "html_url"}
+        if name == "required":
+            return super().required_check_run(sha, name)
+        self.job_reads.append((sha, name))
+        if name != JOB or self.job is None:
+            return None
+        return {"id": self.job_runs.setdefault(sha, 7001 + len(self.job_runs)), "status": "completed",
+                "conclusion": self.job}
 
 
 @contextmanager
-def landed(*owner, check=None, github=CI):
+def landed(*owner, check=None):
     """Issue #2 after one engine run. Its first deliverable is the agents'; then comes one owner
     item per (text, capability) of `owner`: D2, D3. The check run `container-tests` has the
     conclusion `check` on every head, or does not exist (None)."""
     repo = TempRepo()
     try:
-        gh = github(on_merge=repo.merge)
-        if check:
-            gh.job_checks[JOB] = check
+        gh = CI(on_merge=repo.merge)
+        gh.job = check
         needs = {f"D{k}": capability for k, (_, capability) in enumerate(owner, start=2)}
         body = issue_body(f"feat/issue-{ISSUE}", ["`docs/a.txt` contains `alpha`.", *(text for text, _ in owner)],
                           ["The test passes on main."])
@@ -110,7 +109,7 @@ def assert_still_the_owners(run, item, text, capability):
     assert run.gh.issues[ISSUE]["state"] == "open"
 
 
-# ---------------------------------------------------------------------- the mapping and the read
+# ---------------------------------------------------------------------- the mapping
 def test_loop_toml_maps_the_capability_to_the_job():
     policy = L.config.load_policy(HERE.parent / "loop.toml")
     assert policy["ci_jobs"] == {RUNTIME: JOB}
@@ -124,26 +123,12 @@ def test_loop_toml_maps_the_capability_to_the_job():
             L.config.load_policy(path)
 
 
-def test_the_live_client_keeps_the_check_runs_address():
-    address = "https://github.com/owner/repo/actions/runs/7/job/42"
-    runs = [{"id": 41, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/owner/repo/runs/41"},
-            {"id": 42, "status": "completed", "conclusion": "success", "html_url": address}]
-    asked = []
-
-    def gh(args, **kwargs):
-        asked.append(args[-1])
-        return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"check_runs": runs}), stderr="")
-    run = L.github.GhCli("owner/repo", runner=gh).required_check_run("abc123", JOB)
-    assert run == {"id": 42, "status": "completed", "conclusion": "success", "html_url": address}
-    assert asked == [f"repos/owner/repo/commits/abc123/check-runs?check_name={JOB}&filter=latest"]
-
-
 # ---------------------------------------------------------------------- when an issue lands
 def test_a_succeeded_check_run_discharges_the_obligation():
     with landed((SIGN_IN, RUNTIME), (ON_BETA, DEPLOYED), check="success") as run:
         merged_head = run.pr["head"]["sha"]
         assert run.gh.job_reads == [(merged_head, JOB)], "the job's check run is read on the head that was merged"
-        address = run.gh.required_check_run(merged_head, JOB)["html_url"]
+        address = f"https://github.test/runs/{run.gh.job_runs[merged_head]}"   # beside the pull request's page
         # proven, with the check run's address as its evidence
         record, = [e for e in run.st.evidence if e["criterion"] == "D2"]
         assert (record["passed"], record["address"], record["head_sha"]) == (True, address, merged_head)
@@ -165,11 +150,6 @@ def test_without_a_succeeded_check_run_the_obligation_stays_the_owners(check):
         assert run.st.obligations == [obligation("D2", RUNTIME)]
         assert_still_the_owners(run, "D2", SIGN_IN, RUNTIME)
         assert "D2: needs host:container-runtime" in run.pr["body"]
-
-
-def test_a_check_run_without_an_address_discharges_nothing():
-    with landed((SIGN_IN, RUNTIME), check="success", github=NoAddress) as run:
-        assert_still_the_owners(run, "D2", SIGN_IN, RUNTIME)
 
 
 def test_an_item_that_names_no_container_test_stays_the_owners():
