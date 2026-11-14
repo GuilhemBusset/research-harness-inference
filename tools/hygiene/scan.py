@@ -34,6 +34,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -284,10 +285,23 @@ _BUILD_BADGES = tuple(re.compile(_URL + p + _URL_TAIL, re.IGNORECASE) for p in (
     r"codebuild\." + _REGION + r"\.amazonaws\.com(?:\.cn)?/badges(?![a-z0-9-])",          # CodeBuild project
     r"github\.com/[^\s/]+/[^\s/]+/(?:actions/)?workflows/[^\s/]+/badge\.svg(?![a-z0-9-])",   # GitHub Actions workflow
 ))
-# shields.io serves badges of anything. The ones of a build or workflow status say so in their URL.
+# shields.io serves badges of anything, and its route says of what: the name of a repository, a
+# branch or a package, which the URL carries too, says nothing about what the badge shows.
 _SHIELDS_BADGE = re.compile(_URL + r"(?:img|raster)\.shields\.io(/" + _URL_TAIL + r")", re.IGNORECASE)
-_BUILD_WORDS = re.compile(
-    r"(?<![a-z])(?:(?:code)?builds?|workflows?|pipelines?|check-runs|checks-status)(?![a-z])", re.IGNORECASE)
+# The routes of the status of a build, a pipeline, a workflow or a commit's checks: those shields.io
+# files under its category "Build", the retired ones too, since a pasted badge outlives its route.
+_SHIELDS_BUILD_ROUTE = re.compile(r"/(?:" + "|".join((
+    r"appveyor/(?:build|ci|job/build)", r"azure-devops/(?:build|release)", r"vso/(?:build|release)",
+    r"bitbucket/pipelines", r"bitrise", r"buildbot/build", r"buildkite", r"circleci", r"cirrus", r"codeship",
+    r"continuousphp", r"copr/build", r"docker/(?:cloud/)?build", r"docsrs", r"drone/build",
+    r"github/(?:actions/workflow/status|workflow/status|check-runs|check-suites|checks-status|status)",
+    r"gitlab/pipeline(?:-status)?", r"jenkins(?:-ci)?/(?:build|s)", r"netlify", r"obs", r"readthedocs",
+    r"scrutinizer/build", r"shippable", r"snap-ci", r"teamcity/(?:build|codebetter|https?)",
+    r"travis(?!/php-v/)", r"visual-studio-app-center/builds", r"wercker",
+)) + r")(?![^/.])", re.IGNORECASE)
+# A badge whose text the URL writes itself (static, dynamic, endpoint) is one when that text says so.
+_SHIELDS_OWN_TEXT = re.compile(r"/(?:badge|static|endpoint)(?![^/])", re.IGNORECASE)
+_BUILD_WORDS = re.compile(r"(?<![a-z])(?:(?:code)?builds?|workflows?|pipelines?)(?![a-z])", re.IGNORECASE)
 
 _ALLOW = re.compile(r"hygiene:[ \t]{0,8}allow[ \t]{1,8}([a-z-]{1,40})[ \t]{0,8}\(([^()\n]{1,200})\)")
 
@@ -441,8 +455,21 @@ def _build_badges(text: str, cfg: Config) -> Iterator[_Hit]:
             yield _Hit("build-badge", m.start(), _url_end(text, m.start(), m.end()))
     for m in _SHIELDS_BADGE.finditer(text):
         end = _url_end(text, m.start(), m.end())
-        if _BUILD_WORDS.search(text, m.start(1), end):
+        if _shields_shows_a_build(text[m.start(1):end]):
             yield _Hit("build-badge", m.start(), end)
+
+
+def _shields_shows_a_build(route: str) -> bool:
+    """Whether a shields.io badge, given what follows its host, shows a build or workflow status."""
+    path, _, query = route.partition("#")[0].partition("?")
+    if _SHIELDS_BUILD_ROUTE.match(path):
+        return True
+    own = _SHIELDS_OWN_TEXT.match(path)
+    if not own:
+        return False
+    fields = (field.partition("=") for field in query.split("&"))
+    said = [path[own.end():]] + [value for key, _, value in fields if key.lower() in ("label", "message")]
+    return any(_BUILD_WORDS.search(unquote(value)) for value in said)
 
 
 _CONTENT_RULES: tuple[Callable[[str, Config], Iterator[_Hit]], ...] = (
