@@ -12,10 +12,12 @@ decisions are in [`docs/design/`](docs/design/README.md) (the system) and
 [`docs/adr/0001-software-factory.md`](docs/adr/0001-software-factory.md) (the factory). The code
 follows the "Repository layout" section of the system design (section 8.1).
 
-**Status: scaffolding, inert.** Until the owner has gone through
-[`docs/factory/green-light.md`](docs/factory/green-light.md), nothing is committed and nothing is
-pushed. Until then no agent commits, pushes, opens issues, applies the ruleset, activates the
-hooks, or changes anything on GitHub.
+**Status: live, being turned on.** The repository is on GitHub, private until the owner makes it
+public, and its backlog is published as GitHub issues. The rest of
+[`docs/factory/green-light.md`](docs/factory/green-light.md), from step 4 (the ruleset, the git
+hooks, the factory's own token, the doctor, the first epic), is the owner's, by hand. Until the
+owner has done it, no agent runs the implement loop, applies the ruleset, activates the hooks, or
+changes the repository's settings on GitHub.
 
 ## Toolchain
 
@@ -151,13 +153,18 @@ or open pull requests. The rest of this section is for people and interactive se
 
 ## The backlog
 
-Work enters as issues the implement loop can finish. Drafts are files under
-[`backlog/`](backlog/README.md), one per issue, in the shape the engine reads (`## Deliverables`
-and `## Acceptance criteria` as checkboxes, a size label, backticked paths as zones).
-`scripts/backlog.sh lint` checks them with the engine's own parser, `scripts/backlog.sh plan`
-shows their order, and `scripts/backlog.sh publish` creates the GitHub issues (a dry run unless
-`--apply` is given). Use the shared `backlog` skill to write one (`/backlog` in Claude Code,
-`$backlog` in Codex). After publication the GitHub issue is the source of truth.
+The backlog is this repository's GitHub issues: one tracking issue per epic, its work as
+sub-issues, linked by their dependencies. The issue on GitHub is the source of truth.
+
+New work enters as issues the implement loop can finish, drafted first so that it reaches GitHub
+in the shape the engine reads. A draft is a file under [`backlog/drafts/`](backlog/README.md),
+one per issue (`## Deliverables` and `## Acceptance criteria` as checkboxes, a size label,
+backticked paths as zones). `scripts/backlog.sh lint` checks it with the engine's own parser,
+`scripts/backlog.sh plan` shows the order, and `scripts/backlog.sh publish` creates the GitHub
+issues (a dry run unless `--apply` is given); a draft joins a published epic, or waits for a
+published issue, by its number. Use the shared `backlog` skill to write one (`/backlog` in Claude
+Code, `$backlog` in Codex). Once published, a draft is removed by a later change: between two
+publications `backlog/drafts/` is empty.
 
 Every acceptance item is either checkable by a command or a test, or names the capability it
 needs (`(needs aws:deployed-environment)`). An item with neither does not pass the lint.
