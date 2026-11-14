@@ -27,8 +27,25 @@ uv sync --locked
 
 Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock), at the
 exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the app runs on
-(aws-cdk-lib, constructs and cdk-nag) and the tools (pytest, pytest-xdist, Ruff and ty).
-`scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
+(aws-cdk-lib, constructs and cdk-nag), the tools (pytest, pytest-xdist, Ruff, ty and moto) and the
+libraries the services import. `scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
+
+The services' libraries are in dependency groups, one per service and named after it, listed in
+the [installation inventory](#installation-inventory). The dev group, which `uv sync` installs,
+includes every one of them, so the tests and ty see every library. A library a service imports
+goes into that service's group, at one exact version, the same in every group that names it.
+
+A deployed service never gets the dev group. [`src/rhi/packaging.py`](../src/rhi/packaging.py)
+gives it its own group and nothing more, at the versions in `uv.lock`:
+
+- a Lambda function's bundle holds `rhi_common`, the service's package and the group's libraries,
+  which uv installs as wheels for the Lambda runtime's Python and architecture. This happens at
+  `cdk synth`, on the machine that synthesizes, with no container: uv downloads the wheels from
+  the package index into its cache, as `uv sync` does, and installs them into the bundle under
+  `cdk.out/` (ignored by git). The synthesis tests skip it and download nothing;
+- a container image's build context holds `rhi_common`, the service's package, its Dockerfile and
+  a requirements file, exported from `uv.lock` for the group with every hash, which the Dockerfile
+  installs when the pipeline builds the image.
 
 ## Node and the CDK CLI
 
@@ -117,8 +134,17 @@ repositories only: the green-light checklist says how to check that the rule rea
 | Component | Source and destination |
 | --- | --- |
 | `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap | Installed by the contributor; nothing in this repository installs or changes a global tool |
-| Python tools (pytest, pytest-xdist, Ruff, ty) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
+| Python tools (pytest, pytest-xdist, Ruff, ty, and moto with its DynamoDB extra) | The dev group. Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | CDK libraries (aws-cdk-lib, constructs, cdk-nag) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/`, the project environment |
+| Service libraries: the groups below | One dependency group per service in `pyproject.toml`, exact versions and hashes in `uv.lock`. `uv sync --locked` installs them all into `.venv/`, because the dev group includes every group. A function's bundle and an image install their service's group from the lock, and nothing else: uv installs the wheels into the bundle under `cdk.out/` at `cdk synth`, and an image's Dockerfile installs the requirements file exported from the lock with its hashes (`src/rhi/packaging.py`) |
+| Group `gateway` | Starlette, httpx, uvicorn (without its native extras), prometheus-client and boto3, the AWS SDK |
+| Group `mock-engine` | Starlette, uvicorn and prometheus-client |
+| Group `scaler` | boto3, protobuf and cramjam |
+| Group `reporter` | boto3, PyJWT and cryptography |
+| Group `issuer` | boto3 |
+| Group `lifecycle` | boto3 and prometheus-client |
+| Group `admin` | boto3 |
+| Group `cli` | keyring |
 | CDK CLI (`aws-cdk`) | Exact version and integrity hash in `package-lock.json`; installed by `npm ci --ignore-scripts` into `node_modules/`, never globally |
 | Node.js 24, the version `.node-version` names | Installed by the contributor, usually with a version manager that reads `.node-version` (mise with idiomatic version files on, fnm, nodenv, `actions/setup-node` through `node-version-file`). The CDK CLI and the synthesis tests run on it; nothing in this repository installs or enforces it |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |

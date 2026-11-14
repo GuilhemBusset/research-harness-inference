@@ -29,7 +29,57 @@ dev = [
     "pytest-xdist==3.8.0",
     "ruff==0.17.3",
     "ty==0.0.95",
+    # An in-process DynamoDB that evaluates condition expressions, which botocore's Stubber cannot.
+    "moto[dynamodb]==5.2.5",
+    # Every service group, so that the tests and ty see every library a service imports.
+    { include-group = "gateway" },
+    { include-group = "mock-engine" },
+    { include-group = "scaler" },
+    { include-group = "reporter" },
+    { include-group = "issuer" },
+    { include-group = "lifecycle" },
+    { include-group = "admin" },
+    { include-group = "cli" },
 ]
+# One group per service: every library the service imports, through rhi_common included, each at
+# one exact version, the same in every group that names it (one lock holds one version). A
+# function's bundle and an image's requirements file install a service's group from uv.lock
+# (src/rhi/packaging.py), so a library belongs to the group of each service that imports it and to
+# no other. boto3 is the AWS SDK, and brings botocore at the same version. The CDK libraries stay
+# in the project's own dependencies: no service carries them. tests/synth/test_packaging.py checks
+# these pins.
+gateway = [
+    "starlette==1.10.0",
+    "httpx==0.28.1",
+    # Without its optional native extras (uvloop, httptools), which this load does not need.
+    "uvicorn==0.54.0",
+    "prometheus-client==0.26.0",
+    "boto3==1.43.126",
+]
+mock-engine = [
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+    "prometheus-client==0.26.0",
+]
+scaler = [
+    "boto3==1.43.126",
+    "protobuf==7.36.2",
+    # Snappy as prebuilt wheels, with no system library.
+    "cramjam==2.14.0",
+]
+reporter = [
+    "boto3==1.43.126",
+    "PyJWT==2.15.1",
+    "cryptography==50.0.2",
+]
+issuer = ["boto3==1.43.126"]
+lifecycle = [
+    "boto3==1.43.126",
+    "prometheus-client==0.26.0",
+]
+admin = ["boto3==1.43.126"]
+# client/pyproject.toml, from which students install the CLI, declares the same requirement.
+cli = ["keyring==25.7.0"]
 
 [tool.uv]
 package = false
