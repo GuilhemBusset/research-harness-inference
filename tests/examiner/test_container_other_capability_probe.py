@@ -1,6 +1,7 @@
 """Independent checks of the owner fallback and terminal phase for issue 14."""
 
 import pytest
+
 from test_container_mapping_probe import RUNTIME, TEXT, assert_owner, scenario
 
 
