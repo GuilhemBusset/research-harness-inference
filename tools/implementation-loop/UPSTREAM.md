@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.2 |
+| Engine version here | 1.2.3 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -353,6 +353,29 @@ met the fault resumes in `land` with main's merge already committed in its workt
 relock is not made again: if that merge changed one of its locked files, its next verification
 reports the file as changed, which is a round of that issue and not an engine fault.
 
+### 1.2.3: an issue's worktree that git refuses to add (2026-11-14)
+
+The repair of the engine fault e5e7b9c1d5 (issue #246). The build step asks for the issue's
+worktree (`_step_build`, `Workspace.issue_worktree`). When the worktree's directory has no `.git`,
+`_issue_worktree` runs `git worktree add` for it, and git refused: `GitError`, the build step
+crashed, and the issue waited for a new engine version. The frames name the add of a branch that
+exists locally. git refuses that command in two cases the engine can tell apart, and both are
+handled; which of the two the fault met is in the owner's run log, which was not read for this
+repair.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.2 → 1.2.3. | A new engine version: the issues that wait for this repair resume, and a failed issue is revived once by it. |
+| `implement_loop/workspace.py` | `_issue_worktree` keeps its three cases (the branch exists locally, on the remote, or nowhere), now in `_add_issue_worktree`. When git refuses, it runs `git worktree prune` and looks at the registered worktrees (`_checked_out`): if one has the branch checked out, it raises the new `BranchHeld` (a `GitError`); if none has, it decides again among the three cases and adds the worktree. A second refusal is raised as before. | A worktree whose directory was deleted (by hand, or with the run's directory) is still registered, with its path and its branch, and git refuses both until the registration is pruned. `prune` only drops registrations whose directory is gone, so no existing worktree, of this run or another, is touched; it runs under the repository's git lock like every other worktree change. The cases are decided again because a refused `add -b` leaves the branch it created. A worktree that exists and holds the branch is not the engine's to remove: it may hold work. |
+| `implement_loop/engine.py` | `_step_build` catches `BranchHeld` and makes the issue wait, with the kind `claim`, to resume in `build`. | Not an engine fault: no new engine version would free the branch. `claim` is the existing wait for an issue that something else holds; every run resumes it and tries again, so the issue is built by the first run after the branch is free. The detail names the branch and `git worktree list`, and no path. `BranchHeld` is imported the way `GitHubUnavailable` is, with a fallback class when `workspace.py` has none: two test modules (`test_unwritable_probe.py`, `test_relock_digest.py`) load this `engine.py` alone beside the modules of the engine that runs the loop, which under the verifier is the previous version. |
+
+Behaviour an upstream reader would not expect: the engine prunes worktree registrations, and only
+after git refused to add an issue's worktree. An issue whose branch is checked out in another
+worktree waits (`claim`) instead of filing a fault; the progress comment's hint for that kind
+still reads "Another run is working on this issue", and the detail above it says what holds the
+branch. The two other callers of `issue_worktree` (a revert's branch) get the repair of a deleted
+worktree too; for them `BranchHeld` is still an error.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -495,6 +518,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_relock_digest.py`: `RelockDigestTests` (2) | Added: `test_landing_relocks_a_test_main_changed_on_a_host_that_refuses_the_temporary_file`, `test_the_digest_at_a_commit_is_the_verifiers_digest_of_those_bytes`. | The regression of fault d80596ed7c. In a real engine run with the fake agents, an issue's test is on `main` already, `main` changes it while the head is examined, and the land step merges that and relocks; during the relock, and only there, `Path.write_bytes` raises `OSError`, which is where 1.2.1 crashed (`_step_land`, `_relock_candidates`, `_digest_at`, the fingerprint of the fault). The run has no `step_crashed`, relocks the test from `main` and delivers the issue with main's version of it. The second test holds the digests to the verifier's: for a script and for two `pyproject.toml` (one with a pytest table, one that is not TOML), with CRLF and bytes that are not UTF-8, `_digest_at` of the commit equals `verify.digest` of the same file on disk, and is `None` for a path the commit does not have. `Engine` comes from `test_unwritable_probe.py`'s `engine_beside_these_tests`, for the reason given at 1.2.1. |
+
+### 1.2.3
+
+609 collected tests: the 605 before it, none removed and none changed, and 4 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_stale_worktree.py` (4) | Added. | The regression of fault e5e7b9c1d5, with real git. In a real engine run with the fake agents, an issue's worktree holds a commit on the issue's branch and its directory is deleted while git still registers it; the test first shows that git refuses the fault's command there. On 1.2.2 that run ends in `step_crashed` with the fault's fingerprint; now it has none, delivers the issue, and builds on the commit the branch held. A deleted worktree that was registered on another branch gives its place to the issue's new branch, at `main`. A branch checked out in another worktree that exists leaves the issue waiting (`claim`, to resume in `build`) with no build call and that worktree as it was, and the run after the worktree is removed delivers the issue. A place taken by a directory git does not know is still a plain `GitError`. The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
 
 ## Kept as recorded
 
