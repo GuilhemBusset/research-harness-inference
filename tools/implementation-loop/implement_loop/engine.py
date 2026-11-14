@@ -30,17 +30,20 @@ verdict outlasts the run, a record of the awaited commit keeps every run from la
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import posixpath
 import re
+import subprocess
 import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -108,6 +111,17 @@ except (ImportError, AttributeError):   # pragma: no cover - older config.py and
         contexts: tuple[str, ...] = ()
         timeout_s: int = 3600
         approval_description: str = ""
+
+try:   # the scan with the owner's local values arrives with its commands in config.py
+    from .config import LOCAL_VALUES_ENV, local_value_checks, local_values_file
+except ImportError:   # pragma: no cover - older config.py: it names no list and no scan, so none runs
+    LOCAL_VALUES_ENV = "HYGIENE_LOCAL_VALUES"
+
+    def local_values_file(env: Mapping[str, str]) -> Path | None:
+        return None
+
+    def local_value_checks(base: str, head: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return ()
 
 LABELS = {
     "loop:plan": ("C5DEF5", "implement loop: planning"),
@@ -190,6 +204,7 @@ class Engine:
         self.repair = bool(policy.get("repair", False))
         self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
         self._meter_lock = threading.Lock()
+        self._push_lock = threading.Lock()     # one push at a time in this run; across runs, `_hooks_held`
         self._polling: dict[int, float] = {}
         self.deploy: Deploy = policy.get("deploy") or Deploy()
         self._holds_dir = runs_root(repo_root) / DEPLOY_HOLDS
@@ -1251,15 +1266,140 @@ class Engine:
         findings = history_findings(evidence)
         return findings, ([] if findings else problems)
 
-    def _history_refused(self, n: int, head: str, outputs: list[str]) -> None:
+    def _local_scan(self, wt: Path, base: str, head: str) -> tuple[list[str], list[str]] | None:
+        """The scan with the owner's list of local values, immediately before a push of `head`:
+        its tree, and the commits `base..head` the push would publish (`LOCAL_VALUE_CHECKS`). The
+        list exists outside the sandbox only, so this runs in the engine's own process, as the
+        owner, and executes nothing of the branch: the scanner and the allow-list of the checkout
+        the engine runs from, from the engine's repository, reading the branch as git objects.
+
+        None where there is no list: nothing is started. Else (places, problems). A place is
+        `<path>: <rule>` and no more (`local_places`): what the scanner printed stays in this
+        method's memory, because its excerpt surrounds the owner's value itself. A problem says, in
+        the engine's own words, that a scan could not run; that head is not pushed either."""
+        values = local_values_file(os.environ)
+        checks = local_value_checks(base, head) if values is not None else ()
+        if not checks:
+            return None
+        if self._own_hooks(wt) is None:
+            return [], [("the scan with the owner's local values was not run: the engine's git takes its hooks from no "
+                         "directory of the engine's own, so a push could not be held to the commit that was scanned")]
+        env = {**os.environ, LOCAL_VALUES_ENV: str(values), "PYTHONIOENCODING": "utf-8"}
+        places, problems = [], []
+        for name, argv in checks:
+            said = f"the scan with the owner's local values (`{name}`)"
+            try:
+                proc = self._outside(argv, env)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{said} did not end within {self.caps.check_timeout_s} s")
+                continue
+            except OSError as e:
+                problems.append(f"{said} could not be started ({type(e).__name__})")
+                continue
+            found = local_places(proc.stdout) if proc.returncode == HISTORY_FINDINGS_EXIT else []
+            places += found
+            if proc.returncode != 0 and not found:
+                problems.append(f"{said} could not run (exit {proc.returncode}); the same command on the owner's "
+                                f"machine shows why")
+        return list(dict.fromkeys(places)), ([] if places else problems)
+
+    def _outside(self, argv: tuple[str, ...], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        """Run `argv` outside the sandbox, as the engine itself, from the engine's repository. Only
+        the scan with the owner's local values comes here, with an argument vector the engine's
+        configuration holds; nothing an agent wrote is ever started this way."""
+        return subprocess.run(argv, cwd=self.ws.repo, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=self.caps.check_timeout_s, check=False)
+
+    def _own_hooks(self, wt: Path) -> Path | None:
+        """The directory git takes its hooks from in `wt`, when the engine's own environment names
+        it (`sandbox.engine_git_env`, as in every run): a directory the engine owns, which no file
+        of a repository or a worktree can replace. None otherwise."""
+        scope, _, path = self.ws.git("config", "--show-scope", "--get", "core.hooksPath", cwd=wt, check=False).partition("\t")
+        return Path(path) if scope == "command" and Path(path).is_absolute() and Path(path).is_dir() else None
+
+    def _push(self, wt: Path, scanned: str | None) -> bool:
+        """Push the branch of `wt` through the ship script. `scanned` is the head the scan with
+        the owner's local values passed, None where there is no list: the push is then as it
+        always was.
+
+        Shipping fetches main once more and, if main moved since the scan, merges it or rebases
+        onto it: a head, and commits, that scan never saw. So for the time of a scanned push the
+        engine's hooks directory holds a `pre-push` of the engine's own, which lets git publish
+        that one commit and nothing else. False: shipping made another head, and nothing was
+        pushed; the caller has it verified and scanned like any new head.
+
+        Every run of the repository has that same hooks directory, so a push, scanned or not,
+        holds it from before the guard is written until it is removed (`_hooks_held`): the guard
+        git meets is the one of the push it is making."""
+        hooks = self._own_hooks(wt)
+        if scanned and hooks is None:
+            raise GitError("a scanned push needs the engine's own hooks directory")
+        guard = hooks / "pre-push" if hooks else None
+        with self._push_lock, self._hooks_held(hooks):
+            try:
+                if guard and scanned:
+                    guard.write_text(PUSH_GUARD.replace("{only}", scanned))
+                    guard.chmod(0o755)
+                    if not os.access(guard, os.X_OK):   # git would skip it in silence
+                        raise GitError("the engine's hooks directory cannot hold an executable hook")
+                elif guard:
+                    guard.unlink(missing_ok=True)   # one a stopped run left behind: no live run has it, the lock is held
+                self.ws.push(wt)
+            except MergeConflict:
+                raise
+            except GitError:
+                if scanned and self.ws.head(wt) != scanned:
+                    return False
+                raise
+            finally:
+                if guard:
+                    guard.unlink(missing_ok=True)
+        return True
+
+    @staticmethod
+    @contextmanager
+    def _hooks_held(hooks: Path | None) -> Generator[None]:
+        """Hold the engine's hooks directory for one push: an flock on the directory itself, until
+        the push has ended and its guard is gone. Every run of a repository is given the same
+        directory, and a guard is one file in it, so without this a second run would replace the
+        guard of a push under way, or remove it, and git would publish a head no scan saw. Each
+        call opens its own file description, so two engines in one process exclude each other as
+        two processes do, and the lock of a run that died is released with it. Without a hooks
+        directory there is no guard, and nothing to hold."""
+        if hooks is None:
+            yield
+            return
+        try:
+            fd = os.open(hooks, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as e:
+            raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as e:
+                raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+            yield
+        finally:
+            os.close(fd)   # which releases the lock
+
+    def _history_refused(self, n: int, head: str, outputs: list[str], places: list[str] | None = None) -> None:
         """The branch's own commits carry what a history check refuses: a value that reached a
         commit, whatever the files say now, a commit message, or an author's address. No later
         commit takes it back, so no round can repair it and the builder is not asked to: the
         branch is abandoned unpushed, the issue ends `failed`, and its next attempt (a retry, or
-        a new engine version) starts on a new branch from main, with the plan kept."""
+        a new engine version) starts on a new branch from main, with the plan kept.
+
+        `places`: the finding is the scan's with the owner's local values (`_local_scan`), already
+        reduced to paths and rules. There is no output of it to journal."""
         st = self.store.issue(n)
         old, pr = st.branch, st.pr
-        places = history_places(outputs)
+        scan, owed = "the history scan", ""
+        if places is not None:
+            scan = "the scan with the owner's local values, before the push,"
+            owed = (" No agent knows the owner's values: one reaches a branch through text the owner wrote, such as the "
+                    "issue, and is corrected there before a retry.")
+        else:
+            places = history_places(outputs)
         said = ", ".join(places[:8]) + (f" and {len(places) - 8} more" if len(places) > 8 else "")
         self.store.event("history_refused", issue=n, branch=old, head=head, findings=places[:40],
                          output=[o[-1500:] for o in outputs])
@@ -1271,11 +1411,11 @@ class Engine:
                               f"even for one round (use the documented placeholders).")], owner_edit=False)
         self.store.put(st)
         self._fail(n, "history", (
-            f"the commits of `{old}` carry what the history scan refuses: a value that reached a commit, a commit "
+            f"the commits of `{old}` carry what {scan} refuses: a value that reached a commit, a commit "
             f"message or an author's address. No later commit can take it back, so the branch was abandoned at "
             f"`{head[:12]}`, this step pushed nothing of it, and the next attempt (`retry`, or a new engine version) "
             f"builds on a new branch from main, `{st.branch}`. Delete `{old}` once you have read it (`git branch -D`)"
-            + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}."))
+            + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}.{owed}"))
 
     def _release_legacy(self, n: int, wt: Path) -> None:
         st = self.store.issue(n)
@@ -2174,17 +2314,30 @@ class Engine:
             # run is a failed check like any other: a round for the builder, under the progress
             # rule, so it cannot go round between here and the verifier for ever.
             unpushed = self.ws.head(wt)
-            findings, unscanned = self._history_scan(n, wt, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt),
-                                                     unpushed, "push")
+            main = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
+            findings, unscanned = self._history_scan(n, wt, main, unpushed, "push")
             if findings:
                 return self._history_refused(n, unpushed, findings)
             if unscanned:
                 self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
                 return self._round_failed(n, unscanned)
+            # And the owner's own look, where the owner's list of local values exists: outside the
+            # sandbox, with the scanner of the engine's checkout. A finding abandons the branch as
+            # a finding in its history does; a scan that could not run withholds the push.
+            local = self._local_scan(wt, main, unpushed)
+            if local and local[0]:
+                return self._history_refused(n, unpushed, [], places=local[0])
+            if local and local[1]:
+                self.store.event("push_withheld", issue=n, head=unpushed, problems=local[1])
+                return self._round_failed(n, local[1])
             try:
-                self.ws.push(wt)
+                pushed = self._push(wt, unpushed if local is not None else None)
             except MergeConflict as e:
                 return self._conflict(n, wt, e.files, Phase.LAND.value)
+            if not pushed:   # main moved after the scan: the head shipping made is verified and scanned first
+                self.store.event("push_withheld", issue=n, head=unpushed, shipped=self.ws.head(wt), problems=[
+                    "shipping made another head than the one scanned with the owner's local values; nothing was pushed"])
+                return self._set_phase(n, Phase.VERIFY)
             head = self.ws.head(wt)
             if head != st.certified_sha:
                 self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=head)
@@ -2673,8 +2826,11 @@ class Engine:
             if not exam.certify or serious:
                 why = exam.summary[:300] if not exam.certify else "; ".join(f.title for f in serious)[:300]
                 return self._fail(n, "main_broken", f"the other vendor did not certify the revert: {why}")
-            self.ws.push(wt)
-            if self.ws.head(wt) != head:
+            local = self._local_scan(wt, main_sha, head)   # the owner's own look, as before any push
+            if local and (local[0] or local[1]):
+                return self._fail(n, "main_broken", "the revert fails the scan with the owner's local values, so it is not "
+                                                    "pushed: " + "; ".join(local[0] or local[1])[:500])
+            if not self._push(wt, head if local is not None else None) or self.ws.head(wt) != head:
                 return self._fail(n, "main_broken", "main moved while the revert was being certified")
             prs = ", ".join(f"#{pr['number']}" for pr in merged)
             body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
@@ -2884,6 +3040,34 @@ def history_places(outputs: list[str]) -> list[str]:
     feedback to the builder), and an excerpt shows the text around a value."""
     places = [OBJECT_ID.sub(r"@\1", m) for out in outputs for m in HISTORY_PLACE.findall(out)]
     return list(dict.fromkeys(places)) or ["see the `history_refused` event in the run's `events.jsonl`"]
+
+
+# One finding as the scanner prints it: `path:line: rule: excerpt`, the path with `@<blob id>` after
+# it in a history scan (`<commit>@<commit id>` for a commit's own text).
+LOCAL_FINDING = re.compile(r"^(.+?)(?:@[0-9a-f]{12})?:\d+: ([a-z][a-z0-9-]*): ", re.MULTILINE)
+
+
+def local_places(output: str) -> list[str]:
+    """What the engine keeps of the findings of a scan with the owner's local values:
+    `<path>: <rule>`, each once. Not the line, not the object and not the excerpt: the excerpt
+    shows the text around the owner's value, and the rest says where in it to look. The path is as
+    the scanner printed it, which masks a value in a file's name."""
+    return list(dict.fromkeys(f"{path[:200]}: {rule}" for path, rule in LOCAL_FINDING.findall(output)))
+
+
+# The `pre-push` hook of a scanned push (`Engine._push`). git gives it, on standard input, one line
+# for each ref it is about to update: `<local ref> <local commit> <remote ref> <remote commit>`.
+PUSH_GUARD = """#!/bin/sh
+# Written by the implement loop's engine for one push, and removed after it. git may publish the
+# commit the engine scanned with the owner's local values, and no other.
+while read -r ref commit rest; do
+  if [ "$commit" != "{only}" ]; then
+    echo "[loop] not pushed: $commit is not the commit that was scanned ({only})" >&2
+    exit 1
+  fi
+done
+exit 0
+"""
 
 
 def environment_problem(evidence: list[dict]) -> str | None:

@@ -1,6 +1,9 @@
 """Caps, ceilings and repo-specific constants (ADR 0012; this repository's values: ADR 0001)."""
 
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Files many issues tend to touch. Only one in-flight issue may own any of them at a time.
 SHARED_FILES = frozenset({
@@ -65,6 +68,54 @@ HISTORY_FINDINGS_EXIT = 1
 def history_checks(revs: str) -> tuple[tuple[str, str], ...]:
     """The history checks for the commits of `revs` (`<base>..<head>`, both commit IDs)."""
     return tuple((name, command.replace("{range}", revs)) for name, command in HISTORY_CHECKS)
+
+
+# The same scanner once more, immediately before each push, with the owner's list of the values no
+# public pattern can name (`tools/hygiene/README.md`, "Values only the owner knows"). That list
+# exists on the owner's machine only, outside the sandbox, so these are not check commands of the
+# verifier: the engine starts them itself, as the owner (`Engine._local_scan`). Run there, they may
+# execute nothing a builder wrote. The scanner and its allow-list are therefore the ones of the
+# checkout the engine runs from, named by their absolute paths, never the branch's copy; the branch
+# is read as git objects, by commit ID; and the command is an argument vector, with no shell.
+# (name, the scanner's arguments): the tree of the head, then every commit the push would publish.
+# A finding is handled as a finding of a history check is. The engine keeps the path and the
+# rule's name of a finding and nothing else: here the scanner's excerpt surrounds the secret itself.
+LOCAL_VALUE_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("local-values", ("--rev", "{head}")),
+    ("local-values-history", ("--history", "{base}..{head}")),
+)
+LOCAL_VALUE_SCANNER = Path(__file__).resolve().parents[2] / "hygiene" / "scan.py"   # <checkout>/tools/hygiene/scan.py
+LOCAL_VALUE_ALLOW_LIST = LOCAL_VALUE_SCANNER.with_name("hygiene.toml")
+LOCAL_VALUES_ENV = "HYGIENE_LOCAL_VALUES"
+LOCAL_VALUES_DEFAULT = ("research-harness-inference", "hygiene-values")   # under the user's configuration directory
+
+
+def local_values_file(env: Mapping[str, str]) -> Path | None:
+    """The owner's list, by the scanner's own rule (`load_local_values` in `tools/hygiene/scan.py`):
+    the file `HYGIENE_LOCAL_VALUES` names when it is set, whether or not that file exists (the
+    scanner then fails without it, and so the push is withheld), else the default file when it
+    exists. None: there is no list here, and nothing is scanned outside the sandbox."""
+    if env.get(LOCAL_VALUES_ENV):
+        return Path(env[LOCAL_VALUES_ENV])
+    try:
+        base = Path(env["XDG_CONFIG_HOME"]) if env.get("XDG_CONFIG_HOME") else Path.home() / ".config"
+    except RuntimeError:   # no home directory to look in
+        return None
+    path = base.joinpath(*LOCAL_VALUES_DEFAULT)
+    return path if path.exists() else None
+
+
+def local_value_checks(base: str, head: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The scans with the owner's list before a push of `head`, whose commits since `base` the
+    push would publish (both commit IDs): (name, argument vector). The interpreter is the engine's
+    own, isolated (`-I`: no path from the environment or the working directory). They belong with
+    the history checks: where those are off (the engine's test suite, whose repositories hold no
+    scanner), these are off too, whatever the machine the suite runs on holds."""
+    if not HISTORY_CHECKS:
+        return ()
+    start = (sys.executable, "-I", str(LOCAL_VALUE_SCANNER), "--config", str(LOCAL_VALUE_ALLOW_LIST))
+    return tuple((name, start + tuple(a.replace("{base}", base).replace("{head}", head) for a in arguments))
+                 for name, arguments in LOCAL_VALUE_CHECKS)
 
 
 def is_protected(path: str) -> bool:
@@ -168,7 +219,6 @@ def load_policy(path) -> dict:
     """The host's lacks, the CI jobs that provide some of them, the safety invariants and the
     deployment statuses to wait for, from loop.toml (part of the safety surface)."""
     import tomllib
-    from pathlib import Path
     data = tomllib.loads(Path(path).read_text()) if Path(path).exists() else {}
     return {"lacks": list((data.get("host") or {}).get("lacks") or []),
             "ci_jobs": load_ci_jobs(data.get("host")),
