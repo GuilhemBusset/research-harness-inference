@@ -65,6 +65,8 @@ that was force-added is. To scan a directory that is not a git work tree, use `-
 | `email` | Any address, in any script | `noreply@anthropic.com`, GitHub's own addresses, the reserved example domains (`example.com`, `.example`, `.invalid`, `.test`), `git@github.com`; versions (`ruff@0.17.3`), decorators, file names (`logo@2x.png`) |
 | `home-path` | `/home/<name>`, `/Users/<name>`, `/mnt/c/Users/<name>`, `C:\Users\<name>`, `\home\<name>` | Generic users (`user`, `runner`, `ec2-user`, `ubuntu`); paths that merely contain `/home/`; `$HOME`, `~` |
 | `local-value` | A value from the owner's own list, in any letter case, in any file (see below) | Anything, where that list does not exist |
+| `console-link` | A link to the AWS console: a URL, with its scheme, whose host is `console.aws.amazon.com` or `signin.aws.amazon.com`, or their counterparts in the China and GovCloud partitions (`console.amazonaws.cn`, `signin.amazonaws.cn`, `console.amazonaws-us-gov.com`, `signin.amazonaws-us-gov.com`), or ends with one of them after a dot (a region's console, the sign-in page of an account alias), also with that label written as a template. The whole URL is the finding | AWS's documentation and product pages (`docs.aws.amazon.com`, `aws.amazon.com/console/`); service endpoints; a console host name written without a scheme |
+| `build-badge` | The URL, with its scheme, of a CodeBuild project's badge (`codebuild.<region>.amazonaws.com/badges…`), of the badge image of a GitHub Actions workflow (`github.com/<owner>/<repo>/actions/workflows/<file>/badge.svg`, and the older `…/workflows/<name>/badge.svg`), or of a shields.io badge of a build or workflow status, served by `img.shields.io` or `raster.shields.io`. The badge's route decides: the routes shields.io files under its category "Build" for the status of a build, a pipeline, a workflow or a commit's checks (`travis/…`, `circleci/…`, `github/actions/workflow/status/…`, `github/check-runs/…`, `gitlab/pipeline-status/…`, `jenkins/build`, `readthedocs/…` and the like, retired routes included; the table is `_SHIELDS_BUILD_ROUTE`), and a badge whose text the URL writes itself (`badge/…`, `static/…`, `endpoint`) with `build`, `codebuild`, `workflow` or `pipeline` as a word of that text or of its `label` or `message`. The whole URL is the finding | The CodeBuild service endpoint; a link to a workflow's page or file; shields.io badges of anything else (a licence, a version, a coverage), whatever the repository, the branch or the package is called (`github/license/<owner>/build-tools` shows a licence); any of these written without a scheme |
 
 Every rule reads every file, text or not, with two exceptions: `email` is not applied to binary
 files (more than one NUL byte per thousand), where an address is a font's or a PDF's own
@@ -77,8 +79,9 @@ is printed masked wherever it appears, and no marker can allow it: rename the fi
 
 What the patterns cannot see: a real domain name, a public IP address, a bucket or stack name
 that gives the owner away, a secret with no recognisable shape (a GitHub client secret is 40
-hexadecimal characters), anything encoded or compressed. The owner's list (below) covers the
-values the owner thought of; the rest remains the author's and the examiner's job.
+hexadecimal characters), a build badge of a service whose shields.io URL has none of the rule's
+words, anything encoded or compressed. The owner's list (below) covers the values the owner
+thought of; the rest remains the author's and the examiner's job.
 
 What the rules report although it is harmless: a twelve-digit value that is neither an account
 nor one of the shapes above (a `YYYYMMDDHHMM` timestamp, a twelve-digit abbreviated commit ID);
