@@ -1,6 +1,6 @@
 # ADR 0001 — The software factory: the implement loop, vendored, sandboxed and taught about deployments
 
-- **Status:** Proposed. The owner is going through the green light (`docs/factory/green-light.md`): the repository is pushed and the backlog is published as GitHub issues
+- **Status:** Proposed. The owner is going through the green light (`docs/factory/green-light.md`): the repository is public, its ruleset is active and the backlog is published as GitHub issues
 - **Date:** 2026-11-11
 - **Deciders:** Guilhem Busset (repo owner)
 - **Context:** the implement loop of [`GuilhemBusset/coding-agent-cursus`](https://github.com/GuilhemBusset/coding-agent-cursus)
