@@ -11,13 +11,13 @@ from test_deploying import Phase, loop
 def test_final_bad_status_is_sent_to_fix_forward(state):
     context = 'deploy/examiner'
     with loop(2, contexts=(context,)) as run:
-        run.fake.posts[2] = [(state, 'detail must not enter feedback'), 'success']
+        run.fake.posts[2] = [(state, 'STATUS_DESCRIPTION'), 'success']
         run.run()
         assert len(run.events('fix_forward', 2)) == 1
         assert len(run.fake.merges(2)) == 2
         feedback = run.feedback(2)[1]
         assert context in feedback and state in feedback
-        assert 'detail must not enter feedback' not in feedback
+        assert 'STATUS_DESCRIPTION' in feedback   # issue #23: a configured context's description is in the summary
         assert run.issue(2).phase == Phase.DONE
 
 
