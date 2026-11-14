@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import cast
 
-from . import VERSION, environment, report, sandbox
+from . import VERSION, app_token, environment, report, sandbox
 from .config import Config, load_policy
 from .github import GhCli, GitHub, RecordingGitHub
 from .graph import CycleError, build_plan
@@ -28,17 +28,36 @@ def repo_root() -> Path:
 
 
 def repo_slug() -> str:
+    try:
+        env = app_token.gh_env()   # None: the login `gh` has
+    except app_token.AppTokenError as e:
+        sys.exit(f"implement: {e}")
     out = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-                         capture_output=True, text=True, check=False)
+                         capture_output=True, text=True, check=False, env=env)
     if out.returncode != 0:
         sys.exit("implement: `gh repo view` failed; is the GitHub CLI authenticated (gh auth status)?")
     return out.stdout.strip()
 
 
+def github(slug: str) -> GhCli:
+    """The engine's GitHub client. Each `gh` it starts gets its environment from
+    `app_token.gh_env`: a token of the factory's GitHub App with at least ten minutes left when
+    the environment names the App, the login `gh` already has otherwise."""
+    return GhCli(slug, env=app_token.gh_env)
+
+
+def git_as_the_app() -> None:
+    """From here on every git process started from this one (the engine's own, the supervisor's,
+    `ship.sh`'s, and those of the runs a supervision launches) asks `app_token.py` for
+    github.com's credential, when the environment names the factory's GitHub App. The setting
+    names a command, not a token: agents and checks get `sandbox.clean_env`, which replaces it."""
+    os.environ.update(app_token.git_env(os.environ))
+
+
 def cmd_plan(args) -> int:
     root = repo_root()
     try:
-        plan = build_plan(GhCli(args.repo or repo_slug()), args.issue, root)
+        plan = build_plan(github(args.repo or repo_slug()), args.issue, root)
     except CycleError as e:
         print(f"implement: {e}. Fix the blocked-by links before running.", file=sys.stderr)
         return 2
@@ -118,7 +137,7 @@ def cmd_retry(args) -> int:
 
 
 def cmd_record(args) -> int:
-    rec = RecordingGitHub(GhCli(args.repo or repo_slug()))
+    rec = RecordingGitHub(github(args.repo or repo_slug()))
     build_plan(cast(GitHub, rec), args.issue, repo_root())   # it forwards every GitHub method
     rec.save(Path(args.out))
     print(f"Recorded {sum(len(v) for v in rec.fixture.values())} responses to {args.out}")
@@ -132,10 +151,13 @@ def detect_operator() -> str | None:
 
 
 def _out(cmd: list[str]) -> tuple[int, str]:
+    """(exit code, output) of one command. `gh` runs as the identity the engine's own calls have
+    (`app_token.gh_env`); every other command gets the engine's environment, which holds no token."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+        env = app_token.gh_env() if cmd[:1] == ["gh"] else None
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False, env=env)
         return p.returncode, (p.stdout or p.stderr).strip()
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except (OSError, subprocess.TimeoutExpired, app_token.AppTokenError) as e:
         return 1, str(e)
 
 
@@ -151,9 +173,14 @@ def doctor_checks(root: Path, slug: str | None) -> list[tuple[str, str, str]]:
     add(code == 0, "git", out)
     code, out = _out(["gh", "auth", "status"])
     add(code == 0, "gh auth", "authenticated" if code == 0 else out[-200:])
+    checks.append(github_identity_check(root))
     add(bool(slug), "repository", slug or repository_problem(root))
     if slug:
-        add(*base_branch_check(root, Config(repo=slug)))
+        cfg = Config(repo=slug)
+        base = base_branch_check(root, cfg)
+        add(*base)
+        if base[0]:   # without the branch there is no commit to ask about
+            add(*checks_access_check(slug, cfg.base_branch))
     add(*identity_check(root))
     add(*git_config_check(root))
     add(*sandbox_check(root))
@@ -178,6 +205,53 @@ def doctor_checks(root: Path, slug: str | None) -> list[tuple[str, str, str]]:
             warn_only=True)
     add(*node_check(), warn_only=True)
     return checks
+
+
+def github_identity_check(root: Path) -> tuple[str, str, str]:
+    """(status, name, detail): which GitHub identity the engine's `gh` and git run as.
+
+    With none of the App's three variables set, it is the login `gh` already has, and the line
+    names it. With the three set, it is the factory's GitHub App (ADR 0001, amendment 2), and the
+    line fails when GitHub says the installation holds the workflows or the administration
+    permission (GitHub itself must refuse a factory change to a workflow file or a ruleset) or
+    cannot read checks, when a token cannot be minted, and when `origin` is not an
+    https://github.com/ URL: git asks the App's credential helper for that host only, and would
+    push as someone else. Only some of the three set is a failure too."""
+    name, where = "github identity", "docs/factory/green-light.md, step 7"
+    try:
+        app = app_token.configured()
+        if app is None:
+            unset = f"no GitHub App: {', '.join(app_token.VARS)} are not set"
+            code, out = _out(["gh", "api", "user", "--jq", ".login"])
+            if code != 0 or not out.strip():
+                return "WARN", name, f"the login `gh` has, which `gh api user` could not name ({unset})"
+            return "PASS", name, f"{out.strip().splitlines()[0]}, the login `gh` has ({unset})"
+        found = app_token.installation(app)
+        who = f"the GitHub App {found.get('app_slug') or app.app_id}, installation {app.installation_id}"
+        problems = app_token.permission_problems(found.get("permissions"))
+        code, url = _out(["git", "-C", str(root), "remote", "get-url", "--push", "origin"])
+        if code == 0 and not url.startswith(f"https://{app_token.HOST}/"):
+            problems.append(f"`origin` is not an https://{app_token.HOST}/ URL, so git would not push as the App")
+        if problems:
+            return "FAIL", name, f"{who}: {'; '.join(problems)} ({where})"
+        app_token.token()   # the exchange the engine's every call depends on
+    except app_token.AppTokenError as e:
+        return "FAIL", name, f"{e} ({where})"
+    if found.get("repository_selection") != "selected":
+        return "WARN", name, f"{who}, installed on every repository of its account: install it on this one only ({where})"
+    return "PASS", name, f"{who}, on selected repositories"
+
+
+def checks_access_check(slug: str, branch: str) -> tuple[bool, str, str]:
+    """(ok, name, detail): the identity the engine runs as can read check runs, asked the way the
+    engine asks before it lands a pull request (`GhCli.required_check_run`). Whatever the identity:
+    the App's installation token, or the login `gh` has. A fine-grained personal token logs in
+    and still gets a 403 there on a private repository, and no issue could ever land."""
+    code, out = _out(["gh", "api", f"repos/{slug}/commits/{branch}/check-runs?per_page=1", "--jq", ".total_count"])
+    if code == 0:
+        return True, "checks access", f"check runs of {branch} can be read"
+    return False, "checks access", (f"the check runs of {branch} cannot be read ({out[-160:]}): the engine could never "
+                                    "see `required` green (docs/factory/green-light.md, step 7)")
 
 
 # The Node.js majors the CDK CLI supports; `cdk synth` is a check of every infrastructure issue.
@@ -354,6 +428,7 @@ def cmd_doctor(args) -> int:
         return 0 if ok else 1
     for action in environment.heal(root):
         print(f"FIXED {action}")
+    git_as_the_app()   # the doctor judges what a run would use
     code, slug = _out(["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
     checks = doctor_checks(root, args.repo or (slug if code == 0 else None))
     for status, name, detail in checks:
@@ -389,12 +464,13 @@ def cmd_run(args) -> int:
     operator = args.operator or detect_operator()
     if operator not in ("claude", "codex"):
         sys.exit("implement: say who is driving this run with --operator claude or --operator codex")
+    git_as_the_app()
     slug = args.repo or repo_slug()
     preflight(root, slug)
     # From here on every git process of this run (its own commands, ship.sh) ignores the hooks and
     # the monitor a worktree or an agent's git directory names: they would run outside the sandbox.
     os.environ.update(sandbox.engine_git_env(os.environ, runs_dir(root) / "no-hooks"))
-    gh = GhCli(slug)
+    gh = github(slug)
     try:
         plan = build_plan(gh, args.issue, root)
     except CycleError as e:
@@ -446,6 +522,7 @@ def cmd_supervise(args) -> int:
         sys.exit("implement: say who is driving this run with --operator claude or --operator codex")
     if not args.yes:
         sys.exit("implement: confirm with --yes once the user has agreed that these runs merge their own PRs")
+    git_as_the_app()   # the supervisor's own pull of `main`, and every run it launches
     preflight(root, args.repo or repo_slug())   # every run it would launch does the same and would refuse
     if args.detach:
         log = RunStore.for_root(root, args.issue).dir / "supervisor.log"
