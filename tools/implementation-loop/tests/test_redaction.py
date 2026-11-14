@@ -303,12 +303,29 @@ def test_a_progress_comment_that_cannot_be_masked_stops_the_issue_at_its_next_st
 
 
 def test_an_issue_the_owner_ticked_stays_delivered_until_its_last_comment_is_written():
+    """It is not closed, and it waits: left delivered, the supervisor would count it settled and stop."""
     with loop() as run:
         run.add_work(2, items=["Runs under a second on a 2020 laptop."], owner_items=("D2",))
         run.run()
         assert run.state(2)[0] == Phase.DELIVERED
         run.fake.issues[2]["body"] = run.fake.issues[2]["body"].replace("- [ ]", "- [x]")
         run.run(mask=failing_on(says(Phase.DONE)))
-        assert run.state(2) == (Phase.DELIVERED, None, None, "open")
+        assert run.state(2) == (Phase.WAITING, WAIT_GITHUB, "delivered", "open")
         run.run()
         assert run.state(2) == (Phase.DONE, None, None, "closed")
+
+
+def test_a_failed_issue_waits_until_its_fault_issue_and_its_last_comment_are_written():
+    """A failed issue is settled for the supervisor too. It waits as it failed, and is failed again,
+    for the same cause and without being worked again, once the next run has published."""
+    for refused in (lambda text: text.startswith("implement loop: #2 not delivered"), says(Phase.FAILED)):
+        with loop() as run:
+            run.add_work(2)
+            run.run(mask=failing_on(refused), crashing=(2,), infra_budget=1)
+            assert run.state(2) == (Phase.WAITING, WAIT_GITHUB, "failed", "open")
+            assert not [text for text in published(run.fake) if refused(text)]
+            run.run()
+            assert run.state(2) == (Phase.FAILED, None, None, "open") and run.store.issue(2).fail["cause"] == "ceiling"
+            assert not [call for call in run.agents.calls if call[0] == "build"]
+            assert len(run.labelled("loop:engine-bug")) == 1 and masked() in run.labelled("loop:engine-bug")[0]
+            assert [text for text in published(run.fake) if says(Phase.FAILED)(text)]
