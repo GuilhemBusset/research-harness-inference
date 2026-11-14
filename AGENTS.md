@@ -46,6 +46,10 @@ scripts/check.sh fast      # hygiene, shell and JSON syntax, the lock, ruff, ty
 scripts/check.sh all       # fast, every test, the engine tests, the skill pairs, the backlog lint, the ship test, cdk synth
 ```
 
+One step is in neither `fast` nor `all`: `scripts/check.sh container-tests` runs the tests under
+`tests/container/`, which start a container. It fails when no container runtime answers, and the
+agents' host has none, so CI runs it, in its job `container-tests`.
+
 While iterating, run the narrowest check directly:
 
 - one step of the gate: `scripts/check.sh <step>` (`lint`, `types`, `tests`, `synth`, ...);
@@ -127,6 +131,7 @@ fix: it stays in the history. Stop, say so, and leave the decision to the owner.
   | `tests/contract/` | The engine contract (system design, section 4.1), run against each engine adapter, the mock first |
   | `tests/replay/`, `tests/captures/` | Replayed harness traffic, and the scrubbed captures it replays: example host, no key, no address, no student |
   | `tests/smoke/` | The pipeline's verification; locally it runs against an in-process stack |
+  | `tests/container/` | Tests that can only be made by starting a container. Not in the default test run: CI's job `container-tests` runs them (`scripts/check.sh container-tests`), and an acceptance item that rests on one ends with `(needs host:container-runtime)`. See [`tests/container/README.md`](tests/container/README.md) |
 
 - Security invariants over the synthesized templates live under `tests/policy/` (such as: no
   ingress from the internet to the fleet, a hard cap on fleet size, no wildcard IAM; the system

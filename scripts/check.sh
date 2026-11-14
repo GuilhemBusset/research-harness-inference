@@ -9,8 +9,12 @@
 #                              credentials
 #
 # A single step can be run by its name: static, lock, lint, types, tests, engine-tests, skills,
-# backlog-lint, ship-tests, synth. CI's jobs call those. Every step of a run is attempted, each
-# result is printed, and the exit status is 1 if any step failed, 2 on a usage error.
+# backlog-lint, ship-tests, synth, container-tests. CI's jobs call those. Every step of a run is
+# attempted, each result is printed, and the exit status is 1 if any step failed, 2 on a usage
+# error.
+#
+# container-tests runs the tests that start a container (tests/container/). It fails when no
+# container runtime answers, so fast and all do not run it: CI's job container-tests does.
 #
 # This script is a protected path and part of the safety surface
 # (docs/adr/0001-software-factory.md, decision 10).
@@ -80,34 +84,63 @@ do_tests() {
   uv run --locked pytest
 }
 
-do_engine_tests() {
-  # The implement loop's own tests, on the oldest Python it supports. In CI everything they need
-  # is installed, so a skipped test there is lost coverage and fails the step; on another machine
-  # skips are listed and tolerated.
-  local junit rc=0
-  junit="$(mktemp)"
-  uv run --no-project --python "$engine_python" --with "$engine_pytest" --with "$engine_xdist" \
-    python -m pytest -q -n auto -p no:cacheprovider --junitxml="$junit" tools/implementation-loop/tests || rc=1
-  python3 - "$junit" <<'EOF' || rc=1
+skip_report() {   # skip_report <step> <junit file>: what pytest collected and what it skipped
+  # In CI everything a test needs is installed, so a skipped test there is lost coverage and
+  # fails the step; on another machine skips are listed and tolerated. A run that collected
+  # nothing fails everywhere.
+  python3 - "$1" "$2" <<'EOF'
 import os
 import sys
 import xml.etree.ElementTree as ET
 
+step = sys.argv[1]
 try:
-    suites = list(ET.parse(sys.argv[1]).getroot().iter("testsuite"))
+    suites = list(ET.parse(sys.argv[2]).getroot().iter("testsuite"))
 except ET.ParseError:
-    sys.exit("[check] engine-tests: pytest wrote no report")
+    sys.exit(f"[check] {step}: pytest wrote no report")
 tests = sum(int(s.get("tests", 0)) for s in suites)
 skipped = [f'{c.get("classname")}::{c.get("name")}' for s in suites for c in s.iter("testcase")
            if c.find("skipped") is not None]
-print(f"[check] engine-tests: {tests} collected, {len(skipped)} skipped")
+print(f"[check] {step}: {tests} collected, {len(skipped)} skipped")
 for name in skipped:
     print(f"[check]   skipped: {name}")
 if tests == 0:
-    sys.exit("[check] engine-tests: nothing was collected")
+    sys.exit(f"[check] {step}: nothing was collected")
 if skipped and os.environ.get("CI"):
-    sys.exit("[check] engine-tests: a test skipped in CI; install what it needs")
+    sys.exit(f"[check] {step}: a test skipped in CI; install what it needs")
 EOF
+}
+
+do_engine_tests() {
+  # The implement loop's own tests, on the oldest Python it supports. A skipped test fails the
+  # step under CI (skip_report).
+  local junit rc=0
+  junit="$(mktemp)"
+  uv run --no-project --python "$engine_python" --with "$engine_pytest" --with "$engine_xdist" \
+    python -m pytest -q -n auto -p no:cacheprovider --junitxml="$junit" tools/implementation-loop/tests || rc=1
+  skip_report engine-tests "$junit" || rc=1
+  rm -f "$junit"
+  return "$rc"
+}
+
+do_container_tests() {
+  # The tests that can only be made by starting a container (tests/container/README.md;
+  # docs/design/system-design.md, "Checks on a pull request"). The folder is named to pytest,
+  # because pyproject.toml keeps it out of a run that names no path. Without a runtime the step
+  # fails instead of skipping, so a green result always means the tests ran. A skipped test
+  # fails the step under CI (skip_report).
+  if [ -z "$(find tests/container -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit 2>/dev/null)" ]; then
+    echo "[check] container-tests: tests/container/ holds no test yet, nothing to run"
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "[check] container-tests: no container runtime answers (\`docker info\` failed); CI's job container-tests runs these tests" >&2
+    return 1
+  fi
+  local junit rc=0
+  junit="$(mktemp)"
+  uv run --locked pytest -p no:cacheprovider --junitxml="$junit" tests/container || rc=1
+  skip_report container-tests "$junit" || rc=1
   rm -f "$junit"
   return "$rc"
 }
@@ -151,7 +184,7 @@ do_synth() {
 }
 
 usage() {
-  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
 
 if [ "$#" -ne 1 ]; then
@@ -191,6 +224,7 @@ case "$1" in
   backlog-lint) step backlog-lint do_backlog_lint ;;
   ship-tests)   step ship-tests do_ship_tests ;;
   synth)        step synth do_synth ;;
+  container-tests) step container-tests do_container_tests ;;
   *)
     usage
     exit 2
