@@ -84,6 +84,7 @@ class GitHub(Protocol):
     def find_pr(self, head: str) -> dict | None: ...
     def required_check(self, sha: str, name: str) -> str | None: ...
     def required_check_run(self, sha: str, name: str) -> dict | None: ...
+    def deploy_status(self, sha: str, context: str) -> dict | None: ...
     def find_issue(self, label: str, marker: str) -> int | None: ...
     # writes
     def create_comment(self, n: int, body: str) -> dict: ...
@@ -191,6 +192,18 @@ class GhCli:
             return None
         run = max(runs, key=lambda r: r.get("id", 0))
         return {"id": run.get("id"), "status": run.get("status"), "conclusion": run.get("conclusion")}
+
+    def deploy_status(self, sha, context):
+        """The latest commit status called `context` on the commit `sha`: its state (`pending`,
+        `success`, `failure` or `error`) and its description, or None when the commit has no status
+        of that context. This is how the pipeline reports a deployment (ADR 0001, decision 5). A
+        context is posted again at every step, so the commit's statuses are read whole and the
+        newest of the context is kept."""
+        statuses = [s for s in self._pages(self._r(f"commits/{sha}/statuses")) if s.get("context") == context]
+        if not statuses:
+            return None
+        latest = max(statuses, key=lambda s: s.get("id") or 0)   # GitHub lists the newest first: it wins a tie
+        return {"state": latest.get("state"), "description": latest.get("description") or ""}
 
     def find_issue(self, label, marker):
         """An issue (open or closed) with `label` whose body carries `marker`. Listing by label has
@@ -366,6 +379,7 @@ class FakeGitHub:
         self._check_seen: dict[str, dict] = {}  # sha -> the latest check run handed out
         self._run_ids = iter(range(1, 10**9))
         self.reruns: list[str] = []
+        self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
         self.calls: list[tuple] = []
         self.owner = owner
         self.on_merge = on_merge
@@ -378,6 +392,10 @@ class FakeGitHub:
                           "labels": [{"name": l} for l in labels], "html_url": f"https://github.test/issues/{n}"}
         self.subs[n] = list(subs)
         self.blocked[n] = list(blocked_by)
+
+    def set_status(self, sha: str, context: str, state: str, description: str = "") -> None:
+        """Post a commit status on `sha`, as the pipeline's reporter does: the context's latest."""
+        self.statuses.setdefault(sha, []).append({"context": context, "state": state, "description": description})
 
     def _id(self) -> int:
         self._next_id += 1
@@ -421,6 +439,10 @@ class FakeGitHub:
             self._check_seen[sha] = {"id": next(self._run_ids), "status": "completed", "conclusion": conclusion}
         run = self._check_seen[sha]
         return None if run["conclusion"] is None else dict(run)
+
+    def deploy_status(self, sha, context):
+        posted = [s for s in self.statuses.get(sha, []) if s["context"] == context]
+        return {"state": posted[-1]["state"], "description": posted[-1]["description"]} if posted else None
 
     def find_issue(self, label, marker):
         for n, issue in sorted(self.issues.items()):
