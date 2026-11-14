@@ -10,6 +10,11 @@ request. After a 5xx or a broken connection it may have taken effect, so it is n
 engine looks up what it creates (a PR by its branch, an issue or a comment by its marker) before
 creating it again. A transient failure that outlasts the retries raises `GitHubUnavailable`, so
 the engine can tell an outage from a real error; any other failure raises `GitHubError` at once.
+
+`RedactingGitHub` wraps the client a run publishes through: every title and body that creates or
+updates a comment, a pull request or an issue passes through the hygiene scanner's redaction
+first (`redact.py`). Without the scanner nothing is sent, and the call raises
+`RedactionUnavailable`.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
+
+from .redact import RedactionError, redact
 
 PER_PAGE = 100
 RETRY_DELAYS_S = (5, 15, 45)   # seconds slept before each retry of a transient failure
@@ -43,6 +50,12 @@ class GitHubError(RuntimeError):
 class GitHubUnavailable(GitHubError):
     """GitHub could not be reached, or kept failing transiently through every retry: an outage,
     not an answer to the request."""
+
+
+class RedactionUnavailable(GitHubUnavailable):
+    """The hygiene scanner could not mask a title or a body (it is missing, or it failed), so the
+    call was not made: nothing was sent, masked or raw. For the engine this is GitHub being
+    unavailable: the issue waits (`WAIT_GITHUB`) and the supervisor's next run tries again."""
 
 
 def transient(stderr: str, stdout: str = "") -> str | None:
@@ -243,6 +256,46 @@ class GhCli:
 
     def create_issue(self, title, body, labels):
         return self._api(self._r("issues"), "POST", {"title": title, "body": body, "labels": labels})
+
+
+class RedactingGitHub:
+    """Wraps a client: the titles and bodies that create or update a comment, a pull request or an
+    issue are masked by the hygiene scanner before the inner client sees them (ADR 0001, decision
+    4). The text is masked first and sent second, so a scanner that cannot run sends nothing.
+
+    `edit_issue` is forwarded as it is: the engine uses it to close an issue and to tick its
+    boxes, and a tick sends back the issue's own text, which the engine never rewrites. Every
+    other method is forwarded too."""
+
+    def __init__(self, inner: GitHub, mask: Callable[[str], str] = redact):
+        self.inner = inner
+        self._redact = mask
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def _mask(self, text: str) -> str:
+        try:
+            return self._redact(text)
+        except RedactionError as e:
+            raise RedactionUnavailable(f"nothing was published: {e}") from e
+
+    def create_comment(self, n, body):
+        return self.inner.create_comment(n, self._mask(body))
+
+    def update_comment(self, comment_id, body):
+        return self.inner.update_comment(comment_id, self._mask(body))
+
+    def create_pr(self, head, base, title, body):
+        title, body = self._mask(title), self._mask(body)
+        return self.inner.create_pr(head, base, title, body)
+
+    def update_pr(self, n, body):
+        return self.inner.update_pr(n, self._mask(body))
+
+    def create_issue(self, title, body, labels):
+        title, body = self._mask(title), self._mask(body)
+        return self.inner.create_issue(title, body, labels)
 
 
 class RecordingGitHub:

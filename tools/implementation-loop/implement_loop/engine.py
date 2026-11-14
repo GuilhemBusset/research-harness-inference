@@ -82,6 +82,12 @@ except ImportError:   # pragma: no cover - older github.py
     class GitHubUnavailable(GitHubError):
         pass
 
+try:   # RedactionUnavailable arrives with the redacting GitHub client
+    from .github import RedactionUnavailable
+except ImportError:   # pragma: no cover - older github.py, whose client never raises it
+    class RedactionUnavailable(GitHubError):
+        pass
+
 LABELS = {
     "loop:plan": ("C5DEF5", "implement loop: planning"),
     "loop:building": ("FBCA04", "implement loop: building or verifying"),
@@ -144,6 +150,7 @@ class Engine:
         self.invoked_at = invoked_at if invoked_at is not None else time.time()
         self.run_calls = 0
         self._charged: set[int] = set()   # issues whose last failed attempt the meter already charged
+        self._unpublished: dict[int, str] = {}   # issues whose progress comment the hygiene scanner could not mask
         agents.meter = self
 
     # ------------------------------------------------------------------ public
@@ -167,6 +174,8 @@ class Engine:
             finally:
                 self._release_claims()
             self._reconcile_delivered()
+            for n in list(self._unpublished):   # a phase that changed outside a step
+                self._withhold(n)
             self._flush_faults()
             summary = self._summary(stopped)
             self._post_run_summary()
@@ -265,6 +274,7 @@ class Engine:
             st = self.store.issue(n)
             if st.worktree and (Path(st.worktree) / ".git").exists():
                 self._recover_worktree(n, Path(st.worktree))
+            restored = self._restore_ended(st)
             if st.body_hash and st.body_hash != spec.body_hash:
                 if st.phase in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
                     self._new_round(st, ["the issue was edited after its work was merged; deliver the edited version"],
@@ -287,6 +297,21 @@ class Engine:
                 self._restore_deps(n, st)
             self._declare(n, st)
             self.store.put(st)
+            if restored and st.phase in (Phase.DELIVERED, Phase.FAILED):
+                self._sync(n)   # its labels and its comment said `waiting`; `_withhold` if they still must
+
+    def _restore_ended(self, st: IssueState) -> bool:
+        """An issue that had ended (`delivered`, `failed`) and waits only because the hygiene scanner
+        could not mask something of it (its progress comment, its fault issue, the comment that the
+        owner completed it) is what it was again, with all it recorded (`fail`, its obligations),
+        before it is reconciled: an edit starts a new round, a new engine version revives it. What
+        was not published is published by this run, or the issue waits again at the run's end."""
+        w = st.wait or {}
+        if (st.phase != Phase.WAITING or w.get("kind") != WAIT_GITHUB
+                or w.get("resume") not in (Phase.DELIVERED.value, Phase.FAILED.value)):
+            return False
+        self._maybe_resume(st)
+        return True
 
     def _declare(self, n: int, st: IssueState) -> None:
         """What the scheduler sees an issue own: its zones, approved paths and tests."""
@@ -440,6 +465,7 @@ class Engine:
                     if fut.done():
                         del running[n]
                         self._finished(n, fut.exception())
+                        self._withhold(n)
                 if self.store.stop_requested():
                     if not stopped:
                         self.store.event("stop_requested")
@@ -736,12 +762,28 @@ class Engine:
                     number = self.gh.create_issue(entry["title"], entry["body"], [ENGINE_BUG_LABEL[0]])["number"]
                 self.faults.mark_reported(fingerprint, number)
                 self.store.event("fault_filed", fingerprint=fingerprint, issue=number)
+            except RedactionUnavailable as e:
+                # Not best effort: a failed issue is settled for the supervisor, which would stop
+                # with the fault never filed. The fault's issues of this run wait, as they are
+                # (`fail` is kept); the fault stays in the outbox and the next run files it.
+                self.store.event("fault_filing_failed", fingerprint=fingerprint, error=str(e)[:300])
+                for n in sorted({n for n, root in zip(entry["issues"], entry["runs"], strict=False)
+                                 if root == self.plan.root and n in self.plan.work}):
+                    if self.store.issue(n).phase not in (Phase.WAITING, Phase.DONE):
+                        self._wait(n, WAIT_GITHUB, f"the fault issue of #{n} ({fingerprint}) was not filed: {str(e)[:300]}")
             except Exception as e:  # noqa: BLE001 - filing is best effort, by design
                 self.store.event("fault_filing_failed", fingerprint=fingerprint, error=str(e)[:300])
 
     def _safe(self, fn, *args, **kwargs):
+        """A GitHub call the engine can do without: a failure is journaled and the caller goes on.
+        Not when the hygiene scanner could not mask what was to be published: nothing was sent, and
+        no step may go on as if it had been (`_accept` would close an issue whose follow-up was
+        never filed). That one is raised: the step ends there and `_finished` makes its issue wait
+        (`WAIT_GITHUB`); outside a step, `_sync` and the run summary catch it."""
         try:
             return fn(*args, **kwargs)
+        except RedactionUnavailable:
+            raise
         except (GitHubError, OSError) as e:
             self.store.event("github_call_failed", call=getattr(fn, "__name__", str(fn)), error=str(e)[:300])
             return None
@@ -754,7 +796,33 @@ class Engine:
                 self._safe(self.gh.remove_label, n, label)
         if wanted:
             self._safe(self.gh.add_labels, n, [wanted])
-        self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(st, self.plan.root))
+        try:
+            self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(st, self.plan.root))
+            self._unpublished.pop(n, None)
+        except RedactionUnavailable as e:
+            # A phase changes in many places that are no step (the dispatch, `_wait`, `_fail`), so
+            # this is not raised: the phase stays recorded, and `_withhold` makes the issue wait.
+            self._unpublished[n] = str(e)
+            self.store.event("progress_not_published", issue=n, phase=st.phase.value, error=str(e)[:300])
+
+    def _withhold(self, n: int) -> None:
+        """The hygiene scanner could not mask the progress comment of issue `n`, so it was not
+        written: the issue waits, and the next run writes it at the issue's next change of phase.
+        A failed or delivered issue waits too, and resumes as failed or delivered
+        (`_restore_ended`): ended, it would be settled for the supervisor with its comment never
+        written. An issue that already waits keeps its reason, and a done one is closed: before
+        `done`, `_announce` has written the comment already."""
+        detail = self._unpublished.pop(n, None)
+        if detail and self.store.issue(n).phase not in (Phase.WAITING, Phase.DONE):
+            self._wait(n, WAIT_GITHUB, detail)
+            self._unpublished.pop(n, None)   # the wait's own comment was not written either
+
+    def _announce(self, n: int, st: IssueState, phase: Phase) -> None:
+        """Write the progress comment of the phase `st` is about to end in, before that phase is
+        recorded. `_sync` writes it again with the phase, but an ended issue is not worked again:
+        a comment the hygiene scanner could not mask then would never be written. Here that
+        failure is raised (`RedactionUnavailable`) while the issue can still wait."""
+        self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(replace(st, phase=phase), self.plan.root))
 
     def _upsert_comment(self, n: int, marker: str, body: str) -> dict | None:
         comments = self._safe(self.gh.list_comments, n) or []
@@ -2165,12 +2233,17 @@ class Engine:
         st.evidence = evidence
         st.restarts = 0
         st.human_tasks = [self._obligation_text(o) for o in st.obligations]
-        self._file_followup(n, st)
+        # Each publication below ends this step when the hygiene scanner cannot mask it (`_safe`):
+        # the issue waits in `merged` and this step runs again. So the follow-up, which is created
+        # and not updated, comes last of the two and is recorded at once; and the comment that says
+        # how the issue ends is written before anything that cannot be taken back.
         self._publish_deferred(n, st)
+        self._file_followup(n, st)
         self.store.put(st)
         self.store.put_section("accepted_checks", str(n), {
             "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
             "manifest": st.manifest})
+        self._announce(n, st, Phase.DELIVERED if st.obligations else Phase.DONE)
         if st.worktree:
             self.ws.remove(Path(st.worktree))
         if st.obligations:
@@ -2383,6 +2456,14 @@ class Engine:
             body = (self._safe(self.gh.get_issue, n) or {}).get("body") or ""
             items = issue_parser.ledger(body)
             if items and all(i.checked for i in items):
+                try:
+                    self._announce(n, replace(st, human_tasks=[]), Phase.DONE)
+                except RedactionUnavailable as e:
+                    # It stays open and waits, to be delivered again and closed by a later run: left
+                    # delivered it would be settled for the supervisor, which would stop there.
+                    self.store.event("progress_not_published", issue=n, phase=Phase.DONE.value, error=str(e)[:300])
+                    self._wait(n, WAIT_GITHUB, str(e)[:300], resume=Phase.DELIVERED)
+                    continue
                 self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
                 self.store.event("owner_evidence_complete", issue=n)
                 self._set_phase(n, Phase.DONE, human_tasks=[])
@@ -2444,7 +2525,10 @@ class Engine:
 
     def _post_run_summary(self) -> None:
         states = {n: self.store.issue(n) for n in self.plan.work}
-        self._upsert_comment(self.plan.root, report.RUN_MARKER, report.render_run_summary(self.plan.root, states))
+        try:
+            self._upsert_comment(self.plan.root, report.RUN_MARKER, report.render_run_summary(self.plan.root, states))
+        except RedactionUnavailable as e:   # no issue's state depends on it; the next run writes its own
+            self.store.event("run_summary_not_published", error=str(e)[:300])
 
 
 def has_conflict_markers(path: Path) -> bool:
