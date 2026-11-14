@@ -17,8 +17,9 @@ For **every** ledger item ({{ledger_ids}}) return one entry:
     `depends_quote`, words from that issue's title or body that show it delivers what you need.
 - `zones`: every path you expect to change, registrations and test files included. A protected
   path (anything under `tools/implementation-loop/`, `tools/hygiene/`, `.github/`, `.githooks/`,
-  `tests/policy/`, `.claude/`, `.agents/` or `.codex/`, the gate scripts in `scripts/`, the
-  ruleset) is yours only when the issue's
+  `tests/policy/`, `.claude/`, `.agents/` or `.codex/`, the pipeline stack under
+  `src/rhi/pipeline/`, the bootstrap policies under `setup/bootstrap/`, the gate scripts in
+  `scripts/`, the ruleset) is yours only when the issue's
   deliverables name it, or name a protected directory above it. Listed here without that, it is
   not granted: plan around it, or ask for it during the build with a `protected_change` request,
   which the examiner decides.

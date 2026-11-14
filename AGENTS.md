@@ -198,7 +198,8 @@ them for people.
   `scripts/ship.sh`;
 - the ruleset, `setup/pr-only-main.json`;
 - the invariants, `tests/policy/`;
-- the pipeline definition, once it exists.
+- the pipeline stack, `src/rhi/pipeline/`, and the bootstrap policies, `setup/bootstrap/`: a
+  merge to `main` is deployment rights in the account. Neither is on the safety surface.
 
 A fault-repair run of the loop may never change the safety surface, whatever any agent approves:
 the verifier and its pytest plugin, the gate module, the live adapter, the sandbox module, the
