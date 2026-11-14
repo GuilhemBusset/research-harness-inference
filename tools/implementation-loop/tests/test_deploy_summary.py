@@ -58,23 +58,22 @@ def test_commit_statuses_gives_every_status_with_its_context_state_and_descripti
 def test_the_summary_comes_from_statuses_only():
     with loop(ISSUE, contexts=(DEPLOY, VERIFY), timeout_s=0) as run:
         commit, told = fix_forward_feedback(run, [
-            (DEPLOY, "pending", "the deployment started"),
             (f"{VERIFY}/smoke/test_chat_completion", "failure", "the smoke test failed"),
             (VERIFY, "failure", "the verification failed"),
+            (f"{DEPLOY}/resource/GatewayService", "pending", "CREATE_IN_PROGRESS"),
             (f"{DEPLOY}/resource/GatewayService", "failure", "CREATE_FAILED"),
             (DEPLOY, "failure", "the stack was rolled back"),
         ], comment="a commit comment: the bucket of the account could not be reached")
 
         assert run.fake.commit_comments[commit], "the fake holds the comment"
-        assert commit[:12] in told
-        assert "GatewayService" in told and "CREATE_FAILED" in told, "the failed resource, with CloudFormation's status code"
-        assert "test_chat_completion" in told and "the smoke test failed" in told, "the failed smoke test"
-        for context, state, description in ((DEPLOY, "failure", "the stack was rolled back"),
-                                            (VERIFY, "failure", "the verification failed")):
-            assert f"`{context}` is `{state}`: `{description}`" in told, "a configured context, with its description too"
-        assert "the deployment started" not in told, "of a context, the newest status counts"
-        assert told.index(f"{DEPLOY}/resource") < told.rindex(f"`{VERIFY}` is") < told.index(f"{VERIFY}/smoke"), \
-            "in the configured order, each context before its facts"
+        assert f"`{DEPLOY}` is `failure`" in told and f"`{VERIFY}` is `failure`" in told and commit[:12] in told, \
+            "the verdict, as before"
+        assert f"`{DEPLOY}/resource/GatewayService` is `failure`" in told and "CREATE_FAILED" in told, \
+            "the failed resource: its context, its state, and CloudFormation's status code as the description"
+        assert f"`{VERIFY}/smoke/test_chat_completion` is `failure`" in told and "the smoke test failed" in told, \
+            "the failed smoke test"
+        assert "CREATE_IN_PROGRESS" not in told, "of a context, the newest status counts"
+        assert told.index(f"{DEPLOY}/resource") < told.index(f"{VERIFY}/smoke"), "in the configured order of the stages"
         everything_told = json.dumps(run.agents.calls, default=str)
         assert "commit comment" not in everything_told and "bucket" not in everything_told, \
             "nothing of the commit comment reaches an agent"
@@ -100,7 +99,8 @@ def test_other_contexts_are_left_out():
 
 def test_statuses_that_cannot_be_read_spend_no_fix_forward():
     with loop(ISSUE) as run:
-        run.fake.posts[ISSUE] = ["failure", "success"]
+        fact = f"{DEPLOY}/resource/FleetGroup"
+        run.fake.posts[ISSUE] = [{DEPLOY: "failure", fact: ("failure", "UPDATE_FAILED")}, "success"]
 
         def refused(sha):
             raise L.github.GitHubError("gh api GET the statuses failed: HTTP 403")
@@ -113,4 +113,4 @@ def test_statuses_that_cannot_be_read_spend_no_fix_forward():
         del run.fake.commit_statuses
         run.run()
         assert len(run.events("fix_forward", ISSUE)) == 1 and run.waits(ISSUE)[0] == Phase.DONE
-        assert f"`{DEPLOY}` is `failure`" in run.feedback(ISSUE)[0]
+        assert f"`{fact}` is `failure`" in run.feedback(ISSUE)[0] and "UPDATE_FAILED" in run.feedback(ISSUE)[0]

@@ -2730,12 +2730,12 @@ class Engine:
 
     def _deployment_failed(self, n: int, sha: str, failed: dict[str, str]) -> None:
         """A final state that is not success: the merged change broke the deployment. The
-        fix-forward gets the verdict (the commit, the failed contexts and their states) and the
-        summary of `_deployment_summary`. If the statuses cannot be read for it, nothing is decided
-        yet: the issue waits, and the next run reads the same commit again, so that no fix-forward
-        is spent without the reporter's facts."""
+        fix-forward gets the verdict (the commit, the failed contexts and their states, and nothing
+        those statuses say beside) and then the reporter's facts, from `_deployment_facts`. If the
+        statuses cannot be read for them, nothing is decided yet: the issue waits, and the next run
+        reads the same commit again, so that no fix-forward is spent without the facts."""
         try:
-            summary = self._deployment_summary(sha)
+            facts = self._deployment_facts(sha)
         except GitHubError as e:
             return self._wait(n, WAIT_GITHUB, f"the commit statuses of {sha[:12]} could not be read: {str(e)[:300]}",
                               resume=DEPLOYING)
@@ -2745,30 +2745,30 @@ class Engine:
         said = ", ".join(f"`{c}` is `{state}`" for c, state in failed.items())
         self._fix_forward(n, [(f"the deployment failed after the merge: on the merge commit {sha[:12]}, the commit "
                                f"status {said}. Find what in this issue's change broke the deployment, and repair it."),
-                              *summary])
+                              *facts])
 
-    def _deployment_summary(self, sha: str) -> list[str]:
-        """What the pipeline's reporter said of the commit `sha`, as feedback for a fix-forward. It
-        is built from that commit's statuses and from nothing else: the engine reads no commit
-        comment and no other text about a deployment (ADR 0001, amendment 4). A status is kept when
-        its context is a configured one, or a configured one followed by a slash and more: the
-        reporter posts each fact of a failure under the context of its stage (system design,
-        section 8.4). Any other context is another reporter's (`measure/...`), or nobody's the owner
-        named. Of each context the newest status counts; they are given in the configured order,
-        each context before its facts, with the context, the state and the description."""
+    def _deployment_facts(self, sha: str) -> list[str]:
+        """What the pipeline's reporter said of the failed deployment of the commit `sha`, as
+        feedback for a fix-forward: one entry per fact. It is built from that commit's statuses and
+        from nothing else: the engine reads no commit comment and no other text about a deployment
+        (ADR 0001, amendment 4). Only the statuses of a configured context, or of one followed by
+        a slash and more, count. The first kind is the verdict, which `_deployment_failed` gives.
+        The second kind is a fact: the reporter posts each fact of a failure under the context of
+        its stage (system design, section 8.4). Any other context is another reporter's
+        (`measure/...`), or one the owner did not name. Of each context the newest status counts.
+        The facts come in the configured order of their stages, sorted by context below each, with
+        the context, the state and the description."""
         newest: dict[str, dict] = {}
         for status in self.gh.commit_statuses(sha):   # the oldest first: the last of a context is its newest
             newest[str(status.get("context") or "")] = status
-        lines = []
+        facts = []
         for configured in self.deploy.contexts:
-            for context in sorted(c for c in newest if c == configured or c.startswith(configured + "/")):
-                status = newest.pop(context)
+            for context in sorted(c for c in newest if c.startswith(configured + "/")):
+                status = newest.pop(context)   # popped: a context below two configured ones is told once
                 description = " ".join(str(status.get("description") or "").split())
-                lines.append(f"`{context}` is `{status.get('state')}`" + (f": `{description}`" if description else ""))
-        if not lines:
-            return []
-        return [f"What the commit statuses of {sha[:12]} say of the deployment, each with its context, its state and "
-                f"its description: " + "; ".join(lines) + "."]
+                facts.append(f"the deployment's report on the merge commit {sha[:12]}: the commit status `{context}` is "
+                             f"`{status.get('state')}`" + (f", with the description `{description}`" if description else ""))
+        return facts
 
     def _deployment_evidence(self, st: IssueState) -> list[dict]:
         """The deployment verdict as an evidence record of the issue: the commit and each context
