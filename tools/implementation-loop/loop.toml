@@ -1,0 +1,128 @@
+# Per-role settings for the live agents of the implement loop.
+#
+# effort:       low | medium | high | xhigh | max (Claude); Codex uses it as model_reasoning_effort.
+# timeout_s:    a call taking longer is killed and retried (twice), then the step stops.
+# claude_model: alias or full id for `claude --model`; "" uses your Claude Code default.
+# codex_model:  model for `codex exec -m`; "" uses your Codex default.
+#
+# max_budget_usd: Claude only: `claude --max-budget-usd` for one call of the role; the call stops
+#               there and is not tried again. Provisional values (ADR 0001, decision 8): they are
+#               set from the first epic's measured cost. Codex reports tokens, not dollars.
+#
+# Explorers are cheap fact-finders; every other role works at high effort. Each issue has a
+# persistent call ceiling and a dollar ceiling (config.py, ADR 0012, ADR 0001); every call's cost
+# and tokens are logged to <run dir>/agents.jsonl.
+#
+# Roles here (ADR 0001, decision 2): with operator `claude`, plan and build run on Claude Fable
+# and explore on a cheap Claude model; triage, examine, decide, resolve_locked and arbitrate go
+# to the other vendor, Codex, on its default model.
+
+[roles.explore]
+effort = "low"
+timeout_s = 900
+claude_model = "sonnet"
+codex_model = ""
+max_budget_usd = 2
+
+[roles.plan]
+effort = "high"
+timeout_s = 1800
+claude_model = "claude-fable-5-2"
+max_budget_usd = 8
+
+[roles.triage]
+effort = "high"
+timeout_s = 1200
+
+[roles.build]
+effort = "high"
+timeout_s = 5400
+claude_model = "claude-fable-5-2"
+max_budget_usd = 25
+
+[roles.resolve_locked]
+effort = "high"
+timeout_s = 1800
+
+[roles.examine]
+effort = "high"
+timeout_s = 3600
+
+[roles.decide]
+effort = "high"
+timeout_s = 1800
+
+[roles.arbitrate]
+effort = "high"
+timeout_s = 1200
+
+# What this host cannot provide (ADR 0012; ADR 0001, decision 6). Only these make an item the
+# owner's; the doctor adds what it can verify (missing API keys, a WSL host lacking native
+# Linux). Agents have network access, Python through uv, and Node; they hold no AWS credentials
+# and never call `aws` or deploy.
+[host]
+lacks = [
+  "aws:account",
+  "aws:deployed-environment",
+  "aws:console",
+  "gpu:capacity",
+  "human:owner-decision",
+  # No container runtime on this host (ADR 0001, amendment 5): a test that starts a container
+  # lives under `tests/container/`, outside the local gate, and runs only in CI, in the job
+  # `container-tests`, which is part of `required`. An item that rests on such a test names this
+  # capability; that job's result on the head that lands is what discharges it. The engine does
+  # not read that result yet, so until it does the item ends as an obligation on a `delivered`
+  # issue (backlog E0-17 adds the job, E0-19 the reading).
+  "host:container-runtime",
+]
+
+# Safety invariants: a finding that names one blocks even when it quotes no ledger item.
+[invariants]
+names = [
+  "secret exposure",
+  "check or gate bypass",
+  "data loss",
+  "cross-run corruption",
+  "wrong results presented as correct",
+  "a false done",
+  "edits to another issue's merged deliverable",
+  "an aws account id, arn or secret committed",
+  "an iam policy broader than the issue requires",
+  "a resource exposed to the internet without the issue asking",
+  "a pipeline, ruleset or gate change that bypasses review",
+]
+
+# The sandbox every agent call and every check command runs in (ADR 0001, decision 3;
+# docs/factory/isolation.md). The root filesystem is read-only, `/tmp` and the home directory
+# are empty, and only what is listed here and what the engine names for the call (the worktree,
+# its private git directory, the run's package caches) is bound back in. `~` is the home
+# directory; a path that does not exist on this host is skipped. This table is the allow-list:
+# it is on the safety surface, and the doctor's canary fails if it lets a credential through.
+[sandbox]
+# Read-only: the tools. Never a directory that also holds a login, a token or a history.
+toolchain = [
+  "~/.local/bin",                  # the claude, codex and uv launchers
+  "~/.local/share/claude",         # the Claude Code binaries those launchers point to
+  "~/.codex/packages",             # the Codex binary: it lives in Codex's own directory
+  "~/.local/share/uv/python",      # the Pythons uv manages
+  "~/.local/share/mise/installs",  # Node, installed by mise
+]
+# Replaced by empty directories before anything is bound: every home directory, the sockets of
+# the session and of local services (`/run`), and other filesystems (`/mnt`, `/media`). On a WSL
+# host `/mnt` holds the Windows drives and a second mount of this very filesystem, and `/run` the
+# socket that starts Windows programs.
+hide = ["/home", "/root", "/run", "/mnt", "/media", "/var/tmp"]
+
+# Read-write, for that vendor's own calls only: the one file its login is kept in (it is
+# rewritten when a token is refreshed). Not the vendor's directory: that also holds the owner's
+# session history for every project, and hooks, plugins and MCP servers the owner's next session
+# would run outside the sandbox. A file bound this way can be rewritten in place, not replaced by
+# another file (docs/factory/isolation.md, "The vendor's login").
+[sandbox.login]
+claude = ["~/.claude/.credentials.json"]
+codex = ["~/.codex/auth.json"]
+
+# Read-only, for that vendor's own calls only.
+[sandbox.settings]
+claude = []
+codex = ["~/.codex/config.toml"]   # the owner's default model; the engine disables its MCP servers by name

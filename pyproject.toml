@@ -1,0 +1,34 @@
+# One uv project for the whole repository (docs/design/system-design.md, "Repository layout"): today the
+# factory's tooling, later the CDK app, its constructs and their tests. It is not a package and
+# nothing installs it. The runtime dependencies (aws-cdk-lib and friends) arrive with the first
+# backlog issue.
+[project]
+name = "research-harness-inference"
+version = "0"
+description = "A scale-to-zero inference endpoint on AWS, written with Python CDK and built by a software factory"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []
+
+# Exact pins, shared with the vendored implement loop (tools/implementation-loop/UPSTREAM.md) so
+# its tests and lint pass unchanged. Three of them are named in other files as well, and move
+# only together with those:
+#   ruff           required-version in ruff.toml
+#   pytest, xdist  the engine tests command in scripts/check.sh, and the engine's own pytest pin
+# ty is beta and changes diagnostics between releases: a bump is its own pull request.
+[dependency-groups]
+dev = [
+    "pytest==8.3.5",
+    "pytest-xdist==3.8.0",
+    "ruff==0.17.3",
+    "ty==0.0.95",
+]
+
+[tool.uv]
+package = false
+
+# `uv run pytest` runs these. The implement loop's tests have their own command and their own
+# Python (scripts/check.sh engine-tests), so they are not listed here.
+[tool.pytest.ini_options]
+testpaths = ["tools/hygiene/tests", "tools/backlog/tests", "tests"]

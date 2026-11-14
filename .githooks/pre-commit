@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# 1. Block direct commits to protected branches: every change reaches main through a pull request.
+#    The one exception is the first commit of a new repository, which has nowhere else to go.
+# 2. Scan what is being committed with the public-repository hygiene scanner (tools/hygiene/).
+#
+# Inert until core.hooksPath points here: run setup/git-hooks.sh once per clone.
+set -euo pipefail
+
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")"
+
+case "$branch" in
+  main|master)
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+      cat >&2 <<EOF
+[pre-commit] Direct commits to '$branch' are not allowed.
+
+Create a feature branch first:
+  git checkout -b <type>/<short-description>
+
+Then commit, and run /ship (Claude Code) or \$ship (Codex), or open a pull request, to merge.
+EOF
+      exit 1
+    fi
+    ;;
+esac
+
+# The scanner that travels with these hooks, wherever the commit happens (a linked worktree, or
+# a clone that only points core.hooksPath here). A missing scanner blocks the commit.
+scanner="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tools/hygiene/scan.py"
+if [ ! -f "$scanner" ]; then
+  echo "[pre-commit] The hygiene scanner is missing ($scanner): refusing to commit unscanned changes." >&2
+  exit 1
+fi
+if ! python3 "$scanner" --quiet --staged >&2; then
+  cat >&2 <<EOF
+
+[pre-commit] The staged change would put account-specific or secret material in a public
+repository (or the scanner could not run). Remove it, or, for a value that is public on purpose,
+add 'hygiene: allow <rule> (<reason>)' on its line. See tools/hygiene/README.md.
+EOF
+  exit 1
+fi

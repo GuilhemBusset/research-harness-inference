@@ -1,0 +1,290 @@
+"""Run state: a directory under the git common dir, outside every worktree.
+
+`state.json` is rewritten atomically after each transition; `events.jsonl` is append-only.
+A run is keyed by its root issue, so re-running `implement <n>` resumes it. A `STOP` file in
+the run directory asks the engine to stop at the next safe point.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import socket
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any, Self
+
+from .model import IssueState
+
+STATE_VERSION = 1
+
+
+class LockHeld(RuntimeError):
+    pass
+
+
+def git_common_dir(repo_root: Path) -> Path:
+    out = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=repo_root,
+                         capture_output=True, text=True, check=True).stdout.strip()
+    path = Path(out)
+    return path if path.is_absolute() else (repo_root / path).resolve()
+
+
+def runs_root(repo_root: Path) -> Path:
+    return git_common_dir(repo_root) / "implementation-loop"
+
+
+class RunStore:
+    def __init__(self, run_dir: Path):
+        self.dir = run_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._seq = 0
+        path = self.dir / "state.json"
+        self.state: dict[str, Any]
+        if path.exists():
+            self.state = json.loads(path.read_text())
+            events = self.dir / "events.jsonl"
+            if events.exists():
+                with events.open() as f:
+                    self._seq = sum(1 for _ in f)
+        else:
+            self.state = {"version": STATE_VERSION, "issues": {}, "context": None, "meta": {}}
+
+    @classmethod
+    def for_root(cls, repo_root: Path, root: int, fresh: bool = False) -> RunStore:
+        run_dir = runs_root(repo_root) / f"issue-{root}"
+        if fresh and run_dir.exists():
+            run_dir.rename(run_dir.with_name(f"issue-{root}.archived-{int(time.time())}"))
+        store = cls(run_dir)
+        store.state["meta"].setdefault("root", root)
+        return store
+
+    # persistence -------------------------------------------------------------
+    def save(self) -> None:
+        with self._lock:
+            tmp = self.dir / "state.json.tmp"
+            tmp.write_text(json.dumps(self.state, indent=1, sort_keys=True))
+            os.replace(tmp, self.dir / "state.json")
+
+    def event(self, kind: str, **data) -> None:
+        with self._lock:
+            self._seq += 1
+            record = {"seq": self._seq, "ts": round(time.time(), 3), "kind": kind, **data}
+            with (self.dir / "events.jsonl").open("a") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def events(self) -> list[dict]:
+        path = self.dir / "events.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    # issue state -------------------------------------------------------------
+    def issue(self, n: int) -> IssueState:
+        with self._lock:
+            raw = self.state["issues"].get(str(n))
+            return IssueState.from_dict(raw) if raw else IssueState(number=n)
+
+    def put(self, st: IssueState) -> None:
+        with self._lock:
+            self.state["issues"][str(st.number)] = st.to_dict()
+            self.save()
+
+    def put_section(self, section: str, key: str, value) -> None:
+        """Run-level records kept across invocations, such as the checks later merges re-run."""
+        with self._lock:
+            self.state.setdefault(section, {})[key] = value
+            self.save()
+
+    def budget(self, n: int) -> dict:
+        """An issue's spending, kept apart from its state so that no stale copy of the state can
+        overwrite a charge (ADR 0012): answered calls, failed attempts (timeouts and crashes), a
+        bonus a revival or retry granted, and attempts started but never reported (a killed run)."""
+        with self._lock:
+            b = self.state.setdefault("budgets", {}).get(str(n))
+            if b is None:
+                raw = self.state["issues"].get(str(n)) or {}
+                b = {"calls": raw.get("calls", 0), "infra": raw.get("infra", 0),
+                     "bonus": raw.get("ceiling_bonus", 0), "pending": 0}
+            return dict(b)
+
+    def change_budget(self, n: int, **delta) -> dict:
+        """Atomically add each `delta` to the issue's budget (`set_<field>` sets it instead)."""
+        with self._lock:
+            b = self.budget(n)
+            for key, value in delta.items():
+                if key.startswith("set_"):
+                    b[key[4:]] = value
+                else:
+                    b[key] = b.get(key, 0) + value
+            self.state.setdefault("budgets", {})[str(n)] = b
+            self.save()
+            return dict(b)
+
+    def known(self) -> list[int]:
+        return sorted(int(k) for k in self.state["issues"])
+
+    def issue_dir(self, n: int) -> Path:
+        d = self.dir / "issues" / str(n)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # control -----------------------------------------------------------------
+    def stop_requested(self) -> bool:
+        return (self.dir / "STOP").exists()
+
+    def clear_stop(self, older_than: float) -> bool:
+        """Remove a stop request made before `older_than` (left by an earlier run). True if there
+        was one; a newer request is kept."""
+        path = self.dir / "STOP"
+        try:
+            if path.stat().st_mtime >= older_than:
+                return False
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def lock(self) -> RunLock:
+        return RunLock(self.dir / "lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class RunLock:
+    """One engine per run. A lock left by a dead process on this host is taken over."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self) -> Self:
+        me = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.time()}
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(me, f)
+                return self
+            except FileExistsError:
+                try:
+                    holder = json.loads(self.path.read_text())
+                except (OSError, ValueError):
+                    holder = {}
+                if holder.get("host") == me["host"] and not _pid_alive(int(holder.get("pid", 0))):
+                    self.path.unlink(missing_ok=True)
+                    continue
+                raise LockHeld(f"run is locked by pid {holder.get('pid')} on {holder.get('host')}")
+        raise LockHeld("could not acquire the run lock")
+
+    def __exit__(self, *exc) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+class RepoClaims:
+    """Repo-wide claims shared by every run: the merge queue and shared files.
+
+    A claim is a file under `<git common dir>/implementation-loop/claims/`, created atomically.
+    """
+
+    def __init__(self, repo_root: Path):
+        self.dir = runs_root(repo_root) / "claims"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, resource: str) -> Path:
+        return self.dir / (resource.replace("/", "__") + ".claim")
+
+    def acquire(self, resource: str, owner: str) -> bool:
+        path = self._path(resource)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                holder = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return False
+            if holder.get("owner") == owner:
+                return True
+            if holder.get("host") == socket.gethostname() and not _pid_alive(int(holder.get("pid", 0))):
+                path.unlink(missing_ok=True)
+                return self.acquire(resource, owner)
+            return False
+        with os.fdopen(fd, "w") as f:
+            json.dump({"owner": owner, "pid": os.getpid(), "host": socket.gethostname()}, f)
+        return True
+
+    def release(self, resource: str, owner: str) -> None:
+        path = self._path(resource)
+        try:
+            if json.loads(path.read_text()).get("owner") == owner:
+                path.unlink()
+        except (OSError, ValueError):
+            pass
+
+
+class FaultOutbox:
+    """Engine faults waiting to be filed on GitHub, deduplicated repo-wide by fingerprint.
+
+    A local journal (`<git common dir>/implementation-loop/faults.json`) written before any
+    filing is attempted: one issue per distinct fault, a comment when it is seen again, and
+    nothing lost when GitHub is unreachable. Filing never happens inside a failing step."""
+
+    def __init__(self, repo_root: Path):
+        self.path = runs_root(repo_root) / "faults.json"
+        self._lock = threading.Lock()
+
+    class _Transaction:
+        """One read-modify-write, serialized across threads and across runs (an flock)."""
+
+        def __init__(self, outbox: FaultOutbox):
+            self.outbox = outbox
+
+        def __enter__(self) -> dict:
+            self.outbox._lock.acquire()
+            self.fd = os.open(self.outbox.path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            self.data = self.outbox._load()
+            return self.data
+
+        def __exit__(self, exc_type, *rest) -> None:
+            try:
+                if exc_type is None:
+                    tmp = self.outbox.path.with_suffix(f".json.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(self.data, indent=1, sort_keys=True))
+                    os.replace(tmp, self.outbox.path)
+            finally:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                os.close(self.fd)
+                self.outbox._lock.release()
+
+    def _load(self) -> dict:
+        try:
+            return json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def record(self, fingerprint: str, title: str, body: str, issue: int, run: int) -> None:
+        with self._Transaction(self) as data:
+            entry = data.setdefault(fingerprint, {"title": title, "body": body, "count": 0, "reported": 0,
+                                                  "issues": [], "runs": [], "filed": None})
+            entry["count"] += 1
+            entry["issues"].append(issue)
+            entry["runs"].append(run)
+
+    def pending(self) -> list[tuple[str, dict]]:
+        """Faults never filed, or seen again since they were last reported."""
+        return [(fp, e) for fp, e in sorted(self._load().items()) if e["count"] > e["reported"]]
+
+    def mark_reported(self, fingerprint: str, issue_number: int) -> None:
+        with self._Transaction(self) as data:
+            entry = data[fingerprint]
+            entry["filed"], entry["reported"] = issue_number, entry["count"]
