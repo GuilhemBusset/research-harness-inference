@@ -3,9 +3,8 @@
 What a machine needs to work in this repository, and the one-time scripts that switch its gates
 on. Run every command from the repository root.
 
-**Nothing in this directory is to be run before the green light.** The factory is inert by design
-until the owner goes through [`docs/factory/green-light.md`](../docs/factory/green-light.md),
-which calls the two scripts below at the right step. No agent runs them.
+**The owner runs these scripts, at the steps of [`docs/factory/green-light.md`](../docs/factory/green-light.md)
+that call them.** No agent runs them.
 
 ## Prerequisites
 

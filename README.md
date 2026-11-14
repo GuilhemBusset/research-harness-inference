@@ -14,7 +14,7 @@ verified and merged changes come out, and nobody is in the loop during a run.
 
 **Design, factory and backlog in place. Nothing is deployed.**
 
-- The system design is proposed and awaits the owner's review.
+- The system design is accepted ([ADR 0002](docs/adr/0002-accept-the-system-design.md)).
 - The repository is on GitHub, private for now, and its backlog is published as GitHub issues:
   one epic per phase of the design's rollout, each with its issues as sub-issues. The owner turns
   the factory on step by step with [`docs/factory/green-light.md`](docs/factory/green-light.md);
