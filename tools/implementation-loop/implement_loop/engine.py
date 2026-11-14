@@ -190,6 +190,8 @@ WORKFLOWS = ".github/workflows/"
 OWNER_LANDING_MARKER = "<!-- implement-loop:owner-landing:{} -->"
 # The comment that says, on a pull request, that its certified head waits for the owner's review: one per head.
 OWNER_REVIEW_MARKER = "<!-- implement-loop:owner-review:{} -->"
+# The one review decision that ends that wait on an unchanged head: no decision at all does not.
+REVIEW_APPROVED = "APPROVED"
 # Output that means the host cannot run a check, whatever the implementation does.
 ENVIRONMENT_FAILURE = re.compile(
     r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
@@ -487,13 +489,13 @@ class Engine:
 
     def _review_owed(self, st: IssueState, w: dict) -> bool:
         """Whether an issue that waits for the owner's review (`WAIT_OWNER_REVIEW`) still does. It
-        does while its pull request is open at the head the wait is for and the review decision
-        is one that owes a review; and while GitHub cannot be read, which says nothing. Then
-        nothing is run for the issue: no land step, so no verification and no merge queue. It no
-        longer does once the decision is APPROVED (or none is asked for any more): the land step
-        tries the merge of that head again. Nor once the pull request is merged or closed, or has
-        another head: the land step reads that as it always did, and a head that moved is verified
-        again before anything lands."""
+        does while its pull request is open at the head the wait is for and the review decision is
+        not APPROVED: a review owed, no decision at all, or a GitHub that cannot be read, which
+        says nothing. Then nothing is run for the issue: no land step, so no verification and no
+        merge queue. It no longer does once the decision is APPROVED: the land step tries the merge
+        of that head again. Nor once the pull request is merged or closed, or has another head:
+        the land step reads that as it always did, and a head that moved is verified again before
+        anything lands."""
         pr, head = w.get("pr"), w.get("head")
         try:
             pull = (self.gh.find_pr(st.branch) if st.branch else None) or {}
@@ -506,7 +508,7 @@ class Engine:
         except (GitHubError, OSError) as e:
             self.store.event("github_call_failed", call="_review_owed", issue=st.number, error=str(e)[:300])
             return True
-        return decision in REVIEW_OWED
+        return decision != REVIEW_APPROVED
 
     def _maybe_revive(self, st: IssueState) -> None:
         """A failed issue resumes once, with a fresh ceiling, on a new engine version: the loop
@@ -2495,7 +2497,7 @@ class Engine:
         again: the pull request says so, once, and the issue waits (`WAIT_OWNER_REVIEW`) with no
         landing claim, the land step that calls this releasing the merge queue. `_maybe_resume`
         reads the decision again at each run (`_review_owed`) and resumes the land step only
-        once there is something for it to do."""
+        once it is APPROVED, or the pull request is no longer open at this head."""
         self.store.event("owner_review_owed", issue=n, pr=pr, head=head, decision=decision)
         self._say_review_owed(pr, head, decision)
         self._wait(n, WAIT_OWNER_REVIEW, f"pull request #{pr} is certified at `{head[:12]}` with the required check green, "
