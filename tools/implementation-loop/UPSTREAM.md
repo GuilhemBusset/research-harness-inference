@@ -140,6 +140,27 @@ temporary directory: the examination crashed, and the issue waited for a new eng
 Behaviour an upstream reader would not expect: a probe the lint refuses for any reason (a protected
 path, a test that fails unconditionally) is no longer adopted when a blocking finding names it.
 
+### 1.2.1, patched: what the engine publishes is redacted (2026-11-14)
+
+The engine publishes on GitHub: evidence comments with the tail of a command's output, pull request
+bodies, fault issues, follow-up issues, progress comments that quote why an issue waits or failed.
+A command's output can carry an account ID or an ARN that no source file holds. Issue #10 (draft
+E0-04) passes every such text through the hygiene scanner's redaction first, a follow-up that ADR
+0001 lists under its decision 4. The engine's version stays 1.2.1: nothing here repairs a failed
+issue, and the wait this patch uses (`github`) resumes on any run.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/redact.py` | New. `redact(text)` runs `tools/hygiene/scan.py --redact` on the text and returns what the scanner wrote. The scanner is the one of the checkout the module is in, found from the module's own path. It runs with the engine's environment. A scanner that is missing, exits non-zero, cannot be started or does not answer within 60 seconds raises `RedactionError`, whose message holds nothing of the text and nothing the scanner wrote. | The engine runs outside the sandbox, as the owner. The scanner it trusts cannot be the copy in an issue's worktree, which a builder can write, nor one found through the working directory. With the owner's environment the scanner also masks the owner's local values where their list exists. There is no fallback: a text that could not be masked is not returned. |
+| `implement_loop/github.py` | New: `RedactingGitHub`, a client that wraps another one and masks the body of `create_comment`, `update_comment` and `update_pr`, and the title and the body of `create_pr` and `create_issue`, before the inner client is called; every other method is forwarded as it is, `edit_issue` among them. New: `RedactionUnavailable`, a `GitHubUnavailable`, raised when the redaction failed, before anything is sent. `GhCli`, `FakeGitHub` and `RecordingGitHub` are unchanged. | These five calls are every title and body the engine sends. `edit_issue` closes an issue or ticks its boxes; a tick sends back the issue's own text, and the engine never rewrites what the owner wrote. The engine already turns `GitHubUnavailable` into the wait `github`, which the supervisor resumes, so no new kind of wait is needed. |
+| `implement_loop/cli.py` | New: `github_client(slug)`, which returns `RedactingGitHub` around `GhCli`. `cmd_run`, `cmd_plan` and `cmd_record` build their client with it; `GhCli` is constructed nowhere else. | A run, and so every run the supervisor launches (it has no GitHub call of its own), publishes only through the redacting client. |
+| `implement_loop/engine.py` | `_safe`, which journals a failed GitHub call and goes on, raises `RedactionUnavailable` instead of swallowing it. In a step (`_land`, `_accept`) the step ends there and `_finished` makes the issue wait with the kind `github`, in the phase that publishes again. `_sync` catches it, because a phase also changes outside a step: it notes the issue in `_unpublished`, and `_withhold`, called when the issue's step ends and once more at the end of the run, makes the issue wait unless it already waits or has ended. `_accept` publishes the comment about deferred items before the follow-up issue, which is recorded as soon as it is created, and writes the progress comment of the phase the issue ends in before that phase is recorded and before the issue is closed (`_announce`); `_reconcile_delivered` does the same before it closes an issue the owner ticked, and leaves the issue delivered and open when it cannot. `_post_run_summary` journals the failure. The import of `RedactionUnavailable` has the same fallback as that of `GitHubUnavailable`. | Raising `GitHubUnavailable` from the client is not enough: the evidence comment, the follow-up issue, the comment about deferred items and the progress comment are written through `_safe`, so `_accept` would have closed an issue whose follow-up was never filed, and no later call would have made it wait. The issue's deliverables name `github.py` and `cli.py` and not this file; the change was asked for with a `protected_change` request. Three cases keep their state on purpose: an issue that already waits for another reason keeps that reason, a failed issue stays failed (its fault issue stays in the outbox and the next run files it), and the run summary on the root issue belongs to no work item. In all three nothing is published, and the next run that can mask writes the text. |
+
+Behaviour an upstream reader would not expect: what GitHub receives from the engine can differ
+from what the engine rendered, by the scanner's masks (`[redacted <rule>]`) and by line endings
+(the text passes through the scanner's standard input and output, so `\r\n` arrives as `\n`);
+each publication starts one scanner process; `_accept` updates the progress comment twice.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -212,6 +233,14 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_unwritable_probe.py`: `UnwritableProbeTests` (3) | Added: `test_the_file_system_refuses_the_probes_path`, `test_the_lint_refuses_it_instead_of_raising`, `test_an_examination_that_names_one_carries_on`. | The regression of fault a25bef17ec: a probe whose file name is longer than a file system takes. The first shows that the host refuses the path, the second that the lint answers with a reason, the third that an examination whose blocking finding names such a probe rejects it, adopts the probe beside it and still delivers the issue. They take `Engine` from the `engine.py` beside them (`engine_beside_these_tests`), for the reason `judge_by_this_trees_lists` gives above: in an xdist worker under the verifier, `implement_loop` is the running engine's, which is the one with the fault while its repair is built. `loop_pytest.py` is on the safety surface and is not changed here. |
+
+### 1.2.1, patched (2026-11-14)
+
+544 collected tests: the 535 before it, none removed and none changed, and 9 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_redaction.py` (9) | Added. | With this repository's real scanner, and an account number and an ARN put together at run time. `redact` asks the scanner beside the engine and raises when it is missing or fails; the client masks the five calls, sends nothing it could not mask and forwards a tick as written; the client `cmd_run` builds masks what it sends. In real engine runs behind the redacting client: the two values reach the fake GitHub masked in an evidence comment, a pull request body, a fault issue and a follow-up issue; with the scanner removed nothing is published, the issue waits with the kind `github`, and the next run resumes it; a scanner in the issue's worktree that masks nothing is never run; a failure on the evidence comment, the follow-up issue, the comment about deferred items or the last progress comment leaves the issue open and waiting, and the follow-up is filed once; a progress comment that cannot be masked stops the issue when its step ends; an issue the owner ticked stays delivered until its last comment is written. The tests take the engine from the `implement_loop` beside them (`loop_beside_these_tests`), for the reason `judge_by_this_trees_lists` gives above: in an xdist worker under the verifier, `implement_loop` is the running engine's, which has no `redact.py` while this change is built. `loop_pytest.py` is on the safety surface and is not changed here. |
 
 ## Kept as recorded
 
