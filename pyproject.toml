@@ -17,10 +17,13 @@ dependencies = []
 #   ruff           required-version in ruff.toml
 #   pytest, xdist  the engine tests command in scripts/check.sh, and the engine's own pytest pin
 # ty is beta and changes diagnostics between releases: a bump is its own pull request.
+# PyYAML reads CI's workflow file in tests/unit/test_ci_workflow.py: the standard library has no
+# YAML parser.
 [dependency-groups]
 dev = [
     "pytest==8.3.5",
     "pytest-xdist==3.8.0",
+    "pyyaml==6.0.3",
     "ruff==0.17.3",
     "ty==0.0.95",
 ]
@@ -30,5 +33,15 @@ package = false
 
 # `uv run pytest` runs these. The implement loop's tests have their own command and their own
 # Python (scripts/check.sh engine-tests), so they are not listed here.
+#
+# tests/container/ is left out: its tests start a container, and the host of the coding agents
+# has no container runtime (tests/container/README.md). `norecursedirs` keeps a run that names no
+# path, such as scripts/check.sh tests, from entering the folder; a run that names the folder, as
+# scripts/check.sh container-tests does, still collects it. The other entries are pytest's own
+# defaults, which a value here replaces.
 [tool.pytest.ini_options]
 testpaths = ["tools/hygiene/tests", "tools/backlog/tests", "tests"]
+norecursedirs = [
+    "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
+    "tests/container",
+]

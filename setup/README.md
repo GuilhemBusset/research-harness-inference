@@ -15,6 +15,7 @@ that call them.** No agent runs them.
 | The implement loop | The GitHub CLI (`gh`) logged in, the Claude Code and Codex CLIs both logged in, bubblewrap (`bwrap`) | See [`docs/factory/operating.md`](../docs/factory/operating.md); `scripts/implement.sh doctor` checks all of it |
 | `setup/apply-ruleset.sh` | `gh` logged in as a repository admin, `jq` | Once per repository |
 | `cdk synth`, once the CDK app exists | Node.js 22 or 24 with npm | The CDK CLI does not support other Node versions. It is installed from `package-lock.json` into `node_modules/`, never globally |
+| `scripts/check.sh container-tests` | A container runtime that answers `docker info` | Only for the tests under `tests/container/`, which CI runs. `fast` and `all` do not need it |
 
 No AWS credentials are needed for anything in this repository, and none should be reachable from
 the shell an agent runs in. Deployment is CodePipeline's.
@@ -26,7 +27,7 @@ uv sync --locked
 ```
 
 Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock): pytest,
-pytest-xdist, Ruff and ty, at the exact versions in [`pyproject.toml`](../pyproject.toml).
+pytest-xdist, PyYAML, Ruff and ty, at the exact versions in [`pyproject.toml`](../pyproject.toml).
 `scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
 
 ## `git-hooks.sh`: activate the git hooks (every clone, after the green light)
@@ -82,7 +83,7 @@ repositories only: the green-light checklist says how to check that the rule rea
 | Component | Source and destination |
 | --- | --- |
 | `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap, Node.js | Installed by the contributor; nothing in this repository installs or changes a global tool |
-| Python tools (pytest, pytest-xdist, Ruff, ty) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
+| Python tools (pytest, pytest-xdist, Ruff, ty) and PyYAML, the parser of the test that reads CI's workflow | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
 | Git hooks | Checked in under `.githooks/`; `git-hooks.sh` points this clone's `.git/config` at them |
 | GitHub ruleset | `pr-only-main.json`; applied to the `origin` repository only when an admin runs `apply-ruleset.sh` |
