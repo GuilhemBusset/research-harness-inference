@@ -13,8 +13,9 @@ A run never waits for a person and never parks:
 - a failed verification or a blocking finding is one more build round; two rounds that change
   nothing bring a replan on the branch, two more end the issue `failed`;
 - a merge queue another run holds, an outage, a CI check or a deployment with no verdict, a
-  deployment that waits for the owner's approval, or an environment the doctor can repair is a
-  **wait** that resumes by itself (in this run, or under the supervisor);
+  deployment that waits for the owner's approval, a certified change to a workflow file that waits
+  for the owner to push and merge it, or an environment the doctor can repair is a **wait** that
+  resumes by itself (in this run, or under the supervisor);
 - every answered agent call is charged to the issue's ceiling, every timeout or crash to its
   infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
   them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
@@ -112,6 +113,11 @@ except (ImportError, AttributeError):   # pragma: no cover - older config.py and
         timeout_s: int = 3600
         approval_description: str = ""
 
+try:   # the wait for the owner's push and merge arrives with its kind, and with its record, in model.py
+    from .model import WAIT_OWNER_LANDING
+except ImportError:   # pragma: no cover - older model.py: its issue state has no record, so nothing waits
+    WAIT_OWNER_LANDING = "owner_landing"
+
 try:   # the scan with the owner's local values arrives with its commands in config.py
     from .config import LOCAL_VALUES_ENV, local_value_checks, local_values_file
 except ImportError:   # pragma: no cover - older config.py: it names no list and no scan, so none runs
@@ -164,6 +170,15 @@ report.WAIT_HINT.setdefault(WAIT_DEPLOY, ("The deployment gave no verdict yet; t
                                           "nothing else lands before it."))
 report.WAIT_HINT.setdefault(WAIT_OWNER_APPROVAL, ("The deployment waits for the owner's approval in the pipeline; the "
                                                   "supervisor reads its status again."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_LANDING, ("The loop never pushes a change to a workflow file: the owner pushes "
+                                                 "the certified head and merges the pull request the loop then opens; "
+                                                 "the supervisor looks again."))
+# The folder whose files the engine never pushes a change to, whatever identity it runs as (ADR 0001,
+# amendment 2): the factory cannot change its own gates. A branch whose commits change one is landed
+# by the owner (`Engine._owner_lands`), and so is a revert of such a change (`Engine._revert`).
+WORKFLOWS = ".github/workflows/"
+# The comment that hands a certified head to the owner: one per head, found again by its marker.
+OWNER_LANDING_MARKER = "<!-- implement-loop:owner-landing:{} -->"
 # Output that means the host cannot run a check, whatever the implementation does.
 ENVIRONMENT_FAILURE = re.compile(
     r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
@@ -446,7 +461,8 @@ class Engine:
         w = st.wait or {}
         kind = w.get("kind")
         resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite",
-                           WAIT_DEPLOY, WAIT_OWNER_APPROVAL)   # each run reads the merge commit's statuses again
+                           WAIT_DEPLOY, WAIT_OWNER_APPROVAL,   # each run reads the merge commit's statuses again
+                           WAIT_OWNER_LANDING)                 # and the remote branch and its pull request
                   or (kind == WAIT_ENVIRONMENT and (self.env_fingerprint is None or w.get("env") != self.env_fingerprint))
                   or (kind == WAIT_ENGINE and w.get("version") != VERSION))
         if not resume:
@@ -508,6 +524,8 @@ class Engine:
         st.certified_sha = st.verified_sha = None
         st.fail = st.wait = None
         st.deploy = None   # with it goes the record that held the landing claim (`_new_round`, `_drop_stale_holds`)
+        if (self._owner_record(st) or {}).get("revert"):   # as any revert that waited: the edited issue is planned
+            st.owner_landing = None                        # again; the branch's own record stays with the branch
         st.phase = Phase.PENDING
 
     def _context(self) -> None:
@@ -794,6 +812,8 @@ class Engine:
         st.verified_sha = st.examined_sha = st.certified_sha = None
         st.deploy = None   # the next merge has its own deployment and its own verdict
         self._release_hold(n)
+        if self._owner_record(st) is not None:
+            st.owner_landing = None   # it named the branch this round leaves
         st.locked, st.manifest, st.tests, st.probes = {}, {}, [], []
         st.commands = [c for c in st.commands if c.get("author") != "examiner"]   # their probes went with the branch
         st.findings = [f for f in st.findings if f.get("status") == "follow_up"]
@@ -956,8 +976,8 @@ class Engine:
         if call.discarded:
             self.store.event("agent_ref_changes_discarded", issue=n, refs=call.discarded)
 
-    def _delivery(self, st: IssueState, merged_head: str) -> tuple[str, list[str] | None]:
-        reviewed, repo = st.certified_sha, self.ws.repo
+    def _delivery(self, st: IssueState, merged_head: str, reviewed: str | None = None) -> tuple[str, list[str] | None]:
+        reviewed, repo = reviewed or st.certified_sha, self.ws.repo
         if not reviewed or merged_head == reviewed:
             return "same", []
         self.ws.git("fetch", "--quiet", self.ws.remote, merged_head, cwd=repo, check=False)
@@ -2267,7 +2287,6 @@ class Engine:
             # set by startup and build, and only a certified head reaches land
             assert st.worktree is not None and st.branch is not None and st.certified_sha is not None
             wt = Path(st.worktree)
-            issue = self.plan.issues[n]
             if st.certified_sha != st.verified_sha:
                 return self._set_phase(n, Phase.VERIFY)
             existing = self.gh.find_pr(st.branch)
@@ -2297,17 +2316,33 @@ class Engine:
                 # no merge of its own: the commit that carries the change is the head of `main`
                 return self._merged(n, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt) if self.deploy.contexts
                                     else None)
-            # Main may have moved since the certificate. Merging it makes a new head, which is
-            # verified and certified again (a focused delta examination) before it may land.
-            sync = self.ws.update(wt)
-            if sync.status == "conflict":
-                self.ws.abort_in_progress(wt)
-                return self._conflict(n, wt, sync.files, Phase.LAND.value)
-            if sync.status == "merged":
-                self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
-                                 to=self.ws.head(wt), main=sync.main)
-                self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
-                return self._set_phase(n, Phase.VERIFY)
+            record = self._owner_record(st)
+            if record is not None and record.get("revert"):   # of a revert that an edit of the issue abandoned
+                record = st.owner_landing = None
+                self.store.put(st)
+            if record is None:
+                # Main may have moved since the certificate. Merging it makes a new head, which is
+                # verified and certified again (a focused delta examination) before it may land.
+                sync = self.ws.update(wt)
+                if sync.status == "conflict":
+                    self.ws.abort_in_progress(wt)
+                    return self._conflict(n, wt, sync.files, Phase.LAND.value)
+                if sync.status == "merged":
+                    self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
+                                     to=self.ws.head(wt), main=sync.main)
+                    self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
+                    return self._set_phase(n, Phase.VERIFY)
+            else:
+                # A head the owner lands is not brought up to date: however far main moved, nothing is
+                # verified or certified again while that head still merges into it. Only a conflict
+                # is work: the builder's, on main's merge, as in an ordinary round.
+                files = self._conflicts_with_main(wt, existing, st.certified_sha)
+                if files:
+                    record["conflict"] = True   # what the comment of the next certified head says of it
+                    self.store.put(st)
+                    self.store.event("owner_landing_conflict", issue=n, head=st.certified_sha, files=files,
+                                     main=self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt))
+                    return self._conflict(n, wt, files, Phase.LAND.value)
             # The last look before anything leaves the machine: every commit this push would publish.
             # A head that reaches this point was verified with the same checks; this one holds
             # whatever state the run resumed from and whatever moved since. A scan that could not
@@ -2315,21 +2350,32 @@ class Engine:
             # rule, so it cannot go round between here and the verifier for ever.
             unpushed = self.ws.head(wt)
             main = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
-            findings, unscanned = self._history_scan(n, wt, main, unpushed, "push")
-            if findings:
-                return self._history_refused(n, unpushed, findings)
-            if unscanned:
-                self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
-                return self._round_failed(n, unscanned)
-            # And the owner's own look, where the owner's list of local values exists: outside the
-            # sandbox, with the scanner of the engine's checkout. A finding abandons the branch as
-            # a finding in its history does; a scan that could not run withholds the push.
-            local = self._local_scan(wt, main, unpushed)
-            if local and local[0]:
-                return self._history_refused(n, unpushed, [], places=local[0])
-            if local and local[1]:
-                self.store.event("push_withheld", issue=n, head=unpushed, problems=local[1])
-                return self._round_failed(n, local[1])
+            local = None
+            if record is None or record.get("head") != unpushed:   # a head the owner was given was scanned then
+                findings, unscanned = self._history_scan(n, wt, main, unpushed, "push")
+                if findings:
+                    return self._history_refused(n, unpushed, findings)
+                if unscanned:
+                    self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
+                    return self._round_failed(n, unscanned)
+                # And the owner's own look, where the owner's list of local values exists: outside the
+                # sandbox, with the scanner of the engine's checkout. A finding abandons the branch as
+                # a finding in its history does; a scan that could not run withholds the push.
+                local = self._local_scan(wt, main, unpushed)
+                if local and local[0]:
+                    return self._history_refused(n, unpushed, [], places=local[0])
+                if local and local[1]:
+                    self.store.event("push_withheld", issue=n, head=unpushed, problems=local[1])
+                    return self._round_failed(n, local[1])
+            # Before any push: do the commits it would publish change a workflow file? The engine
+            # never pushes such a change, whatever identity it runs as (ADR 0001, amendment 2). The
+            # branch is the owner's to push, and stays so once it was handed over.
+            workflows = self._workflow_paths(wt, main, unpushed)
+            if record is not None or workflows:
+                if unpushed != st.certified_sha:
+                    self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=unpushed)
+                    return self._set_phase(n, Phase.VERIFY)
+                return self._owner_lands(n, unpushed, workflows)
             try:
                 pushed = self._push(wt, unpushed if local is not None else None)
             except MergeConflict as e:
@@ -2342,15 +2388,8 @@ class Engine:
             if head != st.certified_sha:
                 self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=head)
                 return self._set_phase(n, Phase.VERIFY)
-            body = report.render_pr_body(n, issue.title, st, self.op, self.other)
-            pr = self.gh.find_pr(st.branch)
-            if pr is None or pr.get("state") != "open":
-                pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
-            else:
-                self.gh.update_pr(pr["number"], body)
-            st.pr = pr["number"]
-            self.store.put(st)
-            self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+            self._open_pull(n, st, head)
+            assert st.pr is not None   # recorded by `_open_pull`
             conclusion, run_id = self._wait_required(head)
             if conclusion != "success" and head not in st.ci_rerun_heads:
                 st.ci_rerun_heads.append(head)
@@ -2381,6 +2420,144 @@ class Engine:
         finally:
             self.claims.release(MERGE_QUEUE, self.owner)
 
+    def _open_pull(self, n: int, st: IssueState, head: str) -> dict:
+        """Open the pull request of the issue's branch, or update the open one, and write its
+        evidence comment for `head`: the same for a branch the engine pushed and for one the owner
+        pushed (`_owner_lands`)."""
+        assert st.branch is not None
+        issue = self.plan.issues[n]
+        body = report.render_pr_body(n, issue.title, st, self.op, self.other)
+        pr = self.gh.find_pr(st.branch)
+        if pr is None or pr.get("state") != "open":
+            pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
+        else:
+            self.gh.update_pr(pr["number"], body)
+        st.pr = pr["number"]
+        self.store.put(st)
+        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+        return pr
+
+    # ------------------------------------------------------------------ landed by the owner
+    @staticmethod
+    def _owner_record(st: IssueState) -> dict | None:
+        """The record of a change the owner lands (`IssueState.owner_landing`), None when the
+        issue has none."""
+        return getattr(st, "owner_landing", None)   # an older model.py has no such field, and no such issue
+
+    def _workflow_paths(self, wt: Path, base: str, head: str) -> list[str]:
+        """The paths under `.github/workflows/` that the commits `base..head` change: what a push
+        of `head` would publish, `base` being the head of main. Every commit is read by itself, so a
+        workflow file changed in one commit and put back in a later one counts: both commits would
+        be published. A merge commit counts for what differs from every parent, so merging a main
+        that changed a workflow file is not a change of this branch; and the whole difference with
+        main counts, so a merge that drops main's change of one is. Renames are not followed: both
+        names are changed paths."""
+        listed = self.ws.git("log", "--format=", "--name-only", "--no-renames", "-c", "-z", f"{base}..{head}",
+                             cwd=wt, strip=False)
+        listed += "\0" + self.ws.git("diff", "--name-only", "--no-renames", "-z", base, head, cwd=wt, strip=False)
+        return sorted({f.strip("\n") for f in listed.split("\0") if f.strip("\n").startswith(WORKFLOWS)})
+
+    def _conflicts_with_main(self, wt: Path, pr: dict | None, head: str | None) -> list[str]:
+        """The files in which the head of `wt` no longer merges into main without a conflict; none
+        while it does. Once the pull request is open at that head, GitHub's own answer is taken
+        where its record carries one (`mergeable`). Before that, and to name the files, the merge
+        is tried in the worktree and always undone: the worktree stays at its head, clean."""
+        main = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
+        if self.ws.is_ancestor(wt, main, "HEAD"):
+            return []
+        if (pr and pr.get("state") == "open" and pr.get("mergeable") is True
+                and (pr.get("head") or {}).get("sha") == head):
+            return []
+        self.ws.git("merge", "--no-commit", "--no-ff", main, cwd=wt, check=False)
+        files = self.ws.conflicted_files(wt)
+        if self.ws.abort_in_progress(wt) != "merge" or self.ws.git("status", "--porcelain", cwd=wt):
+            raise GitError(f"the merge of {self.ws.base_ref()} could not be tried and undone in {wt}")
+        return files
+
+    def _remote_head(self, branch: str) -> str | None:
+        """The head of `branch` on the remote, read from the remote itself; None when it has no such branch."""
+        out = self.ws.git("ls-remote", "--heads", self.ws.remote, f"refs/heads/{branch}")
+        return out.split()[0] if out else None
+
+    def _hand_over(self, n: int, record: dict, text: str) -> None:
+        """Post the comment that gives the owner the head of `record`: one comment per head, on the
+        issue, found again by its marker, so a step that ends between the comment and its record
+        writes no second one. `text` says what the head is; the rest is the same for every head."""
+        branch, head = record["branch"], record["head"]
+        marker = OWNER_LANDING_MARKER.format(head)
+        changed = ", ".join(f"`{f}`" for f in record.get("paths") or []) or f"a file under `{WORKFLOWS}`"
+        body = (f"{marker}\n**implement loop**: {text} Its commits change {changed}, and the loop never pushes a change "
+                f"to a workflow file (ADR 0001, amendment 2). It is yours to land.\n\n"
+                f"| | |\n|---|---|\n| Branch | `{branch}` |\n| Certified head | `{head}` |\n\n"
+                f"Push the branch as it is, from the repository the loop runs in:\n\n"
+                f"```sh\ngit push {self.ws.remote} {head}:refs/heads/{branch}\n```\n\n"
+                f"The loop then opens the pull request, and you merge it: the loop does not merge this one. Do not bring "
+                f"the branch up to date on GitHub (\"Update branch\"): the head that makes is not certified. If `main` "
+                f"moves and no longer merges with this head, the loop says so here.\n")
+        if self._upsert_comment(n, marker, body):
+            record["announced"] = head
+
+    def _owner_lands(self, n: int, head: str, workflows: list[str]) -> None:
+        """The certified head `head` of issue `n` changes a workflow file, so the engine pushes
+        nothing: the owner pushes the branch, the engine opens the pull request, the owner merges
+        it. The branch and the head are recorded and given to the owner in one comment per head,
+        and the issue waits (`WAIT_OWNER_LANDING`), with no landing claim: the land step that
+        calls this releases the merge queue, and no deployment is awaited yet. Each resumed land
+        step comes back here, until it finds the pull request merged (`_step_land`)."""
+        st = self.store.issue(n)
+        assert st.branch is not None
+        record = self._owner_record(st)
+        if record is None or record.get("head") != head:
+            earlier = record or {}
+            record = {"branch": st.branch, "head": head, "paths": workflows or earlier.get("paths") or [],
+                      "announced": None, "published": None, "pr": earlier.get("pr"), "replaces": earlier.get("head"),
+                      "conflict": bool(earlier.get("conflict"))}
+            st.owner_landing = record
+            self.store.put(st)
+            self.store.event("owner_landing", issue=n, branch=st.branch, head=head, paths=record["paths"],
+                             replaces=record["replaces"])
+        if record.get("announced") != head:
+            replaces = str(record.get("replaces") or "")
+            if not replaces:
+                text = f"this change is certified by {self.other}."
+            else:
+                why = ("`main` moved and no longer merged with the head posted before, so the loop merged `main` and "
+                       "the builder resolved the conflict" if record.get("conflict") else
+                       "the branch moved on from the head posted before")
+                text = (f"{why}, and {self.other} certified the new head, which takes the place of "
+                        f"`{replaces[:12]}`. It descends from that one: the push below moves the remote "
+                        f"branch forward, and an open pull request follows it.")
+            self._hand_over(n, record, text)
+            self.store.put(st)
+        detail = self._owner_pull(n, record, lambda: self._open_pull(n, st, head))
+        self.store.put(st)
+        self._wait(n, WAIT_OWNER_LANDING, detail, resume=Phase.LAND)
+
+    def _owner_pull(self, n: int, record: dict, publish: Callable[[], dict]) -> str:
+        """Where the owner's part of `record` stands, as the detail of the wait. While the remote
+        has no such branch, or has it at another head than the certified one, nothing is opened.
+        With the remote branch at the certified head, `publish` opens the pull request, once for
+        a head; it is never merged from here. A pull request the owner closed is not opened again."""
+        branch, head = record["branch"], record["head"]
+        remote = self._remote_head(branch)
+        if remote is None:
+            return (f"the remote has no branch `{branch}`: the owner pushes the certified head `{head[:12]}` "
+                    f"(the command is in the comment on this issue)")
+        if remote != head:
+            return (f"the remote branch `{branch}` is at `{remote[:12]}`, another head than the certified one, "
+                    f"`{head[:12]}`, which the owner pushes (the command is in the comment on this issue); no pull "
+                    f"request is opened for another head")
+        pr = self.gh.find_pr(branch) or {}
+        if record.get("published") == head and pr.get("number") == record.get("pr") and pr.get("state") != "open":
+            return (f"pull request #{pr.get('number')} of `{branch}` is closed, and was not merged with the certified "
+                    f"head `{head[:12]}`: the owner reopens and merges it")
+        if record.get("published") != head or pr.get("state") != "open":
+            pr = publish()
+            record.update(published=head, pr=pr["number"])
+            self.store.event("owner_landing_pull_request", issue=n, pr=pr["number"], branch=branch, head=head)
+        return (f"pull request #{pr.get('number')} is open with the certified head `{head[:12]}` of `{branch}`: "
+                f"the owner merges it")
+
     # ------------------------------------------------------------------ deploying
     def _merged(self, n: int, sha: str | None, **changes) -> None:
         """The issue's change is on `main` in the commit `sha`: its merge commit, or the head of
@@ -2388,6 +2565,8 @@ class Engine:
         verdict on that commit is awaited before the evidence step (ADR 0001, decision 5), by the
         step that merged: the merge queue is not released in between. With none, the evidence step
         is next, as before."""
+        if self._owner_record(self.store.issue(n)) is not None:
+            changes["owner_landing"] = None   # the owner landed it: from here it is an issue like any other
         if not self.deploy.contexts:
             return self._set_phase(n, Phase.MERGED, deploy=None, **changes)
         sha = sha or (self._safe(self.gh.find_pr, self.store.issue(n).branch) or {}).get("merge_commit_sha")
@@ -2577,6 +2756,8 @@ class Engine:
 
     # ------------------------------------------------------------------ accept
     def _step_accept(self, n: int) -> None:
+        if (self._owner_record(self.store.issue(n)) or {}).get("revert"):
+            return self._owner_revert(n)   # main is still broken: no evidence step before its revert is merged
         if self._verdict_owed(self.store.issue(n)):
             # Never the evidence step with a deployment verdict owed, whatever brought the issue
             # here (a run killed right after the merge, a revert that waited for the queue).
@@ -2830,13 +3011,21 @@ class Engine:
             if local and (local[0] or local[1]):
                 return self._fail(n, "main_broken", "the revert fails the scan with the owner's local values, so it is not "
                                                     "pushed: " + "; ".join(local[0] or local[1])[:500])
+            # Before any push, as in the land step: a revert of a change to a workflow file changes
+            # that file again, and the engine pushes no such commit, whatever identity it runs as.
+            # The certified revert is the owner's to push and to merge (`_owner_revert`).
+            workflows = self._workflow_paths(wt, main_sha, head)
+            if workflows:
+                st = self.store.issue(n)
+                st.owner_landing = {"branch": branch, "head": head, "paths": workflows, "announced": None,
+                                    "published": None, "revert": True, "of": [pr["number"] for pr in merged],
+                                    "feedback": [f[:1500] for f in feedback]}
+                self.store.put(st)
+                self.store.event("owner_landing", issue=n, branch=branch, head=head, paths=workflows, revert=True)
+                return self._owner_revert(n, made=True)
             if not self._push(wt, head if local is not None else None) or self.ws.head(wt) != head:
                 return self._fail(n, "main_broken", "main moved while the revert was being certified")
-            prs = ", ".join(f"#{pr['number']}" for pr in merged)
-            body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
-                    f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
-                    f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
-            rpr = self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
+            rpr = self._revert_pull(n, branch, [pr["number"] for pr in merged], feedback)
             conclusion, _ = self._wait_required(head)
             if conclusion != "success":
                 return self._fail(n, "main_broken", f"the revert PR #{rpr['number']} did not pass the required check "
@@ -2847,15 +3036,79 @@ class Engine:
             if wt is not None:
                 self.ws.remove(wt)
             self.claims.release(MERGE_QUEUE, self.owner)
+        self._reverted(n, rpr["number"], feedback)
+
+    def _revert_pull(self, n: int, branch: str, of: list[int], feedback: list[str]) -> dict:
+        """Open the pull request of a revert of the pull requests `of`, from `branch`."""
+        prs = ", ".join(f"#{number}" for number in of)
+        body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
+                f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
+                f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
+        return self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
+
+    def _reverted(self, n: int, pr: int, feedback: list[str]) -> None:
+        """The revert is merged: the issue is delivered again in a new round, unless it was reverted
+        once too often."""
         st = self.store.issue(n)
         if st.reverts > self.caps.reverts:
-            return self._fail(n, "main_broken", f"its delivery broke main again and was reverted in PR #{rpr['number']}: "
+            return self._fail(n, "main_broken", f"its delivery broke main again and was reverted in PR #{pr}: "
                                                 + "; ".join(feedback)[:500])
-        self._new_round(st, feedback + [(f"Your earlier delivery was reverted in PR #{rpr['number']} because it broke "
+        self._new_round(st, feedback + [(f"Your earlier delivery was reverted in PR #{pr} because it broke "
                                          f"main; deliver it again without breaking it.")], owner_edit=False)
         st.phase = Phase.PLANNED if st.plan else Phase.PENDING
         self.store.put(st)
         self._sync(n)
+
+    def _owner_revert(self, n: int, made: bool = False) -> None:
+        """A certified revert that changes a workflow file is landed by the owner, like the change
+        it undoes: the engine pushes nothing and merges nothing. `made`: the revert was made and
+        certified by the calling step, which holds the merge queue and releases it; this posts the
+        comment that names the revert's branch and head, with the command that pushes it. Each
+        resumed step (`_step_accept`) then looks again. The remote branch at the certified head:
+        the pull request is opened, once. That pull request merged with that head, or with one
+        that descends from it: the issue starts its next round, as after any revert. The revert
+        no longer merges into a main that moved: the issue ends `failed` (`main_broken`), as when
+        main moves while a revert is being certified. Otherwise it keeps waiting
+        (`WAIT_OWNER_LANDING`), and no landing claim is held."""
+        st = self.store.issue(n)
+        record = self._owner_record(st)
+        assert record is not None
+        branch, head, of = record["branch"], record["head"], list(record.get("of") or [])
+        feedback = list(record.get("feedback") or [])
+        pr = None if made else self.gh.find_pr(branch)
+        if pr and (pr.get("merged") or pr.get("merged_at")):
+            merged_head = (pr.get("head") or {}).get("sha") or head
+            if self._delivery(st, merged_head, reviewed=head)[0] != "stale":
+                self.store.event("reverted", issue=n, pr=pr["number"], of=of, head=merged_head, by="owner")
+                st.owner_landing = None
+                self.store.put(st)
+                return self._reverted(n, pr["number"], feedback)
+        if not made:
+            self.ws.fetch()
+            if not self.ws.is_ancestor(self.ws.repo, self.ws.base_ref(), head):
+                wt = self.ws.issue_worktree(n, branch)   # the revert's branch: the issue's own worktree is gone
+                try:
+                    moved = self.ws.head(wt) != head
+                    files = [] if moved else self._conflicts_with_main(wt, pr, head)
+                finally:
+                    self.ws.remove(wt)
+                if moved or files:
+                    st.owner_landing = None
+                    self.store.put(st)
+                    why = (f"the branch `{branch}` is no longer at the certified revert `{head[:12]}`" if moved else
+                           f"main moved, and the certified revert `{head[:12]}` on `{branch}` no longer merges into it "
+                           f"without a conflict ({', '.join(files)[:300]})")
+                    return self._fail(n, "main_broken", (
+                        f"{why}; it was the owner's to land, because it changes a workflow file, and the loop pushed "
+                        f"nothing of it: " + "; ".join(feedback)[:400]))
+        if record.get("announced") != head:
+            self._hand_over(n, record, (
+                f"`main` fails after the merge of {', '.join(f'#{number}' for number in of)}, and one fix-forward did "
+                f"not repair it, so the loop made a revert, and {self.other} certified it."))
+            self.store.put(st)
+        detail = self._owner_pull(n, record, lambda: self._revert_pull(n, branch, of, feedback))
+        self.store.put(st)
+        self._wait(n, WAIT_OWNER_LANDING, f"a revert: {detail}", resume=Phase.MERGED)
 
     def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
         """Re-run the commands of the run's earlier issues on `main` after a merge."""
