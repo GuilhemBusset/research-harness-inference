@@ -1,7 +1,9 @@
 """The per-issue state machine and the scheduling loop (ADR 0012).
 
 Each issue moves through: pending -> plan -> planned -> build -> verify -> examine -> land ->
-merged -> delivered | done. Two vendors hold two keys: the **builder** (the operator's vendor)
+merged -> delivered | done, with `deploying` between the merge and the evidence step while the
+pipeline's verdict on the merge commit is awaited (`loop.toml [deploy]`). Two vendors hold two
+keys: the **builder** (the operator's vendor)
 plans, writes the code, its tests and the commands that prove each item; the **examiner** (the
 other vendor) triages the plan, examines and probes the exact head, approves or refuses the
 builder's typed requests, and certifies the head that may land. The engine owns git, the
@@ -10,8 +12,10 @@ trusted verifier, the gates and every merge, and derives its bookkeeping from wh
 A run never waits for a person and never parks:
 - a failed verification or a blocking finding is one more build round; two rounds that change
   nothing bring a replan on the branch, two more end the issue `failed`;
-- a merge queue another run holds, an outage, a CI check with no verdict or an environment the
-  doctor can repair is a **wait** that resumes by itself (in this run, or under the supervisor);
+- a merge queue another run holds, an outage, a CI check or a deployment with no verdict, a
+  deployment that waits for the owner's approval, a certified change to a workflow file that waits
+  for the owner to push and merge it, or an environment the doctor can repair is a **wait** that
+  resumes by itself (in this run, or under the supervisor);
 - every answered agent call is charged to the issue's ceiling, every timeout or crash to its
   infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
   them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
@@ -20,24 +24,31 @@ A run never waits for a person and never parks:
 
 Steps run on a thread pool, so one issue can be examined while another builds and a third
 plans. Landing is serialized through a repo-wide merge-queue claim, issues through per-issue
-claims, so two runs never land at once or work the same issue.
+claims, so two runs never land at once or work the same issue. The claim is kept from a merge
+until its deployment verdict, so one merge maps to one deployment and one verdict; where the
+verdict outlasts the run, a record of the awaited commit keeps every run from landing.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import io
 import json
 import os
 import posixpath
 import re
+import subprocess
 import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, replace
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from . import VERSION, gate, graph, issue_parser, report, sandbox, scheduler, verify
 from .agents import AgentFailure, Agents, AgentStopped, CeilingReached, IssueRequest
@@ -68,19 +79,68 @@ from .model import (
     WAIT_RUN_CEILING,
     WRITING_PHASES,
     CheckSpec,
+    Evidence,
     Finding,
     Issue,
     IssueState,
     Phase,
 )
-from .state import FaultOutbox, RepoClaims, RunStore
+from .state import FaultOutbox, RepoClaims, RunStore, runs_root
 from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
+
+try:   # BranchHeld arrives with the workspace that adds a deleted worktree again
+    from .workspace import BranchHeld
+except ImportError:   # pragma: no cover - older workspace.py, which never raises it
+    class BranchHeld(GitError):
+        pass
 
 try:   # GitHubUnavailable arrives with the retrying GitHub client
     from .github import GitHubUnavailable
 except ImportError:   # pragma: no cover - older github.py
     class GitHubUnavailable(GitHubError):
         pass
+
+try:   # RedactionUnavailable arrives with the redacting GitHub client
+    from .github import RedactionUnavailable
+except ImportError:   # pragma: no cover - older github.py, whose client never raises it
+    class RedactionUnavailable(GitHubError):
+        pass
+
+try:   # the deployment verdict arrives with `[deploy]` in config.py, and with the phase and its two waits in model.py
+    from .config import Deploy
+    from .model import WAIT_DEPLOY, WAIT_OWNER_APPROVAL
+    DEPLOYING = Phase.DEPLOYING
+except (ImportError, AttributeError):   # pragma: no cover - older config.py and model.py: no context is configured,
+    # so nothing waits, and no issue is ever in the phase, which then equals none
+    WAIT_DEPLOY, WAIT_OWNER_APPROVAL, DEPLOYING = "deploy", "owner_approval", cast(Phase, None)
+
+    @dataclass(frozen=True)
+    class Deploy:
+        contexts: tuple[str, ...] = ()
+        timeout_s: int = 3600
+        approval_description: str = ""
+
+try:   # the wait for the owner's push and merge arrives with its kind, and with its record, in model.py
+    from .model import WAIT_OWNER_LANDING
+except ImportError:   # pragma: no cover - older model.py: its issue state has no record, so nothing waits
+    WAIT_OWNER_LANDING = "owner_landing"
+
+try:   # the wait for the owner's review arrives with its kind in model.py, and with the decisions that owe one in github.py
+    from .github import REVIEW_OWED
+    from .model import WAIT_OWNER_REVIEW
+except ImportError:   # pragma: no cover - older github.py and model.py: their client reads no review decision, so nothing waits
+    REVIEW_OWED, WAIT_OWNER_REVIEW = ("REVIEW_REQUIRED", "CHANGES_REQUESTED"), "owner_review"
+
+try:   # the scan with the owner's local values arrives with its commands in config.py
+    from .config import LOCAL_VALUES_ENV, local_value_checks, local_values_file
+except ImportError:   # pragma: no cover - older config.py: it names no list and no scan, so none runs
+    LOCAL_VALUES_ENV = "HYGIENE_LOCAL_VALUES"
+
+    def local_values_file(env: Mapping[str, str]) -> Path | None:
+        return None
+
+    def local_value_checks(base: str, head: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return ()
 
 LABELS = {
     "loop:plan": ("C5DEF5", "implement loop: planning"),
@@ -99,8 +159,8 @@ ENGINE_BUG_LABEL = ("loop:engine-bug", "5319E7", "implement loop: a fault in the
 PHASE_LABEL = {
     Phase.PLAN: "loop:plan", Phase.PLANNED: "loop:plan",
     Phase.BUILD: "loop:building", Phase.VERIFY: "loop:building", Phase.EXAMINE: "loop:examine",
-    Phase.LAND: "loop:landing", Phase.MERGED: "loop:merged", Phase.DELIVERED: "loop:delivered",
-    Phase.WAITING: "loop:waiting", Phase.FAILED: "loop:failed",
+    Phase.LAND: "loop:landing", Phase.MERGED: "loop:merged", DEPLOYING: "loop:merged",
+    Phase.DELIVERED: "loop:delivered", Phase.WAITING: "loop:waiting", Phase.FAILED: "loop:failed",
 }
 EXPLORE_QUESTIONS = (
     "The issue graph and acceptance criteria: what must be true when this run is done?",
@@ -109,13 +169,72 @@ EXPLORE_QUESTIONS = (
     "External references the issues cite: what do they establish that the work depends on?",
 )
 MERGE_QUEUE = "merge-queue"
+# Deployment verdicts still awaited, one file per issue, under the runs' root. The merge-queue claim
+# belongs to a process: the run frees it when it ends, and a claim whose process died is taken
+# over. A verdict can outlast the run that merged (`WAIT_DEPLOY`), so what keeps the landing claim
+# held until then is this record, which no process owns: while one exists, no run lands.
+DEPLOY_HOLDS = "deploying"
+DEPLOY_FAILED = ("failure", "error")   # the final states of a commit status, with "success"
+# The words of the phase and of its two waits, where `report.py` looks them up for the progress
+# comment and the run summary. They are added from here because issue #12 names this file and
+# `model.py` for the phase, and not `report.py`.
+report.PHASE_TEXT.setdefault(DEPLOYING, "merged, waiting for the deployment verdict")
+report.WAIT_HINT.setdefault(WAIT_DEPLOY, ("The deployment gave no verdict yet; the supervisor reads it again, and "
+                                          "nothing else lands before it."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_APPROVAL, ("The deployment waits for the owner's approval in the pipeline; the "
+                                                  "supervisor reads its status again."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_LANDING, ("The loop never pushes a change to a workflow file: the owner pushes "
+                                                 "the certified head and merges the pull request the loop then opens; "
+                                                 "the supervisor looks again."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_REVIEW, ("GitHub merges this pull request only with the owner's approving "
+                                                "review; the supervisor reads the review decision again, and the "
+                                                "loop merges the certified head once it is approved."))
+# The folder whose files the engine never pushes a change to, whatever identity it runs as (ADR 0001,
+# amendment 2): the factory cannot change its own gates. A branch whose commits change one is landed
+# by the owner (`Engine._owner_lands`), and so is a revert of such a change (`Engine._revert`).
+WORKFLOWS = ".github/workflows/"
+# The comment that hands a certified head to the owner: one per head, found again by its marker.
+OWNER_LANDING_MARKER = "<!-- implement-loop:owner-landing:{} -->"
+# The comment that says, on a pull request, that its certified head waits for the owner's review: one per head.
+OWNER_REVIEW_MARKER = "<!-- implement-loop:owner-review:{} -->"
+# The one review decision that ends that wait on an unchanged head: no decision at all does not.
+REVIEW_APPROVED = "APPROVED"
 # Output that means the host cannot run a check, whatever the implementation does.
 ENVIRONMENT_FAILURE = re.compile(
     r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
     r"|No module named pytest|\b(uv|node|npx|npm|python3): (command )?not found", re.IGNORECASE)
 CI_NO_VERDICT = (None, "missing", "pending", "stale", "cancelled", "startup_failure")
 CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
+# A test that starts a container, as a ledger item names it: a Python file under the repository's
+# `tests/container/` (ADR 0001, amendment 5), written from the repository's root, with or without a
+# leading `./`. The folder alone names no test, and neither does the same folder under another one.
+CONTAINER_TEST = re.compile(r"(?<![\w./-])(?:\./)?tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
+CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item a CI job's check run proved
+# A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
+# check run's own page is `runs/<id>` under the same repository page.
+PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+
+
+class CommittedFile(Path):
+    """A file as a commit holds it, for `verify.digest`: its name, and its bytes from memory. It
+    reads as the same bytes in a file would, and is never on disk."""
+
+    _data = b""
+
+    @classmethod
+    def holding(cls, name: str, data: bytes) -> CommittedFile:
+        file = cls(name)
+        file._data = data
+        return file
+
+    def read_bytes(self) -> bytes:
+        return self._data
+
+    def read_text(self, encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> str:
+        with io.TextIOWrapper(io.BytesIO(self._data), encoding=io.text_encoding(encoding), errors=errors,
+                              newline=newline) as text:   # what `open()` in text mode does to these bytes
+            return text.read()
 
 
 class Engine:
@@ -135,15 +254,21 @@ class Engine:
         self.check_env: dict[str, str] = dict(environment.get("check_env") or {})
         policy = policy or {}
         self.lacks: list[str] = sorted(policy.get("lacks", []))
+        self.ci_jobs: dict[str, str] = dict(policy.get("ci_jobs") or {})   # capability -> the CI job that provides it
         self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
         self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
         self.repair = bool(policy.get("repair", False))
         self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
         self._meter_lock = threading.Lock()
+        self._push_lock = threading.Lock()     # one push at a time in this run; across runs, `_hooks_held`
         self._polling: dict[int, float] = {}
+        self.deploy: Deploy = policy.get("deploy") or Deploy()
+        self._holds_dir = runs_root(repo_root) / DEPLOY_HOLDS
+        self._landers: set[int] = set()   # issues whose land or deploying step runs: one at a time
         self.invoked_at = invoked_at if invoked_at is not None else time.time()
         self.run_calls = 0
         self._charged: set[int] = set()   # issues whose last failed attempt the meter already charged
+        self._unpublished: dict[int, str] = {}   # issues whose progress comment the hygiene scanner could not mask
         agents.meter = self
 
     # ------------------------------------------------------------------ public
@@ -167,6 +292,8 @@ class Engine:
             finally:
                 self._release_claims()
             self._reconcile_delivered()
+            for n in list(self._unpublished):   # a phase that changed outside a step
+                self._withhold(n)
             self._flush_faults()
             summary = self._summary(stopped)
             self._post_run_summary()
@@ -265,8 +392,9 @@ class Engine:
             st = self.store.issue(n)
             if st.worktree and (Path(st.worktree) / ".git").exists():
                 self._recover_worktree(n, Path(st.worktree))
+            restored = self._restore_ended(st)
             if st.body_hash and st.body_hash != spec.body_hash:
-                if st.phase in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
+                if st.phase in (Phase.MERGED, DEPLOYING, Phase.DELIVERED, Phase.DONE):
                     self._new_round(st, ["the issue was edited after its work was merged; deliver the edited version"],
                                     owner_edit=True)
                 else:
@@ -287,6 +415,22 @@ class Engine:
                 self._restore_deps(n, st)
             self._declare(n, st)
             self.store.put(st)
+            if restored and st.phase in (Phase.DELIVERED, Phase.FAILED):
+                self._sync(n)   # its labels and its comment said `waiting`; `_withhold` if they still must
+        self._drop_stale_holds()
+
+    def _restore_ended(self, st: IssueState) -> bool:
+        """An issue that had ended (`delivered`, `failed`) and waits only because the hygiene scanner
+        could not mask something of it (its progress comment, its fault issue, the comment that the
+        owner completed it) is what it was again, with all it recorded (`fail`, its obligations),
+        before it is reconciled: an edit starts a new round, a new engine version revives it. What
+        was not published is published by this run, or the issue waits again at the run's end."""
+        w = st.wait or {}
+        if (st.phase != Phase.WAITING or w.get("kind") != WAIT_GITHUB
+                or w.get("resume") not in (Phase.DELIVERED.value, Phase.FAILED.value)):
+            return False
+        self._maybe_resume(st)
+        return True
 
     def _declare(self, n: int, st: IssueState) -> None:
         """What the scheduler sees an issue own: its zones, approved paths and tests."""
@@ -357,7 +501,10 @@ class Engine:
         only once an outage is over and runs the doctor (which repairs the environment) first."""
         w = st.wait or {}
         kind = w.get("kind")
-        resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite")
+        resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite",
+                           WAIT_DEPLOY, WAIT_OWNER_APPROVAL,   # each run reads the merge commit's statuses again
+                           WAIT_OWNER_LANDING)                 # and the remote branch and its pull request
+                  or (kind == WAIT_OWNER_REVIEW and not self._review_owed(st, w))
                   or (kind == WAIT_ENVIRONMENT and (self.env_fingerprint is None or w.get("env") != self.env_fingerprint))
                   or (kind == WAIT_ENGINE and w.get("version") != VERSION))
         if not resume:
@@ -367,6 +514,29 @@ class Engine:
             st.phase = Phase.PENDING
         st.wait = None
         self.store.event("resumed", issue=st.number, wait=kind, phase=st.phase.value)
+
+    def _review_owed(self, st: IssueState, w: dict) -> bool:
+        """Whether an issue that waits for the owner's review (`WAIT_OWNER_REVIEW`) still does. It
+        does while its pull request is open at the head the wait is for and the review decision is
+        not APPROVED: a review owed, no decision at all, or a GitHub that cannot be read, which
+        says nothing. Then nothing is run for the issue: no land step, so no verification and no
+        merge queue. It no longer does once the decision is APPROVED: the land step tries the merge
+        of that head again. Nor once the pull request is merged or closed, or has another head:
+        the land step reads that as it always did, and a head that moved is verified again before
+        anything lands."""
+        pr, head = w.get("pr"), w.get("head")
+        try:
+            pull = (self.gh.find_pr(st.branch) if st.branch else None) or {}
+            if (pull.get("number") != pr or pull.get("state") != "open" or not head or head != st.certified_sha
+                    or (pull.get("head") or {}).get("sha", head) != head):
+                return False
+            decision = self._review_decision(pull["number"])
+            if decision in REVIEW_OWED:
+                self._say_review_owed(pull["number"], head, decision)   # where GitHub did not take the comment before
+        except (GitHubError, OSError) as e:
+            self.store.event("github_call_failed", call="_review_owed", issue=st.number, error=str(e)[:300])
+            return True
+        return decision != REVIEW_APPROVED
 
     def _maybe_revive(self, st: IssueState) -> None:
         """A failed issue resumes once, with a fresh ceiling, on a new engine version: the loop
@@ -418,6 +588,9 @@ class Engine:
         st.signature = ""
         st.certified_sha = st.verified_sha = None
         st.fail = st.wait = None
+        st.deploy = None   # with it goes the record that held the landing claim (`_new_round`, `_drop_stale_holds`)
+        if (self._owner_record(st) or {}).get("revert"):   # as any revert that waited: the edited issue is planned
+            st.owner_landing = None                        # again; the branch's own record stays with the branch
         st.phase = Phase.PENDING
 
     def _context(self) -> None:
@@ -440,6 +613,7 @@ class Engine:
                     if fut.done():
                         del running[n]
                         self._finished(n, fut.exception())
+                        self._withhold(n)
                 if self.store.stop_requested():
                     if not stopped:
                         self.store.event("stop_requested")
@@ -529,10 +703,14 @@ class Engine:
     def _dispatch(self, pool: ThreadPoolExecutor, running: dict[int, Future]) -> None:
         phases = self._phases()
         writers = [n for n, ph in phases.items() if ph in WRITING_PHASES]
-        landing = any(phases[n] == Phase.LAND for n in running)
+        # A land step keeps the merge queue until it ends, which with a deployment to wait for is
+        # after its issue left `land`: the step counts, whatever phase its issue is in by now.
+        self._landers &= set(running)
+        landing = bool(self._landers)
         steps = {Phase.PLAN: self._step_plan, Phase.BUILD: self._step_build, Phase.VERIFY: self._step_verify,
                  Phase.EXAMINE: self._step_examine, Phase.MERGED: self._step_accept}
-        for n in list(self.plan.work):
+        # An issue that waits for its deployment verdict takes the merge queue before any issue lands.
+        for n in sorted(self.plan.work, key=lambda m: phases.get(m) != DEPLOYING):
             if n in running:
                 continue
             ph = phases.get(n, self.store.issue(n).phase)
@@ -554,13 +732,22 @@ class Engine:
                     writers.append(n)
                     self._set_phase(n, Phase.BUILD)
                     running[n] = pool.submit(self._step_build, n)
-            elif ph == Phase.LAND:
-                if not landing and self.claims.acquire(MERGE_QUEUE, self.owner):
+            elif ph in (Phase.LAND, DEPLOYING):
+                if landing:
+                    continue
+                if self._take_queue(n, lands=ph == Phase.LAND):
                     landing = True
+                    self._landers.add(n)
                     self._polling.pop(n, None)
-                    running[n] = pool.submit(self._step_land, n)
-                elif not landing:
-                    self._polling.setdefault(n, time.monotonic())   # another run is landing: poll
+                    running[n] = pool.submit(self._step_land if ph == Phase.LAND else self._step_deploying, n)
+                    continue
+                hold = self._unreleasable_hold(n, phases) if ph == Phase.LAND else None
+                if hold:   # polling would not see it end: the verdict is read again by the next run
+                    self._polling.pop(n, None)
+                    self._wait(n, WAIT_MERGE_QUEUE, f"nothing lands before #{hold.get('issue')} has the deployment "
+                                                    f"verdict of {str(hold.get('sha'))[:12]}", resume=Phase.LAND)
+                else:
+                    self._polling.setdefault(n, time.monotonic())   # another run is landing, or waits for a verdict: poll
             elif ph in steps:
                 running[n] = pool.submit(steps[ph], n)
 
@@ -688,6 +875,10 @@ class Engine:
         st.branch = f"{self.plan.specs[n].branch or f'loop/issue-{n}'}-r{st.round}"
         st.worktree = st.pr = st.head_sha = st.base_sha = None
         st.verified_sha = st.examined_sha = st.certified_sha = None
+        st.deploy = None   # the next merge has its own deployment and its own verdict
+        self._release_hold(n)
+        if self._owner_record(st) is not None:
+            st.owner_landing = None   # it named the branch this round leaves
         st.locked, st.manifest, st.tests, st.probes = {}, {}, [], []
         st.commands = [c for c in st.commands if c.get("author") != "examiner"]   # their probes went with the branch
         st.findings = [f for f in st.findings if f.get("status") == "follow_up"]
@@ -736,12 +927,28 @@ class Engine:
                     number = self.gh.create_issue(entry["title"], entry["body"], [ENGINE_BUG_LABEL[0]])["number"]
                 self.faults.mark_reported(fingerprint, number)
                 self.store.event("fault_filed", fingerprint=fingerprint, issue=number)
+            except RedactionUnavailable as e:
+                # Not best effort: a failed issue is settled for the supervisor, which would stop
+                # with the fault never filed. The fault's issues of this run wait, as they are
+                # (`fail` is kept); the fault stays in the outbox and the next run files it.
+                self.store.event("fault_filing_failed", fingerprint=fingerprint, error=str(e)[:300])
+                for n in sorted({n for n, root in zip(entry["issues"], entry["runs"], strict=False)
+                                 if root == self.plan.root and n in self.plan.work}):
+                    if self.store.issue(n).phase not in (Phase.WAITING, Phase.DONE):
+                        self._wait(n, WAIT_GITHUB, f"the fault issue of #{n} ({fingerprint}) was not filed: {str(e)[:300]}")
             except Exception as e:  # noqa: BLE001 - filing is best effort, by design
                 self.store.event("fault_filing_failed", fingerprint=fingerprint, error=str(e)[:300])
 
     def _safe(self, fn, *args, **kwargs):
+        """A GitHub call the engine can do without: a failure is journaled and the caller goes on.
+        Not when the hygiene scanner could not mask what was to be published: nothing was sent, and
+        no step may go on as if it had been (`_accept` would close an issue whose follow-up was
+        never filed). That one is raised: the step ends there and `_finished` makes its issue wait
+        (`WAIT_GITHUB`); outside a step, `_sync` and the run summary catch it."""
         try:
             return fn(*args, **kwargs)
+        except RedactionUnavailable:
+            raise
         except (GitHubError, OSError) as e:
             self.store.event("github_call_failed", call=getattr(fn, "__name__", str(fn)), error=str(e)[:300])
             return None
@@ -754,7 +961,33 @@ class Engine:
                 self._safe(self.gh.remove_label, n, label)
         if wanted:
             self._safe(self.gh.add_labels, n, [wanted])
-        self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(st, self.plan.root))
+        try:
+            self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(st, self.plan.root))
+            self._unpublished.pop(n, None)
+        except RedactionUnavailable as e:
+            # A phase changes in many places that are no step (the dispatch, `_wait`, `_fail`), so
+            # this is not raised: the phase stays recorded, and `_withhold` makes the issue wait.
+            self._unpublished[n] = str(e)
+            self.store.event("progress_not_published", issue=n, phase=st.phase.value, error=str(e)[:300])
+
+    def _withhold(self, n: int) -> None:
+        """The hygiene scanner could not mask the progress comment of issue `n`, so it was not
+        written: the issue waits, and the next run writes it at the issue's next change of phase.
+        A failed or delivered issue waits too, and resumes as failed or delivered
+        (`_restore_ended`): ended, it would be settled for the supervisor with its comment never
+        written. An issue that already waits keeps its reason, and a done one is closed: before
+        `done`, `_announce` has written the comment already."""
+        detail = self._unpublished.pop(n, None)
+        if detail and self.store.issue(n).phase not in (Phase.WAITING, Phase.DONE):
+            self._wait(n, WAIT_GITHUB, detail)
+            self._unpublished.pop(n, None)   # the wait's own comment was not written either
+
+    def _announce(self, n: int, st: IssueState, phase: Phase) -> None:
+        """Write the progress comment of the phase `st` is about to end in, before that phase is
+        recorded. `_sync` writes it again with the phase, but an ended issue is not worked again:
+        a comment the hygiene scanner could not mask then would never be written. Here that
+        failure is raised (`RedactionUnavailable`) while the issue can still wait."""
+        self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(replace(st, phase=phase), self.plan.root))
 
     def _upsert_comment(self, n: int, marker: str, body: str) -> dict | None:
         comments = self._safe(self.gh.list_comments, n) or []
@@ -808,8 +1041,8 @@ class Engine:
         if call.discarded:
             self.store.event("agent_ref_changes_discarded", issue=n, refs=call.discarded)
 
-    def _delivery(self, st: IssueState, merged_head: str) -> tuple[str, list[str] | None]:
-        reviewed, repo = st.certified_sha, self.ws.repo
+    def _delivery(self, st: IssueState, merged_head: str, reviewed: str | None = None) -> tuple[str, list[str] | None]:
+        reviewed, repo = reviewed or st.certified_sha, self.ws.repo
         if not reviewed or merged_head == reviewed:
             return "same", []
         self.ws.git("fetch", "--quiet", self.ws.remote, merged_head, cwd=repo, check=False)
@@ -1025,7 +1258,13 @@ class Engine:
         st = self.store.issue(n)
         # set at startup (_reconcile); a prerequisite _depend admits mid-run has none yet and stops here
         assert st.branch is not None
-        wt = self.ws.issue_worktree(n, st.branch)
+        try:
+            wt = self.ws.issue_worktree(n, st.branch)
+        except BranchHeld:
+            # Not an engine fault, and nothing the engine may undo: that worktree may hold work.
+            # The issue waits, and each later run tries again.
+            return self._wait(n, WAIT_CLAIM, f"the branch {st.branch} is checked out in another worktree of this "
+                                             f"repository (`git worktree list`); the issue is built once it is free")
         if str(wt) != st.worktree:
             st.worktree = str(wt)
             self.store.put(st)
@@ -1118,15 +1357,140 @@ class Engine:
         findings = history_findings(evidence)
         return findings, ([] if findings else problems)
 
-    def _history_refused(self, n: int, head: str, outputs: list[str]) -> None:
+    def _local_scan(self, wt: Path, base: str, head: str) -> tuple[list[str], list[str]] | None:
+        """The scan with the owner's list of local values, immediately before a push of `head`:
+        its tree, and the commits `base..head` the push would publish (`LOCAL_VALUE_CHECKS`). The
+        list exists outside the sandbox only, so this runs in the engine's own process, as the
+        owner, and executes nothing of the branch: the scanner and the allow-list of the checkout
+        the engine runs from, from the engine's repository, reading the branch as git objects.
+
+        None where there is no list: nothing is started. Else (places, problems). A place is
+        `<path>: <rule>` and no more (`local_places`): what the scanner printed stays in this
+        method's memory, because its excerpt surrounds the owner's value itself. A problem says, in
+        the engine's own words, that a scan could not run; that head is not pushed either."""
+        values = local_values_file(os.environ)
+        checks = local_value_checks(base, head) if values is not None else ()
+        if not checks:
+            return None
+        if self._own_hooks(wt) is None:
+            return [], [("the scan with the owner's local values was not run: the engine's git takes its hooks from no "
+                         "directory of the engine's own, so a push could not be held to the commit that was scanned")]
+        env = {**os.environ, LOCAL_VALUES_ENV: str(values), "PYTHONIOENCODING": "utf-8"}
+        places, problems = [], []
+        for name, argv in checks:
+            said = f"the scan with the owner's local values (`{name}`)"
+            try:
+                proc = self._outside(argv, env)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{said} did not end within {self.caps.check_timeout_s} s")
+                continue
+            except OSError as e:
+                problems.append(f"{said} could not be started ({type(e).__name__})")
+                continue
+            found = local_places(proc.stdout) if proc.returncode == HISTORY_FINDINGS_EXIT else []
+            places += found
+            if proc.returncode != 0 and not found:
+                problems.append(f"{said} could not run (exit {proc.returncode}); the same command on the owner's "
+                                f"machine shows why")
+        return list(dict.fromkeys(places)), ([] if places else problems)
+
+    def _outside(self, argv: tuple[str, ...], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        """Run `argv` outside the sandbox, as the engine itself, from the engine's repository. Only
+        the scan with the owner's local values comes here, with an argument vector the engine's
+        configuration holds; nothing an agent wrote is ever started this way."""
+        return subprocess.run(argv, cwd=self.ws.repo, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=self.caps.check_timeout_s, check=False)
+
+    def _own_hooks(self, wt: Path) -> Path | None:
+        """The directory git takes its hooks from in `wt`, when the engine's own environment names
+        it (`sandbox.engine_git_env`, as in every run): a directory the engine owns, which no file
+        of a repository or a worktree can replace. None otherwise."""
+        scope, _, path = self.ws.git("config", "--show-scope", "--get", "core.hooksPath", cwd=wt, check=False).partition("\t")
+        return Path(path) if scope == "command" and Path(path).is_absolute() and Path(path).is_dir() else None
+
+    def _push(self, wt: Path, scanned: str | None) -> bool:
+        """Push the branch of `wt` through the ship script. `scanned` is the head the scan with
+        the owner's local values passed, None where there is no list: the push is then as it
+        always was.
+
+        Shipping fetches main once more and, if main moved since the scan, merges it or rebases
+        onto it: a head, and commits, that scan never saw. So for the time of a scanned push the
+        engine's hooks directory holds a `pre-push` of the engine's own, which lets git publish
+        that one commit and nothing else. False: shipping made another head, and nothing was
+        pushed; the caller has it verified and scanned like any new head.
+
+        Every run of the repository has that same hooks directory, so a push, scanned or not,
+        holds it from before the guard is written until it is removed (`_hooks_held`): the guard
+        git meets is the one of the push it is making."""
+        hooks = self._own_hooks(wt)
+        if scanned and hooks is None:
+            raise GitError("a scanned push needs the engine's own hooks directory")
+        guard = hooks / "pre-push" if hooks else None
+        with self._push_lock, self._hooks_held(hooks):
+            try:
+                if guard and scanned:
+                    guard.write_text(PUSH_GUARD.replace("{only}", scanned))
+                    guard.chmod(0o755)
+                    if not os.access(guard, os.X_OK):   # git would skip it in silence
+                        raise GitError("the engine's hooks directory cannot hold an executable hook")
+                elif guard:
+                    guard.unlink(missing_ok=True)   # one a stopped run left behind: no live run has it, the lock is held
+                self.ws.push(wt)
+            except MergeConflict:
+                raise
+            except GitError:
+                if scanned and self.ws.head(wt) != scanned:
+                    return False
+                raise
+            finally:
+                if guard:
+                    guard.unlink(missing_ok=True)
+        return True
+
+    @staticmethod
+    @contextmanager
+    def _hooks_held(hooks: Path | None) -> Generator[None]:
+        """Hold the engine's hooks directory for one push: an flock on the directory itself, until
+        the push has ended and its guard is gone. Every run of a repository is given the same
+        directory, and a guard is one file in it, so without this a second run would replace the
+        guard of a push under way, or remove it, and git would publish a head no scan saw. Each
+        call opens its own file description, so two engines in one process exclude each other as
+        two processes do, and the lock of a run that died is released with it. Without a hooks
+        directory there is no guard, and nothing to hold."""
+        if hooks is None:
+            yield
+            return
+        try:
+            fd = os.open(hooks, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as e:
+            raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as e:
+                raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+            yield
+        finally:
+            os.close(fd)   # which releases the lock
+
+    def _history_refused(self, n: int, head: str, outputs: list[str], places: list[str] | None = None) -> None:
         """The branch's own commits carry what a history check refuses: a value that reached a
         commit, whatever the files say now, a commit message, or an author's address. No later
         commit takes it back, so no round can repair it and the builder is not asked to: the
         branch is abandoned unpushed, the issue ends `failed`, and its next attempt (a retry, or
-        a new engine version) starts on a new branch from main, with the plan kept."""
+        a new engine version) starts on a new branch from main, with the plan kept.
+
+        `places`: the finding is the scan's with the owner's local values (`_local_scan`), already
+        reduced to paths and rules. There is no output of it to journal."""
         st = self.store.issue(n)
         old, pr = st.branch, st.pr
-        places = history_places(outputs)
+        scan, owed = "the history scan", ""
+        if places is not None:
+            scan = "the scan with the owner's local values, before the push,"
+            owed = (" No agent knows the owner's values: one reaches a branch through text the owner wrote, such as the "
+                    "issue, and is corrected there before a retry.")
+        else:
+            places = history_places(outputs)
         said = ", ".join(places[:8]) + (f" and {len(places) - 8} more" if len(places) > 8 else "")
         self.store.event("history_refused", issue=n, branch=old, head=head, findings=places[:40],
                          output=[o[-1500:] for o in outputs])
@@ -1138,11 +1502,11 @@ class Engine:
                               f"even for one round (use the documented placeholders).")], owner_edit=False)
         self.store.put(st)
         self._fail(n, "history", (
-            f"the commits of `{old}` carry what the history scan refuses: a value that reached a commit, a commit "
+            f"the commits of `{old}` carry what {scan} refuses: a value that reached a commit, a commit "
             f"message or an author's address. No later commit can take it back, so the branch was abandoned at "
             f"`{head[:12]}`, this step pushed nothing of it, and the next attempt (`retry`, or a new engine version) "
             f"builds on a new branch from main, `{st.branch}`. Delete `{old}` once you have read it (`git branch -D`)"
-            + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}."))
+            + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}.{owed}"))
 
     def _release_legacy(self, n: int, wt: Path) -> None:
         st = self.store.issue(n)
@@ -1522,13 +1886,10 @@ class Engine:
         return candidates
 
     def _digest_at(self, wt: Path, ref: str, file: str) -> str | None:
+        """The verifier's digest of `file` as `ref` holds it, or None when it is not a file there.
+        Nothing is written for it: a temporary copy is one more file the host can refuse."""
         data = self.ws.show_bytes(wt, ref, file)
-        if data is None:
-            return None
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / Path(file).name
-            p.write_bytes(data)
-            return verify.digest(p)
+        return None if data is None else verify.digest(CommittedFile.holding(file, data))
 
     def _relock(self, n: int, wt: Path, digests: dict[str, str], sources: dict[str, str]) -> None:
         kept = {f: d for f, d in digests.items() if (wt / f).is_file() and verify.digest(wt / f) == d}
@@ -1805,6 +2166,7 @@ class Engine:
                 rejected.append({"file": p.file, "reason": problem})
                 continue
             candidates.append(p)
+        refused = {r["file"] for r in rejected} - {p.file for p in candidates}
         # A probe the standing checks refuse is never run, adopted or committed: the hygiene scan
         # of the head would fail on a file the builder may not change, and its history would keep it.
         unclean = self._unclean_probes(n, wt, candidates)
@@ -1817,6 +2179,8 @@ class Engine:
         for i, f in enumerate(res.findings):
             f.id = f"E{n}-{rnd}-{i + 1}"
             f.round = rnd
+            if f.probe in refused:   # its probe is never adopted: the finding stands on its own reproduction
+                f.probe = None
             probe = next((p for p in res.probes if f.probe and p.file == f.probe), None)
             if probe and probe.file in probe_results:
                 reproduced = not probe_results[probe.file]
@@ -1831,7 +2195,8 @@ class Engine:
         # A follow-up examination adopts only probes that reproduce a blocking finding, or that cover
         # an item still without one, so certification converges.
         covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
-        adopt = [p for p in res.probes if p.file not in unclean and (
+        # A probe the lint refused is not written to the worktree either, whatever finding names it.
+        adopt = [p for p in candidates if p.file not in unclean and (
             any(f.blocking and f.probe == p.file for f in new)
             or (probe_results.get(p.file) is True and (since is None or p.criterion not in covered)))]
         first = st.examined_sha is None
@@ -1939,8 +2304,15 @@ class Engine:
             return "a probe may not be written on a protected path"
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / p.file
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(p.content)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(p.content)
+            except OSError:
+                # A path no file can be created at (a name longer than the file system takes, a
+                # file where a directory is needed) is the examiner's mistake, not an engine fault.
+                # The reason is the engine's own words: what the system said would carry the path
+                # of the temporary directory into the run log.
+                return "a probe file must be a path the file system can create"
             bad = verify.unconditional_failures(Path(tmp), [p.file])
         return f"it fails unconditionally: {bad[0]}" if bad else None
 
@@ -1983,7 +2355,6 @@ class Engine:
             # set by startup and build, and only a certified head reaches land
             assert st.worktree is not None and st.branch is not None and st.certified_sha is not None
             wt = Path(st.worktree)
-            issue = self.plan.issues[n]
             if st.certified_sha != st.verified_sha:
                 return self._set_phase(n, Phase.VERIFY)
             existing = self.gh.find_pr(st.branch)
@@ -1992,13 +2363,13 @@ class Engine:
                 relation, unreviewed = self._delivery(st, merged_head)
                 if relation == "same":
                     self.store.event("merge_found_on_resume", issue=n, pr=existing["number"])
-                    return self._set_phase(n, Phase.MERGED, pr=existing["number"])
+                    return self._merged(n, existing.get("merge_commit_sha"), pr=existing["number"])
                 if relation == "later":
                     self.store.event("merged_externally", issue=n, pr=existing["number"], head=merged_head,
                                      certified=st.certified_sha, unreviewed=unreviewed)
                     if unreviewed != []:
                         st.verdicts = {}
-                    return self._set_phase(n, Phase.MERGED, pr=existing["number"], verdicts=st.verdicts)
+                    return self._merged(n, existing.get("merge_commit_sha"), pr=existing["number"], verdicts=st.verdicts)
                 self.store.event("stale_pr_ignored", issue=n, pr=existing["number"], head=merged_head)
             if not self._requirements_current(n):
                 self.store.event("requirements_changed", issue=n, previous_phase=Phase.LAND.value)
@@ -2010,48 +2381,83 @@ class Engine:
             self.ws.fetch()
             if self.ws.nothing_to_land(wt):
                 self.store.event("nothing_to_land", issue=n, head=st.certified_sha)
-                return self._set_phase(n, Phase.MERGED)
-            # Main may have moved since the certificate. Merging it makes a new head, which is
-            # verified and certified again (a focused delta examination) before it may land.
-            sync = self.ws.update(wt)
-            if sync.status == "conflict":
-                self.ws.abort_in_progress(wt)
-                return self._conflict(n, wt, sync.files, Phase.LAND.value)
-            if sync.status == "merged":
-                self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
-                                 to=self.ws.head(wt), main=sync.main)
-                self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
-                return self._set_phase(n, Phase.VERIFY)
+                # no merge of its own: the commit that carries the change is the head of `main`
+                return self._merged(n, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt) if self.deploy.contexts
+                                    else None)
+            record = self._owner_record(st)
+            if record is not None and record.get("revert"):   # of a revert that an edit of the issue abandoned
+                record = st.owner_landing = None
+                self.store.put(st)
+            if record is None:
+                # Main may have moved since the certificate. Merging it makes a new head, which is
+                # verified and certified again (a focused delta examination) before it may land.
+                sync = self.ws.update(wt)
+                if sync.status == "conflict":
+                    self.ws.abort_in_progress(wt)
+                    return self._conflict(n, wt, sync.files, Phase.LAND.value)
+                if sync.status == "merged":
+                    self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
+                                     to=self.ws.head(wt), main=sync.main)
+                    self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
+                    return self._set_phase(n, Phase.VERIFY)
+            else:
+                # A head the owner lands is not brought up to date: however far main moved, nothing is
+                # verified or certified again while that head still merges into it. Only a conflict
+                # is work: the builder's, on main's merge, as in an ordinary round.
+                files = self._conflicts_with_main(wt, existing, st.certified_sha)
+                if files:
+                    record["conflict"] = True   # what the comment of the next certified head says of it
+                    self.store.put(st)
+                    self.store.event("owner_landing_conflict", issue=n, head=st.certified_sha, files=files,
+                                     main=self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt))
+                    return self._conflict(n, wt, files, Phase.LAND.value)
             # The last look before anything leaves the machine: every commit this push would publish.
             # A head that reaches this point was verified with the same checks; this one holds
             # whatever state the run resumed from and whatever moved since. A scan that could not
             # run is a failed check like any other: a round for the builder, under the progress
             # rule, so it cannot go round between here and the verifier for ever.
             unpushed = self.ws.head(wt)
-            findings, unscanned = self._history_scan(n, wt, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt),
-                                                     unpushed, "push")
-            if findings:
-                return self._history_refused(n, unpushed, findings)
-            if unscanned:
-                self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
-                return self._round_failed(n, unscanned)
+            main = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
+            local = None
+            if record is None or record.get("head") != unpushed:   # a head the owner was given was scanned then
+                findings, unscanned = self._history_scan(n, wt, main, unpushed, "push")
+                if findings:
+                    return self._history_refused(n, unpushed, findings)
+                if unscanned:
+                    self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
+                    return self._round_failed(n, unscanned)
+                # And the owner's own look, where the owner's list of local values exists: outside the
+                # sandbox, with the scanner of the engine's checkout. A finding abandons the branch as
+                # a finding in its history does; a scan that could not run withholds the push.
+                local = self._local_scan(wt, main, unpushed)
+                if local and local[0]:
+                    return self._history_refused(n, unpushed, [], places=local[0])
+                if local and local[1]:
+                    self.store.event("push_withheld", issue=n, head=unpushed, problems=local[1])
+                    return self._round_failed(n, local[1])
+            # Before any push: do the commits it would publish change a workflow file? The engine
+            # never pushes such a change, whatever identity it runs as (ADR 0001, amendment 2). The
+            # branch is the owner's to push, and stays so once it was handed over.
+            workflows = self._workflow_paths(wt, main, unpushed)
+            if record is not None or workflows:
+                if unpushed != st.certified_sha:
+                    self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=unpushed)
+                    return self._set_phase(n, Phase.VERIFY)
+                return self._owner_lands(n, unpushed, workflows)
             try:
-                self.ws.push(wt)
+                pushed = self._push(wt, unpushed if local is not None else None)
             except MergeConflict as e:
                 return self._conflict(n, wt, e.files, Phase.LAND.value)
+            if not pushed:   # main moved after the scan: the head shipping made is verified and scanned first
+                self.store.event("push_withheld", issue=n, head=unpushed, shipped=self.ws.head(wt), problems=[
+                    "shipping made another head than the one scanned with the owner's local values; nothing was pushed"])
+                return self._set_phase(n, Phase.VERIFY)
             head = self.ws.head(wt)
             if head != st.certified_sha:
                 self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=head)
                 return self._set_phase(n, Phase.VERIFY)
-            body = report.render_pr_body(n, issue.title, st, self.op, self.other)
-            pr = self.gh.find_pr(st.branch)
-            if pr is None or pr.get("state") != "open":
-                pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
-            else:
-                self.gh.update_pr(pr["number"], body)
-            st.pr = pr["number"]
-            self.store.put(st)
-            self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+            self._open_pull(n, st, head)
+            assert st.pr is not None   # recorded by `_open_pull`
             conclusion, run_id = self._wait_required(head)
             if conclusion != "success" and head not in st.ci_rerun_heads:
                 st.ci_rerun_heads.append(head)
@@ -2063,12 +2469,21 @@ class Engine:
             if conclusion != "success":
                 return self._ci_failed(n, head, conclusion)
             try:
-                self.gh.merge_pr(st.pr, head)
+                merge = self.gh.merge_pr(st.pr, head)
             except GitHubError as e:
                 again = self._safe(self.gh.find_pr, st.branch) or {}
                 if (again.get("merged") or again.get("merged_at")) and (again.get("head") or {}).get("sha", head) == head:
                     self.store.event("merged", issue=n, pr=st.pr, head=head, note="the merge answer was lost")
-                    return self._set_phase(n, Phase.MERGED)
+                    return self._merged(n, again.get("merge_commit_sha"))
+                # Why GitHub refused is read from the pull request's review decision, never from the
+                # words of the refusal. With a review owed on this very head, what is missing is a
+                # person: no refusal is counted and nothing is verified again. A pull request whose
+                # head is another one was refused for that, and is handled as every other refusal.
+                decision = ""
+                if (again.get("head") or {}).get("sha", head) == head:
+                    decision = self._safe(self._review_decision, st.pr) or ""
+                if decision in REVIEW_OWED:
+                    return self._owner_reviews(n, st.pr, head, decision)
                 st = self.store.issue(n)
                 st.merge_refusals += 1
                 self.store.put(st)
@@ -2078,9 +2493,387 @@ class Engine:
                                       resume=Phase.LAND)
                 return self._set_phase(n, Phase.VERIFY)
             self.store.event("merged", issue=n, pr=st.pr, head=head)
-            self._set_phase(n, Phase.MERGED)
+            self._merged(n, (merge or {}).get("sha"))
         finally:
             self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _review_decision(self, pr: int) -> str:
+        """The review decision of pull request `pr` (`reviewDecision` in GitHub's GraphQL API):
+        APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or empty where GitHub gives none, and where the
+        client cannot read one (an older `github.py`)."""
+        read = getattr(self.gh, "review_decision", None)
+        return (read(pr) or "") if read else ""
+
+    def _say_review_owed(self, pr: int, head: str, decision: str) -> None:
+        """Say on pull request `pr`, once for the certified head `head`, that the loop waits for the
+        owner's review. The comment is found again by its marker, which carries the head: a second
+        refusal, or a resumed run, writes no second one, and a later certified head gets its own.
+        Where the comments cannot be listed, none is written."""
+        marker = OWNER_REVIEW_MARKER.format(head)
+        comments = self._safe(self.gh.list_comments, pr)
+        if comments is None or any(marker in (c.get("body") or "") for c in comments):
+            return
+        self._safe(self.gh.create_comment, pr, (
+            f"{marker}\n**implement loop**: this pull request waits for the owner's review. Its head `{head}` is "
+            f"certified by {self.other} and the required check is green on it, and GitHub refused the merge while the "
+            f"pull request's review decision is `{decision}`. Nothing is verified again meanwhile. Once the pull request "
+            f"is approved, the loop merges this head at its next run. A push to this branch makes another head, which "
+            f"the loop verifies and has certified again before it lands.\n"))
+
+    def _owner_reviews(self, n: int, pr: int, head: str, decision: str) -> None:
+        """GitHub refused to merge the certified head `head` of issue `n`, on which the required
+        check is green, and the review decision of its pull request `pr` owes a review
+        (`REVIEW_OWED`): a pull request that touches a protected path needs the owner's approving
+        review (ADR 0001, amendment 3). That is no merge refusal to count and nothing to verify
+        again: the pull request says so, once, and the issue waits (`WAIT_OWNER_REVIEW`) with no
+        landing claim, the land step that calls this releasing the merge queue. `_maybe_resume`
+        reads the decision again at each run (`_review_owed`) and resumes the land step only
+        once it is APPROVED, or the pull request is no longer open at this head."""
+        self.store.event("owner_review_owed", issue=n, pr=pr, head=head, decision=decision)
+        self._say_review_owed(pr, head, decision)
+        self._wait(n, WAIT_OWNER_REVIEW, f"pull request #{pr} is certified at `{head[:12]}` with the required check green, "
+                                         f"and GitHub merges it only with the owner's approving review (review decision: "
+                                         f"{decision})", resume=Phase.LAND, pr=pr, head=head)
+
+    def _open_pull(self, n: int, st: IssueState, head: str) -> dict:
+        """Open the pull request of the issue's branch, or update the open one, and write its
+        evidence comment for `head`: the same for a branch the engine pushed and for one the owner
+        pushed (`_owner_lands`)."""
+        assert st.branch is not None
+        issue = self.plan.issues[n]
+        body = report.render_pr_body(n, issue.title, st, self.op, self.other)
+        pr = self.gh.find_pr(st.branch)
+        if pr is None or pr.get("state") != "open":
+            pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
+        else:
+            self.gh.update_pr(pr["number"], body)
+        st.pr = pr["number"]
+        self.store.put(st)
+        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+        return pr
+
+    # ------------------------------------------------------------------ landed by the owner
+    @staticmethod
+    def _owner_record(st: IssueState) -> dict | None:
+        """The record of a change the owner lands (`IssueState.owner_landing`), None when the
+        issue has none."""
+        return getattr(st, "owner_landing", None)   # an older model.py has no such field, and no such issue
+
+    def _workflow_paths(self, wt: Path, base: str, head: str) -> list[str]:
+        """The paths under `.github/workflows/` that the commits `base..head` change: what a push
+        of `head` would publish, `base` being the head of main. Every commit is read by itself, so a
+        workflow file changed in one commit and put back in a later one counts: both commits would
+        be published. A merge commit counts for what differs from every parent, so merging a main
+        that changed a workflow file is not a change of this branch; and the whole difference with
+        main counts, so a merge that drops main's change of one is. Renames are not followed: both
+        names are changed paths."""
+        listed = self.ws.git("log", "--format=", "--name-only", "--no-renames", "-c", "-z", f"{base}..{head}",
+                             cwd=wt, strip=False)
+        listed += "\0" + self.ws.git("diff", "--name-only", "--no-renames", "-z", base, head, cwd=wt, strip=False)
+        return sorted({f.strip("\n") for f in listed.split("\0") if f.strip("\n").startswith(WORKFLOWS)})
+
+    def _conflicts_with_main(self, wt: Path, pr: dict | None, head: str | None) -> list[str]:
+        """The files in which the head of `wt` no longer merges into main without a conflict; none
+        while it does. Once the pull request is open at that head, GitHub's own answer is taken
+        where its record carries one (`mergeable`). Before that, and to name the files, the merge
+        is tried in the worktree and always undone: the worktree stays at its head, clean."""
+        main = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
+        if self.ws.is_ancestor(wt, main, "HEAD"):
+            return []
+        if (pr and pr.get("state") == "open" and pr.get("mergeable") is True
+                and (pr.get("head") or {}).get("sha") == head):
+            return []
+        self.ws.git("merge", "--no-commit", "--no-ff", main, cwd=wt, check=False)
+        files = self.ws.conflicted_files(wt)
+        if self.ws.abort_in_progress(wt) != "merge" or self.ws.git("status", "--porcelain", cwd=wt):
+            raise GitError(f"the merge of {self.ws.base_ref()} could not be tried and undone in {wt}")
+        return files
+
+    def _remote_head(self, branch: str) -> str | None:
+        """The head of `branch` on the remote, read from the remote itself; None when it has no such branch."""
+        out = self.ws.git("ls-remote", "--heads", self.ws.remote, f"refs/heads/{branch}")
+        return out.split()[0] if out else None
+
+    def _hand_over(self, n: int, record: dict, text: str) -> None:
+        """Post the comment that gives the owner the head of `record`: one comment per head, on the
+        issue, found again by its marker, so a step that ends between the comment and its record
+        writes no second one. `text` says what the head is; the rest is the same for every head."""
+        branch, head = record["branch"], record["head"]
+        marker = OWNER_LANDING_MARKER.format(head)
+        changed = ", ".join(f"`{f}`" for f in record.get("paths") or []) or f"a file under `{WORKFLOWS}`"
+        body = (f"{marker}\n**implement loop**: {text} Its commits change {changed}, and the loop never pushes a change "
+                f"to a workflow file (ADR 0001, amendment 2). It is yours to land.\n\n"
+                f"| | |\n|---|---|\n| Branch | `{branch}` |\n| Certified head | `{head}` |\n\n"
+                f"Push the branch as it is, from the repository the loop runs in:\n\n"
+                f"```sh\ngit push {self.ws.remote} {head}:refs/heads/{branch}\n```\n\n"
+                f"The loop then opens the pull request, and you merge it: the loop does not merge this one. Do not bring "
+                f"the branch up to date on GitHub (\"Update branch\"): the head that makes is not certified. If `main` "
+                f"moves and no longer merges with this head, the loop says so here.\n")
+        if self._upsert_comment(n, marker, body):
+            record["announced"] = head
+
+    def _owner_lands(self, n: int, head: str, workflows: list[str]) -> None:
+        """The certified head `head` of issue `n` changes a workflow file, so the engine pushes
+        nothing: the owner pushes the branch, the engine opens the pull request, the owner merges
+        it. The branch and the head are recorded and given to the owner in one comment per head,
+        and the issue waits (`WAIT_OWNER_LANDING`), with no landing claim: the land step that
+        calls this releases the merge queue, and no deployment is awaited yet. Each resumed land
+        step comes back here, until it finds the pull request merged (`_step_land`)."""
+        st = self.store.issue(n)
+        assert st.branch is not None
+        record = self._owner_record(st)
+        if record is None or record.get("head") != head:
+            earlier = record or {}
+            record = {"branch": st.branch, "head": head, "paths": workflows or earlier.get("paths") or [],
+                      "announced": None, "published": None, "pr": earlier.get("pr"), "replaces": earlier.get("head"),
+                      "conflict": bool(earlier.get("conflict"))}
+            st.owner_landing = record
+            self.store.put(st)
+            self.store.event("owner_landing", issue=n, branch=st.branch, head=head, paths=record["paths"],
+                             replaces=record["replaces"])
+        if record.get("announced") != head:
+            replaces = str(record.get("replaces") or "")
+            if not replaces:
+                text = f"this change is certified by {self.other}."
+            else:
+                why = ("`main` moved and no longer merged with the head posted before, so the loop merged `main` and "
+                       "the builder resolved the conflict" if record.get("conflict") else
+                       "the branch moved on from the head posted before")
+                text = (f"{why}, and {self.other} certified the new head, which takes the place of "
+                        f"`{replaces[:12]}`. It descends from that one: the push below moves the remote "
+                        f"branch forward, and an open pull request follows it.")
+            self._hand_over(n, record, text)
+            self.store.put(st)
+        detail = self._owner_pull(n, record, lambda: self._open_pull(n, st, head))
+        self.store.put(st)
+        self._wait(n, WAIT_OWNER_LANDING, detail, resume=Phase.LAND)
+
+    def _owner_pull(self, n: int, record: dict, publish: Callable[[], dict]) -> str:
+        """Where the owner's part of `record` stands, as the detail of the wait. While the remote
+        has no such branch, or has it at another head than the certified one, nothing is opened.
+        With the remote branch at the certified head, `publish` opens the pull request, once for
+        a head; it is never merged from here. A pull request the owner closed is not opened again."""
+        branch, head = record["branch"], record["head"]
+        remote = self._remote_head(branch)
+        if remote is None:
+            return (f"the remote has no branch `{branch}`: the owner pushes the certified head `{head[:12]}` "
+                    f"(the command is in the comment on this issue)")
+        if remote != head:
+            return (f"the remote branch `{branch}` is at `{remote[:12]}`, another head than the certified one, "
+                    f"`{head[:12]}`, which the owner pushes (the command is in the comment on this issue); no pull "
+                    f"request is opened for another head")
+        pr = self.gh.find_pr(branch) or {}
+        if record.get("published") == head and pr.get("number") == record.get("pr") and pr.get("state") != "open":
+            return (f"pull request #{pr.get('number')} of `{branch}` is closed, and was not merged with the certified "
+                    f"head `{head[:12]}`: the owner reopens and merges it")
+        if record.get("published") != head or pr.get("state") != "open":
+            pr = publish()
+            record.update(published=head, pr=pr["number"])
+            self.store.event("owner_landing_pull_request", issue=n, pr=pr["number"], branch=branch, head=head)
+        return (f"pull request #{pr.get('number')} is open with the certified head `{head[:12]}` of `{branch}`: "
+                f"the owner merges it")
+
+    # ------------------------------------------------------------------ deploying
+    def _merged(self, n: int, sha: str | None, **changes) -> None:
+        """The issue's change is on `main` in the commit `sha`: its merge commit, or the head of
+        `main` when the branch had nothing left to land. With deployment contexts configured, the
+        verdict on that commit is awaited before the evidence step (ADR 0001, decision 5), by the
+        step that merged: the merge queue is not released in between. With none, the evidence step
+        is next, as before."""
+        if self._owner_record(self.store.issue(n)) is not None:
+            changes["owner_landing"] = None   # the owner landed it: from here it is an issue like any other
+        if not self.deploy.contexts:
+            return self._set_phase(n, Phase.MERGED, deploy=None, **changes)
+        sha = sha or (self._safe(self.gh.find_pr, self.store.issue(n).branch) or {}).get("merge_commit_sha")
+        if not sha:   # the next run finds the merged pull request, and its merge commit with it
+            return self._wait(n, WAIT_GITHUB, "GitHub did not name the merge commit whose deployment is awaited",
+                              resume=Phase.LAND)
+        self._hold(n, sha)
+        self._set_phase(n, Phase.MERGED, deploy={"sha": sha}, **changes)
+        self._await_deployment(n)
+
+    def _verdict_owed(self, st: IssueState) -> bool:
+        """Merged, with contexts configured, and not every one of them has reported success on the
+        merge commit yet: the evidence step is not reached."""
+        if not self.deploy.contexts:
+            return False
+        d = st.deploy or {}
+        return bool(d.get("sha") and not d.get("states"))
+
+    def _step_deploying(self, n: int) -> None:
+        """An issue resumed while its deployment verdict was owed (a wait, or a run that stopped):
+        it holds the merge queue, like the land step it continues, and reads the statuses of the
+        same merge commit again. Nothing is pushed or merged here."""
+        try:
+            if not self._verdict_owed(self.store.issue(n)):   # the contexts were emptied since
+                return self._set_phase(n, Phase.MERGED)
+            self._await_deployment(n)
+        finally:
+            self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _await_deployment(self, n: int) -> None:
+        """Poll the configured contexts on the issue's merge commit, with the merge queue held by
+        the calling step. Every context `success`: the verdict is recorded and the evidence step is
+        next. One `failure` or `error`: the broken-main path, at once. One pending with the
+        configured approval description, and none failed: the deployment waits for the owner, so
+        the landing claim is released and the issue waits (`WAIT_OWNER_APPROVAL`), for as long as
+        it takes. Otherwise, after `timeout_s` of polling, the issue waits (`WAIT_DEPLOY`) with the
+        landing claim still held, and the next run polls the same commit again."""
+        sha = (self.store.issue(n).deploy or {})["sha"]
+        self._hold(n, sha)
+        self._set_phase(n, DEPLOYING)
+        waited = 0
+        while True:
+            try:
+                statuses = {c: self.gh.deploy_status(sha, c) or {} for c in self.deploy.contexts}
+            except GitHubError as e:   # no answer is no verdict: the next run asks again, the claim stays held
+                return self._wait(n, WAIT_GITHUB, f"the commit statuses of {sha[:12]} could not be read: {str(e)[:300]}",
+                                  resume=DEPLOYING)
+            states = {c: s.get("state") for c, s in statuses.items()}
+            failed = {c: state for c, state in states.items() if state in DEPLOY_FAILED}
+            if failed:
+                return self._deployment_failed(n, sha, failed)
+            if all(state == "success" for state in states.values()):
+                return self._deployed(n, sha, dict.fromkeys(states, "success"))
+            approval = [c for c, s in statuses.items() if s.get("state") == "pending" and self.deploy.approval_description
+                        and s.get("description") == self.deploy.approval_description]
+            if approval:
+                self._release_hold(n)
+                return self._wait(n, WAIT_OWNER_APPROVAL, f"the deployment of {sha[:12]} waits for the owner's approval "
+                                                          f"in the pipeline ({', '.join(approval)})", resume=DEPLOYING)
+            if waited >= self.deploy.timeout_s:
+                owed = ", ".join(f"{c} {'is ' + state if state else 'has no status'}" for c, state in states.items()
+                                 if state != "success")
+                return self._wait(n, WAIT_DEPLOY, f"no deployment verdict on {sha[:12]} after {self.deploy.timeout_s}s: "
+                                                  f"{owed}", resume=DEPLOYING)
+            if self.store.stop_requested():
+                return   # it stays in `deploying`, and the next run polls the same commit
+            self.sleep(self.caps.ci_poll_s)
+            waited += max(self.caps.ci_poll_s, 1)
+
+    def _deployed(self, n: int, sha: str, states: dict[str, str]) -> None:
+        st = self.store.issue(n)
+        st.deploy = {"sha": sha, "states": states}
+        self.store.put(st)
+        self.store.event("deployed", issue=n, sha=sha, contexts=states)
+        self._release_hold(n)
+        self._set_phase(n, Phase.MERGED)
+
+    def _deployment_failed(self, n: int, sha: str, failed: dict[str, str]) -> None:
+        """A final state that is not success: the merged change broke the deployment. The
+        fix-forward gets the verdict (the commit, the failed contexts and their states) and then
+        the summary of what the pipeline's reporter said, from `_deployment_summary`. If the
+        statuses cannot be read for it, nothing is decided yet: the issue waits, and the next run
+        reads the same commit again, so that no fix-forward is spent without the summary."""
+        try:
+            summary = self._deployment_summary(sha)
+        except GitHubError as e:
+            return self._wait(n, WAIT_GITHUB, f"the commit statuses of {sha[:12]} could not be read: {str(e)[:300]}",
+                              resume=DEPLOYING)
+        self.store.event("deployment_failed", issue=n, sha=sha, contexts=failed)
+        self._release_hold(n)
+        self.claims.release(MERGE_QUEUE, self.owner)   # the verdict is in; a revert takes the queue itself
+        said = ", ".join(f"`{c}` is `{state}`" for c, state in failed.items())
+        self._fix_forward(n, [(f"the deployment failed after the merge: on the merge commit {sha[:12]}, the commit "
+                               f"status {said}. Find what in this issue's change broke the deployment, and repair it."),
+                              *summary])
+
+    def _deployment_summary(self, sha: str) -> list[str]:
+        """What the pipeline's reporter said of the failed deployment of the commit `sha`, as
+        feedback for a fix-forward: one entry per status. It is built from that commit's statuses
+        and from nothing else: the engine reads no commit comment and no other text about a
+        deployment (ADR 0001, amendment 4). Only the statuses of a configured context, or of one
+        followed by a slash and more, count. The first kind is a stage's own status, whatever its
+        state. The second kind is a fact: the reporter posts each fact of a failure under the
+        context of its stage (system design, section 8.4). Any other context is another reporter's
+        (`measure/...`), or one the owner did not name. Of each context the newest status counts.
+        The entries come in the configured order of the stages, each stage's own status before its
+        facts, the facts sorted by context, each with the context, the state and the description."""
+        newest: dict[str, dict] = {}
+        for status in self.gh.commit_statuses(sha):   # the oldest first: the last of a context is its newest
+            newest[str(status.get("context") or "")] = status
+        summary = []
+        for configured in self.deploy.contexts:
+            for context in sorted(c for c in newest if c == configured or c.startswith(configured + "/")):
+                status = newest.pop(context)   # popped: a context below two configured ones is told once
+                description = " ".join(str(status.get("description") or "").split())
+                summary.append(f"the deployment's report on the merge commit {sha[:12]}: the commit status `{context}` is "
+                               f"`{status.get('state')}`" + (f", with the description `{description}`" if description else ""))
+        return summary
+
+    def _deployment_evidence(self, st: IssueState) -> list[dict]:
+        """The deployment verdict as an evidence record of the issue: the commit and each context
+        with its state. It is no ledger item's proof and ticks no box."""
+        d = (st.deploy or {}) if self.deploy.contexts else {}
+        if not d.get("states"):
+            return []
+        note = f"commit statuses of `{d['sha'][:12]}`: " + ", ".join(f"`{c}` {state}" for c, state in d["states"].items())
+        record = Evidence(criterion="deployment", kind="deployment", command=None, cwd=".", head_sha=d["sha"],
+                          exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="", note=note,
+                          verifier="commit statuses")
+        return [asdict(record) | {"contexts": dict(d["states"])}]
+
+    # The landing claim, where a verdict outlasts the run (`DEPLOY_HOLDS`).
+    def _hold_path(self, n: int) -> Path:
+        return self._holds_dir / f"{self.owner}-issue-{n}.json"
+
+    def _hold(self, n: int, sha: str) -> None:
+        """Record that issue `n` waits for the deployment verdict of `sha`. Written with the merge
+        queue held, so a run that takes the queue and then finds no record may land."""
+        self._holds_dir.mkdir(parents=True, exist_ok=True)
+        path = self._hold_path(n)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"owner": self.owner, "issue": n, "sha": sha, "since": time.time()}))
+        os.replace(tmp, path)
+
+    def _release_hold(self, n: int) -> None:
+        self._hold_path(n).unlink(missing_ok=True)
+
+    def _holds(self, but: int | None = None) -> list[dict]:
+        """The verdicts awaited, by any run; without the one of this run's issue `but`."""
+        out = []
+        for path in sorted(self._holds_dir.glob("*.json")) if self._holds_dir.is_dir() else []:
+            try:
+                hold = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue   # released between the listing and the reading
+            if not (hold.get("owner") == self.owner and hold.get("issue") == but):
+                out.append(hold)
+        return out
+
+    def _drop_stale_holds(self) -> None:
+        """At the start of a run: a record of this run for an issue that no longer waits for a
+        verdict (its state was archived, or the contexts were emptied) would stop every landing
+        for good."""
+        for hold in self._holds():
+            n = hold.get("issue")
+            if hold.get("owner") == self.owner and isinstance(n, int) and (
+                    n not in self.plan.work or not self._verdict_owed(self.store.issue(n))):
+                self._release_hold(n)
+                self.store.event("deploy_hold_dropped", issue=n, sha=hold.get("sha"))
+
+    def _take_queue(self, n: int, lands: bool = True) -> bool:
+        """The merge queue, for issue `n`. To land, no other issue of any run may wait for a
+        deployment verdict: that is the landing claim held through the wait. Records are written
+        under the claim, so they are read again once it is taken."""
+        if lands and self._holds(but=n):
+            return False
+        if not self.claims.acquire(MERGE_QUEUE, self.owner):
+            return False
+        if lands and self._holds(but=n):
+            self.claims.release(MERGE_QUEUE, self.owner)
+            return False
+        return True
+
+    def _unreleasable_hold(self, n: int, phases: dict[int, Phase] | None = None) -> dict | None:
+        """A verdict that stops issue `n` from landing and that this run will not read again: the
+        issue of this run that waits for it waits for the supervisor. Polling the queue in this
+        run would not see it end."""
+        phases = phases or self._phases()
+        for hold in self._holds(but=n):
+            if hold.get("owner") == self.owner and phases.get(hold.get("issue")) not in (Phase.MERGED, DEPLOYING):
+                return hold
+        return None
 
     def _ci_failed(self, n: int, head: str, conclusion: str | None) -> None:
         if conclusion in CI_NO_VERDICT:
@@ -2109,6 +2902,12 @@ class Engine:
 
     # ------------------------------------------------------------------ accept
     def _step_accept(self, n: int) -> None:
+        if (self._owner_record(self.store.issue(n)) or {}).get("revert"):
+            return self._owner_revert(n)   # main is still broken: no evidence step before its revert is merged
+        if self._verdict_owed(self.store.issue(n)):
+            # Never the evidence step with a deployment verdict owed, whatever brought the issue
+            # here (a run killed right after the merge, a revert that waited for the queue).
+            return self._set_phase(n, DEPLOYING)
         with self._accept_lock:
             self._accept(n)
 
@@ -2135,31 +2934,47 @@ class Engine:
         if regressions:
             return self._fix_forward(n, regressions)
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
+        deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
+        discharged = self._ci_discharged(n, st)    # owner items a CI job proved on the head that was merged
+        records = evidence + deployed + list(discharged.values())
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
-                                                 report.render_evidence(n, evidence, head, verdicts)) if st.pr else None)
+                                                 report.render_evidence(n, records, head, verdicts))
+                            if st.pr else None)
         link = (evidence_comment or {}).get("html_url", "")
-        proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts)
+        proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts) | set(discharged)
         issue = self.gh.get_issue(n)
         if issue_parser.body_hash(issue.get("body") or "") != st.body_hash:
             return self._owner_round(n, edited)
-        owed = self._owner_items(st)                 # never ticked by the loop
-        exempt = owed - self._agent_part_items(st)   # an owner item's agent part must still be proven
+        owed = self._owner_items(st) - set(discharged)   # never ticked by the loop
+        exempt = owed - self._agent_part_items(st)       # an owner item's agent part must still be proven
         unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
         if unproven:
             return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
-        ticked = issue_parser.tick(issue.get("body") or "", {cid: link for cid in proven if cid not in owed})
+        links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in discharged.items()}
+        ticked = issue_parser.tick(issue.get("body") or "", links)
         if ticked != (issue.get("body") or ""):
             self._safe(self.gh.edit_issue, n, body=ticked)
         st = self.store.issue(n)
-        st.evidence = evidence
+        st.evidence = records
         st.restarts = 0
+        st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in discharged)]
         st.human_tasks = [self._obligation_text(o) for o in st.obligations]
-        self._file_followup(n, st)
+        # Each publication below ends this step when the hygiene scanner cannot mask it (`_safe`):
+        # the issue waits in `merged` and this step runs again. So the follow-up, which is created
+        # and not updated, comes last of the two and is recorded at once; and the comment that says
+        # how the issue ends is written before anything that cannot be taken back.
+        if discharged and st.pr:   # the pull request listed them as left for later
+            self._safe(self.gh.update_pr, st.pr, report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other))
         self._publish_deferred(n, st)
+        self._file_followup(n, st)
         self.store.put(st)
+        if discharged:
+            self.store.event("obligations_discharged", issue=n, head=next(iter(discharged.values()))["head_sha"],
+                             items={i: e["address"] for i, e in discharged.items()})
         self.store.put_section("accepted_checks", str(n), {
             "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
             "manifest": st.manifest})
+        self._announce(n, st, Phase.DELIVERED if st.obligations else Phase.DONE)
         if st.worktree:
             self.ws.remove(Path(st.worktree))
         if st.obligations:
@@ -2167,6 +2982,52 @@ class Engine:
         self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
         self._set_phase(n, Phase.DONE)
         self._close_trackers(n)
+
+    def _merged_pull(self, st: IssueState) -> dict:
+        """The pull request this round merged, as GitHub records it. Empty when the round merged
+        none (nothing was left to land) or GitHub does not show it merged."""
+        if not st.pr or not st.branch:
+            return {}
+        pr = self._safe(self.gh.find_pr, st.branch) or {}
+        return pr if pr.get("number") == st.pr and (pr.get("merged") or pr.get("merged_at")) else {}
+
+    def _ci_discharged(self, n: int, st: IssueState) -> dict[str, dict]:
+        """The owner items a CI job proves on the head that was merged (ADR 0001, amendment 5), each
+        with its evidence record. An item is one when all of this holds: the plan gives it to the
+        owner for a capability that `[host] ci_jobs` maps to a job; its text names a test under
+        `tests/container/`; and the check run of that job's name on the merged pull request's head
+        (the commit the required check was read on) is completed with the conclusion `success`.
+        The record carries the check run's address (`address`): the page of that check run in the
+        repository, `runs/<id>` beside the pull request's own page, since the client returns a
+        check run's id and not its address. Anything less discharges nothing and the obligation
+        stays the owner's: no mapping, no such test, no merged pull request with a head and an
+        address, no check run, one that is not completed, was skipped or failed, one without an
+        id, or a read GitHub did not answer.
+
+        The plan is read, not `obligations`: this step runs again when a publication ends it, and
+        the second pass, which finds the obligation already removed, records the same evidence."""
+        texts = self._item_text(n)
+        jobs = {i["id"]: self.ci_jobs[i["capability"]] for i in self._items(st)
+                if i["proof"] == "owner" and i.get("capability") in self.ci_jobs
+                and CONTAINER_TEST.search(texts.get(i["id"], ""))}
+        pr = self._merged_pull(st) if jobs else {}
+        head = (pr.get("head") or {}).get("sha")
+        home = PULL_ADDRESS.match(pr.get("html_url") or "")
+        if not head or not home:
+            return {}
+        runs = {job: self._safe(self.gh.required_check_run, head, job) or {} for job in sorted(set(jobs.values()))}
+        out = {}
+        for item, job in jobs.items():
+            run = runs[job]
+            if run.get("status") != "completed" or run.get("conclusion") != "success" or not run.get("id"):
+                continue
+            address = f"{home.group(1)}/runs/{run['id']}"
+            record = Evidence(criterion=item, kind=CHECK_RUN_EVIDENCE, command=None, cwd=".", head_sha=head,
+                              exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
+                              note=f"the check run `{job}` succeeded on the merged head `{head[:12]}`: {address}",
+                              verifier="check run")
+            out[item] = asdict(record) | {"address": address, "check": job}
+        return out
 
     def _obligation_text(self, o: dict) -> str:
         if o["kind"] == "deferred":
@@ -2244,8 +3105,8 @@ class Engine:
         # verifier (every earlier issue's checks on the reverted tree), the other vendor's
         # certificate for the exact head, and the required check on it.
         waited = 0
-        while not self.claims.acquire(MERGE_QUEUE, self.owner):
-            if waited >= self.caps.queue_wait_s:
+        while not self._take_queue(n):
+            if waited >= self.caps.queue_wait_s or self._unreleasable_hold(n):
                 return self._wait(n, WAIT_MERGE_QUEUE, "the revert waits for the merge queue", resume=Phase.MERGED)
             self.sleep(self.caps.queue_poll_s)
             waited += max(self.caps.queue_poll_s, 1)
@@ -2292,14 +3153,25 @@ class Engine:
             if not exam.certify or serious:
                 why = exam.summary[:300] if not exam.certify else "; ".join(f.title for f in serious)[:300]
                 return self._fail(n, "main_broken", f"the other vendor did not certify the revert: {why}")
-            self.ws.push(wt)
-            if self.ws.head(wt) != head:
+            local = self._local_scan(wt, main_sha, head)   # the owner's own look, as before any push
+            if local and (local[0] or local[1]):
+                return self._fail(n, "main_broken", "the revert fails the scan with the owner's local values, so it is not "
+                                                    "pushed: " + "; ".join(local[0] or local[1])[:500])
+            # Before any push, as in the land step: a revert of a change to a workflow file changes
+            # that file again, and the engine pushes no such commit, whatever identity it runs as.
+            # The certified revert is the owner's to push and to merge (`_owner_revert`).
+            workflows = self._workflow_paths(wt, main_sha, head)
+            if workflows:
+                st = self.store.issue(n)
+                st.owner_landing = {"branch": branch, "head": head, "paths": workflows, "announced": None,
+                                    "published": None, "revert": True, "of": [pr["number"] for pr in merged],
+                                    "feedback": [f[:1500] for f in feedback]}
+                self.store.put(st)
+                self.store.event("owner_landing", issue=n, branch=branch, head=head, paths=workflows, revert=True)
+                return self._owner_revert(n, made=True)
+            if not self._push(wt, head if local is not None else None) or self.ws.head(wt) != head:
                 return self._fail(n, "main_broken", "main moved while the revert was being certified")
-            prs = ", ".join(f"#{pr['number']}" for pr in merged)
-            body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
-                    f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
-                    f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
-            rpr = self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
+            rpr = self._revert_pull(n, branch, [pr["number"] for pr in merged], feedback)
             conclusion, _ = self._wait_required(head)
             if conclusion != "success":
                 return self._fail(n, "main_broken", f"the revert PR #{rpr['number']} did not pass the required check "
@@ -2310,15 +3182,79 @@ class Engine:
             if wt is not None:
                 self.ws.remove(wt)
             self.claims.release(MERGE_QUEUE, self.owner)
+        self._reverted(n, rpr["number"], feedback)
+
+    def _revert_pull(self, n: int, branch: str, of: list[int], feedback: list[str]) -> dict:
+        """Open the pull request of a revert of the pull requests `of`, from `branch`."""
+        prs = ", ".join(f"#{number}" for number in of)
+        body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
+                f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
+                f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
+        return self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
+
+    def _reverted(self, n: int, pr: int, feedback: list[str]) -> None:
+        """The revert is merged: the issue is delivered again in a new round, unless it was reverted
+        once too often."""
         st = self.store.issue(n)
         if st.reverts > self.caps.reverts:
-            return self._fail(n, "main_broken", f"its delivery broke main again and was reverted in PR #{rpr['number']}: "
+            return self._fail(n, "main_broken", f"its delivery broke main again and was reverted in PR #{pr}: "
                                                 + "; ".join(feedback)[:500])
-        self._new_round(st, feedback + [(f"Your earlier delivery was reverted in PR #{rpr['number']} because it broke "
+        self._new_round(st, feedback + [(f"Your earlier delivery was reverted in PR #{pr} because it broke "
                                          f"main; deliver it again without breaking it.")], owner_edit=False)
         st.phase = Phase.PLANNED if st.plan else Phase.PENDING
         self.store.put(st)
         self._sync(n)
+
+    def _owner_revert(self, n: int, made: bool = False) -> None:
+        """A certified revert that changes a workflow file is landed by the owner, like the change
+        it undoes: the engine pushes nothing and merges nothing. `made`: the revert was made and
+        certified by the calling step, which holds the merge queue and releases it; this posts the
+        comment that names the revert's branch and head, with the command that pushes it. Each
+        resumed step (`_step_accept`) then looks again. The remote branch at the certified head:
+        the pull request is opened, once. That pull request merged with that head, or with one
+        that descends from it: the issue starts its next round, as after any revert. The revert
+        no longer merges into a main that moved: the issue ends `failed` (`main_broken`), as when
+        main moves while a revert is being certified. Otherwise it keeps waiting
+        (`WAIT_OWNER_LANDING`), and no landing claim is held."""
+        st = self.store.issue(n)
+        record = self._owner_record(st)
+        assert record is not None
+        branch, head, of = record["branch"], record["head"], list(record.get("of") or [])
+        feedback = list(record.get("feedback") or [])
+        pr = None if made else self.gh.find_pr(branch)
+        if pr and (pr.get("merged") or pr.get("merged_at")):
+            merged_head = (pr.get("head") or {}).get("sha") or head
+            if self._delivery(st, merged_head, reviewed=head)[0] != "stale":
+                self.store.event("reverted", issue=n, pr=pr["number"], of=of, head=merged_head, by="owner")
+                st.owner_landing = None
+                self.store.put(st)
+                return self._reverted(n, pr["number"], feedback)
+        if not made:
+            self.ws.fetch()
+            if not self.ws.is_ancestor(self.ws.repo, self.ws.base_ref(), head):
+                wt = self.ws.issue_worktree(n, branch)   # the revert's branch: the issue's own worktree is gone
+                try:
+                    moved = self.ws.head(wt) != head
+                    files = [] if moved else self._conflicts_with_main(wt, pr, head)
+                finally:
+                    self.ws.remove(wt)
+                if moved or files:
+                    st.owner_landing = None
+                    self.store.put(st)
+                    why = (f"the branch `{branch}` is no longer at the certified revert `{head[:12]}`" if moved else
+                           f"main moved, and the certified revert `{head[:12]}` on `{branch}` no longer merges into it "
+                           f"without a conflict ({', '.join(files)[:300]})")
+                    return self._fail(n, "main_broken", (
+                        f"{why}; it was the owner's to land, because it changes a workflow file, and the loop pushed "
+                        f"nothing of it: " + "; ".join(feedback)[:400]))
+        if record.get("announced") != head:
+            self._hand_over(n, record, (
+                f"`main` fails after the merge of {', '.join(f'#{number}' for number in of)}, and one fix-forward did "
+                f"not repair it, so the loop made a revert, and {self.other} certified it."))
+            self.store.put(st)
+        detail = self._owner_pull(n, record, lambda: self._revert_pull(n, branch, of, feedback))
+        self.store.put(st)
+        self._wait(n, WAIT_OWNER_LANDING, f"a revert: {detail}", resume=Phase.MERGED)
 
     def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
         """Re-run the commands of the run's earlier issues on `main` after a merge."""
@@ -2372,6 +3308,14 @@ class Engine:
             body = (self._safe(self.gh.get_issue, n) or {}).get("body") or ""
             items = issue_parser.ledger(body)
             if items and all(i.checked for i in items):
+                try:
+                    self._announce(n, replace(st, human_tasks=[]), Phase.DONE)
+                except RedactionUnavailable as e:
+                    # It stays open and waits, to be delivered again and closed by a later run: left
+                    # delivered it would be settled for the supervisor, which would stop there.
+                    self.store.event("progress_not_published", issue=n, phase=Phase.DONE.value, error=str(e)[:300])
+                    self._wait(n, WAIT_GITHUB, str(e)[:300], resume=Phase.DELIVERED)
+                    continue
                 self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
                 self.store.event("owner_evidence_complete", issue=n)
                 self._set_phase(n, Phase.DONE, human_tasks=[])
@@ -2433,7 +3377,10 @@ class Engine:
 
     def _post_run_summary(self) -> None:
         states = {n: self.store.issue(n) for n in self.plan.work}
-        self._upsert_comment(self.plan.root, report.RUN_MARKER, report.render_run_summary(self.plan.root, states))
+        try:
+            self._upsert_comment(self.plan.root, report.RUN_MARKER, report.render_run_summary(self.plan.root, states))
+        except RedactionUnavailable as e:   # no issue's state depends on it; the next run writes its own
+            self.store.event("run_summary_not_published", error=str(e)[:300])
 
 
 def has_conflict_markers(path: Path) -> bool:
@@ -2492,6 +3439,34 @@ def history_places(outputs: list[str]) -> list[str]:
     feedback to the builder), and an excerpt shows the text around a value."""
     places = [OBJECT_ID.sub(r"@\1", m) for out in outputs for m in HISTORY_PLACE.findall(out)]
     return list(dict.fromkeys(places)) or ["see the `history_refused` event in the run's `events.jsonl`"]
+
+
+# One finding as the scanner prints it: `path:line: rule: excerpt`, the path with `@<blob id>` after
+# it in a history scan (`<commit>@<commit id>` for a commit's own text).
+LOCAL_FINDING = re.compile(r"^(.+?)(?:@[0-9a-f]{12})?:\d+: ([a-z][a-z0-9-]*): ", re.MULTILINE)
+
+
+def local_places(output: str) -> list[str]:
+    """What the engine keeps of the findings of a scan with the owner's local values:
+    `<path>: <rule>`, each once. Not the line, not the object and not the excerpt: the excerpt
+    shows the text around the owner's value, and the rest says where in it to look. The path is as
+    the scanner printed it, which masks a value in a file's name."""
+    return list(dict.fromkeys(f"{path[:200]}: {rule}" for path, rule in LOCAL_FINDING.findall(output)))
+
+
+# The `pre-push` hook of a scanned push (`Engine._push`). git gives it, on standard input, one line
+# for each ref it is about to update: `<local ref> <local commit> <remote ref> <remote commit>`.
+PUSH_GUARD = """#!/bin/sh
+# Written by the implement loop's engine for one push, and removed after it. git may publish the
+# commit the engine scanned with the owner's local values, and no other.
+while read -r ref commit rest; do
+  if [ "$commit" != "{only}" ]; then
+    echo "[loop] not pushed: $commit is not the commit that was scanned ({only})" >&2
+    exit 1
+  fi
+done
+exit 0
+"""
 
 
 def environment_problem(evidence: list[dict]) -> str | None:

@@ -16,7 +16,7 @@ from typing import cast
 
 from . import VERSION, environment, report, sandbox
 from .config import CEILINGS, Config, load_policy
-from .github import GhCli, GitHub, RecordingGitHub
+from .github import GhCli, GitHub, RecordingGitHub, RedactingGitHub
 from .graph import CycleError, build_plan
 from .model import Issue
 from .state import RunStore
@@ -37,10 +37,17 @@ def repo_slug() -> str:
     return out.stdout.strip()
 
 
+def github_client(slug: str) -> GitHub:
+    """The client of every command here, and so of every run the supervisor launches: whatever it
+    publishes on GitHub is masked first by the hygiene scanner of the checkout the engine runs
+    from (`github.RedactingGitHub`). It forwards every other GitHub method."""
+    return cast(GitHub, RedactingGitHub(GhCli(slug)))
+
+
 def cmd_plan(args) -> int:
     root = repo_root()
     try:
-        plan = build_plan(GhCli(args.repo or repo_slug()), args.issue, root)
+        plan = build_plan(github_client(args.repo or repo_slug()), args.issue, root)
     except CycleError as e:
         print(f"implement: {e}. Fix the blocked-by links before running.", file=sys.stderr)
         return 2
@@ -186,7 +193,7 @@ def cmd_costs(args) -> int:
     if not records:
         print(f"No agent call recorded for #{args.issue}.")
         return 0
-    gh = GhCli(args.repo or repo_slug())
+    gh = github_client(args.repo or repo_slug())
     numbers = sorted({*store.known(), *(r["issue"] for r in records if isinstance(r.get("issue"), int))})
     rep = cost_report(records, {n: Issue.from_api(gh.get_issue(n)).size for n in numbers})
     print(json.dumps(rep, indent=1) if args.json else render_costs(args.issue, rep))
@@ -229,7 +236,7 @@ def cmd_retry(args) -> int:
 
 
 def cmd_record(args) -> int:
-    rec = RecordingGitHub(GhCli(args.repo or repo_slug()))
+    rec = RecordingGitHub(github_client(args.repo or repo_slug()))
     build_plan(cast(GitHub, rec), args.issue, repo_root())   # it forwards every GitHub method
     rec.save(Path(args.out))
     print(f"Recorded {sum(len(v) for v in rec.fixture.values())} responses to {args.out}")
@@ -505,7 +512,7 @@ def cmd_run(args) -> int:
     # From here on every git process of this run (its own commands, ship.sh) ignores the hooks and
     # the monitor a worktree or an agent's git directory names: they would run outside the sandbox.
     os.environ.update(sandbox.engine_git_env(os.environ, runs_dir(root) / "no-hooks"))
-    gh = GhCli(slug)
+    gh = github_client(slug)
     try:
         plan = build_plan(gh, args.issue, root)
     except CycleError as e:
