@@ -1,8 +1,14 @@
 # Backlog
 
-The implement loop reads GitHub issues; it does not write them from a design. So the backlog is
-drafted here as files, one per issue, in the shape the loop's engine parses, then linted and
-published by `tools/backlog/` ([ADR 0001](../docs/adr/0001-software-factory.md), decision 7).
+**The backlog is this repository's GitHub issues**: one tracking issue per epic, its work as
+sub-issues, linked by their dependencies. The issue on GitHub is the source of truth; the implement
+loop reads it and writes its evidence there.
+
+The implement loop reads GitHub issues; it does not write them from a design. So new work is
+drafted here first, as files, one per issue, in the shape the loop's engine parses, then linted and
+published by `tools/backlog/` ([ADR 0001](../docs/adr/0001-software-factory.md), decision 7). Once
+published, a draft is removed by a later change, so `backlog/drafts/` is empty between two
+publications.
 
 ```
 scripts/backlog.sh lint               # every draft against the engine's input contract

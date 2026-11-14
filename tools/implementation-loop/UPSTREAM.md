@@ -105,8 +105,8 @@ during a run; a plan's protected zone is not granted by the examiner's silence; 
 the doctor first; check commands have no standard input.
 
 **Not in this version.** The deployment status of ADR 0001, decision 5: no `deploy_status`, no
-`[deploy]` table, no `deploying` phase. Nothing of it is in the engine. It is backlog issue E0-07
-(`backlog/drafts/E0/07-engine-deploying-phase.md`).
+`[deploy]` table, no `deploying` phase. Nothing of it is in the engine. It is backlog issue #12
+(draft E0-07).
 
 ## Tests removed or adapted
 

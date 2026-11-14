@@ -12,13 +12,14 @@ verified and merged changes come out, and nobody is in the loop during a run.
 
 ## Status
 
-**Design and factory scaffolding. Nothing is deployed.**
+**Design, factory and backlog in place. Nothing is deployed.**
 
 - The system design is proposed and awaits the owner's review.
-- The factory is scaffolded in the working tree and is inert: nothing is committed, nothing is
-  pushed (the GitHub repository exists, private and empty), there is no issue and no active git
-  hook. It stays that way until the owner goes through
-  [`docs/factory/green-light.md`](docs/factory/green-light.md).
+- The repository is on GitHub, private for now, and its backlog is published as GitHub issues:
+  one epic per phase of the design's rollout, each with its issues as sub-issues. The owner turns
+  the factory on step by step with [`docs/factory/green-light.md`](docs/factory/green-light.md);
+  until the ruleset, the git hooks and the factory's own token are in place, the implement loop
+  does not run.
 - There is no CDK application yet. The first backlog epic adds it.
 
 ## Where to read
@@ -30,13 +31,13 @@ verified and merged changes come out, and nobody is in the loop during a run.
 | [`docs/factory/`](docs/factory/) | Running the factory: the [green-light checklist](docs/factory/green-light.md) that turns it on, and how to [operate the implement loop](docs/factory/operating.md) |
 | [`AGENTS.md`](AGENTS.md) | The working conventions, for people and for every coding agent |
 | [`setup/README.md`](setup/README.md) | What a machine needs, and the one-time setup scripts |
-| [`backlog/`](backlog/) | The issue drafts the factory will work through |
+| [`backlog/`](backlog/README.md) | How new work is drafted and published as GitHub issues, which are the backlog |
 
 ## Layout
 
 ```
 docs/                       design, ADRs, factory runbooks
-backlog/                    issue drafts, published to GitHub Issues at the green light
+backlog/                    the issue format, and drafts waiting to be published as GitHub issues
 tools/implementation-loop/  the implement loop engine, vendored (see its UPSTREAM.md)
 tools/hygiene/              the public-repository scanner: no account ID, ARN or secret gets committed
 tools/backlog/              lints and publishes the backlog
