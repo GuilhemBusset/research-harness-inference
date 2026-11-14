@@ -49,6 +49,15 @@ class BranchNotRestored(GitError):
         self.branch = branch
 
 
+class BranchHeld(GitError):
+    """An issue's branch is checked out in another worktree that still exists, and git gives a
+    branch to one worktree at a time. Nothing of that worktree is touched."""
+
+    def __init__(self, message: str, branch: str):
+        super().__init__(message)
+        self.branch = branch
+
+
 class RepoLock:
     """Reentrant for one thread, exclusive across threads, Workspaces and processes: an
     `threading.RLock` plus an flock on a file in the repository's common git directory, taken
@@ -255,6 +264,23 @@ class Workspace:
             self.reattach(path)
             return path
         self.dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._add_issue_worktree(path, branch)
+        except GitError:
+            # git refuses a path or a branch it still has registered for a worktree. When that
+            # worktree's directory was deleted (by hand, or with the run's directory), the
+            # registration is all that is left of it and `prune` drops it: prune touches no
+            # worktree whose directory exists. The issue's worktree is then added again, on the
+            # branch as it stands (a refused `add -b` may have created it). A worktree that
+            # exists and holds the branch is another matter, named as such; any other refusal is
+            # raised again by the second attempt.
+            self.git("worktree", "prune")
+            if self._checked_out(branch):
+                raise BranchHeld(f"the branch {branch} is checked out in another worktree", branch) from None
+            self._add_issue_worktree(path, branch)
+        return path
+
+    def _add_issue_worktree(self, path: Path, branch: str) -> None:
         local = bool(self.git("branch", "--list", branch))
         if local:
             self.git("worktree", "add", "--quiet", str(path), branch)
@@ -264,7 +290,10 @@ class Workspace:
         else:
             self.fetch()
             self.git("worktree", "add", "--quiet", "-b", branch, str(path), self.base_ref())
-        return path
+
+    def _checked_out(self, branch: str) -> bool:
+        """Whether a registered worktree has `branch` checked out."""
+        return f"branch refs/heads/{branch}" in self.git("worktree", "list", "--porcelain").splitlines()
 
     def remove(self, path: Path) -> None:
         with self._mutex:
