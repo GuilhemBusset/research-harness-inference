@@ -5,9 +5,13 @@ least ten minutes left, and git gets one from a credential helper.
 GitHub is a stub on the loopback interface that answers the App's two endpoints and verifies the
 signature of each request with the public half of a key `openssl` generates here. `gh` is a
 script that records the token it was started with. git is the real one. Nothing reaches the
-network, and no key or token is written in this file: both are made at run time."""
+network, and no key or token is written in this file: both are made at run time.
+
+These tests run on the engine beside this file, whichever `implement_loop` the process loaded
+first (`the_engine_beside_these_tests`)."""
 
 import base64
+import contextlib
 import json
 import os
 import secrets
@@ -21,15 +25,57 @@ from unittest import mock
 
 import pytest
 
-from helpers import SHIP, TempRepo, git, issue_body
-from implement_loop import app_token, cli, environment, live, sandbox, verify
-from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import Caps, Config
-from implement_loop.engine import Engine
-from implement_loop.github import FakeGitHub, GhCli, GitHubError, GitHubUnavailable
-from implement_loop.graph import build_plan
-from implement_loop.state import RunStore
-from implement_loop.workspace import Workspace
+ENGINE = Path(__file__).resolve().parents[1]
+_beside: dict = {}   # the engine beside this file and its `helpers`, when the process holds another
+
+
+def _swap(modules: dict) -> dict:
+    """Put `modules` where the engine's modules and `helpers` are in `sys.modules`. Returns what was there."""
+    was = {name: module for name, module in sys.modules.items() if name.partition(".")[0] in ("implement_loop", "helpers")}
+    for name in was:
+        del sys.modules[name]
+    sys.modules.update(modules)
+    return was
+
+
+@contextlib.contextmanager
+def the_engine_beside_these_tests():
+    """The verifier loads its result plugin from the running engine, on PYTHONPATH. In an xdist
+    worker that leaves the running engine's `implement_loop` package loaded, and every later
+    import of the engine, from any test file, is then of the running engine: without
+    `app_token`, or with the one of another commit. So while this file is imported, and during
+    each of its tests, `sys.modules` holds the engine beside this file instead (its lazy
+    imports included), with a `helpers` of its own. The process's modules are put back after,
+    for the other test files. Where the engine loaded is already this one, nothing is done."""
+    loaded = getattr(sys.modules.get("implement_loop"), "__file__", None)
+    if loaded is None or Path(loaded).resolve().parents[1] == ENGINE:
+        yield
+        return
+    theirs = _swap(_beside)
+    try:
+        yield
+    finally:
+        _beside.update(_swap(theirs))
+
+
+with the_engine_beside_these_tests():
+    from helpers import SHIP, TempRepo, git, issue_body
+    from implement_loop import app_token, cli, environment, live, sandbox, verify
+    from implement_loop.agents import FakeAgents, Script
+    from implement_loop.config import Caps, Config
+    from implement_loop.engine import Engine
+    from implement_loop.github import FakeGitHub, GhCli, GitHubError, GitHubUnavailable
+    from implement_loop.graph import build_plan
+    from implement_loop.state import RunStore
+    from implement_loop.workspace import Workspace
+assert Path(app_token.__file__).resolve().parents[1] == ENGINE, "these tests are of the engine beside them"
+
+
+@pytest.fixture(autouse=True)
+def _on_the_engine_beside_these_tests():
+    with the_engine_beside_these_tests():
+        yield
+
 
 APP_ID, INSTALLATION_ID = "4242", "777"
 # What ADR 0001 grants the factory: no workflows, no administration.
