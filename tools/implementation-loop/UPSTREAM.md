@@ -108,6 +108,24 @@ the doctor first; check commands have no standard input.
 `[deploy]` table, no `deploying` phase. Nothing of it is in the engine. It is backlog issue #12
 (draft E0-07).
 
+### 1.2.0, patched: the pipeline stack and the bootstrap policies are protected (2026-11-14)
+
+A merge to `main` is deployment rights in the AWS account, so ADR 0001's first amendment adds the
+pipeline stack and the bootstrap policies to the protected paths. Issue #8 (draft E0-02) does it
+before either folder exists: a prefix protects whatever lands under it. The engine's version stays
+1.2.0: a new version revives every failed issue once, and nothing here repairs one.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/config.py` | `PROTECTED_PREFIXES` gains `src/rhi/pipeline/` and `setup/bootstrap/`. `PROTECTED_FILES`, the safety surface (`SAFETY_SURFACE_FILES`, `SAFETY_SURFACE_PREFIXES`) and every other constant are unchanged. | ADR 0001, amendment 1. Neither folder joins the safety surface: the amendment does not ask for it, and a fault-repair run whose issue names one may change it. |
+| `prompts/plan.md`, `prompts/decide.md` | The sentence that lists the protected paths names the pipeline stack under `src/rhi/pipeline/` and the bootstrap policies under `setup/bootstrap/`. The placeholders and the answer formats are unchanged. | The prompts repeat the engine's list for the builder that plans and for the examiner that decides a request. |
+
+Outside this directory:
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `AGENTS.md` | "Protected paths and the safety surface" names the two folders in place of "the pipeline definition, once it exists". | The section repeats the engine's list for people. |
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -164,6 +182,14 @@ itself sets under `GH_` or `GITHUB_` that the scrub keeps by design (a runner's 
 absent. `/run` inside holds the path to `resolv.conf` when the host keeps it there (Ubuntu's
 systemd-resolved), which the sandbox binds back on purpose, and nothing else. No assertion about
 what the sandbox hides or drops was removed.
+
+### 1.2.0, patched (2026-11-14)
+
+532 collected tests: the 529 of 1.2.0, none removed and none changed, and 3 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_protected_zones.py`: `PlanGrantTests` (3 more, 22 in the file) | Added: `test_the_pipeline_stack_and_the_bootstrap_policies_are_protected`, `test_a_plan_zone_there_is_withheld_unless_the_issue_names_it`, `test_neither_folder_is_on_the_safety_surface`. | A file under `src/rhi/pipeline/` or `setup/bootstrap/` is protected and the files beside the two folders are not; a plan that lists one gets it only when the issue's deliverables name it, or the folder above it; neither folder is on the safety surface, so a repair run whose issue names them is granted them. The three read the four lists from the `implement_loop/config.py` beside them (`judge_by_this_trees_lists`): under the verifier, the plugin of the running engine has already imported that engine's `implement_loop`, and `loop_pytest.py` drops it again only in the pytest that records, not in the xdist workers of `scripts/check.sh engine-tests`, where the tests would otherwise judge the running engine's lists. `loop_pytest.py` is on the safety surface and is not changed here. |
 
 ## Kept as recorded
 
