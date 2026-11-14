@@ -10,6 +10,8 @@ def test_merged_examiner_tests_still_collect() -> None:
     repo = Path(__file__).resolve().parents[2]
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
+    # Options from the environment can name a plugin that only that PYTHONPATH makes importable.
+    environment.pop("PYTEST_ADDOPTS", None)
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-c", str(repo / "pyproject.toml"),
          "--collect-only", "-q", "tests/examiner"],
