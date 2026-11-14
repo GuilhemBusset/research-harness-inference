@@ -86,7 +86,13 @@ from .model import (
     Phase,
 )
 from .state import FaultOutbox, RepoClaims, RunStore, runs_root
-from .workspace import AgentCall, BranchHeld, GitError, MergeConflict, UpdateResult, Workspace
+from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
+
+try:   # BranchHeld arrives with the workspace that adds a deleted worktree again
+    from .workspace import BranchHeld
+except ImportError:   # pragma: no cover - older workspace.py, which never raises it
+    class BranchHeld(GitError):
+        pass
 
 try:   # GitHubUnavailable arrives with the retrying GitHub client
     from .github import GitHubUnavailable
