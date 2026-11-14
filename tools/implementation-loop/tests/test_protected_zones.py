@@ -26,6 +26,7 @@ from test_engine import EngineCase
 TEXT = {"D1": "the gate script gains a step", "A1": "the new step passes on the change"}
 ZONES = [".github/workflows/ci.yml", "tools/hygiene", "tools/hygiene/scan.py", "scripts/check.sh", "tests/policy/",
          "tools", "docs/a.md", "infra/stack.py"]
+DEPLOYMENT = ["src/rhi/pipeline/stack.py", "setup/bootstrap/policies.yaml"]   # ADR 0001, amendment 1
 
 
 def body(*named: str) -> str:
@@ -144,6 +145,36 @@ class PlanGrantTests(unittest.TestCase):
         self.assertEqual(self.granted(st), {"docs/a.md": False})
         problems = gate.zone_problems([".claude/settings.json"], [{"path": ".claude/settings.json", "protected": True}], [], True)
         self.assertIn("a fault-repair run may not change the safety surface", "\n".join(problems))
+
+    def test_the_pipeline_stack_and_the_bootstrap_policies_are_protected(self):
+        # ADR 0001, amendment 1: a merge to `main` is deployment rights in the account
+        for path in DEPLOYMENT:
+            self.assertTrue(is_protected(path), path)
+        for path in ["src/rhi/stage.py", "src/rhi/pipeline.py", "setup/README.md", "setup/bootstrap.sh",
+                     "docs/src/rhi/pipeline/notes.md"]:
+            self.assertFalse(is_protected(path), f"{path}: the two folders, at the root, and nothing beside them")
+
+    def test_a_plan_zone_there_is_withheld_unless_the_issue_names_it(self):
+        st = self.plan(body("src/rhi/stage.py"), zones=["src/rhi/stage.py", *DEPLOYMENT])
+        self.assertEqual(self.granted(st), {"src/rhi/stage.py": False}, "a plan cannot reach them by listing them")
+        withheld = [e for e in self.events if e["kind"] == "protected_zones_withheld"]
+        self.assertEqual(withheld[0]["zones"], sorted(DEPLOYMENT))
+        problems = gate.zone_problems(DEPLOYMENT, st.grants, [], False)
+        self.assertIn(f"protected paths changed without approval: {DEPLOYMENT}", "\n".join(problems))
+        st = self.plan(body("src/rhi/pipeline/", "setup/bootstrap/policies.yaml"),
+                       zones=[*DEPLOYMENT, "setup/bootstrap/README.md"])
+        self.assertEqual(self.granted(st), dict.fromkeys(DEPLOYMENT, True),
+                         "the folder the issue names, the file it names, and not the file beside that one")
+        self.assertEqual(gate.zone_problems(DEPLOYMENT, st.grants, [], False), [])
+
+    def test_neither_folder_is_on_the_safety_surface(self):
+        for path in DEPLOYMENT:
+            self.assertFalse(is_safety_surface(path), path)
+        named = body("src/rhi/pipeline/", "setup/bootstrap/", "scripts/check.sh")
+        st = self.plan(named, zones=[*DEPLOYMENT, "scripts/check.sh"], repair=True)
+        self.assertEqual(self.granted(st), dict.fromkeys(DEPLOYMENT, True),
+                         "a repair run whose issue names them gets them, and not the gate script")
+        self.assertEqual(gate.zone_problems(DEPLOYMENT, st.grants, [], True), [])
 
     def test_a_path_named_outside_the_deliverables_is_not_a_grant(self):
         st = self.plan(body("docs/a.md"), zones=["docs/factory/operating.md", "scripts/check.sh"])

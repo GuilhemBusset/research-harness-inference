@@ -16,10 +16,12 @@ TEST_CONFIG_NAMES = frozenset({"conftest.py", "pytest.ini", "tox.ini", "setup.cf
 # unless the issue's own text names them: the loop's machinery, the repository's gates, the
 # invariants written as tests (ADR 0001, decision 10), and the agents' own configuration: a hook
 # or a setting added under `.claude/`, `.agents/` or `.codex/` would run later in the owner's own
-# session, outside the sandbox (amendment 6).
+# session, outside the sandbox (amendment 6). A merge to `main` is deployment rights in the account,
+# so the pipeline stack and the bootstrap policies are protected too (amendment 1). They are not on
+# the safety surface below.
 AGENT_CONFIG_PREFIXES = (".claude/", ".agents/", ".codex/")
 PROTECTED_PREFIXES = ("tools/implementation-loop/", "tools/hygiene/", ".github/", ".githooks/", "tests/policy/",
-                      *AGENT_CONFIG_PREFIXES)
+                      *AGENT_CONFIG_PREFIXES, "src/rhi/pipeline/", "setup/bootstrap/")
 PROTECTED_FILES = frozenset({"scripts/check.sh", "scripts/check-loop-guard.sh", "scripts/implement.sh",
                              "scripts/ship.sh", "setup/pr-only-main.json"})
 
