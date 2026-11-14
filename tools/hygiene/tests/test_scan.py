@@ -122,6 +122,9 @@ POSITIVES = [
     ("home-path", f"{WINDOWS_HOME}\\Desktop", "windows"),
     ("home-path", j("/ho", "me/", "émile/x"), "a name in another script"),
     ("home-path", j("\\\\wsl$\\Ubuntu\\ho", "me\\", "alice"), "wsl, seen from windows"),
+    # More cases, and what stays quiet, are in test_console_and_badges.py.
+    ("console-link", j("https", "://", "eu-north-1.console", ".aws.amazon.com/ec2/home"), "regional console"),
+    ("build-badge", j("https", "://", "codebuild", ".eu-north-1.amazonaws.com/badges?uuid=example"), "codebuild"),
 ]
 
 PLACEHOLDERS = [
