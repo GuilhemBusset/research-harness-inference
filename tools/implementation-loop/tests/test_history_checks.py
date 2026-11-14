@@ -7,23 +7,32 @@ starts on a new branch: no round of the builder could take a commit back.
 Before that, nothing an agent wrote is committed without the standing checks: the builder's
 rounds (test_standing_checks.py) and, here, the examiner's probes.
 
-Like the standing checks, the history checks are off for the rest of the suite (`helpers.py`)."""
+Like the standing checks, the history checks are off for the rest of the suite (`helpers.py`).
+
+Last, the owner's own look (issue #16): no public pattern can name the real domain, so the owner
+keeps such values in a list outside the repository, which does not exist in the sandbox. The
+engine, which runs outside it, scans the head and its commits with that list immediately before
+each push, with the scanner of its own checkout, and keeps of a finding the path and the rule."""
 
 import argparse
+import importlib
 import io
 import json
 import os
+import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import HISTORY_CHECKS, STANDING_CHECKS, git, present
+from helpers import HISTORY_CHECKS, REPO_ROOT, SHIP, STANDING_CHECKS, git, issue_body, present
 from implement_loop import cli, config, sandbox
 from implement_loop import engine as engine_module
 from implement_loop.agents import FakeAgents, Probe
 from implement_loop.engine import Engine, history_findings, history_places
 from implement_loop.model import IssueState, Phase
+from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
 from test_engine import EPIC, EngineCase
 from test_standing_checks import ACCOUNT, LeakAgents, add_scanner
 
@@ -67,6 +76,11 @@ class HistoryCase(EngineCase):
         pinned = mock.patch.dict(os.environ, sandbox.engine_git_env(os.environ, self.repo.tmp / "no-hooks"))
         pinned.start()
         self.addCleanup(pinned.stop)
+        # and no list of the owner's own values, whatever the machine that runs the suite holds
+        unlisted = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.repo.tmp / "no-config")})
+        unlisted.start()
+        self.addCleanup(unlisted.stop)
+        os.environ.pop("HYGIENE_LOCAL_VALUES", None)
         seed = self.repo.tmp / "seed"
         add_scanner(seed)
         git("add", "-A", cwd=seed)
@@ -411,6 +425,320 @@ class ProbesAreScannedBeforeTheyAreCommittedTests(HistoryCase):
         self.assertEqual(summary["phases"], {"done": 1})
         self.assertEqual(calls.count("probes"), 1, "all of an examination's probes in one scan")
         self.assertEqual(self.events("examined", 2)[0]["adopted"], ["checks/probe_2.sh", "checks/probe_2_A1.sh"])
+
+
+# ---------------------------------------------------------------- the owner's list (issue #16)
+
+# A value of the owner's list and the line a builder wrote it on, put together at run time.
+VALUE = "-".join(("quartz", "lantern", "meridian"))
+LINE = f"zephyr harbour {VALUE} velvet anchor"
+NOTE = "docs/note.txt"
+NOTED = f"{NOTE}: local-value"   # all the engine keeps of the finding
+SECRET = (VALUE, "zephyr harbour", "velvet anchor", "[redacted")   # the value, its line, the scanner's excerpt
+SCANNER = REPO_ROOT / "tools" / "hygiene"   # of the checkout the engine under test runs from
+
+
+class TheScanWithTheOwnersListTests(unittest.TestCase):
+    def test_its_commands_are_the_engines_own_scanner_over_the_head_and_its_commits(self):
+        self.assertEqual(L.config.LOCAL_VALUE_CHECKS, (("local-values", ("--rev", "{head}")),
+                                                       ("local-values-history", ("--history", "{base}..{head}"))))
+        start = (sys.executable, "-I", str(SCANNER / "scan.py"), "--config", str(SCANNER / "hygiene.toml"))
+        with mock.patch.object(L.config, "HISTORY_CHECKS", HISTORY_CHECKS):
+            self.assertEqual(L.config.local_value_checks("aaa", "bbb"),
+                             (("local-values", (*start, "--rev", "bbb")),
+                              ("local-values-history", (*start, "--history", "aaa..bbb"))))
+        with mock.patch.object(L.config, "HISTORY_CHECKS", ()):
+            self.assertEqual(L.config.local_value_checks("aaa", "bbb"), (), "off with the history checks, as for the suite")
+
+    def test_the_list_is_where_the_scanner_looks_for_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(L.config.local_values_file({"XDG_CONFIG_HOME": tmp}))
+            default = Path(tmp) / "research-harness-inference" / "hygiene-values"
+            default.parent.mkdir()
+            default.write_text("")
+            self.assertEqual(L.config.local_values_file({"XDG_CONFIG_HOME": tmp}), default)
+            named = str(Path(tmp) / "not-there")   # a file named that way must exist: the scanner says so, not the engine
+            self.assertEqual(L.config.local_values_file({"XDG_CONFIG_HOME": tmp, "HYGIENE_LOCAL_VALUES": named}), Path(named))
+
+    def test_of_a_finding_the_engine_keeps_the_path_and_the_rule(self):
+        output = (f"{NOTE}:1: local-value: zephyr harbour [redacted local-value] velvet anchor\n"
+                  f"{NOTE}@{'ab12' * 3}:7: local-value: zephyr harbour [redacted local-value] velvet anchor\n"
+                  "<commit>@ff7ab7681631:1: local-value: Author: A <[redacted local-value]>\n"
+                  "checks/x.sh:0: account-id: in the file name\n")
+        self.assertEqual(L.engine.local_places(output), [NOTED, "<commit>: local-value", "checks/x.sh: account-id"])
+        self.assertEqual(L.engine.local_places("hygiene: 3 files scanned, 1 findings\n"), [])
+
+
+class Inside(L.sandbox.PassThrough):
+    """A launch as the sandbox makes it, in the one respect these tests are about: the owner's
+    list does not exist in there. A marker tells a command that it was started this way."""
+
+    def __init__(self, nothing: Path):
+        self.nothing = nothing
+
+    def command(self, argv, cwd, vendor=None, mounts=None):
+        return ["env", "-u", "HYGIENE_LOCAL_VALUES", f"XDG_CONFIG_HOME={self.nothing}", "LOOP_LAUNCHED=inside",
+                *super().command(argv, cwd, vendor, mounts)]
+
+
+class OwnersValueAgents(L.agents.FakeAgents):
+    """Builds what the issue asks for and, in its first `rounds` builds, a note with a value of
+    the owner's list on it. Keeps everything an agent is given, for a test to search."""
+
+    def __init__(self, scripts, rounds: int):
+        super().__init__(scripts)
+        self.rounds = rounds
+        self.given: list[str] = []
+
+    def plan(self, vendor, req, worktree):
+        result = super().plan(vendor, req, worktree)
+        result.zones.append(NOTE)
+        return result
+
+    def build(self, vendor, req, plan, worktree, feedback):
+        self.given.append(repr((req, plan, feedback)))
+        result = super().build(vendor, req, plan, worktree, feedback)
+        if self._built[req.issue.number] <= self.rounds:
+            (worktree / NOTE).write_text(LINE + "\n")
+        else:
+            (worktree / NOTE).unlink(missing_ok=True)
+        return result
+
+    def examine(self, vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since):
+        self.given.append(repr((req, plan, evidence, memory, requests)))
+        return super().examine(vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since)
+
+
+class OwnersListCase(HistoryCase):
+    """The repository and the checks of `HistoryCase`, a list of the owner's values outside the
+    sandbox, and the engine beside these tests (`L`): in an xdist worker under the verifier,
+    `implement_loop` is the engine that runs the loop, which has no such scan while this is built."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh = L.github.FakeGitHub(on_merge=self.repo.merge)
+        self.values = self.repo.tmp / "owner" / "hygiene-values"
+        self.values.parent.mkdir()
+        self.values.write_text(f"# what no public pattern can name\n{VALUE}\n")
+        self.outside: list[tuple[str, ...]] = []   # every command the engine started outside the sandbox
+        real = L.engine.Engine._outside
+
+        def recorded(engine, argv, env):
+            self.outside.append(tuple(argv))
+            return real(engine, argv, env)
+        for patcher in (mock.patch.object(L.config, "STANDING_CHECKS", STANDING_CHECKS),
+                        mock.patch.object(L.config, "HISTORY_CHECKS", HISTORY_CHECKS),
+                        mock.patch.dict(os.environ, {"HYGIENE_LOCAL_VALUES": str(self.values)}),
+                        mock.patch.object(L.engine.Engine, "_outside", recorded)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        L.sandbox.use(Inside(self.repo.tmp / "no-config"))
+        self.addCleanup(L.sandbox.use, L.sandbox.PassThrough())
+        self.logged: list[str] = []
+
+    def issue(self, n: int, content: str, blocked_by=(), **script) -> None:
+        body = issue_body(f"feat/issue-{n}", [f"`docs/a.txt` contains `{content}`."], ["The test passes on main."])
+        self.gh.add_issue(n, f"Issue {n}", body, labels=("size:S",), blocked_by=blocked_by)
+        self.scripts[n] = L.agents.Script(files={"docs/a.txt": content}, **script)
+
+    def work(self, **script) -> None:
+        self.issue(2, "alpha", **script)
+        self.epic(2)
+
+    def run_engine(self, agents=None, caps=None, fresh=False, policy=None):
+        self.agents = agents or L.agents.FakeAgents(self.scripts)
+        self.store = L.state.RunStore.for_root(self.repo.work, EPIC, fresh=fresh)
+        engine = L.engine.Engine(
+            L.graph.build_plan(self.gh, EPIC, self.repo.work), self.store, self.gh,
+            L.workspace.Workspace(self.repo.work, EPIC, SHIP, base_dir=self.repo.loop_dir), self.agents,
+            L.config.Config(repo="test/test", caps=caps or L.config.Caps(ci_poll_s=0, queue_poll_s=0)),
+            repo_root=self.repo.work, log=self.logged.append, sleep=lambda s: None, policy=policy or self.policy)
+        return engine.run()
+
+    def retry(self) -> str:
+        cli_beside = importlib.import_module(f"{L.engine.__package__}.cli")
+        with mock.patch.object(cli_beside, "repo_root", return_value=self.repo.work), redirect_stdout(io.StringIO()) as out:
+            cli_beside.cmd_retry(argparse.Namespace(issue=EPIC, items=[]))
+        return out.getvalue()
+
+    def ended(self, n: int = 2) -> tuple[str, str | None]:
+        st = self.store.issue(n)
+        return st.phase.value, (st.fail or {}).get("cause")
+
+    def kept(self) -> str:
+        """Everything the engine sent to GitHub, gave an agent, logged or wrote into the run's records."""
+        gh = self.gh
+        files = [p.read_text(errors="replace") for p in sorted(self.store.dir.rglob("*")) if p.is_file()]
+        return "\n".join([json.dumps([gh.issues, gh.comments, gh.prs, gh.statuses, gh.calls], default=repr),
+                          *getattr(self.agents, "given", []), *self.logged, *files])
+
+    def hooks(self) -> list[Path]:
+        return list((self.repo.tmp / "no-hooks").iterdir())
+
+
+class OwnersListTests(OwnersListCase):
+    def test_a_value_in_the_tree_of_the_head_ends_the_issue_and_only_its_place_is_passed_on(self):
+        self.work()
+        agents = OwnersValueAgents(self.scripts, rounds=1)
+        self.run_engine(agents)
+        st = self.store.issue(2)
+        self.assertEqual(self.ended(), ("failed", "history"))
+        [refused] = self.events("history_refused", 2)
+        self.assertEqual((refused["branch"], refused["findings"], refused["output"]), ("feat/issue-2", [NOTED], []))
+        self.assertEqual(git("show", f"{refused['head']}:{NOTE}", cwd=self.repo.work), LINE, "in the tree of that head")
+        self.assertTrue([c for c in agents.calls if c[0] == "examine"], "which every check in the sandbox passed")
+        self.assertEqual(self.gh.prs, {})
+        self.assertNotIn("feat/issue-2", self.remote_branches(), "nothing of it was pushed")
+        self.assertNotIn(VALUE, self.published())
+        self.assertEqual((st.branch, st.round, st.worktree), ("feat/issue-2-r2", 2, None))
+        self.assertTrue(git("branch", "--list", "feat/issue-2", cwd=self.repo.work), "the abandoned branch stays, locally")
+        [fault] = [i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]]
+        detail = (st.fail or {}).get("detail", "")
+        self.assertIn("the scan with the owner's local values", detail)
+        for text in (detail, fault["body"], st.feedback[0]):
+            self.assertIn(NOTED, text)
+        for secret in SECRET:
+            self.assertNotIn(secret, self.kept())
+        self.assertEqual(self.hooks(), [])
+
+        self.assertIn("#2 gets a fresh ceiling", self.retry())
+        summary = self.run_engine(agents)
+        self.assertEqual(summary["phases"], {"done": 1})
+        pr = self.gh.prs[present(self.store.issue(2).pr)]
+        self.assertEqual((pr["head"]["ref"], pr["merged"]), ("feat/issue-2-r2", True), "the retry built on a new branch")
+        told = next(c for c in agents.calls[::-1] if c[0] == "build")[3]
+        self.assertTrue(any("`feat/issue-2`, was abandoned" in f and NOTED in f for f in told), told)
+        self.assertNotIn("feat/issue-2\n", self.remote_branches() + "\n", "the abandoned branch was never pushed")
+        self.assertNotIn(VALUE, self.published())
+        for secret in SECRET:
+            self.assertNotIn(secret, self.kept())
+
+    def test_a_value_only_in_an_earlier_commit_of_the_branch_ends_the_issue_as_well(self):
+        self.work(wrong_attempts=1)   # the second build repairs the file and takes the note away
+        agents = OwnersValueAgents(self.scripts, rounds=1)
+        self.run_engine(agents)
+        self.assertEqual(self.ended(), ("failed", "history"))
+        [refused] = self.events("history_refused", 2)
+        self.assertEqual(refused["findings"], [NOTED])
+        self.assertEqual(len([c for c in agents.calls if c[0] == "build"]), 2)
+        self.assertNotIn(NOTE, git("ls-tree", "-r", "--name-only", refused["head"], cwd=self.repo.work), "the head is clean")
+        self.assertIn(VALUE, git("log", "-p", "feat/issue-2", cwd=self.repo.work), "its history is not")
+        self.assertEqual(self.gh.prs, {})
+        self.assertNotIn("feat/issue-2", self.remote_branches())
+        self.assertNotIn(VALUE, self.published())
+        self.assertEqual(self.store.issue(2).branch, "feat/issue-2-r2")
+
+    def test_a_branch_whose_own_scanner_accepts_everything_is_still_refused(self):
+        ran = self.repo.tmp / "branch-scanner.log"   # the copy notes each of its runs, and where it was started
+        seed = self.repo.tmp / "seed"
+        (seed / "tools" / "hygiene" / "scan.py").write_text(
+            f"import os\nwith open({str(ran)!r}, 'a') as f:\n    f.write(os.environ.get('LOOP_LAUNCHED', 'outside') + '\\n')\n")
+        git("commit", "-q", "-am", "a scanner that accepts everything", cwd=seed)
+        git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        self.work()
+        self.run_engine(OwnersValueAgents(self.scripts, rounds=1))
+        self.assertEqual(self.ended(), ("failed", "history"))
+        self.assertEqual(self.events("history_refused", 2)[0]["findings"], [NOTED])
+        self.assertEqual(set(ran.read_text().split()), {"inside"}, "the branch's copy ran, and only in the sandbox")
+        self.assertEqual(len(self.outside), 2)
+        for argv in self.outside:
+            self.assertEqual(argv[1:5], ("-I", str(SCANNER / "scan.py"), "--config", str(SCANNER / "hygiene.toml")))
+            self.assertFalse([a for a in argv if str(self.repo.tmp) in a], "no file of the branch or of its repository")
+        self.assertNotIn("feat/issue-2", self.remote_branches())
+
+    def test_with_no_list_nothing_runs_outside_the_sandbox_and_the_push_goes_ahead(self):
+        del os.environ["HYGIENE_LOCAL_VALUES"]   # and the configuration directory holds none (`HistoryCase`)
+        self.work()
+        summary = self.run_engine(OwnersValueAgents(self.scripts, rounds=1))
+        self.assertEqual(summary["phases"], {"done": 1})
+        self.assertEqual(self.outside, [])
+        self.assertFalse(self.events("history_refused") + self.events("push_withheld"))
+        self.assertEqual(self.repo.main_file(NOTE), LINE, "what only the owner's list could have stopped")
+        self.assertEqual(self.hooks(), [], "and git was given no hook")
+
+    def test_a_list_that_cannot_be_read_withholds_the_push(self):
+        self.values.write_bytes(b"\xff\xfe\xff")   # not text: no user can read it as a list
+        self.work()
+        self.run_engine()
+        self.assertEqual(self.ended(), ("failed", "no_progress"))
+        withheld = self.events("push_withheld", 2)
+        self.assertTrue(withheld)
+        for event in withheld:
+            self.assertEqual(len(event["problems"]), 2, "the tree and the commits: neither was scanned")
+            self.assertTrue(all("could not run (exit 2)" in p for p in event["problems"]), event["problems"])
+        self.assertTrue(self.outside)
+        self.assertFalse(self.events("history_refused"), "no finding: the branch is not abandoned")
+        self.assertEqual(self.gh.prs, {})
+        self.assertNotIn("feat/issue-2", self.remote_branches(), "a head the owner's list was not held against is not pushed")
+
+    def test_without_a_hooks_directory_of_its_own_the_engine_scans_nothing_and_pushes_nothing(self):
+        # the engine's git is pinned in every run (`cli.cmd_run`); were it not, a scanned push could not be guarded
+        self.work()
+        with mock.patch.object(L.engine.Engine, "_own_hooks", lambda engine, wt: None):
+            self.run_engine()
+        self.assertEqual(self.ended(), ("failed", "no_progress"))
+        self.assertTrue(self.events("push_withheld", 2))
+        self.assertEqual((self.outside, self.gh.prs), ([], {}))
+        self.assertNotIn("feat/issue-2", self.remote_branches())
+
+    def test_a_head_that_shipping_made_after_the_scan_is_not_pushed_before_it_is_scanned(self):
+        # ship.sh fetches main again before it pushes. Here main moves between the scan and that
+        # fetch, so shipping rebases the branch: a head and commits the scan never saw.
+        self.work()
+        quick = self.repo.tmp / "bin"   # ship.sh waits between its attempts to push
+        quick.mkdir()
+        (quick / "sleep").write_text("#!/bin/sh\n")
+        (quick / "sleep").chmod(0o755)
+        scans, pushes = [], []
+        scan, push = L.engine.Engine._local_scan, L.engine.Engine._push
+
+        def scan_then_main_moves(engine, wt, base, head):
+            result = scan(engine, wt, base, head)
+            scans.append((head, result))
+            if len(scans) == 1:
+                seed = self.repo.tmp / "seed"
+                (seed / "elsewhere.txt").write_text("another change lands\n")
+                git("add", "-A", cwd=seed)
+                git("commit", "-q", "-m", "main moves", cwd=seed)
+                git("push", "-q", "origin", "HEAD:main", cwd=seed)
+            return result
+
+        def push_and_look(engine, wt, scanned):
+            pushed = push(engine, wt, scanned)
+            pushes.append((scanned, pushed, self.remote_branches()))
+            return pushed
+        with mock.patch.dict(os.environ, {"PATH": f"{quick}{os.pathsep}{os.environ['PATH']}"}), \
+                mock.patch.object(L.engine.Engine, "_local_scan", scan_then_main_moves), \
+                mock.patch.object(L.engine.Engine, "_push", push_and_look):
+            summary = self.run_engine()
+        (first, pushed, remote), (second, again, _) = pushes
+        self.assertEqual((pushed, again), (False, True))
+        self.assertNotIn("feat/issue-2", remote, "nothing left the machine the first time")
+        [withheld] = self.events("push_withheld", 2)
+        self.assertEqual(withheld["head"], first)
+        self.assertNotIn(withheld["shipped"], [first, None], "shipping had made another head")
+        self.assertEqual(summary["phases"], {"done": 1})
+        head = self.gh.prs[present(self.store.issue(2).pr)]["head"]["sha"]
+        self.assertEqual((second, scans[-1]), (head, (head, ([], []))), "the head that was pushed is one the scan passed")
+        self.assertNotEqual(head, first)
+        self.assertEqual(self.hooks(), [], "the guard of a push does not outlive it")
+
+
+class OwnersListRevertTests(OwnersListCase):
+    def test_a_revert_with_a_value_of_the_owners_list_is_not_pushed(self):
+        # The words git puts into a revert commit's message are on the list: no earlier push holds them.
+        self.values.write_text("This reverts commit\n")
+        self.issue(2, "alpha")
+        self.issue(3, "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.epic(2, 3)
+        self.run_engine()
+        st = self.store.issue(3)
+        self.assertEqual(self.ended(3), ("failed", "main_broken"))
+        detail = (st.fail or {}).get("detail", "")
+        self.assertIn("the revert fails the scan with the owner's local values, so it is not pushed: <commit>: local-value", detail)
+        self.assertNotIn("[redacted", detail)
+        self.assertNotIn("-revert", self.remote_branches())
+        self.assertFalse(self.events("reverted", 3))
 
 
 if __name__ == "__main__":

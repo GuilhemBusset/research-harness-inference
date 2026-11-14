@@ -14,7 +14,7 @@ that call them.** No agent runs them.
 | `scripts/check.sh fast` and `all` | [uv](https://docs.astral.sh/uv/) | CI pins uv 0.11.28 (`.github/workflows/ci.yml`). uv fetches the Python in `.python-version`, and Python 3.12 for the engine tests |
 | The implement loop | The GitHub CLI (`gh`) logged in, the Claude Code and Codex CLIs both logged in, bubblewrap (`bwrap`) | See [`docs/factory/operating.md`](../docs/factory/operating.md); `scripts/implement.sh doctor` checks all of it |
 | `setup/apply-ruleset.sh` | `gh` logged in as a repository admin, `jq` | Once per repository |
-| `cdk synth`, once the CDK app exists | Node.js 22 or 24 with npm | The CDK CLI does not support other Node versions. It is installed from `package-lock.json` into `node_modules/`, never globally |
+| `cdk synth` and the synthesis tests | Node.js 24 with npm, as `node` on the `PATH` | The version [`.node-version`](../.node-version) names; Node 22 works too, and the CDK supports no other. See [Node and the CDK CLI](#node-and-the-cdk-cli) |
 | `scripts/check.sh container-tests` | A container runtime that answers `docker info` | Only for the tests under `tests/container/`, which CI runs. `fast` and `all` do not need it |
 
 No AWS credentials are needed for anything in this repository, and none should be reachable from
@@ -26,9 +26,44 @@ the shell an agent runs in. Deployment is CodePipeline's.
 uv sync --locked
 ```
 
-Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock): pytest,
-pytest-xdist, PyYAML, Ruff and ty, at the exact versions in [`pyproject.toml`](../pyproject.toml).
+Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock), at the
+exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the app runs on
+(aws-cdk-lib, constructs and cdk-nag) and the tools (pytest, pytest-xdist, PyYAML, Ruff and ty).
 `scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
+
+## Node and the CDK CLI
+
+```sh
+npm ci --ignore-scripts
+```
+
+Creates `node_modules/` (ignored by git) with the CDK CLI, the only dependency of
+[`package.json`](../package.json), at the exact version in
+[`package-lock.json`](../package-lock.json). `scripts/check.sh synth` does this itself, and runs
+the CLI as `node_modules/.bin/cdk`. Never install or run a global `cdk`. Remove it with
+`rm -rf node_modules`.
+
+Two things run on Node: the CDK CLI, and the synthesis tests, because aws-cdk-lib works through
+jsii, which starts the `node` it finds on the `PATH`. The CDK supports Node 22 and 24. The
+repository says which Node it expects in two places and enforces neither:
+
+- [`.node-version`](../.node-version) names Node 24, for version managers;
+- `package.json` declares the engines Node 22 or 24. npm prints a warning when another Node runs
+  it, and still installs.
+
+Nothing here installs Node. Get Node 24 from a version manager, which then selects it in this
+repository from `.node-version`:
+
+| Version manager | How it picks up `.node-version` |
+| --- | --- |
+| [mise](https://mise.jdx.dev/) | Only once idiomatic version files are on for Node: `mise settings add idiomatic_version_file_enable_tools node`. Then `mise install` installs the newest Node 24 |
+| [fnm](https://github.com/Schniz/fnm) | `fnm install`, then `fnm use`, both with no argument; or on every `cd` when the shell is set up with `fnm env --use-on-cd` |
+| [nodenv](https://github.com/nodenv/nodenv) | Reads the file, and looks for an installed version of exactly that name: `24` resolves once an alias of that name exists, which the nodenv-aliases plugin creates |
+| `actions/setup-node` | Its `node-version-file` input, given `.node-version` |
+
+A version manager changes the `node` of a shell it is active in. The implement loop's sandbox finds
+`node` on the `PATH` of the host that runs it, so making Node 24 the default there is the owner's
+step.
 
 ## `git-hooks.sh`: activate the git hooks (every clone, after the green light)
 
@@ -82,8 +117,11 @@ repositories only: the green-light checklist says how to check that the rule rea
 
 | Component | Source and destination |
 | --- | --- |
-| `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap, Node.js | Installed by the contributor; nothing in this repository installs or changes a global tool |
+| `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap | Installed by the contributor; nothing in this repository installs or changes a global tool |
 | Python tools (pytest, pytest-xdist, Ruff, ty) and PyYAML, the parser of the test that reads CI's workflow | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
+| CDK libraries (aws-cdk-lib, constructs, cdk-nag) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/`, the project environment |
+| CDK CLI (`aws-cdk`) | Exact version and integrity hash in `package-lock.json`; installed by `npm ci --ignore-scripts` into `node_modules/`, never globally |
+| Node.js 24, the version `.node-version` names | Installed by the contributor, usually with a version manager that reads `.node-version` (mise with idiomatic version files on, fnm, nodenv, `actions/setup-node` through `node-version-file`). The CDK CLI and the synthesis tests run on it; nothing in this repository installs or enforces it |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
 | Git hooks | Checked in under `.githooks/`; `git-hooks.sh` points this clone's `.git/config` at them |
 | GitHub ruleset | `pr-only-main.json`; applied to the `origin` repository only when an admin runs `apply-ruleset.sh` |
