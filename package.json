@@ -1,0 +1,12 @@
+{
+  "name": "research-harness-inference",
+  "private": true,
+  "description": "Pins the CDK CLI and nothing else: `npm ci` installs it into node_modules, and it runs from there, never from a global install. Python lives in pyproject.toml.",
+  "license": "MIT",
+  "engines": {
+    "node": "22 || 24"
+  },
+  "dependencies": {
+    "aws-cdk": "2.1148.1"
+  }
+}
