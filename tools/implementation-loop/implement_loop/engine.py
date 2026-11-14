@@ -1,7 +1,9 @@
 """The per-issue state machine and the scheduling loop (ADR 0012).
 
 Each issue moves through: pending -> plan -> planned -> build -> verify -> examine -> land ->
-merged -> delivered | done. Two vendors hold two keys: the **builder** (the operator's vendor)
+merged -> delivered | done, with `deploying` between the merge and the evidence step while the
+pipeline's verdict on the merge commit is awaited (`loop.toml [deploy]`). Two vendors hold two
+keys: the **builder** (the operator's vendor)
 plans, writes the code, its tests and the commands that prove each item; the **examiner** (the
 other vendor) triages the plan, examines and probes the exact head, approves or refuses the
 builder's typed requests, and certifies the head that may land. The engine owns git, the
@@ -10,8 +12,9 @@ trusted verifier, the gates and every merge, and derives its bookkeeping from wh
 A run never waits for a person and never parks:
 - a failed verification or a blocking finding is one more build round; two rounds that change
   nothing bring a replan on the branch, two more end the issue `failed`;
-- a merge queue another run holds, an outage, a CI check with no verdict or an environment the
-  doctor can repair is a **wait** that resumes by itself (in this run, or under the supervisor);
+- a merge queue another run holds, an outage, a CI check or a deployment with no verdict, a
+  deployment that waits for the owner's approval, or an environment the doctor can repair is a
+  **wait** that resumes by itself (in this run, or under the supervisor);
 - every answered agent call is charged to the issue's ceiling, every timeout or crash to its
   infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
   them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
@@ -20,7 +23,9 @@ A run never waits for a person and never parks:
 
 Steps run on a thread pool, so one issue can be examined while another builds and a third
 plans. Landing is serialized through a repo-wide merge-queue claim, issues through per-issue
-claims, so two runs never land at once or work the same issue.
+claims, so two runs never land at once or work the same issue. The claim is kept from a merge
+until its deployment verdict, so one merge maps to one deployment and one verdict; where the
+verdict outlasts the run, a record of the awaited commit keeps every run from landing.
 """
 
 from __future__ import annotations
@@ -36,8 +41,9 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from . import VERSION, gate, graph, issue_parser, report, sandbox, scheduler, verify
 from .agents import AgentFailure, Agents, AgentStopped, CeilingReached, IssueRequest
@@ -68,12 +74,13 @@ from .model import (
     WAIT_RUN_CEILING,
     WRITING_PHASES,
     CheckSpec,
+    Evidence,
     Finding,
     Issue,
     IssueState,
     Phase,
 )
-from .state import FaultOutbox, RepoClaims, RunStore
+from .state import FaultOutbox, RepoClaims, RunStore, runs_root
 from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
 
 try:   # GitHubUnavailable arrives with the retrying GitHub client
@@ -87,6 +94,20 @@ try:   # RedactionUnavailable arrives with the redacting GitHub client
 except ImportError:   # pragma: no cover - older github.py, whose client never raises it
     class RedactionUnavailable(GitHubError):
         pass
+
+try:   # the deployment verdict arrives with `[deploy]` in config.py, and with the phase and its two waits in model.py
+    from .config import Deploy
+    from .model import WAIT_DEPLOY, WAIT_OWNER_APPROVAL
+    DEPLOYING = Phase.DEPLOYING
+except (ImportError, AttributeError):   # pragma: no cover - older config.py and model.py: no context is configured,
+    # so nothing waits, and no issue is ever in the phase, which then equals none
+    WAIT_DEPLOY, WAIT_OWNER_APPROVAL, DEPLOYING = "deploy", "owner_approval", cast(Phase, None)
+
+    @dataclass(frozen=True)
+    class Deploy:
+        contexts: tuple[str, ...] = ()
+        timeout_s: int = 3600
+        approval_description: str = ""
 
 LABELS = {
     "loop:plan": ("C5DEF5", "implement loop: planning"),
@@ -105,8 +126,8 @@ ENGINE_BUG_LABEL = ("loop:engine-bug", "5319E7", "implement loop: a fault in the
 PHASE_LABEL = {
     Phase.PLAN: "loop:plan", Phase.PLANNED: "loop:plan",
     Phase.BUILD: "loop:building", Phase.VERIFY: "loop:building", Phase.EXAMINE: "loop:examine",
-    Phase.LAND: "loop:landing", Phase.MERGED: "loop:merged", Phase.DELIVERED: "loop:delivered",
-    Phase.WAITING: "loop:waiting", Phase.FAILED: "loop:failed",
+    Phase.LAND: "loop:landing", Phase.MERGED: "loop:merged", DEPLOYING: "loop:merged",
+    Phase.DELIVERED: "loop:delivered", Phase.WAITING: "loop:waiting", Phase.FAILED: "loop:failed",
 }
 EXPLORE_QUESTIONS = (
     "The issue graph and acceptance criteria: what must be true when this run is done?",
@@ -115,6 +136,20 @@ EXPLORE_QUESTIONS = (
     "External references the issues cite: what do they establish that the work depends on?",
 )
 MERGE_QUEUE = "merge-queue"
+# Deployment verdicts still awaited, one file per issue, under the runs' root. The merge-queue claim
+# belongs to a process: the run frees it when it ends, and a claim whose process died is taken
+# over. A verdict can outlast the run that merged (`WAIT_DEPLOY`), so what keeps the landing claim
+# held until then is this record, which no process owns: while one exists, no run lands.
+DEPLOY_HOLDS = "deploying"
+DEPLOY_FAILED = ("failure", "error")   # the final states of a commit status, with "success"
+# The words of the phase and of its two waits, where `report.py` looks them up for the progress
+# comment and the run summary. They are added from here because issue #12 names this file and
+# `model.py` for the phase, and not `report.py`.
+report.PHASE_TEXT.setdefault(DEPLOYING, "merged, waiting for the deployment verdict")
+report.WAIT_HINT.setdefault(WAIT_DEPLOY, ("The deployment gave no verdict yet; the supervisor reads it again, and "
+                                          "nothing else lands before it."))
+report.WAIT_HINT.setdefault(WAIT_OWNER_APPROVAL, ("The deployment waits for the owner's approval in the pipeline; the "
+                                                  "supervisor reads its status again."))
 # Output that means the host cannot run a check, whatever the implementation does.
 ENVIRONMENT_FAILURE = re.compile(
     r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
@@ -147,6 +182,9 @@ class Engine:
         self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
         self._meter_lock = threading.Lock()
         self._polling: dict[int, float] = {}
+        self.deploy: Deploy = policy.get("deploy") or Deploy()
+        self._holds_dir = runs_root(repo_root) / DEPLOY_HOLDS
+        self._landers: set[int] = set()   # issues whose land or deploying step runs: one at a time
         self.invoked_at = invoked_at if invoked_at is not None else time.time()
         self.run_calls = 0
         self._charged: set[int] = set()   # issues whose last failed attempt the meter already charged
@@ -276,7 +314,7 @@ class Engine:
                 self._recover_worktree(n, Path(st.worktree))
             restored = self._restore_ended(st)
             if st.body_hash and st.body_hash != spec.body_hash:
-                if st.phase in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
+                if st.phase in (Phase.MERGED, DEPLOYING, Phase.DELIVERED, Phase.DONE):
                     self._new_round(st, ["the issue was edited after its work was merged; deliver the edited version"],
                                     owner_edit=True)
                 else:
@@ -299,6 +337,7 @@ class Engine:
             self.store.put(st)
             if restored and st.phase in (Phase.DELIVERED, Phase.FAILED):
                 self._sync(n)   # its labels and its comment said `waiting`; `_withhold` if they still must
+        self._drop_stale_holds()
 
     def _restore_ended(self, st: IssueState) -> bool:
         """An issue that had ended (`delivered`, `failed`) and waits only because the hygiene scanner
@@ -382,7 +421,8 @@ class Engine:
         only once an outage is over and runs the doctor (which repairs the environment) first."""
         w = st.wait or {}
         kind = w.get("kind")
-        resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite")
+        resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite",
+                           WAIT_DEPLOY, WAIT_OWNER_APPROVAL)   # each run reads the merge commit's statuses again
                   or (kind == WAIT_ENVIRONMENT and (self.env_fingerprint is None or w.get("env") != self.env_fingerprint))
                   or (kind == WAIT_ENGINE and w.get("version") != VERSION))
         if not resume:
@@ -443,6 +483,7 @@ class Engine:
         st.signature = ""
         st.certified_sha = st.verified_sha = None
         st.fail = st.wait = None
+        st.deploy = None   # with it goes the record that held the landing claim (`_new_round`, `_drop_stale_holds`)
         st.phase = Phase.PENDING
 
     def _context(self) -> None:
@@ -555,10 +596,14 @@ class Engine:
     def _dispatch(self, pool: ThreadPoolExecutor, running: dict[int, Future]) -> None:
         phases = self._phases()
         writers = [n for n, ph in phases.items() if ph in WRITING_PHASES]
-        landing = any(phases[n] == Phase.LAND for n in running)
+        # A land step keeps the merge queue until it ends, which with a deployment to wait for is
+        # after its issue left `land`: the step counts, whatever phase its issue is in by now.
+        self._landers &= set(running)
+        landing = bool(self._landers)
         steps = {Phase.PLAN: self._step_plan, Phase.BUILD: self._step_build, Phase.VERIFY: self._step_verify,
                  Phase.EXAMINE: self._step_examine, Phase.MERGED: self._step_accept}
-        for n in list(self.plan.work):
+        # An issue that waits for its deployment verdict takes the merge queue before any issue lands.
+        for n in sorted(self.plan.work, key=lambda m: phases.get(m) != DEPLOYING):
             if n in running:
                 continue
             ph = phases.get(n, self.store.issue(n).phase)
@@ -580,13 +625,22 @@ class Engine:
                     writers.append(n)
                     self._set_phase(n, Phase.BUILD)
                     running[n] = pool.submit(self._step_build, n)
-            elif ph == Phase.LAND:
-                if not landing and self.claims.acquire(MERGE_QUEUE, self.owner):
+            elif ph in (Phase.LAND, DEPLOYING):
+                if landing:
+                    continue
+                if self._take_queue(n, lands=ph == Phase.LAND):
                     landing = True
+                    self._landers.add(n)
                     self._polling.pop(n, None)
-                    running[n] = pool.submit(self._step_land, n)
-                elif not landing:
-                    self._polling.setdefault(n, time.monotonic())   # another run is landing: poll
+                    running[n] = pool.submit(self._step_land if ph == Phase.LAND else self._step_deploying, n)
+                    continue
+                hold = self._unreleasable_hold(n, phases) if ph == Phase.LAND else None
+                if hold:   # polling would not see it end: the verdict is read again by the next run
+                    self._polling.pop(n, None)
+                    self._wait(n, WAIT_MERGE_QUEUE, f"nothing lands before #{hold.get('issue')} has the deployment "
+                                                    f"verdict of {str(hold.get('sha'))[:12]}", resume=Phase.LAND)
+                else:
+                    self._polling.setdefault(n, time.monotonic())   # another run is landing, or waits for a verdict: poll
             elif ph in steps:
                 running[n] = pool.submit(steps[ph], n)
 
@@ -714,6 +768,8 @@ class Engine:
         st.branch = f"{self.plan.specs[n].branch or f'loop/issue-{n}'}-r{st.round}"
         st.worktree = st.pr = st.head_sha = st.base_sha = None
         st.verified_sha = st.examined_sha = st.certified_sha = None
+        st.deploy = None   # the next merge has its own deployment and its own verdict
+        self._release_hold(n)
         st.locked, st.manifest, st.tests, st.probes = {}, {}, [], []
         st.commands = [c for c in st.commands if c.get("author") != "examiner"]   # their probes went with the branch
         st.findings = [f for f in st.findings if f.get("status") == "follow_up"]
@@ -2071,13 +2127,13 @@ class Engine:
                 relation, unreviewed = self._delivery(st, merged_head)
                 if relation == "same":
                     self.store.event("merge_found_on_resume", issue=n, pr=existing["number"])
-                    return self._set_phase(n, Phase.MERGED, pr=existing["number"])
+                    return self._merged(n, existing.get("merge_commit_sha"), pr=existing["number"])
                 if relation == "later":
                     self.store.event("merged_externally", issue=n, pr=existing["number"], head=merged_head,
                                      certified=st.certified_sha, unreviewed=unreviewed)
                     if unreviewed != []:
                         st.verdicts = {}
-                    return self._set_phase(n, Phase.MERGED, pr=existing["number"], verdicts=st.verdicts)
+                    return self._merged(n, existing.get("merge_commit_sha"), pr=existing["number"], verdicts=st.verdicts)
                 self.store.event("stale_pr_ignored", issue=n, pr=existing["number"], head=merged_head)
             if not self._requirements_current(n):
                 self.store.event("requirements_changed", issue=n, previous_phase=Phase.LAND.value)
@@ -2089,7 +2145,9 @@ class Engine:
             self.ws.fetch()
             if self.ws.nothing_to_land(wt):
                 self.store.event("nothing_to_land", issue=n, head=st.certified_sha)
-                return self._set_phase(n, Phase.MERGED)
+                # no merge of its own: the commit that carries the change is the head of `main`
+                return self._merged(n, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt) if self.deploy.contexts
+                                    else None)
             # Main may have moved since the certificate. Merging it makes a new head, which is
             # verified and certified again (a focused delta examination) before it may land.
             sync = self.ws.update(wt)
@@ -2142,12 +2200,12 @@ class Engine:
             if conclusion != "success":
                 return self._ci_failed(n, head, conclusion)
             try:
-                self.gh.merge_pr(st.pr, head)
+                merge = self.gh.merge_pr(st.pr, head)
             except GitHubError as e:
                 again = self._safe(self.gh.find_pr, st.branch) or {}
                 if (again.get("merged") or again.get("merged_at")) and (again.get("head") or {}).get("sha", head) == head:
                     self.store.event("merged", issue=n, pr=st.pr, head=head, note="the merge answer was lost")
-                    return self._set_phase(n, Phase.MERGED)
+                    return self._merged(n, again.get("merge_commit_sha"))
                 st = self.store.issue(n)
                 st.merge_refusals += 1
                 self.store.put(st)
@@ -2157,9 +2215,178 @@ class Engine:
                                       resume=Phase.LAND)
                 return self._set_phase(n, Phase.VERIFY)
             self.store.event("merged", issue=n, pr=st.pr, head=head)
-            self._set_phase(n, Phase.MERGED)
+            self._merged(n, (merge or {}).get("sha"))
         finally:
             self.claims.release(MERGE_QUEUE, self.owner)
+
+    # ------------------------------------------------------------------ deploying
+    def _merged(self, n: int, sha: str | None, **changes) -> None:
+        """The issue's change is on `main` in the commit `sha`: its merge commit, or the head of
+        `main` when the branch had nothing left to land. With deployment contexts configured, the
+        verdict on that commit is awaited before the evidence step (ADR 0001, decision 5), by the
+        step that merged: the merge queue is not released in between. With none, the evidence step
+        is next, as before."""
+        if not self.deploy.contexts:
+            return self._set_phase(n, Phase.MERGED, deploy=None, **changes)
+        sha = sha or (self._safe(self.gh.find_pr, self.store.issue(n).branch) or {}).get("merge_commit_sha")
+        if not sha:   # the next run finds the merged pull request, and its merge commit with it
+            return self._wait(n, WAIT_GITHUB, "GitHub did not name the merge commit whose deployment is awaited",
+                              resume=Phase.LAND)
+        self._hold(n, sha)
+        self._set_phase(n, Phase.MERGED, deploy={"sha": sha}, **changes)
+        self._await_deployment(n)
+
+    def _verdict_owed(self, st: IssueState) -> bool:
+        """Merged, with contexts configured, and not every one of them has reported success on the
+        merge commit yet: the evidence step is not reached."""
+        if not self.deploy.contexts:
+            return False
+        d = st.deploy or {}
+        return bool(d.get("sha") and not d.get("states"))
+
+    def _step_deploying(self, n: int) -> None:
+        """An issue resumed while its deployment verdict was owed (a wait, or a run that stopped):
+        it holds the merge queue, like the land step it continues, and reads the statuses of the
+        same merge commit again. Nothing is pushed or merged here."""
+        try:
+            if not self._verdict_owed(self.store.issue(n)):   # the contexts were emptied since
+                return self._set_phase(n, Phase.MERGED)
+            self._await_deployment(n)
+        finally:
+            self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _await_deployment(self, n: int) -> None:
+        """Poll the configured contexts on the issue's merge commit, with the merge queue held by
+        the calling step. Every context `success`: the verdict is recorded and the evidence step is
+        next. One `failure` or `error`: the broken-main path, at once. One pending with the
+        configured approval description, and none failed: the deployment waits for the owner, so
+        the landing claim is released and the issue waits (`WAIT_OWNER_APPROVAL`), for as long as
+        it takes. Otherwise, after `timeout_s` of polling, the issue waits (`WAIT_DEPLOY`) with the
+        landing claim still held, and the next run polls the same commit again."""
+        sha = (self.store.issue(n).deploy or {})["sha"]
+        self._hold(n, sha)
+        self._set_phase(n, DEPLOYING)
+        waited = 0
+        while True:
+            try:
+                statuses = {c: self.gh.deploy_status(sha, c) or {} for c in self.deploy.contexts}
+            except GitHubError as e:   # no answer is no verdict: the next run asks again, the claim stays held
+                return self._wait(n, WAIT_GITHUB, f"the commit statuses of {sha[:12]} could not be read: {str(e)[:300]}",
+                                  resume=DEPLOYING)
+            states = {c: s.get("state") for c, s in statuses.items()}
+            failed = {c: state for c, state in states.items() if state in DEPLOY_FAILED}
+            if failed:
+                return self._deployment_failed(n, sha, failed)
+            if all(state == "success" for state in states.values()):
+                return self._deployed(n, sha, dict.fromkeys(states, "success"))
+            approval = [c for c, s in statuses.items() if s.get("state") == "pending" and self.deploy.approval_description
+                        and s.get("description") == self.deploy.approval_description]
+            if approval:
+                self._release_hold(n)
+                return self._wait(n, WAIT_OWNER_APPROVAL, f"the deployment of {sha[:12]} waits for the owner's approval "
+                                                          f"in the pipeline ({', '.join(approval)})", resume=DEPLOYING)
+            if waited >= self.deploy.timeout_s:
+                owed = ", ".join(f"{c} {'is ' + state if state else 'has no status'}" for c, state in states.items()
+                                 if state != "success")
+                return self._wait(n, WAIT_DEPLOY, f"no deployment verdict on {sha[:12]} after {self.deploy.timeout_s}s: "
+                                                  f"{owed}", resume=DEPLOYING)
+            if self.store.stop_requested():
+                return   # it stays in `deploying`, and the next run polls the same commit
+            self.sleep(self.caps.ci_poll_s)
+            waited += max(self.caps.ci_poll_s, 1)
+
+    def _deployed(self, n: int, sha: str, states: dict[str, str]) -> None:
+        st = self.store.issue(n)
+        st.deploy = {"sha": sha, "states": states}
+        self.store.put(st)
+        self.store.event("deployed", issue=n, sha=sha, contexts=states)
+        self._release_hold(n)
+        self._set_phase(n, Phase.MERGED)
+
+    def _deployment_failed(self, n: int, sha: str, failed: dict[str, str]) -> None:
+        """A final state that is not success: the merged change broke the deployment. The summary
+        the fix-forward gets names the contexts and their states, and nothing a status says beside
+        (ADR 0001, amendment 4)."""
+        self.store.event("deployment_failed", issue=n, sha=sha, contexts=failed)
+        self._release_hold(n)
+        self.claims.release(MERGE_QUEUE, self.owner)   # the verdict is in; a revert takes the queue itself
+        said = ", ".join(f"`{c}` is `{state}`" for c, state in failed.items())
+        self._fix_forward(n, [(f"the deployment failed after the merge: on the merge commit {sha[:12]}, the commit "
+                               f"status {said}. Find what in this issue's change broke the deployment, and repair it.")])
+
+    def _deployment_evidence(self, st: IssueState) -> list[dict]:
+        """The deployment verdict as an evidence record of the issue: the commit and each context
+        with its state. It is no ledger item's proof and ticks no box."""
+        d = (st.deploy or {}) if self.deploy.contexts else {}
+        if not d.get("states"):
+            return []
+        note = f"commit statuses of `{d['sha'][:12]}`: " + ", ".join(f"`{c}` {state}" for c, state in d["states"].items())
+        record = Evidence(criterion="deployment", kind="deployment", command=None, cwd=".", head_sha=d["sha"],
+                          exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="", note=note,
+                          verifier="commit statuses")
+        return [asdict(record) | {"contexts": dict(d["states"])}]
+
+    # The landing claim, where a verdict outlasts the run (`DEPLOY_HOLDS`).
+    def _hold_path(self, n: int) -> Path:
+        return self._holds_dir / f"{self.owner}-issue-{n}.json"
+
+    def _hold(self, n: int, sha: str) -> None:
+        """Record that issue `n` waits for the deployment verdict of `sha`. Written with the merge
+        queue held, so a run that takes the queue and then finds no record may land."""
+        self._holds_dir.mkdir(parents=True, exist_ok=True)
+        path = self._hold_path(n)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"owner": self.owner, "issue": n, "sha": sha, "since": time.time()}))
+        os.replace(tmp, path)
+
+    def _release_hold(self, n: int) -> None:
+        self._hold_path(n).unlink(missing_ok=True)
+
+    def _holds(self, but: int | None = None) -> list[dict]:
+        """The verdicts awaited, by any run; without the one of this run's issue `but`."""
+        out = []
+        for path in sorted(self._holds_dir.glob("*.json")) if self._holds_dir.is_dir() else []:
+            try:
+                hold = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue   # released between the listing and the reading
+            if not (hold.get("owner") == self.owner and hold.get("issue") == but):
+                out.append(hold)
+        return out
+
+    def _drop_stale_holds(self) -> None:
+        """At the start of a run: a record of this run for an issue that no longer waits for a
+        verdict (its state was archived, or the contexts were emptied) would stop every landing
+        for good."""
+        for hold in self._holds():
+            n = hold.get("issue")
+            if hold.get("owner") == self.owner and isinstance(n, int) and (
+                    n not in self.plan.work or not self._verdict_owed(self.store.issue(n))):
+                self._release_hold(n)
+                self.store.event("deploy_hold_dropped", issue=n, sha=hold.get("sha"))
+
+    def _take_queue(self, n: int, lands: bool = True) -> bool:
+        """The merge queue, for issue `n`. To land, no other issue of any run may wait for a
+        deployment verdict: that is the landing claim held through the wait. Records are written
+        under the claim, so they are read again once it is taken."""
+        if lands and self._holds(but=n):
+            return False
+        if not self.claims.acquire(MERGE_QUEUE, self.owner):
+            return False
+        if lands and self._holds(but=n):
+            self.claims.release(MERGE_QUEUE, self.owner)
+            return False
+        return True
+
+    def _unreleasable_hold(self, n: int, phases: dict[int, Phase] | None = None) -> dict | None:
+        """A verdict that stops issue `n` from landing and that this run will not read again: the
+        issue of this run that waits for it waits for the supervisor. Polling the queue in this
+        run would not see it end."""
+        phases = phases or self._phases()
+        for hold in self._holds(but=n):
+            if hold.get("owner") == self.owner and phases.get(hold.get("issue")) not in (Phase.MERGED, DEPLOYING):
+                return hold
+        return None
 
     def _ci_failed(self, n: int, head: str, conclusion: str | None) -> None:
         if conclusion in CI_NO_VERDICT:
@@ -2188,6 +2415,10 @@ class Engine:
 
     # ------------------------------------------------------------------ accept
     def _step_accept(self, n: int) -> None:
+        if self._verdict_owed(self.store.issue(n)):
+            # Never the evidence step with a deployment verdict owed, whatever brought the issue
+            # here (a run killed right after the merge, a revert that waited for the queue).
+            return self._set_phase(n, DEPLOYING)
         with self._accept_lock:
             self._accept(n)
 
@@ -2214,8 +2445,10 @@ class Engine:
         if regressions:
             return self._fix_forward(n, regressions)
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
+        deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
-                                                 report.render_evidence(n, evidence, head, verdicts)) if st.pr else None)
+                                                 report.render_evidence(n, evidence + deployed, head, verdicts))
+                            if st.pr else None)
         link = (evidence_comment or {}).get("html_url", "")
         proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts)
         issue = self.gh.get_issue(n)
@@ -2230,7 +2463,7 @@ class Engine:
         if ticked != (issue.get("body") or ""):
             self._safe(self.gh.edit_issue, n, body=ticked)
         st = self.store.issue(n)
-        st.evidence = evidence
+        st.evidence = evidence + deployed
         st.restarts = 0
         st.human_tasks = [self._obligation_text(o) for o in st.obligations]
         # Each publication below ends this step when the hygiene scanner cannot mask it (`_safe`):
@@ -2328,8 +2561,8 @@ class Engine:
         # verifier (every earlier issue's checks on the reverted tree), the other vendor's
         # certificate for the exact head, and the required check on it.
         waited = 0
-        while not self.claims.acquire(MERGE_QUEUE, self.owner):
-            if waited >= self.caps.queue_wait_s:
+        while not self._take_queue(n):
+            if waited >= self.caps.queue_wait_s or self._unreleasable_hold(n):
                 return self._wait(n, WAIT_MERGE_QUEUE, "the revert waits for the merge queue", resume=Phase.MERGED)
             self.sleep(self.caps.queue_poll_s)
             waited += max(self.caps.queue_poll_s, 1)

@@ -116,13 +116,52 @@ class Config:
     label_prefix: str = "loop:"
 
 
+@dataclass(frozen=True)
+class Deploy:
+    """What the engine waits for after a merge (ADR 0001, decision 5): the table `[deploy]` of
+    loop.toml. With no context nothing is read and nothing waits."""
+    contexts: tuple[str, ...] = ()    # commit statuses the pipeline posts on a merge commit (`deploy/<stage>`, ...)
+    timeout_s: int = 3600             # polling for a verdict, per run; after it the issue waits for the supervisor
+    approval_description: str = ""    # the description of a pending status while the pipeline waits for the owner
+
+
+def load_deploy(table) -> Deploy:
+    """`[deploy]` as loop.toml gives it. A key the engine does not know is refused (`ValueError`),
+    and so is a value of the wrong type (`TypeError`): a misspelt key would leave the engine not
+    waiting for a deployment that the owner believes it waits for."""
+    if table is None:
+        return Deploy()
+    if not isinstance(table, dict):
+        raise TypeError("loop.toml: [deploy] must be a table")
+    known = set(Deploy.__dataclass_fields__)
+    unknown = sorted(set(table) - known)
+    if unknown:
+        raise ValueError(f"loop.toml: [deploy] has no key {', '.join(unknown)} (its keys are {', '.join(sorted(known))})")
+    contexts = table.get("contexts", [])
+    if not isinstance(contexts, list) or not all(isinstance(c, str) for c in contexts):
+        raise TypeError("loop.toml: [deploy] contexts must be a list of commit status contexts")
+    if not all(c.strip() for c in contexts):
+        raise ValueError("loop.toml: [deploy] contexts cannot hold an empty context")
+    timeout_s = table.get("timeout_s", Deploy.timeout_s)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, int):
+        raise TypeError("loop.toml: [deploy] timeout_s must be a whole number of seconds")
+    if timeout_s < 0:
+        raise ValueError("loop.toml: [deploy] timeout_s cannot be negative")
+    approval = table.get("approval_description", "")
+    if not isinstance(approval, str):
+        raise TypeError("loop.toml: [deploy] approval_description must be a string")
+    return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
+
+
 def load_policy(path) -> dict:
-    """The host's lacks and the safety invariants from loop.toml (part of the safety surface)."""
+    """The host's lacks, the safety invariants and the deployment statuses to wait for, from
+    loop.toml (part of the safety surface)."""
     import tomllib
     from pathlib import Path
     data = tomllib.loads(Path(path).read_text()) if Path(path).exists() else {}
     return {"lacks": list((data.get("host") or {}).get("lacks") or []),
-            "invariants": list((data.get("invariants") or {}).get("names") or [])}
+            "invariants": list((data.get("invariants") or {}).get("names") or []),
+            "deploy": load_deploy(data.get("deploy"))}
 
 
 def ceiling(size: str, infra: bool) -> int:

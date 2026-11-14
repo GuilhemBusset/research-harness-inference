@@ -15,6 +15,7 @@ class Phase(str, Enum):
     EXAMINE = "examine"          # the other vendor examines, probes and certifies the exact head
     LAND = "land"                # push, PR, required check on the exact head, merge
     MERGED = "merged"            # merged; post-merge verification pending
+    DEPLOYING = "deploying"      # merged; the pipeline's verdict on the merge commit is awaited (`loop.toml [deploy]`)
     DELIVERED = "delivered"      # merged; every agent item proven; typed obligations remain
     DONE = "done"                # every ledger item has evidence; issue closed
     WAITING = "waiting"          # not terminal: resumes by itself once its condition clears
@@ -41,6 +42,9 @@ WAIT_GITHUB = "github"               # GitHub kept failing after retries
 WAIT_ENVIRONMENT = "environment"     # the host cannot run the checks; the doctor's recipes may fix it
 WAIT_ENGINE = "engine"               # an engine fault was filed; resumes on a new engine version
 WAIT_RUN_CEILING = "run_ceiling"     # the run's call ceiling stopped new calls
+WAIT_DEPLOY = "deploy"               # the deployment gave no verdict in time; the landing claim stays held
+WAIT_OWNER_APPROVAL = "owner_approval"   # the deployment waits for the owner's approval in the pipeline; no
+#                                      timeout of its own, and the landing claim is released meanwhile
 IN_RUN_WAITS = frozenset({WAIT_MERGE_QUEUE, WAIT_CLAIM})
 
 # Proof kinds a plan gives each ledger item (ADR 0012).
@@ -178,6 +182,9 @@ class IssueState:
     examined_sha: str | None = None      # the last head the examiner saw
     certified_sha: str | None = None     # the head the examiner certified: the only one that may land
     pr: int | None = None
+    # The commit on `main` whose deployment verdict decides this round, once merged with contexts
+    # configured: {sha}, then {sha, states: {context: "success"}} when every context reported success.
+    deploy: dict | None = None
     body_hash: str | None = None
     round: int = 1                       # work rounds: a new one after a post-merge edit or a fix-forward
     # The plan (ADR 0012): per-item readings and proof kinds, zones, decisions.
