@@ -287,7 +287,7 @@ def test_a_failed_deployment_gets_a_fix_forward_that_names_the_context_and_its_s
         assert len(run.events("fix_forward", 2)) == 1 and not run.events("reverted", 2)
         told = run.feedback(2)[1]
         assert DEPLOY in told and "failure" in told and first[:12] in told
-        assert "rolled back" not in told, "the summary is the context and its state, nothing a status says beside"
+        assert "the stack was rolled back" in told, "and the description of the context's status (issue #23)"
         assert len(run.fake.merges(2)) == 2
         assert run.waits(2)[0] == Phase.DONE
         assert [e["head_sha"] for e in run.issue(2).evidence if e["kind"] == "deployment"] == [second]
