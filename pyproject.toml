@@ -59,8 +59,10 @@ pythonpath = [
     "admin",
     "dashboards",
     "scripts/pipeline",
-    # Not a root of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
+    # Not roots of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
     # this configuration too, and import their helpers and each other by bare name, which the
-    # default import mode allowed by putting each test file's folder on the path.
+    # default import mode allowed by putting each test file's folder on the path. The examiner's
+    # probes of the engine, in tests/examiner, import each other the same way.
     "tools/implementation-loop/tests",
+    "tests/examiner",
 ]
