@@ -309,6 +309,31 @@ head. What only the real GitHub can show (that it refuses the merge under the ru
 `CODEOWNERS` entry of issue #20, and gives `REVIEW_REQUIRED` then) is not shown by these tests,
 which run against the fake.
 
+### 1.2.1, patched a seventh time: the reporter's facts for a fix-forward (2026-11-14)
+
+A failed deployment went down the broken-main path with feedback that named the failed context and
+its state, and nothing else (the patch "the deployment verdict" above). That does not tell a
+builder what to fix. The pipeline's reporter adds a structured report to a failure, as further
+commit statuses on the same commit, one per fact, each under the context of its stage followed by
+a slash and a suffix (system design, section 8.4; ADR 0001, amendment 4). Issue #23 (draft E0-29)
+gives the fix-forward a summary built from those statuses. The engine's version stays 1.2.1:
+nothing here repairs a failed issue.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/github.py` | New: `commit_statuses(sha)` on the `GitHub` protocol, on `GhCli` and on `FakeGitHub`: every commit status of the commit, the oldest first, each as its context, its state and its description, and no other field. `GhCli` reads every page of `commits/<sha>/statuses` and orders them by id. `FakeGitHub` returns what `set_status` recorded. `RedactingGitHub` and `RecordingGitHub` forward the call like any other read. `deploy_status` is unchanged. `FakeGitHub` also gains `commit_comments` and `add_commit_comment(sha, body)`: a comment the fake holds and no method of the protocol reads. | The first deliverable. The facts of a failure are statuses of contexts the engine cannot list ahead, so the commit's statuses are read whole. The fake's commit comment is there so that a test can show that nothing of one reaches a fix-forward; there is no read of commit comments, in the protocol or in `GhCli`. |
+| `implement_loop/engine.py` | `_deployment_failed` adds the entries of the new `_deployment_summary` to the fix-forward's feedback, after the line it gave before (the commit, the failed configured contexts, their states), which is unchanged. They are built from `commit_statuses` of the merge commit and from nothing else. Only the statuses whose context is a configured context of `[deploy]`, or one followed by a slash and more, count. The first kind is a stage's own status, whatever its state (a stage that succeeded is told too). The second kind is a fact of the reporter. Each such context gets one feedback entry: its context, its state and its description (white space folded to single spaces, left out when empty), from the newest status of that context. The entries come in the configured order of the stages, each stage's own status before its facts, the facts sorted by context. A status of any other context is left out: `measure/...`, a context that is not configured, one that only starts with the same characters (`deploy/beta-canary` beside `deploy/beta`). | The second deliverable. The slash keeps a sibling context from passing for a fact. The newest status of a context is the one that counts, as for the verdict. The description of a configured context's own status is in the feedback, which the earlier patch ("the deployment verdict") kept out: the issue asks for the contexts, states and descriptions of the configured contexts as of those below them, and one assertion of `tests/test_deploying.py` follows (below). |
+| `implement_loop/engine.py` | `_deployment_failed` reads the statuses before it journals `deployment_failed`, releases the landing claim or starts the fix-forward. If GitHub does not answer, the issue waits with the kind `github` and resumes in `deploying`, with the landing claim still held, as when the verdict itself cannot be read. | Each issue has one fix-forward before a revert: it is not spent on feedback without the facts. The next run reads the same commit, finds the failure again and reads the facts. |
+
+Behaviour an upstream reader would not expect: the feedback of a fix-forward, and with it the body
+of a revert pull request and a failure's reason, which repeat that feedback, carry the
+descriptions of commit statuses, which the engine did not write; they pass through the redacting
+client like everything published. Whoever can post a commit status below a configured context can
+put a line in a builder's feedback: on GitHub that is the reporter's App and the factory's own
+identity (system design, section 8.4). The event `deployment_failed` and the evidence record of a
+deployment keep their shape. A failed deployment makes one more read of the commit's statuses than
+before.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -430,6 +455,16 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_owner_review.py` (5) | Added. | `GhCli.review_decision` against a scripted `gh`: the call is `gh api graphql`, its query names `reviewDecision`, a value and a null are read. In real engine runs, with the fake agents and the fake GitHub: a merge refused with `REVIEW_REQUIRED`, and with `CHANGES_REQUESTED`, leaves the issue waiting `owner_review` after one refusal, with none counted, nothing verified after it and one comment on the pull request, while a second issue of the same run, built once the first waits, lands (the merge queue was free); a resumed run with the review still owed runs no step. Once the fake's decision is `APPROVED`, a resumed run merges the head certified before the wait, with no verification before the merge, and the issue ends `done` (`test_a_given_review_merges_the_certified_head`). A refusal with `APPROVED`, with no decision and with one that cannot be read is counted three times and ends in the wait `github` (`test_other_refusals_are_unchanged`). A `main` that moved during the wait is merged and verified again before the landing, and a pull request that got another head is refused and verified as before. The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
+
+### 1.2.1, patched a seventh time (2026-11-14)
+
+603 collected tests: the 595 before it, none removed, one assertion of one test turned around, and 8 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_deploy_summary.py` (4) | Added. | `commit_statuses` gives every status of a commit, the oldest first, with the three fields and no other, for `GhCli` behind a fake `gh` and for the fake GitHub alike. In real engine runs with the fake agents and the fake GitHub, which holds the statuses a reporter would post on the merge commit: the fix-forward's feedback keeps the verdict line, names a failed resource with its status code and a failed smoke test, takes the newest status of a context, keeps the configured order of the stages, and no agent is told anything of a commit comment the fake holds (`test_the_summary_comes_from_statuses_only`); statuses under `measure/`, of a context that is not configured and below it, and of a context that only starts like the configured one are not in it, while a fact below the configured context is (`test_other_contexts_are_left_out`); statuses that cannot be read for the facts leave the issue waiting `github` with no fix-forward spent, and the next run gives the fix-forward its facts. That a stage's own status is in the feedback with its description is asserted by the two rows below. The modules and the loop come from `test_deploying.py`, for the reason given there. |
+| `tests/test_examiner_deploy_summary_probe.py` (4) | Added, by the examiner. | The examiner's probes of the same patch, adopted as tests: `commit_statuses` across two pages; the statuses of the configured contexts themselves, a failed one and a successful one, are in the feedback with their states and descriptions; a failed resource and a failed smoke test reach the builder and a commit comment does not; statuses under `measure/`, of contexts that are not configured, of a sibling context and of another commit are left out. |
+| `tests/test_deploying.py::test_a_failed_deployment_gets_a_fix_forward_that_names_the_context_and_its_state` | Adapted: one assertion turned around. | It asserted that the description of the failed context's status is not in the fix-forward's feedback, which was the behaviour of the patch "the deployment verdict". Issue #23 puts the description of a configured context's status in the summary, so the test now asserts that it is there. Its other assertions are unchanged: the context, its state, the commit, one fix-forward, two merges, the evidence of the second. |
 
 ## Kept as recorded
 

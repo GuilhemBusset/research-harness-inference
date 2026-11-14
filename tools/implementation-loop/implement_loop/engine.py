@@ -2729,15 +2729,46 @@ class Engine:
         self._set_phase(n, Phase.MERGED)
 
     def _deployment_failed(self, n: int, sha: str, failed: dict[str, str]) -> None:
-        """A final state that is not success: the merged change broke the deployment. The summary
-        the fix-forward gets names the contexts and their states, and nothing a status says beside
-        (ADR 0001, amendment 4)."""
+        """A final state that is not success: the merged change broke the deployment. The
+        fix-forward gets the verdict (the commit, the failed contexts and their states) and then
+        the summary of what the pipeline's reporter said, from `_deployment_summary`. If the
+        statuses cannot be read for it, nothing is decided yet: the issue waits, and the next run
+        reads the same commit again, so that no fix-forward is spent without the summary."""
+        try:
+            summary = self._deployment_summary(sha)
+        except GitHubError as e:
+            return self._wait(n, WAIT_GITHUB, f"the commit statuses of {sha[:12]} could not be read: {str(e)[:300]}",
+                              resume=DEPLOYING)
         self.store.event("deployment_failed", issue=n, sha=sha, contexts=failed)
         self._release_hold(n)
         self.claims.release(MERGE_QUEUE, self.owner)   # the verdict is in; a revert takes the queue itself
         said = ", ".join(f"`{c}` is `{state}`" for c, state in failed.items())
         self._fix_forward(n, [(f"the deployment failed after the merge: on the merge commit {sha[:12]}, the commit "
-                               f"status {said}. Find what in this issue's change broke the deployment, and repair it.")])
+                               f"status {said}. Find what in this issue's change broke the deployment, and repair it."),
+                              *summary])
+
+    def _deployment_summary(self, sha: str) -> list[str]:
+        """What the pipeline's reporter said of the failed deployment of the commit `sha`, as
+        feedback for a fix-forward: one entry per status. It is built from that commit's statuses
+        and from nothing else: the engine reads no commit comment and no other text about a
+        deployment (ADR 0001, amendment 4). Only the statuses of a configured context, or of one
+        followed by a slash and more, count. The first kind is a stage's own status, whatever its
+        state. The second kind is a fact: the reporter posts each fact of a failure under the
+        context of its stage (system design, section 8.4). Any other context is another reporter's
+        (`measure/...`), or one the owner did not name. Of each context the newest status counts.
+        The entries come in the configured order of the stages, each stage's own status before its
+        facts, the facts sorted by context, each with the context, the state and the description."""
+        newest: dict[str, dict] = {}
+        for status in self.gh.commit_statuses(sha):   # the oldest first: the last of a context is its newest
+            newest[str(status.get("context") or "")] = status
+        summary = []
+        for configured in self.deploy.contexts:
+            for context in sorted(c for c in newest if c == configured or c.startswith(configured + "/")):
+                status = newest.pop(context)   # popped: a context below two configured ones is told once
+                description = " ".join(str(status.get("description") or "").split())
+                summary.append(f"the deployment's report on the merge commit {sha[:12]}: the commit status `{context}` is "
+                               f"`{status.get('state')}`" + (f", with the description `{description}`" if description else ""))
+        return summary
 
     def _deployment_evidence(self, st: IssueState) -> list[dict]:
         """The deployment verdict as an evidence record of the issue: the commit and each context

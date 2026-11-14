@@ -91,6 +91,7 @@ class GitHub(Protocol):
     def required_check(self, sha: str, name: str) -> str | None: ...
     def required_check_run(self, sha: str, name: str) -> dict | None: ...
     def deploy_status(self, sha: str, context: str) -> dict | None: ...
+    def commit_statuses(self, sha: str) -> list[dict]: ...
     def find_issue(self, label: str, marker: str) -> int | None: ...
     def review_decision(self, n: int) -> str: ...
     # writes
@@ -212,6 +213,17 @@ class GhCli:
             return None
         latest = max(statuses, key=lambda s: s.get("id") or 0)   # GitHub lists the newest first: it wins a tie
         return {"state": latest.get("state"), "description": latest.get("description") or ""}
+
+    def commit_statuses(self, sha):
+        """Every commit status of the commit `sha`, the oldest first, each with its context, its
+        state and its description, and nothing else GitHub says of it. A failed deployment's facts
+        are further statuses of the same commit, one per fact (ADR 0001, amendment 4): this is the
+        whole of what the engine reads about a deployment."""
+        posted = self._pages(self._r(f"commits/{sha}/statuses"))
+        posted.reverse()   # GitHub lists the newest first
+        posted.sort(key=lambda s: s.get("id") or 0)
+        return [{"context": s.get("context") or "", "state": s.get("state") or "", "description": s.get("description") or ""}
+                for s in posted]
 
     def find_issue(self, label, marker):
         """An issue (open or closed) with `label` whose body carries `marker`. Listing by label has
@@ -401,6 +413,7 @@ class FakeGitHub:
         self._run_ids = iter(range(1, 10**9))
         self.reruns: list[str] = []
         self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
+        self.commit_comments: dict[str, list[str]] = {}   # sha -> the comments on that commit; no read gives them
         self.default_review: str = ""   # the review decision of a pull request when it is opened: none is asked for
         self.calls: list[tuple] = []
         self.owner = owner
@@ -418,6 +431,11 @@ class FakeGitHub:
     def set_status(self, sha: str, context: str, state: str, description: str = "") -> None:
         """Post a commit status on `sha`, as the pipeline's reporter does: the context's latest."""
         self.statuses.setdefault(sha, []).append({"context": context, "state": state, "description": description})
+
+    def add_commit_comment(self, sha: str, body: str) -> None:
+        """Comment on the commit `sha`. The fake holds the comment and no method of the `GitHub`
+        protocol reads it: a test shows with it that the engine takes nothing from one."""
+        self.commit_comments.setdefault(sha, []).append(body)
 
     def _id(self) -> int:
         self._next_id += 1
@@ -465,6 +483,9 @@ class FakeGitHub:
     def deploy_status(self, sha, context):
         posted = [s for s in self.statuses.get(sha, []) if s["context"] == context]
         return {"state": posted[-1]["state"], "description": posted[-1]["description"]} if posted else None
+
+    def commit_statuses(self, sha):
+        return [dict(s) for s in self.statuses.get(sha, [])]
 
     def find_issue(self, label, marker):
         for n, issue in sorted(self.issues.items()):
