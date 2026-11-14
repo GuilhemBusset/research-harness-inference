@@ -15,6 +15,11 @@ the engine can tell an outage from a real error; any other failure raises `GitHu
 environment of one `gh` process, asked before each one. `cli.py` gives it `app_token.gh_env`,
 which carries a token of the factory's GitHub App with at least ten minutes left. A token that
 cannot be minted is a request that was not sent: an outage if repeating may help, an error if not.
+
+`RedactingGitHub` wraps the client a run publishes through: every title and body that creates or
+updates a comment, a pull request or an issue passes through the hygiene scanner's redaction
+first (`redact.py`). Without the scanner nothing is sent, and the call raises
+`RedactionUnavailable`.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .app_token import AppTokenError
+from .redact import RedactionError, redact
 
 PER_PAGE = 100
 RETRY_DELAYS_S = (5, 15, 45)   # seconds slept before each retry of a transient failure
@@ -41,6 +47,12 @@ _NOT_SENT = re.compile(r"could not resolve host|no such host|error connecting to
                        re.IGNORECASE)
 # The connection broke or timed out: the request may or may not have reached GitHub.
 _NETWORK = re.compile(r"connection reset|timeout|timed out|\bEOF\b", re.IGNORECASE)
+# A pull request's review decision, as GitHub's GraphQL API gives it: APPROVED, CHANGES_REQUESTED,
+# REVIEW_REQUIRED, or null where no review is asked for. The REST API has no such field.
+REVIEW_DECISION_QUERY = ("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) "
+                         "{ pullRequest(number: $number) { reviewDecision } } }")
+# The decisions with which GitHub refuses a merge for want of a person: a review is owed, or one asks for changes.
+REVIEW_OWED = ("REVIEW_REQUIRED", "CHANGES_REQUESTED")
 
 
 class GitHubError(RuntimeError):
@@ -50,6 +62,12 @@ class GitHubError(RuntimeError):
 class GitHubUnavailable(GitHubError):
     """GitHub could not be reached, or kept failing transiently through every retry: an outage,
     not an answer to the request."""
+
+
+class RedactionUnavailable(GitHubUnavailable):
+    """The hygiene scanner could not mask a title or a body (it is missing, or it failed), so the
+    call was not made: nothing was sent, masked or raw. For the engine this is GitHub being
+    unavailable: the issue waits (`WAIT_GITHUB`) and the supervisor's next run tries again."""
 
 
 def transient(stderr: str, stdout: str = "") -> str | None:
@@ -78,7 +96,10 @@ class GitHub(Protocol):
     def find_pr(self, head: str) -> dict | None: ...
     def required_check(self, sha: str, name: str) -> str | None: ...
     def required_check_run(self, sha: str, name: str) -> dict | None: ...
+    def deploy_status(self, sha: str, context: str) -> dict | None: ...
+    def commit_statuses(self, sha: str) -> list[dict]: ...
     def find_issue(self, label: str, marker: str) -> int | None: ...
+    def review_decision(self, n: int) -> str: ...
     # writes
     def create_comment(self, n: int, body: str) -> dict: ...
     def update_comment(self, comment_id: int, body: str) -> dict: ...
@@ -105,22 +126,23 @@ class GhCli:
         self._run = runner
         self._sleep = sleep
         self.retry_delays = tuple(retry_delays)
-        self._env = env
+        self.env = env   # asked before each `gh` process; `cli.github` sets it
 
     def _identity(self) -> dict[str, Any]:
         """What one `gh` process is started with beyond the usual: its own environment when the
         engine runs as the factory's App (asked each time: the token in it is renewed before it
         runs out), nothing when it runs with the login `gh` has. Raises `AppTokenError`."""
-        env = self._env() if self._env is not None else None
+        env = self.env() if self.env is not None else None
         return {} if env is None else {"env": env}
 
     def _api(self, path: str, method: str = "GET", payload: dict | None = None, ok_codes: tuple[int, ...] = (),
-             idempotent: bool | None = None) -> Any:
+             idempotent: bool | None = None, fields: tuple[str, ...] = ()) -> Any:
         """One REST call. An HTTP error in `ok_codes` means "nothing to do" and returns None.
         `idempotent` says whether repeating the call is harmless; by default every method but POST
-        is. What is retried, and what is raised, is in the module docstring."""
+        is. What is retried, and what is raised, is in the module docstring. `fields` are `gh api`
+        field flags, added as they are: how a GraphQL query and its variables are given."""
         args = ["gh", "api", "--method", method, "-H", f"X-GitHub-Api-Version: {self.api_version}",
-                "-H", "Accept: application/vnd.github+json", path]
+                "-H", "Accept: application/vnd.github+json", path, *fields]
         if payload is not None:
             args += ["--input", "-"]
         repeatable = method != "POST" if idempotent is None else idempotent
@@ -204,6 +226,29 @@ class GhCli:
         run = max(runs, key=lambda r: r.get("id", 0))
         return {"id": run.get("id"), "status": run.get("status"), "conclusion": run.get("conclusion")}
 
+    def deploy_status(self, sha, context):
+        """The latest commit status called `context` on the commit `sha`: its state (`pending`,
+        `success`, `failure` or `error`) and its description, or None when the commit has no status
+        of that context. This is how the pipeline reports a deployment (ADR 0001, decision 5). A
+        context is posted again at every step, so the commit's statuses are read whole and the
+        newest of the context is kept."""
+        statuses = [s for s in self._pages(self._r(f"commits/{sha}/statuses")) if s.get("context") == context]
+        if not statuses:
+            return None
+        latest = max(statuses, key=lambda s: s.get("id") or 0)   # GitHub lists the newest first: it wins a tie
+        return {"state": latest.get("state"), "description": latest.get("description") or ""}
+
+    def commit_statuses(self, sha):
+        """Every commit status of the commit `sha`, the oldest first, each with its context, its
+        state and its description, and nothing else GitHub says of it. A failed deployment's facts
+        are further statuses of the same commit, one per fact (ADR 0001, amendment 4): this is the
+        whole of what the engine reads about a deployment."""
+        posted = self._pages(self._r(f"commits/{sha}/statuses"))
+        posted.reverse()   # GitHub lists the newest first
+        posted.sort(key=lambda s: s.get("id") or 0)
+        return [{"context": s.get("context") or "", "state": s.get("state") or "", "description": s.get("description") or ""}
+                for s in posted]
+
     def find_issue(self, label, marker):
         """An issue (open or closed) with `label` whose body carries `marker`. Listing by label has
         no search-index delay, so an issue created a moment ago is found."""
@@ -211,6 +256,19 @@ class GhCli:
             if marker in (issue.get("body") or "") and "pull_request" not in issue:
                 return issue["number"]
         return None
+
+    def review_decision(self, n):
+        """The review decision of pull request `n`: the field `reviewDecision` of GitHub's GraphQL
+        API, read with `gh api graphql`. APPROVED, CHANGES_REQUESTED or REVIEW_REQUIRED; empty where
+        GitHub gives none (no review is asked for). A query changes nothing, so it is retried
+        like a read."""
+        owner, _, name = self.repo.partition("/")
+        answer = self._api("graphql", "POST", idempotent=True, fields=(
+            "-f", f"query={REVIEW_DECISION_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={int(n)}"))
+        pull = (((answer or {}).get("data") or {}).get("repository") or {}).get("pullRequest")
+        if not isinstance(pull, dict):
+            raise GitHubError(f"gh api graphql gave no pull request {n} of {self.repo}")
+        return str(pull.get("reviewDecision") or "")
 
     def create_comment(self, n, body):
         return self._api(self._r(f"issues/{n}/comments"), "POST", {"body": body})
@@ -272,6 +330,46 @@ class GhCli:
 
     def create_issue(self, title, body, labels):
         return self._api(self._r("issues"), "POST", {"title": title, "body": body, "labels": labels})
+
+
+class RedactingGitHub:
+    """Wraps a client: the titles and bodies that create or update a comment, a pull request or an
+    issue are masked by the hygiene scanner before the inner client sees them (ADR 0001, decision
+    4). The text is masked first and sent second, so a scanner that cannot run sends nothing.
+
+    `edit_issue` is forwarded as it is: the engine uses it to close an issue and to tick its
+    boxes, and a tick sends back the issue's own text, which the engine never rewrites. Every
+    other method is forwarded too."""
+
+    def __init__(self, inner: GitHub, mask: Callable[[str], str] = redact):
+        self.inner = inner
+        self._redact = mask
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def _mask(self, text: str) -> str:
+        try:
+            return self._redact(text)
+        except RedactionError as e:
+            raise RedactionUnavailable(f"nothing was published: {e}") from e
+
+    def create_comment(self, n, body):
+        return self.inner.create_comment(n, self._mask(body))
+
+    def update_comment(self, comment_id, body):
+        return self.inner.update_comment(comment_id, self._mask(body))
+
+    def create_pr(self, head, base, title, body):
+        title, body = self._mask(title), self._mask(body)
+        return self.inner.create_pr(head, base, title, body)
+
+    def update_pr(self, n, body):
+        return self.inner.update_pr(n, self._mask(body))
+
+    def create_issue(self, title, body, labels):
+        title, body = self._mask(title), self._mask(body)
+        return self.inner.create_issue(title, body, labels)
 
 
 class RecordingGitHub:
@@ -342,6 +440,9 @@ class FakeGitHub:
         self._check_seen: dict[str, dict] = {}  # sha -> the latest check run handed out
         self._run_ids = iter(range(1, 10**9))
         self.reruns: list[str] = []
+        self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
+        self.commit_comments: dict[str, list[str]] = {}   # sha -> the comments on that commit; no read gives them
+        self.default_review: str = ""   # the review decision of a pull request when it is opened: none is asked for
         self.calls: list[tuple] = []
         self.owner = owner
         self.on_merge = on_merge
@@ -354,6 +455,15 @@ class FakeGitHub:
                           "labels": [{"name": l} for l in labels], "html_url": f"https://github.test/issues/{n}"}
         self.subs[n] = list(subs)
         self.blocked[n] = list(blocked_by)
+
+    def set_status(self, sha: str, context: str, state: str, description: str = "") -> None:
+        """Post a commit status on `sha`, as the pipeline's reporter does: the context's latest."""
+        self.statuses.setdefault(sha, []).append({"context": context, "state": state, "description": description})
+
+    def add_commit_comment(self, sha: str, body: str) -> None:
+        """Comment on the commit `sha`. The fake holds the comment and no method of the `GitHub`
+        protocol reads it: a test shows with it that the engine takes nothing from one."""
+        self.commit_comments.setdefault(sha, []).append(body)
 
     def _id(self) -> int:
         self._next_id += 1
@@ -398,11 +508,23 @@ class FakeGitHub:
         run = self._check_seen[sha]
         return None if run["conclusion"] is None else dict(run)
 
+    def deploy_status(self, sha, context):
+        posted = [s for s in self.statuses.get(sha, []) if s["context"] == context]
+        return {"state": posted[-1]["state"], "description": posted[-1]["description"]} if posted else None
+
+    def commit_statuses(self, sha):
+        return [dict(s) for s in self.statuses.get(sha, [])]
+
     def find_issue(self, label, marker):
         for n, issue in sorted(self.issues.items()):
             if marker in (issue.get("body") or "") and {"name": label} in issue.get("labels", []):
                 return n
         return None
+
+    def review_decision(self, n):
+        if n not in self.prs:
+            raise GitHubError(f"pull request {n} not found")
+        return self.prs[n].get("review_decision") or ""
 
     # writes
     def create_comment(self, n, body):
@@ -447,7 +569,8 @@ class FakeGitHub:
     def create_pr(self, head, base, title, body):
         n = 5000 + len(self.prs) + 1
         pr = {"number": n, "head": {"ref": head}, "base": {"ref": base}, "title": title, "body": body,
-              "state": "open", "merged": False, "html_url": f"https://github.test/pull/{n}", "labels": []}
+              "state": "open", "merged": False, "html_url": f"https://github.test/pull/{n}", "labels": [],
+              "review_decision": self.default_review}
         self.prs[n] = pr
         self.calls.append(("create_pr", head))
         return pr
@@ -460,6 +583,8 @@ class FakeGitHub:
         pr = self.prs[n]
         if pr.get("head_sha") and pr["head_sha"] != sha:
             raise GitHubError("Head branch was modified. Review and try the merge again.")
+        if pr.get("review_decision") in REVIEW_OWED:   # as a ruleset that asks for the owner's review refuses it
+            raise GitHubError("Repository rule violations found: a review is required")
         merge_sha = self.on_merge(pr["head"]["ref"], sha) if self.on_merge else f"merged-{sha}"
         pr.update(state="closed", merged=True, merge_commit_sha=merge_sha)
         pr["head"]["sha"] = sha

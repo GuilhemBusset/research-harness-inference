@@ -1,4 +1,4 @@
-"""Command line: `implement doctor | plan | run | status | stop | retry | supervise | record-fixture`."""
+"""Command line: `implement doctor | plan | run | status | costs | stop | retry | supervise | record-fixture`."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -14,9 +15,10 @@ from pathlib import Path
 from typing import cast
 
 from . import VERSION, app_token, environment, report, sandbox
-from .config import Config, load_policy
-from .github import GhCli, GitHub, RecordingGitHub
+from .config import CEILINGS, Config, load_policy
+from .github import GhCli, GitHub, RecordingGitHub, RedactingGitHub
 from .graph import CycleError, build_plan
+from .model import Issue
 from .state import RunStore
 
 
@@ -40,10 +42,20 @@ def repo_slug() -> str:
 
 
 def github(slug: str) -> GhCli:
-    """The engine's GitHub client. Each `gh` it starts gets its environment from
+    """The `gh` client under every command here. Each `gh` it starts gets its environment from
     `app_token.gh_env`: a token of the factory's GitHub App with at least ten minutes left when
     the environment names the App, the login `gh` already has otherwise."""
-    return GhCli(slug, env=app_token.gh_env)
+    client = GhCli(slug)
+    client.env = app_token.gh_env
+    return client
+
+
+def github_client(slug: str) -> GitHub:
+    """The client of every command here, and so of every run the supervisor launches: whatever it
+    publishes on GitHub is masked first by the hygiene scanner of the checkout the engine runs
+    from (`github.RedactingGitHub`). It forwards every other GitHub method. Under it is
+    `github(slug)`, so what it sends, it sends as the factory's App when the environment names one."""
+    return cast(GitHub, RedactingGitHub(github(slug)))
 
 
 def git_as_the_app() -> None:
@@ -57,7 +69,7 @@ def git_as_the_app() -> None:
 def cmd_plan(args) -> int:
     root = repo_root()
     try:
-        plan = build_plan(github(args.repo or repo_slug()), args.issue, root)
+        plan = build_plan(github_client(args.repo or repo_slug()), args.issue, root)
     except CycleError as e:
         print(f"implement: {e}. Fix the blocked-by links before running.", file=sys.stderr)
         return 2
@@ -101,6 +113,115 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _spread(values: list[float]) -> dict:
+    """The total of `values`, with their median and their maximum (None when there is none)."""
+    return {"total": sum(values), "median": statistics.median(values) if values else None,
+            "max": max(values, default=None)}
+
+
+def cost_report(records: list[dict], sizes: dict[int, str]) -> dict:
+    """What a run cost, from the attempts of its `agents.jsonl` and the size of each of its issues
+    (`sizes`: every issue of the run, also one no agent was called for yet).
+
+    An answered call is an attempt the vendor answered: what an issue's call ceiling counts. The
+    dollars are what Claude reported (`cost_usd`); an attempt that reports none (a timeout, a
+    crash, every Codex call) adds no dollar and is not among the calls its role's median and
+    maximum are taken over. Codex reports tokens, input plus output as `status` adds them, and
+    its side is in tokens. A size's median and maximum are per issue, over the issues an agent
+    was called for: an issue nothing ran for yet says nothing about what its size costs."""
+    def dollars(r: dict) -> float | None:
+        cost = r.get("cost_usd")
+        return float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+
+    def tokens(r: dict) -> int | None:
+        usage = r.get("usage")
+        if r.get("vendor") != "codex" or not isinstance(usage, dict):
+            return None
+        return (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+
+    def summed(group: list[dict]) -> dict:
+        return {"attempts": len(group), "answered": sum(1 for r in group if r.get("outcome") == "answered"),
+                "usd": sum(dollars(r) or 0 for r in group), "tokens": sum(tokens(r) or 0 for r in group)}
+
+    by_issue: dict[int, list[dict]] = {n: [] for n in sizes}
+    by_role: dict[str, list[dict]] = {}
+    for r in records:
+        if r.get("issue") in by_issue:
+            by_issue[r["issue"]].append(r)
+        by_role.setdefault(str(r.get("role")), []).append(r)
+    issues = [{"issue": n, "size": sizes[n], **summed(by_issue[n])} for n in sorted(by_issue)]
+    no_issue = summed([r for r in records if r.get("issue") not in by_issue])   # the run's own calls (explore)
+    roles = []
+    for role in sorted(by_role):
+        group = by_role[role]
+        roles.append({"role": role, "attempts": len(group),
+                      "answered": sum(1 for r in group if r.get("outcome") == "answered"),
+                      "usd": _spread([d for d in map(dollars, group) if d is not None]),
+                      "tokens": _spread([t for t in map(tokens, group) if t is not None])})
+    by_size: dict[str, list[dict]] = {}
+    for n, row in zip(sorted(by_issue), issues, strict=True):
+        if by_issue[n]:
+            by_size.setdefault(sizes[n], []).append(row)
+    known = list(CEILINGS)
+    per_size = []
+    for size in sorted(by_size, key=lambda s: (known.index(s) if s in known else len(known), s)):
+        rows = by_size[size]
+        per_size.append({"size": size, "issues": len(rows),
+                         **{key: {k: v for k, v in _spread([row[key] for row in rows]).items() if k != "total"}
+                            for key in ("answered", "usd", "tokens")}})
+    return {"total": summed(records), "issues": issues, "no_issue": no_issue, "roles": roles, "sizes": per_size}
+
+
+def render_costs(root: int, rep: dict) -> str:
+    def usd(value) -> str:
+        return "-" if value is None else f"${value:,.2f}"
+
+    def count(value) -> str:
+        return "-" if value is None else f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
+
+    total = rep["total"]
+    lines = [(f"Cost of the run for #{root}, from agents.jsonl: {total['attempts']} attempt(s), {total['answered']} "
+              f"answered · Claude {usd(total['usd'])} · Codex tokens {count(total['tokens'])}"),
+             "", "Per issue: answered calls (what the call ceiling counts), Claude dollars, Codex tokens"]
+    for row in rep["issues"]:
+        lines.append(f"#{row['issue']:<5} size {row['size']:<3} calls {row['answered']:<4} {usd(row['usd']):>9}"
+                     f" · tokens {count(row['tokens'])}")
+    if rep["no_issue"]["attempts"]:
+        row = rep["no_issue"]
+        lines.append(f"{'no issue':<15} calls {row['answered']:<4} {usd(row['usd']):>9} · tokens {count(row['tokens'])}")
+    lines += ["", "Per role: per call, over the calls that reported a cost (Claude) or tokens (Codex)"]
+    for row in rep["roles"]:
+        d, t = row["usd"], row["tokens"]
+        lines.append(f"{row['role']:<15} attempts {row['attempts']} · answered {row['answered']}"
+                     f" · Claude {usd(d['total'])}, per call median {usd(d['median'])}, max {usd(d['max'])}"
+                     f" · Codex tokens {count(t['total'])}, per call median {count(t['median'])}, max {count(t['max'])}")
+    lines += ["", "Per size: per issue, over the issues an agent was called for"]
+    for row in rep["sizes"]:
+        lines.append(f"size {row['size']:<3} issues {row['issues']}"
+                     f" · calls median {count(row['answered']['median'])}, max {count(row['answered']['max'])}"
+                     f" · Claude median {usd(row['usd']['median'])}, max {usd(row['usd']['max'])}"
+                     f" · Codex tokens median {count(row['tokens']['median'])}, max {count(row['tokens']['max'])}")
+    return "\n".join(lines)
+
+
+def cmd_costs(args) -> int:
+    """What each issue of a run cost, by role and by size: what the ceilings of `config.py` and
+    the budgets of `loop.toml` are set from (ADR 0001, decision 8). Read-only: the run's
+    `agents.jsonl`, and each issue's `size:` label on GitHub, read as `plan` reads issues, since
+    the run records do not keep it."""
+    store = RunStore.for_root(repo_root(), args.issue)
+    calls = store.dir / "agents.jsonl"
+    records = [json.loads(line) for line in calls.read_text().splitlines() if line.strip()] if calls.exists() else []
+    if not records:
+        print(f"No agent call recorded for #{args.issue}.")
+        return 0
+    gh = github_client(args.repo or repo_slug())
+    numbers = sorted({*store.known(), *(r["issue"] for r in records if isinstance(r.get("issue"), int))})
+    rep = cost_report(records, {n: Issue.from_api(gh.get_issue(n)).size for n in numbers})
+    print(json.dumps(rep, indent=1) if args.json else render_costs(args.issue, rep))
+    return 0
+
+
 def cmd_stop(args) -> int:
     store = RunStore.for_root(repo_root(), args.issue)
     (store.dir / "STOP").write_text("stop requested\n")
@@ -137,7 +258,7 @@ def cmd_retry(args) -> int:
 
 
 def cmd_record(args) -> int:
-    rec = RecordingGitHub(github(args.repo or repo_slug()))
+    rec = RecordingGitHub(github_client(args.repo or repo_slug()))
     build_plan(cast(GitHub, rec), args.issue, repo_root())   # it forwards every GitHub method
     rec.save(Path(args.out))
     print(f"Recorded {sum(len(v) for v in rec.fixture.values())} responses to {args.out}")
@@ -470,7 +591,7 @@ def cmd_run(args) -> int:
     # From here on every git process of this run (its own commands, ship.sh) ignores the hooks and
     # the monitor a worktree or an agent's git directory names: they would run outside the sandbox.
     os.environ.update(sandbox.engine_git_env(os.environ, runs_dir(root) / "no-hooks"))
-    gh = github(slug)
+    gh = github_client(slug)
     try:
         plan = build_plan(gh, args.issue, root)
     except CycleError as e:
@@ -555,6 +676,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("status", help="show a run's progress")
     p.add_argument("issue", type=int)
     p.set_defaults(func=cmd_status)
+    p = sub.add_parser("costs", help="show what each issue of a run cost, by role and by size")
+    p.add_argument("issue", type=int, help="the run's root issue")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_costs)
     p = sub.add_parser("stop", help="ask a running run to stop at the next safe point")
     p.add_argument("issue", type=int)
     p.set_defaults(func=cmd_stop)

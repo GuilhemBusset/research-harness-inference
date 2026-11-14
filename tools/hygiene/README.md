@@ -13,6 +13,7 @@ second.
 | `.githooks/pre-commit` | `scan.py --staged` | A person or an interactive agent committing a leak |
 | `.githooks/pre-push` | `scan.py --rev <sha>` for the tip of each pushed ref | A branch whose tree carries a leak leaving the machine |
 | The implement loop's verifier | `scan.py`, in the tree of the exact head | A loop branch being examined or pushed with a leak |
+| The implement loop's engine, immediately before each push | `scan.py --rev <head>` and `scan.py --history <main>..<head>`, outside the sandbox, where the owner's list exists (below) | A loop branch leaving the machine with a value only the owner's list names |
 | CI, job `hygiene` | `scripts/check.sh hygiene` | A head that is not clean on a clean machine |
 | CI, job `history` | `scan.py --history` (the pull request's commits; on `main`, everything) | A value that was committed and later removed, a forbidden file that was later renamed, a value in a commit message or in a commit's author address |
 
@@ -112,16 +113,39 @@ exist.
 
 Where the file does not exist the rule is off, silently: in CI, on a contributor's machine, and
 inside the implement loop's sandbox, whose home directory is empty. Agents never see the values.
-The owner's hooks, the owner's `scripts/check.sh` and the green-light scans do. A consequence:
+The owner's hooks, the owner's `scripts/check.sh`, the green-light scans and the implement loop's
+engine, before each push (below), do. A consequence:
 `pre-push` on the owner's machine can refuse a branch that passed every other check, if the branch
 contains one of these values. That is the leak being stopped, at the last local point.
 
-One path the rule does not cover today: the implement loop pushes its branches with its own git
-calls, which run no hooks, and its verifier scans inside the sandbox, where this file does not
-exist. A loop branch is therefore checked against every pattern, in its tree and in its history,
-but not against the owner's list. The agents never see those values, so they can only reach a
-loop branch through text the owner wrote into an issue. Having the engine itself, which runs
-outside the sandbox, scan with the owner's list before it pushes is a backlog issue.
+The implement loop's branches are checked against the list by the engine. The loop pushes its
+branches with its own git calls, which run none of the repository's hooks, and its verifier scans
+inside the sandbox, where this file does not exist. The engine process itself runs outside the
+sandbox, as the owner. Where the file exists, the engine scans immediately before each push of a
+branch, an issue's or a revert's: the tree of the head (`--rev`), then the commits the push would
+publish (`--history <main>..<head>`). The commands are `LOCAL_VALUE_CHECKS` in
+`tools/implementation-loop/implement_loop/config.py`.
+
+- That scan runs the `scan.py` and the `hygiene.toml` of the checkout the engine runs from, never
+  the branch's copies, and reads the branch as git objects: nothing a builder wrote is executed
+  outside the sandbox.
+- A finding is handled as a finding in a branch's history is (ADR 0001, amendment 7): the branch
+  is abandoned unpushed, the issue ends `failed` with the reason `history`, and a retry starts on
+  a new branch. A revert with a finding is not pushed.
+- What this scan finds is the value itself. The engine keeps the path and the rule's name of a
+  finding and nothing else: the line number and the excerpt reach no issue, no comment, no agent
+  and no file of the run. The agents never see the values, so one can only reach a loop branch
+  through text the owner wrote into an issue: that text is what to correct before a retry.
+- A scan that cannot run (a list that cannot be read, a `HYGIENE_LOCAL_VALUES` that names no
+  file) withholds the push.
+- `ship.sh` fetches `main` once more before it pushes, and merges it or rebases onto it if it
+  moved: a head the scan did not see. While the engine pushes a scanned head, its git therefore
+  has a `pre-push` hook of the engine's own, in the hooks directory the engine owns, which
+  refuses any other commit. A head shipping made is verified, certified and scanned before it is
+  pushed. Every run of the repository has that same hooks directory, so a push holds a lock on
+  it until its hook is removed: two runs push one after the other, each under its own hook.
+
+Where the file does not exist, the engine scans nothing outside the sandbox and pushes as before.
 
 ## What to write instead
 

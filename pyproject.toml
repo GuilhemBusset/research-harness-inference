@@ -1,7 +1,6 @@
-# One uv project for the whole repository (docs/design/system-design.md, "Repository layout"): today the
-# factory's tooling, later the CDK app, its constructs and their tests. It is not a package and
-# nothing installs it. The runtime dependencies (aws-cdk-lib and friends) arrive with the first
-# backlog issue.
+# One uv project for the whole repository (docs/design/system-design.md, "Repository layout"): the
+# factory's tooling, the CDK app, its constructs and their tests. It is not a package and nothing
+# installs it.
 [project]
 name = "research-harness-inference"
 version = "0"
@@ -9,7 +8,14 @@ description = "A scale-to-zero inference endpoint on AWS, written with Python CD
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = []
+# What the CDK app runs on, each pinned to an exact version (docs/design/evidence.md, E20).
+# constructs is pinned at the version the lock resolves for aws-cdk-lib: bump the two together.
+# The CDK CLI is pinned apart, in package.json. tests/unit/test_toolchain.py checks these pins.
+dependencies = [
+    "aws-cdk-lib==2.276.0",
+    "constructs==10.8.1",
+    "cdk-nag==3.0.2",
+]
 
 # Exact pins, shared with the vendored implement loop (tools/implementation-loop/UPSTREAM.md) so
 # its tests and lint pass unchanged. Three of them are named in other files as well, and move
@@ -32,3 +38,31 @@ package = false
 # Python (scripts/check.sh engine-tests), so they are not listed here.
 [tool.pytest.ini_options]
 testpaths = ["tools/hygiene/tests", "tools/backlog/tests", "tests"]
+# A test module is imported under a name made from its path, not its bare file name, so two test
+# files of one name in different folders (tests/synth/test_pipeline.py and
+# tests/policy/test_pipeline.py) are both collected, with no `__init__.py` in the tests tree.
+addopts = ["--import-mode=importlib"]
+# The Python roots of the "Repository layout" (system design, section 8.1): one package under each,
+# and scripts/pipeline, whose scripts are modules the tests import by name. A new module goes into
+# an existing root; ruff.toml (`src`) and ty.toml (`root`, `include`) list the same folders, and
+# tests/unit/test_layout.py holds the three lists together.
+pythonpath = [
+    "src",
+    "services/common",
+    "services/gateway",
+    "services/issuer",
+    "services/scaler",
+    "services/reporter",
+    "services/engine/lifecycle",
+    "services/engine/mock",
+    "client",
+    "admin",
+    "dashboards",
+    "scripts/pipeline",
+    # Not roots of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
+    # this configuration too, and import their helpers and each other by bare name, which the
+    # default import mode allowed by putting each test file's folder on the path. The examiner's
+    # probes of the engine, in tests/examiner, import each other the same way.
+    "tools/implementation-loop/tests",
+    "tests/examiner",
+]
