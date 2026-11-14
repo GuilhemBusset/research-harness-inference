@@ -191,6 +191,31 @@ of `main`; the evidence comment can carry a row that is no ledger item (`deploym
 that waits with `owner_approval` is resumed by every run and waits again until the status changes,
 so the supervisor reaches its bounds if the owner does not act, and `status` shows the kind.
 
+### 1.2.1, patched a third time: a container obligation discharged by its CI job (2026-11-14)
+
+An item that rests on a test under `tests/container/` names `host:container-runtime`, which the
+host lacks, so until now it ended as an owner obligation on a `delivered` issue, with nothing left
+for the owner to do: the CI job `container-tests` runs those tests on the very head that lands, as
+part of `required`. Issue #14 (draft E0-19) builds what amendment 5 of ADR 0001 left to the
+backlog: when an issue lands, the engine reads that job's check run on the head that was merged
+and, if it succeeded, records the item as proven. No capability is added. The engine's version
+stays 1.2.1: nothing here repairs a failed issue. The 1.2.0 entry of `loop.toml` above says the
+engine does not read the job's result yet; that was so until this patch.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `loop.toml` | `[host]` gains `ci_jobs = { "host:container-runtime" = "container-tests" }`: for a capability of `lacks`, the name of the CI job that provides it. The comment on the capability says what the engine now reads and when the item still ends as an obligation. `lacks` is unchanged. | The mapping is configuration on the safety surface, like the list it completes: the engine holds no job name of its own. |
+| `implement_loop/config.py` | New `load_ci_jobs`, which `load_policy` calls: the policy gains the key `ci_jobs`, a dictionary from capability to job name, empty when the table has none. A value that is not a non-empty string raises `TypeError`. | `cli.py` passes the policy to the engine as it is, so it is not changed. |
+| `implement_loop/engine.py` | `_accept` calls the new `_ci_discharged` before it writes the evidence comment. An owner item is discharged when the plan gives it a capability that `ci_jobs` maps to a job, its text names a Python file under `tests/container/` (`CONTAINER_TEST`; the folder alone names no test), and the check run of that job's name on the merged pull request's head (`_merged_head`: the pull request recorded for the round, merged, as `find_pr` returns it) is completed with the conclusion `success` and has an address. Such an item gets an evidence record (kind `check_run`, with the commit, the job and the address), a row in the evidence comment, and its box ticked with the check run's address as the evidence link; its obligation is removed, so it is in neither `obligations` nor `human_tasks`, and the pull request's body is rendered again without it under "Left for later". The event `obligations_discharged` journals the head and the addresses. The rest of `_accept` is unchanged: an issue with no obligation left is closed as `done` by the code that was there. | Amendment 5. The head of the merged pull request is the commit `required` was read on before the merge, so the job's run is complete there. The plan is read rather than `obligations` so that the step, which runs again when a publication ends it, records the same evidence the second time. |
+| `implement_loop/engine.py` | What discharges nothing, and leaves the obligation as it was: a capability with no mapping (no check run is read for it), an item that names no test under `tests/container/`, a round that merged no pull request, no check run of that name, one that is not completed, was skipped or did not succeed, one without an address, and a read GitHub did not answer (journaled as `github_call_failed`). The check run is read once and not waited for. | The owner's obligation is the safe outcome: a false discharge would close an issue on evidence nobody has. |
+| `implement_loop/github.py` | `GhCli.required_check_run` also returns the check run's `html_url` (empty when GitHub gives none); the id, the status and the conclusion are as before. `FakeGitHub` gains `required_name` (`required`) and `job_checks`: `checks`, `default_check` and `check_script` play the check run of that name, as before, and a check run of any other name exists only when a test lists its conclusion in `job_checks`, with an address. | The live client dropped the address, so a discharged item would have had an empty evidence link. The fake answered every name with the required check's verdict, so an absent job could not be played and would have read as a success. The issue does not name this file: the builder asked for it with a `protected_change` request. |
+
+Behaviour an upstream reader would not expect: an issue with an owner item can end `done` with no
+action of the owner; a box of the issue can be ticked with a link that is not the evidence comment;
+the evidence comment can carry a row whose proof is a check run; a merged pull request's body is
+edited after the merge when an item was discharged. The address is published as GitHub gives it,
+through the redacting client like the rest of the comment.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -279,6 +304,14 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_deploying.py` (16) | Added. | `deploy_status` returns the newest status of a context, for `GhCli` behind a fake `gh` and for the fake GitHub alike; the committed `loop.toml` loads to the three neutral values, and a key the table does not have is refused. In real engine runs, with the fake GitHub posting statuses on merge commits as a pipeline would: an empty contexts list reads nothing and waits for nothing; success of every context is journaled between the merge and the evidence step and recorded as evidence with the commit and the contexts; a failure gets one fix-forward whose feedback names the context and its state and not the status's description; an error that the fix-forward does not repair ends in a revert pull request; a second issue stays in `land` while the first polls, and does not land after the timeout either, until the first has its verdict (`test_the_landing_claim_is_held`); a run for another root does not land before that verdict; an approval leaves the issue waiting `owner_approval` with the claim free, a second issue lands meanwhile, and the first ends done once its status is success (`test_an_approval_releases_the_claim`); that wait has no timeout, a failure ends it, and an empty `approval_description` matches no status; a resumed wait reads the same commit and finds one merge (`test_a_resumed_wait_does_not_merge_again`); statuses that cannot be read are no verdict and no engine fault; the evidence step is not reached with a verdict owed; emptying the contexts frees the issue and the claim; a run stopped while it polls renders the phase in its summary and resumes in `deploying`. The module takes `implement_loop` from the folder beside it (`loop_beside_these_tests`), for the reason `judge_by_this_trees_lists` gives above. |
+
+### 1.2.1, patched a third time (2026-11-14)
+
+573 collected tests: the 561 before it, none removed and none changed, and 12 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_container_obligations.py` (12) | Added. | The committed `loop.toml` maps `host:container-runtime` to `container-tests` and still lists the capability; `GhCli` behind a fake `gh` returns the address of the latest check run. In real engine runs, with the fake GitHub playing the job's check run: a success is read on the merged head, ticks the item with the check run's address, records it as evidence and leaves only the other obligation listed; an absent, a skipped and a failed check run, and one without an address, leave the obligation the owner's on a `delivered` issue; so does an item that names no test under `tests/container/`, for which nothing is read; an item that needs `aws:deployed-environment` stays the owner's whatever the check run says (`test_other_obligations_are_untouched`); an issue whose only obligation was discharged ends `done` and closes with its epic (`test_an_issue_with_nothing_left_is_done`). The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
 
 ## Kept as recorded
 

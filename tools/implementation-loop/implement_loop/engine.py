@@ -156,6 +156,10 @@ ENVIRONMENT_FAILURE = re.compile(
     r"|No module named pytest|\b(uv|node|npx|npm|python3): (command )?not found", re.IGNORECASE)
 CI_NO_VERDICT = (None, "missing", "pending", "stale", "cancelled", "startup_failure")
 CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
+# A test that starts a container, as a ledger item names it: a Python file under the repository's
+# `tests/container/` (ADR 0001, amendment 5). The folder alone names no test.
+CONTAINER_TEST = re.compile(r"(?<![\w./-])tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
+CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item a CI job's check run proved
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
 
 
@@ -176,6 +180,7 @@ class Engine:
         self.check_env: dict[str, str] = dict(environment.get("check_env") or {})
         policy = policy or {}
         self.lacks: list[str] = sorted(policy.get("lacks", []))
+        self.ci_jobs: dict[str, str] = dict(policy.get("ci_jobs") or {})   # capability -> the CI job that provides it
         self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
         self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
         self.repair = bool(policy.get("repair", False))
@@ -2446,33 +2451,42 @@ class Engine:
             return self._fix_forward(n, regressions)
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
+        discharged = self._ci_discharged(n, st)    # owner items a CI job proved on the head that was merged
+        records = evidence + deployed + list(discharged.values())
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
-                                                 report.render_evidence(n, evidence + deployed, head, verdicts))
+                                                 report.render_evidence(n, records, head, verdicts))
                             if st.pr else None)
         link = (evidence_comment or {}).get("html_url", "")
-        proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts)
+        proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts) | set(discharged)
         issue = self.gh.get_issue(n)
         if issue_parser.body_hash(issue.get("body") or "") != st.body_hash:
             return self._owner_round(n, edited)
-        owed = self._owner_items(st)                 # never ticked by the loop
-        exempt = owed - self._agent_part_items(st)   # an owner item's agent part must still be proven
+        owed = self._owner_items(st) - set(discharged)   # never ticked by the loop
+        exempt = owed - self._agent_part_items(st)       # an owner item's agent part must still be proven
         unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
         if unproven:
             return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
-        ticked = issue_parser.tick(issue.get("body") or "", {cid: link for cid in proven if cid not in owed})
+        links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in discharged.items()}
+        ticked = issue_parser.tick(issue.get("body") or "", links)
         if ticked != (issue.get("body") or ""):
             self._safe(self.gh.edit_issue, n, body=ticked)
         st = self.store.issue(n)
-        st.evidence = evidence + deployed
+        st.evidence = records
         st.restarts = 0
+        st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in discharged)]
         st.human_tasks = [self._obligation_text(o) for o in st.obligations]
         # Each publication below ends this step when the hygiene scanner cannot mask it (`_safe`):
         # the issue waits in `merged` and this step runs again. So the follow-up, which is created
         # and not updated, comes last of the two and is recorded at once; and the comment that says
         # how the issue ends is written before anything that cannot be taken back.
+        if discharged and st.pr:   # the pull request listed them as left for later
+            self._safe(self.gh.update_pr, st.pr, report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other))
         self._publish_deferred(n, st)
         self._file_followup(n, st)
         self.store.put(st)
+        if discharged:
+            self.store.event("obligations_discharged", issue=n, head=next(iter(discharged.values()))["head_sha"],
+                             items={i: e["address"] for i, e in discharged.items()})
         self.store.put_section("accepted_checks", str(n), {
             "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
             "manifest": st.manifest})
@@ -2484,6 +2498,50 @@ class Engine:
         self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
         self._set_phase(n, Phase.DONE)
         self._close_trackers(n)
+
+    def _merged_head(self, st: IssueState) -> str | None:
+        """The head commit of the pull request this round merged, as GitHub records it: the commit
+        the required check was read on. None when the round merged no pull request (nothing was
+        left to land) or GitHub does not name the commit."""
+        if not st.pr or not st.branch:
+            return None
+        pr = self._safe(self.gh.find_pr, st.branch) or {}
+        if pr.get("number") != st.pr or not (pr.get("merged") or pr.get("merged_at")):
+            return None
+        return (pr.get("head") or {}).get("sha") or None
+
+    def _ci_discharged(self, n: int, st: IssueState) -> dict[str, dict]:
+        """The owner items a CI job proves on the head that was merged (ADR 0001, amendment 5), each
+        with its evidence record. An item is one when all of this holds: the plan gives it to the
+        owner for a capability that `[host] ci_jobs` maps to a job; its text names a test under
+        `tests/container/`; and the check run of that job's name on the merged pull request's head
+        is completed with the conclusion `success` and has an address, which the record carries
+        (`address`). Anything less discharges nothing and the obligation stays the owner's: no
+        mapping, no such test, no merged head, no check run, one that is not completed, was skipped
+        or failed, one without an address, or a read GitHub did not answer.
+
+        The plan is read, not `obligations`: this step runs again when a publication ends it, and
+        the second pass, which finds the obligation already removed, records the same evidence."""
+        texts = self._item_text(n)
+        jobs = {i["id"]: self.ci_jobs[i["capability"]] for i in self._items(st)
+                if i["proof"] == "owner" and i.get("capability") in self.ci_jobs
+                and CONTAINER_TEST.search(texts.get(i["id"], ""))}
+        head = self._merged_head(st) if jobs else None
+        if not head:
+            return {}
+        runs = {job: self._safe(self.gh.required_check_run, head, job) or {} for job in sorted(set(jobs.values()))}
+        out = {}
+        for item, job in jobs.items():
+            run = runs[job]
+            address = run.get("html_url") or ""
+            if run.get("status") != "completed" or run.get("conclusion") != "success" or not address:
+                continue
+            record = Evidence(criterion=item, kind=CHECK_RUN_EVIDENCE, command=None, cwd=".", head_sha=head,
+                              exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
+                              note=f"the check run `{job}` succeeded on the merged head `{head[:12]}`: {address}",
+                              verifier="check run")
+            out[item] = asdict(record) | {"address": address, "check": job}
+        return out
 
     def _obligation_text(self, o: dict) -> str:
         if o["kind"] == "deferred":

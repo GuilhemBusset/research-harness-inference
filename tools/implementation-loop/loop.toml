@@ -70,11 +70,16 @@ lacks = [
   # No container runtime on this host (ADR 0001, amendment 5): a test that starts a container
   # lives under `tests/container/`, outside the local gate, and runs only in CI, in the job
   # `container-tests`, which is part of `required`. An item that rests on such a test names this
-  # capability; that job's result on the head that lands is what discharges it. The engine does
-  # not read that result yet, so until it does the item ends as an obligation on a `delivered`
-  # issue (backlog E0-17 adds the job, E0-19 the reading).
+  # capability, and `ci_jobs` below maps it to that job: when the issue lands, the engine reads
+  # the job's check run on the head that was merged, and a success proves the item, with the
+  # check run's address as its evidence. With no such check run, a skipped one or one that did
+  # not succeed, the item ends as an obligation on a `delivered` issue, as it does for an item
+  # that names no test under `tests/container/` (backlog E0-17 adds the job).
   "host:container-runtime",
 ]
+# For a capability listed above, the name of the CI job that provides it: its check run on the
+# merged head discharges the obligation. A capability with no entry here stays the owner's.
+ci_jobs = { "host:container-runtime" = "container-tests" }
 
 # Safety invariants: a finding that names one blocks even when it quotes no ledger item.
 [invariants]
