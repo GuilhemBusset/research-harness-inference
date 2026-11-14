@@ -30,6 +30,7 @@ verdict outlasts the run, a record of the awaited commit keeps every run from la
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -40,8 +41,9 @@ import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -202,7 +204,7 @@ class Engine:
         self.repair = bool(policy.get("repair", False))
         self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
         self._meter_lock = threading.Lock()
-        self._push_lock = threading.Lock()     # one push at a time: the guard of a scanned push is one file
+        self._push_lock = threading.Lock()     # one push at a time in this run; across runs, `_hooks_held`
         self._polling: dict[int, float] = {}
         self.deploy: Deploy = policy.get("deploy") or Deploy()
         self._holds_dir = runs_root(repo_root) / DEPLOY_HOLDS
@@ -1324,12 +1326,16 @@ class Engine:
         onto it: a head, and commits, that scan never saw. So for the time of a scanned push the
         engine's hooks directory holds a `pre-push` of the engine's own, which lets git publish
         that one commit and nothing else. False: shipping made another head, and nothing was
-        pushed; the caller has it verified and scanned like any new head."""
+        pushed; the caller has it verified and scanned like any new head.
+
+        Every run of the repository has that same hooks directory, so a push, scanned or not,
+        holds it from before the guard is written until it is removed (`_hooks_held`): the guard
+        git meets is the one of the push it is making."""
         hooks = self._own_hooks(wt)
         if scanned and hooks is None:
             raise GitError("a scanned push needs the engine's own hooks directory")
-        with self._push_lock:
-            guard = hooks / "pre-push" if hooks else None
+        guard = hooks / "pre-push" if hooks else None
+        with self._push_lock, self._hooks_held(hooks):
             try:
                 if guard and scanned:
                     guard.write_text(PUSH_GUARD.replace("{only}", scanned))
@@ -1337,7 +1343,7 @@ class Engine:
                     if not os.access(guard, os.X_OK):   # git would skip it in silence
                         raise GitError("the engine's hooks directory cannot hold an executable hook")
                 elif guard:
-                    guard.unlink(missing_ok=True)   # one a stopped run left behind
+                    guard.unlink(missing_ok=True)   # one a stopped run left behind: no live run has it, the lock is held
                 self.ws.push(wt)
             except MergeConflict:
                 raise
@@ -1349,6 +1355,32 @@ class Engine:
                 if guard:
                     guard.unlink(missing_ok=True)
         return True
+
+    @staticmethod
+    @contextmanager
+    def _hooks_held(hooks: Path | None) -> Generator[None]:
+        """Hold the engine's hooks directory for one push: an flock on the directory itself, until
+        the push has ended and its guard is gone. Every run of a repository is given the same
+        directory, and a guard is one file in it, so without this a second run would replace the
+        guard of a push under way, or remove it, and git would publish a head no scan saw. Each
+        call opens its own file description, so two engines in one process exclude each other as
+        two processes do, and the lock of a run that died is released with it. Without a hooks
+        directory there is no guard, and nothing to hold."""
+        if hooks is None:
+            yield
+            return
+        try:
+            fd = os.open(hooks, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as e:
+            raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as e:
+                raise GitError(f"the engine's hooks directory cannot be held for a push ({type(e).__name__})") from e
+            yield
+        finally:
+            os.close(fd)   # which releases the lock
 
     def _history_refused(self, n: int, head: str, outputs: list[str], places: list[str] | None = None) -> None:
         """The branch's own commits carry what a history check refuses: a value that reached a

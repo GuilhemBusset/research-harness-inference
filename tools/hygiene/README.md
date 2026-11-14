@@ -142,7 +142,8 @@ publish (`--history <main>..<head>`). The commands are `LOCAL_VALUE_CHECKS` in
   moved: a head the scan did not see. While the engine pushes a scanned head, its git therefore
   has a `pre-push` hook of the engine's own, in the hooks directory the engine owns, which
   refuses any other commit. A head shipping made is verified, certified and scanned before it is
-  pushed.
+  pushed. Every run of the repository has that same hooks directory, so a push holds a lock on
+  it until its hook is removed: two runs push one after the other, each under its own hook.
 
 Where the file does not exist, the engine scans nothing outside the sandbox and pushes as before.
 
