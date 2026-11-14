@@ -38,3 +38,31 @@ package = false
 # Python (scripts/check.sh engine-tests), so they are not listed here.
 [tool.pytest.ini_options]
 testpaths = ["tools/hygiene/tests", "tools/backlog/tests", "tests"]
+# A test module is imported under a name made from its path, not its bare file name, so two test
+# files of one name in different folders (tests/synth/test_pipeline.py and
+# tests/policy/test_pipeline.py) are both collected, with no `__init__.py` in the tests tree.
+addopts = ["--import-mode=importlib"]
+# The Python roots of the "Repository layout" (system design, section 8.1): one package under each,
+# and scripts/pipeline, whose scripts are modules the tests import by name. A new module goes into
+# an existing root; ruff.toml (`src`) and ty.toml (`root`, `include`) list the same folders, and
+# tests/unit/test_layout.py holds the three lists together.
+pythonpath = [
+    "src",
+    "services/common",
+    "services/gateway",
+    "services/issuer",
+    "services/scaler",
+    "services/reporter",
+    "services/engine/lifecycle",
+    "services/engine/mock",
+    "client",
+    "admin",
+    "dashboards",
+    "scripts/pipeline",
+    # Not roots of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
+    # this configuration too, and import their helpers and each other by bare name, which the
+    # default import mode allowed by putting each test file's folder on the path. The examiner's
+    # probes of the engine, in tests/examiner, import each other the same way.
+    "tools/implementation-loop/tests",
+    "tests/examiner",
+]

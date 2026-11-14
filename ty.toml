@@ -1,5 +1,6 @@
-# ty (https://docs.astral.sh/ty/) for the repository's Python: today the implement loop engine,
-# the hygiene scanner and the backlog tooling. From the repository root:
+# ty (https://docs.astral.sh/ty/) for the repository's Python: the implement loop engine, the
+# hygiene scanner, the backlog tooling, the CDK app, its services and the tests. From the
+# repository root:
 #
 #   uv run --locked ty check
 #
@@ -13,15 +14,49 @@ python-version = "3.12"
 python-platform = "linux"
 # The project environment `uv sync --locked` creates.
 python = ".venv"
-# The folders these programs and tests put on sys.path for their imports.
+# The folders these programs and tests put on sys.path for their imports. After the tools come the
+# Python roots of the "Repository layout" (system design, section 8.1), the same list as
+# `pythonpath` in pyproject.toml; tests/unit/test_layout.py holds them together. ty refuses a root
+# that does not exist, so each folder holds a file from the start.
 root = [
     "tools/implementation-loop", "tools/implementation-loop/tests",
     "tools/hygiene",
     "tools/backlog", "tools/backlog/tests",
+    "tests/examiner",
+    "src",
+    "services/common",
+    "services/gateway",
+    "services/issuer",
+    "services/scaler",
+    "services/reporter",
+    "services/engine/lifecycle",
+    "services/engine/mock",
+    "client",
+    "admin",
+    "dashboards",
+    "scripts/pipeline",
 ]
 
 [src]
-include = ["tools/implementation-loop", "tools/hygiene", "tools/backlog"]
+# What is checked: the tools, the app's entry point (app.py, which arrives with the CDK app), the
+# roots above and the tests.
+include = [
+    "tools/implementation-loop", "tools/hygiene", "tools/backlog",
+    "app.py",
+    "src",
+    "services/common",
+    "services/gateway",
+    "services/issuer",
+    "services/scaler",
+    "services/reporter",
+    "services/engine/lifecycle",
+    "services/engine/mock",
+    "client",
+    "admin",
+    "dashboards",
+    "scripts/pipeline",
+    "tests",
+]
 
 [terminal]
 error-on-warning = true
