@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -207,6 +208,27 @@ CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item 
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+
+
+class CommittedFile(Path):
+    """A file as a commit holds it, for `verify.digest`: its name, and its bytes from memory. It
+    reads as the same bytes in a file would, and is never on disk."""
+
+    _data = b""
+
+    @classmethod
+    def holding(cls, name: str, data: bytes) -> CommittedFile:
+        file = cls(name)
+        file._data = data
+        return file
+
+    def read_bytes(self) -> bytes:
+        return self._data
+
+    def read_text(self, encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> str:
+        with io.TextIOWrapper(io.BytesIO(self._data), encoding=io.text_encoding(encoding), errors=errors,
+                              newline=newline) as text:   # what `open()` in text mode does to these bytes
+            return text.read()
 
 
 class Engine:
@@ -1852,13 +1874,10 @@ class Engine:
         return candidates
 
     def _digest_at(self, wt: Path, ref: str, file: str) -> str | None:
+        """The verifier's digest of `file` as `ref` holds it, or None when it is not a file there.
+        Nothing is written for it: a temporary copy is one more file the host can refuse."""
         data = self.ws.show_bytes(wt, ref, file)
-        if data is None:
-            return None
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / Path(file).name
-            p.write_bytes(data)
-            return verify.digest(p)
+        return None if data is None else verify.digest(CommittedFile.holding(file, data))
 
     def _relock(self, n: int, wt: Path, digests: dict[str, str], sources: dict[str, str]) -> None:
         kept = {f: d for f, d in digests.items() if (wt / f).is_file() and verify.digest(wt / f) == d}
