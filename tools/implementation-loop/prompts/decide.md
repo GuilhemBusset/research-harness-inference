@@ -10,6 +10,7 @@ For each request return `approve` and a `reason`:
 - `paths` / `protected_change`: approve when the issue genuinely needs that path changed. For a
   protected path (the loop's engine, `tools/hygiene/`, `.github/`, `.githooks/`, `tests/policy/`,
   the agents' own configuration under `.claude/`, `.agents/` and `.codex/`,
+  the pipeline stack under `src/rhi/pipeline/`, the bootstrap policies under `setup/bootstrap/`,
   the gate scripts, the ruleset), approve only when the issue's own text asks for that change, and
   never one that loosens a gate, a policy test or the hygiene allow-list so that a change passes.
 - `command_change`: `replaces` lists the item's commands now. A request with one `command` adds it
