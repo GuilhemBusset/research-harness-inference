@@ -7,6 +7,7 @@ could reach the gates by planning to. A plan's protected zone is granted now onl
 issue's own text names it: that path, or a protected directory above it. An issue that names a
 wider directory (`scripts/`, `tools/`) has not named the gates inside it."""
 
+import runpy
 import shutil
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from helpers import present
+from implement_loop import config as loaded
 from implement_loop import gate, issue_parser
 from implement_loop.agents import ItemPlan, PlanResult
 from implement_loop.config import Caps, is_protected, is_safety_surface
@@ -27,6 +29,7 @@ TEXT = {"D1": "the gate script gains a step", "A1": "the new step passes on the 
 ZONES = [".github/workflows/ci.yml", "tools/hygiene", "tools/hygiene/scan.py", "scripts/check.sh", "tests/policy/",
          "tools", "docs/a.md", "infra/stack.py"]
 DEPLOYMENT = ["src/rhi/pipeline/stack.py", "setup/bootstrap/policies.yaml"]   # ADR 0001, amendment 1
+LISTS = ("PROTECTED_PREFIXES", "PROTECTED_FILES", "SAFETY_SURFACE_PREFIXES", "SAFETY_SURFACE_FILES")
 
 
 def body(*named: str) -> str:
@@ -71,6 +74,17 @@ class PlanGrantTests(unittest.TestCase):
     @staticmethod
     def granted(st: IssueState) -> dict[str, bool]:
         return {g["path"]: g["protected"] for g in st.grants}
+
+    def judge_by_this_trees_lists(self):
+        """The lists a test of a change to them judges are those of the `config.py` beside these
+        tests, read from the file. The verifier's pytest plugin belongs to the engine that runs the
+        loop, and loading it imports that engine's `implement_loop`. It drops the package again
+        only in the pytest that records, not in an xdist worker, so the tests of
+        `scripts/check.sh engine-tests` would find there the lists of the running engine."""
+        mine = runpy.run_path(str(Path(__file__).resolve().parent.parent / "implement_loop" / "config.py"))
+        patch = mock.patch.multiple(loaded, **{name: mine[name] for name in LISTS})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_a_protected_zone_the_issue_does_not_name_is_withheld(self):
         st = self.plan(body("infra/stack.py", "docs/a.md"))
@@ -148,6 +162,7 @@ class PlanGrantTests(unittest.TestCase):
 
     def test_the_pipeline_stack_and_the_bootstrap_policies_are_protected(self):
         # ADR 0001, amendment 1: a merge to `main` is deployment rights in the account
+        self.judge_by_this_trees_lists()
         for path in DEPLOYMENT:
             self.assertTrue(is_protected(path), path)
         for path in ["src/rhi/stage.py", "src/rhi/pipeline.py", "setup/README.md", "setup/bootstrap.sh",
@@ -155,6 +170,7 @@ class PlanGrantTests(unittest.TestCase):
             self.assertFalse(is_protected(path), f"{path}: the two folders, at the root, and nothing beside them")
 
     def test_a_plan_zone_there_is_withheld_unless_the_issue_names_it(self):
+        self.judge_by_this_trees_lists()
         st = self.plan(body("src/rhi/stage.py"), zones=["src/rhi/stage.py", *DEPLOYMENT])
         self.assertEqual(self.granted(st), {"src/rhi/stage.py": False}, "a plan cannot reach them by listing them")
         withheld = [e for e in self.events if e["kind"] == "protected_zones_withheld"]
@@ -168,6 +184,7 @@ class PlanGrantTests(unittest.TestCase):
         self.assertEqual(gate.zone_problems(DEPLOYMENT, st.grants, [], False), [])
 
     def test_neither_folder_is_on_the_safety_surface(self):
+        self.judge_by_this_trees_lists()
         for path in DEPLOYMENT:
             self.assertFalse(is_safety_surface(path), path)
         named = body("src/rhi/pipeline/", "setup/bootstrap/", "scripts/check.sh")

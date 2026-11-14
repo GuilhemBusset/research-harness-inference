@@ -189,7 +189,7 @@ what the sandbox hides or drops was removed.
 
 | Test | Change | Why |
 | --- | --- | --- |
-| `tests/test_protected_zones.py`: `PlanGrantTests` (3 more, 22 in the file) | Added: `test_the_pipeline_stack_and_the_bootstrap_policies_are_protected`, `test_a_plan_zone_there_is_withheld_unless_the_issue_names_it`, `test_neither_folder_is_on_the_safety_surface`. | A file under `src/rhi/pipeline/` or `setup/bootstrap/` is protected and the files beside the two folders are not; a plan that lists one gets it only when the issue's deliverables name it, or the folder above it; neither folder is on the safety surface, so a repair run whose issue names them is granted them. |
+| `tests/test_protected_zones.py`: `PlanGrantTests` (3 more, 22 in the file) | Added: `test_the_pipeline_stack_and_the_bootstrap_policies_are_protected`, `test_a_plan_zone_there_is_withheld_unless_the_issue_names_it`, `test_neither_folder_is_on_the_safety_surface`. | A file under `src/rhi/pipeline/` or `setup/bootstrap/` is protected and the files beside the two folders are not; a plan that lists one gets it only when the issue's deliverables name it, or the folder above it; neither folder is on the safety surface, so a repair run whose issue names them is granted them. The three read the four lists from the `implement_loop/config.py` beside them (`judge_by_this_trees_lists`): under the verifier, the plugin of the running engine has already imported that engine's `implement_loop`, and `loop_pytest.py` drops it again only in the pytest that records, not in the xdist workers of `scripts/check.sh engine-tests`, where the tests would otherwise judge the running engine's lists. `loop_pytest.py` is on the safety surface and is not changed here. |
 
 ## Kept as recorded
 
