@@ -1,6 +1,9 @@
 """Caps, ceilings and repo-specific constants (ADR 0012; this repository's values: ADR 0001)."""
 
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Files many issues tend to touch. Only one in-flight issue may own any of them at a time.
 SHARED_FILES = frozenset({
@@ -67,6 +70,54 @@ def history_checks(revs: str) -> tuple[tuple[str, str], ...]:
     return tuple((name, command.replace("{range}", revs)) for name, command in HISTORY_CHECKS)
 
 
+# The same scanner once more, immediately before each push, with the owner's list of the values no
+# public pattern can name (`tools/hygiene/README.md`, "Values only the owner knows"). That list
+# exists on the owner's machine only, outside the sandbox, so these are not check commands of the
+# verifier: the engine starts them itself, as the owner (`Engine._local_scan`). Run there, they may
+# execute nothing a builder wrote. The scanner and its allow-list are therefore the ones of the
+# checkout the engine runs from, named by their absolute paths, never the branch's copy; the branch
+# is read as git objects, by commit ID; and the command is an argument vector, with no shell.
+# (name, the scanner's arguments): the tree of the head, then every commit the push would publish.
+# A finding is handled as a finding of a history check is. The engine keeps the path and the
+# rule's name of a finding and nothing else: here the scanner's excerpt surrounds the secret itself.
+LOCAL_VALUE_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("local-values", ("--rev", "{head}")),
+    ("local-values-history", ("--history", "{base}..{head}")),
+)
+LOCAL_VALUE_SCANNER = Path(__file__).resolve().parents[2] / "hygiene" / "scan.py"   # <checkout>/tools/hygiene/scan.py
+LOCAL_VALUE_ALLOW_LIST = LOCAL_VALUE_SCANNER.with_name("hygiene.toml")
+LOCAL_VALUES_ENV = "HYGIENE_LOCAL_VALUES"
+LOCAL_VALUES_DEFAULT = ("research-harness-inference", "hygiene-values")   # under the user's configuration directory
+
+
+def local_values_file(env: Mapping[str, str]) -> Path | None:
+    """The owner's list, by the scanner's own rule (`load_local_values` in `tools/hygiene/scan.py`):
+    the file `HYGIENE_LOCAL_VALUES` names when it is set, whether or not that file exists (the
+    scanner then fails without it, and so the push is withheld), else the default file when it
+    exists. None: there is no list here, and nothing is scanned outside the sandbox."""
+    if env.get(LOCAL_VALUES_ENV):
+        return Path(env[LOCAL_VALUES_ENV])
+    try:
+        base = Path(env["XDG_CONFIG_HOME"]) if env.get("XDG_CONFIG_HOME") else Path.home() / ".config"
+    except RuntimeError:   # no home directory to look in
+        return None
+    path = base.joinpath(*LOCAL_VALUES_DEFAULT)
+    return path if path.exists() else None
+
+
+def local_value_checks(base: str, head: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The scans with the owner's list before a push of `head`, whose commits since `base` the
+    push would publish (both commit IDs): (name, argument vector). The interpreter is the engine's
+    own, isolated (`-I`: no path from the environment or the working directory). They belong with
+    the history checks: where those are off (the engine's test suite, whose repositories hold no
+    scanner), these are off too, whatever the machine the suite runs on holds."""
+    if not HISTORY_CHECKS:
+        return ()
+    start = (sys.executable, "-I", str(LOCAL_VALUE_SCANNER), "--config", str(LOCAL_VALUE_ALLOW_LIST))
+    return tuple((name, start + tuple(a.replace("{base}", base).replace("{head}", head) for a in arguments))
+                 for name, arguments in LOCAL_VALUE_CHECKS)
+
+
 def is_protected(path: str) -> bool:
     return path in PROTECTED_FILES or path.startswith(PROTECTED_PREFIXES)
 
@@ -116,13 +167,63 @@ class Config:
     label_prefix: str = "loop:"
 
 
+@dataclass(frozen=True)
+class Deploy:
+    """What the engine waits for after a merge (ADR 0001, decision 5): the table `[deploy]` of
+    loop.toml. With no context nothing is read and nothing waits."""
+    contexts: tuple[str, ...] = ()    # commit statuses the pipeline posts on a merge commit (`deploy/<stage>`, ...)
+    timeout_s: int = 3600             # polling for a verdict, per run; after it the issue waits for the supervisor
+    approval_description: str = ""    # the description of a pending status while the pipeline waits for the owner
+
+
+def load_deploy(table) -> Deploy:
+    """`[deploy]` as loop.toml gives it. A key the engine does not know is refused (`ValueError`),
+    and so is a value of the wrong type (`TypeError`): a misspelt key would leave the engine not
+    waiting for a deployment that the owner believes it waits for."""
+    if table is None:
+        return Deploy()
+    if not isinstance(table, dict):
+        raise TypeError("loop.toml: [deploy] must be a table")
+    known = set(Deploy.__dataclass_fields__)
+    unknown = sorted(set(table) - known)
+    if unknown:
+        raise ValueError(f"loop.toml: [deploy] has no key {', '.join(unknown)} (its keys are {', '.join(sorted(known))})")
+    contexts = table.get("contexts", [])
+    if not isinstance(contexts, list) or not all(isinstance(c, str) for c in contexts):
+        raise TypeError("loop.toml: [deploy] contexts must be a list of commit status contexts")
+    if not all(c.strip() for c in contexts):
+        raise ValueError("loop.toml: [deploy] contexts cannot hold an empty context")
+    timeout_s = table.get("timeout_s", Deploy.timeout_s)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, int):
+        raise TypeError("loop.toml: [deploy] timeout_s must be a whole number of seconds")
+    if timeout_s < 0:
+        raise ValueError("loop.toml: [deploy] timeout_s cannot be negative")
+    approval = table.get("approval_description", "")
+    if not isinstance(approval, str):
+        raise TypeError("loop.toml: [deploy] approval_description must be a string")
+    return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
+
+
+def load_ci_jobs(host) -> dict[str, str]:
+    """`ci_jobs` of the table `[host]` as loop.toml gives it: for a capability the host lacks, the
+    name of the CI job that provides it (ADR 0001, amendment 5). The engine reads that job's check
+    run on a merged head to discharge an obligation for the capability. No entry: none is read.
+    A value that is no job name is refused (`TypeError`)."""
+    jobs = (host or {}).get("ci_jobs") or {}
+    if not isinstance(jobs, dict) or not all(isinstance(job, str) and job.strip() for job in jobs.values()):
+        raise TypeError("loop.toml: [host] ci_jobs must map a capability to the name of a CI job")
+    return dict(jobs)
+
+
 def load_policy(path) -> dict:
-    """The host's lacks and the safety invariants from loop.toml (part of the safety surface)."""
+    """The host's lacks, the CI jobs that provide some of them, the safety invariants and the
+    deployment statuses to wait for, from loop.toml (part of the safety surface)."""
     import tomllib
-    from pathlib import Path
     data = tomllib.loads(Path(path).read_text()) if Path(path).exists() else {}
     return {"lacks": list((data.get("host") or {}).get("lacks") or []),
-            "invariants": list((data.get("invariants") or {}).get("names") or [])}
+            "ci_jobs": load_ci_jobs(data.get("host")),
+            "invariants": list((data.get("invariants") or {}).get("names") or []),
+            "deploy": load_deploy(data.get("deploy"))}
 
 
 def ceiling(size: str, infra: bool) -> int:
