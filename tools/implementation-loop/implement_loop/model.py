@@ -48,6 +48,8 @@ WAIT_OWNER_APPROVAL = "owner_approval"   # the deployment waits for the owner's 
 WAIT_OWNER_LANDING = "owner_landing"     # a certified change to a workflow file: the engine never pushes one, so the
 #                                      owner pushes the branch and merges the pull request the engine then opens; no
 #                                      landing claim is held meanwhile
+WAIT_OWNER_REVIEW = "owner_review"       # GitHub refused the merge of a certified head for want of the owner's
+#                                      review: nothing is verified again and no landing claim is held meanwhile
 IN_RUN_WAITS = frozenset({WAIT_MERGE_QUEUE, WAIT_CLAIM})
 
 # Proof kinds a plan gives each ledger item (ADR 0012).

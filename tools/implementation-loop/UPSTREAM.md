@@ -277,6 +277,38 @@ pipeline; and a remote branch the owner brought up to date with GitHub's button,
 head than the certified one: the issue waits, says so, and the engine certifies nothing GitHub
 made.
 
+### 1.2.1, patched a sixth time: a merge refused for want of the owner's review (2026-11-14)
+
+With the owner's yes to decision 8 of the design, a pull request that touches a protected path
+needs the owner's approving review before GitHub merges it (system design, section 8.4, control 5;
+ADR 0001, amendment 3). The amendment says the engine already has an outcome for such an issue. It
+did not: the land step counted the refused merge as a merge refusal, sent the issue back to
+verification, and after three refusals made it wait as if GitHub were failing (`github`). Issue
+#19 (draft E0-25) gives that case its own wait. The head is certified and the required check is
+green on it, so nothing is verified again, and the landing claim is released while the owner
+reviews. The engine's version stays 1.2.1: nothing here repairs a failed issue, and the wait this
+patch adds is read again by every run.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/github.py` | New in the `GitHub` protocol, `GhCli` and `FakeGitHub`: `review_decision(n)`, the review decision of pull request `n`. `GhCli` reads the field `reviewDecision` of GitHub's GraphQL API with `gh api graphql` (`REVIEW_DECISION_QUERY`; the query as a raw field, the owner and the name as raw fields, the number as a typed one) and returns `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, or an empty string where GitHub gives null. `_api` takes `fields`, the field flags of that one call, so the query is retried like every read. `REVIEW_OWED` names the two decisions that owe a review. `FakeGitHub` keeps a decision on each pull request (`review_decision`, set from `default_review` when it is opened; empty by default) and `merge_pr` refuses while it is one of `REVIEW_OWED`. | The first deliverable. The REST API has no such field. The words of GitHub's refusal are not a contract, the review decision is. With the default, the fake merges as it always did, so no earlier test changes. |
+| `implement_loop/model.py` | New wait kind `WAIT_OWNER_REVIEW` (`owner_review`). | The second deliverable: the kind is defined here. The wait itself records the pull request and the head (`pr`, `head`); `IssueState` is unchanged. |
+| `implement_loop/engine.py` | `_step_land`, where `merge_pr` raised and the pull request is not found merged after all: the review decision is read (`_review_decision`) before anything is counted. With `REVIEW_REQUIRED` or `CHANGES_REQUESTED`, on a pull request whose head is still the certified one, `_owner_reviews` journals `owner_review_owed`, says so on the pull request and makes the issue wait (`WAIT_OWNER_REVIEW`, resumed in `land`): `merge_refusals` is not incremented, no `merge_refused` is journaled, the issue does not go back to `verify`, and the step's end releases the merge queue as it always does. With any other decision (`APPROVED`, none, one that could not be read), or on a pull request whose head GitHub gives as another one, the lines that follow are the ones that were there: a counted refusal, back to `verify`, the wait `github` after three. | The second, third and fifth deliverables. A pull request with another head was refused for that head, whatever its review decision says, and waiting for a review of it would wait for ever. |
+| `implement_loop/engine.py` | `_say_review_owed`: one comment on the pull request per certified head, found again by a marker that carries the head (`OWNER_REVIEW_MARKER`). It gives the head and the review decision and says that nothing is verified meanwhile, that the loop merges this head once the pull request is approved, and that a push makes another head. The words are the engine's own; nothing of GitHub's refusal is repeated. | The third deliverable: said once. A head certified later (after `main` moved) is another head to review, so it gets its own comment. |
+| `implement_loop/engine.py` | `_maybe_resume` resumes the new kind only when `_review_owed` says the wait is over. It reads the pull request and its review decision, with no step and no claim. Still open at the head of the wait with any decision but `APPROVED` (a review owed, or none at all), or GitHub could not be read: the issue stays as it is, and with a review owed a comment GitHub did not take before is written. `APPROVED`: the issue resumes in `land`, whose unchanged step merges the certified head. Merged or closed, or with another head: it resumes in `land` too, which reads that as it always did. | The fourth deliverable. Resuming into the land step at every run, as the other owner waits do, would take the merge queue, scan the head again and ask GitHub for a merge it is known to refuse. A `main` that moved during the wait is merged by the land step once the review is given, and the new head is verified and certified again before it lands, as for every landing. Only `APPROVED` releases an unchanged head: the issue says the engine keeps waiting while the decision is not that one, and an empty decision on a head GitHub has just refused is no approval. An owner who lifts the review rule instead approves or merges the pull request, and either ends the wait. |
+| `implement_loop/engine.py` | `WAIT_OWNER_REVIEW` and `REVIEW_OWED` are imported inside a `try`, with the same values as stand-ins, and the client's `review_decision` is looked up with `getattr`. The wait's hint for the progress comment is added to `report.WAIT_HINT` from here. | As for the waits before it: `tests/test_unwritable_probe.py` loads the `engine.py` beside it into the `implement_loop` of the engine that runs the loop, whose `model.py` and `github.py` have neither while this patch is built. `report.py` is not a file the issue names. |
+
+Behaviour an upstream reader would not expect: a refused merge is not always counted; the engine
+asks GitHub's GraphQL API a question; an issue can wait at the start of a run without any step
+being run for it. Left as they were: the supervisor, which counts an issue that waits for the
+owner's review as unsettled and stops at its bound of runs, as it does for the other waits for the
+owner; a remote branch that someone else pushed to, which `ship.sh` refuses to push over, as
+before; and whether an approval survives a new head, which is the ruleset's choice (issue #20):
+where it does not, the new head is refused, and the issue waits again with a comment for that
+head. What only the real GitHub can show (that it refuses the merge under the ruleset and the
+`CODEOWNERS` entry of issue #20, and gives `REVIEW_REQUIRED` then) is not shown by these tests,
+which run against the fake.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -390,6 +422,14 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_owner_landing.py` (8) | Added. | Real engine runs on a bare remote whose `main` has `.github/workflows/ci.yml`, with the fake agents and the fake GitHub. The test plays the owner: it runs the push command of the engine's comment, as written, in the repository the engine runs in, and merges a pull request with a squash in the remote and not through the fake's `merge_pr`, so every `merge_pr` in the fake's log is the engine's. A branch that changes the workflow file: nothing on the remote, the issue waiting `owner_landing` with its record and one comment, the merge queue free, no fault. The remote branch at the certified head: one pull request, with the body and the evidence the renderers give, no merge call, and `done` after the owner's merge, with the post-merge verification and the deployment verdict. Another head on the remote: no pull request. A conflicting move of `main`: one build round, a new verification and examination, a head that descends from the old one and holds `main`, a second comment, the remote branch untouched until the owner's fast-forward push, then `done`. A clean move of `main`: no verification, examination or round, the worktree at its head. A change to another file under `.github/`, and a branch that merged a `main` whose workflow file changed: pushed and merged by the engine. A workflow change whose deployment fails twice: the revert certified, not pushed, not merged, handed over, its pull request opened after the owner's push, and the next round the owner's to land again. |
+
+### 1.2.1, patched a sixth time (2026-11-14)
+
+595 collected tests: the 590 before it, none removed and none changed, and 5 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_owner_review.py` (5) | Added. | `GhCli.review_decision` against a scripted `gh`: the call is `gh api graphql`, its query names `reviewDecision`, a value and a null are read. In real engine runs, with the fake agents and the fake GitHub: a merge refused with `REVIEW_REQUIRED`, and with `CHANGES_REQUESTED`, leaves the issue waiting `owner_review` after one refusal, with none counted, nothing verified after it and one comment on the pull request, while a second issue of the same run, built once the first waits, lands (the merge queue was free); a resumed run with the review still owed runs no step. Once the fake's decision is `APPROVED`, a resumed run merges the head certified before the wait, with no verification before the merge, and the issue ends `done` (`test_a_given_review_merges_the_certified_head`). A refusal with `APPROVED`, with no decision and with one that cannot be read is counted three times and ends in the wait `github` (`test_other_refusals_are_unchanged`). A `main` that moved during the wait is merged and verified again before the landing, and a pull request that got another head is refused and verified as before. The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
 
 ## Kept as recorded
 
