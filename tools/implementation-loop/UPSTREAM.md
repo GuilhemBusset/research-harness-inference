@@ -215,6 +215,36 @@ the evidence comment can carry a row whose proof is a check run; a merged pull r
 edited after the merge when an item was discharged. The address is published through the
 redacting client like the rest of the comment.
 
+### 1.2.1, patched a fourth time: the owner's local values before every push (2026-11-14)
+
+No public pattern can name the real domain, so the owner keeps such values in a list outside the
+repository, and the hygiene scanner reports them as `local-value` where that list exists
+(`tools/hygiene/README.md`, "Values only the owner knows"). The loop's pushes were the one path
+not held against it: its git runs no hook of the repository, and its verifier scans in the
+sandbox, where the list does not exist. Issue #16 (draft E0-20) has the engine, which runs outside
+the sandbox as the owner, scan with that list immediately before each push. The engine's version
+stays 1.2.1: nothing here repairs a failed issue.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/config.py` | Beside `HISTORY_CHECKS`: `LOCAL_VALUE_CHECKS`, the scanner's arguments for the tree of the head (`--rev {head}`) and for the commits a push would publish (`--history {base}..{head}`); `LOCAL_VALUE_SCANNER` and `LOCAL_VALUE_ALLOW_LIST`, the `scan.py` and the `hygiene.toml` of the checkout this file is in; `local_value_checks`, which makes the argument vectors (the engine's own interpreter with `-I`, the scanner, `--config` and the allow-list by absolute path, no shell), and returns none where `HISTORY_CHECKS` is empty; `local_values_file`, the scanner's own rule for where the list is (`HYGIENE_LOCAL_VALUES` when set, else the default file when it exists). The module now imports `sys`, `Mapping` and `Path` at its top. | The scan runs outside the sandbox, so it may execute nothing a builder wrote: the scanner is named from the engine's own place, as `redact.py` names it, and never from a worktree. Off with the history checks: `tests/helpers.py`, which this issue does not name, turns those off for the suite, and the suite then starts no scan with whatever list the machine that runs it holds. In a run the history checks are always on. |
+| `implement_loop/engine.py` | New `_local_scan`, called in `_step_land` after the history scan and in `_revert` after the certificate, each time directly before the push. With no list it starts nothing and returns `None`. With one it runs each command through `_outside` (`subprocess.run` in the engine's repository, with the list named in `HYGIENE_LOCAL_VALUES`, bounded by `check_timeout_s`), and returns places and problems. `local_places` reduces a finding to `<path>: <rule>`: the line number, the blob or commit ID and the excerpt are dropped, and the scanner's output is never journaled, recorded under the run's directory or put into an exception. A scan that ends with another status than 0 or 1, does not end, or cannot be started is a problem in the engine's own words, with the exit status and nothing the scanner wrote. | The issue's deliverables. Here the excerpt surrounds the owner's value itself, and the line number says where in a file to look for it. |
+| `implement_loop/engine.py` | `_history_refused` takes `places`: given, they are journaled as the findings with an empty `output`, the failure's detail names the scan with the owner's local values and says that such a value comes from text the owner wrote, and the rest is as for a history finding (the branch abandoned unpushed, `failed` with the cause `history`, the next attempt on a new branch). In `_step_land` a problem journals `push_withheld` and fails the round, as an unrunnable history check does. In `_revert` a finding or a problem ends in `main_broken`, and the revert is not pushed. | A finding of this scan is handled as a finding of the history check is. Existing callers pass no `places` and are unchanged. |
+| `implement_loop/engine.py` | New `_push`, which both steps call in place of `Workspace.push`, and `_own_hooks`. For a scanned head, `_push` writes a `pre-push` hook (`PUSH_GUARD`) into the hooks directory the engine's environment pins (`sandbox.engine_git_env`), calls `Workspace.push`, and removes the hook. The hook refuses any commit but the scanned one. When `ship.sh` then fails and the head is another, `_push` returns `False`: `_step_land` journals `push_withheld` with both heads and sends the issue to `verify`; `_revert` fails with `main_broken`, as it did after the fact. Pushes take one lock (`_push_lock`). Where git's hooks directory is not one the engine's environment names, a scan is not run and the push is withheld. With no list, `_push` removes a hook a stopped run left and pushes as before. | `ship.sh` fetches `main` again and merges it or rebases onto it before it pushes: with a `main` that moved after the scan, it would publish a head and commits the owner's list was never held against. `Workspace.push` takes no environment and `workspace.py` is not named by the issue, so the guard is a file in the directory the engine already owns. `sandbox.py` and the README of this directory call that directory empty; it is, except while the engine pushes a scanned head. `ship.sh` tries a refused push four times, about 14 seconds in all, before it gives up. |
+| `implement_loop/engine.py` | `LOCAL_VALUES_ENV`, `local_value_checks` and `local_values_file` are imported inside a `try`, with stand-ins that name no list and no scan. | `tests/test_unwritable_probe.py` loads the `engine.py` beside it into the `implement_loop` of the engine that runs the loop (see the entry of the deployment verdict above). While this patch is built, that engine's `config.py` has none of the three. Once this patch runs the loop, the `except` branch is dead. |
+| `tools/hygiene/README.md` (outside this directory) | The paragraph that said the loop's pushes are not checked against the owner's list now says where they are, and "Where it runs" has a row for it. | The gap it described is closed. |
+
+Behaviour an upstream reader would not expect: the engine starts a process outside the sandbox
+that is neither git nor the ship script; an issue can end `failed` with the cause `history` on a
+branch every check in the sandbox passed; a `history_refused` event can carry findings without a
+line number and no output; a push can be withheld because `main` moved, with the issue back in
+`verify` and nothing published. Three things are left as they were. `sandbox.clean_env` passes
+`HYGIENE_LOCAL_VALUES` into the sandbox, where the file it names does not exist and the scanner
+then fails: an owner who sets that variable, instead of using the default file, fails every
+standing check. The verifier, the hooks and CI are unchanged. And a value already on `main` that
+the owner adds to the list later is found in the tree of every head, so every issue then ends
+`failed` until `main` is corrected.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -311,6 +341,15 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_container_obligations.py` (10) | Added. | The committed `loop.toml` maps `host:container-runtime` to `container-tests` and still lists the capability. In real engine runs, with the fake GitHub playing the job's check run (`CI`, in the test module: `FakeGitHub` answers every name with the required check's verdict, so the subclass answers by name, and `github.py` is not changed): a success is read on the merged head, ticks the item with the check run's address, records it as evidence and leaves only the other obligation listed; an absent, a skipped and a failed check run leave the obligation the owner's on a `delivered` issue; so does an item that names no test under `tests/container/`, for which nothing is read; an item that needs `aws:deployed-environment` stays the owner's whatever the check run says (`test_other_obligations_are_untouched`); an issue whose only obligation was discharged ends `done` and closes with its epic (`test_an_issue_with_nothing_left_is_done`). The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
+
+### 1.2.1, patched a fourth time (2026-11-14)
+
+582 collected tests: the 571 before it, none removed and none weakened, and 11 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_history_checks.py`: `HistoryCase.setUp` | Three lines added: `XDG_CONFIG_HOME` names an empty directory and `HYGIENE_LOCAL_VALUES` is unset, for the test. | The tests of this module run with the history checks on. On a machine that holds the owner's list they would otherwise scan with it. No assertion of an earlier test changed. |
+| `tests/test_history_checks.py` (11) | Added: `TheScanWithTheOwnersListTests` (3), `OwnersListTests` (7), `OwnersListRevertTests` (1). | The commands and where the list is looked for; what is kept of a finding. In real engine runs, with a list written by the test, a value put together at run time, and this repository's scanner: the value in the tree of the head, or only in an earlier commit, ends the issue `failed` with the cause `history`, nothing pushed, and a retry lands on a new branch; the value, the words of its line and the scanner's excerpt are in nothing the fake GitHub received, no agent was given them, and no file of the run's directory holds them, while the path and the rule's name are in the event, the failure, the fault issue and the next builder's feedback; a branch whose own `scan.py` accepts everything is refused all the same, and that copy ran in the sandbox only (`Inside`, a launcher that hides the list as the sandbox does and marks what it starts); with no list no process is started outside the sandbox and the push goes ahead; a list that cannot be read, and a git whose hooks directory is not the engine's, withhold the push; a head `ship.sh` made after the scan, because `main` moved, is not pushed before it is scanned; a revert whose commit message holds a value of the list is not pushed. The engine runs take `implement_loop` from the folder beside the tests (`L`, from `test_deploying.py`'s `loop_beside_these_tests`), for the reason given there. |
 
 ## Kept as recorded
 
