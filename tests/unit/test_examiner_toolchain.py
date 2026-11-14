@@ -19,6 +19,8 @@ def read_json(name):
 
 def load_checks():
     spec = importlib.util.spec_from_file_location("reviewed_toolchain", ROOT / "tests/unit/test_toolchain.py")
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

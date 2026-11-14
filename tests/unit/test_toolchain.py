@@ -43,7 +43,9 @@ def library_pin_problems(pyproject: Path) -> list[str]:
     requirements = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
     specifiers = {}
     for requirement in requirements:
-        name, specifier = re.fullmatch(r"([A-Za-z0-9._-]+)\s*(.*)", requirement).groups()
+        requirement_parts = re.fullmatch(r"([A-Za-z0-9._-]+)\s*(.*)", requirement)
+        assert requirement_parts is not None, requirement
+        name, specifier = requirement_parts.groups()
         specifiers[name.lower().replace("_", "-")] = specifier
     problems = []
     for library, floor in LIBRARY_FLOORS.items():
