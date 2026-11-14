@@ -6,10 +6,13 @@ Claude attempt that timed out and reports no cost (22), one that answered with a
 one that stopped at its budget, charged but not answered (23), and a Codex attempt that crashed
 with no usage (23). Every dollar value is a multiple of 0.25, so the sums below are exact."""
 
+import importlib
+import importlib.util
 import io
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -17,8 +20,29 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import HERE, REPO_ROOT, git
-from implement_loop import cli
-from implement_loop.github import FakeGitHub
+
+
+def engine_of_this_tree():
+    """This tree's `implement_loop`, loaded under a name of its own.
+
+    The verifier puts the engine that runs it first on PYTHONPATH and loads its plugin from there.
+    The plugin drops that package from the module cache of the pytest that records, not of an
+    xdist worker, so in a worker `implement_loop` is the running engine: the one before this
+    change, with no `costs`. The command under test is the one in this tree."""
+    package = HERE.parent / "implement_loop"
+    spec = importlib.util.spec_from_file_location("implement_loop_of_this_tree", package / "__init__.py",
+                                                  submodule_search_locations=[str(package)])
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {package}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return spec.name
+
+
+ENGINE = engine_of_this_tree()
+cli = importlib.import_module(f"{ENGINE}.cli")
+FakeGitHub = importlib.import_module(f"{ENGINE}.github").FakeGitHub
 
 FIXTURES = HERE / "fixtures" / "costs"
 RECORDS = [json.loads(line) for line in (FIXTURES / "agents.jsonl").read_text().splitlines()]
