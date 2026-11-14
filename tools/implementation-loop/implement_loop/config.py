@@ -153,13 +153,25 @@ def load_deploy(table) -> Deploy:
     return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
 
 
+def load_ci_jobs(host) -> dict[str, str]:
+    """`ci_jobs` of the table `[host]` as loop.toml gives it: for a capability the host lacks, the
+    name of the CI job that provides it (ADR 0001, amendment 5). The engine reads that job's check
+    run on a merged head to discharge an obligation for the capability. No entry: none is read.
+    A value that is no job name is refused (`TypeError`)."""
+    jobs = (host or {}).get("ci_jobs") or {}
+    if not isinstance(jobs, dict) or not all(isinstance(job, str) and job.strip() for job in jobs.values()):
+        raise TypeError("loop.toml: [host] ci_jobs must map a capability to the name of a CI job")
+    return dict(jobs)
+
+
 def load_policy(path) -> dict:
-    """The host's lacks, the safety invariants and the deployment statuses to wait for, from
-    loop.toml (part of the safety surface)."""
+    """The host's lacks, the CI jobs that provide some of them, the safety invariants and the
+    deployment statuses to wait for, from loop.toml (part of the safety surface)."""
     import tomllib
     from pathlib import Path
     data = tomllib.loads(Path(path).read_text()) if Path(path).exists() else {}
     return {"lacks": list((data.get("host") or {}).get("lacks") or []),
+            "ci_jobs": load_ci_jobs(data.get("host")),
             "invariants": list((data.get("invariants") or {}).get("names") or []),
             "deploy": load_deploy(data.get("deploy"))}
 
