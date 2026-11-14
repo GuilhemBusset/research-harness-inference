@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.0 |
+| Engine version here | 1.2.1 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -126,6 +126,20 @@ Outside this directory:
 | --- | --- | --- |
 | `AGENTS.md` | "Protected paths and the safety surface" names the two folders in place of "the pipeline definition, once it exists". | The section repeats the engine's list for people. |
 
+### 1.2.1: a probe file the file system refuses (2026-11-14)
+
+The repair of the engine fault a25bef17ec (issue #243). An examiner named a probe file that no file
+system can create, and the lint of the probe raised `OSError` where it writes the probe to a
+temporary directory: the examination crashed, and the issue waited for a new engine version.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.0 → 1.2.1. | A new engine version: the issues that wait for this repair resume, and a failed issue is revived once by it. |
+| `implement_loop/engine.py` | `_probe_problem` answers with a reason when the probe's directory or file cannot be created (`OSError`), in the engine's own words, instead of raising. `_step_examine` adopts only probes that passed the lint, and a finding that names a probe the lint refused loses that reference and stands on its own reproduction. | A path the file system refuses is the examiner's mistake, like the other paths the lint refuses, and not an engine fault. Guarding the lint alone left the same crash one step later: a blocking finding that named the refused probe had it adopted, which writes it to the worktree, and a finding that keeps the name of a probe that is never adopted cannot close. The reason does not repeat what the system said, which carries the path of the temporary directory. |
+
+Behaviour an upstream reader would not expect: a probe the lint refuses for any reason (a protected
+path, a test that fails unconditionally) is no longer adopted when a blocking finding names it.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -190,6 +204,14 @@ what the sandbox hides or drops was removed.
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_protected_zones.py`: `PlanGrantTests` (3 more, 22 in the file) | Added: `test_the_pipeline_stack_and_the_bootstrap_policies_are_protected`, `test_a_plan_zone_there_is_withheld_unless_the_issue_names_it`, `test_neither_folder_is_on_the_safety_surface`. | A file under `src/rhi/pipeline/` or `setup/bootstrap/` is protected and the files beside the two folders are not; a plan that lists one gets it only when the issue's deliverables name it, or the folder above it; neither folder is on the safety surface, so a repair run whose issue names them is granted them. The three read the four lists from the `implement_loop/config.py` beside them (`judge_by_this_trees_lists`): under the verifier, the plugin of the running engine has already imported that engine's `implement_loop`, and `loop_pytest.py` drops it again only in the pytest that records, not in the xdist workers of `scripts/check.sh engine-tests`, where the tests would otherwise judge the running engine's lists. `loop_pytest.py` is on the safety surface and is not changed here. |
+
+### 1.2.1
+
+535 collected tests: the 532 before it, none removed and none changed, and 3 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_unwritable_probe.py`: `UnwritableProbeTests` (3) | Added: `test_the_file_system_refuses_the_probes_path`, `test_the_lint_refuses_it_instead_of_raising`, `test_an_examination_that_names_one_carries_on`. | The regression of fault a25bef17ec: a probe whose file name is longer than a file system takes. The first shows that the host refuses the path, the second that the lint answers with a reason, the third that an examination whose blocking finding names such a probe rejects it, adopts the probe beside it and still delivers the issue. They take `Engine` from the `engine.py` beside them (`engine_beside_these_tests`), for the reason `judge_by_this_trees_lists` gives above: in an xdist worker under the verifier, `implement_loop` is the running engine's, which is the one with the fault while its repair is built. `loop_pytest.py` is on the safety surface and is not changed here. |
 
 ## Kept as recorded
 

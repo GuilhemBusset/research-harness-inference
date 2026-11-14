@@ -1805,6 +1805,7 @@ class Engine:
                 rejected.append({"file": p.file, "reason": problem})
                 continue
             candidates.append(p)
+        refused = {r["file"] for r in rejected} - {p.file for p in candidates}
         # A probe the standing checks refuse is never run, adopted or committed: the hygiene scan
         # of the head would fail on a file the builder may not change, and its history would keep it.
         unclean = self._unclean_probes(n, wt, candidates)
@@ -1817,6 +1818,8 @@ class Engine:
         for i, f in enumerate(res.findings):
             f.id = f"E{n}-{rnd}-{i + 1}"
             f.round = rnd
+            if f.probe in refused:   # its probe is never adopted: the finding stands on its own reproduction
+                f.probe = None
             probe = next((p for p in res.probes if f.probe and p.file == f.probe), None)
             if probe and probe.file in probe_results:
                 reproduced = not probe_results[probe.file]
@@ -1831,7 +1834,8 @@ class Engine:
         # A follow-up examination adopts only probes that reproduce a blocking finding, or that cover
         # an item still without one, so certification converges.
         covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
-        adopt = [p for p in res.probes if p.file not in unclean and (
+        # A probe the lint refused is not written to the worktree either, whatever finding names it.
+        adopt = [p for p in candidates if p.file not in unclean and (
             any(f.blocking and f.probe == p.file for f in new)
             or (probe_results.get(p.file) is True and (since is None or p.criterion not in covered)))]
         first = st.examined_sha is None
@@ -1939,8 +1943,15 @@ class Engine:
             return "a probe may not be written on a protected path"
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / p.file
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(p.content)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(p.content)
+            except OSError:
+                # A path no file can be created at (a name longer than the file system takes, a
+                # file where a directory is needed) is the examiner's mistake, not an engine fault.
+                # The reason is the engine's own words: what the system said would carry the path
+                # of the temporary directory into the run log.
+                return "a probe file must be a path the file system can create"
             bad = verify.unconditional_failures(Path(tmp), [p.file])
         return f"it fails unconditionally: {bad[0]}" if bad else None
 
