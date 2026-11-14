@@ -157,8 +157,9 @@ ENVIRONMENT_FAILURE = re.compile(
 CI_NO_VERDICT = (None, "missing", "pending", "stale", "cancelled", "startup_failure")
 CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
 # A test that starts a container, as a ledger item names it: a Python file under the repository's
-# `tests/container/` (ADR 0001, amendment 5). The folder alone names no test.
-CONTAINER_TEST = re.compile(r"(?<![\w./-])tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
+# `tests/container/` (ADR 0001, amendment 5), written from the repository's root, with or without a
+# leading `./`. The folder alone names no test, and neither does the same folder under another one.
+CONTAINER_TEST = re.compile(r"(?<![\w./-])(?:\./)?tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
 CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item a CI job's check run proved
 # A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
 # check run's own page is `runs/<id>` under the same repository page.
