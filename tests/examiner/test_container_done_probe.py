@@ -1,8 +1,6 @@
 """Independent checks of the owner fallback and terminal phase for issue 14."""
 
-import pytest
-
-from test_container_mapping_probe import JOB, RUNTIME, TEXT, L, assert_owner, scenario
+from test_container_mapping_probe import L, scenario
 
 
 def test_discharging_last_obligation_closes_issue_as_done():
