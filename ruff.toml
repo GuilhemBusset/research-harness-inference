@@ -15,10 +15,25 @@ line-length = 120
 # The oldest Python the repository runs on (pyproject.toml); rules such as UP017 key off it.
 target-version = "py312"
 # The folders the programs and tests put on sys.path (as in ty.toml): their modules are first-party.
+# After the tools come the Python roots of the "Repository layout" (system design, section 8.1),
+# the same list as `pythonpath` in pyproject.toml; tests/unit/test_layout.py holds them together.
+# `ruff check .` already checks every Python file of the tree, app.py and the tests included.
 src = [
   "tools/implementation-loop", "tools/implementation-loop/tests",
   "tools/hygiene",
   "tools/backlog", "tools/backlog/tests",
+  "src",
+  "services/common",
+  "services/gateway",
+  "services/issuer",
+  "services/scaler",
+  "services/reporter",
+  "services/engine/lifecycle",
+  "services/engine/mock",
+  "client",
+  "admin",
+  "dashboards",
+  "scripts/pipeline",
 ]
 
 [lint]
