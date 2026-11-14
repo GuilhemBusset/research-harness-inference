@@ -1,0 +1,2519 @@
+"""The per-issue state machine and the scheduling loop (ADR 0012).
+
+Each issue moves through: pending -> plan -> planned -> build -> verify -> examine -> land ->
+merged -> delivered | done. Two vendors hold two keys: the **builder** (the operator's vendor)
+plans, writes the code, its tests and the commands that prove each item; the **examiner** (the
+other vendor) triages the plan, examines and probes the exact head, approves or refuses the
+builder's typed requests, and certifies the head that may land. The engine owns git, the
+trusted verifier, the gates and every merge, and derives its bookkeeping from what happened.
+
+A run never waits for a person and never parks:
+- a failed verification or a blocking finding is one more build round; two rounds that change
+  nothing bring a replan on the branch, two more end the issue `failed`;
+- a merge queue another run holds, an outage, a CI check with no verdict or an environment the
+  doctor can repair is a **wait** that resumes by itself (in this run, or under the supervisor);
+- every answered agent call is charged to the issue's ceiling, every timeout or crash to its
+  infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
+  them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
+- an item that needs a capability the host lacks becomes an owner obligation; one that needs
+  another issue waits for it in the run, or becomes a deferred obligation.
+
+Steps run on a thread pool, so one issue can be examined while another builds and a third
+plans. Landing is serialized through a repo-wide merge-queue claim, issues through per-issue
+claims, so two runs never land at once or work the same issue.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import posixpath
+import re
+import tempfile
+import threading
+import time
+import traceback
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import asdict, replace
+from pathlib import Path
+
+from . import VERSION, gate, graph, issue_parser, report, sandbox, scheduler, verify
+from .agents import AgentFailure, Agents, AgentStopped, CeilingReached, IssueRequest
+from .config import (
+    HISTORY_FINDINGS_EXIT,
+    INFRA_PREFIXES,
+    Config,
+    ceiling,
+    history_checks,
+    is_protected,
+    is_safety_surface,
+    standing_checks,
+    usd_ceiling,
+)
+from .github import GitHub, GitHubError
+from .graph import Plan
+from .model import (
+    AGENT_PROOFS,
+    SATISFIES_DEPENDENTS,
+    TERMINAL,
+    WAIT_CI,
+    WAIT_CLAIM,
+    WAIT_ENGINE,
+    WAIT_ENVIRONMENT,
+    WAIT_GITHUB,
+    WAIT_MERGE_QUEUE,
+    WAIT_OUTAGE,
+    WAIT_RUN_CEILING,
+    WRITING_PHASES,
+    CheckSpec,
+    Finding,
+    Issue,
+    IssueState,
+    Phase,
+)
+from .state import FaultOutbox, RepoClaims, RunStore
+from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
+
+try:   # GitHubUnavailable arrives with the retrying GitHub client
+    from .github import GitHubUnavailable
+except ImportError:   # pragma: no cover - older github.py
+    class GitHubUnavailable(GitHubError):
+        pass
+
+LABELS = {
+    "loop:plan": ("C5DEF5", "implement loop: planning"),
+    "loop:building": ("FBCA04", "implement loop: building or verifying"),
+    "loop:examine": ("D4C5F9", "implement loop: examined by the other vendor"),
+    "loop:landing": ("0E8A16", "implement loop: PR open, merging"),
+    "loop:merged": ("BFDADC", "implement loop: merged, verifying on main"),
+    "loop:delivered": ("F9D0C4", "implement loop: merged; owner obligations or deferred items remain"),
+    "loop:waiting": ("EDEDED", "implement loop: waiting; resumes by itself"),
+    "loop:failed": ("B60205", "implement loop: not delivered; filed as a loop fault"),
+}
+DEFERRED_LABEL = ("loop:deferred", "C2E0C6", "implement loop: an item waits for another issue")
+FOLLOWUP_LABEL = ("loop:follow-up", "BFD4F2", "implement loop: non-blocking findings to consider")
+LEGACY_LABELS = ("loop:awaiting-human", "loop:needs-human", "loop:parked", "loop:design", "loop:review")
+ENGINE_BUG_LABEL = ("loop:engine-bug", "5319E7", "implement loop: a fault in the loop's own engine")
+PHASE_LABEL = {
+    Phase.PLAN: "loop:plan", Phase.PLANNED: "loop:plan",
+    Phase.BUILD: "loop:building", Phase.VERIFY: "loop:building", Phase.EXAMINE: "loop:examine",
+    Phase.LAND: "loop:landing", Phase.MERGED: "loop:merged", Phase.DELIVERED: "loop:delivered",
+    Phase.WAITING: "loop:waiting", Phase.FAILED: "loop:failed",
+}
+EXPLORE_QUESTIONS = (
+    "The issue graph and acceptance criteria: what must be true when this run is done?",
+    "Existing material and conventions these issues must follow (ADRs, AGENTS.md, guides).",
+    "Build, check and CI tooling: how is work validated in this repo today?",
+    "External references the issues cite: what do they establish that the work depends on?",
+)
+MERGE_QUEUE = "merge-queue"
+# Output that means the host cannot run a check, whatever the implementation does.
+ENVIRONMENT_FAILURE = re.compile(
+    r"error while loading shared libraries|Host system is missing dependencies|Executable doesn't exist at"
+    r"|No module named pytest|\b(uv|node|npx|npm|python3): (command )?not found", re.IGNORECASE)
+CI_NO_VERDICT = (None, "missing", "pending", "stale", "cancelled", "startup_failure")
+CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
+CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+
+
+class Engine:
+    def __init__(self, plan: Plan, store: RunStore, gh: GitHub, ws: Workspace, agents: Agents, cfg: Config,
+                 repo_root: Path, log: Callable[[str], None] = print, sleep: Callable[[float], None] = time.sleep,
+                 environment: dict | None = None, invoked_at: float | None = None, policy: dict | None = None):
+        self.plan, self.store, self.gh, self.ws, self.agents, self.cfg = plan, store, gh, ws, agents, cfg
+        self.repo_root = repo_root
+        self.log, self.sleep = log, sleep
+        self.caps = cfg.caps
+        self.claims = RepoClaims(repo_root)
+        self.faults = FaultOutbox(repo_root)
+        self.owner = f"run-{plan.root}"
+        self.op, self.other = agents.operator, agents.other
+        environment = environment or {}
+        self.env_fingerprint: str | None = environment.get("fingerprint")
+        self.check_env: dict[str, str] = dict(environment.get("check_env") or {})
+        policy = policy or {}
+        self.lacks: list[str] = sorted(policy.get("lacks", []))
+        self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
+        self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
+        self.repair = bool(policy.get("repair", False))
+        self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
+        self._meter_lock = threading.Lock()
+        self._polling: dict[int, float] = {}
+        self.invoked_at = invoked_at if invoked_at is not None else time.time()
+        self.run_calls = 0
+        self._charged: set[int] = set()   # issues whose last failed attempt the meter already charged
+        agents.meter = self
+
+    # ------------------------------------------------------------------ public
+    def run(self) -> dict:
+        with self.store.lock():
+            if self.store.clear_stop(older_than=self.invoked_at):
+                self.store.event("stale_stop_cleared")
+            self.store.event("run_started", root=self.plan.root, mode=self.plan.mode, work=self.plan.work,
+                             operator=self.op, other=self.other, version=VERSION, environment=self.env_fingerprint,
+                             repair=self.repair, admit=self.admit)
+            self._ensure_labels()
+            self._reconcile()
+            stopped = False
+            try:
+                self._context()
+                stopped = self._loop()
+                if not stopped:
+                    self._mark_blocked()
+            except CeilingReached as e:   # the run's own ceiling, reached while gathering context
+                self.store.event("run_ceiling", error=str(e))
+            finally:
+                self._release_claims()
+            self._reconcile_delivered()
+            self._flush_faults()
+            summary = self._summary(stopped)
+            self._post_run_summary()
+            self.store.event("run_finished", **summary)
+            return summary
+
+    # ------------------------------------------------------------------ the meter (agents.meter)
+    def _infra(self, n: int) -> bool:
+        issue = self.plan.issues[n]
+        zones = (self.store.issue(n).plan or {}).get("zones") or self.plan.specs[n].declared_paths
+        return any(z.startswith(INFRA_PREFIXES) for z in zones) or "loop:infra" in issue.labels
+
+    def _ceiling(self, n: int) -> int:
+        return ceiling(self.plan.issues[n].size, self._infra(n)) + self.store.budget(n)["bonus"]
+
+    def _usd_ceiling(self, n: int) -> float:
+        """The dollars the issue may cost (what the vendors report: Claude's calls), with the
+        fresh ceiling a revival or a retry granted."""
+        return usd_ceiling(self.plan.issues[n].size, self._infra(n)) + self.store.budget(n).get("usd_bonus", 0)
+
+    def _run_ceiling(self) -> int:
+        return int(sum(ceiling(self.plan.issues[n].size, False) for n in self.plan.work)
+                   * self.caps.run_ceiling_factor) + 8   # + the explorers
+
+    def before(self, issue: int | None, role: str, vendor: str) -> None:
+        """Refuse a call the issue's or the run's ceiling no longer covers; journal the attempt
+        before it starts, so a run killed during the call charges it when it resumes."""
+        with self._meter_lock:
+            if self.run_calls >= self._run_ceiling():
+                raise CeilingReached(f"the run's ceiling of {self._run_ceiling()} calls is spent", scope="run")
+            if issue is None or issue not in self.plan.issues:
+                return
+            b = self.store.budget(issue)
+            if b["calls"] >= self._ceiling(issue):
+                raise CeilingReached(f"#{issue}'s ceiling of {self._ceiling(issue)} calls is spent")
+            if b.get("usd", 0) >= self._usd_ceiling(issue):
+                raise CeilingReached(f"#{issue}'s ceiling of ${self._usd_ceiling(issue):.2f} is spent "
+                                     f"(${b.get('usd', 0):.2f} so far)")
+            if b["infra"] >= self.caps.infra_budget:
+                raise CeilingReached(f"#{issue}'s infrastructure budget of {self.caps.infra_budget} failed attempts is spent")
+            self.store.change_budget(issue, pending=1)
+
+    def after(self, issue: int | None, role: str, vendor: str, outcome: str) -> None:
+        """Charge an attempt: an answer to the work ceiling, a timeout or crash to the
+        infrastructure budget; an outage to neither (the issue waits for it)."""
+        with self._meter_lock:
+            if outcome == "answered":
+                self.run_calls += 1
+            if issue is None or issue not in self.plan.issues:
+                return
+            b = self.store.budget(issue)
+            delta = {"set_pending": max(b.get("pending", 0) - 1, 0)}
+            if outcome == "answered":
+                delta["calls"] = 1
+            elif outcome in ("timeout", "crash"):
+                delta["infra"] = 1
+                self._charged.add(issue)
+            b = self.store.change_budget(issue, **delta)
+            self.store.event("agent_attempt", issue=issue, role=role, vendor=vendor, outcome=outcome,
+                             calls=b["calls"], infra=b["infra"])
+
+    def spent(self, issue: int | None, role: str, vendor: str, cost_usd: float) -> None:
+        """Charge what one attempt cost, as its vendor reported it, to the issue's dollar ceiling
+        (ADR 0001, decision 8). Whatever the attempt's outcome: a call that failed was paid for."""
+        if issue is None or issue not in self.plan.issues or not cost_usd or cost_usd < 0:
+            return
+        with self._meter_lock:
+            b = self.store.change_budget(issue, usd=round(float(cost_usd), 6))
+            self.store.event("agent_cost", issue=issue, role=role, vendor=vendor, cost_usd=round(float(cost_usd), 6),
+                             usd=round(b.get("usd", 0), 6))
+
+    def _settle_interrupted(self, n: int) -> None:
+        """Attempts journaled but never reported (the engine was killed mid-call) are charged as
+        failed attempts when the run resumes."""
+        pending = self.store.budget(n).get("pending", 0)
+        if pending:
+            self.store.change_budget(n, infra=pending, set_pending=0)
+            self.store.event("interrupted_attempts_charged", issue=n, count=pending)
+
+    # ------------------------------------------------------------------ setup
+    def _ensure_labels(self) -> None:
+        for name, (color, desc) in LABELS.items():
+            self._safe(self.gh.ensure_label, name, color, desc)
+        for name, color, desc in (DEFERRED_LABEL, FOLLOWUP_LABEL):
+            self._safe(self.gh.ensure_label, name, color, desc)
+
+    def _reconcile(self) -> None:
+        for n in list(self.plan.work):
+            self._settle_interrupted(n)
+            st = self.store.issue(n)
+            spec = self.plan.specs[n]
+            if st.wait and st.wait.get("kind") == "legacy":
+                self._migrate(st)
+            if not self._restore_branch(n):
+                continue
+            st = self.store.issue(n)
+            if st.worktree and (Path(st.worktree) / ".git").exists():
+                self._recover_worktree(n, Path(st.worktree))
+            if st.body_hash and st.body_hash != spec.body_hash:
+                if st.phase in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
+                    self._new_round(st, ["the issue was edited after its work was merged; deliver the edited version"],
+                                    owner_edit=True)
+                else:
+                    self.store.event("requirements_changed", issue=n, previous_phase=st.phase.value)
+                    self._owner_edit(st)
+            elif st.phase == Phase.DONE:
+                self._new_round(st, ["the issue was reopened after it was closed; find what is missing and deliver it"],
+                                owner_edit=True)
+            elif st.phase == Phase.WAITING:
+                self._maybe_resume(st)
+            elif st.phase == Phase.FAILED:
+                self._maybe_revive(st)
+            elif st.phase in (Phase.PLANNED, Phase.BUILD, Phase.VERIFY, Phase.EXAMINE, Phase.LAND) and not st.plan:
+                st.phase = Phase.PENDING
+            st.body_hash = spec.body_hash
+            st.branch = st.branch or spec.branch or f"loop/issue-{n}"
+            if st.extra_deps:
+                self._restore_deps(n, st)
+            self._declare(n, st)
+            self.store.put(st)
+
+    def _declare(self, n: int, st: IssueState) -> None:
+        """What the scheduler sees an issue own: its zones, approved paths and tests."""
+        if st.plan:
+            spec = self.plan.specs[n]
+            spec.declared_paths = sorted(set(st.plan.get("zones", [])) | {g["path"] for g in st.grants}
+                                         | set(st.tests) | set(st.probes)) or spec.declared_paths
+
+    def _migrate(self, st: IssueState) -> None:
+        """State an earlier engine wrote (ADR 0008/0011): a parked issue resumes; a design becomes
+        the starting point of a plan, its locked checks become the builder's tests (released in
+        the CI guard at the next build), and nothing already written is lost."""
+        legacy = st.wait or {}
+        design = legacy.get("design") or {}
+        st.wait = None
+        old_tests = sorted(set(design.get("check_files", [])) | {f for f in legacy.get("locked", {})
+                                                                  if Path(f).suffix in (".py", ".mjs", ".js", ".sh")})
+        if old_tests:
+            st.tests = sorted(set(st.tests) | set(old_tests))
+            st.feedback = list(st.feedback) + [(f"An earlier version of the loop wrote these tests on your branch: "
+                                                f"{', '.join(old_tests)}. They are yours now; keep, fix or replace them.")]
+            st.requests.append({"id": "legacy-unlock", "kind": "legacy_unlock", "paths": sorted(legacy.get("locked", {})),
+                                "status": "pending", "detail": "release an earlier engine's locked checks"})
+        for f in design.get("files", []):
+            st.grants.append({"path": f, "source": "earlier design", "protected": False})
+        if legacy.get("reason"):
+            st.feedback.append(f"An earlier version of the loop set this issue aside: {str(legacy['reason'])[:600]}")
+        if st.phase not in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
+            st.phase = Phase.PENDING
+        st.locked = {}
+        self.store.event("migrated", issue=st.number, park_kind=legacy.get("park_kind"), tests=old_tests)
+        self.store.put(st)
+
+    def _restore_branch(self, n: int) -> bool:
+        """A worktree whose branch was deleted from under it gets its branch back from its own
+        history. Without such evidence the issue starts a new round on a new branch: the work
+        is lost, never guessed, and the issue carries on. False when a new round was started."""
+        st = self.store.issue(n)
+        wt = Path(st.worktree) if st.worktree else self.ws.dir / f"issue-{n}"
+        if not (wt / ".git").exists():
+            return True
+        anchors = [st.base_sha, st.head_sha, st.verified_sha, st.examined_sha, st.certified_sha]
+        try:
+            restored = self.ws.restore_branch(wt, [a for a in anchors if a])
+        except GitError as e:
+            self.store.event("branch_restore_failed", issue=n, error=str(e)[:300])
+            self._new_round(st, [(f"the branch {st.branch} was lost and could not be restored from its history; "
+                                  f"start again from main")], owner_edit=False)
+            st.phase = Phase.PENDING
+            self.store.put(st)
+            return False
+        if restored:
+            self.store.event("branch_restored", issue=n, branch=restored[0].removeprefix("refs/heads/"), sha=restored[1])
+        return True
+
+    def _recover_worktree(self, n: int, wt: Path) -> None:
+        try:
+            self.ws.reattach(wt)
+            op = self.ws.abort_in_progress(wt)
+        except GitError as e:
+            self.store.event("worktree_recovery_failed", issue=n, error=str(e)[:300])
+            return
+        if op:
+            self.store.event("worktree_recovered", issue=n, operation=op, head=self.ws.head(wt))
+
+    def _maybe_resume(self, st: IssueState) -> None:
+        """A wait ends when what it waits for may have changed. The supervisor launches a run
+        only once an outage is over and runs the doctor (which repairs the environment) first."""
+        w = st.wait or {}
+        kind = w.get("kind")
+        resume = (kind in (WAIT_MERGE_QUEUE, WAIT_CLAIM, WAIT_CI, WAIT_GITHUB, WAIT_OUTAGE, WAIT_RUN_CEILING, "prerequisite")
+                  or (kind == WAIT_ENVIRONMENT and (self.env_fingerprint is None or w.get("env") != self.env_fingerprint))
+                  or (kind == WAIT_ENGINE and w.get("version") != VERSION))
+        if not resume:
+            return
+        st.phase = Phase(w.get("resume") or Phase.PENDING.value)
+        if st.phase in (Phase.PLANNED, Phase.BUILD, Phase.VERIFY, Phase.EXAMINE, Phase.LAND) and not st.plan:
+            st.phase = Phase.PENDING
+        st.wait = None
+        self.store.event("resumed", issue=st.number, wait=kind, phase=st.phase.value)
+
+    def _maybe_revive(self, st: IssueState) -> None:
+        """A failed issue resumes once, with a fresh ceiling, on a new engine version: the loop
+        repairs itself (as it did for #74 and #78) and tries again."""
+        f = st.fail or {}
+        if f.get("version") == VERSION or f.get("resumed"):
+            return
+        b = self.store.budget(st.number)
+        self.store.change_budget(st.number, bonus=b["calls"] - b["bonus"] if b["calls"] > b["bonus"] else 0, set_infra=0,
+                                 set_usd_bonus=b.get("usd", 0))
+        st.unproductive = st.replans = 0
+        st.fail = {**f, "resumed": True}
+        st.phase = Phase.BUILD if st.plan and st.worktree else Phase.PENDING
+        # heals a state saved before the fix (#50): the deletions it approved are in its requests
+        deleted = {p for r in st.requests if r.get("kind") == "test_change" and r.get("status") == "approved"
+                   for p, text in (r.get("content") or {}).items() if text is None}
+        self._retire_probe_commands(st.number, st, sorted(deleted - set(st.probes)))
+        retired = self._retire_uncommanded(st)   # heals a state saved before the fix (#148)
+        st.feedback = [(f"An earlier attempt failed ({f.get('cause')}): {str(f.get('detail'))[:500]}. "
+                        f"A new engine version gives it one more try.")]
+        if retired:
+            st.feedback.append(f"These commands were retired, because the plan no longer proves their items by "
+                               f"a command: {retired[:6]}.")
+        self.store.event("revived", issue=st.number, cause=f.get("cause"), phase=st.phase.value)
+
+    def _retire_probe_commands(self, n: int, st: IssueState, deleted: list[str]) -> None:
+        """An examiner's command for a probe an approved change deleted goes with it. Only the
+        examiner's own commands are kept beside the builder's, so nobody else could retire it
+        (#50 spent its ceiling on that exit 4); a command naming no deleted probe always stays."""
+        stale = [c for c in st.commands if c.get("author") == "examiner"
+                 and any(_names_probe(c, p) for p in deleted)]
+        if stale:
+            st.commands = [c for c in st.commands if c not in stale]
+            self.store.event("probe_commands_retired", issue=n,
+                             commands=[f"{c.get('criterion')}: {c['command'][:160]}" for c in stale])
+
+    def _owner_edit(self, st: IssueState) -> None:
+        """The owner edited the issue: new evidence. Plan again on the branch, with the previous
+        decisions as a starting point; budgets are reset; tests stay locked."""
+        notes = ["The owner edited the issue; plan for the edited version, on your branch."]
+        if st.decisions:
+            notes.append("Decisions so far, to keep where they still fit: " + json.dumps(st.decisions)[:1500])
+        st.plan = None
+        st.feedback = notes
+        self.store.change_budget(st.number, set_calls=0, set_infra=0, set_bonus=0, set_pending=0, set_usd=0,
+                                 set_usd_bonus=0)
+        st.unproductive = st.replans = 0
+        st.fix_forwards = st.reverts = st.merge_refusals = st.restarts = 0
+        st.signature = ""
+        st.certified_sha = st.verified_sha = None
+        st.fail = st.wait = None
+        st.phase = Phase.PENDING
+
+    def _context(self) -> None:
+        if self.store.state.get("context"):
+            return
+        briefing = report.render_briefing(self.plan)
+        with ThreadPoolExecutor(max_workers=self.caps.max_parallel_agents) as pool:
+            notes = list(pool.map(lambda q: self.agents.explore(self.op, q, briefing), EXPLORE_QUESTIONS))
+        self.store.state["context"] = "\n\n".join(notes)
+        self.store.save()
+        self.store.event("context_gathered", explorers=len(notes))
+
+    # ------------------------------------------------------------------ loop
+    def _loop(self) -> bool:
+        running: dict[int, Future] = {}
+        stopped = False
+        with ThreadPoolExecutor(max_workers=self.caps.max_parallel_agents) as pool:
+            while True:
+                for n, fut in list(running.items()):
+                    if fut.done():
+                        del running[n]
+                        self._finished(n, fut.exception())
+                if self.store.stop_requested():
+                    if not stopped:
+                        self.store.event("stop_requested")
+                        stopped = True
+                        terminate = getattr(self.agents, "terminate_all", None)
+                        if terminate:
+                            terminate()
+                    if not running:
+                        return True
+                else:
+                    self._dispatch(pool, running)
+                if not running:
+                    if self._polling and not self.store.stop_requested():
+                        self.sleep(self.caps.queue_poll_s)
+                        self._expire_polls()
+                        continue
+                    return stopped
+                wait(list(running.values()), timeout=30, return_when=FIRST_COMPLETED)
+                if self.store.stop_requested() and not stopped:
+                    self.store.event("stop_requested")
+                    stopped = True
+                    terminate = getattr(self.agents, "terminate_all", None)
+                    if terminate:
+                        terminate()   # a long agent call is stopped now, not when it ends
+
+    def _finished(self, n: int, exc: BaseException | None) -> None:
+        if exc is None:
+            return
+        if isinstance(exc, AgentStopped) or type(exc).__name__ == "AgentStopped":
+            self.store.event("step_interrupted", issue=n, phase=self.store.issue(n).phase.value)
+        elif isinstance(exc, CeilingReached):
+            if exc.scope == "run":
+                self._wait(n, WAIT_RUN_CEILING, str(exc))
+            else:
+                self._fail(n, "ceiling", str(exc))
+        elif isinstance(exc, AgentFailure) or type(exc).__name__ == "AgentFailure":
+            kind = getattr(exc, "kind", "crash")
+            self.store.event("agent_unavailable", issue=n, failure=kind, error=str(exc)[:500])
+            if kind == "outage":
+                self._wait(n, WAIT_OUTAGE, str(exc)[:300], vendor=getattr(exc, "vendor", ""))
+                return
+            # a timeout or crash: charged here too (a failure before the meter started is not
+            # charged by it), so retrying the step always ends within the infrastructure budget
+            if n not in self._charged:
+                self.store.change_budget(n, infra=1)
+            self._charged.discard(n)
+            if self.store.budget(n)["infra"] >= self.caps.infra_budget:
+                self._fail(n, "ceiling", f"#{n}'s infrastructure budget of {self.caps.infra_budget} failed attempts "
+                                         f"is spent: {str(exc)[:300]}")
+        elif isinstance(exc, GitHubUnavailable):
+            self._wait(n, WAIT_GITHUB, str(exc)[:300])
+        elif isinstance(exc, sandbox.SandboxUnavailable):
+            # Nothing an agent controls ran, and nothing is concluded from that: the issue waits
+            # until the host can isolate agents and checks again (the doctor says what is missing).
+            self._wait(n, WAIT_ENVIRONMENT, f"the sandbox is unavailable, so nothing was run: {str(exc)[:300]}")
+        else:
+            self._engine_fault(n, exc)
+
+    def _phases(self) -> dict[int, Phase]:
+        return {n: self.store.issue(n).phase for n in self.plan.work}
+
+    def _claim_issue(self, n: int) -> bool:
+        """Two runs never work the same issue: a repo-wide claim per issue, held for the run."""
+        if self.claims.acquire(f"issue-{n}", self.owner):
+            self._polling.pop(-n, None)
+            return True
+        self._polling.setdefault(-n, time.monotonic())
+        return False
+
+    def _release_claims(self) -> None:
+        for n in self.plan.work:
+            self.claims.release(f"issue-{n}", self.owner)
+        self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _expire_polls(self) -> None:
+        """A merge queue or an issue another run holds is polled for `queue_wait_s`; past that
+        the issue waits for the supervisor."""
+        now = time.monotonic()
+        for key, since in list(self._polling.items()):
+            if now - since < self.caps.queue_wait_s:
+                continue
+            del self._polling[key]
+            n = abs(key)
+            self._wait(n, WAIT_CLAIM if key < 0 else WAIT_MERGE_QUEUE,
+                       "another run held it for longer than the in-run wait")
+
+    def _dispatch(self, pool: ThreadPoolExecutor, running: dict[int, Future]) -> None:
+        phases = self._phases()
+        writers = [n for n, ph in phases.items() if ph in WRITING_PHASES]
+        landing = any(phases[n] == Phase.LAND for n in running)
+        steps = {Phase.PLAN: self._step_plan, Phase.BUILD: self._step_build, Phase.VERIFY: self._step_verify,
+                 Phase.EXAMINE: self._step_examine, Phase.MERGED: self._step_accept}
+        for n in list(self.plan.work):
+            if n in running:
+                continue
+            ph = phases.get(n, self.store.issue(n).phase)
+            if ph in TERMINAL or ph == Phase.WAITING:
+                continue
+            if not self._claim_issue(n):
+                continue
+            if ph == Phase.PENDING:
+                if not scheduler.prerequisites_met(self.plan, phases, n):
+                    continue
+                if not self.store.issue(n).plan:
+                    self._set_phase(n, Phase.PLAN)
+                    running[n] = pool.submit(self._step_plan, n)
+                    continue
+                self._set_phase(n, Phase.PLANNED)   # already planned: it may start building in this pass
+                ph = Phase.PLANNED
+            if ph == Phase.PLANNED:
+                if scheduler.can_start_writing(self.plan, n, writers, self.caps.max_parallel_writers):
+                    writers.append(n)
+                    self._set_phase(n, Phase.BUILD)
+                    running[n] = pool.submit(self._step_build, n)
+            elif ph == Phase.LAND:
+                if not landing and self.claims.acquire(MERGE_QUEUE, self.owner):
+                    landing = True
+                    self._polling.pop(n, None)
+                    running[n] = pool.submit(self._step_land, n)
+                elif not landing:
+                    self._polling.setdefault(n, time.monotonic())   # another run is landing: poll
+            elif ph in steps:
+                running[n] = pool.submit(steps[ph], n)
+
+    # ------------------------------------------------------------------ helpers
+    def _req(self, n: int, feedback: list[str] | None = None) -> IssueRequest:
+        st = self.store.issue(n)
+        facts = {"lacks": self.lacks, "invariants": list(self.invariants), "repair": self.repair,
+                 "decisions": st.decisions[-20:], "operator": self.op, "other": self.other}
+        return IssueRequest(issue=self.plan.issues[n], spec=self.plan.specs[n],
+                            context=self.store.state.get("context") or "", feedback=list(feedback or []), facts=facts)
+
+    def _item_text(self, n: int) -> dict[str, str]:
+        return {i.id: i.text for i in self.plan.specs[n].ledger}
+
+    def _items(self, st: IssueState) -> list[dict]:
+        return (st.plan or {}).get("items", [])
+
+    def _agent_items(self, st: IssueState) -> set[str]:
+        return {i["id"] for i in self._items(st) if i["proof"] in AGENT_PROOFS}
+
+    def _owner_items(self, st: IssueState) -> set[str]:
+        return {i["id"] for i in self._items(st) if i["proof"] in ("owner", "deferred")}
+
+    def _review_items(self, st: IssueState) -> set[str]:
+        return {i["id"] for i in self._items(st) if i["proof"] == "review"}
+
+    def _behavioural_items(self, st: IssueState) -> set[str]:
+        """Items proven by a durable test: each gets at least one independent probe."""
+        return {i["id"] for i in self._items(st) if i["proof"] == "test"}
+
+    def _agent_part_items(self, st: IssueState) -> set[str]:
+        """Owner items whose agent part must still be proven (by a command or a verdict)."""
+        return {i["id"] for i in self._items(st) if i["proof"] == "owner"
+                and (i.get("agent_part") or "none").strip().lower() not in ("", "none")}
+
+    def _verdict_items(self, st: IssueState) -> set[str]:
+        """Items the examiner must judge: review items, and owner items' agent parts no command proves."""
+        commanded = {c["criterion"] for c in st.commands if c.get("author") == "builder"}
+        return self._review_items(st) | (self._agent_part_items(st) - commanded)
+
+    def _commanded_items(self, st: IssueState) -> set[str]:
+        """Items a builder's command may prove: `test` and `command` items, and owner items' agent
+        parts. A review or deferred item has no builder command."""
+        return {i["id"] for i in self._items(st) if i["proof"] in ("test", "command", "owner")}
+
+    def _retire_uncommanded(self, st: IssueState) -> list[str]:
+        """Retire the builder's commands for items the current plan no longer proves by a command.
+        In #148, a replan moved A2 from `command` to `review`, but A2's old command kept running,
+        and failing, until the replan could change nothing (no_progress). Only items the plan names
+        with another proof are retired; a command for an item the plan does not list is left alone."""
+        uncommanded = {i["id"] for i in self._items(st)} - self._commanded_items(st)
+        stale = [c for c in st.commands if c.get("author") == "builder" and c.get("criterion") in uncommanded]
+        if not stale:
+            return []
+        st.commands = [c for c in st.commands if c not in stale]
+        retired = [f"{c.get('criterion')}: {c['command'][:160]}" for c in stale]
+        self.store.event("commands_retired", issue=st.number, commands=retired[:8])
+        return retired
+
+    def _specs(self, st: IssueState) -> list[CheckSpec]:
+        fields = CheckSpec.__dataclass_fields__
+        return [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in st.commands]
+
+    @staticmethod
+    def _item_commands(st: IssueState, item: str) -> list[dict]:
+        """The builder's commands an item runs now: what a `command_change` changes."""
+        return [{"command": c["command"], "cwd": c.get("cwd") or "."} for c in st.commands
+                if c.get("criterion") == item and c.get("author") == "builder"]
+
+    def _set_phase(self, n: int, phase: Phase, **changes) -> None:
+        st = self.store.issue(n)
+        previous = st.phase
+        st.phase = phase
+        b = self.store.budget(n)   # a mirror for reports; the budget section is the source of truth
+        st.calls, st.infra, st.ceiling_bonus = b["calls"], b["infra"], b["bonus"]
+        for k, v in changes.items():
+            setattr(st, k, v)
+        self.store.put(st)
+        if previous != phase:
+            self.store.event("phase", issue=n, frm=previous.value, to=phase.value)
+            self.log(f"#{n} {previous.value} -> {phase.value}")
+            self._sync(n)
+
+    def _wait(self, n: int, kind: str, detail: str, resume: Phase | None = None, **extra) -> None:
+        """Not terminal: the issue resumes by itself once its condition clears."""
+        st = self.store.issue(n)
+        resume_phase = resume or (st.phase if st.phase != Phase.WAITING else Phase.PENDING)
+        st.wait = {"kind": kind, "resume": resume_phase.value, "detail": detail[:600], "since": time.time(), **extra}
+        if kind == WAIT_ENVIRONMENT:
+            st.wait["env"] = self.env_fingerprint
+        if kind == WAIT_ENGINE:
+            st.wait["version"] = VERSION
+        self.store.put(st)
+        self.store.event("waiting", issue=n, wait=kind, detail=detail[:600], resume=resume_phase.value)
+        self.log(f"#{n} waiting ({kind}): {detail[:200]}")
+        self._set_phase(n, Phase.WAITING)
+
+    def _fail(self, n: int, cause: str, detail: str) -> None:
+        """Explicit non-delivery: nothing partial is merged, nothing is called delivered. Filed as
+        a loop fault; a new engine version resumes it once."""
+        st = self.store.issue(n)
+        st.fail = {"cause": cause, "detail": detail[:800], "version": VERSION, "resumed": bool((st.fail or {}).get("resumed"))}
+        self.store.put(st)
+        fingerprint = hashlib.sha256(f"stall:{cause}:{n}".encode()).hexdigest()[:10]
+        body = (f"{report.FAULT_MARKER.format(fingerprint)}\nThe implement loop could not deliver #{n} (run for "
+                f"#{self.plan.root}, engine {VERSION}): **{cause}**.\n\n{detail[:1500]}\n\nThe issue resumes once, with a "
+                f"fresh ceiling, on the next engine version. Its branch keeps the work.\n\n"
+                f"## Deliverables\n- [ ] From #{n}'s run log (`events.jsonl` and `calls/`), the cause is diagnosed and fixed "
+                f"in the engine or its prompts, with a regression test.\n"
+                f"- [ ] The engine version (`implement_loop/__init__.py`) is bumped, so #{n} resumes.\n\n"
+                f"## Acceptance criteria\n- [ ] The engine's full test suite passes.\n"
+                f"- [ ] Nothing on the loop's safety surface changes.\n")
+        self.faults.record(fingerprint, f"implement loop: #{n} not delivered ({cause})", body, issue=n, run=self.plan.root)
+        self.store.event("failed", issue=n, cause=cause, detail=detail[:800])
+        self.log(f"#{n} failed ({cause}): {detail[:200]}")
+        self._set_phase(n, Phase.FAILED)
+
+    def _new_round(self, st: IssueState, feedback: list[str], owner_edit: bool) -> None:
+        """Deliver an already-merged issue again (it was edited, reopened, or broke `main`): a new
+        branch from `main`; the plan is kept unless the owner edited the issue."""
+        n = st.number
+        if st.worktree:
+            self.ws.remove(Path(st.worktree))
+        st.round += 1
+        st.branch = f"{self.plan.specs[n].branch or f'loop/issue-{n}'}-r{st.round}"
+        st.worktree = st.pr = st.head_sha = st.base_sha = None
+        st.verified_sha = st.examined_sha = st.certified_sha = None
+        st.locked, st.manifest, st.tests, st.probes = {}, {}, [], []
+        st.commands = [c for c in st.commands if c.get("author") != "examiner"]   # their probes went with the branch
+        st.findings = [f for f in st.findings if f.get("status") == "follow_up"]
+        st.human_tasks, st.reverted, st.dropped = [], [], []
+        st.feedback = list(feedback)
+        if owner_edit:
+            self._owner_edit(st)
+            st.feedback = list(feedback) + st.feedback
+        st.phase = Phase.PENDING
+        self.store.event("new_round", issue=n, round=st.round, reason=feedback[0][:400] if feedback else "",
+                         owner_edit=owner_edit)
+
+    def _engine_fault(self, n: int, exc: BaseException) -> None:
+        """An engine bug: journal it, queue one GitHub issue per distinct fault; the issue waits
+        for a new engine version."""
+        detail = redact("".join(traceback.format_exception(exc))[-2500:], self.repo_root)
+        fingerprint = fault_fingerprint(exc)
+        phase = self.store.issue(n).phase.value
+        self.store.event("step_crashed", issue=n, error=redact(repr(exc), self.repo_root)[:500], traceback=detail,
+                         fingerprint=fingerprint)
+        title = f"implement loop: {type(exc).__name__} in the engine ({fingerprint})"
+        body = (f"{report.FAULT_MARKER.format(fingerprint)}\nThe implement loop's engine raised `{type(exc).__name__}` "
+                f"in phase `{phase}` while working on #{n} (run for #{self.plan.root}, engine {VERSION}). The issue "
+                f"waits for a new engine version and the run carried on. The message and full traceback are in the "
+                f"local run log (`events.jsonl`, event `step_crashed`, fingerprint `{fingerprint}`).\n\nEngine frames:\n\n"
+                f"```\n{engine_frames(exc)}\n```\n\n"
+                f"## Deliverables\n- [ ] A regression test reproduces this fault's path ({engine_frames(exc).splitlines()[-1] if engine_frames(exc) else 'unknown'}).\n"
+                f"- [ ] The engine handles that path, and the test passes.\n"
+                f"- [ ] The engine version (`implement_loop/__init__.py`) is bumped, so waiting issues resume.\n\n"
+                f"## Acceptance criteria\n- [ ] The engine's full test suite passes.\n"
+                f"- [ ] Nothing on the loop's safety surface changes.\n")
+        self.faults.record(fingerprint, title, body, issue=n, run=self.plan.root)
+        resume = Phase(phase) if phase not in (Phase.WAITING.value, Phase.FAILED.value) else Phase.PENDING
+        self._wait(n, WAIT_ENGINE, f"engine error {type(exc).__name__} in phase {phase} (fault {fingerprint})",
+                   resume=resume, fingerprint=fingerprint)
+
+    def _flush_faults(self) -> None:
+        self._safe(self.gh.ensure_label, *ENGINE_BUG_LABEL)
+        for fingerprint, entry in self.faults.pending():
+            try:
+                number = entry.get("filed") or self.gh.find_issue(ENGINE_BUG_LABEL[0], report.FAULT_MARKER.format(fingerprint))
+                if number:
+                    self.gh.create_comment(number, f"Seen again: {entry['count']} occurrence(s) so far, latest on "
+                                                   f"#{entry['issues'][-1]} (run for #{entry['runs'][-1]}).")
+                else:
+                    number = self.gh.create_issue(entry["title"], entry["body"], [ENGINE_BUG_LABEL[0]])["number"]
+                self.faults.mark_reported(fingerprint, number)
+                self.store.event("fault_filed", fingerprint=fingerprint, issue=number)
+            except Exception as e:  # noqa: BLE001 - filing is best effort, by design
+                self.store.event("fault_filing_failed", fingerprint=fingerprint, error=str(e)[:300])
+
+    def _safe(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (GitHubError, OSError) as e:
+            self.store.event("github_call_failed", call=getattr(fn, "__name__", str(fn)), error=str(e)[:300])
+            return None
+
+    def _sync(self, n: int) -> None:
+        st = self.store.issue(n)
+        wanted = PHASE_LABEL.get(st.phase)
+        for label in (*LABELS, *LEGACY_LABELS):
+            if label != wanted:
+                self._safe(self.gh.remove_label, n, label)
+        if wanted:
+            self._safe(self.gh.add_labels, n, [wanted])
+        self._upsert_comment(n, report.PROGRESS_MARKER, report.render_progress(st, self.plan.root))
+
+    def _upsert_comment(self, n: int, marker: str, body: str) -> dict | None:
+        comments = self._safe(self.gh.list_comments, n) or []
+        for c in comments:
+            if marker in (c.get("body") or ""):
+                return self._safe(self.gh.update_comment, c["id"], body)
+        return self._safe(self.gh.create_comment, n, body)
+
+    def _requirements_current(self, n: int) -> bool:
+        data = self.gh.get_issue(n)
+        st = self.store.issue(n)
+        if issue_parser.body_hash(data.get("body") or "") == st.body_hash:
+            return True
+        issue = Issue.from_api(data)
+        self.plan.issues[n] = issue
+        self.plan.specs[n] = issue_parser.parse(issue)
+        return False
+
+    def _lookup_issue(self, m: int | None) -> gate.OpenIssue | None:
+        if not m:
+            return None
+        if m in self.plan.issues:
+            i = self.plan.issues[m]
+        else:
+            data = self._safe(self.gh.get_issue, m)
+            if not data:
+                return None
+            i = Issue.from_api(data)
+        return gate.OpenIssue(number=i.number, state=i.state, title=i.title, body=i.body,
+                              tracking=i.sub_issue_total > 0 or m in self.plan.tracking)
+
+    def _absorb_agent_commits(self, n: int, wt: Path, call: AgentCall, merge_head: str | None = None) -> None:
+        """Only the engine creates history. The agent ran against a private git directory
+        (`Workspace.agent_call`): its working tree is kept as it is, and is committed, verified and
+        examined like everything else; the events say what was dropped."""
+        if call.after_branch != call.branch:
+            self.store.event("agent_checkout_undone", issue=n, was=call.after_branch or call.after_head,
+                             branch=call.branch)
+        if call.after_head and call.after_head != call.head:
+            self.store.event("agent_commits_absorbed", issue=n, from_head=call.after_head, to=call.head)
+        if call.branch:
+            now = self.ws.git("rev-parse", "-q", "--verify", call.branch, check=False) or None
+            if now != call.head:
+                self.store.event("issue_branch_moved_externally", issue=n, branch=call.branch,
+                                 **{"from": call.head, "to": now})
+        if merge_head and call.after_merge_head is None and not call.merge_committed:
+            self.ws.git("merge", "--quit", cwd=wt)
+            self.store.event("agent_merge_dropped", issue=n, merge_head=merge_head)
+        if call.created:
+            self.store.event("agent_refs_deleted", issue=n, refs=call.created)
+        if call.discarded:
+            self.store.event("agent_ref_changes_discarded", issue=n, refs=call.discarded)
+
+    def _delivery(self, st: IssueState, merged_head: str) -> tuple[str, list[str] | None]:
+        reviewed, repo = st.certified_sha, self.ws.repo
+        if not reviewed or merged_head == reviewed:
+            return "same", []
+        self.ws.git("fetch", "--quiet", self.ws.remote, merged_head, cwd=repo, check=False)
+        if not self.ws.has_commit(repo, merged_head):
+            return "later", None
+        if not self.ws.is_ancestor(repo, reviewed, merged_head):
+            return "stale", None
+        touched = self.ws.git("diff", "--name-only", reviewed, merged_head, cwd=repo)
+        allowed = self.plan.specs[st.number].declared_paths
+        return "later", sorted({f for f in touched.splitlines() if f and any(scheduler.overlaps(f, a) for a in allowed)})
+
+    def _verify(self, root: Path, st: IssueState, head: str, work_dir: Path, check_tamper: bool = True):
+        with self.ws.disposable(root) as scratch:
+            return self._verify_in(scratch, st, head, work_dir, check_tamper)
+
+    def _verify_in(self, root: Path, st: IssueState, head: str, work_dir: Path, check_tamper: bool = True):
+        return verify.verify(root, self._specs(st), head, work_dir, st.locked, sorted(set(st.tests) | set(st.probes)),
+                             st.manifest or None, self.caps.check_timeout_s,
+                             extra_env=self.check_env, check_tamper=check_tamper,
+                             standing=standing_checks(), mounts=self._mounts(root))
+
+    def _mounts(self, scratch: Path) -> sandbox.Mounts:
+        """What a check command may see of the tree under judgement: that throwaway copy and its
+        private git directory read-write, the shared object store read-only."""
+        return sandbox.worktree_mounts(scratch, True, self.ws)
+
+    def _decide(self, st: IssueState, entry: dict) -> None:
+        st.decisions = [d for d in st.decisions if d.get("id") != entry.get("id")] + [entry]
+
+    # ------------------------------------------------------------------ plan
+    def _step_plan(self, n: int) -> None:
+        st = self.store.issue(n)
+        spec = self.plan.specs[n]
+        wt = Path(st.worktree) if st.worktree and (Path(st.worktree) / ".git").exists() else None
+        req = self._req(n, st.feedback)
+        item_text = self._item_text(n)
+        ledger_ids = [i.id for i in spec.ledger]
+        res = self.agents.plan(self.op, req, wt)
+        items = [asdict(i) for i in res.items]
+        problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, res.zones)
+        if problems:   # one free retry, then the engine makes it usable itself
+            res = self.agents.plan(self.op, replace(req, feedback=req.feedback + problems), wt)
+            items = [asdict(i) for i in res.items]
+            problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, res.zones)
+        st = self.store.issue(n)
+        for d in res.decisions:
+            self._decide(st, d)
+        if problems:
+            items, fixes = gate.repair_plan(items, ledger_ids, item_text)
+            for d in fixes:
+                self._decide(st, d)
+            fixed = []
+            for i in items:
+                bad = gate.lint_plan([i], [i["id"]], item_text, self.lacks, self._lookup_issue, [])
+                if bad and i["proof"] in ("owner", "deferred"):
+                    i, d = gate.demote(i, "; ".join(bad))
+                    self._decide(st, d)
+                fixed.append(i)
+            items = fixed
+        plan = {"items": items, "zones": sorted({z.rstrip("/") for z in res.zones}), "notes": res.notes}
+        st.plan = plan
+        self.store.put(st)
+        objections = [asdict(o) for o in self.agents.triage(self.other, self._req(n), plan)]
+        kept = [o for o in objections if gate.keep_objection(o, item_text, self._lookup_issue)]
+        st = self.store.issue(n)
+        st.plan = plan   # one canonical plan from here on: dependency handling edits st.plan in place
+        feedback = []
+        infra = any(z.startswith(INFRA_PREFIXES) for z in plan["zones"])
+        for o in kept:
+            if o["kind"] == "classification":
+                ruling = self.agents.arbitrate(self.other, self._req(n), {
+                    "kind": "classification", "item": o["item"], "item_text": item_text.get(o["item"]),
+                    "plan": next((i for i in items if i["id"] == o["item"]), None), "objection": o,
+                    "lacks": self.lacks})
+                if ruling.upheld and o.get("proof") in ("test", "command", "review", "owner", "deferred"):
+                    item = next(i for i in plan["items"] if i["id"] == o["item"])
+                    candidate = {**item, "proof": o["proof"], "capability": o.get("capability"),
+                                 "depends_on": o.get("depends_on"), "depends_quote": o.get("depends_quote"),
+                                 "agent_part": item.get("agent_part") or "the parts agents can do"}
+                    if not gate.lint_plan([candidate], [o["item"]], item_text, self.lacks, self._lookup_issue, []):
+                        plan["items"] = [candidate if i["id"] == o["item"] else i for i in plan["items"]]
+                        self._decide(st, {"id": f"classification-{o['item']}", "choice": f"{o['item']} is {o['proof']}",
+                                          "rationale": f"the arbiter upheld the examiner: {ruling.reason}"})
+            elif o["kind"] == "dependency":
+                self._depend(n, st, o["item"], o["depends_on"], o.get("depends_quote") or "")
+            elif o["kind"] == "misreading":
+                feedback.append(f"The examiner says the plan misreads {o['item']} (\"{o['quote']}\"): {o['text']} "
+                                f"Accept or reject this reading, with a reason, in your decisions.")
+            elif o["kind"] == "scenario" and infra:
+                feedback.append(f"Failure scenario to cover: {o['text']}")
+        for i in plan["items"]:
+            if i["proof"] == "deferred" and i.get("depends_on"):
+                self._depend(n, st, i["id"], int(i["depends_on"]), i.get("depends_quote") or "")
+            if i["proof"] == "owner":
+                self._obligate(st, {"item": i["id"], "kind": "capability", "detail": i.get("capability"),
+                                    "agent_part": i.get("agent_part")})
+        # A protected path among the zones is granted here only when the issue's own text names it
+        # (ADR 0001, decision 10). Triage has no objection kind for a zone, so its silence approves
+        # nothing: any other protected zone is withheld, and the builder asks for it with a typed
+        # `protected_change` request, which the examiner decides. Never the safety surface in a
+        # fault-repair run.
+        # Naming means the protected path itself, or a directory that is protected: an issue that
+        # names `scripts/` or `tools/` has not named `scripts/check.sh` or `tools/hygiene/`.
+        # Earlier plans' zones stay granted, with their provenance: a replan never takes away a path
+        # the branch was allowed to change (the redesign that did so parked #42 and #78).
+        guarded = [z for z in plan["zones"] if is_protected(z) or is_protected(z + "/")]
+        named = [p.rstrip("/") for p in issue_parser.declared_paths(self.plan.issues[n].body)] if guarded else []
+        named = [p for p in named if is_protected(p) or is_protected(p + "/")]
+        approved = [z for z in guarded if any(z == p or z.startswith(p + "/") for p in named)]
+        withheld = [z for z in guarded if z not in approved]
+        earlier = [{**g, "source": "earlier plan"} if g.get("source") == "plan" else g for g in st.grants]
+        st.grants = earlier + [{"path": z, "source": "plan", "protected": z in approved} for z in plan["zones"]
+                               if z not in withheld and not (self.repair and is_safety_surface(z))
+                               and not any(g["path"] == z for g in earlier)]
+        if guarded:
+            choice = [f"granted, because the issue names them: {', '.join(approved)}"] if approved else []
+            choice += [f"not granted, because the issue does not name them: {', '.join(withheld)}"] if withheld else []
+            self._decide(st, {"id": "protected-zones", "choice": "protected paths among the plan's zones: " + "; ".join(choice),
+                              "rationale": "a protected path changes only when the issue names it or the examiner "
+                                           "approves a `protected_change` request"})
+        if withheld:
+            feedback.append(f"Your plan's zones include protected paths the issue does not name: {withheld}. They are "
+                            f"not granted. If the issue cannot be delivered without changing one, ask with a "
+                            f"`protected_change` request that says why; the examiner decides.")
+            self.store.event("protected_zones_withheld", issue=n, zones=withheld)
+        plan = st.plan
+        retired = self._retire_uncommanded(st)
+        if retired:
+            feedback.append(f"These commands were retired, because the plan no longer proves their items by a "
+                            f"command: {retired[:6]}.")
+        st.feedback = feedback
+        self.store.put(st)
+        self._declare(n, st)
+        self.store.event("planned", issue=n, items={i["id"]: i["proof"] for i in plan["items"]}, zones=plan["zones"],
+                         objections=len(objections), kept=len(kept), problems=problems)
+        if not scheduler.prerequisites_met(self.plan, self._phases(), n):
+            self._set_phase(n, Phase.PENDING)    # a prerequisite was added: wait for it
+        else:
+            self._set_phase(n, Phase.PLANNED)
+
+    def _obligate(self, st: IssueState, ob: dict) -> None:
+        st.obligations = [o for o in st.obligations if o["item"] != ob["item"]] + [ob]
+
+    def _depend(self, n: int, st: IssueState, item: str, m: int, quote: str) -> None:
+        """An item needs another open issue. In this run it waits for it; an open issue of the
+        run's epic is admitted when the launch allowed it; otherwise the item is a deferred
+        obligation that reopens when that issue lands."""
+        other = self._lookup_issue(m)
+        if other is None or other.state != "open" or m == n:
+            return
+        edges = {k: set(v) for k, v in self.plan.deps.items()}
+        edges.setdefault(n, set()).add(m)
+        in_epic = m in self.plan.parent or m in self.plan.closed_work or m in self.plan.work
+        try:
+            if m in self.plan.work:
+                graph.topological_order(set(self.plan.work), edges)
+                self.plan.deps[n] = edges[n]
+                self._wait_for(st, item, m)
+                self._decide(st, {"id": f"depends-{item}", "choice": f"{item} waits for #{m}, in this run",
+                                  "rationale": f"it needs #{m}: \"{quote}\""})
+                self.store.event("dependency_added", issue=n, on=m, item=item, admitted=False)
+                return
+            if self.admit and in_epic and not other.tracking:
+                data = self.gh.get_issue(m)
+                issue = Issue.from_api(data)
+                self.plan.issues[m] = issue
+                self.plan.specs[m] = issue_parser.parse(issue)
+                graph.topological_order(set(self.plan.work) | {m}, edges)
+                self.plan.work.insert(0, m)
+                self.plan.deps[n] = edges[n]
+                self.plan.deps.setdefault(m, set())
+                self._wait_for(st, item, m)
+                self._decide(st, {"id": f"depends-{item}", "choice": f"#{m} joined the run; {item} waits for it",
+                                  "rationale": f"it needs #{m}: \"{quote}\" (the launch allowed prerequisites from the epic)"})
+                self.store.event("prerequisite_added", issue=n, on=m, item=item)
+                return
+        except graph.CycleError:
+            self.store.event("dependency_cycle", issue=n, on=m, item=item)
+        self._obligate(st, {"item": item, "kind": "deferred", "detail": f"#{m}", "issue": m})
+        if st.plan:   # the item is owed, never proven or ticked here
+            st.plan["items"] = [{**i, "proof": "deferred", "depends_on": m, "depends_quote": quote}
+                                if i["id"] == item else i for i in st.plan["items"]]
+        self._decide(st, {"id": f"depends-{item}", "choice": f"{item} is deferred to #{m}",
+                          "rationale": f"it needs #{m} (\"{quote}\"), which this run does not build"})
+        self.store.event("dependency_deferred", issue=n, on=m, item=item)
+
+    def _wait_for(self, st: IssueState, item: str, m: int) -> None:
+        """An item waiting on a prerequisite in the run: the edge is kept across runs, and the
+        item is proven (by the examiner's review, unless a replan says otherwise) once it lands."""
+        st.extra_deps = sorted(set(st.extra_deps) | {m})
+        if st.plan:
+            st.plan["items"] = [{**i, "proof": "review" if i["proof"] == "deferred" else i["proof"],
+                                 "depends_on": m} if i["id"] == item else i for i in st.plan["items"]]
+
+    def _restore_deps(self, n: int, st: IssueState) -> None:
+        """Prerequisites found in earlier runs: back into the graph (admitted again when the launch
+        allows it); one no longer reachable becomes a deferred obligation."""
+        for m in list(st.extra_deps):
+            if m in self.plan.work:
+                self.plan.deps.setdefault(n, set()).add(m)
+                continue
+            other = self._lookup_issue(m)
+            if other is None or other.state != "open":
+                st.extra_deps = [x for x in st.extra_deps if x != m]
+                continue
+            item = next((i["id"] for i in self._items(st) if i.get("depends_on") == m), "")
+            self._depend(n, st, item, m, "")
+
+    # ------------------------------------------------------------------ build
+    def _step_build(self, n: int) -> None:
+        """Every round starts from current main: main is merged in first. On a conflict the merge
+        stays in progress for the builder to resolve, and is concluded or aborted within this step."""
+        st = self.store.issue(n)
+        # set at startup (_reconcile); a prerequisite _depend admits mid-run has none yet and stops here
+        assert st.branch is not None
+        wt = self.ws.issue_worktree(n, st.branch)
+        if str(wt) != st.worktree:
+            st.worktree = str(wt)
+            self.store.put(st)
+        if not self._restore_branch(n):
+            return
+        self._recover_worktree(n, wt)
+        self._release_legacy(n, wt)
+        self.ws.fetch()
+        sync: UpdateResult | None = None
+        held = self._uncommittable(n, wt) if self.ws.uncommitted(wt) else []
+        if held:
+            # Work the standing checks refuse is never committed, so there is nothing to merge main
+            # over: this round runs on the branch as it is, and main is merged in once it is fixed.
+            self.store.event("update_postponed", issue=n, problems=[p[:300] for p in held])
+            head = self.ws.head(wt)
+            sync = UpdateResult("current", [], head, head)
+        elif self.ws.uncommitted(wt) and not self.ws.is_ancestor(wt, self.ws.base_ref(), "HEAD"):
+            sha = self._commit_work(n, wt, f"Checkpoint #{n} before merging main")
+            self.store.event("checkpoint_before_update", issue=n, sha=sha)
+        if not st.base_sha:
+            self._set_phase(n, Phase.BUILD, base_sha=self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt))
+        try:
+            if sync is None:
+                sync = self.ws.update(wt)
+        except GitError:
+            # main moved between the fetch above and update's own, and git refused to merge over
+            # the uncommitted work: checkpoint it after all and merge again
+            if not self.ws.uncommitted(wt):
+                raise
+            sha = self._commit_work(n, wt, f"Checkpoint #{n} before merging main")
+            self.store.event("checkpoint_before_update", issue=n, sha=sha, retried=True)
+            sync = self.ws.update(wt)
+        try:
+            self._build_round(n, wt, sync)
+        finally:
+            if self.ws.in_progress(wt):
+                self.ws.abort_in_progress(wt)
+
+    def _uncommittable(self, n: int, wt: Path) -> list[str]:
+        """What the standing checks say of the worktree as it stands, before the engine commits it:
+        their problems, or nothing. A change they refuse is not committed, so no commit of a loop
+        branch carries what the hygiene scan stops, and a commit that is never made is never
+        pushed. The scan runs in the sandbox, with the worktree read-only."""
+        checks = standing_checks()
+        if not checks:
+            return []
+        _, problems = verify.standing_checks(wt, checks, self.ws.head(wt), self.store.issue_dir(n) / "uncommitted",
+                                             self.caps.check_timeout_s, self.check_env,
+                                             sandbox.worktree_mounts(wt, False, self.ws))
+        return problems
+
+    def _unclean_probes(self, n: int, wt: Path, probes: list) -> dict[str, str]:
+        """The probes the standing checks refuse, each with what they said. An adopted probe is
+        committed by the engine like a builder's round, so it is scanned first, like one
+        (`_uncommittable`): all of them at once in a throwaway copy of the head and, only when that
+        fails, one by one, to name the ones at fault."""
+        checks = standing_checks()
+        if not checks or not probes:
+            return {}
+
+        def refused(group: list) -> list[str]:
+            with self.ws.disposable(wt) as scratch:
+                for p in group:
+                    if self._inside(scratch, p.file):
+                        self._replace_file(scratch / p.file, p.content)
+                _, problems = verify.standing_checks(scratch, checks, self.ws.head(wt), self.store.issue_dir(n) / "probes",
+                                                     self.caps.check_timeout_s, self.check_env, self._mounts(scratch))
+            return problems
+
+        together = refused(probes)
+        if not together:
+            return {}
+        alone = {p.file: refused([p]) for p in probes}
+        if not any(alone.values()):   # only together: none of them is kept
+            alone = {p.file: together for p in probes}
+        return {file: "the standing checks refuse it: " + "; ".join(problems)[:600] for file, problems in alone.items()
+                if problems}
+
+    def _history_scan(self, n: int, wt: Path, base: str, head: str, where: str) -> tuple[list[str], list[str]]:
+        """Run the history checks on the commits `base..head` of the worktree's branch, in a
+        throwaway copy of that head, in the sandbox. Returns (findings, problems): the output of
+        each check that reported findings, and what any other failure says (a check that could
+        not run proves nothing, so that head is not pushed either)."""
+        checks = history_checks(f"{base}..{head}")
+        if not checks:
+            return [], []
+        with self.ws.disposable(wt) as scratch:
+            evidence, problems = verify.standing_checks(scratch, checks, head, self.store.issue_dir(n) / where,
+                                                        self.caps.check_timeout_s, self.check_env, self._mounts(scratch))
+        findings = history_findings(evidence)
+        return findings, ([] if findings else problems)
+
+    def _history_refused(self, n: int, head: str, outputs: list[str]) -> None:
+        """The branch's own commits carry what a history check refuses: a value that reached a
+        commit, whatever the files say now, a commit message, or an author's address. No later
+        commit takes it back, so no round can repair it and the builder is not asked to: the
+        branch is abandoned unpushed, the issue ends `failed`, and its next attempt (a retry, or
+        a new engine version) starts on a new branch from main, with the plan kept."""
+        st = self.store.issue(n)
+        old, pr = st.branch, st.pr
+        places = history_places(outputs)
+        said = ", ".join(places[:8]) + (f" and {len(places) - 8} more" if len(places) > 8 else "")
+        self.store.event("history_refused", issue=n, branch=old, head=head, findings=places[:40],
+                         output=[o[-1500:] for o in outputs])
+        st.restarts += 1
+        self._new_round(st, [(f"An earlier branch of this issue, `{old}`, was abandoned: its commits carry what the "
+                              f"public-repository scan refuses ({said}). What reaches a commit stays in the branch's "
+                              f"history whatever later commits do, so that branch is never pushed. This is a new branch "
+                              f"from main: build the issue again here, and never write such a value into a file, not "
+                              f"even for one round (use the documented placeholders).")], owner_edit=False)
+        self.store.put(st)
+        self._fail(n, "history", (
+            f"the commits of `{old}` carry what the history scan refuses: a value that reached a commit, a commit "
+            f"message or an author's address. No later commit can take it back, so the branch was abandoned at "
+            f"`{head[:12]}`, this step pushed nothing of it, and the next attempt (`retry`, or a new engine version) "
+            f"builds on a new branch from main, `{st.branch}`. Delete `{old}` once you have read it (`git branch -D`)"
+            + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}."))
+
+    def _release_legacy(self, n: int, wt: Path) -> None:
+        st = self.store.issue(n)
+        pending = [r for r in st.requests if r.get("kind") == "legacy_unlock" and r.get("status") == "pending"]
+        for r in pending:
+            on_branch = [f for f in r.get("paths", []) if (wt / f).exists()]
+            self.ws.commit_all(wt, f"Release the earlier engine's checks for #{n}", "acceptance-checks", n,
+                               unlocks=on_branch or None)
+            r["status"] = "approved"
+            r["reason"] = "the builder takes over tests an earlier engine locked"
+            self.store.event("legacy_checks_released", issue=n, files=on_branch)
+        if pending:
+            self.store.put(st)
+
+    def _build_round(self, n: int, wt: Path, sync: UpdateResult) -> None:
+        st = self.store.issue(n)
+        assert st.plan is not None   # an issue without one goes back to pending at startup
+        feedback = list(st.feedback) + self._open_feedback(st)
+        files = sync.files if sync.status == "conflict" else []
+        expected: dict[str, str] = {}
+        restore: dict[str, tuple] = {}
+        sources: dict[str, str] = {}
+        if st.conflict_pending and not files:
+            st.conflict_pending = False
+            self.store.put(st)
+        if sync.status == "merged":
+            self.store.event("updated_from_main", issue=n, phase=Phase.BUILD.value, frm=sync.before,
+                             to=self.ws.head(wt), main=sync.main)
+            self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
+        elif files:
+            st.conflict_paths = sorted(set(st.conflict_paths) | set(files))
+            st.grants = st.grants + [{"path": f, "source": "conflict", "protected": False} for f in files
+                                     if not any(g["path"] == f for g in st.grants)]
+            st.conflict_pending = True
+            self.store.event("conflict", issue=n, phase=Phase.BUILD.value, files=files)
+            self.store.put(st)
+            self._declare(n, st)
+            locked = [f for f in files if f in st.locked]
+            if locked and not self._resolve_locked_conflict(n, wt, locked, sync.main):
+                return self._back_to_build(n, wt, "check_conflict_unresolved", locked,
+                                           f"The other vendor could not resolve main's conflict in the locked tests "
+                                           f"{locked}; the next round merges main again.")
+            expected = self._relock_candidates(n, wt, sync.before)
+            merged = {f: self.ws.file_state(wt, f) for f in {**st.locked, **expected}}
+            restore = {f: s for f, s in merged.items() if s is not None}
+            sources = {f: "other-vendor" if f in locked else "main" for f in expected}
+            feedback.append(conflict_feedback([f for f in files if f not in locked], locked))
+        with self.ws.agent_call(wt) as call:
+            result = self.agents.build(self.op, self._req(n, feedback), st.plan, wt, feedback)
+        self._absorb_agent_commits(n, wt, call, merge_head=sync.main if files else None)
+        unresolved = []
+        if files:
+            st = self.store.issue(n)
+            st.conflict_pending = False
+            self.store.put(st)
+            unresolved = (files if self.ws.in_progress(wt) != "merge"
+                          else [f for f in files if has_conflict_markers(wt / f)])
+            if unresolved and result.status == "done":
+                return self._back_to_build(n, wt, "conflict_unresolved", unresolved,
+                                           f"Conflict markers are still in {unresolved}, so main's merge was aborted. "
+                                           f"The next round merges main again: resolve every marker.")
+            if unresolved:
+                self.ws.abort_in_progress(wt)
+                expected, restore = {}, {}
+        refused = self._uncommittable(n, wt)
+        if refused:
+            # Not committed, and the answer's commands and requests are not kept: the builder gets
+            # the scanner's output and builds again on the same files. A merge of main in progress
+            # is aborted, as for an unresolved conflict; the next clean round merges it again.
+            if self.ws.in_progress(wt):
+                self.ws.abort_in_progress(wt)
+            st = self.store.issue(n)
+            st.conflict_pending = False
+            self.store.put(st)
+            self.store.event("build_not_committed", issue=n, status=result.status, problems=[p[:600] for p in refused])
+            return self._round_failed(n, refused)
+        # A locked test the builder edited without approval is reverted; its proposed content is
+        # kept with a `test_change` request if it made one, for the other vendor to decide.
+        st = self.store.issue(n)
+        proposals = self._locked_edits(st, wt, restore)
+        requests = self._new_requests(n, st, result.requests, proposals)
+        subject = (f"Merge main and build #{n}" if files and not unresolved else f"Build #{n}")
+        sha = self._commit_work(n, wt, subject, expected, restore)
+        if files and not unresolved:
+            self._relock(n, wt, expected, sources)
+        st = self.store.issue(n)
+        known = {r["id"] for r in st.requests}
+        self._absorb_build(st, result, wt)
+        requests = requests + [r for r in st.requests if r["id"] not in known]   # a locked command's change, decided now
+        self.store.put(st)
+        self.store.event("built", issue=n, sha=sha, status=result.status, note=result.note[:600],
+                         requests=[r["id"] for r in requests])
+        if requests:
+            self._decide_requests(n, wt)
+            st = self.store.issue(n)
+            if not scheduler.prerequisites_met(self.plan, self._phases(), n):
+                self.store.event("waits_for_prerequisite", issue=n, on=sorted(self.plan.deps.get(n, ())))
+                return self._set_phase(n, Phase.PENDING, feedback=self._request_feedback(
+                    [r for r in st.requests if r["id"] in {q["id"] for q in requests}]))
+        if result.status != "done":
+            decided = [r for r in st.requests if r["id"] in {q["id"] for q in requests}]
+            if any(r["status"] in ("approved", "ruled_for") for r in decided):
+                return self._set_phase(n, Phase.BUILD, feedback=self._request_feedback(decided))
+            return self._round_failed(n, [f"blocked: {result.note[:400]}" + (
+                "" if requests else " — a blocked answer needs a typed request the other vendor can decide")])
+        self._set_phase(n, Phase.VERIFY, head_sha=self.ws.head(wt), feedback=self._request_feedback(
+            [r for r in st.requests if r["id"] in {q["id"] for q in requests}]))
+
+    def _absorb_build(self, st: IssueState, result, wt: Path | None = None) -> None:
+        """The builder's tests, commands and dispositions. Before the first examination they are its
+        own; after it, commands for locked items change only through an approved request."""
+        proofs = {i["id"]: i["proof"] for i in self._items(st)}
+        commanded = self._commanded_items(st)
+        inside = (lambda rel: self._inside(wt, rel)) if wt is not None else (lambda rel: True)
+        refused = [t for t in result.tests if t and not inside(t)]
+        if refused:
+            self.store.event("test_paths_refused", issue=st.number, paths=refused[:8])
+        st.tests = sorted(set(st.tests) | {t for t in result.tests if t and inside(t)})
+        current: dict[str, list[dict]] = {}
+        for c in st.commands:
+            if c.get("author") == "builder":
+                current.setdefault(c["criterion"], []).append(c)
+        probes = [c for c in st.commands if c.get("author") == "examiner"]
+        given: dict[str, list[dict]] = {}   # an item may need several commands; each one is kept
+        dropped = []
+        for c in result.commands:
+            item = criterion_item(c.criterion, set(proofs))
+            why = ("its criterion names no plan item" if item is None
+                   else f"{item} is proven by {proofs[item]}, not by a command" if item not in commanded
+                   else "it is empty" if not c.command
+                   else "its cwd is outside the worktree" if not inside(c.cwd or ".") else None)
+            if item is None or why:   # said to the builder, never dropped in silence (#24 lost every probe command this way)
+                dropped.append(f"`{(c.command or '')[:120]}` (criterion {(c.criterion or '')[:80]!r}): {why}")
+                continue
+            given.setdefault(item, []).append(asdict(c) | {
+                "criterion": item, "description": c.description or c.criterion,
+                "author": "builder", "timeout_s": min(c.timeout_s or self.caps.check_timeout_s, self.caps.max_check_timeout_s)})
+        if dropped:
+            self.store.event("commands_dropped", issue=st.number, commands=dropped[:8])
+        st.dropped = dropped
+
+        def shape(entries: list[dict]) -> list[tuple[str, str]]:
+            return sorted((e["command"], e.get("cwd") or ".") for e in entries)
+        for item, entries in given.items():
+            if st.examined_sha and item in current and shape(current[item]) != shape(entries):
+                st.requests.append({"id": f"R{st.number}-{len(st.requests) + 1}", "kind": "command_change",
+                                    "item": item, "commands": entries, "status": "pending",
+                                    "replaces": self._item_commands(st, item),
+                                    "detail": f"change the locked commands for {item}"})
+                continue
+            current[item] = entries
+        st.commands = [e for entries in current.values() for e in entries] + probes
+        self._retire_uncommanded(st)
+        for test_id, why in (result.dispositions or {}).items():
+            st.dispositions.setdefault(test_id, why)
+        for d in result.decisions or []:
+            self._decide(st, d)
+
+    def _locked_edits(self, st: IssueState, wt: Path, restore: dict) -> dict[str, str | None]:
+        """Locked tests the builder changed: their proposed content (None: deleted)."""
+        out = {}
+        for rel, d in st.locked.items():
+            p = wt / rel
+            if rel in restore:
+                continue
+            if not p.is_file():
+                out[rel] = None
+            elif verify.digest(p) != d:
+                out[rel] = p.read_text(errors="replace")
+        return out
+
+    def _new_requests(self, n: int, st: IssueState, requests, proposals: dict[str, str | None]) -> list[dict]:
+        added = []
+        for r in requests:
+            entry = asdict(r)
+            entry["id"] = f"R{n}-{len(st.requests) + 1}"
+            entry["status"] = "pending"
+            if r.kind == "test_change":
+                # only locked tests the builder edited (None: deleted); a path it did not edit is no proposal
+                entry["content"] = {p: proposals[p] for p in (r.paths or list(proposals)) if p in proposals}
+            if r.kind == "command_change":
+                # one typed command is added to the item's commands, never put in place of all of them
+                # (#37 lost its checker tests that way); the decider sees what the item runs now
+                entry["replaces"] = self._item_commands(st, r.item or "")
+                if r.command and r.command.get("command"):
+                    c = r.command
+                    entry["command"] = c | {"criterion": r.item, "author": "builder",
+                                            "description": c.get("description") or f"{r.item}: {r.detail[:120]}",
+                                            "timeout_s": min(c.get("timeout_s") or self.caps.check_timeout_s,
+                                                             self.caps.max_check_timeout_s)}
+            st.requests.append(entry)
+            added.append(entry)
+        unrequested = [p for p in proposals if not any(p in (q.get("content") or {}) for q in added)]
+        if unrequested:
+            st.reverted = sorted(unrequested)
+        self.store.put(st)
+        return added
+
+    def _request_feedback(self, decided: list[dict]) -> list[str]:
+        out = []
+        for r in decided:
+            verdict = {"approved": "approved", "ruled_for": "ruled in your favour"}.get(r["status"], "refused")
+            out.append(f"Your {r['kind']} request {r['id']} ({r.get('detail', '')[:200]}) was {verdict}: {r.get('reason', '')[:400]}")
+        return out
+
+    def _decide_requests(self, n: int, wt: Path) -> None:
+        """The other vendor decides the builder's typed requests; disputes go to the arbiter. The
+        engine enforces its own rules first: no safety surface in a repair run, `owner` only for
+        a capability the host lacks."""
+        st = self.store.issue(n)
+        pending = [r for r in st.requests if r.get("status") == "pending" and r.get("kind") != "legacy_unlock"]
+        if not pending:
+            return
+        for r in pending:
+            refusal = self._engine_refusal(st, r)
+            if refusal:
+                r["status"], r["reason"] = "refused", refusal
+        disputes = [r for r in pending if r["status"] == "pending" and r["kind"] == "dispute"]
+        others = [r for r in pending if r["status"] == "pending" and r["kind"] != "dispute"]
+        self.store.put(st)
+        if others:
+            with self.ws.disposable(wt) as scratch:
+                decisions = self.agents.decide(self.other, self._req(n), scratch, others)
+            by_id = {d.request: d for d in decisions}
+            for r in others:
+                d = by_id.get(r["id"])
+                if d is None:
+                    r["status"], r["reason"] = "refused", "no decision was given; ask again with evidence"
+                    continue
+                r["status"], r["reason"] = ("approved" if d.approve else "refused"), d.reason
+                if d.approve:
+                    self._apply_request(n, st, wt, r, d.dispositions)
+        for r in disputes:
+            f = next((x for x in st.findings if x["id"] == r.get("finding")), None)
+            if f is None:
+                r["status"], r["reason"] = "refused", "no such open finding"
+                continue
+            with self.ws.disposable(wt) as scratch:
+                ruling = self.agents.arbitrate(self.other, self._req(n), {
+                    "kind": "finding", "finding": f, "item_text": self._item_text(n).get(f.get("item") or ""),
+                    "invariants": list(self.invariants), "argument": r.get("detail"), "lacks": self.lacks,
+                    "history": [x for x in st.findings if x.get("item") == f.get("item")][-5:]}, scratch)
+            if ruling.upheld:
+                r["status"], r["reason"] = "refused", f"the arbiter upheld the finding: {ruling.reason}"
+            else:
+                r["status"], r["reason"] = "ruled_for", f"the arbiter ruled the item does not require it: {ruling.reason}"
+                f["status"], f["blocking"], f["reason"] = "closed", False, f"ruled out by the arbiter: {ruling.reason}"
+        self.store.put(st)
+        self.store.event("requests_decided", issue=n, decided={r["id"]: r["status"] for r in pending})
+
+    def _engine_refusal(self, st: IssueState, r: dict) -> str | None:
+        paths = r.get("paths") or []
+        if self.repair and any(is_safety_surface(p) for p in paths):
+            return "a fault-repair run may never change the loop's safety surface"
+        if r["kind"] == "reclassify":
+            if r.get("capability") not in self.lacks:
+                return f"`owner` is only for a capability this host lacks ({', '.join(self.lacks)})"
+            if r.get("item") not in self._agent_items(st):
+                return "only an agent item can be reclassified"
+        if r["kind"] == "test_change" and not r.get("content"):
+            return "a test change needs the proposed content: edit the locked test in your worktree and name it"
+        if r["kind"] == "depends" and not r.get("depends_on"):
+            return "name the issue it depends on"
+        return None
+
+    def _apply_request(self, n: int, st: IssueState, wt: Path, r: dict, dispositions: dict[str, str]) -> None:
+        kind = r["kind"]
+        if kind in ("paths", "protected_change"):
+            for p in r.get("paths") or []:
+                st.grants.append({"path": p.rstrip("/"), "source": f"approved {r['id']}",
+                                  "protected": kind == "protected_change" or is_protected(p)})
+            self._declare(n, st)
+        elif kind == "command_change" and r.get("commands"):   # the item's whole new list
+            st.commands = [c for c in st.commands if not (c["criterion"] == r["item"] and c.get("author") == "builder")]
+            st.commands.extend(r["commands"])
+        elif kind == "command_change" and (r.get("command") or {}).get("command"):   # one more command
+            c = r["command"]
+            if (c["command"], c.get("cwd") or ".") not in {(x["command"], x.get("cwd") or ".")
+                                                          for x in self._item_commands(st, r["item"])}:
+                st.commands.append(c)
+        elif kind == "reclassify":
+            assert st.plan is not None   # requests come from a build, which needs the plan
+            st.plan["items"] = [{**i, "proof": "owner", "capability": r.get("capability"),
+                                 "agent_part": r.get("detail")} if i["id"] == r["item"] else i for i in st.plan["items"]]
+            self._obligate(st, {"item": r["item"], "kind": "capability", "detail": r.get("capability"),
+                                "agent_part": r.get("detail")})
+        elif kind == "depends":
+            self._depend(n, st, r.get("item") or "", int(r["depends_on"]), r.get("depends_quote") or "")
+        elif kind == "test_change":
+            content = {p: c for p, c in (r.get("content") or {}).items()
+                       if self._inside(wt, p) and (not self.repair or not is_safety_surface(p))}
+            for p, text in content.items():
+                target = wt / p
+                if target.is_symlink() or text is None:
+                    target.unlink(missing_ok=True)   # replace a link itself, never write through it
+                if text is not None:
+                    self._replace_file(target, text)
+            removed = [p for p, t in content.items() if t is None]
+            sha = self.ws.commit_all(wt, f"Change locked tests for #{n} (approved {r['id']})", "acceptance-checks", n,
+                                     unlocks=removed or None,
+                                     trailers={"Loop-Approved": f"{r['id']} by {self.other}"})
+            for p, text in content.items():
+                if text is None:
+                    st.locked.pop(p, None)
+                    st.tests = [t for t in st.tests if t != p]
+                    st.probes = [t for t in st.probes if t != p]
+                elif p in st.locked:
+                    st.locked[p] = verify.digest(wt / p)
+            self._retire_probe_commands(n, st, removed)
+            self.store.event("locked_tests_changed", issue=n, request=r["id"], sha=sha, files=sorted(content))
+        st.dispositions.update(dispositions or {})
+        if kind in ("test_change", "command_change") and dispositions and st.manifest:
+            # exact node ids; a disposition naming the function itself retires all its cases
+            def retired(i: str) -> bool:
+                return i in dispositions or (verify.base_id(i) in dispositions and verify.base_id(i) != i)
+            st.manifest = {k: [i for i in v if not retired(i)] for k, v in st.manifest.items()}
+        self._decide(st, {"id": r["id"], "choice": f"{kind}: {r.get('detail', '')[:200]}",
+                          "rationale": f"approved by {self.other}: {r.get('reason', '')[:300]}"})
+
+    def _open_feedback(self, st: IssueState) -> list[str]:
+        out = []
+        for f in st.findings:
+            if f.get("status") == "open":
+                where = f"item {f['item']} (\"{f.get('quote')}\")" if f.get("item") else f"invariant: {f.get('invariant')}"
+                repro = f.get("reproduction") or (f"bash {f['probe']}" if f.get("probe") else "")
+                out.append(f"Open finding {f['id']} on {where}: {f['title']}. Observed: {f['observed']}. "
+                           f"Expected: {f['expected']}. Reproduce: {repro}. It closes when that passes, or dispute it "
+                           f"with a `dispute` request if the item as written does not require it.")
+        for i, v in st.verdicts.items():
+            if v.get("verdict") == "unmet":
+                out.append(f"The examiner judges {i} unmet (\"{v.get('quote')}\"): {v.get('note', '')[:400]}")
+        return out
+
+    def _back_to_build(self, n: int, wt: Path, kind: str, files: list[str], note: str) -> None:
+        self.ws.abort_in_progress(wt)
+        st = self.store.issue(n)
+        st.conflict_pending = False
+        self.store.put(st)
+        self.store.event(kind, issue=n, files=files)
+        self._set_phase(n, Phase.BUILD, feedback=[note])
+
+    def _conflict(self, n: int, wt: Path, files: list[str], phase: str) -> None:
+        """Bringing the branch up to date with main hit conflicts: work for the builder, not a
+        fault, and no round is charged (main moving is nobody's design fault)."""
+        if self.ws.in_progress(wt) or self.ws.git("status", "--porcelain", cwd=wt):
+            raise GitError(f"the worktree of #{n} is not clean after aborting the conflicted update")
+        st = self.store.issue(n)
+        st.conflict_pending = True
+        st.conflict_paths = sorted(set(st.conflict_paths) | set(files))
+        st.grants = st.grants + [{"path": f, "source": "conflict", "protected": False} for f in files
+                                 if not any(g["path"] == f for g in st.grants)]
+        self.store.put(st)
+        self._declare(n, st)
+        self.store.event("conflict", issue=n, phase=phase, files=files)
+        self._set_phase(n, Phase.BUILD, feedback=[
+            (f"Main moved on and conflicts with this branch in: {', '.join(files)}. The next round starts with main's "
+             f"merge in progress; resolve the conflicts in those files.")])
+
+    def _relock_candidates(self, n: int, wt: Path, before: str) -> dict[str, str]:
+        st = self.store.issue(n)
+        if not st.locked:
+            return {}
+        cwds = sorted({c.get("cwd", ".") for c in st.commands})
+        current = verify.lock(wt, sorted(st.locked), cwds)
+        candidates, refused = {}, []
+        for f, d in current.items():
+            pre = self._digest_at(wt, before, f)
+            if pre == d:
+                continue
+            if pre != st.locked.get(f):
+                refused.append(f)
+                continue
+            candidates[f] = d
+        if refused:
+            self.store.event("checks_not_relocked", issue=n, files=sorted(refused),
+                             reason="changed on the branch before main's merge")
+        return candidates
+
+    def _digest_at(self, wt: Path, ref: str, file: str) -> str | None:
+        data = self.ws.show_bytes(wt, ref, file)
+        if data is None:
+            return None
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / Path(file).name
+            p.write_bytes(data)
+            return verify.digest(p)
+
+    def _relock(self, n: int, wt: Path, digests: dict[str, str], sources: dict[str, str]) -> None:
+        kept = {f: d for f, d in digests.items() if (wt / f).is_file() and verify.digest(wt / f) == d}
+        if not kept:
+            return
+        st = self.store.issue(n)
+        st.locked = {**st.locked, **kept}
+        self.store.put(st)
+        by_source: dict[str, list[str]] = {}
+        for f in sorted(kept):
+            by_source.setdefault(sources.get(f, "main"), []).append(f)
+        for source, files in sorted(by_source.items()):
+            self.store.event("checks_relocked", issue=n, files=files, source=source)
+
+    def _resolve_locked_conflict(self, n: int, wt: Path, lane: list[str], merge_head: str) -> bool:
+        """Conflicts in locked tests go to the other vendor, never the builder. Its edits outside
+        `lane`, staged or not, are undone from the index entries and bytes taken before it ran."""
+        snapshot = {f: self.ws.file_state(wt, f) for f in self.ws.uncommitted(wt)}
+        index = self.ws.index_entries(wt)
+        feedback = [(f"Main moved on, and merging it into this branch conflicts in the locked tests {', '.join(lane)}. "
+                     f"The merge is in progress: resolve the conflict markers in those files, keeping the requirements "
+                     f"of both sides (main's side tests work already merged). Change nothing else; do not run git "
+                     f"merge, commit or abort.")]
+        with self.ws.agent_call(wt) as call:
+            self.agents.resolve_locked(self.other, self._req(n), wt, lane, feedback)
+        self._absorb_agent_commits(n, wt, call, merge_head=merge_head)
+        restored = []
+        index_now = self.ws.index_entries(wt)
+        changed_in_index = {f for f in set(index) | set(index_now) if index.get(f) != index_now.get(f)}
+        for f in sorted(set(self.ws.uncommitted(wt)) | set(snapshot) | changed_in_index):
+            if any(scheduler.overlaps(f, c) for c in lane):
+                continue
+            now = self.ws.file_state(wt, f)
+            was = snapshot[f] if f in snapshot else self.ws.file_state_at(wt, "HEAD", f)
+            if now == was and f not in changed_in_index:
+                continue
+            if now != was:
+                self.ws.write_file_state(wt, f, was)
+            self.ws.restore_index_entry(wt, f, index.get(f, []))
+            restored.append(f)
+        if restored:
+            self.store.event("resolver_out_of_lane", issue=n, discarded=restored)
+        return self.ws.in_progress(wt) == "merge" and not any(has_conflict_markers(wt / f) for f in lane)
+
+    def _commit_work(self, n: int, wt: Path, subject: str, expected: dict[str, str] | None = None,
+                     restore: dict[str, tuple] | None = None) -> str | None:
+        """Commit the builder's work, minus any edit to a locked test (its proposal is kept with
+        its request). Mid-merge, `expected` holds the locked digests main's merge brought and
+        `restore` their file states: HEAD lacks main's side, so those files are restored from them."""
+        st = self.store.issue(n)
+        restore = restore or {}
+
+        def mode_changed(rel: str) -> bool:
+            ref = restore[rel] if rel in restore else self.ws.file_state_at(wt, "HEAD", rel)
+            now = self.ws.file_state(wt, rel)
+            return ref is not None and (now is None or now[0] != ref[0] or now[2:] != ref[2:])
+
+        touched = [rel for rel, d in {**st.locked, **(expected or {})}.items()
+                   if not (wt / rel).is_file() or verify.digest(wt / rel) != d or mode_changed(rel)]
+        if touched:
+            for rel in touched:
+                if rel in restore:
+                    self.ws.write_file_state(wt, rel, restore[rel])
+            from_head = [rel for rel in touched if rel not in restore]
+            if from_head:
+                self.ws.git("checkout", "HEAD", "--", *from_head, cwd=wt, check=False)
+            self.store.event("locked_changes_reverted", issue=n, files=touched)
+            st.reverted = sorted(set(st.reverted) | set(touched))
+            self.store.put(st)
+        return self.ws.commit_all(wt, subject, "implementation", n)
+
+    # ------------------------------------------------------------------ verify
+    def _step_verify(self, n: int) -> None:
+        st = self.store.issue(n)
+        assert st.worktree is not None   # verify follows a build, which records it
+        wt = Path(st.worktree)
+        head = self.ws.head(wt)
+        problems: list[str] = []
+        notes: list[str] = []
+        if st.reverted:   # already undone: a note for the builder, not a failure of the round
+            notes.append(f"Your edits to the locked tests {st.reverted} were reverted. Leave them unchanged, or "
+                         f"propose a change with a `test_change` request.")
+            self.store.event("reverted_edits_noted", issue=n, files=st.reverted)
+            st.reverted = []
+        if st.dropped:
+            items = sorted(self._agent_items(st) | {i["id"] for i in self._items(st) if i["proof"] == "owner"})
+            notes.append(f"These commands were not kept, so they did not run: {st.dropped[:6]}. A command's "
+                         f"`criterion` is exactly one plan item id ({', '.join(items)}); a command that "
+                         f"proves several items names the first of them.")
+            st.dropped = []
+        if notes:
+            st.feedback = list(st.feedback) + notes
+            self.store.put(st)
+        if not st.commands and self._agent_items(st) - self._review_items(st):
+            problems.append("no commands prove the test/command items; return one command per item")
+        locked_tests = sorted(set(st.tests) | set(st.probes))
+        # Checks are agent-written commands: they run in a throwaway copy of the head on a private git
+        # directory, so nothing they do reaches the worktree or another run's refs.
+        # The standing checks look at the tree of this head; the history checks at every commit the
+        # branch adds to main, which is what a push would publish.
+        history = history_checks(f"{self.ws.git('rev-parse', self.ws.base_ref(), cwd=wt)}..{head}")
+        with self.ws.disposable(wt) as scratch:
+            ok, evidence, vproblems, ran = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n),
+                                                         st.locked, locked_tests, st.manifest or None,
+                                                         self.caps.check_timeout_s, extra_env=self.check_env,
+                                                         check_tamper=bool(st.examined_sha),
+                                                         standing=standing_checks() + history, mounts=self._mounts(scratch))
+        refused = history_findings(evidence)
+        if refused:   # nothing the builder could do about it in a next round
+            return self._history_refused(n, head, refused)
+        problems += vproblems
+        selected = {"*": sorted(set(ran) | {t for v in (st.manifest or {}).values() for t in v})}
+        unselected = verify.unselected(wt, [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")],
+                                       selected, st.dispositions)
+        if unselected:
+            problems.append(f"tests in locked files that no command selects: {unselected[:6]} — select each one in a "
+                            f"command, or give it a disposition (owner-run, or excluded: <reason>)")
+        closed = self._close_findings(n, st, wt, evidence)
+        st = self.store.issue(n)
+        still = [f for f in st.findings if f.get("status") == "open"]
+        base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
+        changed = self.ws.changed_files(wt, base)
+        problems += gate.zone_problems(changed, st.grants, st.probes, self.repair)
+        problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
+        self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
+        st.evidence, st.base_sha = evidence, base
+        st.last_ran = {"*": sorted(ran)} if ok else st.last_ran
+        if ok and st.examined_sha:
+            # the manifest only grows: a locked test that ran once must keep running
+            grown = {i for i in ran if i.split("::")[0] in st.locked}
+            if grown - set((st.manifest or {}).get("*", [])):
+                st.manifest = {"*": sorted(set((st.manifest or {}).get("*", [])) | grown)}
+        self.store.put(st)
+        if not problems and st.examined_sha:
+            ran_files = {i.split("::")[0] for i in ran} | self._command_tests(wt, st.commands)
+            unlocked = sorted(f for f in ran_files if f not in st.locked and (wt / f).is_file())
+            if unlocked:   # a test file first run now locks now; the new head is verified again
+                self.ws.commit_all(wt, f"Lock newly run tests for #{n}", "acceptance-checks", n, locks=unlocked)
+                st = self.store.issue(n)
+                st.tests = sorted(set(st.tests) | set(unlocked))
+                st.locked = {**st.locked, **verify.lock(wt, unlocked, sorted({c.get("cwd", ".") for c in st.commands}))}
+                self.store.put(st)
+                self.store.event("tests_locked", issue=n, locked=unlocked, late=True)
+                return self._set_phase(n, Phase.VERIFY)
+        if not problems:
+            nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
+            return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
+        env = environment_problem(evidence)
+        if env:
+            return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}", resume=Phase.VERIFY)
+        self._round_failed(n, problems, [f["id"] for f in still], notes=notes)
+
+    def _close_findings(self, n: int, st: IssueState, wt: Path, evidence: list[dict]) -> list[str]:
+        """An open finding closes only when its reproduction passes on the new head (a probe-based
+        one when its probe passes)."""
+        closed = []
+        passed_probe = {c["command"] for c in st.commands if c.get("author") == "examiner"} & {
+            e["command"] for e in evidence if e.get("passed")}
+        for f in st.findings:
+            if f.get("status") != "open":
+                continue
+            if f.get("probe"):
+                cmd = next((c["command"] for c in st.commands if c.get("author") == "examiner"
+                            and _names_probe(c, f["probe"])), None)
+                if cmd and cmd in passed_probe:
+                    f["status"], f["reason"] = "closed", "its probe passes"
+                    closed.append(f["id"])
+                continue
+            if f.get("reproduction"):
+                still = self._reproduces(wt, f.get("reproduction"), f.get("cwd") or ".", None)
+                if still is False:
+                    f["status"], f["reason"] = "closed", "its reproduction passes"
+                    closed.append(f["id"])
+        if closed:
+            self.store.put(st)
+        return closed
+
+    def _reproduces(self, wt: Path, command: str | None, cwd: str, probe: tuple[str, str] | None) -> bool | None:
+        """Run a reproduction (and an optional probe file) in a throwaway copy of the head: True
+        when it fails (the finding holds), False when it passes, None when it cannot run."""
+        if not command:
+            return None
+        if probe and not self._inside(Path("/nonexistent-root"), probe[0]):
+            self.store.event("probe_path_refused", path=str(probe[0])[:200])
+            return None
+        with self.ws.disposable(wt) as scratch:
+            if probe:
+                target = scratch / probe[0]
+                if not self._inside(scratch, probe[0]):   # a symlink pointing out of the copy
+                    self.store.event("probe_path_refused", path=str(probe[0])[:200])
+                    return None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(probe[1])
+            spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
+            ev, _ = verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
+                                     self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
+        if ev.exit_code is None and "timed out" not in (ev.output_tail or ""):
+            return None
+        return not ev.passed
+
+    @staticmethod
+    def _replace_file(target: Path, text: str) -> None:
+        """Write a file the engine owns by replacing its directory entry with a freshly created one:
+        never through a symlink or a hard link an agent left at that path."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".loop-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(tmp, target)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _inside(root: Path, rel: str) -> bool:
+        """A probe path is repo-relative and stays inside `root` once resolved (symlinks included)."""
+        p = Path(rel)
+        if not rel or p.is_absolute() or ".." in p.parts or ".git" in p.parts:
+            return False
+        try:
+            return (root / p).resolve().is_relative_to(root.resolve())
+        except (OSError, RuntimeError):
+            return False
+
+    def _round_failed(self, n: int, problems: list[str], open_ids: list[str] | None = None,
+                      unmet: list[str] | None = None, notes: list[str] | None = None) -> None:
+        """The progress rule: a round is productive when what fails changes. Two unproductive
+        rounds bring a replan on the branch, two more end the issue `failed`. Notes reach the
+        builder but are not failures, so they stay out of the signature."""
+        st = self.store.issue(n)
+        sig = gate.signature(problems, open_ids or [], unmet or [])
+        st.unproductive = st.unproductive + 1 if sig == st.signature else 0
+        st.signature = sig
+        self.store.put(st)
+        problems = list(notes or []) + problems
+        self.store.event("round_failed", issue=n, unproductive=st.unproductive, problems=problems[:8])
+        if st.unproductive >= self.caps.unproductive_fail:
+            return self._fail(n, "no_progress", "the same failure repeated after a replan: " + "; ".join(problems)[:600])
+        if st.unproductive >= self.caps.unproductive_replan and st.replans < self.caps.replans:
+            st.replans += 1
+            self.store.put(st)
+            self.store.event("replan", issue=n, count=st.replans)
+            return self._set_phase(n, Phase.PLAN, feedback=[
+                "Two rounds changed nothing. Replan on your branch: the same failure keeps coming back. "
+                "Keep what works; change the approach, the zones or the proof kinds (classification changes go through "
+                "a request). The failures were: " + "; ".join(problems)[:1500]])
+        self._set_phase(n, Phase.BUILD, feedback=problems)
+
+    # ------------------------------------------------------------------ examine
+    def _step_examine(self, n: int) -> None:
+        st = self.store.issue(n)
+        assert st.worktree is not None and st.plan is not None and st.base_sha is not None   # set by plan and build
+        wt = Path(st.worktree)
+        head = self.ws.head(wt)
+        if head != st.verified_sha:
+            self.store.event("head_changed_before_examination", issue=n, verified=st.verified_sha, head=head)
+            return self._set_phase(n, Phase.VERIFY)
+        since = st.examined_sha
+        memory = [f for f in st.findings if f.get("status") in ("open", "closed", "follow_up")]
+        with self.ws.disposable(wt) as scratch:   # whatever the examiner changes is discarded with its copy
+            res = self.agents.examine(self.other, self._req(n, st.exam_feedback), st.plan, scratch, st.base_sha, head,
+                                      st.evidence, memory, [], since)
+        st = self.store.issue(n)
+        item_text = self._item_text(n)
+        rnd = len({f.get("round") for f in st.findings}) + 1
+        # probes: linted, run on the exact head, adopted when they pass or reproduce a blocking finding
+        probe_results: dict[str, bool] = {}
+        rejected = []
+        candidates = []
+        for p in res.probes:
+            problem = self._probe_problem(p)
+            if problem:
+                rejected.append({"file": p.file, "reason": problem})
+                continue
+            candidates.append(p)
+        # A probe the standing checks refuse is never run, adopted or committed: the hygiene scan
+        # of the head would fail on a file the builder may not change, and its history would keep it.
+        unclean = self._unclean_probes(n, wt, candidates)
+        for p in candidates:
+            if p.file in unclean:
+                rejected.append({"file": p.file, "reason": unclean[p.file]})
+                continue
+            probe_results[p.file] = self._reproduces(wt, p.command, p.cwd, (p.file, p.content)) is False
+        new: list[Finding] = []
+        for i, f in enumerate(res.findings):
+            f.id = f"E{n}-{rnd}-{i + 1}"
+            f.round = rnd
+            probe = next((p for p in res.probes if f.probe and p.file == f.probe), None)
+            if probe and probe.file in probe_results:
+                reproduced = not probe_results[probe.file]
+            else:
+                reproduced = self._reproduces(wt, f.reproduction, f.cwd or ".", None)
+            new.append(gate.classify(f, item_text, self.invariants, reproduced, self._agent_items(st),
+                                     self._owner_items(st), {i["id"]: i.get("agent_part") or "" for i in self._items(st)}))
+        accepted, unmet, missing = gate.review_verdicts(res.verdicts, item_text, self._verdict_items(st))
+        for i, v in accepted.items():
+            st.verdicts[i] = {**v, "head": head}
+        st.findings += [asdict(f) for f in new]
+        # A follow-up examination adopts only probes that reproduce a blocking finding, or that cover
+        # an item still without one, so certification converges.
+        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
+        adopt = [p for p in res.probes if p.file not in unclean and (
+            any(f.blocking and f.probe == p.file for f in new)
+            or (probe_results.get(p.file) is True and (since is None or p.criterion not in covered)))]
+        first = st.examined_sha is None
+        st.examined_sha = head
+        self.store.put(st)
+        new_head = self._lock_and_adopt(n, wt, adopt, first)
+        st = self.store.issue(n)
+        blocking = [f for f in new if f.blocking] + [Finding(**{k: v for k, v in f.items() if k in Finding.__dataclass_fields__})
+                                                     for f in st.findings if f.get("status") == "open"
+                                                     and f.get("round") != rnd]
+        self.store.event("examined", issue=n, head=head, findings={f.id: f.status for f in new},
+                         unmet=unmet, missing=missing, certify=res.certify, adopted=[p.file for p in adopt],
+                         rejected=rejected)
+        problems = []
+        if unmet:
+            problems += [f"{i} judged unmet by the examiner" for i in unmet]
+        if blocking:
+            problems += [f"blocking finding {f.id}: {f.title}" for f in blocking]
+        if not res.certify and not problems and not missing:
+            problems.append(f"the examiner withheld its certificate: {res.summary[:400]}")
+        if problems:
+            bundled = [f for f in new if f.status == "follow_up"]
+            if bundled:
+                problems += [f"also worth fixing (not blocking): {f.title}" for f in bundled]
+            self._set_phase(n, Phase.EXAMINE, exam_feedback=[], exam_retries=0)
+            return self._round_failed(n, problems, [f.id for f in blocking], unmet)
+        # What the examiner still owes (a verdict, an independent probe) is asked of it again, at
+        # most twice; it is not the builder's failure.
+        st = self.store.issue(n)
+        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
+        unprobed = sorted(self._behavioural_items(st) - covered)
+        owed = ([f"give a verdict on {', '.join(missing)}"] if missing else []) + (
+            [f"write an independent probe for {', '.join(unprobed)}"] if unprobed else [])
+        if owed and st.exam_retries < 2:
+            self.store.event("examination_incomplete", issue=n, missing=missing, unprobed=unprobed, retry=st.exam_retries + 1)
+            not_kept = [f"`{r['file']}` ({r['reason'][:400]})" for r in rejected if r["file"] in unclean]
+            return self._set_phase(n, Phase.VERIFY, exam_retries=st.exam_retries + 1, exam_feedback=[
+                f"Your previous examination is incomplete: {'; '.join(owed)}."
+                + (f" These probes were not kept: {'; '.join(not_kept)}." if not_kept else "")])
+        if owed:
+            if missing:
+                return self._round_failed(n, [f"no verdict on {', '.join(missing)} after two requests"], [], missing)
+            # No independent probe after two requests: a second key decides whether the builder's
+            # locked tests prove those items as written. If not, the builder strengthens them.
+            with self.ws.disposable(wt) as scratch:   # the arbiter reads the verified head itself
+                ruling = self.agents.arbitrate(self.other, self._req(n), {
+                    "kind": "probe_waiver", "items": {i: self._item_text(n).get(i) for i in unprobed},
+                    "tests": sorted(st.tests), "commands": [c for c in st.commands if c.get("criterion") in unprobed],
+                    "manifest": st.manifest, "head": head,
+                    "evidence": [{k: e.get(k) for k in ("criterion", "command", "passed", "tests", "note")}
+                                 for e in st.evidence],
+                    "question": "Your working directory is the verified head. Read the tests: do these locked tests, "
+                                "run by these commands, prove each item as written?"}, scratch)
+            st = self.store.issue(n)
+            if not ruling.upheld:
+                return self._round_failed(n, [(f"no independent probe could be written for {', '.join(unprobed)}, and the "
+                                               f"arbiter judges your tests do not prove them as written: {ruling.reason}")])
+            self._decide(st, {"id": "probe-waiver", "choice": f"{', '.join(unprobed)}: proven by the builder's locked tests",
+                              "rationale": f"no independent probe after two requests; the arbiter ruled: {ruling.reason}"})
+            self.store.put(st)
+        if new_head != head:
+            # adopting probes made a new head: it is verified, then certified by a delta examination
+            return self._set_phase(n, Phase.VERIFY, feedback=[], exam_feedback=[], exam_retries=0)
+        self._set_phase(n, Phase.VERIFY, certified_sha=head, feedback=[], exam_feedback=[], exam_retries=0)
+
+    @staticmethod
+    def _command_tests(wt: Path, commands: list[dict]) -> set[str]:
+        """Test files the builder's commands name (a script under tests/ or checks/, test_*.py,
+        *.test.mjs...): they lock with the tests, so a command cannot keep running an editable file."""
+        import shlex
+        out = set()
+        for c in commands:
+            if c.get("author") != "builder":
+                continue
+            try:
+                tokens = shlex.split(c.get("command") or "")
+            except ValueError:
+                continue
+            base = wt / (c.get("cwd") or ".")
+            expanded = []
+            for tok in tokens:
+                tok = tok.split("::")[0]
+                expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
+                             else [tok])
+            for tok in expanded:
+                rel = Path(c.get("cwd") or ".") / tok
+                path = (wt / rel).resolve()
+                if not path.is_file() or not path.is_relative_to(wt.resolve()):
+                    continue
+                rel_s = str(path.relative_to(wt.resolve()))
+                name = path.name
+                if (name.startswith("test_") or name.endswith(("_test.py", ".test.mjs", ".test.js", ".test.ts"))
+                        or any(part in ("tests", "checks") for part in Path(rel_s).parts[:-1])):
+                    out.add(rel_s)
+        return out
+
+    def _probe_problem(self, p) -> str | None:
+        if not p.file or not p.command or not p.content:
+            return "a probe needs a file, its content and the command that runs it"
+        if Path(p.file).is_absolute() or ".." in Path(p.file).parts or ".git" in Path(p.file).parts:
+            return "a probe file must be a repo-relative path outside .git"
+        if Path(p.cwd or ".").is_absolute() or ".." in Path(p.cwd or ".").parts:
+            return "a probe's directory must be inside the repository"
+        if is_protected(p.file) or (self.repair and is_safety_surface(p.file)):
+            return "a probe may not be written on a protected path"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / p.file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(p.content)
+            bad = verify.unconditional_failures(Path(tmp), [p.file])
+        return f"it fails unconditionally: {bad[0]}" if bad else None
+
+    def _lock_and_adopt(self, n: int, wt: Path, probes, first: bool) -> str:
+        """At the first examination the builder's tests, their configuration and the selection
+        manifest lock, pass or fail; adopted probes lock with them (failing ones included, so a
+        blocking finding stays open until its probe passes)."""
+        st = self.store.issue(n)
+        probes = [p for p in probes if self._inside(wt, p.file)]   # never follow a symlink out of the worktree
+        for p in probes:
+            self._replace_file(wt / p.file, p.content)
+        if first:   # whatever the commands actually ran locks too, listed by the builder or not
+            ran_files = {i.split("::")[0] for ids in st.last_ran.values() for i in ids}
+            st.tests = sorted(set(st.tests) | {f for f in ran_files | self._command_tests(wt, st.commands)
+                                               if (wt / f).is_file()})
+        files = sorted(set(st.tests) | {p.file for p in probes})
+        existing = [t for t in st.tests if (wt / t).is_file()] if first else []
+        if not probes and not existing:
+            return self.ws.head(wt)
+        sha = self.ws.commit_all(wt, f"Lock the tests for #{n}" + (" and adopt the examiner's probes" if probes else ""),
+                                 "acceptance-checks", n, locks=existing or None,
+                                 trailers={"Loop-Probe-Author": self.other} if probes else None)
+        cwds = sorted({c.get("cwd", ".") for c in st.commands} | {p.cwd for p in probes})
+        st.locked = {**st.locked, **verify.lock(wt, [f for f in files if (wt / f).is_file()], cwds)}
+        st.probes = sorted(set(st.probes) | {p.file for p in probes})
+        st.commands = st.commands + [asdict(CheckSpec(criterion=p.criterion, command=p.command, cwd=p.cwd,
+                                                      author="examiner")) for p in probes]
+        if first and not st.manifest:
+            st.manifest = {k: list(v) for k, v in st.last_ran.items()}
+        head = self.ws.head(wt)
+        st.verified_sha = head if not probes else st.verified_sha
+        self.store.put(st)
+        self.store.event("tests_locked", issue=n, sha=sha, locked=sorted(st.locked), probes=[p.file for p in probes])
+        return head
+
+    # ------------------------------------------------------------------ land
+    def _step_land(self, n: int) -> None:
+        try:
+            st = self.store.issue(n)
+            # set by startup and build, and only a certified head reaches land
+            assert st.worktree is not None and st.branch is not None and st.certified_sha is not None
+            wt = Path(st.worktree)
+            issue = self.plan.issues[n]
+            if st.certified_sha != st.verified_sha:
+                return self._set_phase(n, Phase.VERIFY)
+            existing = self.gh.find_pr(st.branch)
+            if existing and (existing.get("merged") or existing.get("merged_at")):
+                merged_head = (existing.get("head") or {}).get("sha") or st.certified_sha
+                relation, unreviewed = self._delivery(st, merged_head)
+                if relation == "same":
+                    self.store.event("merge_found_on_resume", issue=n, pr=existing["number"])
+                    return self._set_phase(n, Phase.MERGED, pr=existing["number"])
+                if relation == "later":
+                    self.store.event("merged_externally", issue=n, pr=existing["number"], head=merged_head,
+                                     certified=st.certified_sha, unreviewed=unreviewed)
+                    if unreviewed != []:
+                        st.verdicts = {}
+                    return self._set_phase(n, Phase.MERGED, pr=existing["number"], verdicts=st.verdicts)
+                self.store.event("stale_pr_ignored", issue=n, pr=existing["number"], head=merged_head)
+            if not self._requirements_current(n):
+                self.store.event("requirements_changed", issue=n, previous_phase=Phase.LAND.value)
+                st = self.store.issue(n)
+                self._owner_edit(st)
+                st.body_hash = self.plan.specs[n].body_hash
+                self.store.put(st)
+                return self._set_phase(n, Phase.PENDING)
+            self.ws.fetch()
+            if self.ws.nothing_to_land(wt):
+                self.store.event("nothing_to_land", issue=n, head=st.certified_sha)
+                return self._set_phase(n, Phase.MERGED)
+            # Main may have moved since the certificate. Merging it makes a new head, which is
+            # verified and certified again (a focused delta examination) before it may land.
+            sync = self.ws.update(wt)
+            if sync.status == "conflict":
+                self.ws.abort_in_progress(wt)
+                return self._conflict(n, wt, sync.files, Phase.LAND.value)
+            if sync.status == "merged":
+                self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
+                                 to=self.ws.head(wt), main=sync.main)
+                self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
+                return self._set_phase(n, Phase.VERIFY)
+            # The last look before anything leaves the machine: every commit this push would publish.
+            # A head that reaches this point was verified with the same checks; this one holds
+            # whatever state the run resumed from and whatever moved since. A scan that could not
+            # run is a failed check like any other: a round for the builder, under the progress
+            # rule, so it cannot go round between here and the verifier for ever.
+            unpushed = self.ws.head(wt)
+            findings, unscanned = self._history_scan(n, wt, self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt),
+                                                     unpushed, "push")
+            if findings:
+                return self._history_refused(n, unpushed, findings)
+            if unscanned:
+                self.store.event("push_withheld", issue=n, head=unpushed, problems=[p[:600] for p in unscanned])
+                return self._round_failed(n, unscanned)
+            try:
+                self.ws.push(wt)
+            except MergeConflict as e:
+                return self._conflict(n, wt, e.files, Phase.LAND.value)
+            head = self.ws.head(wt)
+            if head != st.certified_sha:
+                self.store.event("head_changed_after_certificate", issue=n, certified=st.certified_sha, head=head)
+                return self._set_phase(n, Phase.VERIFY)
+            body = report.render_pr_body(n, issue.title, st, self.op, self.other)
+            pr = self.gh.find_pr(st.branch)
+            if pr is None or pr.get("state") != "open":
+                pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
+            else:
+                self.gh.update_pr(pr["number"], body)
+            st.pr = pr["number"]
+            self.store.put(st)
+            self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+            conclusion, run_id = self._wait_required(head)
+            if conclusion != "success" and head not in st.ci_rerun_heads:
+                st.ci_rerun_heads.append(head)
+                self.store.put(st)
+                rerun = self._safe(self.gh.rerun_failed, head)
+                self.store.event("ci_rerun", issue=n, head=head, conclusion=conclusion, started=bool(rerun))
+                if rerun:
+                    conclusion, run_id = self._wait_required(head, after=run_id)
+            if conclusion != "success":
+                return self._ci_failed(n, head, conclusion)
+            try:
+                self.gh.merge_pr(st.pr, head)
+            except GitHubError as e:
+                again = self._safe(self.gh.find_pr, st.branch) or {}
+                if (again.get("merged") or again.get("merged_at")) and (again.get("head") or {}).get("sha", head) == head:
+                    self.store.event("merged", issue=n, pr=st.pr, head=head, note="the merge answer was lost")
+                    return self._set_phase(n, Phase.MERGED)
+                st = self.store.issue(n)
+                st.merge_refusals += 1
+                self.store.put(st)
+                self.store.event("merge_refused", issue=n, error=str(e)[:300], count=st.merge_refusals)
+                if st.merge_refusals >= self.caps.merge_refusals:
+                    return self._wait(n, WAIT_GITHUB, f"GitHub refused the merge {st.merge_refusals} times: {str(e)[:300]}",
+                                      resume=Phase.LAND)
+                return self._set_phase(n, Phase.VERIFY)
+            self.store.event("merged", issue=n, pr=st.pr, head=head)
+            self._set_phase(n, Phase.MERGED)
+        finally:
+            self.claims.release(MERGE_QUEUE, self.owner)
+
+    def _ci_failed(self, n: int, head: str, conclusion: str | None) -> None:
+        if conclusion in CI_NO_VERDICT:
+            st = self.store.issue(n)
+            st.ci_rerun_heads = [h for h in st.ci_rerun_heads if h != head]
+            self.store.put(st)
+            return self._wait(n, WAIT_CI, f"the required check gave no verdict on {head[:7]} ({conclusion})",
+                              resume=Phase.LAND)
+        log = self._safe(self.gh.failed_log, head) or "(no log available)"
+        self.store.event("ci_failed", issue=n, head=head, conclusion=conclusion)
+        self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}, also after one re-run. Find and "
+                                f"fix the cause; never weaken or skip a check to get green. Tail of the failed log:\n"
+                                f"{log[-3000:]}")])
+
+    def _wait_required(self, sha: str, after: int | None = None) -> tuple[str, int | None]:
+        waited = 0
+        while True:
+            run = self.gh.required_check_run(sha, self.cfg.required_check)
+            fresh = run is not None and (after is None or run["id"] != after)
+            if fresh and run["status"] == "completed" and run["conclusion"] not in (None, "pending"):
+                return run["conclusion"], run["id"]
+            if waited >= self.caps.ci_timeout_s:
+                return ("pending" if fresh else "missing"), (run or {}).get("id")
+            self.sleep(self.caps.ci_poll_s)
+            waited += self.caps.ci_poll_s
+
+    # ------------------------------------------------------------------ accept
+    def _step_accept(self, n: int) -> None:
+        with self._accept_lock:
+            self._accept(n)
+
+    def _accept(self, n: int) -> None:
+        st = self.store.issue(n)
+        edited = ["the issue was edited after its work was merged; deliver the edited version"]
+        if not self._requirements_current(n):
+            return self._owner_round(n, edited)
+        coord = self.ws.coord()
+        head = self.ws.head(coord)
+        with self.ws.disposable(coord) as scratch:
+            ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
+                                                      sorted(set(st.tests) | set(st.probes)), st.manifest or None,
+                                                      self.caps.check_timeout_s, extra_env=self.check_env,
+                                                      standing=standing_checks(), mounts=self._mounts(scratch))
+        self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
+        if not ok:
+            env = environment_problem(evidence)
+            if env:
+                return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}",
+                                  resume=Phase.MERGED)
+            return self._fix_forward(n, ["verification failed on main after the merge: " + "; ".join(problems)[:600]])
+        regressions = self._regressions(n, coord, head)
+        if regressions:
+            return self._fix_forward(n, regressions)
+        verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
+        evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
+                                                 report.render_evidence(n, evidence, head, verdicts)) if st.pr else None)
+        link = (evidence_comment or {}).get("html_url", "")
+        proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts)
+        issue = self.gh.get_issue(n)
+        if issue_parser.body_hash(issue.get("body") or "") != st.body_hash:
+            return self._owner_round(n, edited)
+        owed = self._owner_items(st)                 # never ticked by the loop
+        exempt = owed - self._agent_part_items(st)   # an owner item's agent part must still be proven
+        unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
+        if unproven:
+            return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
+        ticked = issue_parser.tick(issue.get("body") or "", {cid: link for cid in proven if cid not in owed})
+        if ticked != (issue.get("body") or ""):
+            self._safe(self.gh.edit_issue, n, body=ticked)
+        st = self.store.issue(n)
+        st.evidence = evidence
+        st.restarts = 0
+        st.human_tasks = [self._obligation_text(o) for o in st.obligations]
+        self._file_followup(n, st)
+        self._publish_deferred(n, st)
+        self.store.put(st)
+        self.store.put_section("accepted_checks", str(n), {
+            "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
+            "manifest": st.manifest})
+        if st.worktree:
+            self.ws.remove(Path(st.worktree))
+        if st.obligations:
+            return self._set_phase(n, Phase.DELIVERED)
+        self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
+        self._set_phase(n, Phase.DONE)
+        self._close_trackers(n)
+
+    def _obligation_text(self, o: dict) -> str:
+        if o["kind"] == "deferred":
+            return f"{o['item']}: waits for {o['detail']}; it reopens by itself when that issue lands"
+        part = f" (agents proved: {o['agent_part']})" if o.get("agent_part") and o["agent_part"] != "none" else ""
+        return f"{o['item']}: needs {o['detail']}, which this host lacks{part}"
+
+    def _file_followup(self, n: int, st: IssueState) -> None:
+        """Reproduced findings that tie to no item or invariant: one follow-up issue per PR."""
+        follow = [f for f in st.findings if f.get("status") == "follow_up"]
+        if not follow or st.followup:
+            return
+        lines = [f"- **{f['title']}** — observed: {f.get('observed')}; expected: {f.get('expected')}; reproduce: "
+                 f"`{f.get('reproduction') or f.get('probe')}`" for f in follow]
+        body = (f"Follow-up to #{n}" + (f" (PR #{st.pr})" if st.pr else "") + ". The other vendor's examination "
+                "reproduced these findings, which no ledger item or safety invariant requires, so they did not block "
+                "the merge:\n\n" + "\n".join(lines) + "\n")
+        created = self._safe(self.gh.create_issue, f"Follow-up to #{n}: {len(follow)} non-blocking finding(s)", body,
+                             [FOLLOWUP_LABEL[0]])
+        if created:
+            st.followup = created.get("number")
+            self.store.event("followup_filed", issue=n, followup=st.followup, findings=[f["id"] for f in follow])
+
+    def _publish_deferred(self, n: int, st: IssueState) -> None:
+        deferred = [o for o in st.obligations if o["kind"] == "deferred"]
+        if not deferred:
+            return
+        self._safe(self.gh.add_labels, n, [DEFERRED_LABEL[0]])
+        body = (f"{report.DEFERRED_MARKER}\n**implement loop**: delivered without these items, each waiting for another "
+                f"issue. Each reopens by itself (under the supervisor) once that issue is delivered or done:\n\n"
+                + "\n".join(f"- {o['item']}: waits for {o['detail']}" for o in deferred) + "\n")
+        self._upsert_comment(n, report.DEFERRED_MARKER, body)
+
+    def _owner_round(self, n: int, feedback: list[str]) -> None:
+        self._requirements_current(n)
+        st = self.store.issue(n)
+        self._new_round(st, feedback, owner_edit=True)
+        st.body_hash = self.plan.specs[n].body_hash
+        self.store.put(st)
+        self._set_phase(n, Phase.PENDING)
+
+    def _fix_forward(self, n: int, feedback: list[str]) -> None:
+        """A merged change broke `main`: one fix-forward round, then a revert PR through the same
+        gates; `main` is never left red."""
+        st = self.store.issue(n)
+        if st.fix_forwards >= self.caps.fix_forwards:
+            return self._revert(n, feedback)
+        st.fix_forwards += 1
+        self._new_round(st, feedback, owner_edit=False)
+        st.phase = Phase.PLANNED if st.plan else Phase.PENDING
+        self.store.put(st)
+        self.store.event("fix_forward", issue=n, round=st.round)
+        self._sync(n)
+
+    def _revert(self, n: int, feedback: list[str]) -> None:
+        """Revert what this issue merged since it broke `main`: the breaking round and its
+        fix-forward rounds (one round, after an earlier revert). `main` is reverted even past the
+        revert cap; past it, the issue fails instead of being delivered once more."""
+        st = self.store.issue(n)
+        base = self.plan.specs[n].branch or f"loop/issue-{n}"
+        # rounds abandoned unmerged (a refused history) lie between the merged ones: look past them
+        first = st.round if st.reverts else max(st.round - st.fix_forwards - st.restarts, 1)
+        merged = []
+        for r in range(st.round, first - 1, -1):   # newest first
+            pr = self._safe(self.gh.find_pr, base if r == 1 else f"{base}-r{r}") or {}
+            if (pr.get("merged") or pr.get("merged_at")) and pr.get("merge_commit_sha"):
+                merged.append(pr)
+        if not merged:
+            return self._fail(n, "main_broken", "main fails after the merge and the fix-forward; the revert could not be "
+                                                "made: " + "; ".join(feedback)[:500])
+        if st.worktree:   # the revert's worktree takes the issue worktree's place, as the next round does
+            self.ws.remove(Path(st.worktree))
+            st.worktree = None
+        # A revert lands through the same gates as any change: the merge queue, the trusted
+        # verifier (every earlier issue's checks on the reverted tree), the other vendor's
+        # certificate for the exact head, and the required check on it.
+        waited = 0
+        while not self.claims.acquire(MERGE_QUEUE, self.owner):
+            if waited >= self.caps.queue_wait_s:
+                return self._wait(n, WAIT_MERGE_QUEUE, "the revert waits for the merge queue", resume=Phase.MERGED)
+            self.sleep(self.caps.queue_poll_s)
+            waited += max(self.caps.queue_poll_s, 1)
+        wt = None
+        try:
+            st.reverts += 1
+            self.store.put(st)
+            branch = f"{st.branch}-revert"
+            wt = self.ws.issue_worktree(n, branch)
+            self.ws.fetch()
+            main_sha = self.ws.git("rev-parse", self.ws.base_ref(), cwd=wt)
+            self.ws.git("reset", "--hard", "--quiet", main_sha, cwd=wt)
+            self.ws.git("revert", "--no-edit", *[pr["merge_commit_sha"] for pr in merged], cwd=wt)
+            head = self.ws.head(wt)
+            regressions = self._regressions(n, wt, head)
+            if regressions:
+                return self._fail(n, "main_broken", "reverting it still leaves earlier issues' checks failing: "
+                                                    + "; ".join(regressions)[:500])
+            with self.ws.disposable(wt) as scratch:   # like any head that is pushed: the standing checks first
+                _, standing = verify.standing_checks(scratch, standing_checks(), head, self.store.issue_dir(n) / "revert",
+                                                     self.caps.check_timeout_s, self.check_env, self._mounts(scratch))
+            if standing:
+                return self._fail(n, "main_broken", "the revert's head fails the standing checks: "
+                                                    + "; ".join(standing)[:500])
+            findings, unscanned = self._history_scan(n, wt, main_sha, head, "revert")
+            if findings or unscanned:   # the revert commits themselves: their messages and their author
+                return self._fail(n, "main_broken", "the revert's commits fail the history checks, so it is not pushed: "
+                                                    + ("; ".join(history_places(findings)) if findings
+                                                       else "; ".join(unscanned))[:500])
+            with self.ws.disposable(wt) as scratch:
+                exam = self.agents.examine(self.other, self._req(n, [
+                    (f"Certify a revert: the loop reverts this issue's merged change because main fails after it and a "
+                     f"fix-forward did not repair it. Check that `{main_sha[:12]}..{head[:12]}` only undoes that "
+                     f"change and leaves main working.")]), {"items": [], "zones": []}, scratch, main_sha, head, [], [], [],
+                    None)
+            serious = []
+            for f in exam.findings:   # the same rule as any examination: reproduced, witnessed, tied to an invariant
+                probe = next((p for p in exam.probes if f.probe and p.file == f.probe and not self._probe_problem(p)),
+                             None)
+                reproduced = (self._reproduces(wt, probe.command, probe.cwd, (probe.file, probe.content)) if probe
+                              else self._reproduces(wt, f.reproduction, f.cwd or ".", None))
+                if gate.classify(f, {}, self.invariants, reproduced, set(), set()).blocking:
+                    serious.append(f)
+            if not exam.certify or serious:
+                why = exam.summary[:300] if not exam.certify else "; ".join(f.title for f in serious)[:300]
+                return self._fail(n, "main_broken", f"the other vendor did not certify the revert: {why}")
+            self.ws.push(wt)
+            if self.ws.head(wt) != head:
+                return self._fail(n, "main_broken", "main moved while the revert was being certified")
+            prs = ", ".join(f"#{pr['number']}" for pr in merged)
+            body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
+                    f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
+                    f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
+            rpr = self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
+            conclusion, _ = self._wait_required(head)
+            if conclusion != "success":
+                return self._fail(n, "main_broken", f"the revert PR #{rpr['number']} did not pass the required check "
+                                                    f"({conclusion})")
+            self.gh.merge_pr(rpr["number"], head)
+            self.store.event("reverted", issue=n, pr=rpr["number"], of=[pr["number"] for pr in merged])
+        finally:
+            if wt is not None:
+                self.ws.remove(wt)
+            self.claims.release(MERGE_QUEUE, self.owner)
+        st = self.store.issue(n)
+        if st.reverts > self.caps.reverts:
+            return self._fail(n, "main_broken", f"its delivery broke main again and was reverted in PR #{rpr['number']}: "
+                                                + "; ".join(feedback)[:500])
+        self._new_round(st, feedback + [(f"Your earlier delivery was reverted in PR #{rpr['number']} because it broke "
+                                         f"main; deliver it again without breaking it.")], owner_edit=False)
+        st.phase = Phase.PLANNED if st.plan else Phase.PENDING
+        self.store.put(st)
+        self._sync(n)
+
+    def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
+        """Re-run the commands of the run's earlier issues on `main` after a merge."""
+        out = []
+        fields = CheckSpec.__dataclass_fields__
+        for key, entry in sorted(self.store.state.get("accepted_checks", {}).items()):
+            m = int(key)
+            checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in entry["checks"]
+                      if c.get("kind", "command") == "command"]
+            if m == n or not checks:
+                continue
+            with self.ws.disposable(coord) as scratch:
+                ok, evidence, problems, _ = verify.verify(scratch, checks, head, self.store.issue_dir(m) / "regression",
+                                                          {}, entry.get("check_files", []), entry.get("manifest") or None,
+                                                          self.caps.check_timeout_s, extra_env=self.check_env,
+                                                          check_tamper=False, mounts=self._mounts(scratch))
+            self.store.event("regression_check", issue=n, of=m, head=head, ok=ok, problems=problems)
+            if not ok and not environment_problem(evidence):
+                out.append(f"after #{n} merged, #{m}'s checks fail on main: " + "; ".join(problems)[:400])
+        return out
+
+    def _reconcile_delivered(self) -> None:
+        """A delivered issue whose owner has since ticked every remaining box is done. A deferred
+        item whose issue has since been delivered or closed reopens: a new round delivers it."""
+        for n in self.plan.work:
+            st = self.store.issue(n)
+            if st.phase != Phase.DELIVERED:
+                continue
+            landed = [o for o in st.obligations if o.get("kind") == "deferred" and self._delivered(o.get("issue"))]
+            for o in st.obligations:
+                if o.get("kind") == "deferred" and not o.get("unresolved") and o not in landed:
+                    data = self._safe(self.gh.get_issue, o.get("issue")) or {}
+                    if data.get("state") == "closed":   # closed without delivering: reported, never reopened
+                        o["unresolved"] = True
+                        self.store.put(st)
+                        self.store.event("deferred_unresolved", issue=n, item=o["item"], on=o.get("issue"))
+            if landed:
+                st.obligations = [o for o in st.obligations if o not in landed]
+                st.plan = {**(st.plan or {}), "items": [
+                    {**i, "proof": "review" if i["proof"] == "deferred" else i["proof"]}
+                    if any(o["item"] == i["id"] for o in landed) else i for i in (st.plan or {}).get("items", [])]}
+                self.store.event("deferred_reopened", issue=n, items=[o["item"] for o in landed])
+                self._new_round(st, [f"{o['item']} was deferred to {o['detail']}, which has landed; deliver it now."
+                                     for o in landed], owner_edit=False)
+                st.phase = Phase.PLAN
+                self.store.put(st)
+                self._sync(n)
+                continue
+            if any(o.get("kind") == "deferred" for o in st.obligations):
+                continue   # it closes once its deferred items are delivered, not on ticked boxes
+            body = (self._safe(self.gh.get_issue, n) or {}).get("body") or ""
+            items = issue_parser.ledger(body)
+            if items and all(i.checked for i in items):
+                self._safe(self.gh.edit_issue, n, state="closed", state_reason="completed")
+                self.store.event("owner_evidence_complete", issue=n)
+                self._set_phase(n, Phase.DONE, human_tasks=[])
+                self._close_trackers(n)
+
+    def _delivered(self, m: int | None) -> bool:
+        """Has issue `m` landed? Delivered or done in this run, or on GitHub closed as completed or
+        labelled delivered. A closure as not planned is not a delivery."""
+        if not m:
+            return False
+        if m in self.plan.work and self.store.issue(m).phase in SATISFIES_DEPENDENTS:
+            return True
+        data = self._safe(self.gh.get_issue, m) or {}
+        labels = {l["name"] if isinstance(l, dict) else l for l in data.get("labels", [])}
+        if data.get("state") == "closed":
+            return (data.get("state_reason") or "completed") == "completed"
+        return "loop:delivered" in labels
+
+    def _mark_blocked(self) -> None:
+        """Issues still pending behind a prerequisite that waits or failed wait with it, so the
+        report says why; they resume when it is delivered."""
+        phases = self._phases()
+        for n in self.plan.work:
+            if phases[n] != Phase.PENDING:
+                continue
+            stuck = [d for d in sorted(self.plan.deps.get(n, ())) if phases.get(d) in (Phase.WAITING, Phase.FAILED)]
+            if stuck:
+                self._wait(n, "prerequisite", f"waits for #{stuck[0]}, which is {phases[stuck[0]].value}",
+                           resume=Phase.PENDING)
+
+    def _close_trackers(self, n: int) -> None:
+        parent = self.plan.parent.get(n)
+        while parent is not None:
+            children = self.plan.tracking.get(parent, [])
+            phases = self._phases()
+            done = all((c in self.plan.closed_work) or phases.get(c) == Phase.DONE or
+                       (c in self.plan.tracking and self.plan.issues[c].state == "closed") for c in children)
+            body = (self._safe(self.gh.get_issue, parent) or {}).get("body") or ""
+            if not done or any(not item.checked for item in issue_parser.ledger(body)):
+                return
+            self._safe(self.gh.edit_issue, parent, state="closed", state_reason="completed")
+            self.plan.issues[parent].state = "closed"
+            self.store.event("tracker_closed", issue=parent)
+            parent = self.plan.parent.get(parent)
+
+    # ------------------------------------------------------------------ end
+    def _summary(self, stopped: bool) -> dict:
+        phases = self._phases()
+        counts: dict[str, int] = {}
+        for ph in phases.values():
+            counts[ph.value] = counts.get(ph.value, 0) + 1
+        return {"stopped": stopped, "phases": counts,
+                "waiting": {n: f"[{(self.store.issue(n).wait or {}).get('kind')}] {(self.store.issue(n).wait or {}).get('detail')}"
+                            for n, ph in phases.items() if ph == Phase.WAITING},
+                "failed": {n: f"[{(self.store.issue(n).fail or {}).get('cause')}] {(self.store.issue(n).fail or {}).get('detail')}"
+                           for n, ph in phases.items() if ph == Phase.FAILED},
+                "owner_obligations": {n: self.store.issue(n).human_tasks for n, ph in phases.items()
+                                      if ph == Phase.DELIVERED}}
+
+    def _post_run_summary(self) -> None:
+        states = {n: self.store.issue(n) for n in self.plan.work}
+        self._upsert_comment(self.plan.root, report.RUN_MARKER, report.render_run_summary(self.plan.root, states))
+
+
+def has_conflict_markers(path: Path) -> bool:
+    return path.is_file() and bool(CONFLICT_MARKER.search(path.read_text(errors="replace")))
+
+
+def conflict_feedback(files: list[str], locked: list[str]) -> str:
+    text = ("Main moved on, and merging it into this branch conflicts. The merge is in progress in your worktree."
+            if files or locked else "")
+    if files:
+        text += (f" Resolve the conflict markers in {', '.join(files)}, keeping the intent of both sides: main's side "
+                 f"is work already merged, this branch's side is this issue's work.")
+    if locked:
+        text += (f" The conflicts in the locked tests {', '.join(locked)} were resolved by the other vendor; do not "
+                 f"edit them.")
+    return text + " Do not run git merge, commit or abort: the engine concludes the merge."
+
+
+def criterion_item(criterion: str | None, items: set[str]) -> str | None:
+    """The plan item a command proves: its criterion, or the item id it leads with ("D2, D3: the
+    probes" proves D2). None when it names no item."""
+    if criterion in items:
+        return criterion
+    m = CRITERION_LEAD.match(criterion or "")
+    return m.group(1) if m and m.group(1) in items else None
+
+
+def _names_probe(command: dict, probe: str) -> bool:
+    """Whether an examiner's command runs a probe file: one of its path words, resolved from the
+    command's cwd, is the probe (`tests/x.py` run in `services/api/` names `services/api/tests/x.py`;
+    `archive/tests/x.py` there does not)."""
+    cwd = command.get("cwd") or "."
+    target = posixpath.normpath(probe)
+    for word in re.findall(r"[^\s'\"=;&|()<>]+", command.get("command") or ""):
+        path = word.split("::", 1)[0]
+        if path and posixpath.normpath(posixpath.join(cwd, path)) == target:
+            return True
+    return False
+
+
+def history_findings(evidence: list[dict]) -> list[str]:
+    """From evidence records, the output of each history check that reported findings (its exit
+    status says so). One that could not run is not among them: it is an ordinary failed check."""
+    names = {f"{verify.STANDING}{name}" for name, _ in history_checks("")}
+    return [e.get("output_tail") or "" for e in evidence
+            if e.get("criterion") in names and e.get("exit_code") == HISTORY_FINDINGS_EXIT]
+
+
+HISTORY_PLACE = re.compile(r"^(\S[^\n]*?:\d+: [A-Za-z][\w-]*): ", re.MULTILINE)
+OBJECT_ID = re.compile(r"@([0-9a-f]{12})[0-9a-f]{28,52}\b")
+
+
+def history_places(outputs: list[str]) -> list[str]:
+    """Where a history check found something and which rule, without the excerpt it printed:
+    `path@<blob>:<line>: <rule>`, object IDs shortened. The engine publishes this (a fault issue,
+    feedback to the builder), and an excerpt shows the text around a value."""
+    places = [OBJECT_ID.sub(r"@\1", m) for out in outputs for m in HISTORY_PLACE.findall(out)]
+    return list(dict.fromkeys(places)) or ["see the `history_refused` event in the run's `events.jsonl`"]
+
+
+def environment_problem(evidence: list[dict]) -> str | None:
+    for ev in evidence:
+        m = ENVIRONMENT_FAILURE.search(ev.get("output_tail") or "")
+        if m:
+            line = next((l for l in (ev.get("output_tail") or "").splitlines() if m.group(0) in l), m.group(0))
+            return f"{ev.get('criterion')}: {line.strip()[:300]}"
+    return None
+
+
+def fault_fingerprint(exc: BaseException) -> str:
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if "implement_loop" in (f.filename or "")]
+    where = f"{Path(frames[-1].filename).name}:{frames[-1].name}" if frames else "unknown"
+    return hashlib.sha256(f"{type(exc).__name__}@{where}".encode()).hexdigest()[:10]
+
+
+def engine_frames(exc: BaseException) -> str:
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if "implement_loop" in (f.filename or "")]
+    return "\n".join(f"{Path(f.filename).name}:{f.lineno} in {f.name}" for f in frames) or "(no engine frame)"
+
+
+def redact(text: str, repo_root: Path) -> str:
+    home = str(Path.home())
+    return text.replace(str(repo_root), "<repo>").replace(home, "~")

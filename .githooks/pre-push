@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# 1. Block direct pushes to protected branches. Use /ship or open a pull request instead.
+# 2. Scan the tree at the tip of every ref being pushed with the public-repository hygiene
+#    scanner (tools/hygiene/). The tip's tree only, exactly what the implement loop's verifier
+#    scans before it pushes, so a branch the loop verified cannot fail here. The commits below
+#    the tip are not read: CI's `history` job does that (scan.py --history).
+#
+# Inert until core.hooksPath points here: run setup/git-hooks.sh once per clone.
+set -euo pipefail
+
+protected_regex='^refs/heads/(main|master)$'
+zero_regex='^0+$'
+
+scanner="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tools/hygiene/scan.py"
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  if [[ "$remote_ref" =~ $protected_regex ]]; then
+    cat >&2 <<EOF
+[pre-push] Direct pushes to '$remote_ref' are not allowed.
+
+Push your feature branch instead, then run /ship (Claude Code) or \$ship (Codex), or open a
+pull request by hand, to merge:
+  git push -u origin <your-feature-branch>
+EOF
+    exit 1
+  fi
+
+  if [[ "$local_sha" =~ $zero_regex ]]; then
+    continue   # deleting a remote branch pushes no content
+  fi
+  if [ ! -f "$scanner" ]; then
+    echo "[pre-push] The hygiene scanner is missing ($scanner): refusing to push unscanned commits." >&2
+    exit 1
+  fi
+  # stdin is the list of refs: keep the scanner away from it.
+  if ! python3 "$scanner" --quiet --rev "$local_sha" >&2 </dev/null; then
+    cat >&2 <<EOF
+
+[pre-push] ${local_sha:0:12} carries account-specific or secret material (or the scanner could
+not run). Nothing was pushed. Fix it in a new commit; if the value was ever real, treat it as
+leaked and tell the repository owner. See tools/hygiene/README.md.
+EOF
+    exit 1
+  fi
+done
+
+exit 0

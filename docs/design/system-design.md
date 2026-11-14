@@ -1,0 +1,1083 @@
+# System design: a scale-to-zero inference endpoint for the coding-agent cursus
+
+- **Status:** Proposed. The decisions that wait for the owner are in section 15.
+- **Date:** 2026-11-13
+- **Evidence:** a claim marked `[E n]` is traced in [`evidence.md`](evidence.md), with its source and how far it was verified. A claim marked `[S n]` is an assumption that a named validation spike must confirm (section 12).
+
+## 0. Summary
+
+Students of the coding-agent cursus point their harnesses (Claude Code, Codex CLI, their own SDK scripts, and the research skill packs that run inside them) at one HTTPS endpoint. Behind it, GPU machines start when someone needs them and stop when nobody does. The instructor watches everything in Grafana, including what each machine serves against what this design predicts. All of it is Python CDK, deployed only by AWS CodePipeline, in a repository that can be public.
+
+A small always-on **gateway** authenticates each student's API key, enforces budgets, validates the request and forwards it to a **pool** of GPU instances. Each pool is an EC2 Auto Scaling group with a minimum of zero and a stopped warm pool, running one vLLM server per machine. One small **scaler** function is the only thing that changes a pool's size. When a request arrives and the pool is empty, the scaler starts an instance and the gateway holds the request until the model is ready. Metrics from every machine and from the gateway go to Amazon Managed Service for Prometheus; Grafana reads them.
+
+Five findings shape the rest:
+
+1. **The model is chosen for the harnesses, and it fits one GPU.** What Claude Code and Codex demand of a model (232,000 tokens of context, tool calls on nested schemas, its own reasoning accepted back, images) points to one model that fits a single GPU: Qwen3.8-27B, Apache-2.0, on one 96 GB GPU at $3.36 an hour `[E5][E28]`. Whether to serve it at 8 bits or at 4 is settled by measurement. A larger sibling on four GPUs, at $16.57 an hour, is the upgrade for scheduled sessions, if its licence allows (section 4.2). The engine is vLLM alone: Ray Serve would add a layer that lacks two of the three routes the harnesses use (section 4.6).
+2. **vLLM speaks the three wire formats the harnesses need** (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) `[E3][E15]`, so the gateway does not translate between formats. **But no open model works in Claude Code through vLLM unchanged** `[E28]`. For the chosen model, Claude Code's default request is refused and every turn recomputes the whole conversation unless two things in the request are rewritten, and a PDF ends the session unless a third is. The gateway already parses every request, because the engine's request surface is too large to hand to forty students unfiltered `[E23]`; it also carries a small per-model table of such rewrites (section 6.2).
+3. **Client retries cannot cover a GPU cold start**, so the gateway holds requests `[E12]`. Cold-start time is the central engineering number: 10 to 13 minutes measured on a stock setup `[E11]`, an estimated 2 to 6 minutes from the warm pool, and up to 13 minutes when the warm instance is unavailable. Nobody has published the warm figure for a GPU instance; it is the first thing this project measures `[S1]`. The hold for a stream covers the warm case. A non-streaming call is held for less, and a slow start tells it to retry.
+4. **What one instance serves is an estimate until this project measures it.** With eight agents generating at once, each stream should get 15 to 22 tokens per second, which is at the edge of acceptable, and a turn whose transcript is cached should start within a second or two. One instance should carry 10 to 20 students working hands-on, and 4 to 8 when each runs several agents, as the second session's research packs do (section 4.7). Nobody has published a measurement of this model on this instance type, so those numbers are arithmetic checked against measurements on other GPUs `[E29]`. Spike `[S5]` replaces them, and the inference dashboard shows the prediction beside the measurement (section 7.2).
+5. **The always-on platform costs more than the GPUs.** The course is five sessions, 12 live hours in total `[E25]`. On the coursework pool that is about $63 of GPU time per instance for the whole course, against about $170 a month for the endpoint that must exist between sessions (section 11). The cost question for the owner is the floor, not the fleet.
+
+### Decisions at a glance
+
+| Area | Decision | Main reason |
+| --- | --- | --- |
+| Model | Qwen3.8-27B on one 96 GB GPU; Qwen3.8-Flash-Next on four for scheduled sessions, licence permitting | The only candidate that meets what the harnesses demand on one GPU |
+| Engine | vLLM alone, behind an engine contract; no Ray Serve | vLLM serves the harnesses' routes itself; Ray Serve lacks two of them and pins an older vLLM |
+| Compute | One EC2 Auto Scaling group per pool, min 0, stopped warm pool | Fastest cold start; control of drivers and images |
+| Scaling | One scaler function is the only writer of pool size | No races between writers; the logic is testable without AWS |
+| Routing | A student's turns stay on one instance | The engine's cache makes a turn cost a second instead of tens of seconds |
+| Cold start | The gateway holds the request: up to 7 minutes for a stream, 4 for a non-streaming call | Clients give up in seconds on their own; each has a known limit the hold stays under |
+| Gateway | Custom, on Fargate: closed route list, validated bodies, a per-model request profile, no translation between formats | Filtering is needed anyway; LiteLLM's 2026 supply-chain record |
+| Student login | GitHub App device flow; the issuer redeems the code and mints a personal key | Students already have GitHub; nothing reusable is exposed |
+| Edge | Public ALB, ACM certificate, own domain, WAF | No timeout cap on long generations |
+| Metrics | Managed Prometheus, pushed from each node | Mature; month-long queries; nothing to discover |
+| Grafana | Grafana OSS on Fargate, behind ALB sign-in with Cognito; a performance dashboard that shows the prediction | Declarative; no AWS Organizations; no exposed Grafana login |
+| Delivery | CDK Pipelines (CodePipeline V2) from `main` only | Owner requirement; pull-request checks run without credentials |
+| Trust | A bounded deployment role, invariants as tests, a separate identity for agents | A merge to `main` is deployment rights in the account |
+| Public repo | No lookups, no literals, configuration in SSM, scanners as gates, public-safe from the first commit | Account identifiers stay out of git and out of public logs |
+
+## 1. Context, goals, non-goals
+
+### Requirements (from the owner)
+
+| ID | Requirement | Where | Delivered |
+| --- | --- | --- | --- |
+| R1 | An inference endpoint on AWS that the students' harnesses point at | 3, 6 | Phase 1 (mock), phase 2 (GPU) |
+| R2 | Machines scale from 0 to n with load | 5 | Phase 1 (mock), phase 2 (GPU) |
+| R3 | Each machine loads an open-weight LLM, chosen for the harnesses it serves | 4.2 | Phase 2 |
+| R4 | Students log in securely | 6.4 | Phase 1 |
+| R5 | An admin sees all relevant telemetry in Grafana, including what each pool serves against what was predicted | 7 | Phase 1, complete in phase 3 |
+| R6 | Production grade; CodePipeline, Python CDK, uv, ty | 8 | Phase 0 |
+| R7 | The repository can be public without leaking AWS information | 10 | Phase 0 |
+| R8 | Test with a cheap model first; move to bigger models when needed | 4.2 | The coursework pool in phase 2, at $3.36 an hour, is the cheap model; the upgrade pool in phase 4 is the bigger one. Decision 2 asks the owner to accept that reading |
+| R9 | Know what the chosen model and machines can serve, in tokens per second and the other numbers that matter, and measure it | 4.7, 7.2 | The estimate now; measured in phase 2 (`[S5]`) |
+
+### Assumptions
+
+- A1. 10 to 40 students, one instructor who is the only admin. The real number is a decision in section 15.
+- A2. Five biweekly sessions, the first of four hours and the others of two: 12 live hours over about nine weeks `[E25]`. Homework use between sessions is unknown and is priced separately.
+- A3. Traffic is agentic: long streamed responses, tool calls, many sequential requests per run, minutes of silence between bursts. Every request re-sends the whole transcript, so input outweighs output about a hundred to one, and nine-tenths of it repeats the previous request `[E31]`. Section 4.7 puts numbers on this.
+- A4. One AWS account, one region. The region comes from the deploying credentials, never from the repository.
+- A5. The owner can register a domain name (about $15 a year).
+
+### Non-goals
+
+- Multi-node model replicas (one replica is one instance; the largest has 8 GPUs).
+- Training or fine-tuning.
+- A general multi-provider LLM gateway, or translation between wire formats.
+- A second region.
+- A separate staging environment (section 8.5 says what replaces it).
+
+## 2. Architecture
+
+```mermaid
+flowchart LR
+  subgraph student[Student machine]
+    H[Harness<br/>Claude Code, Codex, SDK]
+    L[rhi login]
+  end
+  GH[GitHub App<br/>device flow]
+  subgraph edge[Public subnets]
+    ALB[Public ALB<br/>ACM, WAF, Cognito sign-in for Grafana]
+  end
+  subgraph ctrl[Always on, small]
+    GW[Gateway<br/>Fargate]
+    ISS[Key issuer<br/>Lambda]
+    SC[Scaler<br/>Lambda, one at a time]
+    GRAF[Grafana<br/>Fargate]
+    DDB[(DynamoDB<br/>keys, roster, usage, pool state)]
+  end
+  subgraph fleet[Scales 0 to n]
+    IALB[Internal ALB<br/>four routes only]
+    ASG[Model pool<br/>Auto Scaling group<br/>+ stopped warm pool]
+  end
+  S3[(S3 model store)]
+  AMP[(Managed Prometheus)]
+  CW[CloudWatch<br/>alarms, logs]
+
+  L -- device code --> GH
+  L -- redeem --> ALB
+  H -- HTTPS + API key --> ALB
+  ALB --> GW
+  ALB --> ISS
+  ALB --> GRAF
+  ISS --> DDB
+  GW --> DDB
+  GW -- validated request --> IALB --> ASG
+  GW -- wake --> SC
+  SC -- set desired capacity --> ASG
+  SC --> DDB
+  ASG -- weights --> S3
+  ASG -- metrics --> AMP
+  GW -- metrics --> AMP
+  SC -- metrics --> AMP
+  GRAF --> AMP
+  GRAF --> CW
+```
+
+| Component | AWS service | Runs when | Why this service |
+| --- | --- | --- | --- |
+| Edge | Application Load Balancer, ACM, Route 53, WAF | always | Idle timeout up to 4000 s `[E13]`; nothing else in the path caps a long generation |
+| Gateway | ECS Fargate | always | Holds long-lived streams; Lambda and API Gateway cap or bill them badly `[E14]` |
+| Key issuer | Lambda behind the ALB | on request | Separate privileges from the data path |
+| Scaler | Lambda, reserved concurrency 1, called by the gateway and every minute | always, cents | One writer of pool size; pure decision logic |
+| State | DynamoDB on demand | always, cents | Atomic counters and conditional writes; nothing to run |
+| Model pools | EC2 Auto Scaling, launch templates, warm pools | on demand | Section 4.5 |
+| Pool routing | Internal Application Load Balancer | always | Health checks, draining, least-outstanding routing with stickiness per student (section 5.5), and a second route allow-list in front of the engine |
+| Model store | S3 with a gateway VPC endpoint | always, cents | Cheapest at rest; streaming from S3 is within seconds of local disk `[E11]` |
+| Metrics | Amazon Managed Service for Prometheus | usage-priced | Section 7 |
+| Alarms, logs | CloudWatch | usage-priced | Alerts that must work when Grafana is down |
+| Dashboards | Grafana OSS on Fargate; Cognito for sign-in | always | Section 7.4 |
+| Delivery | CodePipeline V2, CodeBuild, CodeConnections, ECR | on merge | Owner requirement R6 |
+| Guardrails | The scaler's ceilings, AWS Budgets, SNS | always, cents | Section 11.3 |
+
+## 3. Request flow
+
+**Warm path.** The harness sends a request with its API key. The public ALB terminates TLS. The gateway hashes the key, finds the student, reserves budget and a concurrency slot, validates and rewrites the request body, and sends it to the internal ALB. The ALB sends it to the instance that served that student's previous turn, or, for a student it has not seen, to the instance with the fewest requests in flight (section 5.5). The response streams back through the gateway, which reads token usage from it as it passes and settles the reservation.
+
+**Cold path.** The same, but the pool has no healthy instance:
+
+```mermaid
+sequenceDiagram
+  participant H as Harness
+  participant G as Gateway
+  participant S as Scaler
+  participant A as Auto Scaling
+  participant I as GPU instance
+  H->>G: POST /v1/messages (stream)
+  G->>G: authenticate, reserve budget, validate
+  G->>S: wake pool
+  S->>S: check mode and ceilings
+  S->>A: set desired capacity to 1
+  G-->>H: 200 + keep-alive every 10 s
+  A->>I: start the stopped warm-pool instance
+  I->>I: boot, check image and model revision, start engine, stream weights from S3, warm up
+  I-->>A: complete the launch lifecycle hook
+  Note over I: internal ALB health check passes
+  G->>I: forward the held request
+  I-->>H: tokens stream through the gateway
+```
+
+If the instance is not ready by the hold deadline, the gateway ends the request with a proper error for that wire format, naming one of a fixed set of causes (section 5.3).
+
+## 4. The inference fleet
+
+### 4.1 Engine contract
+
+A model server is anything that satisfies this contract. The gateway, the scaler, the dashboards and the tests depend on the contract only.
+
+| Capability | Contract |
+| --- | --- |
+| Inference | `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /v1/messages/count_tokens`, with SSE streaming and tool calling |
+| Health | `GET /health` returns 200 only when the model can serve |
+| Metrics | `GET /metrics` in Prometheus format, on localhost only. At least: running and waiting requests; time to first token; time per output token; input tokens, the cached part of them, and output tokens; cache use |
+| Reachability | Port 8000 accepts connections from the internal ALB only. The internal ALB forwards the four inference routes and answers 404 to everything else. Those routes require the pool's bearer secret |
+| Identity | The instance's lifecycle agent reports the image digest and model revision being served, in its heartbeat and as a metric. The engine itself does not know its image digest |
+| Shutdown | Finishes in-flight requests on SIGTERM |
+
+The reachability row is worded carefully because the engine cannot be trusted to protect itself: vLLM's `--api-key` covers only some path prefixes, and routes such as `/invocations` and `/pause` answer without it `[E23]`. The allow-list on the internal ALB is the control; the secret is a second lock. Tests call the forbidden routes through both hops and expect 404.
+
+Engine adapters:
+
+| Adapter | State | Notes |
+| --- | --- | --- |
+| `mock` | Phase 1 | A CPU container that satisfies the contract with canned streams. It makes the whole control loop testable for cents, in CI and in the deployed stack |
+| `vllm` | Phase 2 | Serves all inference routes natively, plus `/health` and `/metrics` `[E3]`. The only GPU engine this design plans (section 4.6) |
+| `sglang` | Not planned | The candidate if vLLM disappoints on a model; different metric names `[E19]` |
+
+Engines name their metrics differently. First-party dashboards build their queries from a small per-engine table, so adding an engine is one adapter and one table row. The table names the same quantities for every engine: the ones section 4.7 predicts and section 7.2 measures.
+
+Engine settings that are part of the contract for vLLM: usage telemetry off, Hugging Face access off, no request-supplied chat templates, no development or profiling routes, media fetching restricted to inline data `[E23]`. A test of the unit file asserts them.
+
+### 4.2 The model, and the pools that serve it
+
+A **pool** is one model on one family of instance types. It is declared in configuration and becomes one Auto Scaling group, one target group and one dashboard row.
+
+```toml
+[pools.coursework]
+engine = "vllm"
+model = "Qwen/Qwen3.8-27B-FP8"
+revision = "<pinned commit of the model repository>"
+instance_types = ["g7e.2xlarge"]       # one 96 GB RTX PRO 6000, 4 cores
+max_instances = 2
+warm_instances = 2                     # stopped instances kept ready; each costs its disk
+wake = "on-demand"                     # or "scheduled-only"
+target_concurrency = 8
+hold_seconds = 420                     # for streams; non-streaming calls are held 240 s
+idle_minutes = 20
+drain_seconds = 300
+gpu_hours_per_day = 16                 # the scaler refuses to wake beyond this
+```
+
+`warm_instances` is the number of prepared instances, running or stopped, that the group keeps (the warm pool's prepared capacity, with a pool minimum of zero) `[E10]`. With `warm_instances = 1` and two instances allowed, the second is always a cold launch. A pool minimum above zero is never used: it would launch a fresh GPU instance to refill the pool on every wake.
+
+Students choose a pool by model name. Moving to another model is a new pool entry and a merge.
+
+**What the harnesses ask of a model.** The model is chosen for the programs that will call it: Claude Code as the anchor, Codex beside it, their headless and SDK forms, and the research skill packs of the course's second session, which run inside them `[E25]`. Those programs make demands that most open-weight models, or vLLM's support for them, do not meet today `[E28]`:
+
+| The model must | Because |
+| --- | --- |
+| Serve at least 232,000 tokens of context | Claude Code assumes a 200,000-token window for a model it does not know, and asks for up to 32,000 tokens of output. When a prompt is too long, vLLM's error is not one Claude Code recognises, so the session cannot compact itself and is lost |
+| Call tools through a parser that vLLM ships, on nested schemas | vLLM turns a model's tool calls into the wire format with one parser per model family `[E4]`. Claude Code sends about 25 tools with deeply nested schemas on every request; Codex sends its own on the Responses route |
+| Accept its own reasoning back in the history | Claude Code returns earlier reasoning blocks with each request. A model whose template rejects them fails, and one whose template drops them loses its thread in the middle of a tool loop |
+| Read images | Claude Code reads screenshots and plots; the paper-writing pack's drafting agent reads the figures it writes about |
+| Do agent work well, measured inside a harness | The coursework is optimisation modelling in Python, running solvers and writing LaTeX: long tool loops, not chat |
+| Leave room on its GPU for a class | Every request keeps its whole transcript in GPU memory while it runs. What a token costs there varies eightfold between the candidates (section 4.7) |
+| Carry a licence without conditions, and need no code from its repository | A public course; model code is off by default (section 4.4) |
+| Have a vLLM recipe run on the instance's GPU | Otherwise this project is the first to try the combination. In these recipes "verified" means the model started, served and answered a prompt on that GPU, no more |
+
+The research packs add three things that are about vLLM more than about the model `[E28]`. None of them changes which model is chosen; each is a limit to handle and to tell students about:
+
+| The pack does | Behind vLLM | What this design does |
+| --- | --- | --- |
+| Runs several agents at once | Each is a stream on the GPU | Counted in the capacity of section 4.7 |
+| Reads PDFs | Claude Code sends a PDF as a document block. vLLM refuses it, and every later request of that session then fails | The request profile replaces such a block with a line of text saying the endpoint cannot read it (section 6.2). The student guide says to convert a PDF to text first, which the agent can do itself |
+| Loads skills and adds tools in mid-session | Claude Code carries them in system messages placed mid-conversation. vLLM 0.33 accepts the blocks; the request profile changes those messages' role | Spike `[S3]` checks that a skill loaded mid-session still works |
+| Searches the web | Claude Code's built-in search is expected not to work here: it is run by its vendor's service, not by the harness. Not verified | The course's science skills search through public services from the student's machine `[E25]`. `[S3]` confirms, and the guide says so |
+
+The candidates that fit one GPU, and the two larger ones worth a scheduled session. Six more were considered and are listed with their reasons in `[E28]`:
+
+| Model | Size | Licence | Context | Images | Evidence on agent work | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Qwen3.8-27B** | 27.8B, dense; 31 GB at 8 bits, 22 GB at 4 | Apache-2.0 | 262,144 | Yes | Its publisher ran SWE-bench Pro inside Claude Code: 61.7. An independent index puts it above the one other single-GPU candidate that has a score. No independent agent benchmark yet | **The coursework model** |
+| Qwen3.6-27B | 27.8B, dense | Apache-2.0 | 262,144 | Yes | The only candidate with an independent agent result: 31.2% on SWE-rebench. Its publisher scores it 53.5 where the 3.8 scores 61.7. Loses its reasoning mid-loop in Claude Code | The fallback if the 3.8 fails `[S3]` for a reason of its own. Same size and speed |
+| Qwen3.6-35B-A3B | 36B, 3B active per token | Apache-2.0 | 262,144 | Yes | Independent: 24.7% on SWE-rebench, below the dense model of its generation. Same loss of reasoning. Needs model code | About three times faster per stream, weaker at the work. The fallback if speed proves the constraint |
+| gpt-oss-120b | 117B, 5B active | Apache-2.0 | 131,072 | No | The example in vLLM's own guide for Claude Code. Drops images and flattens Claude Code's tool schemas | Fails on context and on images |
+| **Qwen3.8-Flash-Next** | 176B, 6B active; 186 GB at 8 bits | Qwen community licence | 262,144 | Yes | Publisher, in Claude Code: 62.5 on SWE-bench Pro, and 58.7 against the 27B's 42.2 on a second set | **The upgrade model** |
+| DeepSeek-V4.1-Flash | 763B by its repository's count, 16B active; 510 GB | MIT | 1M | Yes | Highest independent index of the models that fit one machine. Rejects one of Claude Code's effort values | The optional xl model |
+
+**The coursework model is Qwen3.8-27B.** It is the only candidate that meets every row of the first table on one GPU. Its architecture is also cheap per token of transcript: only 16 of its 64 layers keep a per-token cache, which comes to about 40% of what the conventional models of its size cost `[E28]`. That is what lets one GPU hold a class's sessions. Four things about it are less solid than the table makes them look, and section 12 tests each:
+
+- **Its quality rests on its publisher's numbers.** The independent evidence is one composite index and the previous generation's result on SWE-rebench. Spike `[S3]` runs the course's own kind of task in each harness, which is worth more here than any leaderboard.
+- **It does not work in Claude Code through vLLM unchanged.** No open model does: the vLLM project replayed real Claude Code traffic through its Messages route and found a defect for every model family `[E28]`. For Qwen3.8 two of them matter, and the gateway handles both (section 6.2).
+- **Which build to serve is open.** The publisher's 8-bit build is the default here, because it is the publisher's own and the less compressed. But it is not one of the two builds the recipe ran on the G7e GPU: those were the 16-bit weights and a 4-bit build published by NVIDIA. The recipe ran the 8-bit build on an RTX 5090, a GPU of the same generation. By the arithmetic of section 4.7 the 4-bit build is also about 40% faster. What nobody has measured is what 4 bits cost in the accuracy of tool calls. `[S3]` and `[S5]` run both builds, and the 4-bit build becomes the default if it does the tasks as well. The 16-bit weights are not a fallback: at that size the GPU would serve each stream below the floor of section 7.3.
+- **It reasons before it answers.** Every turn starts with reasoning, at an effort the request sets. How long a turn takes depends on that setting more than on anything else in this design (section 4.7).
+
+The pools:
+
+| Pool | Model | Weights | Engine and instance | $/hour | Wake | What is known |
+| --- | --- | --- | --- | --- | --- | --- |
+| mock | canned responses | none | `mock` on `t4g.small` | 0.02 | on demand | Phase 1 |
+| coursework | Qwen3.8-27B, 8-bit | 31 GB | vLLM 0.33 or later on `g7e.2xlarge`, one 96 GB GPU | 3.36 | on demand | The default pool, and the first GPU pool built. Section 4.7 estimates what it serves |
+| upgrade | Qwen3.8-Flash-Next, 8-bit | 186 GB | vLLM on `g7e.24xlarge`, 4 × 96 GB | 16.57 | scheduled only | Recipe run on four of this GPU. Same chat template and parsers as the coursework model, so the same request profile. Its licence may not allow this use without its publisher's agreement: decision 3 (section 15) |
+| xl | DeepSeek-V4.1-Flash | 510 GB | vLLM on `p5en.48xlarge`, 8 × H200 | 63.30 | scheduled only | Optional, built only if the owner asks. The one pool with a published benchmark on agent traffic (section 4.7). Long first load `[E2]` |
+
+Engine settings that belong to the coursework pool's release. They are the ones the recipe used on this GPU with the 4-bit build `[E28]`: the full 262,144-token context; an 8-bit cache; prefix caching; at most 8 requests running at once, which is also the pool's `target_concurrency`; a budget of 8,192 tokens for each engine step, which trades steadier streams against a faster first token (section 4.7); the `qwen3_coder` tool parser and the `qwen3` reasoning parser. To these the design adds a served name without a slash, which Claude Code requires, and finer histogram buckets and cache metrics than vLLM's defaults (section 7.2).
+
+What the owner should take from this:
+
+- **There is no cheaper GPU tier below the coursework pool.** A smaller model would run a different chat template and different parsers, so it would exercise none of the request handling the coursework model needs. The same model on a 48 GB GPU, at 4 bits, has been run by a third party and holds two to four sessions `[E29]`; it would be a second configuration to keep working, to save $1.12 an hour. The mock proves the control loop for cents, and the first GPU pool is the one the class uses. R8 asked for a cheap model first: the coursework model is the cheap one, and decision 2 asks the owner to accept that reading.
+- **The upgrade pool is for scheduled sessions.** It runs `wake = "scheduled-only"`: a schedule or an admin command starts it, never a student's request. It keeps no warm instance between sessions. One upgrade instance should carry a class that needs several coursework instances, and serve each student faster, by a margin nobody has measured (section 4.7).
+- **The model is a configuration entry.** A model that meets the first table better replaces this one with a merge and a pass of `[S3]`. Qwen has announced a next generation with no weights yet `[E28]`.
+
+### 4.3 What happens on an instance
+
+The launch template names an AWS-published GPU machine image by ID, read from an SSM parameter in the owner's account. A promotion job changes that parameter only after a canary start on the new image passes, so an unrelated merge can never change the driver under a pinned engine. The image must list the pool's instance family, and the promotion job refuses a pool whose family it does not list. The image is AWS's base GPU image with the open-source NVIDIA driver on Ubuntu 22.04. Its release of 10 November 2026 lists G6e, G7e, P5 and P5en `[E10]`.
+
+User data runs only on an instance's first boot `[E10]`, so it holds no settings and installs one thing: a small boot unit. At every start, including a restart from the warm pool, that unit reads the pool's current release (engine image digest, model revision, engine flags) from one parameter, fetches that release's unit files and lifecycle agent from the pipeline's artifact bucket, checks them against the digest recorded in the same parameter, and starts them. Docker's data and the engine's compile cache live on the EBS volume, not on the instance store, which is wiped when an instance stops. Four systemd units run:
+
+1. `rhi-engine`: the engine container with the NVIDIA runtime. Weights load straight from S3 into GPU memory. Its bearer secret comes from Secrets Manager at start, never from user data.
+2. `rhi-dcgm`: the NVIDIA DCGM exporter, bound to localhost.
+3. `rhi-collector`: an OpenTelemetry collector that scrapes the engine, DCGM and host metrics on localhost and pushes them to Managed Prometheus.
+4. `rhi-lifecycle`: a small agent with five duties. On launch, it abandons the instance unless what is on disk equals the pool's current release; it completes the launch hook only after the engine answers a real warm-up request. While serving, it writes a heartbeat row every 5 seconds with the engine's running and waiting counts and the release it serves, and it runs a one-token completion every minute, restarting the engine if that fails, because an engine can hang with its health route still answering `[E23]`. On termination, it completes the hook once the engine reports nothing running or waiting.
+
+The lifecycle transitions are specified, not left to defaults `[E10]`:
+
+| Transition | What the agent does | Timeout, then abandon |
+| --- | --- | --- |
+| New instance enters the warm pool | Pull the image, check the release, complete the hook; the group then stops it | 15 minutes on the coursework pool |
+| Warm instance promoted to service | Check the release, start the engine, warm up, complete the hook | Twice the measured start; heartbeats extend it for the multi-GPU pools |
+| Instance leaves service for the pool, or is terminated | Wait for the engine to drain, complete the hook | `drain_seconds` plus a margin |
+
+Without explicit timeouts a hook waits an hour, and a dead agent bills an hour of GPU per attempt. One launch hook serves the first two rows, so it carries the longer timeout and the agent keeps each row's own deadline, abandoning the instance when it passes. The same wait state also serves the termination hook on the way back to the pool, so the agent chooses by transition `[E10]`.
+
+Zone rebalancing is suspended on GPU groups, because it replaces instances in service. New instances are protected from scale-in; the scaler lifts that protection when it chooses which instance leaves (section 5.1).
+
+Instances have no public IP and no SSH. IMDSv2 is required. Debugging is through Session Manager with a custom minimal policy; the AWS-managed policy would let every instance read all SSM parameters, including this project's configuration `[E23]`. The instance role can read its model prefix in S3, read its pool's secret, write metrics and logs, pull its image, and complete lifecycle actions for its own group.
+
+The engine image is a thin layer over the upstream vLLM image pinned by digest, built by the pipeline into ECR. **A deployment does not reach an existing instance by itself:** AWS leaves instances alone when a launch template changes `[E10]`. So a change to the engine image, the machine image or a pool's release starts an instance refresh, which replaces instances in service first and then those in the warm pool, and the pipeline's verification asserts that the served release equals the deployed one. Each such deployment costs one GPU start per warm instance. Without this, the stopped instance that serves every normal wake would keep the old engine while the pipeline reports success.
+
+### 4.4 Model weights
+
+- A pipeline job copies each pool's model, at its pinned revision, from Hugging Face into the model bucket. It copies only an allow-list of file types (safetensors, JSON, tokenizer files) and refuses pickle formats and Python files. It verifies every file against a SHA-256 manifest committed to the repository. Only that job's role can write to the bucket.
+- Model code from a repository (`trust-remote-code`) is off by default. The coursework and upgrade models do not need it `[E28]`. A pool that does is a reviewed exception recorded with that pool; the DeepSeek V4 recipes ask for it `[E2]`.
+- Instances read weights through the S3 gateway endpoint and never talk to Hugging Face.
+- vLLM's Run:ai streamer loads from `s3://` into GPU memory. AWS measured 15 GB in about 5 seconds and 200 GB in about 25 seconds when tuned; defaults can be ten times slower, and one model was reported slower than the plain loader `[E11]`. The loader is a per-pool setting, with "download to local disk, then load" as the fallback `[S4]`.
+- At rest, S3 costs $0.023 per GB-month: under $1 for the coursework model, about $4 for the upgrade model, about $12 for the 510 GB one.
+
+### 4.5 Why plain Auto Scaling groups
+
+| Option | What decides | Verdict |
+| --- | --- | --- |
+| **EC2 Auto Scaling group + warm pool** | The only option that can stop an instance and reuse it. Scale 0→1 is one API call. Est. 2 to 6 min from the warm pool `[S1]` | **Chosen** |
+| ECS Managed Instances | No stopped state and no choice of machine image `[E9]`. AWS measured 13 min from request to first output with a 14 GB image | Simplest to operate, but every wake is a cold launch |
+| ECS on EC2, capacity provider | Cannot return instances to the warm pool on scale-in; managed scaling starts **two** instances from zero `[E9]` | Loses the warm pool's whole benefit |
+| SageMaker real-time, scale to zero | Streams capped at 8 minutes; requests **fail** while capacity starts; one invocation contract against three routes; 15 to 40% dearer. Its start time is comparable: 258 s measured for an 8B model `[E8]` | Still needs this gateway; less control for more money |
+| EKS Auto Mode + KEDA | An interceptor holds requests; $73 a month of control plane and Kubernetes operations for one person `[E9]` | Too much to operate |
+| Bedrock Custom Model Import | No CloudFormation support, no Prometheus metrics, and the machines are not ours (R2, R3) `[E22]` | Not this project |
+
+Cold-start time alone does not decide: SageMaker's measured start is in the same range as this design's estimate. What decides is that only a plain group can keep a stopped instance and bring it back, with the pulled image on its disk, and that nothing in the path caps a long agent turn. One model server per instance needs no container scheduler.
+
+The price is real and larger than four systemd units: this project owns the boot sequence, the lifecycle hooks, draining, the image promotion and the refresh on every release.
+
+### 4.6 Why vLLM alone, without Ray Serve
+
+Ray Serve is not another engine. Its LLM module starts vLLM inside a Ray cluster and puts a router, replica autoscaling and multi-model serving around it. The question is whether this design needs that layer between the gateway and vLLM. It does not, and adding it would take away things the design depends on `[E30]`.
+
+| What Ray Serve offers | What this design has for it | Verdict |
+| --- | --- | --- |
+| An OpenAI-compatible front door | vLLM's own routes for Messages, Responses and Chat Completions (section 6.1) | Ray Serve's stable front door serves Chat Completions but neither Messages nor Responses, as of Ray 2.60. The pull requests that added them there were closed unmerged. Claude Code and Codex could not connect; the workaround is an experimental mode that exposes vLLM's own application for one model. Ray is working on that mode: support for Messages in its cache-aware router was merged in October 2026 and is not yet released |
+| Replica autoscaling and scale to zero | The scaler, the only writer of pool size (section 5.1), and the gateway's hold with keep-alives (section 5.3) | Ray would be a second writer of fleet size, and one writer is a decision of section 5.1. The gateway's hold would still be needed in front of it |
+| Starting and stopping machines | Auto Scaling groups with stopped warm pools (section 4.5) | Ray's launcher for EC2 creates instances itself, outside CloudFormation and outside any warm pool, and needs a head node that is always on and is a single point of failure |
+| Several models on shared GPUs, adapters swapped per request, one model across several nodes, pipelines of models | Nothing: one model per instance, and nothing spans nodes (section 1, non-goals) | No use here |
+| Routing that follows the engine's prefix cache | Affinity by student (section 5.5), which this comparison prompted | Ray's router follows the cache more finely, and ignores the per-student salt this design uses `[E30]`. With pools of one to four instances, affinity by student captures the reuse there is |
+| Its own dashboard and metrics | Prometheus and Grafana (section 7) | A duplicate |
+
+Three costs weigh beyond the table:
+
+- **Ray pins the vLLM version.** Ray 2.60.0 requires vLLM 0.29.0, four minor releases and eight weeks behind upstream on the day it shipped `[E30]`. vLLM releases are how this design gets security fixes (sections 4.3 and 9) and support for a new model, and vLLM ships one about every two weeks `[E3]`.
+- **Ray assumes a trusted cluster.** Its documentation says any client that can reach a cluster can run code on it. This design treats the engine as its least trusted component (section 4.1): a compromised engine holds its own instance's role and sees the requests sent to it. Inside a Ray cluster it could reach every node and the head.
+- **More to operate.** A head node, a larger image, a second control loop and a second set of metrics, for one operator and pools of one to four instances.
+
+The answer changes if Ray ships stable routes for Messages and Responses with a vLLM within a release or two of upstream, which is the direction it is moving in; if a model must span several nodes; if many small models must share few GPUs; if a pool regularly runs more instances than the rebalancing of section 5.5 keeps even; or if the platform moves to Kubernetes. Offline batch work, which the research skill packs could use, would be a case for Ray Data, which does not need Ray Serve.
+
+### 4.7 What a pool can serve
+
+R9 asks what the chosen model and machines can deliver, in tokens per second and in the other numbers that matter. This section gives estimates, says what each rests on, and uses the quantities that section 7.2 measures in Grafana, so that prediction and measurement sit on the same panel.
+
+**No number for the coursework pool below is a measurement on its instance type: nobody has published one.** They are arithmetic from the GPU's memory bandwidth and the model's shape, checked against published measurements of the same model on other GPUs `[E29]`. Spike `[S5]` replaces them with measurements.
+
+**The quantities.**
+
+| Quantity | What it is | What it decides |
+| --- | --- | --- |
+| Time to first token | Seconds from a request reaching the engine to its first token: queueing, then *prefill*, which is computing the part of the transcript the engine has not cached | How long a student waits before anything moves |
+| Output speed per stream | Tokens per second that one request receives while it generates | How long a reply takes: 500 tokens at 20 per second is 25 seconds |
+| Output throughput | Tokens per second from all the streams of an instance, or of a pool | Cost per token |
+| Prefill speed | Input tokens computed per second | Time to first token when the cache misses, and how much each new turn slows the streams beside it |
+| Cached share of input | The fraction of input tokens the engine did not have to compute | Whether a turn starts in a second or in tens of seconds |
+| Cache capacity | Tokens of transcript one GPU holds, for running requests and for recent ones | How many sessions fit before the engine queues, preempts, or forgets an idle session |
+| Concurrent streams | Requests generating at once on an instance | When the scaler adds an instance |
+| Cost per million tokens | An instance's hourly price over what it produced | Comparison with a hosted model |
+
+"Tokens per second" alone is ambiguous: per stream it says what a student sees, summed it says what a machine yields. This design always says which.
+
+**The load.** Public replays of real Claude Code sessions show what an agent sends `[E31]`. A request carries a median of 74,000 to 130,000 input tokens, and a tenth carry over 230,000. It returns a median of 300 to 500 tokens, with a mean near 1,000. Between 91 and 98% of the input repeats the previous request. A running session sends a request every 12 to 25 seconds. Those sessions come from heavy users of fast hosted models, so three assumptions stand between them and this class, and `[S5]` tests each:
+
+- **Transcripts of 50,000 to 100,000 tokens.** Nothing enforces this. Claude Code compacts a session near its window, which is 200,000 tokens here, so the table has a row for 150,000.
+- **Turns that add 1,000 to 5,000 input tokens and produce about 500.** The 500 comes from other models. This one reasons before it answers, and how much depends on the effort the request sets (section 6.2).
+- **A running agent holds a stream about 80% of its time.** A turn of 500 tokens takes 23 to 33 seconds to generate at the speeds below, and the tools between turns are assumed to take 5 to 10.
+
+**The coursework pool, per instance**: Qwen3.8-27B at 8 bits on one 96 GB GPU, with an 8-bit cache. A stream's speed is bounded by memory traffic: each step of the engine reads the weights once, and the cached transcript of every stream. The estimates take 77 to 87% of that bound, which is the range the measurements of `[E29]` support.
+
+| Quantity | Estimate | Rests on |
+| --- | --- | --- |
+| Output speed, one stream alone | 40 to 45 tokens/s; 35 to 40 with a 100,000-token transcript | 31 GB of weights read for each token, at 1,597 GB a second: a bound of 52. The same model at 4 bits on a 48 GB GPU was measured at 43.7 tokens/s, 80% of that GPU's bound or more |
+| Output speed per stream, 8 streams, decode alone | 20 to 30 tokens/s | The bound with eight transcripts of 50,000 to 100,000 tokens read at each step. An upper limit: it leaves out the next two effects |
+| Output speed per stream, 8 agent streams | **15 to 22 tokens/s** | The row above, less the time the GPU spends computing the streams' new input (about a sixth, from the load above), less a cost per extra stream that the same model shows on the 48 GB GPU (18% at four streams) |
+| The same, with transcripts of 150,000 tokens | 12 to 14 tokens/s | The same arithmetic |
+| Output throughput, 8 agent streams | 120 to 180 tokens/s | Eight times the per-stream figure |
+| Prefill speed | 4,000 to 6,000 input tokens/s on a long transcript; up to about 10,000 on short prompts | Long: the rate this GPU reaches on a smaller model, scaled by the two models' sizes, and the 1,100 tokens/s or so that a report on an NVIDIA GB10 desktop implies for this model. Short: the same model on the 48 GB GPU computed 15,000 tokens in 3 seconds |
+| Time to first token, a turn whose transcript is cached | 0.3 to 1.5 s on the GPU | 1,000 to 5,000 new tokens at the prefill speed. Before that the server renders and tokenises the whole transcript on the instance's four cores, which is not estimated here |
+| Time to first token, the first turn of a session | 2 to 5 s | Claude Code's opening of about 20,000 tokens, computed once for each student because the cache salt is per student |
+| The same, twenty students starting in the same minute | 30 to 50 s for the last of them on two instances; 70 to 100 s on one | 400,000 tokens of openings, computed eight at a time. Every stream already running slows meanwhile |
+| Time to first token, transcript not in the cache | 10 to 25 s | 50,000 to 100,000 tokens at the prefill speed. This is what sections 5.5 and 6.2 exist to prevent |
+| Cache capacity | 1.1 to 1.8 million tokens; half that with a 16-bit cache | 51 to 54 GiB left after the weights, at 32 to 48 KiB a token: the model's shape gives 32, and a published run on a smaller GPU puts it under 48 and shows the 8-bit cache holding exactly twice the 16-bit one |
+| Sessions held in the cache | 11 to 36; 7 to 12 at 150,000 tokens each | The capacity over the size of a transcript |
+| Students per instance, working hands-on | 10 to 20 | Eight streams carry about ten running agents. Between half and all of the students have one running at a given moment |
+| Students per instance, each running several agents | 4 to 8 | The second session's packs run plotting and literature agents in parallel and draft in one long pass: one or two streams a student, almost all the time |
+| Cost per million output tokens | $5.20 to $7.80 with eight agent streams | $3.36 an hour over 120 to 180 tokens/s. An idle instance costs the same per hour |
+
+Three of these rows carry the design.
+
+- **The cached share.** A report on vLLM's tracker replayed a real Claude Code session of 52,000 to 65,000 tokens on this model, on a small desktop machine: the time to first token fell from 30 to 43 seconds a turn to 2 to 6 once the conversation stayed in the cache `[E29]`.
+- **Speed per stream.** At 15 to 22 tokens a second, a reply of 500 tokens takes 23 to 33 seconds, and the estimate sits on the floor that section 7.3 sets for an acceptable class. `[S5]` may well show the pool below that floor at eight streams. The levers below are the answer, in order. If they are not enough, the pool runs fewer streams on each instance, which means more instances for the same class.
+- **Students per instance.** It halves when students run several agents each. A class of twenty that fits two instances in the first session needs three to five in the second, or the upgrade pool.
+
+**Levers, in the order to try them.** Spike `[S5]` measures each.
+
+- **The 4-bit build.** It reads 22 GB for each token where the 8-bit build reads 31, so by the same arithmetic it gives 18 to 28 tokens per second at eight agent streams, and it leaves 8 GiB more for the cache. It is one of the two builds the recipe ran on this GPU (section 4.2). The price is unknown: what 4 bits do to tool calls.
+- **Reasoning effort.** The request profile maps Claude Code's default to the model's highest setting (section 6.2). Mapping it one step lower shortens every turn. The cost is quality, which `[S3]` judges.
+- **A smaller window.** Claude Code compacts a session when it nears its window, and a setting lowers that point `[E15]`. `rhi login` can write it. At 100,000 tokens instead of 200,000, streams stay in the faster rows of the table and more sessions fit the cache; each compaction costs the student some context and one full prefill.
+- **The 8-bit cache**, assumed above. It halves what a token of transcript costs. If it harms answers, the 16-bit cache halves the sessions an instance holds and slows every step.
+- **The model's own draft head.** The checkpoint includes a head that proposes several tokens at once. On the 48 GB GPU it raised speed by half at one to four streams `[E29]`. vLLM has an open defect with longer drafts on this model, so it is off until `[S5]` shows it helps and `[S3]` shows it changes no tool call.
+- **The step budget.** A smaller budget of tokens for each engine step keeps streams steadier while a long transcript is computed, and makes that transcript's first token later `[E29]`.
+- **A shared cache salt for scheduled sessions.** With one salt for the class, students would share whatever part of the 20,000-token opening is identical, and a class starting together would not queue behind its own openings. It would also let one student test whether another has sent a given text (section 6.6). The default stays per student.
+- **A larger instance of the same family**, if the four cores prove the limit on the time to first token.
+- **More instances.** An instance adds streams, not speed: each student still gets what one GPU gives one stream.
+- **The faster sibling.** Qwen3.6-35B-A3B should generate about three times faster per stream, going by a measurement of a model of its shape on this GPU `[E29]`, and is weaker at agent work (section 4.2).
+
+**The larger pools.**
+
+| | upgrade: Qwen3.8-Flash-Next on 4 × 96 GB | xl: DeepSeek-V4.1-Flash on 8 × H200 |
+| --- | --- | --- |
+| What the numbers are | Judgment, from measurements of two other models with 5 and 10 billion active parameters on this GPU `[E29]`. The weakest numbers of this section: nobody has published a measurement of this model, or of any model on four of these GPUs | A third party's benchmark that replays Claude Code sessions on this class of machine, with vLLM 0.33, 4-bit weights and the model's draft head on `[E29]` |
+| Output speed per stream | 60 to 100 tokens/s alone; 40 to 60 at 8 streams; 25 to 40 at 32 | 376 alone; 296 at 8; 215 at 16; 143 at 32; 60 at 64 |
+| Output throughput | 800 to 1,300 tokens/s at 32 streams | 1,239 tokens/s at 32 streams; 2,227 at 64 |
+| Time to first token, cached turn | Under 1 s | 0.24 to 0.36 s at the median, up to 64 streams |
+| Cache capacity | Several million tokens | Not published |
+| Students per instance | A class of twenty; forty if they work hands-on | Forty in any session |
+| Cost per million output tokens | $3.50 to $5.80 at 32 streams | $14.20 at 32 streams; $7.90 at 64 |
+
+**What it means for a class.**
+
+| Class | Working hands-on | Each student running several agents, as in the second session |
+| --- | --- | --- |
+| Twenty students | 1 to 2 coursework instances: $3.36 to $6.72 an hour | 3 to 5 coursework instances, $10 to $17 an hour, or one upgrade instance at $16.57 |
+| Forty students | 2 to 4 coursework instances: $6.72 to $13.44 an hour. Or one upgrade instance | 5 to 10 coursework instances, or the upgrade pool beyond what its estimate covers. The xl pool is the one sized for this |
+
+A session's number of instances is therefore a setting, not something the scaler discovers once the class has started: each window of the schedule carries it, and the scaler pre-warms that many (section 5.1). `max_instances` must be at least that number, `warm_instances` should equal it, the GPU quota must cover one instance more (section 5.4), and the daily ceiling must cover that many instances for the session's length plus 80 minutes of pre-warm and idle tail (section 11.3). The defaults, two instances and 16 GPU-hours a day, fit a class of twenty working hands-on.
+
+**How the estimate is checked.** Spike `[S5]` measures every row of the coursework table with replayed agent sessions of both shapes, hands-on and several agents a student, at 1, 4, 8 and 16 streams and at the class's size, for the 8-bit and the 4-bit build. It records the result under `docs/measurements/`; that record replaces this table. Each pool's configuration carries its expected values for speed per stream, time to first token and cache capacity. The inference dashboard shows them beside the live series (section 7.2), and the dry-run class of phase 3 is judged against them.
+
+## 5. Scaling
+
+### 5.1 One writer: the scaler
+
+If the gateway, CloudWatch alarms and scheduled actions could each change a pool's size, they would race: a read-then-write on desired capacity, gauges summed wrongly across gateway tasks, a nightly "force to zero" undone by the next alarm. So one function decides, and only it writes.
+
+The **scaler** is a Lambda that runs one invocation at a time. It is called by the gateway when a request needs a cold pool, by a one-minute schedule, and by the admin CLI. Each run reads the same inputs and computes the size every pool should have:
+
+| Input | Source |
+| --- | --- |
+| Pool configuration and mode (`enabled`, `scheduled-only`, `disabled`, `budget-latched`) | Configuration and the pool-state table |
+| Demand: requests in flight, requests held, and the time of the last request received, per pool | A heartbeat row each gateway task rewrites every 5 seconds; rows older than 20 seconds are ignored. Status calls and token counting are not demand. An explicit wake (`POST /wake`) is: it counts as a held request until the pool is ready, and as a request received at that moment |
+| Engine load: running and waiting, per instance | The lifecycle agent's heartbeat row |
+| Supply: desired, in service, starting, draining, warm, and every running instance in any state | Auto Scaling and target health |
+| Schedule: session windows, the instances each needs, and pre-warm lead | Configuration |
+| Spend: GPU-seconds used today and this month, per pool | Accrued by the scaler on every run, for every running instance of the group, including one being prepared for the warm pool |
+
+The decision is a pure function of those inputs, so it is unit-tested exhaustively without AWS: two first requests at once, a request arriving during scale-in, a wake after a long idle, a launch that never becomes healthy, a gateway that stops reporting.
+
+| Transition | Rule |
+| --- | --- |
+| 0 → 1 | Any held request for an `enabled` pool under its ceilings. One instance, however many requests are held: a cold start is not overload. The gateway repeats the wake every 15 seconds while it holds |
+| 1 → n | Requests in flight, averaged over the in-service instances, above `target_concurrency` for 60 seconds; or an instance reporting waiting requests for 60 seconds while no other instance of the pool has room. One instance at a time, up to `max_instances`. Instances still starting count as supply |
+| rebalance | An instance reporting waiting requests for 60 seconds while another runs below half of `target_concurrency`, which is also the state of a pool that has just grown: the scaler raises the pool's rebalance number, which moves a few students to the emptier instance (section 5.5). At most once a minute, and only while the imbalance lasts. The size does not change |
+| n → n−1 | Load would fit in n−1 instances at half of target for 10 minutes, and 15 minutes since the last scale-out. The scaler picks an instance that reports nothing running, lifts its scale-in protection, and lowers desired capacity |
+| n → 0 | No request received and none in flight for `idle_minutes`, re-checked at the moment of acting |
+| pre-warm | Inside a session window minus the pool's lead time, the scaler keeps at least the number of instances that window names in the schedule, 1 if it names none (section 4.7) |
+| stop | Mode `disabled` or `budget-latched`, or a ceiling reached: no wake; scale in as instances fall idle |
+| gateway silent | No fresh heartbeat for 10 minutes: scale to zero. Nobody can reach the fleet without the gateway |
+| launch loop | Three abandoned launches in a row: suspend the group's launches, alarm, and wait for the admin |
+
+The group's own minimum is always zero and it has no scaling policies and no scheduled minimum: schedules, ceilings and stops all live in the scaler, so they cannot contradict one another. A stop sets desired capacity to zero and leaves the warm pool as it is.
+
+What stays outside the scaler, so that a broken scaler cannot cost money: the group's maximum size; the GPU quota; a nightly scheduled action that sets desired capacity to zero; an alarm when the scaler has not completed a run for five minutes; and an alarm when instances are running in a group for 20 minutes with nothing in service. If the scaler is healthy and a student is working at night, it starts the pool again, which is correct; the nightly action is for the night the scaler is not healthy.
+
+Students cannot wake a `scheduled-only` pool. Unauthenticated or over-budget requests never reach the scaler.
+
+**Scale-in and draining.** The group deregisters an instance from the target group and drains it before the termination hook runs `[E13]`. Two things are not settled by AWS's documentation: whether the group waits the whole deregistration delay for a target that has no connections, and whether it drains at all before stopping an instance into the warm pool. So the design does not lean on a long delay. The scaler removes only instances that report nothing running, the delay is short (`drain_seconds`, 300), the gateway closes idle upstream connections promptly, and the termination hook is the second guard. If AWS does wait the full delay, each cycle costs five more GPU-minutes, and a request arriving in that window is a cold launch. `[S7]` measures both paths on the mock pool, for cents, before any GPU depends on them.
+
+### 5.2 The cold-start budget
+
+Measured on stock setups: 10 to 13 minutes, dominated by pulling a multi-gigabyte image (about 7 minutes) and fetching weights (about 2 minutes) `[E11]`. The design removes those two stages for the common case:
+
+| Stage | Stock, measured | From the warm pool, estimated | Cold launch (pool empty or its instance failed to start), estimated |
+| --- | --- | --- | --- |
+| Trigger to start issued | 1 to 2 min (alarm) | 5 to 20 s | 5 to 20 s |
+| Instance start and boot | 30 to 90 s | 40 to 80 s | 45 to 90 s |
+| Container image | 5 to 7 min pull | 0, already on disk | 1 to 7 min pull |
+| Container start | included above | 20 to 50 s | 20 to 50 s |
+| Weights to GPU | about 2 min | 20 to 100 s for 31 GB, streamed from S3 | 20 to 100 s |
+| Engine init and warm-up | 1 to 2 min | 30 to 90 s | 30 to 90 s |
+| Hook, registration, first health check | not reported | 10 to 35 s | 10 to 35 s |
+| **Total** | **10 to 13 min** | **about 2 to 6 min** | **about 3 to 13 min** |
+
+A stopped instance costs only its disk (about $12 a month for 150 GB), keeps the pulled image and the engine's compile cache, and returns to the pool on scale-in. GPU families cannot hibernate, so stopped is the only warm state `[E10]`.
+
+The estimated columns are a reading of published stage timings. Each total is the sum of its column. The published S3 timings come from an instance with far more network bandwidth than a single-GPU type has `[E11]`. No source measured a stopped GPU instance returning to service, or how often one fails to restart for lack of capacity `[E10]`. Spike `[S1]` measures every stage before anything else depends on the total. Settings that the estimate assumes: a 5-second health-check interval on the target group, the compile cache kept on disk, and the release check done before the engine starts. Baking the engine image into the machine image would bring the cold-launch column close to the warm one; it is scheduled only if `[S1]` shows it is needed.
+
+The upgrade and xl pools do not fit this table. Loading 186 or 510 GB takes minutes at best, and for the xl model upstream reports first loads of an hour or more on a new image `[E2]`. They are pre-warmed on a schedule with a measured lead time.
+
+### 5.3 What the client sees while it waits
+
+A stream is held for at most `hold_seconds`, 420 by default; a non-streaming call for 240. Those numbers are chosen from the clients, because each has a limit the hold must stay under:
+
+| Client | Limit that matters | Consequence |
+| --- | --- | --- |
+| Claude Code | Tolerates a stream of only `ping` events for about 12 minutes `[E12]` | Messages streams are held with real `ping` events |
+| Codex CLI | Its idle timer counts parsed events and ignores SSE comments; default 300 s `[E12]` | Comment keep-alives do not help Codex. `rhi login` writes a Codex provider profile with a 15-minute stream timeout; a Codex without that profile fails a long hold at 5 minutes |
+| OpenAI and Anthropic SDKs | 10-minute default timeout for the whole call; 2 retries `[E12]` | A non-streaming call is held 240 s, leaving time to generate |
+
+- **Streaming requests:** the gateway answers 200 at once and sends a keep-alive every 10 seconds: `ping` events on Messages, SSE comments on the OpenAI formats. The real stream follows on the same connection. The keep-alives continue after the request is forwarded, until the engine's first event: the engine is silent while it computes a long transcript, which can take tens of seconds when the cache misses (section 4.7) `[E28]`.
+- **Non-streaming requests:** held silently. Both load balancers run a 1200-second idle timeout `[E13]`.
+- **Readiness:** the gateway learns a pool is ready from the target group's health, which the internal ALB establishes by checking each engine directly. Each gateway task reads it through the AWS API every 5 seconds for every pool, whether or not it is holding a request, and decides from that cached value whether a request is forwarded or held. It never probes through the ALB, which forwards the four inference routes and nothing else.
+- **At the deadline:** a stream ends with that format's error event; a non-streaming request gets 503 with `Retry-After`. Every error the gateway produces names one cause from a fixed list (section 6.2, step 8). The gateway never relays text from AWS or from the engine: students paste errors into public issues.
+- **Cheap calls** (`GET /v1/models`, `count_tokens`, probes) never wake a GPU. Token counting on a pool that is not ready answers `warming` at once; Claude Code then falls back to its own estimate `[E15]`.
+- `GET /status`, with a key, says whether a pool is cold, warming or ready. `POST /wake`, with a key, starts a pool under the same rules as a request (mode, budget, ceilings) without sending one. `rhi wait` calls it and then polls the status until the pool is ready; it is the documented way to start a homework session on a cold pool. Both name a pool by its model name. `GET /status` lists the pools the key may use, each with a state and, when unavailable, a cause from the list in 6.2. A pool is `ready` when it has a healthy target; `warming` when it has none but the scaler has asked for capacity; `cold` when it has none and none is asked for; `unavailable` when it cannot be started for this caller: `pool_disabled`, `pool_ceiling_reached`, `pool_scheduled_only`, or `capacity_unavailable` when its last launch found no capacity in the past 10 minutes. A wake on a pool unavailable for capacity is still passed to the scaler, which tries again; for the other three causes a wake asks for nothing. `POST /wake` answers at once with the same record for one pool. An explicit wake counts as demand for 10 minutes or until the pool is ready, whichever comes first; `rhi wait` repeats it every minute, and stops with the cause when the pool is unavailable.
+
+Spike `[S2]` runs each client through a full hold. The fallback for any client that misbehaves is the non-streaming behaviour plus `rhi wait`.
+
+### 5.4 When capacity is not there
+
+- **No capacity in the zone:** the group spans three zones. A pool may list fallback instance types with the same GPU, the next sizes of its family; they cost more, so the configuration then gives a price for each type and the scaler accrues what actually ran. A warm instance that fails to start is terminated and replaced by a cold launch `[E10]`. The gateway holds until the deadline, then answers `capacity_unavailable`.
+- **Quota exhausted:** new accounts have a quota of zero vCPUs for GPU families `[E6]`. Requesting it is the owner's first task. The quota is also a ceiling: set to what the owner can afford, no bug can exceed it. It must leave room for one instance more than `max_instances`, because a draining instance and a cold launch can overlap.
+- **Instance never healthy:** the launch hook times out and abandons it; the group replaces it; an alarm fires when a pool has wanted capacity for 10 minutes with nothing in service.
+- **A launch that fails every time** (a bad image, a wrong prefix, a rotated secret) would otherwise loop: launch, wait, abandon, relaunch, with desired capacity at zero and no alarm keyed on it. The scaler counts abandoned launches, suspends launches after three, and its spend accounting sees every running instance.
+- **Class day:** each pool has a pre-warm lead (60 minutes by default for the coursework pool, measured for the larger ones). Thirty minutes before a session the scaler sends the instructor a go or no-go notice with each pool's state, and the runbook has one fallback command: switch the default model to a pool that is up.
+
+### 5.5 Keeping a student on one instance
+
+An agent re-sends its whole transcript on every turn. The engine keeps what it has already computed for that transcript in its prefix cache, so a turn that reaches the instance that served the previous one pays only for the new tokens. On any other instance it pays for the whole transcript again: tens of thousands of tokens, and seconds of waiting (section 4.7). Least-outstanding routing knows nothing of this. With one instance in a pool there is nothing to decide. With two, it would send about half of a student's turns to the instance that had not seen the other half.
+
+The cache salt is per student (section 6.2), so a prefix is reused only by the student who sent it, and affinity by student captures all the reuse there is. The mechanism uses what is already in the path `[E13]`:
+
+- Each pool's target group has duration-based stickiness. The internal ALB picks a target for a first request by least-outstanding requests, and names it in an encrypted cookie on the response. A request that carries the cookie goes to the same target.
+- The gateway is the ALB's client, so the gateway keeps the cookie: one per student and pool, on the student's budget record. The write that reserves budget returns it and the write that settles stores it (section 6.2, step 3), so affinity costs no extra call and every gateway task sees the same value. The cookie never reaches the student.
+- When the target a cookie names is unhealthy, deregistered or draining, the ALB picks another and issues a new cookie. Scale-in and a failed instance therefore need no code: the student's next turn pays for its transcript once, on the new instance.
+- Stickiness alone would leave a new instance empty, and could leave one instance queuing while another idles. The scaler keeps a rebalance number in the pool's record, which the gateway already reads, and raises it while a pool is lopsided, at most once a minute (section 5.1). For each new number the gateway drops the cookie of about one student in ten, chosen by a hash of the student and the number. The student's record keeps the last number applied, so each number acts once. Least-outstanding routing then sends that student's next request to the emptiest instance, where it pays for its transcript once. Moving a few students at a time matters: each move costs 10 to 25 seconds of prefill on the instance that receives it (section 4.7), and moving half a class at once would stall that instance for minutes. The gateway cannot aim: the cookie is opaque, so it does not know which instance a student is on, and a student dropped from the emptier instance simply returns to it.
+
+A student's parallel requests, such as Claude Code's subagents, follow the same cookie, so whatever their prompts have in common with the main session is computed once.
+
+Affinity does not help when the cache itself is full: the engine evicts the prefixes of idle sessions first, and a student who comes back after a pause pays again. How much cache a pool has is part of section 4.7. AWS's page lists a healthy target in every zone as a requirement for stickiness, which a pool of one or two instances does not have; `[S8]` checks on the mock pool that a replayed cookie pins a student with two targets in two zones, and that the cookie moves when its target leaves. If it does not hold, a pool stays at one instance until it does, and a class that needs more runs on the upgrade pool, whose single instance needs no affinity.
+
+## 6. Gateway and student access
+
+### 6.1 Wire formats
+
+| Client | Needs |
+| --- | --- |
+| Claude Code, in the terminal, headless and through the Agent SDK; the Anthropic SDK | Anthropic Messages `[E15]` |
+| Codex CLI | OpenAI Responses only; Chat Completions is a configuration error since February 2026 `[E15]` |
+| OpenAI SDK scripts, aider, opencode | OpenAI Chat Completions |
+| The research skill packs of the second session: a paper-writing pack and a bundle of science skills | Whatever the harness that runs them speaks. They add images, long documents and parallel subagents, not a format `[E25]` |
+
+vLLM serves all three `[E3]`; the gateway does not convert one into another. Four caveats:
+
+- **A route existing is not a harness working.** Each harness sends structured history, tools, reasoning options and vendor extensions. The vLLM project replayed real Claude Code traffic through its Messages route for every major model family, and found defects with each `[E28]`. Spike `[S3]` runs a multi-turn tool-calling task with each harness against each pool's model, and its result decides which harnesses a pool supports.
+- **For the coursework model, three of those defects decide whether a Claude Code session works** `[E28]`:
+  1. Claude Code asks for reasoning effort `high` by default. The model's chat template accepts `xhigh`, `medium` and `low` and raises an error on anything else, so every default request is refused.
+  2. Claude Code places short system messages in the middle of a conversation and changes them from turn to turn. The model's template wants system text first, so vLLM moves them all to the top of the prompt. The top then differs on every turn, nothing after it can be served from the cache, and each turn recomputes the whole conversation. The fix is an open pull request, in no release.
+  3. Claude Code sends a PDF as a document block. vLLM refuses it, and because the block stays in the history, every later request of that session is refused too.
+
+  The gateway's request profile handles all three (section 6.2, step 4). Two more are avoided by configuration: vLLM 0.33 or later, which no longer drops the request's `thinking` field; and a served context of 262,144 tokens, above the 232,000 that keeps Claude Code clear of a context error it cannot recover from (section 4.2).
+- **Claude Code against non-Claude models is unsupported by Anthropic** `[E15]`. Claude Code is the cursus's anchor harness, so `[S3]` passes only if Claude Code completes the task on the coursework model, or the owner waives it in writing.
+- **The upgrade model shares the coursework model's template and parsers, so it shares the profile. The optional xl model does not.** Its recipe uses a different vLLM front end and mentions only Chat Completions `[E2]`, and its template rejects one of the effort values Claude Code can send `[E28]`. Whether Messages and Responses work there is part of `[S6]`.
+
+### 6.2 What the gateway does
+
+1. **Routes by a closed table.** Forwarded: `POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/chat/completions`, `POST /v1/responses`. Answered locally: `GET /v1/models`, `GET /status`, `POST /wake`, `HEAD /api/hello`. Everything else is 404. The upstream URL comes from the table, never from the client's path.
+2. **Authenticates from headers before reading the body.** The key arrives in `Authorization: Bearer` or `x-api-key`; if both arrive and differ, the request is rejected. The key's checksum is verified first, so junk costs nothing; then its SHA-256 is looked up (cached for 60 seconds).
+3. **Reserves, then settles.** One conditional DynamoDB write reserves the estimated input plus the request's output limit against the student's daily token budget and takes a concurrency slot with an expiring lease. A clean end settles to the reported usage. Any other end (disconnect, timeout, error) charges the tokens observed and never less than the input estimate. Checking a budget only at admission, or counting only at the end, lets a client overspend by opening many streams or by hanging up early. The same two writes carry the student's affinity cookie for the pool (section 5.5).
+4. **Validates and rewrites the body.** It parses the JSON (rejecting duplicate keys and oversized bodies), keeps an allow-list of the standard fields of that wire format and drops the rest, clamps numbers to the pool's limits, rejects media URLs that are not inline data, sets a per-student cache salt, replaces the request ID, maps `claude-*` model names to the default pool, applies the pool's **request profile**, and forwards the re-serialized body. The profile is a short per-model table of rewrites that stay inside one wire format. For the coursework model it has three entries (sections 4.2 and 6.1). Reasoning effort is mapped to a value the model's template accepts: `low` and `medium` pass, and `high`, `xhigh` and `max` become `xhigh`, the model's default and the setting its published results were measured at; the mapping is configuration, because it is also a lever on speed (section 4.7). A system message placed mid-conversation is sent as user content in the same place, so that the engine does not move it and the cache survives. A document block, which is how Claude Code sends a PDF, is replaced by a line of text saying that the endpoint cannot read it, because the engine's refusal would otherwise end the session. Each entry names the engine defect it works around, is covered by a replayed capture, and is deleted when the pinned engine no longer has the defect. vLLM 0.33 has a flag for the first mapping; the gateway does it instead, so that a unit test proves it without a GPU. What the second entry does to a skill or a tool that Claude Code announces in such a message has not been measured: the one report behind it recorded cache hits and nothing else `[E29]`, and `[S3]` checks it. This body handling is the filter the engine's maintainers ask for: vLLM states it gives no isolation between tenants sharing a server, and many of its 2026 advisories are a single request field that stalls the engine for everyone `[E23]`.
+5. **Ensures capacity and holds** (section 5).
+6. **Streams the response without buffering** and reads usage as it passes, with one incremental parser per wire format, because the three report usage differently: Messages across `message_start` and `message_delta`, Responses in its terminal event, Chat Completions in an optional final chunk that the gateway requests from the engine and hides from clients that did not ask for it.
+7. **Bounds time.** A request may run 30 minutes at most. Timeouts are set explicitly on every hop (the HTTP client's defaults would cut a quiet stream after 5 seconds).
+8. **Returns errors in the wire format in use,** each with one cause from this list and a fixed sentence. A parked platform (section 11.2) has no gateway and answers nothing:
+
+   | Cause | Status | When |
+   | --- | --- | --- |
+   | `invalid_key` | 401 | The key is missing, malformed, unknown, revoked or expired, or the two key headers differ |
+   | `not_found` | 404 | Any route outside the table |
+   | `request_refused` | 400 | The filter rejects the body: not JSON, duplicate keys, too large, a media URL that is not inline data |
+   | `concurrency_limit` | 429 with `Retry-After` | The student is at their limit of concurrent requests |
+   | `budget_reached` | 402 | The student's daily token budget is spent |
+   | `pool_ceiling_reached` | 402 | The pool is at its GPU-hour ceiling, or the monthly budget has latched it |
+   | `warming` | 503 with `Retry-After` | The hold deadline passed while the pool was starting; also token counting on a cold pool |
+   | `capacity_unavailable` | 503 with `Retry-After` | AWS could not provide an instance |
+   | `pool_scheduled_only` | 503 | A student asked for a pool that only a schedule or the admin starts |
+   | `pool_disabled` | 503 | The admin disabled the pool |
+   | `engine_error` | 502 | The engine failed, or ended a response early. On a stream that has started, this is that format's error event |
+   | `time_limit` | 504 | The request reached the 30-minute limit. On a stream, that format's error event |
+
+   The SDKs retry 408, 409, 429 and 5xx, and nothing else `[E12]`, so the two budget causes use 402 and reach the student at once. How each harness shows a 402 is part of `[S2]`. `Retry-After` is 30 seconds for `warming`, 60 for `capacity_unavailable` and 5 for `concurrency_limit`.
+
+It is a Python service (Starlette and httpx) on Fargate. It logs metadata only: who, when, which pool, token counts, latency, status. It never logs request or response bodies.
+
+This is more than a pass-through. The gateway parses JSON and SSE for three formats, and that code decides who pays for what. It gets the heaviest tests in the repository: recorded streams split at arbitrary byte boundaries, disconnects at every event, and captures of each harness recorded against the mock engine under an example host and scrubbed.
+
+### 6.3 Why a custom gateway and not LiteLLM
+
+LiteLLM was the first candidate. The reasons it lost, in order of weight:
+
+- **Its job is translation, which this design does not need,** and its Messages adapter has open defects with reasoning models on vLLM `[E16]`.
+- **The filtering in step 4 has to be written either way.** No off-the-shelf gateway scopes vLLM's request surface per student.
+- **Its published artifacts were compromised twice in 2026,** the second time three weeks before this document `[E16]`. That is a different risk from having vulnerabilities; vLLM has more advisories than LiteLLM this year `[E23]`. The difference is placement: LiteLLM would be the internet-facing component that authenticates students, while vLLM sits behind an authenticated gateway that filters what reaches it.
+- **Budgets in dollars, single sign-on free for five users, Postgres and Redis to run,** and about three times the idle cost `[E16]`.
+
+It remains the fallback if the owner prefers not to own gateway code (section 15): pinned by digest, admin-issued keys, admin routes blocked at the edge, and the body filter still to be written as a plugin.
+
+### 6.4 Student login
+
+Students already have GitHub accounts. Login uses that identity and leaves nothing reusable on the student's machine except the key itself.
+
+1. `rhi login` asks GitHub for a device code for this project's **GitHub App** and shows the student a short code to confirm in the browser `[E17]`.
+2. The CLI sends the device code to the key issuer and polls.
+3. The issuer redeems the device code with GitHub. GitHub itself guarantees the code belongs to this app. The issuer reads the numeric user ID and checks it against the roster.
+4. The issuer creates an API key, stores only its SHA-256 hash, returns the key once, and discards the GitHub token.
+5. The CLI stores the key in the operating system's keychain, or in a file only the user can read, and configures each harness to fetch it through a helper (`apiKeyHelper` for Claude Code, an auth command for Codex), so the key is not pasted into settings files that get committed.
+
+Why a GitHub App and not an OAuth app: with an OAuth app, whoever starts a device flow chooses the scopes, and the client ID is public. Anyone could start a flow asking for write access to repositories, under the course's name, and send the code to a student. A GitHub App with no permissions yields a token that can read public data only, and it expires in hours `[E17]`. Spike `[S9]` confirms that an app nobody has installed completes the device flow and reads the user ID.
+
+Details that matter:
+
+- The roster is keyed by numeric GitHub ID, because handles can be renamed. The admin manages it with a CLI that uses the admin's own AWS credentials. There is no public admin API.
+- Keys look like `rhi_`, random characters and a checksum, so scanners can recognise one in a homework branch.
+- A student has one key per installation of the CLI, and at most two installations (a laptop and a desktop, say). `rhi login` on an installation replaces that installation's key; the old one stops working within 60 seconds, which is the gateway's lookup cache. Keys expire at course end. An installation is an identifier the CLI creates at its first login and sends with the device code. `rhi revoke` revokes the installation's own key, authenticated by that key; `rhi revoke --all` revokes every key of the student and requires a fresh device flow, since it must work when a key is lost. The issuer's routes all live under `/auth/`.
+- The CLI is given the endpoint once (`rhi login --endpoint`, from the course's private channel) and stores it. It reads the login app's client ID from the issuer (`GET /auth/config`). Neither value is in the repository.
+- The issuer is throttled: reserved concurrency, a WAF rate rule on its path, malformed input rejected before any call to GitHub, a limit on issuances per student.
+- GitHub allows 50 code confirmations an hour per app `[E17]`. Students log in before the first session; an admin command that issues a key directly is the fallback.
+- **What remains:** someone can start a device flow and talk a student into confirming the code, and so obtain a key billed to that student. The key can spend one student's daily budget on inference and nothing else; the student guide says to confirm only a code their own terminal just printed; each login shows when the previous key was issued.
+
+Cognito was considered and rejected: it has no GitHub provider, because GitHub's OAuth is not OpenID Connect `[E17]`.
+
+### 6.5 Edge and network
+
+- **TLS and domain.** A public ALB with an ACM certificate on the owner's domain, the TLS 1.3 security policy AWS recommends, `ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09` at the time of writing, pinned by a policy test (the CDK default still allows TLS 1.1 `[E26]`), and no listener on port 80: a redirect would mean the key already crossed in cleartext. CloudFront's default domain was rejected because its origin timeout breaks non-streaming generations `[E14]`; API Gateway caps streams at 15 minutes and meters requests, not tokens `[E14]`.
+- **WAF.** A per-address rate limit (generous: a campus shares one address), tighter rules scoped to the issuer and Grafana, and the AWS reputation list. No body-inspection rule groups: the cross-site-scripting rule blocks real coding prompts `[E18]`. Request sampling is off or masks the key headers; otherwise API keys would sit in WAF samples in cleartext `[E26]`.
+- **Network.** GPU instances and Fargate tasks are in private subnets with one NAT gateway for outbound calls. No security group for an instance or task admits traffic from the internet; a test asserts it. The public ALB reaches only the gateway, the issuer and Grafana; only the gateway reaches the internal ALB; only the internal ALB reaches port 8000.
+- **Why not save the NAT gateway.** Without it, instances need public addresses, and a security group would be the only thing between the internet and an engine with unauthenticated routes. Outbound-only IPv6 would remove the $37 a month without that exposure; whether every AWS service used here answers on IPv6 is an optional spike, not a dependency.
+
+### 6.6 Privacy
+
+- Prompts and responses are not stored. On a shared engine, the per-student cache salt keeps one student's cached prefixes from being probed by another `[E23]`.
+- What is kept: usage metadata per student, and source addresses in load balancer, WAF and gateway logs. All of it is personal data.
+- Retention is set on every store, not assumed: DynamoDB expiry, CloudWatch log retention, and the Prometheus workspace's retention, all at course end plus 90 days. Per-student series exist only in Prometheus, labelled with a roster alias, not the GitHub ID; CloudWatch metrics cannot be deleted for 15 months, so nothing per-student goes there `[E27]`.
+- The admin CLI can export and erase one student's data.
+- A one-page notice for students names the controller, what is logged, where (AWS, GitHub), for how long, and whether usage counts toward grading. If students are in the EU, the owner picks an EU region before the first login (section 15).
+
+## 7. Observability
+
+### 7.1 Pipeline
+
+```mermaid
+flowchart LR
+  E[Engine /metrics] --> C[Collector on the node]
+  D[DCGM exporter] --> C
+  N[Host metrics] --> C
+  C -- remote write, SigV4 --> AMP[(Managed Prometheus)]
+  G[Gateway] -- collector sidecar --> AMP
+  SC[Scaler] --> AMP
+  AWS[ALB, Auto Scaling, pipeline] --> CW[(CloudWatch metrics)]
+  X[All components] --> LOGS[(CloudWatch Logs)]
+  AMP --> GRAF[Grafana]
+  CW --> GRAF
+  LOGS --> GRAF
+  CW --> AL[Alarms] --> SNS[SNS]
+```
+
+- **Each node pushes its own metrics.** There is nothing to discover: an instance that exists reports, one that is gone stops. AWS's managed collector cannot discover Auto Scaling members `[E19]`.
+- **Managed Prometheus, not CloudWatch's new PromQL store.** CloudWatch has answered PromQL since June 2026 and would remove one service `[E19]`. It limits a query to 7 days and 500 series, which breaks month-to-date panels per student and for cost, and it has open questions about histograms. Managed Prometheus is proven and costs a few dollars a month here.
+- **Scaling does not depend on CloudWatch metrics.** The scaler reads demand from heartbeats. CloudWatch keeps AWS's own metrics and the alarms.
+
+### 7.2 What is collected, and where each number comes from
+
+| Panel group | Source | Path |
+| --- | --- | --- |
+| Engine: what each pool serves, by the quantities of section 4.7 (table below) | Engine `/metrics` | Node collector to Prometheus `[E3]` |
+| GPU: utilization of memory bandwidth and of compute, memory, temperature, power and energy, Xid errors | DCGM exporter, pinned at 4.9 or later: that release renamed the default metrics and changed their units `[E19]` | Node collector to Prometheus |
+| Per student: requests, tokens in and out, errors, budget left | Gateway | Sidecar collector to Prometheus, labelled by alias |
+| What students experience: time to first token and output speed per request, per pool and wire format | Gateway | Sidecar collector to Prometheus; never labelled by student |
+| Fleet: desired, in service, warm, scale decisions and their reasons | Scaler | Prometheus; Auto Scaling's own metrics in CloudWatch |
+| Cold start: seconds per stage, per launch | Lifecycle agent | Node collector to Prometheus |
+| Cost: GPU-hours and estimated dollars per pool, cost per million tokens | Scaler: accrued instance-seconds times the configured hourly price; the gateway's token counts | Prometheus. Labelled an estimate; one billing panel reconciles it against the account's month-to-date charge |
+| Deployments: runs, result, version in service | Pipeline events; the engine's identity report | CloudWatch Logs; Prometheus |
+
+**Performance: section 4.7's prediction, measured.** Each quantity has two sources where it can. The engine sees its own work. The gateway sees what the student got, which adds the wait in front of the engine, the hold and the network. The engine's names below are vLLM's at version 0.33 `[E3]`; the per-engine table of section 4.1 maps them for any other engine.
+
+| Quantity of section 4.7 | From the engine | From the gateway |
+| --- | --- | --- |
+| Output throughput, per pool and per instance | Rate of `vllm:generation_tokens` | Rate of output tokens settled |
+| Input throughput, and the part actually computed | Rate of `vllm:prompt_tokens`, which includes cached tokens; rate of `vllm:prompt_tokens_by_source` for the source `local_compute` | Rate of input tokens settled |
+| Output speed per stream | The mean, as output tokens over decode time: `vllm:request_generation_tokens` over `vllm:request_decode_time_seconds`. The median and the slowest tenth from `vllm:request_time_per_output_token_seconds`. Plotted with the instance's computed-input rate on the same panel, since that is what slows a stream | A histogram of tokens per second for each request, from its first token to its last |
+| Time to first token | `vllm:time_to_first_token_seconds`, at the median and the 95th percentile; its two parts, `vllm:request_queue_time_seconds` and `vllm:request_prefill_time_seconds` | A histogram from request accepted to first token sent, labelled warm or held, and first turn or later. A second one to the first token that is not reasoning, which is when a student sees an answer begin |
+| Transcript size and output per turn, the two assumptions under the estimate | The distributions `vllm:request_prompt_tokens` and `vllm:request_generation_tokens` | The same, from the tokens settled |
+| Prefill speed | Tokens computed over prefill time: `vllm:request_prefill_kv_computed_tokens` over `vllm:request_prefill_time_seconds` | None |
+| Cached share of input | `vllm:prompt_tokens_cached` over `vllm:prompt_tokens` | None |
+| Cache capacity and pressure | `vllm:kv_cache_usage_perc`, `vllm:num_preemptions`. The capacity in tokens is what the engine logs at start; the lifecycle agent exports it as a number, because vLLM's own metric carries it only as a label | None |
+| Sessions the cache forgot | `vllm:kv_block_idle_before_evict_seconds`, with the engine's cache metrics switched on: how long a block sat idle before it was evicted | None |
+| Concurrent streams, and the queue | `vllm:num_requests_running`, `vllm:num_requests_waiting`, for each instance | Requests in flight and held, per pool |
+| Students per instance | None | Students with a request in the last five minutes, over the pool's instances in service. An average only: the gateway cannot know which instance serves a student (section 5.5), so imbalance shows as one instance's queue beside another's |
+| Cost per million tokens | None | The scaler's accrued dollars for the pool over the gateway's token counts, for a session and for the month |
+| Tokens per GPU-hour and per joule | Output throughput over the instances in service; over the rate of the DCGM energy counter | None |
+
+The dashboard code follows six rules, because each has a way of showing a wrong number:
+
+- **Rates are taken per instance and then summed.** An instance's counters restart from zero every time it starts, and a rate over a sum would read that as a fall.
+- **A pool at zero has no engine series at all**, not series at zero. Its panels take the pool's state from the scaler and show "asleep", never a gap or a stale value.
+- **A percentile is shown with the number of requests behind it.** Over a handful of long agent requests it is noise.
+- **The engine's histograms get finer buckets than vLLM's defaults**, set in the pool's engine flags `[E3]`. At 20 to 45 tokens per second a token takes 22 to 50 ms, which the defaults split into two buckets. The mean, a ratio of two sums, needs no buckets, which is why it is the headline.
+- **"Input tokens per second" is not work done**, because the engine's input counter includes cached tokens. The computed part is plotted beside it.
+- **The collector adds the labels** for pool, instance and instance type. vLLM emits only the model's name.
+
+### 7.3 Dashboards, alerts and objectives
+
+Six dashboards (fleet and scaling, GPU health, inference performance, students, cost, deployments), written in Python with the Grafana Foundation SDK and checked in CI. The SDK is a preview at version 0.0.x `[E19]`; plain JSON with a schema check is the fallback.
+
+The inference performance dashboard has one row per pool, and each row answers R9 for that pool: output speed per stream, output throughput, time to first token, cached share, cache use against capacity, concurrent streams and waiting requests, students per instance, and cost per million tokens. The pool's expected values from configuration (section 4.7) are shown on the panels they belong to: reference lines for speed per stream and time to first token, and the expected capacity beside the reported one. A pool that serves less than predicted is visible at a glance. A session view gives the same numbers over one session window, for the record after each class.
+
+Alerts that must work when Grafana is down are CloudWatch alarms to SNS: a pool wanted but nothing in service, the scaler not running, gateway error rate, a GPU-hour ceiling or budget threshold reached, pipeline failure, class-day no-go. The class-day notice also goes to the instructor's phone.
+
+Objectives, measured during session windows:
+
+| Objective | Target |
+| --- | --- |
+| Gateway answers | 99.5% of requests are not 5xx from the gateway's own fault |
+| Time to first token, warm pool | 95th percentile under 5 s, with the first turns of sessions counted apart |
+| Output speed per stream, warm pool | On the coursework pool, the median request at 15 tokens per second or more and the slowest tenth at 10 or more |
+| Cached share of input | Above 85%. When the request profile fails, the share falls to about a third `[E29]`; when affinity fails, to about half |
+| Cold start from the warm pool | 90th percentile under 5 minutes |
+| Pool ready at session start | Every scheduled pool in service 30 minutes before |
+
+The speed targets and the cached share are provisional, held in configuration, until `[S5]` has measured the pool. The estimate of section 4.7 puts the coursework pool at the speed floor, not clear of it.
+
+### 7.4 Which Grafana
+
+| | Grafana OSS on Fargate, behind ALB sign-in | Amazon Managed Grafana |
+| --- | --- | --- |
+| Sign-in | The ALB authenticates against a Cognito user pool with one admin user and mandatory MFA. Unauthenticated requests never reach Grafana | IAM Identity Center, which needs AWS Organizations, or a SAML provider `[E19]` |
+| Dashboards as code | Files in the container image; nothing imperative | Pushed through the HTTP API by a pipeline step with a token minted per run `[E19]` |
+| Manual setup | None beyond the admin's e-mail in configuration | Enable Organizations and Identity Center, create a user, assign the role by API |
+| Cost | About $9 a month | $9 per editor, plus $9 in months the pipeline deploys |
+| Upkeep | This project patches the image | AWS patches it |
+
+**Chosen: self-hosted behind ALB sign-in.** Grafana's own GitHub sign-in cannot be restricted to one user: the documented configuration admits every GitHub user as a viewer, and a viewer may run any query against the data sources `[E24]`. Putting AWS-managed sign-in in front removes Grafana's login page from the internet. Grafana then trusts the identity header the ALB sets, accepts connections from the ALB only, has its login form and default admin account disabled, and its role can query the one Prometheus workspace and named log groups, not the build logs that hold real configuration. A CI test starts the pinned image and asserts that a request without the header is refused and that the default account does not exist `[S10]`.
+
+If the owner already has AWS Organizations or a university SAML provider, Managed Grafana is the better choice and the swap is contained in one stack.
+
+## 8. Delivery
+
+### 8.1 Repository layout
+
+```
+pyproject.toml, uv.lock      one uv project: CDK app, constructs, dev tools
+package.json, package-lock   pins the CDK CLI only
+cdk.json                     "app": "uv run --locked python app.py"; flags only
+app.py                       environment-agnostic; loads configuration through one loader
+src/rhi/                     constructs: network, pools, gateway, access, observability, pipeline, guardrails
+src/rhi/config.py            reads example | file | SSM; fails closed
+config.example.toml          example.com and 123456789012 only
+services/common/             what the services share: key format, error list, records, SSE framing
+services/gateway/            gateway service and its image
+services/issuer/             key issuer
+services/scaler/             the scaler and its decision function
+services/reporter/           the commit-status reporter
+services/engine/             engine images, boot unit, lifecycle agent, mock engine
+services/grafana/            Grafana image and provisioning
+dashboards/                  dashboards as Python
+client/                      the rhi CLI: login, token, wait, revoke
+admin/                       the admin CLI: roster, keys, pool modes, export and erase
+models/manifests/            SHA-256 manifests of the model files
+spikes/                      spike jobs and their measurement records
+scripts/pipeline/            scripts the pipeline's steps run
+tests/                       unit, synth assertions, contract tests, replayed captures
+tests/policy/                invariants over the synthesized templates; protected
+tests/container/             tests that start a container; run by CI only
+tools/                       the factory's own tools: implement loop, hygiene scanner, backlog
+docs/                        design, ADRs, runbooks, student guide, measurements
+```
+
+Students install the CLI with one `uv tool install` command from this repository; the student guide gives it.
+
+### 8.2 Pipeline
+
+CDK Pipelines on CodePipeline V2, queued execution `[E20]`.
+
+1. **Source.** GitHub through a CodeConnections connection created by the pipeline stack. It starts pending; the owner authorizes it once, for this repository only. Push to `main` only.
+2. **Synth.** CodeBuild: `uv sync --locked`, read configuration from SSM into an untracked file, `cdk synth --lookups=false`, tests. cdk-nag's AWS Solutions pack runs inside synth as a policy-validation plugin and fails the build on a finding `[E20]`. The synth role can read the configuration path and nothing else. This step also greps the source tree for the real configuration values, the one place that knows them, and alerts if any is present.
+3. **Self-update.** The pipeline updates its own definition.
+4. **Assets.** Container images to ECR; Lambda bundles.
+5. **Deploy.** Change sets. Held from one hour before to one hour after a scheduled session.
+6. **Verify.** Smoke tests from CodeBuild against the deployed endpoint with a canary roster entry: health, rejection without a key, the forbidden routes, a full wake, hold and completion on the mock pool, metrics present. When a change touches the engine image, the machine image or a pool, the same test runs on the coursework pool and checks the served image digest and model revision. A weekly canary does the GPU test regardless.
+7. **Report.** An EventBridge rule on pipeline state invokes a Lambda that posts a commit status to GitHub (section 8.4).
+
+### 8.3 Checks on a pull request
+
+Pull requests run in GitHub Actions with no AWS credentials and no secrets: lock check, ruff, ty, unit tests, the scaler's decision tests, gateway parser and replay tests, CDK assertion and policy tests, `cdk synth --lookups=false` against the example configuration (which includes cdk-nag), cfn-lint, the hygiene scanner over the tree and over the branch's history, and workflow linting. Actions are pinned by commit.
+
+Tests that start a container, such as the Grafana sign-in test of section 7.4, live under `tests/container/` and run in a CI job of their own, which is part of the required check. The coding agents' host has no container runtime, so those tests are not in the local gate, and an issue that needs one names the capability `host:container-runtime`.
+
+CodeBuild is never triggered by a pull request. On a public repository that would run a stranger's code with a role in the owner's account `[E20]`.
+
+ty is beta and changes diagnostics between releases `[E20]`. It is pinned exactly and is a blocking gate; version bumps arrive as their own pull request.
+
+### 8.4 The trust boundary
+
+**A merge to `main` is deployment rights in the AWS account.** The pipeline deploys every merge, and updates itself first. The controls, from the outside in:
+
+1. **A bounded deployment role.** The account is bootstrapped with a project policy and a permissions boundary instead of the default, which is administrator access `[E20]`. A merged change cannot create IAM users, access keys, identity providers or trust to another account, whatever the template says.
+2. **Invariants as tests.** `tests/policy/` asserts, on the synthesized templates: no ingress from the internet to instances or tasks; the TLS policy; the fleet cap; no wildcard IAM; the pipeline's own roles and steps; no identity provider and no cross-account trust; retention and deletion protection on stateful resources and their logical IDs unchanged; the list of acknowledged cdk-nag findings, each with its reason. These tests are protected: changing them needs an issue that says so and the examiner's approval (ADR 0001).
+3. **A separate identity for agents.** The coding agents push through a GitHub App without the workflows and administration permissions, so GitHub refuses an agent's change to a workflow or a ruleset. Agents run in a sandbox that holds no AWS credentials and no real configuration (ADR 0001).
+4. **A ruleset on `main` with no bypass:** pull request required, required checks that only GitHub Actions can satisfy, no force-push.
+5. **Owner approval for the boundary itself.** Recommended: `CODEOWNERS` on the pipeline stack, the bootstrap policy, `.github/`, the gates and `tests/policy/`, so that ordinary work merges autonomously and only a change to these paths waits for the owner. This is a decision in section 15.
+6. **The approval on widened permissions** that CDK Pipelines offers is kept as a tripwire for honest mistakes. It does not cover the pipeline's own stack, which updates earlier in the same run `[E20]`.
+
+**What the factory learns from a deployment.** Agents hold no AWS credentials, so the commit status is their only view.
+
+- The public status carries a state, a fixed context, and a description chosen from an enumerated set. It never carries text from AWS: error messages contain bucket names, addresses and resource IDs that no deny-list reliably catches.
+- A structured report accompanies a failure, as further commit statuses on the same commit, one per fact. Each is assembled only from allow-listed parts: the stage and action that failed, the logical IDs of failed resources (checked against the names in that commit's own synthesized template), CloudFormation's status codes, the IDs of failed smoke tests, and the last lifecycle stage an instance reached. Enumerations and names from this repository only: no free text, and no commit comment.
+- A pipeline's self-update can cancel executions still queued `[E20]`. The reporter marks such a commit as superseded and names the commit whose execution covers it, so every merge ends with a verdict.
+- Spikes and canaries post their numeric results the same way, and a housekeeping change records them under `docs/measurements/`.
+- Anything beyond that goes to the owner by SNS. Some failures in phases 1 and 2 will therefore need the owner to relay a diagnosis; the design does not pretend otherwise.
+- The reporting Lambda's credential is a GitHub App installation that can write commit statuses on this repository and nothing else.
+
+### 8.5 Production without staging
+
+There is one environment. What stands in for staging:
+
+- The mock pool exercises the whole control loop in the real environment on every deployment.
+- Deployments wait outside session windows.
+- A gateway deployment drains: ECS waits for the old task's target to finish deregistering before it stops the task `[E13]`. With the default delay that is about five minutes, which would cut a held request or a long stream; the gateway's target group is set to 1800 seconds, so requests up to 30 minutes long finish and a gateway deployment takes that long to complete `[S7]`.
+- State is protected: point-in-time recovery, deletion protection and a retain policy on the DynamoDB tables, and a test that fails when a stateful resource's logical ID changes. A rename by a coding agent would otherwise replace the key table and void every student's key mid-course.
+- A failed verification fails the pipeline; the fix is a forward fix or a revert through the same pipeline.
+
+### 8.6 What the owner does once
+
+1. Request GPU quotas. The G family now: 8 vCPUs for each coursework instance, for one more than `max_instances` (section 5.4), and 96 more if the upgrade pool is wanted. The P family only for the optional xl pool.
+2. Register a domain.
+3. Create three GitHub Apps: student login (no permissions, device flow on), status reporter (commit statuses on this repository), and the factory's identity (ADR 0001). Store their secrets in Secrets Manager.
+4. Write the configuration to SSM: domain, admin e-mail, session schedule, ceilings and budget.
+5. Turn on billing alerts in the Billing console; confirm the SNS subscription.
+6. `cdk bootstrap` with the project's execution policy and permissions boundary, then `cdk deploy` the pipeline stack once from a laptop.
+7. Authorize the GitHub connection for this repository only.
+8. Apply the repository ruleset; enable secret scanning and push protection; set a noreply commit address.
+9. Enter the roster through the admin CLI.
+
+And recurring: approve the pipeline's pause when a change widens permissions (frequent in phases 1 to 3), approve changes to the trust boundary if that option is chosen, and run the class-day preflight.
+
+A script walks through the one-time steps and writes nothing account-specific to the working tree.
+
+## 9. Operations
+
+Runbooks delivered in phase 3, each tested once:
+
+class-day preflight · capacity failure during a session · ceiling or kill switch tripped, and re-arming · leaked key · park and unpark · bad deployment · secret and token rotation · machine image and engine upgrade · course-end teardown and data deletion.
+
+Patching: a scheduled GitHub Actions workflow, with no AWS access, checks the pinned engine version against published advisories. When the version falls in the range of a high or critical one, it opens an issue; it is the only workflow allowed to write issues. The issue is a plain one for the owner: the advisory's public identifier, the pinned version and the fixed version. Turning it into backlog work is the owner's step, through the backlog tooling. The fix redeploys and refreshes warm instances. Automated digest updates wait a cooling-off period before adoption, except for security fixes: a compromised release is usually caught within hours `[E16]`.
+
+## 10. Keeping the repository public-safe
+
+Three classes of information, treated differently:
+
+| Class | Examples | Rule |
+| --- | --- | --- |
+| Credentials | Keys, tokens, secrets | Never in git, logs or artifacts |
+| Private by policy | Account ID, ARNs, resource IDs, roster, e-mail, schedule, budget | Never in git or in anything public. AWS does not call an account ID secret `[E21]`; the owner's rule is stricter and cheap to keep |
+| Discoverable | Domain, region, the login app's client ID | Kept out of the repository, but no control may depend on them being secret: forty students hold the domain, and public certificates are logged |
+
+| Risk | Control |
+| --- | --- |
+| `cdk.context.json` caches account and resource IDs | No context lookups. `--lookups=false` in CI and in the pipeline makes a lookup a build failure. The file is ignored by git |
+| Hard-coded environments | Stacks are environment-agnostic; account and region come from the deploying credentials |
+| ARNs, domain, e-mail, schedules | Read from SSM at deploy time, or by the pipeline's synth step into an untracked file. The committed example uses `example.com` and `123456789012` |
+| Synth output, logs, badges | `cdk.out` ignored; no console links or build badges anywhere public |
+| An identifier slips into a change | The project's hygiene scanner (account IDs, ARNs, resource IDs, endpoints, e-mail addresses, local paths) runs at commit, in the factory's verifier before any push, and as a required check. GitHub's own scanning has no account-ID pattern `[E21]` |
+| The real domain or e-mail slips in | No public pattern can name them without leaking them. An owner-local hook holds the literal values in an untracked file; the pipeline's synth step checks the tree for them |
+| A credential slips in | GitHub secret scanning with push protection; gitleaks over the full history in CI |
+| Run logs and pull-request text | Making a private repository public also publishes its Actions logs and discussion. The repository is treated as public from its first commit |
+| Commit metadata | A GitHub noreply address for commits |
+| Tests and captures | Tests use the example configuration whatever the environment. Captures are recorded against the mock engine under an example host and scrubbed |
+| Messages to students and to GitHub | Fixed vocabularies (sections 5.3 and 8.4) |
+| Coding agents | Agents work against the example file, in a sandbox without AWS credentials |
+
+What these controls do not give: a guarantee. A hook can be bypassed by a person, and a scanner can miss a value it has no pattern for. The layers make a leak unlikely and make it visible; the checklist for going public ends with a scan of the whole history.
+
+## 11. Cost
+
+Prices are US East list prices; the GPU prices were checked against AWS's published price feed, except that of `g7e.24xlarge`, which comes from a price tracker `[E5]`. Everything computed from assumptions is marked as an estimate.
+
+### 11.1 GPU time
+
+For the whole course, sessions only: 12 live hours, plus a 60-minute pre-warm and a 20-minute idle tail for each of five sessions, is about 19 GPU-hours per instance.
+
+| Pool | $/hour | Whole course, one instance | Each further 10 hours of homework use |
+| --- | --- | --- | --- |
+| coursework, `g7e.2xlarge` | 3.36 | about $63 | $34 |
+| upgrade, `g7e.24xlarge` | 16.57 | about $310 | $166 |
+| xl, `p5en.48xlarge` | 63.30 | about $1,180 | $633 |
+
+Multiply the coursework row by the number of instances a session needs (section 4.7). A class of twenty needs one or two while it works hands-on, and three to five in a session where each student runs several agents. Two instances for every session come to about $125 for the course, and four to about $250, until `[S5]` gives the real numbers. The larger pools carry a class of twenty on one instance. Each release that touches a pool also costs one GPU start per warm instance, and each scale-in may cost a few drain minutes `[S7]`. Homework hours are the open variable, and the owner's to estimate (section 15).
+
+**Compared with a managed model.** AWS's managed DeepSeek-V3.2 on Bedrock costs $0.62 and $1.85 per million input and output tokens `[E22]`. An agent re-sends its transcript every turn, so input dominates: about a hundred input tokens for each output token `[E31]`. Replays of real sessions give the volume: a running agent sends a request every 12 to 25 seconds, which at a 50,000-token transcript is 7 to 15 million input tokens for each hour an agent runs, or $4 to $9 at that price if no cached rate applies (not checked). A class of 20 to 40 whose agents run a third of the 12 live hours would then cost roughly $350 to $1,500 there, against $125 to $250 of GPU time on the coursework pool, or $310 on the upgrade pool. The estimate is a guess about how students work, and the models differ, but it leans towards self-hosting for the sessions; the fixed platform of section 11.2 is what a managed model would save. Bedrock offers Chat Completions and Responses but not Messages `[E22]`, so it is not a drop-in fallback for Claude Code.
+
+### 11.2 What does not scale to zero
+
+| Item | Per month | Note |
+| --- | --- | --- |
+| Public ALB and its two public addresses | $26 | |
+| Internal ALB | $18 | Also the engine's route allow-list |
+| NAT gateway and address | $37 | Section 6.5 |
+| Gateway on Fargate, two tasks of 0.5 vCPU and 1 GB | $29 | One task: $14 |
+| Grafana on Fargate | $9 | |
+| WAF | $10 | |
+| Warm pool disk, per warm instance | $12 | Two on the coursework pool. The scheduled pools keep no warm instance |
+| Prometheus, CloudWatch, S3, ECR, secrets, DNS, Lambda | $20 | Estimate |
+| **Total at idle** | **about $170** | Estimate, with two warm instances on the coursework pool; about $400 over a ten-week course |
+
+Not in the table: the weekly GPU canary (about $1.50 a run, since each wake also pays the idle tail), and the pipeline itself. While the factory is building the system, ten merges a day at an estimated $0.25 to $0.50 a run is $75 to $150 a month.
+
+Levers, in order of effect:
+
+- **`parked`.** A configuration flag that removes the load balancers, NAT, Fargate services and warm pool, leaving data and the pipeline: a few dollars a month. It is the right state between cohorts, and outside homework periods if the owner accepts unparking before use. Delivered and tested in phase 3.
+- One gateway task instead of two ($14): loses zone redundancy, keeps rolling deployments.
+- One warm instance instead of two on the coursework pool ($12): the second instance is then always a cold launch.
+- Outbound IPv6 instead of the NAT gateway ($37), after its spike.
+
+### 11.3 Guardrails
+
+- **Hard caps:** `max_instances` per pool; GPU vCPU quotas; a list of allowed instance types. Configuration validation refuses `wake = "on-demand"` for a pool above a price threshold.
+- **GPU-hour ceilings, enforced in-band.** The scaler accrues every pool's GPU-seconds and refuses to wake a pool past its daily or monthly ceiling. This is the real total cap. Token budgets alone do not bound it: one small request every 19 minutes would keep a coursework instance up all month for about $2,400. A GPU-hour here is one instance running for an hour, whatever its number of GPUs. The daily ceiling must cover a session's instances for its length plus 80 minutes of pre-warm and idle tail: the default for the coursework pool, 16, covers two instances through the four-hour first session, which uses 10.7, and four instances would need 22.
+- **One operating state.** Each pool's mode (`enabled`, `scheduled-only`, `disabled`, `budget-latched`) lives in one record that the scaler and the gateway read. It survives deployments, and only the admin CLI clears a latch or re-enables a pool. (`parked`, in section 11.2, is something else: a deployment flag that removes infrastructure.)
+- **AWS Budgets as the backstop.** Its data is updated about once a day, so it is a brake, not a cap. At 100% it latches every pool.
+- **Per student:** daily token budget, concurrency limit, key expiry. The budget counts every input token, cached or not, and an agent re-sends its transcript on each request (section 4.7), so the default is large: 100 million tokens a day, about twice what a heavy four-hour session sends. It is a fairness guard between students; the GPU-hour ceilings are the cost cap. Wakes and idle-extension minutes are attributed to the student who caused them, and an alarm fires when a pool is in service long outside sessions.
+- **Detection:** Cost Anomaly Detection, and the cost dashboard.
+
+## 12. Why this will work
+
+Each load-bearing mechanism, the evidence for it, and what is still assumed.
+
+| Mechanism | Evidence | Still assumed |
+| --- | --- | --- |
+| A group with minimum 0 starts on one API call | Standard EC2 Auto Scaling behaviour | — |
+| Stopped warm pool with GPU instances, reused on scale-in, refreshed on a release | Documented, including the refresh order; hibernation excluded for GPU `[E10]` | `[S1]` restart time and failure rate; `[S7]` how long an idle instance takes to leave, and draining on the return-to-pool path |
+| A single scaler decides pool size | Design; decision function tested without AWS | — |
+| Holding a stream for up to 7 minutes | Client timeouts documented or read from source `[E12]`; ALB idle timeout up to 4000 s `[E13]` | `[S2]` every client survives the hold |
+| Three wire formats without translation | vLLM documents all three routes `[E3]`. Its own replay of Claude Code traffic names the defects for each model family, and the request profile covers the three that stop a session on the coursework model `[E28]` | `[S3]` each harness completes a tool-calling task with the profile in place; `[S6]` the same on the upgrade model |
+| The engine is reachable only through four routes | vLLM's security guide prescribes exactly this `[E23]` | — |
+| Budgets cannot be evaded by disconnecting | Reserve-then-settle on a conditional write | — |
+| Weights from S3 in seconds | AWS measurements `[E11]` | `[S4]` on our models and loader settings |
+| The coursework model does the coursework | Its publisher's results inside Claude Code; one independent index; the previous generation on an independent benchmark `[E28]` | `[S3]` the course's own kind of task, in each harness |
+| What one instance serves (section 4.7) | Arithmetic from the GPU's memory bandwidth and the model's shape, checked against measurements of the same model on other GPUs `[E29]` | `[S5]` every row of the table, measured with replayed sessions |
+| The upgrade model on AWS | A vLLM recipe verified on four of the G7e GPU `[E28]` | `[S6]` it loads and serves on the instance type, and what it serves |
+| A student's turns reach the instance that holds their cached transcript | ALB stickiness is documented with least-outstanding routing, and moves when a target leaves `[E13]` | `[S8]` a replayed cookie pins a student with two targets in two zones |
+| Login with a zero-permission GitHub App | GitHub's documentation `[E17]` | `[S9]` an uninstalled app completes the flow |
+| Grafana behind ALB sign-in | Both features are long-standing | `[S10]` the pinned configuration refuses everything else |
+| Metrics pushed from nodes to Managed Prometheus | Documented remote write with SigV4 | — |
+| Checks without credentials | `--lookups=false`, assertion tests, cdk-nag as a plugin `[E20]` | `[S11]` ty on current aws-cdk-lib; environment-agnostic stages in CDK Pipelines |
+| The factory sees deployment results | EventBridge and the commit-status API | — |
+
+### Validation spikes
+
+Each is a short experiment with a pass condition and a consequence. Spikes that need AWS run as pipeline jobs and post numeric results through the reporter (section 8.4); the owner starts the ones that cost real money.
+
+| ID | Question | Pass | If it fails |
+| --- | --- | --- | --- |
+| S1 | How long is each stage from stopped to serving on the coursework pool's instance type, and from cold? Is the engine image still on disk after a stop and start? How often does a stopped instance fail to start? | Warm start under 5 min at the 90th percentile over 20 starts | Bake the image; lower expectations for homework; rely on pre-warm for sessions |
+| S2 | Does each client survive a 7-minute held stream and a 4-minute held call? Codex with its default timer and with the profile `rhi login` writes | No client aborts with the profile in place | Shorter hold for that client; document `rhi wait` |
+| S3 | Does each harness complete a multi-turn tool-calling task of the course's kind on the coursework model? With Claude Code's default settings: is every request accepted, including its short side queries; does an image inside a tool result arrive; does a session that fills its window compact and continue; and how much of a replayed session's input is served from the cache? A run shaped like the second session: a skill loaded and a tool added in mid-session, a PDF read, a pack's parallel agents with a figure, a web search. Each of these on the 8-bit and on the 4-bit build | Claude Code, Codex and an SDK script pass, or the owner waives one in writing; at least 85% of the replayed session's input is cached; each step of the second-session run works or has a documented limit and workaround | An addition to the request profile, another engine version, the fallback model of section 4.2, or a harness marked unsupported for that pool |
+| S4 | Weights load time from S3, tuned | Under 100 s for the coursework model's 31 GB | Download, then load |
+| S5 | What does one coursework instance serve? Every row of section 4.7's table, with replayed agent sessions of both shapes, hands-on and several agents a student, at 1, 4, 8 and 16 streams and at the class's size, on the 8-bit and the 4-bit build. What cache size does the engine report at start? How long are real transcripts and turns? What does each lever of section 4.7 change? | At the class's size over the session's instances: 95th-percentile time to first token under 5 s, first turns apart; the median stream at 15 tokens per second or more and the slowest tenth at 10 or more (provisional floors, in configuration); no preemptions | The levers of section 4.7 in order; then fewer streams and more instances per session, or the upgrade pool |
+| S6 | Does Qwen3.8-Flash-Next on `g7e.24xlarge` load and serve under vLLM, on all three routes with tool calls? How long is the load from S3, and what does the instance serve, by the measures of section 4.7? The same for the xl pool if the owner wants it | Loads within the launch hook's timeout; routes answer; a class's sessions within the floors of S5 | The upgrade pool waits, and scheduled sessions run on more coursework instances |
+| S7 | On the mock pool: how long does an idle instance take to leave service, when terminated and when returned to the warm pool? Does a request in flight survive a scale-in and a gateway deployment? Is a wake right after a long idle ever lost? | An idle instance stops within a minute or two; in-flight requests finish; no wake is lost | A shorter delay with protection as the only drain, or balancing in the gateway without the internal ALB |
+| S8 | On the mock pool, with two instances in two zones: does a replayed stickiness cookie keep one student on one instance, and move when that instance leaves? | Every request of a student reaches one instance until it leaves | The fallback of section 5.5: a pool stays at one instance, and a class that needs more runs on the upgrade pool |
+| S9 | A GitHub App with no permissions and no installation completes the device flow; the issuer reads the user ID | Yes | Fall back to an OAuth app with the phishing risk documented, or admin-issued keys |
+| S10 | Grafana behind ALB and Cognito with the pinned settings | The CI assertions and a deployed check pass | Managed Grafana |
+| S11 | ty on current aws-cdk-lib; environment-agnostic stages in CDK Pipelines | A clean gate on a hello-world stack; the phase 0 deployment | Adjust ty rules; give stages an environment from pipeline variables |
+
+S9, S10 and the first half of S11 need no GPU and come first. S1 to S5 are the exit of phase 2, on the coursework pool; S5 can also replay a public set of recorded Claude Code sessions, which makes its numbers comparable with published benchmarks `[E31]`. S6 costs real money (about $17 an hour on the upgrade pool, $63 on the xl pool) and is the owner's call.
+
+## 13. Risks
+
+| Risk | Likelihood | Effect | Response |
+| --- | --- | --- | --- |
+| Cold start slower than estimated | Medium | Holds time out; homework users wait | S1 early; baked image; pre-warm for sessions; `rhi wait` |
+| No GPU capacity when a class starts | Medium for the coursework pool, higher for the larger types | No model | Three zones, fallback types, 60-minute pre-warm, go or no-go notice, fallback pool |
+| The coursework model does not work with Claude Code | Medium | The anchor harness is unusable on it | The request profile for the three known defects; S3 in phase 2, before any session depends on it; the fallback models of section 4.2 |
+| A harness or engine update breaks the request profile | Medium over a term | Requests refused, or the cache stops helping and every turn is slow | Captures replayed in CI; the cached-share objective and its panel; each entry tied to a named engine defect; harness versions noted in the student guide |
+| An instance serves fewer students, or serves them slower, than section 4.7 estimates | High: the estimate already sits on the floor | Slow replies or queueing during a session, most of all in the second session | S5 before any session; the levers of section 4.7; more instances for the session, or the upgrade pool; the dashboard shows it live against the prediction |
+| A step of the second session does not work behind vLLM: a PDF, a skill loaded mid-session, a web search | Medium | That part of the session needs a workaround on the day | `[S3]` runs a session of that shape first; the request profile for PDFs; limits and workarounds in the student guide |
+| The coursework model is weaker at the work than its publisher's numbers suggest | Medium | Students fight the model instead of learning the harness | S3 on the course's own tasks; the upgrade pool for sessions; the model is one configuration entry |
+| A student request stalls the shared engine | High without filtering | The pool is down for everyone | Body allow-list; liveness by inference; engine patch policy |
+| A bug in gateway accounting or authentication | Medium | Wrong budgets, or a bypass | Heaviest tests here; small code; keys carry no other privilege |
+| A student leaks a key | High over a term | That student's daily token budget, and GPU time bounded by the pool's ceiling | Recognisable prefix, revocation within a minute, ceilings |
+| A bad merge reaches the account | Low | Whatever the deployment role allows | Section 8.4 |
+| Runaway cost | Low | Money | Section 11.3, independent layers |
+| Self-hosted Grafana falls behind on patches | Medium | Low: nothing reaches it unauthenticated | Pinned digest, updates through the pipeline |
+| The idle cost is judged too high | Medium | Owner unhappy with about $170 a month | `parked`; one gateway task; one warm instance; IPv6 egress |
+| The factory cannot diagnose an AWS-only failure | High in phases 1 and 2 | Work waits for the owner | Structured reports; the owner relays the rest |
+
+## 14. Rollout
+
+| Phase | Delivers | Exit criteria |
+| --- | --- | --- |
+| 0 | Owner prerequisites (8.6); repository scaffold; the bounded bootstrap; policy tests; S11 | The pipeline deploys an empty stage; a commit status appears on GitHub |
+| 1 | Network, gateway (routes, validation, reserve-and-settle, hold), issuer and CLI, scaler, mock pool, Prometheus, Grafana behind sign-in, state protection; S9, S10 | A student key works end to end against the mock pool; the scaler's scenarios and the forbidden-route tests pass in the pipeline's verification |
+| 2 | The coursework pool with its warm pool, its request profile and student affinity; S1 to S5, S7 and S8 | Measured cold start, hold behaviour, harness results and what one instance serves recorded under `docs/measurements/`; the weekly canary green twice |
+| 3 | Ceilings and kill switch, schedules and class-day notice, all dashboards and alarms, `parked`, the runbooks of section 9, privacy notice and data commands, student guide | A dry-run class on the coursework model: the expected number of concurrent harness sessions for an hour, within the objectives of 7.3 and the ceilings |
+| 4 | The upgrade pool: Qwen3.8-Flash-Next on four GPUs, under vLLM; S6. The xl pool only if the owner asks for it | A scheduled session served by the upgrade pool |
+
+Phase 0 costs almost nothing. Phase 1 turns on the idle floor of section 11.2. Phases 0 and 1 need no GPU quota, so they can start the day the owner approves; the quota request should go in the same day, because nobody documents how long it takes `[E6]`.
+
+No dates are given because the design does not know the first session's date. It is the first thing section 15 asks.
+
+## 15. Decisions for the owner
+
+1. **Dates.** When is the first session that should use this endpoint, and what do students use if it is not ready?
+2. **The coursework model.** Recommended: Qwen3.8-27B on one 96 GB GPU, at $3.36 an hour for each instance (section 4.2), subject to `[S3]`. This also answers "a cheap model first" (R8): there is no cheaper GPU tier below it. Accept both?
+3. **Scheduled sessions and the upgrade model.** Should scheduled sessions run on several coursework instances, or on the upgrade pool at $16.57 an hour, with one instance for the class and each student served faster by a margin nobody has measured? The upgrade model's licence needs a reading first. It requires "a separate license" from its publisher of a licensee who "conducts a Model as a Service ... business" and uses the model "for any commercial purpose". It defines Model as a Service as "giving a third party access to language model inference ... (e.g., via API or a hosted endpoint)", and exempts internal use only if the model's capabilities are not made "available to any third party" `[E28]`. An endpoint for students is the activity described. Whether a university course is a business with a commercial purpose, and who counts as an affiliate, is the owner's question, or their institution's. The coursework model, under Apache-2.0, raises none of this.
+4. **Harnesses.** Which must work: Claude Code, Codex, SDK scripts, others? Claude Code on open models is unsupported by its vendor.
+5. **Class size and homework.** How many students, and how many hours of use outside sessions? The estimate is 10 to 20 students for each coursework instance while they work hands-on, and 4 to 8 when each runs several agents (section 4.7). The class size and the kind of session therefore set each session's instances, `max_instances`, the GPU quota and the daily ceiling. Homework users on a cold pool wait an estimated 2 to 6 minutes, and longer when the warm instance cannot start.
+6. **Money.** A monthly ceiling for the kill switch; GPU-hour ceilings per pool; whether about $170 a month while the endpoint is up is acceptable, with `parked` between uses; a budget for the paid spike (S6).
+7. **Gateway.** Own a small custom gateway, as chosen here, or accept LiteLLM with its risks?
+8. **Trust boundary.** Should changes to the pipeline, workflows, gates and policy tests wait for the owner's approval (recommended), or merge autonomously like everything else? Should production deployments during course weeks wait for a person?
+9. **Region and privacy.** US East by default. An EU region if students' data should stay in the EU; Stockholm has the widest GPU selection there `[E5]`. Who signs the privacy notice?
+10. **Domain.** Which domain or subdomain.
+11. **Grafana.** Self-hosted behind ALB sign-in, as chosen, or Managed Grafana if Organizations or SAML is already in place.
+12. **Continuity.** May a managed model stand in for a session if no GPU capacity is available? That relaxes R2 and R3 for that session, and works for Codex and SDK clients only.
+
+## 16. Alternatives considered
+
+| Area | Alternative | Why not |
+| --- | --- | --- |
+| Whole system | Bedrock's managed open-weight models, no GPUs | Not self-hosted, no Messages route, and R2 and R3 ask for machines loading open weights. Section 11.1 compares the cost |
+| Engine | Ray Serve around vLLM | Section 4.6: no Messages or Responses route, a pinned and older vLLM, a second writer of fleet size, a trusted-cluster security model `[E30]` |
+| Engine | DeepInfer | As released, an offline batch library with no server and no metrics, one supported model, and on AWS an 8-GPU instance at about $114 an hour `[E1]` |
+| Engine | SGLang, TGI, llama.cpp | vLLM serves the three wire formats natively and publishes a recipe for each model of section 4.2 `[E3][E28]`. SGLang stays the fallback (section 4.1) |
+| Compute | ECS Managed Instances, SageMaker, EKS, Bedrock import | Section 4.5 |
+| Model | A DeepSeek model | None fits one GPU; the one that works unchanged in Claude Code reads no images and costs $33 an hour; the strongest is the optional xl pool (section 4.2) |
+| Model | A cheaper GPU tier to prove the plumbing first: a small model, or the coursework model at 4 bits on a 48 GB GPU | The first runs a different chat template and parsers and proves none of the request handling the coursework model needs; the second is another configuration to keep working, to save $1.12 an hour (section 4.2) |
+| Model | The faster 3B-active models; gpt-oss; Devstral; Gemma | Section 4.2: weaker at agent work, or defects in Claude Code that a gateway cannot repair |
+| Capacity | Capacity Blocks | P-family types only, so the xl pool and not the G7e pools; a day at a time, paid up front; many times the cost of the hours used `[E7]`. Worth it only as insurance for one critical session |
+| Capacity | Spot instances | Incompatible with warm pools in mixed groups; an interruption kills a generation mid-stream `[E10]` |
+| Scaling | CloudWatch alarms and step policies, with the gateway setting capacity directly | Several writers race; gauges sum wrongly across gateway tasks; a forced stop is undone by the next alarm (section 5.1) |
+| Weights | Baked into the machine image, EFS, FSx | Slow first read, or high idle cost `[E11]` |
+| Gateway | LiteLLM, Bifrost, APISIX, Kong, Envoy AI Gateway | Section 6.3; the others are less proven, need Kubernetes, or keep token limits in a paid tier `[E16]` |
+| Edge | CloudFront default domain; API Gateway | Section 6.5 |
+| Network | Public subnets without NAT | An engine with unauthenticated routes one security group from the internet |
+| Login | An OAuth app; Cognito; admin-distributed keys only | Section 6.4. Admin-issued keys remain as a fallback command |
+| Metrics | CloudWatch PromQL store; CloudWatch only | Section 7.1 |
+| Grafana | Grafana's own GitHub sign-in; Managed Grafana; Grafana Cloud | Section 7.4; telemetry would leave the account |
+| Delivery | GitHub Actions deploying with OIDC | Owner asked for CodePipeline; this also keeps every AWS credential out of GitHub |
+| Environments | A separate staging stage | Doubles the idle floor for 12 live hours; section 8.5 |
+
+## 17. Configuration defaults
+
+Numbers the sections above leave to configuration. Each is a default, not a decision the code depends on.
+
+| Setting | Default |
+| --- | --- |
+| Rate limit at the edge, per source address | 2,000 requests per 5 minutes |
+| Rate limit on the issuer's routes, per source address | 100 requests per 5 minutes |
+| Rate limit on Grafana, per source address | 300 requests per 5 minutes |
+| Issuer's reserved concurrency | 5 |
+| Key issuances per student | 5 a day |
+| Request body limit | 8 MB |
+| Longest request | 30 minutes |
+| Student's daily token budget | 100 million tokens, input plus output, cached input included |
+| Student's concurrent requests | 4 |
+| Hold | 420 s for a stream, 240 s for a non-streaming call |
+| Keep-alive interval | 10 s |
+| `Retry-After` | 30 s for `warming`, 60 s for `capacity_unavailable`, 5 s for `concurrency_limit` |
+| Heartbeats | Every 5 s from each gateway task and each instance; ignored after 20 s |
+| Idle time before a pool scales to zero | 20 minutes |
+| Pre-warm lead before a session | 60 minutes for the coursework pool |
+| Drain | 300 s for a pool, 1800 s for the gateway |
+| Stickiness on a pool's target group (section 5.5) | 3600 s, renewed by every request |
+| Launch hook timeout until spike S1 has measured a start | 15 minutes for the coursework pool |
+| Margin added to the drain for the termination hook | 60 s |
+| Limits the body filter clamps to | The pool's own: its context length and its largest output |
+| Hourly price above which a pool cannot be `wake = "on-demand"` | $5 |
+| GPU-hour ceilings, coursework pool | 16 a day, 150 a month |
+| `target_concurrency`, coursework pool | 8, the engine's limit on requests running at once |
+| Nightly stop | 02:00 in the configured time zone |
+| "In service long outside sessions" alarm | 3 hours |
+| Gateway error-rate alarm | More than 5% of requests failing for the gateway's own fault over 5 minutes |
+| Budget notifications | At 50%, 80% and 100% of the monthly amount |
+| Cooling-off before an automated digest update is adopted | 7 days, none for a security fix |
+| Floors for spike S5 and for the objectives of section 7.3 | Time to first token under 5 s at the 95th percentile, first turns apart; the median stream at 15 tokens per second or more; the slowest tenth at 10 or more |
+| Cached share of input below which the dashboard flags a pool | 85% |
+| Students moved by one rebalance number, and the least time between two | About one in ten; 60 s |
+| Instances a session window pre-warms | 1, unless the schedule names more |
+| Reasoning effort sent to the coursework model | `low` and `medium` unchanged; `high`, `xhigh` and `max` as `xhigh` |

@@ -1,0 +1,453 @@
+"""GitHub access. `GhCli` talks to the real API through `gh api`; `FakeGitHub` is the
+in-memory double used by the tests; `RecordingGitHub` captures real read responses as a
+fixture for those tests.
+
+`GhCli` retries transient failures (HTTP 5xx, 429, rate limits, network errors) with backoff.
+A call whose repetition is harmless (GET, PUT, PATCH, DELETE, and the POSTs that only add to a
+set) is retried on any of them. Any other POST creates something, so it is retried only when
+GitHub certainly did not act on it: the host could not be reached, or a rate limit refused the
+request. After a 5xx or a broken connection it may have taken effect, so it is not repeated; the
+engine looks up what it creates (a PR by its branch, an issue or a comment by its marker) before
+creating it again. A transient failure that outlasts the retries raises `GitHubUnavailable`, so
+the engine can tell an outage from a real error; any other failure raises `GitHubError` at once.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import time
+import urllib.parse
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Protocol
+
+PER_PAGE = 100
+RETRY_DELAYS_S = (5, 15, 45)   # seconds slept before each retry of a transient failure
+
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+_RATE_LIMITED = re.compile(r"rate limit|abuse", re.IGNORECASE)
+# The request never reached GitHub: no name resolution (gh says "error connecting to <host>"), no
+# connection, or no TLS session (a request is sent only once the handshake is done).
+_NOT_SENT = re.compile(r"could not resolve host|no such host|error connecting to|connection refused|tls handshake",
+                       re.IGNORECASE)
+# The connection broke or timed out: the request may or may not have reached GitHub.
+_NETWORK = re.compile(r"connection reset|timeout|timed out|\bEOF\b", re.IGNORECASE)
+
+
+class GitHubError(RuntimeError):
+    pass
+
+
+class GitHubUnavailable(GitHubError):
+    """GitHub could not be reached, or kept failing transiently through every retry: an outage,
+    not an answer to the request."""
+
+
+def transient(stderr: str, stdout: str = "") -> str | None:
+    """How a failed `gh api` call failed, from its output: "not-sent" when GitHub certainly did not
+    act on it (the host was unreachable, or a rate limit refused it), "unknown" when it may have (a
+    5xx, a broken or timed-out connection), None when the failure is not transient (a 4xx answer,
+    an authentication problem)."""
+    text = f"{stderr}\n{stdout}"
+    codes = _HTTP_STATUS.findall(stderr)
+    if codes:
+        status = int(codes[-1])
+        if status == 429 or (status == 403 and _RATE_LIMITED.search(text)):
+            return "not-sent"
+        return "unknown" if 500 <= status <= 599 else None
+    if _RATE_LIMITED.search(text) or _NOT_SENT.search(text):
+        return "not-sent"
+    return "unknown" if _NETWORK.search(text) else None
+
+
+class GitHub(Protocol):
+    # reads
+    def get_issue(self, n: int) -> dict: ...
+    def list_sub_issues(self, n: int) -> list[dict]: ...
+    def list_blocked_by(self, n: int) -> list[dict]: ...
+    def list_comments(self, n: int) -> list[dict]: ...
+    def find_pr(self, head: str) -> dict | None: ...
+    def required_check(self, sha: str, name: str) -> str | None: ...
+    def required_check_run(self, sha: str, name: str) -> dict | None: ...
+    def find_issue(self, label: str, marker: str) -> int | None: ...
+    # writes
+    def create_comment(self, n: int, body: str) -> dict: ...
+    def update_comment(self, comment_id: int, body: str) -> dict: ...
+    def edit_issue(self, n: int, *, body: str | None = None, state: str | None = None, state_reason: str | None = None) -> dict: ...
+    def add_labels(self, n: int, labels: list[str]) -> None: ...
+    def remove_label(self, n: int, label: str) -> None: ...
+    def ensure_label(self, name: str, color: str, description: str) -> None: ...
+    def create_pr(self, head: str, base: str, title: str, body: str) -> dict: ...
+    def update_pr(self, n: int, body: str) -> dict: ...
+    def merge_pr(self, n: int, sha: str, method: str = "squash") -> dict: ...
+    def rerun_failed(self, sha: str) -> bool: ...
+    def failed_log(self, sha: str) -> str: ...
+    def create_issue(self, title: str, body: str, labels: list[str]) -> dict: ...
+
+
+class GhCli:
+    """The real API, through the authenticated `gh` CLI. Pins the REST API version."""
+
+    def __init__(self, repo: str, api_version: str = "2022-11-28", runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+                 sleep: Callable[[float], None] = time.sleep, retry_delays: tuple[float, ...] = RETRY_DELAYS_S):
+        self.repo = repo
+        self.api_version = api_version
+        self._run = runner
+        self._sleep = sleep
+        self.retry_delays = tuple(retry_delays)
+
+    def _api(self, path: str, method: str = "GET", payload: dict | None = None, ok_codes: tuple[int, ...] = (),
+             idempotent: bool | None = None) -> Any:
+        """One REST call. An HTTP error in `ok_codes` means "nothing to do" and returns None.
+        `idempotent` says whether repeating the call is harmless; by default every method but POST
+        is. What is retried, and what is raised, is in the module docstring."""
+        args = ["gh", "api", "--method", method, "-H", f"X-GitHub-Api-Version: {self.api_version}",
+                "-H", "Accept: application/vnd.github+json", path]
+        if payload is not None:
+            args += ["--input", "-"]
+        repeatable = method != "POST" if idempotent is None else idempotent
+        attempt = 0
+        while True:
+            attempt += 1
+            proc = self._run(args, input=json.dumps(payload) if payload is not None else None,
+                             capture_output=True, text=True)
+            if proc.returncode == 0:
+                out = proc.stdout.strip()
+                return json.loads(out) if out else None
+            stderr, stdout = proc.stderr or "", proc.stdout or ""
+            for code in ok_codes:
+                if f"HTTP {code}" in stderr:
+                    return None
+            detail = (stderr or stdout).strip()[:500]
+            kind = transient(stderr, stdout)
+            if kind is None:
+                raise GitHubError(f"gh api {method} {path} failed: {detail}")
+            if kind == "unknown" and not repeatable:
+                raise GitHubUnavailable(f"gh api {method} {path} failed and may have taken effect, so it was not "
+                                        f"repeated: {detail}")
+            if attempt > len(self.retry_delays):
+                raise GitHubUnavailable(f"gh api {method} {path} still failing after {attempt} attempts: {detail}")
+            self._sleep(self.retry_delays[attempt - 1])
+
+    def _pages(self, path: str) -> list[dict]:
+        items: list[dict] = []
+        sep = "&" if "?" in path else "?"
+        page = 1
+        while True:
+            batch = self._api(f"{path}{sep}per_page={PER_PAGE}&page={page}") or []
+            items.extend(batch)
+            if len(batch) < PER_PAGE:
+                return items
+            page += 1
+
+    def _r(self, tail: str) -> str:
+        return f"repos/{self.repo}/{tail}"
+
+    def get_issue(self, n):
+        return self._api(self._r(f"issues/{n}"))
+
+    def list_sub_issues(self, n):
+        return self._pages(self._r(f"issues/{n}/sub_issues"))
+
+    def list_blocked_by(self, n):
+        return self._pages(self._r(f"issues/{n}/dependencies/blocked_by"))
+
+    def list_comments(self, n):
+        return self._pages(self._r(f"issues/{n}/comments"))
+
+    def find_pr(self, head):
+        owner = self.repo.split("/")[0]
+        prs = self._api(self._r(f"pulls?state=all&head={urllib.parse.quote(owner + ':' + head)}")) or []
+        open_prs = [p for p in prs if p.get("state") == "open"]
+        return (open_prs or prs or [None])[0]
+
+    def required_check(self, sha, name):
+        run = self.required_check_run(sha, name)
+        if run is None:
+            return None
+        return run["conclusion"] if run["status"] == "completed" else "pending"
+
+    def required_check_run(self, sha, name):
+        """The latest check run called `name` on `sha`: its id (a re-run gets a new one), status
+        and conclusion."""
+        data = self._api(self._r(f"commits/{sha}/check-runs?check_name={urllib.parse.quote(name)}&filter=latest")) or {}
+        runs = data.get("check_runs", [])
+        if not runs:
+            return None
+        run = max(runs, key=lambda r: r.get("id", 0))
+        return {"id": run.get("id"), "status": run.get("status"), "conclusion": run.get("conclusion")}
+
+    def find_issue(self, label, marker):
+        """An issue (open or closed) with `label` whose body carries `marker`. Listing by label has
+        no search-index delay, so an issue created a moment ago is found."""
+        for issue in self._pages(self._r(f"issues?state=all&labels={urllib.parse.quote(label)}")):
+            if marker in (issue.get("body") or "") and "pull_request" not in issue:
+                return issue["number"]
+        return None
+
+    def create_comment(self, n, body):
+        return self._api(self._r(f"issues/{n}/comments"), "POST", {"body": body})
+
+    def update_comment(self, comment_id, body):
+        return self._api(self._r(f"issues/comments/{comment_id}"), "PATCH", {"body": body})
+
+    def edit_issue(self, n, *, body=None, state=None, state_reason=None):
+        payload = {k: v for k, v in {"body": body, "state": state, "state_reason": state_reason}.items() if v is not None}
+        return self._api(self._r(f"issues/{n}"), "PATCH", payload)
+
+    def add_labels(self, n, labels):
+        # adds to the issue's label set: adding a label it already has changes nothing
+        if labels:
+            self._api(self._r(f"issues/{n}/labels"), "POST", {"labels": labels}, idempotent=True)
+
+    def remove_label(self, n, label):
+        self._api(self._r(f"issues/{n}/labels/{urllib.parse.quote(label, safe='')}"), "DELETE", ok_codes=(404,))
+
+    def ensure_label(self, name, color, description):
+        # repeating a creation that took effect answers 422 (already exists): fine, see ok_codes
+        self._api(self._r("labels"), "POST", {"name": name, "color": color, "description": description},
+                  ok_codes=(422,), idempotent=True)
+
+    def create_pr(self, head, base, title, body):
+        return self._api(self._r("pulls"), "POST", {"head": head, "base": base, "title": title, "body": body})
+
+    def update_pr(self, n, body):
+        return self._api(self._r(f"pulls/{n}"), "PATCH", {"body": body})
+
+    def merge_pr(self, n, sha, method="squash"):
+        # `sha` makes GitHub refuse the merge unless the PR head is exactly the reviewed commit.
+        return self._api(self._r(f"pulls/{n}/merge"), "PUT", {"sha": sha, "merge_method": method})
+
+    def _failed_runs(self, sha):
+        runs = (self._api(self._r(f"actions/runs?head_sha={sha}&per_page=50")) or {}).get("workflow_runs", [])
+        return [r for r in runs if r.get("conclusion") in ("failure", "timed_out", "cancelled", "startup_failure")]
+
+    def rerun_failed(self, sha):
+        """Re-run the failed jobs of every workflow run on `sha`. True if any re-run started."""
+        started = False
+        for run in self._failed_runs(sha):
+            self._api(self._r(f"actions/runs/{run['id']}/rerun-failed-jobs"), "POST", {})
+            started = True
+        return started
+
+    def failed_log(self, sha):
+        """The tail of the failed jobs' logs on `sha`, for the implementer to read."""
+        parts = []
+        for run in self._failed_runs(sha)[:3]:
+            proc = self._run(["gh", "run", "view", str(run["id"]), "--log-failed", "-R", self.repo],
+                             capture_output=True, text=True)
+            parts.append(f"## {run.get('name', 'workflow')} (run {run['id']})\n{(proc.stdout or proc.stderr)[-6000:]}")
+        return "\n\n".join(parts)
+
+    def create_issue(self, title, body, labels):
+        return self._api(self._r("issues"), "POST", {"title": title, "body": body, "labels": labels})
+
+
+class RecordingGitHub:
+    """Wraps a real client and records read responses, to build offline test fixtures."""
+
+    READS = ("get_issue", "list_sub_issues", "list_blocked_by")
+
+    def __init__(self, inner: GitHub):
+        self.inner = inner
+        self.fixture: dict[str, dict] = {name: {} for name in self.READS}
+
+    def __getattr__(self, name):
+        attr = getattr(self.inner, name)
+        if name not in self.READS:
+            return attr
+
+        def recorded(n):
+            result = attr(n)
+            self.fixture[name][str(n)] = result
+            return result
+        return recorded
+
+    def save(self, path: Path) -> None:
+        """Each issue once under "issues"; listings keep only issue numbers."""
+        issues: dict[str, dict] = {}
+        for key, value in self.fixture["get_issue"].items():
+            issues[key] = slim(value)
+        listings: dict[str, dict[str, list[int]]] = {"sub_issues": {}, "blocked_by": {}}
+        for name, target in (("list_sub_issues", "sub_issues"), ("list_blocked_by", "blocked_by")):
+            for key, items in self.fixture[name].items():
+                listings[target][key] = [i["number"] for i in items]
+                for i in items:
+                    issues.setdefault(str(i["number"]), slim(i))
+        path.write_text(json.dumps({"issues": issues, **listings}, indent=1, sort_keys=True) + "\n")
+
+
+_KEEP = ("number", "title", "state", "body", "labels", "id", "html_url", "sub_issues_summary", "issue_dependencies_summary")
+
+
+def slim(issue: dict) -> dict:
+    """Only the fields the engine reads, so fixtures stay small and readable."""
+    out = {k: issue[k] for k in _KEEP if k in issue}
+    out["labels"] = [{"name": l["name"]} if isinstance(l, dict) else {"name": l} for l in issue.get("labels", [])]
+    return out
+
+
+class FakeGitHub:
+    """In-memory GitHub. Reads come from a fixture; writes are applied and logged.
+
+    `on_merge(branch, sha)` lets a test perform the actual git merge in a local bare remote.
+    """
+
+    def __init__(self, fixture: dict | None = None, owner: str = "test", on_merge: Callable[[str, str], str] | None = None):
+        fixture = fixture or {}
+        self.issues: dict[int, dict] = {int(k): v for k, v in fixture.get("issues", {}).items()}
+        self.subs: dict[int, list[int]] = {int(k): list(v) for k, v in fixture.get("sub_issues", {}).items()}
+        self.blocked: dict[int, list[int]] = {int(k): list(v) for k, v in fixture.get("blocked_by", {}).items()}
+        # a recorded issue knows its true counts even when its listing was never fetched
+        for n, issue in self.issues.items():
+            if n not in self.subs and (issue.get("sub_issues_summary") or {}).get("total"):
+                raise ValueError(f"fixture lacks the sub-issue listing of #{n}")
+        self.comments: dict[int, list[dict]] = {}
+        self.labels: set[str] = set()
+        self.prs: dict[int, dict] = {}
+        self.checks: dict[str, str] = {}
+        self.default_check: str | None = "success"
+        self.check_script: list[str | None] = []   # conclusions handed out in order, one per head looked at
+        self._check_seen: dict[str, dict] = {}  # sha -> the latest check run handed out
+        self._run_ids = iter(range(1, 10**9))
+        self.reruns: list[str] = []
+        self.calls: list[tuple] = []
+        self.owner = owner
+        self.on_merge = on_merge
+        self._next_id = 1000
+
+    # helpers for tests
+    def add_issue(self, n: int, title: str, body: str = "", labels: tuple[str, ...] = (), state: str = "open",
+                  subs: tuple[int, ...] = (), blocked_by: tuple[int, ...] = ()) -> None:
+        self.issues[n] = {"number": n, "title": title, "state": state, "body": body, "id": 10_000 + n,
+                          "labels": [{"name": l} for l in labels], "html_url": f"https://github.test/issues/{n}"}
+        self.subs[n] = list(subs)
+        self.blocked[n] = list(blocked_by)
+
+    def _id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    def _issue(self, n):
+        if n not in self.issues:
+            raise GitHubError(f"issue {n} not found")
+        data = dict(self.issues[n])
+        data["sub_issues_summary"] = {"total": len(self.subs.get(n, []))}
+        data["issue_dependencies_summary"] = {"total_blocked_by": len(self.blocked.get(n, []))}
+        return data
+
+    # reads
+    def get_issue(self, n):
+        return self._issue(n)
+
+    def list_sub_issues(self, n):
+        return [self._issue(c) for c in self.subs.get(n, [])]
+
+    def list_blocked_by(self, n):
+        return [self._issue(c) for c in self.blocked.get(n, [])]
+
+    def list_comments(self, n):
+        return list(self.comments.get(n, []))
+
+    def find_pr(self, head):
+        matches = [p for p in self.prs.values() if p["head"]["ref"] == head]
+        open_prs = [p for p in matches if p["state"] == "open"]
+        return (open_prs or matches or [None])[0]
+
+    def required_check(self, sha, name):
+        run = self.required_check_run(sha, name)
+        return None if run is None else run["conclusion"]
+
+    def required_check_run(self, sha, name):
+        if sha in self.checks:
+            return {"id": 0, "status": "completed", "conclusion": self.checks[sha]}
+        if sha not in self._check_seen:
+            conclusion = self.check_script.pop(0) if self.check_script else self.default_check
+            self._check_seen[sha] = {"id": next(self._run_ids), "status": "completed", "conclusion": conclusion}
+        run = self._check_seen[sha]
+        return None if run["conclusion"] is None else dict(run)
+
+    def find_issue(self, label, marker):
+        for n, issue in sorted(self.issues.items()):
+            if marker in (issue.get("body") or "") and {"name": label} in issue.get("labels", []):
+                return n
+        return None
+
+    # writes
+    def create_comment(self, n, body):
+        c = {"id": self._id(), "body": body, "html_url": f"https://github.test/issues/{n}#issuecomment-{self._next_id}"}
+        self.comments.setdefault(n, []).append(c)
+        self.calls.append(("create_comment", n))
+        return c
+
+    def update_comment(self, comment_id, body):
+        for cs in self.comments.values():
+            for c in cs:
+                if c["id"] == comment_id:
+                    c["body"] = body
+                    self.calls.append(("update_comment", comment_id))
+                    return c
+        raise GitHubError(f"comment {comment_id} not found")
+
+    def edit_issue(self, n, *, body=None, state=None, state_reason=None):
+        target = self.issues[n] if n in self.issues else self.prs[n]
+        if body is not None:
+            target["body"] = body
+        if state is not None:
+            target["state"] = state
+        self.calls.append(("edit_issue", n, state))
+        return target
+
+    def add_labels(self, n, labels):
+        target = self.issues.get(n) or self.prs[n]
+        names = {l["name"] for l in target.setdefault("labels", [])}
+        for l in labels:
+            if l not in names:
+                target["labels"].append({"name": l})
+        self.calls.append(("add_labels", n, tuple(labels)))
+
+    def remove_label(self, n, label):
+        target = self.issues.get(n) or self.prs[n]
+        target["labels"] = [l for l in target.get("labels", []) if l["name"] != label]
+
+    def ensure_label(self, name, color, description):
+        self.labels.add(name)
+
+    def create_pr(self, head, base, title, body):
+        n = 5000 + len(self.prs) + 1
+        pr = {"number": n, "head": {"ref": head}, "base": {"ref": base}, "title": title, "body": body,
+              "state": "open", "merged": False, "html_url": f"https://github.test/pull/{n}", "labels": []}
+        self.prs[n] = pr
+        self.calls.append(("create_pr", head))
+        return pr
+
+    def update_pr(self, n, body):
+        self.prs[n]["body"] = body
+        return self.prs[n]
+
+    def merge_pr(self, n, sha, method="squash"):
+        pr = self.prs[n]
+        if pr.get("head_sha") and pr["head_sha"] != sha:
+            raise GitHubError("Head branch was modified. Review and try the merge again.")
+        merge_sha = self.on_merge(pr["head"]["ref"], sha) if self.on_merge else f"merged-{sha}"
+        pr.update(state="closed", merged=True, merge_commit_sha=merge_sha)
+        pr["head"]["sha"] = sha
+        self.calls.append(("merge_pr", n, sha))
+        return {"merged": True, "sha": merge_sha}
+
+    def rerun_failed(self, sha):
+        self.reruns.append(sha)
+        self.calls.append(("rerun_failed", sha))
+        self._check_seen.pop(sha, None)   # the re-run is a new check run, with its own id and verdict
+        return True
+
+    def failed_log(self, sha):
+        return f"FAILED tests/test_fake.py::test_platform - fake CI failure on {sha[:7]}"
+
+    def create_issue(self, title, body, labels):
+        n = max(list(self.issues) + [9000]) + 1
+        self.add_issue(n, title, body, labels=tuple(labels))
+        self.calls.append(("create_issue", n, title))
+        return self._issue(n)

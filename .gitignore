@@ -1,0 +1,63 @@
+# This repository is meant to be public. Nothing that identifies an AWS account may be tracked:
+# see AGENTS.md ("Public-repository hygiene") and tools/hygiene/, which refuses most of the files
+# below even when one is added with `git add -f`.
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments / uv
+.venv/
+venv/
+.uv/
+
+# Test, lint and type-checker caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# CDK: synthesized templates, and the lookup cache, which records account and resource IDs.
+# The design allows no context lookups at all (docs/design/system-design.md, "Keeping the
+# repository public-safe").
+cdk.out/
+cdk.context.json
+
+# Environment files, keys and state: never committed. `.env.example` holds placeholders only.
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.tfstate
+*.tfstate.*
+.aws/
+
+# Real configuration is read from the deployment environment (SSM), or written by the pipeline's
+# synth step into an untracked file. The tracked example is config.example.toml.
+config.local.*
+
+# Node: the CDK CLI is installed from package-lock.json
+node_modules/
+
+# Agent tooling: per-machine state
+.claude/worktrees/
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,269 @@
+name: CI
+
+# The one workflow every pull request runs. It ends with a single job, `required`, which the
+# ruleset (setup/pr-only-main.json) names as the required status check and which the implement
+# loop reads on the exact head it is about to merge (docs/adr/0001-software-factory.md,
+# decision 4). The jobs call scripts/check.sh, the same gate script a laptop and the loop's
+# verifier run.
+#
+# Rules this file keeps (docs/design/system-design.md, "Checks on a pull request"):
+#   - No AWS credentials and no secrets, on any event. Nothing here deploys; deployment is
+#     CodePipeline's, after a merge. Never add `pull_request_target`, an OIDC role or a secret.
+#   - The token is read-only (`contents: read`), and checkout does not leave it in .git/config.
+#   - Every action is pinned by commit SHA, with its tag in a comment; tools are pinned by
+#     version and, when downloaded, by SHA-256. Dependabot proposes the bumps.
+#
+# Every push to main, a nightly schedule and a manual dispatch run the same jobs: the canary for
+# runner and toolchain drift.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request replaces the run of the previous head. Runs on main are never
+# cancelled: each merge commit keeps its own result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # The uv the lockfile was written with. Bump it here and relock in the same pull request.
+  UV_VERSION: '0.11.28'
+
+jobs:
+  # Nothing account-specific and no credential in the tree (tools/hygiene/), and no secret
+  # anywhere in the history (gitleaks, default rules). The job `history` reads the history with
+  # the project's own rules.
+  hygiene:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Hygiene scan of the tree
+        run: bash scripts/check.sh hygiene
+
+      - name: Install gitleaks (pinned, checksum verified)
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" gitleaks
+
+      - name: Secret scan of the full history
+        run: |
+          "$RUNNER_TEMP/bin/gitleaks" git --no-banner --redact --verbose --log-opts=--all .
+
+  # Shell and JSON syntax, the lock, ruff, ty; the skill copies; the backlog drafts; the
+  # workflows themselves; and, on a pull request, the acceptance checks the implement loop locked.
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Hygiene, syntax, lock, lint, types
+        run: bash scripts/check.sh fast
+
+      # Each skill is checked in twice (Claude Code reads .claude/skills/, Codex reads
+      # .agents/skills/). The two copies must never drift.
+      - name: Skill copies are byte-identical
+        run: bash scripts/check.sh skills
+
+      # Every issue draft under backlog/drafts/ is one the implement loop can finish.
+      - name: Backlog drafts lint
+        run: bash scripts/check.sh backlog-lint
+
+      - name: Install actionlint (pinned, checksum verified)
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
+
+      # Without the runner's unpinned shellcheck and pyflakes, so the result depends only on
+      # the pinned actionlint.
+      - name: Workflow lint
+        run: |
+          "$RUNNER_TEMP/bin/actionlint" -shellcheck= -pyflakes= -color
+
+      # Acceptance checks the implement loop committed stay untouched on their branch.
+      - name: Loop-locked acceptance checks unchanged
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-loop-guard.sh "$BASE" "$HEAD"
+
+  # The repository's own tests (pyproject.toml, testpaths): the tooling's today, the CDK
+  # assertion and policy tests (tests/, tests/policy/) as the backlog adds them. Then the ship
+  # script's test, which runs offline against a throwaway remote with the real git hooks.
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Tests
+        run: bash scripts/check.sh tests
+
+      - name: Ship script behaviour
+        run: bash scripts/check.sh ship-tests
+
+  # The implement loop engine's own tests (tools/implementation-loop/). A skipped test fails
+  # this job (scripts/check.sh engine-tests, under CI), so everything they need is prepared here.
+  engine-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      # A verifier test runs pytest through `uv run --offline --no-project` at the repository's
+      # root, where uv picks the interpreter `.python-version` names: that interpreter and the
+      # pinned pytest must already be in uv's cache, or that test skips. So the cache is warmed
+      # the same way, with no `--python`.
+      - name: Warm uv's cache with the pinned pytest
+        run: uv run --no-project --with pytest==8.3.5 python -c 'import pytest'
+
+      # The engine runs agents and check commands inside bubblewrap. Ubuntu 24.04 restricts
+      # unprivileged user namespaces, which bubblewrap needs; the runner is a throwaway machine,
+      # so the restriction is lifted here. The last line states what the tests will find.
+      - name: Prepare bubblewrap for the sandbox tests
+        run: |
+          set -uo pipefail
+          command -v bwrap >/dev/null || sudo apt-get install --yes --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if bwrap --ro-bind / / --unshare-pid --proc /proc --dev /dev true; then
+            echo "bubblewrap: works"
+          else
+            echo "::warning::bubblewrap cannot start a sandbox on this runner; tests that need it will skip, and a skip fails this job"
+          fi
+
+      - name: Engine tests
+        run: bash scripts/check.sh engine-tests
+
+  # `cdk synth` with no credentials and no context lookups, once the CDK app exists. Until then
+  # the step says so and passes. Node 24: the CDK CLI supports Node 22 and 24.
+  synth:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Is there a CDK app yet?
+        id: cdk
+        run: |
+          if [ -f cdk.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Install uv
+        if: steps.cdk.outputs.present == 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Install Node.js
+        if: steps.cdk.outputs.present == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Synthesize without credentials
+        run: bash scripts/check.sh synth
+
+  # The hygiene scanner over history, where the tree scan cannot look. On a pull request, every
+  # file version its commits add, and those commits' messages and author addresses: a value
+  # committed and then removed is still published with the branch, and no later commit can take
+  # it back, so a finding here means the branch has to be made again. On main, nightly and on
+  # dispatch, the whole history: it must be green before the repository is made public
+  # (docs/factory/green-light.md).
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Hygiene scan of the history
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            python3 tools/hygiene/scan.py --history "$BASE..$HEAD"
+          else
+            python3 tools/hygiene/scan.py --history
+          fi
+
+  # The single required status check. Every job above must have succeeded: a missing, skipped,
+  # cancelled or failed result never counts as green.
+  required:
+    if: always()
+    needs: [hygiene, history, checks, tests, engine-tests, synth]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every check passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '
+            (["hygiene", "history", "checks", "tests", "engine-tests", "synth"] - keys == [])
+            and all(.[]; .result == "success")
+          ' > /dev/null
