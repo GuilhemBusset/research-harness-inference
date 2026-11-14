@@ -1,0 +1,81 @@
+{
+ "issues": {
+  "21": {
+   "number": 21,
+   "title": "Costs fixture: issue 21",
+   "state": "closed",
+   "body": "",
+   "id": 10021,
+   "labels": [
+    {
+     "name": "kind:work"
+    },
+    {
+     "name": "size:S"
+    }
+   ]
+  },
+  "22": {
+   "number": 22,
+   "title": "Costs fixture: issue 22",
+   "state": "closed",
+   "body": "",
+   "id": 10022,
+   "labels": [
+    {
+     "name": "kind:work"
+    },
+    {
+     "name": "size:S"
+    }
+   ]
+  },
+  "23": {
+   "number": 23,
+   "title": "Costs fixture: issue 23",
+   "state": "closed",
+   "body": "",
+   "id": 10023,
+   "labels": [
+    {
+     "name": "kind:work"
+    },
+    {
+     "name": "size:S"
+    }
+   ]
+  },
+  "31": {
+   "number": 31,
+   "title": "Costs fixture: issue 31",
+   "state": "closed",
+   "body": "",
+   "id": 10031,
+   "labels": [
+    {
+     "name": "kind:work"
+    },
+    {
+     "name": "size:L"
+    }
+   ]
+  },
+  "32": {
+   "number": 32,
+   "title": "Costs fixture: issue 32",
+   "state": "closed",
+   "body": "",
+   "id": 10032,
+   "labels": [
+    {
+     "name": "kind:work"
+    },
+    {
+     "name": "size:L"
+    }
+   ]
+  }
+ },
+ "sub_issues": {},
+ "blocked_by": {}
+}

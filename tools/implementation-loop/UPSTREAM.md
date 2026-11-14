@@ -376,6 +376,16 @@ still reads "Another run is working on this issue", and the detail above it says
 branch. The two other callers of `issue_worktree` (a revert's branch) get the repair of a deleted
 worktree too; for them `BranchHeld` is still an error.
 
+### 1.2.3, patched: the `costs` command (2026-11-15)
+
+The report the dollar ceilings and the per-role budgets are set from (ADR 0001, decision 8 and
+Consequences), issue #11 (draft E0-06). The engine's version stays 1.2.3: the command only reads,
+and a new version revives every failed issue once.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/cli.py` | New command `costs <issue>` (`cmd_costs`, `cost_report`, `render_costs`), reached as `scripts/implement.sh costs <issue>`, with `--json` for the same figures as data. It reads the run's `agents.jsonl` and, since the run records do not keep an issue's size, each issue's `size:` label on GitHub, as `plan` reads issues and through the same client (`github_client`) (an issue without one counts as `M`, as for its ceilings). It prints, for each issue of the run, its size, its answered calls, its Claude dollars and its Codex tokens, with one line for the calls made for no issue; per role, the attempts and the answered calls, the Claude dollars and the Codex tokens with the median and the maximum per call; per size, the median and the maximum per issue. An attempt that reports no cost adds no dollar and is not among the calls its role's median is taken over; an issue no agent was called for is listed and left out of its size's figures. Nothing is written, and neither `config.py` nor `loop.toml` changes. | `status` shows each issue's calls and dollars and the run's totals, not what `USD_CEILINGS`, `CEILINGS` and `max_budget_usd` are set from: the cost per call of each role and the spread of an issue's cost within a size. Setting them stays the owner's (`docs/factory/green-light.md`, step 10). |
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -526,6 +536,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_stale_worktree.py` (4) | Added. | The regression of fault e5e7b9c1d5, with real git. In a real engine run with the fake agents, an issue's worktree holds a commit on the issue's branch and its directory is deleted while git still registers it; the test first shows that git refuses the fault's command there. On 1.2.2 that run ends in `step_crashed` with the fault's fingerprint; now it has none, delivers the issue, and builds on the commit the branch held. A deleted worktree that was registered on another branch gives its place to the issue's new branch, at `main`. A branch checked out in another worktree that exists leaves the issue waiting (`claim`, to resume in `build`) with no build call and that worktree as it was, and the run after the worktree is removed delivers the issue. A place taken by a directory git does not know is still a plain `GitError`. The modules come from `test_deploying.py`'s `loop_beside_these_tests`, for the reason given there. |
+
+### 1.2.3, patched (2026-11-15)
+
+620 collected tests: the 609 before it, none removed and none changed, and 11 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_costs.py` (11), `tests/fixtures/costs/agents.jsonl`, `tests/fixtures/costs/issues.json` | Added. The run log (twenty attempts) and the five issues with their `size:` labels are written for the test, not taken from a run. The test loads this tree's `implement_loop` under a name of its own: under the verifier an xdist worker keeps the running engine's package in its module cache (`loop_pytest` drops it only in the pytest that records), and that engine has no `costs` until this change runs. | The command on that log, with GitHub replaced by the recorded issues: each issue's size, answered calls and dollars; the totals; each role's median and maximum per call; each size's median and maximum per issue; an attempt that reports no cost (a timeout, a null cost, every Codex call) adds no dollar; an issue nothing ran for stays out of its size; `scripts/implement.sh costs` reaches the command. |
 
 ## Kept as recorded
 
