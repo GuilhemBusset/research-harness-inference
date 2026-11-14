@@ -15,11 +15,11 @@ verified and merged changes come out, and nobody is in the loop during a run.
 **Design, factory and backlog in place. Nothing is deployed.**
 
 - The system design is accepted ([ADR 0002](docs/adr/0002-accept-the-system-design.md)).
-- The repository is on GitHub, private for now, and its backlog is published as GitHub issues:
-  one epic per phase of the design's rollout, each with its issues as sub-issues. The owner turns
-  the factory on step by step with [`docs/factory/green-light.md`](docs/factory/green-light.md);
-  until the ruleset, the git hooks and the factory's own token are in place, the implement loop
-  does not run.
+- The repository is public. `main` takes changes only through pull requests whose `required`
+  check is green, and the backlog is published as GitHub issues: one epic per phase of the
+  design's rollout, each with its issues as sub-issues. The owner turns the factory on with
+  [`docs/factory/green-light.md`](docs/factory/green-light.md); its last steps (the factory's own
+  token, the doctor) come before the implement loop's first run.
 - There is no CDK application yet. The first backlog epic adds it.
 
 ## Where to read

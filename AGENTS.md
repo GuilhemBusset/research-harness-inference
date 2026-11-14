@@ -12,12 +12,12 @@ decisions are in [`docs/design/`](docs/design/README.md) (the system) and
 [`docs/adr/0001-software-factory.md`](docs/adr/0001-software-factory.md) (the factory). The code
 follows the "Repository layout" section of the system design (section 8.1).
 
-**Status: live, being turned on.** The repository is on GitHub, private until the owner makes it
-public, and its backlog is published as GitHub issues. The rest of
-[`docs/factory/green-light.md`](docs/factory/green-light.md), from step 4 (the ruleset, the git
-hooks, the factory's own token, the doctor, the first epic), is the owner's, by hand. Until the
-owner has done it, no agent runs the implement loop, applies the ruleset, activates the hooks, or
-changes the repository's settings on GitHub.
+**Status: live.** The repository is public, `main` takes changes only through pull requests
+(the ruleset), and the backlog is published as GitHub issues. The implement loop runs when the
+owner launches it, after the last steps of
+[`docs/factory/green-light.md`](docs/factory/green-light.md) (the factory's own token, the
+doctor). No agent launches it on its own initiative, and no agent changes the repository's
+settings, its ruleset or its tokens on GitHub.
 
 ## Toolchain
 
