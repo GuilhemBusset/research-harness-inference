@@ -1,0 +1,37 @@
+# The example configuration: every key the loader knows (src/rhi/config.py), with placeholders
+# only. Tests, agents and `cdk synth` in the pull request checks read this file (RHI_CONFIG=example).
+# The real values are the owner's, in SSM; they are never written to the repository.
+#
+# No key holds an AWS account or a region: both come from the deploying credentials. Wherever the
+# repository shows an account, it is 123456789012.
+#
+# Every value below is invented.
+
+# The domain the endpoint is served under, and the ID of its Route 53 hosted zone.
+domain = "example.com"
+hosted_zone_id = "Z0EXAMPLE0HOSTED0ZONE"
+
+# The one admin user, and the address the alerts go to.
+admin_email = "admin@example.com"
+
+# The phone the class-day notice also goes to.
+instructor_phone = "+15555550100"
+
+# The repository the pipeline deploys from.
+github_owner = "example-owner"
+github_repo = "example-repository"
+
+# The client ID of the GitHub App students log in with.
+login_client_id = "Iv1.0000example0000"
+
+# The monthly budget, in whole US dollars, that latches every pool.
+monthly_budget_usd = 1000
+
+# The schedule: the time zone its times are in, the day the course ends, and the session windows.
+time_zone = "Etc/UTC"
+course_end = 2099-12-31
+# Entries have no shape yet: the loader refuses any.
+session_windows = []
+
+# One entry per pool. Entries have no shape yet: the loader refuses any.
+pools = []
