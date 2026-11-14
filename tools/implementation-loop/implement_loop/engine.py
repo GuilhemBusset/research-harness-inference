@@ -86,7 +86,7 @@ from .model import (
     Phase,
 )
 from .state import FaultOutbox, RepoClaims, RunStore, runs_root
-from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
+from .workspace import AgentCall, BranchHeld, GitError, MergeConflict, UpdateResult, Workspace
 
 try:   # GitHubUnavailable arrives with the retrying GitHub client
     from .github import GitHubUnavailable
@@ -1252,7 +1252,13 @@ class Engine:
         st = self.store.issue(n)
         # set at startup (_reconcile); a prerequisite _depend admits mid-run has none yet and stops here
         assert st.branch is not None
-        wt = self.ws.issue_worktree(n, st.branch)
+        try:
+            wt = self.ws.issue_worktree(n, st.branch)
+        except BranchHeld:
+            # Not an engine fault, and nothing the engine may undo: that worktree may hold work.
+            # The issue waits, and each later run tries again.
+            return self._wait(n, WAIT_CLAIM, f"the branch {st.branch} is checked out in another worktree of this "
+                                             f"repository (`git worktree list`); the issue is built once it is free")
         if str(wt) != st.worktree:
             st.worktree = str(wt)
             self.store.put(st)
