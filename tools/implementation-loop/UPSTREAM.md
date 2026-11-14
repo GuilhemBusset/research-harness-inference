@@ -108,6 +108,16 @@ the doctor first; check commands have no standard input.
 `[deploy]` table, no `deploying` phase. Nothing of it is in the engine. It is backlog issue #12
 (draft E0-07).
 
+### The `costs` command (2026-11-14, backlog issue #11)
+
+The report the dollar ceilings and the per-role budgets are set from (ADR 0001, decision 8 and
+Consequences). The engine version stays 1.2.0: the command only reads, and a new version would
+revive every failed issue.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/cli.py` | New command `costs <issue>` (`cmd_costs`, `cost_report`, `render_costs`), reached as `scripts/implement.sh costs <issue>`, with `--json` for the same figures as data. It reads the run's `agents.jsonl` and, since the run records do not keep an issue's size, each issue's `size:` label on GitHub, as `plan` reads issues (an issue without one counts as `M`, as for its ceilings). It prints, for each issue of the run, its size, its answered calls, its Claude dollars and its Codex tokens, with one line for the calls made for no issue; per role, the attempts and the answered calls, the Claude dollars and the Codex tokens with the median and the maximum per call; per size, the median and the maximum per issue. An attempt that reports no cost adds no dollar and is not among the calls its role's median is taken over; an issue no agent was called for is listed and left out of its size's figures. Nothing is written, and neither `config.py` nor `loop.toml` changes. | `status` shows each issue's calls and dollars and the run's totals, not what `USD_CEILINGS`, `CEILINGS` and `max_budget_usd` are set from: the cost per call of each role and the spread of an issue's cost within a size. Setting them stays the owner's (`docs/factory/green-light.md`, step 10). |
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -172,3 +182,11 @@ repository, made with `implement record-fixture`. It is test input for the graph
 and is not edited: its issues talk about sessions, HTML pages and upstream paths, and it carries
 many external links. Several tests also keep upstream's capability names (`hardware:laptop`,
 `human:rehearsal`) and example file names as arbitrary test data.
+
+### The `costs` command
+
+No existing test changed; 11 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_costs.py` (11), `tests/fixtures/costs/agents.jsonl`, `tests/fixtures/costs/issues.json` | Added. The run log (twenty attempts) and the five issues with their `size:` labels are written for the test, not taken from a run. | The command on that log, with GitHub replaced by the recorded issues: each issue's size, answered calls and dollars; the totals; each role's median and maximum per call; each size's median and maximum per issue; an attempt that reports no cost (a timeout, a null cost, every Codex call) adds no dollar; an issue nothing ran for stays out of its size; `scripts/implement.sh costs` reaches the command. |
