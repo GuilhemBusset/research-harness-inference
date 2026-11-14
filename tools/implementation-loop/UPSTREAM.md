@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.1 |
+| Engine version here | 1.2.2 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -334,6 +334,25 @@ identity (system design, section 8.4). The event `deployment_failed` and the evi
 deployment keep their shape. A failed deployment makes one more read of the commit's statuses than
 before.
 
+### 1.2.2: the digest of a locked test before main's merge (2026-11-14)
+
+The repair of the engine fault d80596ed7c (issue #244). Landing merged `main` into a certified
+branch, and the relock that follows (`_relock_candidates`) asked for the digest of each locked file
+as the branch held it before the merge. `_digest_at` wrote those bytes to a temporary directory to
+hand the verifier's `digest` a file, and the host refused the write: `OSError`, the land step
+crashed after the merge was committed, and the issue waited for a new engine version.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.1 → 1.2.2. | A new engine version: the issues that wait for this repair resume, and a failed issue is revived once by it. |
+| `implement_loop/engine.py` | New: `CommittedFile`, a `Path` that carries a file's name and its bytes at a commit, and answers `read_bytes` and `read_text` from memory (`read_text` decodes as a file opened in text mode would: the same default encoding, error handling and newlines). `_digest_at` hands `verify.digest` one of these, and no longer makes a temporary directory or writes a file. `tempfile` is still imported, for the two other uses. | The digest needs the bytes and the name (a `pyproject.toml` is digested by its pytest table), and git already gave the bytes: the temporary copy was only a way to call `digest`, and one more file a host can refuse, whatever its reason (the run log with the reason is the owner's, and was not read for this repair). `verify.py` is on the safety surface and is not changed: `digest` is called as before, with a path it can read. |
+
+Behaviour an upstream reader would not expect: none in what the engine decides. The digests are the
+ones the temporary copy gave, so the same files are relocked and refused as before. The issue that
+met the fault resumes in `land` with main's merge already committed in its worktree, so that
+relock is not made again: if that merge changed one of its locked files, its next verification
+reports the file as changed, which is a round of that issue and not an engine fault.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -468,6 +487,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | `tests/test_examiner_deploy_summary_probe.py` (4) | Added, by the examiner. | The examiner's probes of the same patch, adopted as tests: `commit_statuses` across two pages; the statuses of the configured contexts themselves, a failed one and a successful one, are in the feedback with their states and descriptions; a failed resource and a failed smoke test reach the builder and a commit comment does not; statuses under `measure/`, of contexts that are not configured, of a sibling context and of another commit are left out. |
 | `tests/test_deploying.py::test_a_failed_deployment_gets_a_fix_forward_that_names_the_context_and_its_state` | Adapted: one assertion turned around. | It asserted that the description of the failed context's status is not in the fix-forward's feedback, which was the behaviour of the patch "the deployment verdict". Issue #23 puts the description of a configured context's status in the summary, so the test now asserts that it is there. Its other assertions are unchanged: the context, its state, the commit, one fix-forward, two merges, the evidence of the second. |
 | `.examiner-probes/test_deploy_failure.py::test_final_bad_status_is_sent_to_fix_forward` (at the root of the repository, outside the engine's tests) | Adapted: the same assertion turned around. | The examiner's probe of issue #12, adopted with the patch "the deployment verdict" and run again on `main` after every later merge of a run. It asserted, for a `failure` and for an `error`, what the test above asserted: that the description of the failed context's status is not in the fix-forward's feedback. The first delivery of issue #23 turned the assertion around in `tests/test_deploying.py` and left this copy as it was, so issue #12's checks failed on `main` once the patch had merged. It now asserts that the description is there. Its other assertions are unchanged: the context, its state, one fix-forward, two merges, the issue done. |
+
+### 1.2.2
+
+605 collected tests: the 603 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_relock_digest.py`: `RelockDigestTests` (2) | Added: `test_landing_relocks_a_test_main_changed_on_a_host_that_refuses_the_temporary_file`, `test_the_digest_at_a_commit_is_the_verifiers_digest_of_those_bytes`. | The regression of fault d80596ed7c. In a real engine run with the fake agents, an issue's test is on `main` already, `main` changes it while the head is examined, and the land step merges that and relocks; during the relock, and only there, `Path.write_bytes` raises `OSError`, which is where 1.2.1 crashed (`_step_land`, `_relock_candidates`, `_digest_at`, the fingerprint of the fault). The run has no `step_crashed`, relocks the test from `main` and delivers the issue with main's version of it. The second test holds the digests to the verifier's: for a script and for two `pyproject.toml` (one with a pytest table, one that is not TOML), with CRLF and bytes that are not UTF-8, `_digest_at` of the commit equals `verify.digest` of the same file on disk, and is `None` for a path the commit does not have. `Engine` comes from `test_unwritable_probe.py`'s `engine_beside_these_tests`, for the reason given at 1.2.1. |
 
 ## Kept as recorded
 
