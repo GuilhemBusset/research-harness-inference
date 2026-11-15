@@ -18,13 +18,15 @@ Rules hold those two, and every action:
 - an asset-publishing action is in the asset stage, and every action of that stage is a CodeBuild
   action. One that does more than publish assets is a step like any other, held by the list;
 - a CloudFormation action comes after the approval on widened permissions of its stage: a manual
-  approval that follows a CodeBuild action whose project runs `cdk diff --security-only`
-  (`ConfirmPermissionsBroadening` of CDK Pipelines). A deployment made any other way is a step,
-  held by the list, and so is a CloudFormation action that deletes a stack;
+  approval that follows a CodeBuild action whose project runs `cdk diff --security-only` as a
+  command of its build specification, the conditional CDK Pipelines writes
+  (`ConfirmPermissionsBroadening`), and not text that only mentions it. A deployment made any
+  other way is a step, held by the list, and so is a CloudFormation action that deletes a stack;
 - the pipeline starts on a push to `main` and on nothing else: its source is the connection's, on
   that branch; a trigger filters pushes to that branch, and never pull requests or tags; and no
-  EventBridge rule or schedule of the pipeline's template has the pipeline as its target
-  (section 8.2);
+  EventBridge rule or schedule of any template targets a pipeline: not one of the pipeline's
+  template by its reference, not one of another template by an import of the pipeline's
+  export, and none by a CodePipeline ARN (section 8.2);
 - no CodeBuild project has a webhook: on a public repository it would run a stranger's code with
   a role of the account (section 8.3);
 - every role of every template carries the permissions boundary of the bounded bootstrap, by its
@@ -70,8 +72,12 @@ INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
 # one that failed.
 DEPLOYS = ("CHANGE_SET_REPLACE", "CHANGE_SET_EXECUTE", "CREATE_UPDATE")
-# What the check of the approval on widened permissions runs, as CDK Pipelines writes it.
+# What the check of the approval on widened permissions runs, as CDK Pipelines writes it: the
+# security diff, as a command of its own or as the condition that opens one.
 SECURITY_DIFF = "cdk diff -a . --security-only --fail $STAGE_PATH/"
+RUNS_THE_SECURITY_DIFF = re.compile(r"(if )?" + re.escape(SECURITY_DIFF) + r"\\\*(; then .*)?", re.DOTALL)
+# What stands for a value only known when the stack is deployed, in a command read from a template.
+DEPLOY_TIME = "<deploy-time value>"
 
 BRANCH = "main"
 # The boundary, as `Fn::Sub` would write its ARN: the fixed name, in the account that deploys.
@@ -112,10 +118,16 @@ def stages_of(pipeline: Mapping[str, Any]) -> list[tuple[str, list[dict[str, Any
     ]
 
 
-def text_of(value: Any) -> str:
-    """The text of a value of a template, without what is only known when the stack is deployed."""
+def text_of(value: Any, deploy_time: str | None = None) -> str:
+    """The text of a value of a template, without what is only known when the stack is deployed,
+    or with `deploy_time` in its place."""
     if isinstance(value, dict) and list(value) == ["Fn::Join"]:
-        return value["Fn::Join"][0].join(part for part in value["Fn::Join"][1] if isinstance(part, str))
+        parts = value["Fn::Join"][1]
+        return value["Fn::Join"][0].join(
+            part if isinstance(part, str) else deploy_time
+            for part in parts
+            if isinstance(part, str) or deploy_time is not None
+        )
     return value if isinstance(value, str) else ""
 
 
@@ -131,17 +143,24 @@ def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any
     return resource.get("Properties", {}).get("Source", {}).get("BuildSpec")
 
 
-def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
-    """Whether an action is a CodeBuild action whose project does nothing but publish assets:
-    every command of its build specification installs `cdk-assets` or publishes with it."""
+def commands_of(build_spec: Any) -> list[str] | None:
+    """The commands of a build specification written as text, in every phase. None when it is not
+    such a build specification."""
     try:
-        phases = json.loads(build_spec_of(action, template))["phases"]
+        phases = json.loads(build_spec)["phases"]
         commands = [
             command for phase in phases.values() for key in ("commands", "finally") for command in phase.get(key, [])
         ]
     except (TypeError, ValueError, KeyError, AttributeError):  # Not such a build specification.
-        return False
-    if not all(isinstance(command, str) for command in commands):
+        return None
+    return commands if all(isinstance(command, str) for command in commands) else None
+
+
+def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
+    """Whether an action is a CodeBuild action whose project does nothing but publish assets:
+    every command of its build specification installs `cdk-assets` or publishes with it."""
+    commands = commands_of(build_spec_of(action, template))
+    if commands is None:
         return False
     publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
     return bool(publishing) and all(
@@ -190,13 +209,18 @@ def differences(templates: Templates, reviewed: Reviewed) -> list[tuple[str, str
     return different
 
 
+def checks_permissions(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
+    """Whether an action is a CodeBuild action whose project runs the security diff: one command
+    of its build specification is that diff, or opens with it as its condition."""
+    commands = commands_of(text_of(build_spec_of(action, template), DEPLOY_TIME)) or []
+    return any(RUNS_THE_SECURITY_DIFF.fullmatch(command) for command in commands)
+
+
 def approval_on_widened_permissions(actions: list[dict[str, Any]], template: Mapping[str, Any]) -> int | None:
     """The run order of a stage's approval on widened permissions: a manual approval that follows
     a CodeBuild action of the stage whose project runs the security diff. None when the stage has
     none."""
-    checked = [
-        action.get("RunOrder", 1) for action in actions if SECURITY_DIFF in text_of(build_spec_of(action, template))
-    ]
+    checked = [action.get("RunOrder", 1) for action in actions if checks_permissions(action, template)]
     approved = [
         action.get("RunOrder", 1)
         for action in actions
@@ -220,6 +244,24 @@ def names(value: Any, logical_id: str) -> bool:
     if isinstance(value, list):
         return any(names(part, logical_id) for part in value)
     return isinstance(value, str) and (value == logical_id or "${" + logical_id in value)
+
+
+def imports(value: Any, exports: list[Any]) -> bool:
+    """Whether a value of a template imports one of the exports, by its name."""
+    if isinstance(value, dict):
+        return any(value.get("Fn::ImportValue") == name for name in exports) or any(
+            imports(part, exports) for part in value.values()
+        )
+    return isinstance(value, list) and any(imports(part, exports) for part in value)
+
+
+def mentions_a_pipeline(value: Any) -> bool:
+    """Whether a value of a template holds text of a CodePipeline ARN."""
+    if isinstance(value, dict):
+        return any(mentions_a_pipeline(part) for part in value.values())
+    if isinstance(value, list):
+        return any(mentions_a_pipeline(part) for part in value)
+    return isinstance(value, str) and ":codepipeline:" in value
 
 
 def written(value: Any) -> str | None:
@@ -261,11 +303,26 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
                     found.append((path, name, ANOTHER_TRIGGER))
         if not all(is_a_push_to_main(trigger) for trigger in pipeline.get("Triggers", [])):
             found.append((path, pipeline_id, ANOTHER_TRIGGER))
-        # What starts the pipeline from outside it: the targets of a rule, the target of a schedule.
-        for kind, targets in (("AWS::Events::Rule", "Targets"), ("AWS::Scheduler::Schedule", "Target")):
-            for _, logical_id, properties, _ in resources({path: template}, kind):
-                if names(properties.get(targets), pipeline_id):
-                    found.append((path, logical_id, ANOTHER_TRIGGER))
+    # What starts a pipeline from outside it, in any template: the targets of a rule, the target of
+    # a schedule. A target names the pipeline of its own template by a reference, the pipeline of
+    # another by importing what that template exports of it, and any pipeline by its ARN.
+    pipelines = resources(templates, "AWS::CodePipeline::Pipeline")
+    exports = [
+        output["Export"]["Name"]
+        for _, pipeline_id, _, template in pipelines
+        for output in template.get("Outputs", {}).values()
+        if "Name" in output.get("Export", {}) and names(output.get("Value"), pipeline_id)
+    ]
+    for kind, key in (("AWS::Events::Rule", "Targets"), ("AWS::Scheduler::Schedule", "Target")):
+        for path, logical_id, properties, _ in resources(templates, kind):
+            targets = properties.get(key)
+            own = [pipeline_id for pipeline_path, pipeline_id, _, _ in pipelines if pipeline_path == path]
+            if (
+                any(names(targets, pipeline_id) for pipeline_id in own)
+                or imports(targets, exports)
+                or mentions_a_pipeline(targets)
+            ):
+                found.append((path, logical_id, ANOTHER_TRIGGER))
     for path, logical_id, properties, _ in resources(templates, "AWS::CodeBuild::Project"):
         # Only a project that says it has no webhook, and nothing more, has none.
         if properties.get("Triggers", {"Webhook": False}) != {"Webhook": False}:
@@ -487,6 +544,30 @@ def a_schedule_every_night(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
     scheduler.Schedule(stack, "Nightly", schedule=nightly, target=target)
 
 
+def in_another_stack(starts: Change) -> Change:
+    """Makes the same change in a stack of its own, beside the pipeline's and under the boundary,
+    that reaches the pipeline across the stacks."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        other = cdk.Stack(stack.node.scope, "Nightly")
+        boundary = cdk.aws_iam.ManagedPolicy.from_managed_policy_name(other, "Boundary", BOUNDARY)
+        cdk.aws_iam.PermissionsBoundary.of(other).apply(boundary)
+        starts(cdk, other, pipeline)
+
+    return change
+
+
+def a_check_that_only_prints_the_diff(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+    """Replaces the commands of the check on widened permissions by one that prints its diff."""
+    (check,) = [
+        node
+        for node in stack.node.find_all()
+        if isinstance(node, cdk.aws_codebuild.CfnProject) and "SecurityCheck" in node.node.path
+    ]
+    printed = {"version": "0.2", "phases": {"build": {"commands": [f"echo '{SECURITY_DIFF}\\*'"]}}}
+    check.add_property_override("Source.BuildSpec", json.dumps(printed))
+
+
 def a_project_with_a_webhook(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
     codebuild = cdk.aws_codebuild
     opened = codebuild.FilterGroup.in_event_of(codebuild.EventAction.PULL_REQUEST_CREATED)
@@ -536,6 +617,21 @@ def test_keeps_a_trigger_on_a_push_to_main(cdk: ModuleType, tmp_path: Path) -> N
         ),
         pytest.param({"change": a_rule_every_night}, ANOTHER_TRIGGER, id="a rule that starts the pipeline"),
         pytest.param({"change": a_schedule_every_night}, ANOTHER_TRIGGER, id="a schedule that starts the pipeline"),
+        pytest.param(
+            {"change": in_another_stack(a_rule_every_night)},
+            ANOTHER_TRIGGER,
+            id="a rule of another stack that starts the pipeline",
+        ),
+        pytest.param(
+            {"change": in_another_stack(a_schedule_every_night)},
+            ANOTHER_TRIGGER,
+            id="a schedule of another stack that starts the pipeline",
+        ),
+        pytest.param(
+            {"change": a_check_that_only_prints_the_diff},
+            NOT_AFTER_THE_APPROVAL,
+            id="a deployment after a check that only prints the diff",
+        ),
         pytest.param(
             {"stack_with_an_asset": BOUNDARY, "change": an_approval_in_the_asset_stage},
             NOT_CODEBUILD,
