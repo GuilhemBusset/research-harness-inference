@@ -214,6 +214,8 @@ CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item 
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+# One more item id of the list a criterion leads with, after `,`, `;`, `/`, `&`, `+` or `and`.
+CRITERION_NEXT = re.compile(r"\s*(?:(?:[,;/&+]|and\b)\s*)*([A-Za-z]+\d+)\b")
 
 
 class CommittedFile(Path):
@@ -777,6 +779,16 @@ class Engine:
     def _behavioural_items(self, st: IssueState) -> set[str]:
         """Items proven by a durable test: each gets at least one independent probe."""
         return {i["id"] for i in self._items(st) if i["proof"] == "test"}
+
+    def _probed(self, st: IssueState) -> set[str]:
+        """What the examiner's adopted probes cover: every plan item a probe's criterion names
+        (`criterion_items`: one file may prove several), and each criterion as it was written."""
+        items = {i["id"] for i in self._items(st)}
+        covered: set[str] = set()
+        for c in st.commands:
+            if c.get("author") == "examiner":
+                covered |= {c["criterion"]} | criterion_items(c["criterion"], items)
+        return covered
 
     def _agent_part_items(self, st: IssueState) -> set[str]:
         """Owner items whose agent part must still be proven (by a command or a verdict)."""
@@ -2188,17 +2200,28 @@ class Engine:
                 reproduced = self._reproduces(wt, f.reproduction, f.cwd or ".", None)
             new.append(gate.classify(f, item_text, self.invariants, reproduced, self._agent_items(st),
                                      self._owner_items(st), {i["id"]: i.get("agent_part") or "" for i in self._items(st)}))
-        accepted, unmet, missing = gate.review_verdicts(res.verdicts, item_text, self._verdict_items(st))
+        # An owner item is judged on its agent part alone, like a finding on one (`gate.classify`):
+        # the words an `unmet` must quote are that part's. One that quotes anything else is about
+        # what the owner still owes, which is an obligation and nothing the builder can change (#20
+        # was sent back four times for one). It is no verdict: the examiner still owes one, and is
+        # asked again below.
+        parts = {i["id"]: i.get("agent_part") or "" for i in self._items(st) if i["id"] in self._agent_part_items(st)}
+        accepted, unmet, missing = gate.review_verdicts(res.verdicts, {**item_text, **parts}, self._verdict_items(st))
+        misjudged = sorted(i for i in missing if i in parts
+                           and any(v.get("item") == i and v.get("verdict") == "unmet" for v in res.verdicts))
         for i, v in accepted.items():
             st.verdicts[i] = {**v, "head": head}
         st.findings += [asdict(f) for f in new]
         # A follow-up examination adopts only probes that reproduce a blocking finding, or that cover
         # an item still without one, so certification converges.
-        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
+        # A probe covers every plan item its criterion names, so one file may prove several.
+        covered = self._probed(st)
+        ids = {i["id"] for i in self._items(st)}
         # A probe the lint refused is not written to the worktree either, whatever finding names it.
         adopt = [p for p in candidates if p.file not in unclean and (
             any(f.blocking and f.probe == p.file for f in new)
-            or (probe_results.get(p.file) is True and (since is None or p.criterion not in covered)))]
+            or (probe_results.get(p.file) is True
+                and (since is None or (criterion_items(p.criterion, ids) or {p.criterion}) - covered)))]
         first = st.examined_sha is None
         st.examined_sha = head
         self.store.put(st)
@@ -2209,7 +2232,7 @@ class Engine:
                                                      and f.get("round") != rnd]
         self.store.event("examined", issue=n, head=head, findings={f.id: f.status for f in new},
                          unmet=unmet, missing=missing, certify=res.certify, adopted=[p.file for p in adopt],
-                         rejected=rejected)
+                         rejected=rejected, **({"owner_evidence": misjudged} if misjudged else {}))
         problems = []
         if unmet:
             problems += [f"{i} judged unmet by the examiner" for i in unmet]
@@ -2226,9 +2249,10 @@ class Engine:
         # What the examiner still owes (a verdict, an independent probe) is asked of it again, at
         # most twice; it is not the builder's failure.
         st = self.store.issue(n)
-        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
-        unprobed = sorted(self._behavioural_items(st) - covered)
+        unprobed = sorted(self._behavioural_items(st) - self._probed(st))
         owed = ([f"give a verdict on {', '.join(missing)}"] if missing else []) + (
+            [f"judge {i} on its agent part alone (\"{parts[i][:300]}\"): `met` when that part is delivered on this "
+             f"commit, whatever the owner still owes; `unmet` only with a quote of that part" for i in misjudged]) + (
             [f"write an independent probe for {', '.join(unprobed)}"] if unprobed else [])
         if owed and st.exam_retries < 2:
             self.store.event("examination_incomplete", issue=n, missing=missing, unprobed=unprobed, retry=st.exam_retries + 1)
@@ -3397,6 +3421,18 @@ def conflict_feedback(files: list[str], locked: list[str]) -> str:
         text += (f" The conflicts in the locked tests {', '.join(locked)} were resolved by the other vendor; do not "
                  f"edit them.")
     return text + " Do not run git merge, commit or abort: the engine concludes the merge."
+
+
+def criterion_items(criterion: str | None, items: set[str]) -> set[str]:
+    """The plan items a probe proves: the list of item ids its criterion leads with ("D1, D2, A1;
+    A3 agent portion" names the four; "D1: as D2 does" names D1). An id the plan does not have
+    names nothing."""
+    named: set[str] = set()
+    m = CRITERION_LEAD.match(criterion or "")
+    while m:
+        named.add(m.group(1))
+        m = CRITERION_NEXT.match(criterion or "", m.end())
+    return named & items
 
 
 def criterion_item(criterion: str | None, items: set[str]) -> str | None:
