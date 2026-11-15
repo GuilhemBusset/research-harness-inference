@@ -38,16 +38,18 @@ follow. Its settlement is still one write, to the item of its own day, which lea
 behind: a reservation that stand-ins refuse reads the day before again and removes, in its own
 single write, those whose request has ended.
 
-A stand-in is never missing, because no request is admitted to a day once the day is over. A
-write can be sent before midnight and made after it, when another task has already read the day
-and opened the next one, so the ledger reads the clock again when the write has answered. If the
-day has changed, the reservation does not count: one more write takes the lease and its tokens
-back, and the request reserves again, in the new day, where it is admitted or refused like any
-other. Such a request makes two writes more than the two of every other, and only a write in
-flight at midnight is one. So the leases that count in a day were all written before it ended,
-the first reservation of the next day reads them all, and from then on they can only go. That
-rests on the clocks of the gateway's tasks agreeing on the day: a reservation that a task whose
-clock is behind confirms in the old day, after another task has read that day, has no stand-in.
+A stand-in is never missing, because no reservation counts in a day once the next day is
+open without it. A write can be sent before midnight and made after it, when another task has
+already read the day and opened the next one. So when a write answers, the ledger reads the clock
+again, and if the day has changed it reads the next day's item: the reservation counts if that
+item is not there yet (whoever opens it will read the lease) or holds its stand-in. If not, one
+more write takes the lease and its tokens back, as a settlement that charges nothing, and the
+request is refused with `concurrency_limit`, which the client retries. Every request thus makes
+two writes at most, and a write that crosses midnight alone still makes one. So the leases that
+count in a day were all written before the next day was opened, or were carried into it, and from
+then on they can only go. That rests on the clocks of the gateway's tasks agreeing on the day: a
+reservation that a task whose clock is behind confirms in the old day, after another task has read
+that day, has no stand-in.
 
 **The input estimate** is computed from the request body alone, before any call to the engine: a
 token for every four bytes, rounded up. The design gives no rule. Four bytes a token is the usual
@@ -102,8 +104,7 @@ LEASE_MARGIN_SECONDS = 60
 # The retention of every store: the course end plus 90 days (section 6.6).
 USAGE_RETENTION_SECONDS = 90 * 86_400
 
-# How many times the DynamoDB ledger sends a reservation whose record changed under it, and how
-# many times a ledger makes again a reservation that was confirmed after its day.
+# How many times the DynamoDB ledger sends a reservation whose record changed under it.
 _ATTEMPTS = 10
 # What the name of a stand-in begins with: the day of the request it stands for.
 _STAND_IN = re.compile(r"\d{4}-\d{2}-\d{2}/", re.ASCII)
@@ -281,26 +282,33 @@ def _reserve_within_the_day(
     output_limit: int,
     seconds: int,
     write: Callable[[Reservation, int], None],
+    read: Callable[[int, str], UsageDay | None],
     take_back: Callable[[Reservation], object],
 ) -> Reservation:
-    """A reservation that `write` made, and that was confirmed before its day ended.
+    """A reservation that `write` made, and that counts in the day it was confirmed in.
 
-    `write` adds the reservation to the record of its day, or raises the refusal. The clock is read
-    again when it returns. If the day has changed, another task may have read the old day before
-    the write was made, and opened the new day without it: `take_back` removes the lease and its
-    tokens, and the reservation is made again in the new day.
+    `write` adds the reservation to the record of its day, or raises the refusal; `read` reads a
+    student's day without writing. The clock is read again when `write` returns. If the day has
+    changed and the next day was opened without this lease, `take_back` removes the lease and its
+    tokens, and the request is refused.
     """
     now = int(clock())
-    for _ in range(_ATTEMPTS):
-        lease = _new_lease(body, output_limit, now + seconds)
-        reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
-        write(reservation, now)
-        now = int(clock())
-        if utc_day(now) == reservation.day:
-            return reservation
-        take_back(reservation)
-    # No clock changes its day this often.
-    raise GatewayError(Cause.CONCURRENCY_LIMIT, "no reservation was confirmed within its day")
+    lease = _new_lease(body, output_limit, now + seconds)
+    reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
+    write(reservation, now)
+    today = utc_day(int(clock()))
+    if today == reservation.day or _carried(reservation, today, read):
+        return reservation
+    take_back(reservation)
+    raise GatewayError(Cause.CONCURRENCY_LIMIT, "the next day was opened while this reservation was made")
+
+
+def _carried(reservation: Reservation, today: str, read: Callable[[int, str], UsageDay | None]) -> bool:
+    """Whether a reservation confirmed after its day counts in `today`: not opened yet, or holding its stand-in."""
+    if _day_before(today) != reservation.day:
+        return False
+    found = read(reservation.github_id, today)
+    return found is None or f"{reservation.day}/{reservation.request_id}" in found.leases
 
 
 def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: bool, now: int) -> int:
@@ -364,6 +372,7 @@ class InMemoryLedger:
             output_limit,
             lease_seconds(hold_seconds, longest_request_seconds),
             write,
+            self.day,
             lambda reservation: self._remove(reservation, 0),
         )
 
@@ -414,8 +423,9 @@ class DynamoDBLedger:
     after one read of the day before, and for a request that expired leases or stand-ins are in
     the way of (for stand-ins, with one read of the day before). It gives up, with
     `concurrency_limit`, after ten calls that each found the record changed by another request. A
-    reservation whose write answers after its day has ended is taken back, in one call, and made
-    again in the new day. A settlement is one call, and the read one consistent read.
+    reservation whose write answers after its day has ended reads the next day's item, and is
+    taken back, in one call, only if that day was opened without it. A settlement is one call,
+    and the read one consistent read.
 
     An error of DynamoDB other than a failed condition is raised as the SDK raised it. It carries
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
@@ -444,6 +454,7 @@ class DynamoDBLedger:
             output_limit,
             lease_seconds(hold_seconds, longest_request_seconds),
             lambda reservation, now: self._write_reservation(student, reservation, now),
+            self._read,
             lambda reservation: self._remove(reservation, 0),
         )
 
