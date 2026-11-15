@@ -89,5 +89,3 @@ def test_d2_walkthrough_routes_read_app_id_and_asks_for_key(shell):
     assert "private key file, outside the working tree" in done.stdout
     assert f"rhi.owner_secret {SECRET} --app-id 707 --installation-id 808 --private-key-file {key}" in calls
     assert "/aws " not in calls
-
-

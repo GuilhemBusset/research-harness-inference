@@ -39,5 +39,3 @@ def test_d2_secret_creation_and_update(tmp_path, capsys, monkeypatch, exists):
         "app_id": "707", "installation_id": "808", "private_key": key.read_text()}
     output = capsys.readouterr()
     assert MARK not in output.out + output.err
-
-
