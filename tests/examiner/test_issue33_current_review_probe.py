@@ -121,6 +121,7 @@ def test_policy_test_rejects_each_removed_denial(logical_id, action, tmp_path, m
     checker.test_the_two_policies_hold_every_denial()
     template, errors = decode_str(TARGET.read_text())
     assert not errors
+    assert template is not None
     changed = copy.deepcopy(template)
     for statement in changed["Resources"][logical_id]["Properties"]["PolicyDocument"]["Statement"]:
         if statement["Effect"] == "Deny":
