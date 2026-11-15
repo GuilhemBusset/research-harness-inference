@@ -330,44 +330,67 @@ def test_no_command_of_the_apps_step_is_a_call_with_the_owners_login(walkthrough
     assert {token for token in github.tokens_seen() if token.count(".") != 2} <= minted
 
 
-def test_the_app_keys_come_from_outside_the_tree(walkthrough: Walkthrough) -> None:
-    def step(option: str, file: Path | str) -> subprocess.CompletedProcess[str]:
-        return walkthrough.run("--dry-run", "--step", "apps", option, file)
+def test_the_reporter_key_comes_from_outside_the_tree(walkthrough: Walkthrough) -> None:
+    def step(file: Path | str) -> subprocess.CompletedProcess[str]:
+        return walkthrough.run("--dry-run", "--step", "apps", "--reporter-key", file)
 
-    # A key file outside the tree: the commands name the file. It is not opened, so one that
-    # nobody may read is accepted too, and its content is never printed.
+    # A key file outside the tree: the writer's command names the secret and the file. The file is
+    # not opened, so one that nobody may read is accepted too, and its content is never printed.
     key = walkthrough.owner_file(KEY, "reporter.pem")
     for mode in (0o000, 0o600):
         key.chmod(mode)
-        accepted = step("--reporter-key", key)
+        accepted = step(key)
         assert accepted.returncode == 0, accepted.stderr
         (writer,) = [command for command in commands(accepted.stdout) if "rhi.owner_secret" in command]
         assert f" {SECRET} " in writer
         assert writer.endswith(f"--private-key-file {key}")
-        reporter, login = [command for command in commands(accepted.stdout) if " reporter " in command or " login " in command]
-        assert f"--key-file {key}" in reporter
-        assert f"--key-file {key}" in login
         assert KEY_MARK not in accepted.stdout + accepted.stderr
-        accepted = step("--factory-key", key)
-        assert accepted.returncode == 0, accepted.stderr
-        (factory,) = [command for command in commands(accepted.stdout) if "rhi.owner_apps factory" in command]
-        assert f"--key-file {key}" in factory
         assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
 
     # The same file inside the tree, and a link in the tree to the file outside: refused.
     (walkthrough.tree / "reporter.pem").write_text(KEY, encoding="utf-8")
     (walkthrough.tree / "link.pem").symlink_to(key)
-    for option, offered in (("--reporter-key", "rhi.owner_secret"), ("--factory-key", "rhi.owner_apps factory")):
-        for inside in (walkthrough.tree / "reporter.pem", "reporter.pem", walkthrough.tree / "link.pem"):
-            refused = step(option, inside)
-            assert refused.returncode != 0
-            assert "inside the working tree" in refused.stderr
-            assert offered not in refused.stdout  # the command is not offered
-            assert KEY_MARK not in refused.stdout + refused.stderr
-            assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+    for inside in (walkthrough.tree / "reporter.pem", "reporter.pem", walkthrough.tree / "link.pem"):
+        refused = step(inside)
+        assert refused.returncode != 0
+        assert "inside the working tree" in refused.stderr
+        assert "rhi.owner_secret" not in refused.stdout  # the writing is not offered
+        assert KEY_MARK not in refused.stdout + refused.stderr
+        assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
 
 
-def test_the_reporter_step_stores_the_installation_github_reports(walkthrough: Walkthrough) -> None:
+def test_the_app_keys_come_from_outside_the_tree(walkthrough: Walkthrough) -> None:
+    def step(option: str, file: Path | str) -> subprocess.CompletedProcess[str]:
+        return walkthrough.run("--dry-run", "--step", "apps", option, file)
+
+    # The reporter's key signs the reading of the reporter and of the login App; the factory's key
+    # the reading of the factory's App. Neither is opened by the step, nor printed.
+    key = walkthrough.owner_file(KEY, "app.pem")
+    accepted = step("--reporter-key", key)
+    assert accepted.returncode == 0, accepted.stderr
+    reporter, login = [command for command in commands(accepted.stdout) if " reporter " in command or " login " in command]
+    assert f"--key-file {key}" in reporter
+    assert f"--key-file {key}" in login
+    accepted = step("--factory-key", key)
+    assert accepted.returncode == 0, accepted.stderr
+    (factory,) = [command for command in commands(accepted.stdout) if "rhi.owner_apps factory" in command]
+    assert f"--key-file {key}" in factory
+    assert KEY_MARK not in accepted.stdout + accepted.stderr
+    assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+
+    # The factory's key inside the tree, or a link in the tree to the file outside: refused.
+    (walkthrough.tree / "factory.pem").write_text(KEY, encoding="utf-8")
+    (walkthrough.tree / "link.pem").symlink_to(key)
+    for inside in (walkthrough.tree / "factory.pem", "factory.pem", walkthrough.tree / "link.pem"):
+        refused = step("--factory-key", inside)
+        assert refused.returncode != 0
+        assert "inside the working tree" in refused.stderr
+        assert "rhi.owner_apps factory" not in refused.stdout  # the reading is not offered
+        assert KEY_MARK not in refused.stdout + refused.stderr
+        assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+
+
+def test_the_reporter_step_asks_before_it_stores(walkthrough: Walkthrough) -> None:
     reporter, _ = apps(walkthrough.github)
     # The reporter's ID, its key, this repository, and a yes to reading it; then the writing.
     asked = f"202\n{reporter}\n{REPOSITORY}\ny\n"
@@ -378,25 +401,15 @@ def test_the_reporter_step_stores_the_installation_github_reports(walkthrough: W
     assert not [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
     assert walkthrough.called("aws") == []
 
-    # Yes to the writing, no to the check: the App's ID and the installation's ID are GitHub's,
-    # and no answer gave the installation's.
+    # Yes to the writing, no to the check: the module stores, and nothing is left behind.
     done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
     assert done.returncode == 0, done.stderr
     (stored,) = [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
-    assert stored.endswith(f"rhi.owner_secret {SECRET} --app-id 202 --installation-id 404 --private-key-file {reporter}")
+    assert f"rhi.owner_secret {SECRET} " in stored
     assert walkthrough.called("aws") == []
     key_lines = [line for line in reporter.read_text(encoding="utf-8").splitlines() if "KEY" not in line]
     assert not [line for line in key_lines if line in done.stdout + done.stderr]
     assert list((walkthrough.tmp_path / "tmp").glob("rhi-owner-setup.*")) == []
-
-    # A reporter on every repository, or with no installation yet: nothing is offered to store.
-    apps(walkthrough.github, reporter="all")
-    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
-    assert "refused: " in done.stderr
-    walkthrough.github.app(202, "course-reporter", [], STAND_IN.REPORTER)
-    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
-    assert "no installation" in done.stdout
-    assert not [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
 
     # A key file inside the tree is refused in a real run too, whichever way it is named.
     (walkthrough.tree / "reporter.pem").write_text(KEY, encoding="utf-8")
@@ -406,6 +419,26 @@ def test_the_reporter_step_stores_the_installation_github_reports(walkthrough: W
     done = walkthrough.run("--step", "apps", "--reporter-key", "reporter.pem", answers="202\ny\n")
     assert done.returncode != 0
     assert walkthrough.called("uv", "aws") == []
+
+
+def test_the_reporter_step_stores_the_installation_github_reports(walkthrough: Walkthrough) -> None:
+    reporter, _ = apps(walkthrough.github)
+    asked = f"202\n{reporter}\n{REPOSITORY}\ny\n"
+
+    # The App's ID and the installation's ID are GitHub's, and no answer gave the installation's.
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert done.returncode == 0, done.stderr
+    (stored,) = [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
+    assert stored.endswith(f"rhi.owner_secret {SECRET} --app-id 202 --installation-id 404 --private-key-file {reporter}")
+
+    # A reporter on every repository, or with no installation yet: nothing is offered to store.
+    apps(walkthrough.github, reporter="all")
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert "refused: " in done.stderr
+    walkthrough.github.app(202, "course-reporter", [], STAND_IN.REPORTER)
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert "no installation" in done.stdout
+    assert not [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
 
 
 class Secrets:
