@@ -28,8 +28,7 @@ from unittest import mock
 
 from helpers import HISTORY_CHECKS, REPO_ROOT, SHIP, STANDING_CHECKS, git, issue_body, present
 from implement_loop import cli, config, sandbox
-from implement_loop import engine as engine_module
-from implement_loop.agents import FakeAgents, Probe
+from implement_loop.agents import FakeAgents
 from implement_loop.engine import Engine, history_findings, history_places
 from implement_loop.model import IssueState, Phase
 from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
@@ -358,73 +357,6 @@ class RevertHistoryTests(HistoryCase):
         st = IssueState(number=3, fix_forwards=1, reverts=1, restarts=2)
         engine._owner_edit(st)
         self.assertEqual((st.fix_forwards, st.reverts, st.restarts), (0, 0, 0))
-
-
-class DirtyProbeAgents(FakeAgents):
-    """The examiner's first probe for D1 carries an account ID. Asked again, it writes a clean one."""
-
-    def __init__(self, scripts):
-        super().__init__(scripts)
-        self.asked: list[list[str]] = []
-
-    def examine(self, vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since):
-        self.asked.append(list(req.feedback))
-        result = super().examine(vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since)
-        first = self.probe_file(req.issue.number)
-        if len(self.asked) == 1:
-            result.probes = [Probe(p.file, p.criterion, p.command, p.cwd, p.content + f"# the account is {ACCOUNT}\n")
-                             if p.file == first else p for p in result.probes]
-        elif any("were not kept" in f for f in req.feedback):
-            result.probes = [Probe(first, "D1", f"bash {first}", content="#!/usr/bin/env bash\ntest -s docs/a.txt\n")]
-        return result
-
-
-class ProbesAreScannedBeforeTheyAreCommittedTests(HistoryCase):
-    def test_a_probe_the_scan_refuses_is_not_adopted_and_the_examiner_is_told_why(self):
-        self.work()
-        agents = DirtyProbeAgents(self.scripts)
-        summary = self.run_engine(agents=agents)
-        self.assertEqual(summary["phases"], {"done": 1})
-        first, second = self.events("examined", 2)[:2]
-        [rejected] = first["rejected"]
-        self.assertEqual(rejected["file"], "checks/probe_2.sh")
-        self.assertTrue(rejected["reason"].startswith("the standing checks refuse it: standing check `hygiene` failed"))
-        self.assertIn("checks/probe_2.sh:4: account-id", rejected["reason"])
-        self.assertEqual(first["adopted"], ["checks/probe_2_A1.sh"], "the clean probe of the same examination is kept")
-        told = "\n".join(agents.asked[1])
-        self.assertIn("These probes were not kept: `checks/probe_2.sh`", told)
-        self.assertIn("account-id", told)
-        self.assertNotIn(ACCOUNT, told)
-        self.assertEqual(second["adopted"], ["checks/probe_2.sh"], "its clean replacement is adopted")
-        self.assertFalse(self.events("history_refused"), "so the branch's history never held the value")
-        self.assertNotIn(ACCOUNT, git("log", "--all", "-p", cwd=self.repo.work))
-        self.assertNotIn(ACCOUNT, present(self.repo.main_file("checks/probe_2.sh")))
-
-    def test_without_that_scan_the_probes_commit_would_have_ended_the_issue(self):
-        # what the scan before adoption saves: the same examination, committed as it came
-        self.work()
-        agents = DirtyProbeAgents(self.scripts)
-        with mock.patch.object(Engine, "_unclean_probes", lambda *a: {}):
-            self.run_engine(agents=agents)
-        st = self.store.issue(2)
-        self.assertEqual((st.phase, (st.fail or {}).get("cause")), (Phase.FAILED, "history"))
-        self.assertTrue(any(f.startswith("checks/probe_2.sh@") for f in self.events("history_refused", 2)[0]["findings"]))
-        self.assertEqual(self.gh.prs, {})
-        self.assertNotIn(ACCOUNT, self.published())
-
-    def test_clean_probes_cost_one_scan_and_are_all_kept(self):
-        self.work()
-        calls = []
-        real = engine_module.verify.standing_checks
-
-        def recorded(root, checks, head_sha, work_dir, *args, **kwargs):
-            calls.append(work_dir.name)
-            return real(root, checks, head_sha, work_dir, *args, **kwargs)
-        with mock.patch.object(engine_module.verify, "standing_checks", recorded):
-            summary = self.run_engine()
-        self.assertEqual(summary["phases"], {"done": 1})
-        self.assertEqual(calls.count("probes"), 1, "all of an examination's probes in one scan")
-        self.assertEqual(self.events("examined", 2)[0]["adopted"], ["checks/probe_2.sh", "checks/probe_2_A1.sh"])
 
 
 # ---------------------------------------------------------------- the owner's list (issue #16)

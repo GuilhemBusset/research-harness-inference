@@ -136,7 +136,7 @@ Two other ways to get an issue moving again:
 | `done` | Merged, verified again on `main`, every ledger item has evidence. The issue is closed with its checkboxes ticked. | Nothing. |
 | `delivered` | Merged, and every item agents can prove is proven. Typed obligations remain, written on the issue: an `owner` item (it needs something this host lacks, listed in `loop.toml [host] lacks`), or an item deferred to another open issue. The issue stays open with the `loop:delivered` label. | The owner discharges owner items. A deferred item reopens by itself when its issue lands. |
 | `waiting` | Not an end state. The issue waits for something that clears by itself. | The supervisor resumes it. `retry` resumes it at once. |
-| `failed` | Not delivered, and nothing partial was merged. `status` shows the cause, one of the four below. It is filed as a loop fault (`loop:engine-bug`). | The supervisor may run one repair run per fault on the engine itself (never on the safety surface). A new engine version revives the issue once. `retry` gives it fresh ceilings. |
+| `failed` | Not delivered, and nothing partial was merged. `status` shows the cause, one of the four below. It is filed as a loop fault (`loop:engine-bug`). | No repair run: the fault stays filed for the operator. A new engine version revives the issue once. `retry` gives it fresh ceilings. |
 
 Why an issue `failed`, and what the operator does about it:
 
@@ -158,7 +158,7 @@ What a `waiting` issue waits for (`status` shows the kind):
 | `outage` | A vendor CLI could not reach its service, or a Claude model refused the call (usage or rate limit) and its fallback refused too. The supervisor resumes once the vendor answers a smoke call. |
 | `github` | GitHub kept failing after retries. |
 | `environment` | The host cannot run the issue's checks (a missing tool, for example). It resumes when the doctor's probes change. |
-| `engine` | The engine itself faulted; a `loop:engine-bug` issue was filed. It resumes on a new engine version. |
+| `engine` | The engine itself faulted; a `loop:engine-bug` issue was filed, and the supervisor gives it one repair run (never on the safety surface). It resumes on a new engine version. |
 | `run_ceiling` | The run's own call ceiling stopped new calls. The next run continues. |
 
 "Merged" means the gates passed on the pull request. It does not mean the change works in AWS.
