@@ -13,6 +13,8 @@ The rules here take a pool from zero, grow it, and take it back:
 | n to n - 1 | Two instances or more in service and none starting or leaving, the requests in flight at most (n - 1) times half of `target_concurrency` for 10 minutes, 15 minutes after the last scale-out, in a pool nobody stopped: one instance fewer, one that reports nothing running and nothing waiting, and none when no instance does |
 | to 0 | No request received and none in flight or held for `idle_minutes`, in any mode: zero, naming every instance |
 | stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
+| gateway silent | No fresh gateway heartbeat for 10 minutes, in any mode: zero, naming every instance, even one that reports work |
+| launch loop | Three launches abandoned in a row: suspend the group's launches and set the mark; nothing wakes or grows the pool until the admin clears it |
 
 Demand is what the fresh gateway heartbeats report. An explicit wake reaches them as a held request
 and as a request received, so it has no rule of its own. A pool in mode `scheduled-only` is not
@@ -33,6 +35,20 @@ A scale-in removes only an instance whose fresh heartbeat reports nothing runnin
 waiting: the design does not lean on the load balancer's drain. An instance with no fresh heartbeat
 is not known to be idle, so it is not removed. The last instance never leaves by this rule, only by
 idleness. A scale-in starts the 10 minutes again, so the next one is judged on the smaller pool.
+
+The two fail-safes come from section 5.1. Nobody can reach the fleet without the gateway, so a pool
+that has capacity and no fresh gateway heartbeat for 10 minutes goes to zero, before any other rule:
+an instance that reports work does not keep it. The time of the last heartbeat is kept in the
+memory, so the 10 minutes span runs; a pool no run has seen a gateway report on is silent.
+
+A launch that fails every time would loop: launch, wait, abandon, relaunch. When the input counts
+three launches abandoned in a row, the decision suspends the group's launches and sets the mark
+`launch_suspended` in the memory. While it stands, every run keeps the launches suspended, and no
+rule raises the capacity: a held request does not wake the pool and a full pool does not grow. The
+rules that lower it still apply. The admin clears the mark by setting it back to false. The run
+that finds it so resumes the launches and keeps its own time as the start of the count; it ignores
+the abandons it was given, which the group's history still holds, and decides as for any pool, so a
+held request wakes it. Only three abandons counted from that time suspend it again.
 """
 
 from __future__ import annotations
@@ -48,6 +64,10 @@ SCALE_OUT_SECONDS = 60
 LOW_LOAD_SECONDS = 10 * 60
 # How long after the last scale-out the pool may shrink.
 AFTER_SCALE_OUT_SECONDS = 15 * 60
+# How long without a fresh gateway heartbeat before a pool goes to zero.
+GATEWAY_SILENT_SECONDS = 10 * 60
+# How many launches abandoned in a row suspend the group's launches.
+ABANDONED_LAUNCHES_LIMIT = 3
 
 
 def _every_instance(supply: Supply) -> tuple[str, ...]:
@@ -71,6 +91,22 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     held = sum(heartbeat.held for heartbeat in gateways)
     # The last request received: the latest among the fresh heartbeats and the memory, which keeps it.
     received = [pool.memory.last_request_at, *(heartbeat.last_request_at for heartbeat in gateways)]
+    # The last gateway heartbeat seen, kept the same way.
+    heard = [pool.memory.last_gateway_at, *(heartbeat.written_at for heartbeat in gateways)]
+    last_gateway_at = max((time for time in heard if time is not None), default=None)
+
+    # The launch loop. A mark that is false while the memory keeps when it was set: the admin
+    # cleared it. That run starts the count again and ignores the abandons it was given, which the
+    # edge counted from the old start.
+    before = pool.memory
+    cleared = not before.launch_suspended and before.suspended_at is not None
+    abandons_counted_from = now if cleared else before.abandons_counted_from
+    if before.launch_suspended:
+        suspended, suspended_at = True, now if before.suspended_at is None else before.suspended_at
+    elif not cleared and pool.abandoned_launches >= ABANDONED_LAUNCHES_LIMIT:
+        suspended, suspended_at = True, now
+    else:
+        suspended, suspended_at = False, None
 
     supply = pool.supply
     target = pool.config.target_concurrency
@@ -133,7 +169,10 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     # scale-in may remove.
     unused = sorted({heartbeat.instance for heartbeat in serving if not heartbeat.running and not heartbeat.waiting})
 
-    if pool.mode in STOPPED_MODES:
+    if (desired > 0 or bool(counted)) and _older_than(last_gateway_at, GATEWAY_SILENT_SECONDS, now):
+        # Nobody can reach the fleet without the gateway: zero, before every other rule.
+        desired, lift, reason = 0, _every_instance(supply), Reason.GATEWAY_SILENT
+    elif pool.mode in STOPPED_MODES:
         # A stop comes before idleness: an instance that still reports work is kept, even when the
         # gateways have seen no request for `idle_minutes` (a client that left, an engine that has
         # not finished).
@@ -147,10 +186,14 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     elif idle:
         desired, lift, reason = 0, _every_instance(supply), Reason.IDLE
     elif held and desired == 0:
-        if pool.mode is Mode.ENABLED:
-            desired, reason = 1, Reason.WAKE
-        else:
+        if pool.mode is not Mode.ENABLED:
             reason = Reason.NOT_WOKEN
+        elif suspended:
+            reason = Reason.LAUNCH_SUSPENDED
+        else:
+            desired, reason = 1, Reason.WAKE
+    elif full and not launching and desired < pool.config.max_instances and suspended:
+        reason = Reason.LAUNCH_SUSPENDED
     elif full and not launching and desired < pool.config.max_instances:
         # One instance at a time: the next waits for this one to be in service.
         desired, reason = desired + 1, Reason.SCALE_OUT
@@ -167,13 +210,14 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         desired, lift, reason = n - 1, (unused[0],), Reason.SCALE_IN
         # The next scale-in is judged on the smaller pool: its 10 minutes start again.
         low_load_since = None
+    if suspended and reason is Reason.UNCHANGED:
+        reason = Reason.LAUNCH_SUSPENDED
 
     return PoolDecision(
         pool=pool.config.name,
         desired=desired,
         lift_protection=lift,
-        # The launch-loop rule sets it; no rule here does.
-        suspend_launches=False,
+        suspend_launches=suspended,
         memory=Memory(
             last_request_at=memory.last_request_at,
             last_in_flight_at=memory.last_in_flight_at,
@@ -181,6 +225,10 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
             waiting_since=memory.waiting_since,
             last_scale_out_at=last_scale_out_at,
             low_load_since=low_load_since,
+            last_gateway_at=last_gateway_at,
+            launch_suspended=suspended,
+            suspended_at=suspended_at,
+            abandons_counted_from=abandons_counted_from,
         ),
         reason=reason,
     )
