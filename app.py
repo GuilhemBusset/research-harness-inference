@@ -26,8 +26,10 @@ def package_roots() -> list[Path]:
 sys.path[:0] = [str(root) for root in package_roots() if str(root) not in sys.path]
 
 import aws_cdk as cdk
+import cdk_nag
 
 from rhi import config as configuration
+from rhi import nag
 from rhi.stage import EndpointStage
 
 if TYPE_CHECKING:
@@ -36,12 +38,34 @@ if TYPE_CHECKING:
     from rhi.config import Config
 
 
+def add_nag(app: cdk.App, *, acknowledged: Path = nag.ACKNOWLEDGED, source: Path = nag.SOURCE) -> None:
+    """Runs cdk-nag's AWS Solutions pack inside the synthesis of the app, as a policy-validation
+    plugin: a finding fails synthesis (system design, section 8.2, step 2), unless the file of the
+    module that created the resource acknowledges it (`rhi.nag`).
+
+    cdk-nag writes every acknowledgement into the template, in the metadata of the resource it
+    covers. `tests/policy/test_nag_acknowledgements.py` reads them there, so that nothing is
+    acknowledged that the protected files do not list. `acknowledged` and `source` are the folder
+    of those files and the source tree of the modules that name them; a test gives its own.
+    """
+    # First, so that on each resource the acknowledgements are made before they are written.
+    nag.acknowledge(app, folder=acknowledged, source=source)
+    cdk.Validations.of(app).add_plugins(cdk_nag.AwsSolutionsChecks(app, write_suppressions_to_cloud_formation=True))
+    # The pack writes through an aspect of the app, which does not visit what is inside a stage:
+    # each stage gets the same aspect.
+    for assembly in nag.assemblies(app):
+        if assembly.parent_stage is not None:
+            cdk.Aspects.of(assembly).add(cdk_nag.WriteNagSuppressionsToCloudFormationAspect())
+
+
 def build(config: Config, *, outdir: str | None = None, context: Mapping[str, Any] | None = None) -> cdk.App:
     """The app for one configuration. The CDK CLI gives the output directory and the context of
     `cdk.json` through the environment; a test gives its own."""
     # No version-reporting resource: in a stack without a region, its condition lists region names.
     app = cdk.App(outdir=outdir, context=context, analytics_reporting=False)
     EndpointStage(app, "Rhi", config=config)
+    # Last: it reaches the stages the app holds by now.
+    add_nag(app)
     return app
 
 
