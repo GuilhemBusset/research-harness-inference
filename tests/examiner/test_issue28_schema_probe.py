@@ -12,7 +12,8 @@ OWNER_KEYS = {'domain', 'hosted_zone_id', 'admin_email', 'instructor_phone', 'gi
 
 
 def test_schema_private_keys_and_deferred_entries(tmp_path):
-    assert {field.name for field in fields(config.Config)} == OWNER_KEYS
+    # A later key has a default (issue E2-47 added one): only the owner's keys are required.
+    assert {field.name for field in fields(config.Config)} == set(config.KEYS) >= OWNER_KEYS
     assert config.required_keys() == OWNER_KEYS
     assert config.PRIVATE_KEYS == {'domain', 'hosted_zone_id', 'admin_email', 'instructor_phone', 'login_client_id'}
     text = Path('config.example.toml').read_text()
