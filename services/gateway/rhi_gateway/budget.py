@@ -44,10 +44,14 @@ already read the day and opened the next one. So when a write answers, the ledge
 again, and if the day has changed it reads the next day's item: the reservation counts if that
 item is not there yet (whoever opens it will read the lease) or holds its stand-in. If not, one
 more write takes the lease and its tokens back, as a settlement that charges nothing, and the
-request is refused with `concurrency_limit`, which the client retries. Every request thus makes
-two writes at most, and a write that crosses midnight alone still makes one. So the leases that
-count in a day were all written before the next day was opened, or were carried into it, and from
-then on they can only go. That rests on the clocks of the gateway's tasks agreeing on the day: a
+request is refused with `concurrency_limit`, which the client retries. "Not there yet" is not
+enough on its own: whoever opens the day may have read the day before already and not written yet.
+So whoever opens a day reads the day before again once its write has answered, and if a live lease
+appeared there in between, one more write takes its own reservation back and carries the stand-ins
+it missed, and that request too is refused with `concurrency_limit`. Every request thus makes two
+writes at most, and a write that crosses midnight alone still makes one. So the leases that count
+in a day were all written before the next day was opened, or were carried into it, and from then
+on they can only go. That rests on the clocks of the gateway's tasks agreeing on the day: a
 reservation that a task whose clock is behind confirms in the old day, after another task has read
 that day, has no stand-in.
 
@@ -420,7 +424,8 @@ class DynamoDBLedger:
     `client` is a DynamoDB client of the AWS SDK, which threads may share, and `table_name` the
     deployed table's name. A reservation is one call, and more only when that call writes
     nothing: for the student's first request of a day, whose item is not there yet and is written
-    after one read of the day before, and for a request that expired leases or stand-ins are in
+    between two reads of the day before (and taken back in one more call if the day before gained
+    a live lease in between), and for a request that expired leases or stand-ins are in
     the way of (for stand-ins, with one read of the day before). It gives up, with
     `concurrency_limit`, after ten calls that each found the record changed by another request. A
     reservation whose write answers after its day has ended reads the next day's item, and is
@@ -492,15 +497,29 @@ class DynamoDBLedger:
         # Every attempt found a record that another request had just changed.
         raise GatewayError(Cause.CONCURRENCY_LIMIT, "the student's day kept changing under this request")
 
-    def _remove(self, reservation: Reservation, charge: int) -> bool:
-        """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there."""
+    def _remove(self, reservation: Reservation, charge: int, *, stand_ins: Mapping[str, Lease] | None = None) -> bool:
+        """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there.
+
+        `stand_ins` are the requests of the day before that the write also carries into the day,
+        each as a stand-in that reserves no tokens and expires with the request's lease.
+        """
+        names = {f"#carried{number}": name for number, name in enumerate(stand_ins or {})}
+        values: dict[str, object] = {":change": charge - reservation.lease.tokens}
+        update = "REMOVE #leases.#request ADD #tokens :change"
+        if names:
+            carried = (stand_ins or {}).values()
+            values |= {
+                f":carried{number}": Lease(tokens=0, estimate=0, expires=lease.expires).to_map()
+                for number, lease in enumerate(carried)
+            }
+            update += " SET " + ", ".join(f"#leases.{name} = :{name[1:]}" for name in names)
         written, _ = self._conditional(
             self._client.update_item,
             Key=self._key(reservation.github_id, reservation.day),
-            UpdateExpression="REMOVE #leases.#request ADD #tokens :change",
+            UpdateExpression=update,
             ConditionExpression="attribute_exists(#leases.#request)",
-            ExpressionAttributeNames={**_NAMES, "#request": reservation.request_id},
-            ExpressionAttributeValues=_values({":change": charge - reservation.lease.tokens}),
+            ExpressionAttributeNames={**_NAMES, "#request": reservation.request_id, **names},
+            ExpressionAttributeValues=_values(values),
         )
         return written
 
@@ -547,16 +566,30 @@ class DynamoDBLedger:
         It holds a stand-in for each request still running from the day before, read here, and
         the refusal is raised if those leave no slot.
         """
-        before = self._read(reservation.github_id, _day_before(reservation.day))
+        yesterday = _day_before(reservation.day)
+        before = self._read(reservation.github_id, yesterday)
         fresh = _new_day(student, reservation.day, before, now)
         _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
         day = _reserved(fresh, reservation.request_id, reservation.lease, {})
-        return self._conditional(
+        written, found = self._conditional(
             self._client.put_item,
             Item=_values(day.to_item()),
             ConditionExpression="attribute_not_exists(#day)",
             ExpressionAttributeNames={"#day": "day"},
         )
+        if not written:
+            return written, found
+        # A reservation of the day before may have been written after the read above, and have
+        # found no item of this day when it checked: it counts, and its stand-in is not here.
+        late = {
+            request: lease
+            for request, lease in _live(self._read(reservation.github_id, yesterday), now).items()
+            if request not in _live(before, now)
+        }
+        if late:
+            self._remove(reservation, 0, stand_ins={f"{yesterday}/{request}": lease for request, lease in late.items()})
+            raise GatewayError(Cause.CONCURRENCY_LIMIT, "the day before changed while this day was opened")
+        return True, None
 
     def _conditional(self, write: Callable[..., Any], **arguments: Any) -> tuple[bool, UsageDay | None]:
         """Make one conditional write: whether it was written and, if not, the day it found there."""
