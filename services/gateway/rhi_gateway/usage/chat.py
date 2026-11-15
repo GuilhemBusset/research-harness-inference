@@ -23,9 +23,13 @@ How the counts are made:
   (`null`, as in the chunks before the last one, or a missing field) is no usage and changes
   nothing. Until a usage object has been read the counts are zero. A usage object on a chunk that
   also has choices is read like the final one, and the last one read is what is reported.
-- A stream has ended cleanly once `data: [DONE]` has been read after a usage: the answer is over
-  and there is a reported usage to settle to. A stream cut before it has not, nor has one that
-  ends without a usage, as a stream that carries an error and then `[DONE]` does.
+- A stream has ended cleanly once `data: [DONE]` has been read after a usage and no error: the
+  answer is over and there is a reported usage to settle to. A stream cut before it has not, nor
+  has one that ends without a usage.
+- An error is a chunk whose `error` is not `null`, which is how Chat Completions reports one on a
+  stream that has started. A stream that carried one never ends cleanly, whatever follows it: the
+  counts read before it are kept, as the tokens observed, and the `[DONE]` after it changes
+  nothing.
 
 Hiding the usage chunk. This is the one place where the gateway changes the stream that reaches
 the client, so `feed` returns the bytes to forward:
@@ -67,7 +71,7 @@ class Usage:
     """The whole input as reported, the tokens read from the cache included."""
     output_tokens: int
     ended_cleanly: bool
-    """Whether the answer is complete: a stream's `[DONE]` was read after its usage, or a whole answer."""
+    """Whether the answer is complete: a stream's `[DONE]` after its usage and no error, or a whole answer."""
 
 
 class ChatStreamUsage:
@@ -79,6 +83,7 @@ class ChatStreamUsage:
         self._event = bytearray()  # The whole lines of the event that has not ended yet.
         self._line = bytearray()  # The line that has not ended yet.
         self._counts: tuple[int, int] | None = None
+        self._failed = False  # Whether a chunk has reported an error.
         self._ended = False
 
     def feed(self, chunk: bytes | bytearray | memoryview) -> bytes:
@@ -126,9 +131,10 @@ class ChatStreamUsage:
         if event.comment:
             return False
         if event.data == DONE:
-            self._ended = self._counts is not None
+            self._ended = self._counts is not None and not self._failed
             return False
         payload = _json_object(event.data)
+        self._failed = self._failed or payload.get("error") is not None
         self._counts = _counts(payload.get("usage")) or self._counts
         return _is_usage_chunk(payload)
 
