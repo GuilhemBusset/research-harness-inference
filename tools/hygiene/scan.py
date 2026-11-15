@@ -216,6 +216,9 @@ _SECRET_KEY = re.compile(
     r"(?i:secret[_-]?(?:access[_-]?)?key|session[_-]?token)[\"']?[ \t]*[:= \t][ \t]*[\"']?([A-Za-z0-9/+=]{40,400})")
 # 4. token: the credentials this project's tools and its design use, and private keys.
 _WORD_START = r"(?:(?<![A-Za-z0-9_-])|(?<=\\[ntr]))"   # not inside a word; `\n` before it is an escape, not a word
+# A student's API key: the scanner's own copy of KEY_PATTERN in services/common/rhi_common/keys.py,
+# since it imports nothing from the product. tools/hygiene/tests/test_student_key.py keeps the two equal.
+STUDENT_KEY = r"rhi_[0-9A-Za-z]{46}"
 _TOKENS = tuple(re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{36,}",                                  # GitHub: classic, OAuth, app, refresh
     r"github_pat_[A-Za-z0-9_]{36,}",                                # GitHub: fine-grained
@@ -224,6 +227,9 @@ _TOKENS = tuple(re.compile(p) for p in (
     _WORD_START + r"sk-[A-Za-z0-9]{32,}",                           # OpenAI: legacy
     r"hf_[A-Za-z0-9]{30,}",                                         # Hugging Face (the model store)
     r"glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}",                         # Grafana service account
+    # Anywhere in a line, a file name included, unless a letter or a digit follows: a longer run
+    # is not a key. The package names (`rhi_common`, `rhi_mock_engine`) are far too short.
+    STUDENT_KEY + r"(?![0-9A-Za-z])",                               # this project's student keys
     # PEM and OpenPGP private keys: the header and whatever shares its line (a key kept on one
     # line, as in a JSON document). The lines below a header are masked by redact().
     r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[^\n]*",
