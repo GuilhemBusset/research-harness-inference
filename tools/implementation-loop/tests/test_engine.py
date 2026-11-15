@@ -109,10 +109,21 @@ class HappyPathTests(EngineCase):
         self.add_work(2, "docs/a.txt", "alpha")
         self.add_work(3, "docs/b.txt", "beta")
         self.epic(2, 3)
-        self.run_engine()
+        self.run_engine(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2))
         building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
         merged = {e["issue"]: e["seq"] for e in self.events("merged")}
         self.assertLess(max(building.values()), min(merged.values()))
+        self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
+
+    def test_by_default_one_issue_is_built_at_a_time(self):
+        self.add_work(2, "docs/a.txt", "alpha")
+        self.add_work(3, "docs/b.txt", "beta")
+        self.epic(2, 3)
+        self.run_engine()
+        building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
+        merged = {e["issue"]: e["seq"] for e in self.events("merged")}
+        first, second = sorted((2, 3), key=building.get)
+        self.assertLess(merged[first], building[second])
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
 
     def test_unquoted_triage_objections_are_dropped(self):
