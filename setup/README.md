@@ -29,9 +29,9 @@ uv sync --locked
 Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock), at the
 exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the app runs on
 (aws-cdk-lib, constructs and cdk-nag), boto3 (the AWS SDK, with which the app reads its
-configuration from SSM and writes it there), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty and
-moto) and the libraries the services import. `scripts/check.sh` does this itself. Remove it with
-`rm -rf .venv`.
+configuration from SSM and writes it there), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty,
+moto and cfn-lint) and the libraries the services import. `scripts/check.sh` does this itself.
+Remove it with `rm -rf .venv`.
 
 The services' libraries are in dependency groups, one per service and named after it, listed in
 the [installation inventory](#installation-inventory). The dev group, which `uv sync` installs,
@@ -137,7 +137,7 @@ repositories only: the green-light checklist says how to check that the rule rea
 | Component | Source and destination |
 | --- | --- |
 | `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap | Installed by the contributor; nothing in this repository installs or changes a global tool |
-| Python tools (pytest, pytest-xdist, Ruff, ty, and moto with its DynamoDB extra) and PyYAML, the parser of the test that reads CI's workflow | The dev group. Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
+| Python tools (pytest, pytest-xdist, Ruff, ty, moto with its DynamoDB extra, and cfn-lint, which lints the synthesized templates and the templates under `setup/` in `tests/synth/test_cfn_lint.py`) and PyYAML, the parser of the test that reads CI's workflow | The dev group. Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | CDK libraries (aws-cdk-lib, constructs, cdk-nag) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/`, the project environment |
 | boto3, the AWS SDK, for the app itself | In the project's dependencies for the ssm source and the writer of `src/rhi/config.py` only, at the version the service groups carry. Exact version and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | Service libraries: the groups below | One dependency group per service in `pyproject.toml`, exact versions and hashes in `uv.lock`. `uv sync --locked` installs them all into `.venv/`, because the dev group includes every group. A function's bundle and an image install their service's group from the lock, and nothing else: uv installs the wheels into the bundle under `cdk.out/` at `cdk synth`, and an image's Dockerfile installs the requirements file exported from the lock with its hashes (`src/rhi/packaging.py`) |
