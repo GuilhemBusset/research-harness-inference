@@ -24,8 +24,12 @@ has served since its start. It knows one by a file it writes before it completes
 service, in a folder the host empties at every start (`SERVED_FILE`).
 
 **Abandon.** A release that differs, a step that fails and the transition's deadline all end the
-same way. The steps on the host take what is left of the deadline as their time limit, so a pull
-that hangs is abandoned at the deadline and not when it returns.
+same way. Every step takes what is left of the deadline as its time limit, so a pull that hangs, or
+a health route that is slow to answer, is abandoned at the deadline and not when it returns.
+
+Whether the disk holds the image is the first question of a launch into service, and until the
+host has answered it the launch may be a promotion. So where a start was measured, the question is
+asked within the promotion's deadline, and a docker that does not answer in that time is abandoned.
 
 **What cannot be completed.** The hook is named in the settings of the release parameter, and the
 instance by its metadata. Without one of them there is nothing to call: `run` returns
@@ -147,9 +151,11 @@ class Engine:
     def __init__(self, fetch: Fetch = fetch) -> None:
         self._fetch = fetch
 
-    def healthy(self) -> bool:
-        """Whether `GET /health` answers 200: the model can serve (section 4.1)."""
-        answer = self._fetch(urllib.request.Request(f"{ENGINE_URL}/health"), ANSWER_SECONDS)
+    def healthy(self, timeout: float | None = None) -> bool:
+        """Whether `GET /health` answers 200: the model can serve (section 4.1). The answer may
+        take `ANSWER_SECONDS`, or `timeout` seconds when that is less."""
+        limit = ANSWER_SECONDS if timeout is None else min(ANSWER_SECONDS, timeout)
+        answer = self._fetch(urllib.request.Request(f"{ENGINE_URL}/health"), limit)
         return answer is not None and answer[0] == 200
 
     def warm_up(self, model: str, secret: str, timeout: float | None = None) -> bool:
@@ -250,15 +256,16 @@ class Launch:
         self._left(deadline)
 
     def _enter_service(self, current: release.Current, started: float) -> None:
+        measured = current.measured_start_seconds
+        # A promotion's deadline. The launch may be one until the host says the disk has no image.
+        deadline = None if measured is None else started + PROMOTION_DEADLINE_STARTS * measured
         try:
-            warm = self.host.holds(current.release.engine_image)
+            warm = self.host.holds(current.release.engine_image, timeout=self._left(deadline))
         except HostError:
             raise _Abandon from None
-        measured = current.measured_start_seconds
-        deadline = None
-        if warm and measured is not None:
-            deadline = started + PROMOTION_DEADLINE_STARTS * measured
         if not warm:
+            # Straight into service: this start is not the measured one, and has no deadline here.
+            deadline = None
             self._pull(current, deadline)
         self._check(current)
         secret = self._secret(current.settings.secret_id)
@@ -266,7 +273,7 @@ class Launch:
             self.host.start_engine(timeout=self._left(deadline))
         except HostError:
             raise _Abandon from None
-        while not self.engine.healthy():
+        while not self.engine.healthy(self._left(deadline)):
             left = self._left(deadline)
             self.sleep(HEALTH_INTERVAL_SECONDS if left is None else min(HEALTH_INTERVAL_SECONDS, left))
         # The pool's name is the model name the engine serves (section 4.2).

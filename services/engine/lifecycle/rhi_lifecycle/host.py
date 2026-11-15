@@ -57,11 +57,13 @@ class Host:
         self._ecr = ecr
         self._nsenter = nsenter
 
-    def holds(self, image: str) -> bool:
+    def holds(self, image: str, timeout: float | None = None) -> bool:
         """Whether the host's docker holds `image`: an instance that went through the warm pool
-        pulled it there, and one launched straight into service has not."""
+        pulled it there, and one launched straight into service has not. A docker that has not
+        answered within `timeout` seconds, when one is given, has not said no: `HostError`."""
+        end = None if timeout is None else time.monotonic() + timeout
         try:
-            self._run("inspect", ("docker", "image", "inspect", image), quiet=True)
+            self._run("inspect", ("docker", "image", "inspect", image), end=end, quiet=True)
         except HostError as error:
             if error.returncode is None:
                 raise
