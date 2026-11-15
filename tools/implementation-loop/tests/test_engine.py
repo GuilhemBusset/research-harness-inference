@@ -122,7 +122,7 @@ class HappyPathTests(EngineCase):
         self.run_engine()
         building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
         merged = {e["issue"]: e["seq"] for e in self.events("merged")}
-        first, second = sorted((2, 3), key=building.get)
+        first, second = sorted((2, 3), key=lambda n: building[n])
         self.assertLess(merged[first], building[second])
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
 
