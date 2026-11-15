@@ -1,0 +1,25 @@
+# The rhi CLI, as students install it from this repository with one command (system design,
+# section 8.1), the repository's address in place of <owner>/<repo>:
+#
+#   uv tool install "git+https://github.com/<owner>/<repo>#subdirectory=client"
+#
+# An install reads no lock file, so every library is pinned here to the exact version the
+# repository's uv.lock holds, the same as the root project's group `cli`;
+# tests/unit/client/test_package.py holds the three together.
+[project]
+name = "rhi-cli"
+version = "0.1.0"
+description = "Log in to the course's inference endpoint and keep its key out of sight"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["keyring==25.7.0"]
+
+[project.scripts]
+rhi = "rhi_cli.main:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rhi_cli"]

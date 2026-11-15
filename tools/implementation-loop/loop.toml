@@ -3,6 +3,10 @@
 # effort:       low | medium | high | xhigh | max (Claude); Codex uses it as model_reasoning_effort.
 # timeout_s:    a call taking longer is killed and retried (twice), then the step stops.
 # claude_model: alias or full id for `claude --model`; "" uses your Claude Code default.
+# claude_fallback_model: the model a call asks for instead while `claude_model` refuses calls
+#               (its usage limit reached, or rate limited). The refused attempt is charged to
+#               nothing; the role keeps the fallback for 30 minutes, then asks its own model again.
+#               "" or absent: no fallback, and the issue waits as an outage.
 # codex_model:  model for `codex exec -m`; "" uses your Codex default.
 #
 # max_budget_usd: Claude only: `claude --max-budget-usd` for one call of the role; the call stops
@@ -13,9 +17,9 @@
 # persistent call ceiling and a dollar ceiling (config.py, ADR 0012, ADR 0001); every call's cost
 # and tokens are logged to <run dir>/agents.jsonl.
 #
-# Roles here (ADR 0001, decision 2): with operator `claude`, plan and build run on Claude Fable
-# and explore on a cheap Claude model; triage, examine, decide, resolve_locked and arbitrate go
-# to the other vendor, Codex, on its default model.
+# Roles here (ADR 0001, decision 2): with operator `claude`, plan and build run on Claude Fable,
+# on Claude Opus while Fable refuses calls, and explore on a cheap Claude model; triage, examine,
+# decide, resolve_locked and arbitrate go to the other vendor, Codex, on its default model.
 
 [roles.explore]
 effort = "low"
@@ -28,6 +32,7 @@ max_budget_usd = 2
 effort = "high"
 timeout_s = 1800
 claude_model = "claude-fable-5-2"
+claude_fallback_model = "claude-opus-5-5"
 max_budget_usd = 8
 
 [roles.triage]
@@ -38,6 +43,7 @@ timeout_s = 1200
 effort = "high"
 timeout_s = 5400
 claude_model = "claude-fable-5-2"
+claude_fallback_model = "claude-opus-5-5"
 max_budget_usd = 25
 
 [roles.resolve_locked]
