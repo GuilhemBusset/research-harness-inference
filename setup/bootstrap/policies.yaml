@@ -1,0 +1,127 @@
+# The two policies of the bounded bootstrap (system design, section 8.4, control 1; README.md).
+#
+# The owner deploys this template once, before `cdk bootstrap`, which then gives CloudFormation's
+# execution role the execution policy in place of administrator access, and the boundary as its
+# permissions boundary. It names no account and no region: both come from pseudo parameters.
+#
+# Both policies allow everything and then deny the same list, so each holds the list alone: the
+# execution policy for what CloudFormation does with a merged template, the boundary for what any
+# role created by a deployment does afterwards, whatever policy the template gave that role.
+# CloudFormation's YAML has no aliases, so the list is written twice, and
+# tests/policy/test_bootstrap_policies.py holds the two copies together.
+#
+# Neither policy can deny trust to another account: IAM has no condition key that reads a role's
+# trust policy. tests/policy/test_trust.py holds that invariant, over the synthesized templates.
+#
+# The names are fixed: a policy cannot name its own ARN any other way, the bootstrap command names
+# them, and renaming one would replace it under the roles that carry it.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: The execution policy and the permissions boundary the CDK bootstrap is given.
+
+Resources:
+  ExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: rhi-cfn-execution
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowTheDeployment
+            Effect: Allow
+            Action: "*"
+            Resource: "*"
+          - Sid: DenyUsersAndTheirCredentials
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreateAccessKey
+              - iam:CreateLoginProfile
+            Resource: "*"
+          - Sid: DenyIdentityProviders
+            Effect: Deny
+            Action:
+              - iam:CreateSAMLProvider
+              - iam:CreateOpenIDConnectProvider
+            Resource: "*"
+          # A request that names no boundary has no such key, and a negated operator then matches.
+          - Sid: DenyARoleWithoutThisBoundary
+            Effect: Deny
+            Action:
+              - iam:CreateRole
+              - iam:PutRolePermissionsBoundary
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                iam:PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary
+          # That call takes no boundary, so the role it creates could never carry this one.
+          - Sid: DenyAServiceLinkedRole
+            Effect: Deny
+            Action: iam:CreateServiceLinkedRole
+            Resource: "*"
+          - Sid: DenyRemovingABoundary
+            Effect: Deny
+            Action: iam:DeleteRolePermissionsBoundary
+            Resource: "*"
+          - Sid: DenyChangingThesePolicies
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:DeletePolicy
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-cfn-execution
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary
+
+  PermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: rhi-permissions-boundary
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # A boundary grants nothing: this is the most a role's own policies can give it.
+          - Sid: AllowWhatTheRoleIsGiven
+            Effect: Allow
+            Action: "*"
+            Resource: "*"
+          - Sid: DenyUsersAndTheirCredentials
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreateAccessKey
+              - iam:CreateLoginProfile
+            Resource: "*"
+          - Sid: DenyIdentityProviders
+            Effect: Deny
+            Action:
+              - iam:CreateSAMLProvider
+              - iam:CreateOpenIDConnectProvider
+            Resource: "*"
+          - Sid: DenyARoleWithoutThisBoundary
+            Effect: Deny
+            Action:
+              - iam:CreateRole
+              - iam:PutRolePermissionsBoundary
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                iam:PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary
+          - Sid: DenyAServiceLinkedRole
+            Effect: Deny
+            Action: iam:CreateServiceLinkedRole
+            Resource: "*"
+          - Sid: DenyRemovingABoundary
+            Effect: Deny
+            Action: iam:DeleteRolePermissionsBoundary
+            Resource: "*"
+          - Sid: DenyChangingThesePolicies
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:DeletePolicy
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-cfn-execution
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary

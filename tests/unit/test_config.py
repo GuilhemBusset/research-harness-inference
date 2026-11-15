@@ -95,7 +95,9 @@ def test_the_file_source_defaults_to_config_local_toml(tmp_path: Path, monkeypat
     assert config.load({"RHI_CONFIG": "file"}).github_owner == "local-owner"
 
 
-@pytest.mark.parametrize("environ", [{}, {"RHI_CONFIG": ""}, {"RHI_CONFIG": "ssm"}, {"RHI_CONFIG": f"source{MARK}"}])
+@pytest.mark.parametrize(
+    "environ", [{}, {"RHI_CONFIG": ""}, {"RHI_CONFIG": "parameter-store"}, {"RHI_CONFIG": f"source{MARK}"}]
+)
 def test_an_unset_or_unknown_source_raises(environ: dict[str, str]) -> None:
     with pytest.raises(config.ConfigError, match="RHI_CONFIG") as raised:
         config.load(environ)

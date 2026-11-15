@@ -16,9 +16,10 @@ that call them.** No agent runs them.
 | `setup/apply-ruleset.sh` | `gh` logged in as a repository admin, `jq` | Once per repository |
 | `cdk synth` and the synthesis tests | Node.js 24 with npm, as `node` on the `PATH` | The version [`.node-version`](../.node-version) names; Node 22 works too, and the CDK supports no other. See [Node and the CDK CLI](#node-and-the-cdk-cli) |
 | `scripts/check.sh container-tests` | A container runtime that answers `docker info` | Only for the tests under `tests/container/`, which CI runs. `fast` and `all` do not need it |
+| `setup/owner-setup.sh` | The AWS CLI with the owner's credentials, `gh` logged in as a repository admin, `uv`, and the CDK CLI for its bootstrap step | The owner's one-time steps. Its `--dry-run` needs `uv` alone |
 
-No AWS credentials are needed for anything in this repository, and none should be reachable from
-the shell an agent runs in. Deployment is CodePipeline's.
+No AWS credentials are needed for anything else in this repository, and none should be reachable
+from the shell an agent runs in. Deployment is CodePipeline's.
 
 ## Python environment
 
@@ -28,9 +29,10 @@ uv sync --locked
 
 Creates `.venv/` (ignored by git) with the packages locked in [`uv.lock`](../uv.lock), at the
 exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the app runs on
-(aws-cdk-lib, constructs and cdk-nag), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty and moto)
-and the libraries the services import. `scripts/check.sh` does this itself. Remove it with
-`rm -rf .venv`.
+(aws-cdk-lib, constructs and cdk-nag), boto3 (the AWS SDK, with which the app reads its
+configuration from SSM and writes it there), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty,
+moto and cfn-lint) and the libraries the services import. `scripts/check.sh` does this itself.
+Remove it with `rm -rf .venv`.
 
 The services' libraries are in dependency groups, one per service and named after it, listed in
 the [installation inventory](#installation-inventory). The dev group, which `uv sync` installs,
@@ -134,13 +136,38 @@ the fact. Re-running the script updates the ruleset in place; it fails if the ru
 applied. On a personal account without a paid plan, GitHub enforces rulesets on public
 repositories only: the green-light checklist says how to check that the rule really binds.
 
+## `owner-setup.sh`: the owner's one-time steps in the AWS account
+
+```sh
+setup/owner-setup.sh --dry-run
+```
+
+Walks through what only the owner can do, once (system design, section 8.6): the GPU quotas, the
+domain, the GitHub Apps, the configuration in SSM, billing alerts, the bootstrap, the GitHub
+connection, the repository's settings and the roster.
+[`docs/runbooks/owner-setup.md`](../docs/runbooks/owner-setup.md) describes each step and how to
+check it. The owner runs it, with their own credentials, from a shell no agent runs in.
+
+It asks before each command it runs, and `--dry-run` prints every step and every command and
+calls neither AWS nor GitHub. One step runs on its own with `--step <name>`: the configuration
+step, `--step configuration --config <file>`, is also how the configuration is changed later.
+The Apps step, `--step apps --reporter-key <file>`, reads each GitHub App back with `gh` and
+stores the status reporter's credentials in the Secrets Manager secret the reporter reads.
+The values step, `--step values --config <file>`, adds the configuration's private values to the
+hygiene scanner's list of local values (`tools/hygiene/README.md`, "Values only the owner knows").
+
+It installs nothing and writes nothing to the working tree. Python keeps no bytecode, and uv's
+project environment and the CDK's output go to a temporary folder, under `TMPDIR`, that is removed
+when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no `cdk.out`.
+
 ## Installation inventory
 
 | Component | Source and destination |
 | --- | --- |
 | `git`, `bash`, `python3`, `uv`, `gh`, `jq`, the agent CLIs, bubblewrap | Installed by the contributor; nothing in this repository installs or changes a global tool |
-| Python tools (pytest, pytest-xdist, Ruff, ty, and moto with its DynamoDB extra) and PyYAML, the parser of the test that reads CI's workflow | The dev group. Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
+| Python tools (pytest, pytest-xdist, Ruff, ty, moto with its DynamoDB extra, and cfn-lint, which lints the synthesized templates and the templates under `setup/` in `tests/synth/test_cfn_lint.py`) and PyYAML, the parser of the test that reads CI's workflow | The dev group. Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | CDK libraries (aws-cdk-lib, constructs, cdk-nag) | Exact versions and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/`, the project environment |
+| boto3, the AWS SDK, for the app itself | In the project's dependencies for the ssm source and the writer of `src/rhi/config.py` only, at the version the service groups carry. Exact version and hashes in `uv.lock`; installed by `uv sync --locked` into `.venv/` |
 | Service libraries: the groups below | One dependency group per service in `pyproject.toml`, exact versions and hashes in `uv.lock`. `uv sync --locked` installs them all into `.venv/`, because the dev group includes every group. A function's bundle and an image install their service's group from the lock, and nothing else: uv installs the wheels into the bundle under `cdk.out/` at `cdk synth`, and an image's Dockerfile installs the requirements file exported from the lock with its hashes (`src/rhi/packaging.py`) |
 | Group `gateway` | Starlette, httpx, uvicorn (without its native extras), prometheus-client and boto3, the AWS SDK |
 | Group `mock-engine` | Starlette, uvicorn and prometheus-client |
@@ -155,6 +182,7 @@ repositories only: the green-light checklist says how to check that the rule rea
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
 | Git hooks | Checked in under `.githooks/`; `git-hooks.sh` points this clone's `.git/config` at them |
 | GitHub ruleset | `pr-only-main.json`; applied to the `origin` repository only when an admin runs `apply-ruleset.sh` |
+| The owner's walkthrough | `owner-setup.sh` installs nothing. While it runs, uv installs the project's own dependencies, at the versions in `uv.lock`, into a temporary folder outside the working tree, which the script removes. Its values step writes one file, for the owner alone: the scanner's list of local values, which is the file `HYGIENE_LOCAL_VALUES` names or else `research-harness-inference/hygiene-values` under the owner's configuration folder (`XDG_CONFIG_HOME`, by default `.config` in the home directory). It refuses a list inside the working tree |
 | Hygiene scanner | Checked in under `tools/hygiene/` (standard-library Python); installs nothing |
 | Implement loop | Checked in under `tools/implementation-loop/` (standard-library Python); where its run state and worktrees live is described in `docs/factory/operating.md` |
 | Skills | Checked in under `.claude/skills/` and `.agents/skills/`; no global skill installation, no MCP server |
