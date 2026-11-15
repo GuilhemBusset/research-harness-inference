@@ -12,7 +12,8 @@ in to the image's registry. The token's password reaches docker on its standard 
 command's arguments, where any process of the host could read it.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
-nothing the command or AWS printed.
+nothing the command or AWS printed. So does a command that is still running when the time its
+caller gave it has passed: it is stopped, because a transition has a deadline (section 4.3).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import base64
 import binascii
 import re
 import subprocess
+import time
 from typing import Any
 
 import boto3
@@ -36,8 +38,8 @@ _REGISTRY = re.compile(r"([A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?)/\S+", re.ASCII)
 
 
 class HostError(Exception):
-    """An action on the host failed. `action` is `login`, `pull`, `start`, `restart` or `stop`;
-    `returncode` is the command's exit status, or None when no command ran to its end."""
+    """An action on the host failed. `action` is `login`, `pull`, `inspect`, `start`, `restart` or
+    `stop`; `returncode` is the command's exit status, or None when no command ran to its end."""
 
     def __init__(self, action: str, returncode: int | None = None) -> None:
         how = "could not be run" if returncode is None else f"exited with status {returncode}"
@@ -55,18 +57,34 @@ class Host:
         self._ecr = ecr
         self._nsenter = nsenter
 
-    def pull(self, image: str) -> None:
-        """Log the host's docker in to the registry of `image`, then pull `image`."""
+    def holds(self, image: str, timeout: float | None = None) -> bool:
+        """Whether the host's docker holds `image`: an instance that went through the warm pool
+        pulled it there, and one launched straight into service has not. A docker that has not
+        answered within `timeout` seconds, when one is given, has not said no: `HostError`."""
+        end = None if timeout is None else time.monotonic() + timeout
+        try:
+            self._run("inspect", ("docker", "image", "inspect", image), end=end, quiet=True)
+        except HostError as error:
+            if error.returncode is None:
+                raise
+            return False
+        return True
+
+    def pull(self, image: str, timeout: float | None = None) -> None:
+        """Log the host's docker in to the registry of `image`, then pull `image`, the two within
+        `timeout` seconds when one is given."""
+        end = None if timeout is None else time.monotonic() + timeout
         found = _REGISTRY.fullmatch(image)
         if found is None:
             raise HostError("login")
         registry = found.group(1)
         user, password = self._credentials()
-        self._run("login", ("docker", "login", "--username", user, "--password-stdin", registry), password)
-        self._run("pull", ("docker", "pull", image))
+        self._run("login", ("docker", "login", "--username", user, "--password-stdin", registry), password, end=end)
+        self._run("pull", ("docker", "pull", image), end=end)
 
-    def start_engine(self) -> None:
-        self._run("start", ("systemctl", "start", ENGINE_UNIT))
+    def start_engine(self, timeout: float | None = None) -> None:
+        end = None if timeout is None else time.monotonic() + timeout
+        self._run("start", ("systemctl", "start", ENGINE_UNIT), end=end)
 
     def restart_engine(self) -> None:
         self._run("restart", ("systemctl", "restart", ENGINE_UNIT))
@@ -88,15 +106,31 @@ class Host:
             raise HostError("login")
         return user, password
 
-    def _run(self, action: str, command: tuple[str, ...], given: str | None = None) -> None:
-        """Run `command` in the host's namespaces, with `given` on its standard input."""
+    def _run(
+        self,
+        action: str,
+        command: tuple[str, ...],
+        given: str | None = None,
+        *,
+        end: float | None = None,
+        quiet: bool = False,
+    ) -> None:
+        """Run `command` in the host's namespaces, with `given` on its standard input. `end` is
+        the moment, on the monotonic clock, at which a command still running is stopped. A `quiet`
+        command prints nothing: only its exit status is the answer."""
         arguments = (self._nsenter, *HOST_NAMESPACES, "--", *command)
+        timeout = None if end is None else max(end - time.monotonic(), 0)
+        output = subprocess.DEVNULL if quiet else None
         try:
             if given is None:
-                done = subprocess.run(arguments, stdin=subprocess.DEVNULL, check=False)
+                done = subprocess.run(
+                    arguments, stdin=subprocess.DEVNULL, stdout=output, stderr=output, timeout=timeout, check=False
+                )
             else:
-                done = subprocess.run(arguments, input=given.encode("utf-8"), check=False)
-        except OSError:
+                done = subprocess.run(
+                    arguments, input=given.encode("utf-8"), stdout=output, stderr=output, timeout=timeout, check=False
+                )
+        except (OSError, subprocess.TimeoutExpired):
             raise HostError(action) from None
         if done.returncode != 0:
             raise HostError(action, done.returncode)
