@@ -148,6 +148,8 @@ check it. The owner runs it, with their own credentials, from a shell no agent r
 It asks before each command it runs, and `--dry-run` prints every step and every command and
 calls neither AWS nor GitHub. One step runs on its own with `--step <name>`: the configuration
 step, `--step configuration --config <file>`, is also how the configuration is changed later.
+The Apps step, `--step apps --reporter-key <file>`, reads each GitHub App back with `gh` and
+stores the status reporter's credentials in the Secrets Manager secret the reporter reads.
 
 It installs nothing and writes nothing to the working tree. Python keeps no bytecode, and uv's
 project environment and the CDK's output go to a temporary folder, under `TMPDIR`, that is removed
