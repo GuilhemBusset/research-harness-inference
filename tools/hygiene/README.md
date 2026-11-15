@@ -59,7 +59,7 @@ that was force-added is. To scan a directory that is not a git work tree, use `-
 | `account-in-arn` | An ARN whose account field is filled, in any partition | The documented accounts; ARNs with an empty account field or `aws` as the account |
 | `account-id` | Exactly twelve digits, also inside a name (`assets-<id>-us-east-1`), a host name or a URL-encoded string; the console's `1234-5678-9012` form, alone or inside a name | The documented accounts; twelve digits inside a run of 16 or more hexadecimal characters (a hash); the fraction of a decimal number; the last group of a UUID; longer digit runs; lockfiles |
 | `access-key` | IAM unique IDs (`AKIA`, `ASIA`, `AIDA`, `AROA` and the other prefixes, plus 16 characters); a value of 40 characters or more given by name to a secret key or a session token (`aws_secret_access_key`, `SecretAccessKey`, `aws_session_token`) | The access key and secret key of AWS's documentation; a name with no value after it |
-| `token` | GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`), Anthropic and OpenAI keys (`sk-ant-`, `sk-proj-`, `sk-` and 32 characters), Hugging Face tokens (`hf_`), Grafana service-account tokens (`glsa_`), PEM, OpenPGP and PuTTY private keys, a password in a URL (`scheme://<user>:<password>@host`) | Public keys and certificates; values too short to be a token; a template where the password would be (`{token}`, `${PASSWORD}`, `<password>`, `%s`, `****`) |
+| `token` | GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`), Anthropic and OpenAI keys (`sk-ant-`, `sk-proj-`, `sk-` and 32 characters), Hugging Face tokens (`hf_`), Grafana service-account tokens (`glsa_`), a student's API key of this project (`rhi_` and 46 letters or digits, anywhere in a line, when no letter or digit follows), PEM, OpenPGP and PuTTY private keys, a password in a URL (`scheme://<user>:<password>@host`) | Public keys and certificates; values too short to be a token (`rhi_` and 45 characters), and a longer run of letters and digits after `rhi_`; this repository's package names (`rhi_common`, `rhi_gateway` and the others); a template where the password would be (`{token}`, `${PASSWORD}`, `<password>`, `%s`, `****`) |
 | `forbidden-file` | A file named `cdk.context.json`, `.env`, `.env.*`, `.envrc`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.ppk`, `id_rsa` and its siblings, `*.tfstate`, or anything under `cdk.out/` or `.aws/` | `.env.example` (its content is still scanned) |
 | `endpoint` | Host names of API Gateway (`execute-api`), CloudFront distributions, load balancers (`elb`), Lambda function URLs, also with the region written as a template; Managed Prometheus workspace IDs; `hostedzone/Z…` | Wildcards, and templates of the identifying part (`*.cloudfront.net`, `{id}.execute-api.{region}.amazonaws.com`); service endpoints; the CloudFront host of AWS's documentation |
 | `resource-id` | EC2-style IDs in their 17-character form (`i-`, `vpc-`, `subnet-`, `sg-`, `ami-`, `eni-`, `vol-` and others), alone or at the end of a name | The IDs of AWS's documentation |
@@ -90,8 +90,11 @@ allow it on its line. The account IDs AWS itself owns and CDK writes into templa
 load-balancer log-delivery accounts, for instance) are reported too: when a snapshot first needs
 them, add them to `account_ids` in `hygiene.toml` with their source.
 
-When the design's student API keys get their final format (`rhi_…`, system design, "Student
-login"), add the pattern to the `token` rule.
+The pattern of a student's API key is the scanner's own copy (`STUDENT_KEY`) of the format that
+`services/common/rhi_common/keys.py` defines: the scanner imports nothing from the product, and
+`tests/test_student_key.py`, beside this file, keeps the two equal. So a test or a capture that
+needs a key generates it at run time with that module, or carries a value that is not a key (one
+character short, say).
 
 ## Values only the owner knows
 
