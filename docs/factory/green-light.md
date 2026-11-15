@@ -208,24 +208,24 @@ gh run list --workflow pr-only.yml --limit 1
 **Done when** `required` was green on the pull request, the merge went through, and the PR-only
 audit on `main` is green.
 
-## 7. A token for the factory, limited to this repository
+## 7. An identity for the factory, limited to this repository
 
 Until this step the engine would act with your own `gh` login, which reaches every repository you
-own. The system design ("The trust boundary") gives the factory an identity of its own, without
-the workflows and administration permissions, so that GitHub itself refuses an agent's change to
-a workflow or a ruleset. The form of that identity `gh` can use today is a fine-grained personal
-access token. The design's final form is a GitHub App, an issue of the factory epic: once that
-issue lands, the App replaces this token, and the token is revoked.
+own, and whose pull requests you could not review: an author cannot approve their own. The system
+design ("The trust boundary") and ADR 0001's second amendment give the factory an identity of its
+own, a GitHub App installed on this repository only, without the workflows and administration
+permissions, so that GitHub itself refuses an agent's change to a workflow or a ruleset.
 
-Create the token (GitHub, Settings, Developer settings, Fine-grained tokens): resource owner
-yourself, **Only select repositories** with this repository alone, an expiry of 90 days or less,
-and these repository permissions:
+Create the App (GitHub, Settings, Developer settings, GitHub Apps, New GitHub App): any name and
+homepage URL, **Webhook** not active, installable **only on this account**, and these repository
+permissions:
 
 | Permission | Access | The engine uses it to |
 | --- | --- | --- |
 | Contents | Read and write | Push its branches, merge its pull requests |
 | Pull requests | Read and write | Open pull requests, post evidence |
-| Issues | Read and write | Read the issue graph, tick checkboxes, file follow-ups; publish the backlog (step 8) |
+| Issues | Read and write | Read the issue graph, tick checkboxes, file follow-ups |
+| Checks | Read-only | Read the `required` check of a pull request's head before it lands |
 | Commit statuses | Read-only | Read `deploy/<stage>` and `verify/<stage>` on a merge commit |
 | Actions | Read-only | Read the log of a failed check |
 | Metadata | Read-only | Granted automatically |
@@ -236,32 +236,59 @@ the factory cannot change its own gates. An issue that names a workflow file the
 landed by you. The credential that *writes* commit statuses is a different one and belongs to the
 pipeline (step 11).
 
-Store it in a `gh` configuration of its own, and run the factory from shells that point at it:
+Then, on the App's page:
+
+1. Note the **App ID**.
+2. Generate a private key. GitHub downloads it once. Move it out of the downloads folder to a
+   place under your home directory and outside every checkout of this repository, readable by
+   you alone. The sandbox hides your home directory from agents and checks, apart from what its
+   allow-list binds back ([`isolation.md`](isolation.md)), and the engine never copies the key:
+   `openssl` signs with it where it is.
+3. Install the App (**Install App**), on **Only select repositories**, with this repository
+   alone. The installation's page then ends its URL with a number: the **installation ID**.
 
 ```sh
-export GH_CONFIG_DIR="$HOME/.config/gh-factory"
-gh auth login --hostname github.com --git-protocol https --with-token   # paste the token, Enter, Ctrl-D
-gh auth setup-git
-gh auth status
+install -d -m 700 "$HOME/.config/implement-loop"
+mv "$HOME"/Downloads/*.private-key.pem "$HOME/.config/implement-loop/factory-app.pem"
+chmod 600 "$HOME/.config/implement-loop/factory-app.pem"
 ```
 
-Then check what this shell can do:
+Run the factory from shells that name the App with three variables, all three or none. Set them
+in the shell, or in a file outside the repository that the shell reads: never in a file of the
+repository.
 
 ```sh
-gh api "repos/$repo" --jq .permissions                                   # push: true, admin: false
-gh api "repos/$repo/commits/$(git rev-parse origin/main)/check-runs?check_name=required" \
-  --jq '.check_runs[0].conclusion'                                       # success
+export LOOP_GITHUB_APP_ID=<the App ID>
+export LOOP_GITHUB_APP_INSTALLATION_ID=<the installation ID>
+export LOOP_GITHUB_APP_KEY_FILE="$HOME/.config/implement-loop/factory-app.pem"
+scripts/implement.sh doctor
 ```
 
-The second command matters. The engine learns that `required` is green from that endpoint, and
-GitHub's list of fine-grained token permissions has none for check runs. If it answers `403`
-("Resource not accessible by personal access token"), this token cannot land anything while the
-repository is private; GitHub serves check runs of public repositories without a permission. In
-that case run the factory under your own `gh` login until step 12 (unset `GH_CONFIG_DIR`),
-knowing what ADR 0001 says about that login's reach, and bring the GitHub App forward in the
-backlog: an App installed on this repository only can be granted read access to checks.
+With the three set, the engine mints an installation token of the App
+(`tools/implementation-loop/implement_loop/app_token.py`), gives it to each `gh` process it starts
+and answers git with one through a credential helper for github.com. A token lasts an hour and
+is replaced before its last ten minutes, so a run of any length keeps working. The token is in
+no file, and your own `gh` login is neither used nor changed. Commits keep the author of the
+`commit identity` line; the pushes, the pull requests and the comments are the App's.
 
-**Done when** both commands answer as shown, or you have chosen the fallback knowingly.
+The doctor says which identity a run would have, and refuses the wrong one:
+
+| Line | What it says |
+| --- | --- |
+| `github identity` | `PASS` with the App's name and installation. `FAIL` when the installation holds the workflows or the administration permission, when it cannot read checks, when no token can be minted (the App ID, the key, the installation), when only some of the three variables are set, or when `origin` is not an `https://github.com/` URL (step 3): git would push as someone else. `WARN` when the App is installed on every repository of the account. Without the three variables it names the login `gh` has. |
+| `gh auth` | `PASS`: `gh` accepts the App's token. |
+| `checks access` | `PASS` when the identity can read the check runs of `main`, asked the way the engine asks. `FAIL` otherwise, whatever the identity. |
+
+Without the three variables the engine keeps the login `gh` already has, and the `github
+identity` line names it: your own, with the reach described above. A fine-grained personal access
+token is not a way around the App. GitHub's list of fine-grained token permissions has none for
+check runs: such a token logs in and is still refused there on a private repository
+("Resource not accessible by personal access token"), which is the case the `checks access` line
+fails on. If one was created for the factory before the App existed, revoke it, and unset the
+`GH_CONFIG_DIR` that pointed at it.
+
+**Done when** `scripts/implement.sh doctor` shows `github identity` as `PASS` with the App's
+name, and `checks access` as `PASS`.
 
 ## 8. Publish the backlog
 
@@ -405,7 +432,7 @@ gh api -X PUT "repos/$repo/actions/permissions/fork-pr-contributor-approval" \
 
 The last command makes every pull request from someone outside the repository wait for your
 approval before its workflows run. Then repeat the probe push of step 4 (it must be refused now,
-whatever the plan), and the two checks of step 7 if the factory was running under your own login.
+whatever the plan), and the doctor of step 7.
 
 **Done when** the repository is public, the probe push is refused, secret scanning and push
 protection report `enabled`, and the next nightly CI run is green.

@@ -11,6 +11,11 @@ engine looks up what it creates (a PR by its branch, an issue or a comment by it
 creating it again. A transient failure that outlasts the retries raises `GitHubUnavailable`, so
 the engine can tell an outage from a real error; any other failure raises `GitHubError` at once.
 
+`GhCli` runs `gh` with the login it has, unless it is given `env`: a function that answers the
+environment of one `gh` process, asked before each one. `cli.py` gives it `app_token.gh_env`,
+which carries a token of the factory's GitHub App with at least ten minutes left. A token that
+cannot be minted is a request that was not sent: an outage if repeating may help, an error if not.
+
 `RedactingGitHub` wraps the client a run publishes through: every title and body that creates or
 updates a comment, a pull request or an issue passes through the hygiene scanner's redaction
 first (`redact.py`). Without the scanner nothing is sent, and the call raises
@@ -28,6 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
+from .app_token import AppTokenError
 from .redact import RedactionError, redact
 
 PER_PAGE = 100
@@ -113,12 +119,21 @@ class GhCli:
     """The real API, through the authenticated `gh` CLI. Pins the REST API version."""
 
     def __init__(self, repo: str, api_version: str = "2022-11-28", runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-                 sleep: Callable[[float], None] = time.sleep, retry_delays: tuple[float, ...] = RETRY_DELAYS_S):
+                 sleep: Callable[[float], None] = time.sleep, retry_delays: tuple[float, ...] = RETRY_DELAYS_S,
+                 env: Callable[[], dict[str, str] | None] | None = None):
         self.repo = repo
         self.api_version = api_version
         self._run = runner
         self._sleep = sleep
         self.retry_delays = tuple(retry_delays)
+        self.env = env   # asked before each `gh` process; `cli.github` sets it
+
+    def _identity(self) -> dict[str, Any]:
+        """What one `gh` process is started with beyond the usual: its own environment when the
+        engine runs as the factory's App (asked each time: the token in it is renewed before it
+        runs out), nothing when it runs with the login `gh` has. Raises `AppTokenError`."""
+        env = self.env() if self.env is not None else None
+        return {} if env is None else {"env": env}
 
     def _api(self, path: str, method: str = "GET", payload: dict | None = None, ok_codes: tuple[int, ...] = (),
              idempotent: bool | None = None, fields: tuple[str, ...] = ()) -> Any:
@@ -134,8 +149,17 @@ class GhCli:
         attempt = 0
         while True:
             attempt += 1
+            try:
+                identity = self._identity()
+            except AppTokenError as e:   # no token, so nothing was sent
+                if not e.transient:
+                    raise GitHubError(f"gh api {method} {path} was not sent: {e}") from None
+                if attempt > len(self.retry_delays):
+                    raise GitHubUnavailable(f"gh api {method} {path} was not sent in {attempt} attempts: {e}") from None
+                self._sleep(self.retry_delays[attempt - 1])
+                continue
             proc = self._run(args, input=json.dumps(payload) if payload is not None else None,
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, **identity)
             if proc.returncode == 0:
                 out = proc.stdout.strip()
                 return json.loads(out) if out else None
@@ -295,8 +319,12 @@ class GhCli:
         """The tail of the failed jobs' logs on `sha`, for the implementer to read."""
         parts = []
         for run in self._failed_runs(sha)[:3]:
+            try:
+                identity = self._identity()
+            except AppTokenError as e:
+                raise (GitHubUnavailable if e.transient else GitHubError)(f"gh run view was not started: {e}") from None
             proc = self._run(["gh", "run", "view", str(run["id"]), "--log-failed", "-R", self.repo],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, **identity)
             parts.append(f"## {run.get('name', 'workflow')} (run {run['id']})\n{(proc.stdout or proc.stderr)[-6000:]}")
         return "\n\n".join(parts)
 
