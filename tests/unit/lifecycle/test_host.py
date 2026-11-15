@@ -25,7 +25,8 @@ TOKEN = base64.b64encode(f"AWS:{PASSWORD}".encode()).decode()
 IN_THE_HOST = ["--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "--"]
 
 # One file per call, numbered: the arguments, one per line, then the standard input. The call
-# exits with status 3 when one of its arguments is the word in the file `fail`.
+# exits with status 3 when one of its arguments is the word in the file `fail`, and does not end
+# by itself when one is the word in the file `hang`.
 STAND_IN = """\
 #!/bin/sh
 here=$(dirname "$0")
@@ -34,6 +35,7 @@ printf '%s\\n' "$@" > "$here/arguments/$call"
 cat > "$here/input/$call"
 for argument in "$@"; do
     if [ -f "$here/fail" ] && [ "$argument" = "$(cat "$here/fail")" ]; then exit 3; fi
+    if [ -f "$here/hang" ] && [ "$argument" = "$(cat "$here/hang")" ]; then exec sleep 60; fi
 done
 """
 
@@ -63,6 +65,9 @@ class Nsenter:
 
     def fail_on(self, word: str) -> None:
         (self.folder / "fail").write_text(word)
+
+    def hang_on(self, word: str) -> None:
+        (self.folder / "hang").write_text(word)
 
     def calls(self) -> list[list[str]]:
         files = sorted((self.folder / "arguments").iterdir(), key=lambda file: int(file.name))
@@ -145,8 +150,42 @@ def test_without_a_token_from_ecr_the_pull_fails_and_no_command_runs(token: str 
     assert nsenter.calls() == []
 
 
+def test_the_host_says_whether_its_docker_holds_an_image(nsenter: Nsenter) -> None:
+    assert host(nsenter).holds(IMAGE)
+    assert nsenter.calls() == [[*IN_THE_HOST, "docker", "image", "inspect", IMAGE]]
+
+    # docker's own answer for an image it does not hold is an exit status that is not zero.
+    nsenter.fail_on("inspect")
+    assert not host(nsenter).holds(IMAGE)
+
+
+@pytest.mark.parametrize(("word", "action"), [("login", "login"), ("pull", "pull")])
+def test_a_pull_still_running_at_its_time_limit_is_stopped_and_reported(
+    word: str, action: str, nsenter: Nsenter
+) -> None:
+    nsenter.hang_on(word)
+
+    with pytest.raises(HostError) as raised:
+        host(nsenter).pull(IMAGE, timeout=0.3)
+
+    assert (raised.value.action, raised.value.returncode) == (action, None)
+
+
+def test_a_start_still_running_at_its_time_limit_is_stopped_and_reported(nsenter: Nsenter) -> None:
+    nsenter.hang_on("start")
+
+    with pytest.raises(HostError) as raised:
+        host(nsenter).start_engine(timeout=0.3)
+
+    assert (raised.value.action, raised.value.returncode) == ("start", None)
+
+
 def test_a_command_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
     with pytest.raises(HostError) as raised:
         Host(Ecr(), nsenter=str(tmp_path / "missing")).start_engine()
 
     assert (raised.value.action, raised.value.returncode) == ("start", None)
+
+    # No answer is not the answer "no": the host could not be asked whether it holds the image.
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).holds(IMAGE)
