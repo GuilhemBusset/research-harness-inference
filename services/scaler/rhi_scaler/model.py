@@ -48,10 +48,19 @@ class Memory:
     deployment look like an idle pool. `last_in_flight_at` is the time of the last run that saw a
     request in flight or held: a request can outlast `idle_minutes`, and the pool is not idle the
     moment it ends.
+
+    The other two time how long a pool has been measurably full, which is what makes it grow.
+    `above_target_since` is the time of the first of the runs in a row that saw the requests in
+    flight, averaged over the instances in service, above `target_concurrency`, and `None` when the
+    last run did not. `waiting_since` pairs, in sorted order, each instance in service that reports
+    waiting requests while no instance of the pool has room with the time of the first of the runs
+    in a row that saw it so. It is empty as soon as an instance has room.
     """
 
     last_request_at: int | None = None
     last_in_flight_at: int | None = None
+    above_target_since: int | None = None
+    waiting_since: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,8 @@ class Reason(StrEnum):
     IDLE = "idle"
     # The pool is stopped (`disabled` or `budget-latched`) and releases its idle instances.
     STOPPED = "stopped"
+    # The instances in service have been full for 60 seconds: the pool grows by one instance.
+    SCALE_OUT = "scale-out"
     # Requests are held for a pool at zero whose mode does not let them wake it.
     NOT_WOKEN = "not-woken"
     # No rule asks for another size.
