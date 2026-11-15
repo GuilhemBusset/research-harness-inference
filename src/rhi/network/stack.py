@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
 
+from rhi.network.security import SecurityGroups
 from rhi.network.vpc import ZONES, Network
 
 if TYPE_CHECKING:
@@ -20,11 +21,15 @@ if TYPE_CHECKING:
 
 
 class NetworkStack(cdk.Stack):
-    """Holds the VPC, which the other stacks of the stage take from `vpc`."""
+    """Holds the VPC and the security groups, which the other stacks of the stage take from `vpc`
+    and `security_groups`."""
 
     def __init__(self, scope: Construct, construct_id: str) -> None:
         super().__init__(scope, construct_id)
         self.vpc: ec2.Vpc = Network(self, "Network", availability_zones=self.availability_zones).vpc
+        # The groups of the load balancers, the tasks and the instances: another stack of the stage
+        # takes one from `security_groups` (`security_groups.gateway`, ...).
+        self.security_groups = SecurityGroups(self, "SecurityGroups", vpc=self.vpc)
         # The VPC strips its default security group of every rule (the flag of `cdk.json`), through
         # a function the CDK puts at the stack's root. That function names its role's ARN, which
         # orders the two already; its `DependsOn` on the role repeats it, and cfn-lint warns
