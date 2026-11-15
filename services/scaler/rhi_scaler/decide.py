@@ -10,7 +10,7 @@ The rules here take a pool from zero and back:
 | --- | --- |
 | 0 to 1 | A held request for a pool in mode `enabled` at zero asks for one instance, however many are held |
 | to 0 | No request received and none in flight or held for `idle_minutes`, in any mode: zero, naming every instance |
-| stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once |
+| stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
 
 Demand is what the fresh gateway heartbeats report. An explicit wake reaches them as a held request
 and as a request received, so it has no rule of its own. A pool in mode `scheduled-only` is not
@@ -58,29 +58,35 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     lift: tuple[str, ...] = ()
     reason = Reason.UNCHANGED
 
-    if (
-        (desired > 0 or counted)
+    # No request received and none in flight or held for `idle_minutes`, on what the gateways report.
+    idle = (
+        (desired > 0 or bool(counted))
         and not in_flight
         and not held
         and _older_than(memory.last_request_at, idle_seconds, now)
         and _older_than(memory.last_in_flight_at, idle_seconds, now)
-    ):
-        desired, lift, reason = 0, _every_instance(supply), Reason.IDLE
-    elif pool.mode in STOPPED_MODES:
-        released = sorted(
-            {
-                heartbeat.instance
-                for heartbeat in pool.instance_heartbeats
-                if heartbeat.instance in counted
-                and is_fresh(heartbeat, now)
-                and heartbeat.running == 0
-                and heartbeat.waiting == 0
-            }
-        )
-        if released:
-            desired, lift, reason = max(0, desired - len(released)), tuple(released), Reason.STOPPED
+    )
+    # What the counted instances report themselves, in a fresh heartbeat.
+    reports = [
+        heartbeat
+        for heartbeat in pool.instance_heartbeats
+        if heartbeat.instance in counted and is_fresh(heartbeat, now)
+    ]
+    working = {heartbeat.instance for heartbeat in reports if heartbeat.running or heartbeat.waiting}
+
+    if pool.mode in STOPPED_MODES:
+        # A stop comes before idleness: an instance that still reports work is kept, even when the
+        # gateways have seen no request for `idle_minutes` (a client that left, an engine that has
+        # not finished).
+        released = tuple(sorted({heartbeat.instance for heartbeat in reports} - working))
+        if idle and not working:
+            desired, lift, reason = 0, _every_instance(supply), Reason.IDLE
+        elif released:
+            desired, lift, reason = max(0, desired - len(released)), released, Reason.STOPPED
         elif held and desired == 0:
             reason = Reason.NOT_WOKEN
+    elif idle:
+        desired, lift, reason = 0, _every_instance(supply), Reason.IDLE
     elif held and desired == 0:
         if pool.mode is Mode.ENABLED:
             desired, reason = 1, Reason.WAKE
