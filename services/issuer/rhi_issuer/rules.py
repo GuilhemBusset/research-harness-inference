@@ -141,6 +141,11 @@ def _scanned_keys(github_id: int, keys: Any) -> dict[str, _Known]:
         scan["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
+def every_key(github_id: int, keys: Any) -> list[StudentKey]:
+    """Every key of the student, revoked or not, read with a consistent scan: none stored before the call is missed."""
+    return [known.record for known in _scanned_keys(github_id, keys).values()]
+
+
 def _latest(found: dict[str, _Known], keys: Any, *, consistent: bool) -> _Known | None:
     """The student's latest key from a login, the one with no successor; `None` when there is none.
 
