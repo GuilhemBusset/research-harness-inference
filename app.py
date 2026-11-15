@@ -6,6 +6,7 @@ and it looks nothing up, so it synthesizes on a machine that has never seen an A
 
 from __future__ import annotations
 
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -24,6 +25,11 @@ def package_roots() -> list[Path]:
 # package roots go on the import path here, in pytest's order, before anything of the repository
 # is imported.
 sys.path[:0] = [str(root) for root in package_roots() if str(root) not in sys.path]
+
+# No reliance on an existing cache (AGENTS.md, "Toolchain"): jsii's package cache lives under the
+# user's home folder, and jsii refuses to start when that folder's owners do not suit it, as in a
+# sandbox. The runtime reads this when `aws_cdk` is first imported.
+os.environ.setdefault("JSII_RUNTIME_PACKAGE_CACHE", "disabled")
 
 import aws_cdk as cdk
 import cdk_nag
