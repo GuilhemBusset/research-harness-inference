@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.8 |
+| Engine version here | 1.2.9 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -561,6 +561,21 @@ does.
 | --- | --- | --- |
 | `implement_loop/__init__.py` | `VERSION` 1.2.7 → 1.2.8. | A new engine version: #92 is revived once, with fresh ceilings, and resumes its build. |
 
+### 1.2.9: #90's revived build, refused again (2026-11-15)
+
+The repair of fault 734810b2a3. On engine 1.2.4, #90 failed with `ceiling` in the same way #92
+did: its run log shows ten `build` calls on Claude, each refused for the account's usage limit
+(exit 1, an empty stderr, 429 `usage_limit_reached` in the JSON result, no cost, about half a
+second) and each charged to the infrastructure budget as a crash. 1.2.7 repairs that cause, in
+files on the safety surface, which do not change here. What #90 adds is its next step: a new
+engine version revives it, once, back into `build` on the branch that keeps its work, where the
+vendor may still refuse. A refusal there must not spend the one revival; the test below covers
+that path.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.8 → 1.2.9. | A new engine version: #90 is revived once, with fresh ceilings, and resumes its build. |
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -767,6 +782,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_refused_build.py` (2) | Added. | The regression of fault 5500f31f10: the live adapter with the checked-in `build` settings, against a fake `claude` that refuses as #92's call records show (scrubbed), metered by a real `Engine` (`before`, `after`) and its failure handled by `_finished`. A refused Fable build is answered on Opus with nothing charged to the infrastructure budget; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed with `ceiling`. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #92's own message. |
+
+### 1.2.9
+
+657 collected tests: the 655 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_revived_refused_build.py` (2) | Added. | The regression of fault 734810b2a3: #90's record (planned, a worktree, failed `ceiling` on 1.2.4 with its infrastructure budget spent) revived by a real `Engine` (`_maybe_revive`) into `build` with that budget at 0, then the live adapter with the checked-in `build` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A revived build refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #90's own message. |
 
 ## Kept as recorded
 
