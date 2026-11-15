@@ -71,19 +71,19 @@ class Waker:
                 self._pending[pool].append(now)
 
     def pending(self, pool: str) -> int:
-        """How many explicit wakes for `pool` are still pending."""
+        """How many explicit wakes for `pool` are still pending.
+
+        Only counts: a wake past its 10 minutes is dropped by the next readiness cycle, which may
+        still have observed the pool ready before then and must find it to end it ready.
+        """
+        now = self._clock()
         with self._lock:
-            return len(self._unexpired(pool, self._clock()))
+            return sum(1 for at in self._pending[pool] if now - at < EXPLICIT_WAKE_SECONDS)
 
     def ended_ready_at(self, pool: str) -> float | None:
         """When the last explicit wake for `pool` ended with its pool ready; `None` if none did."""
         with self._lock:
             return self._ended_ready_at[pool]
-
-    def _unexpired(self, pool: str, now: float) -> list[float]:
-        kept = [at for at in self._pending[pool] if now - at < EXPLICIT_WAKE_SECONDS]
-        self._pending[pool] = kept
-        return kept
 
     def _settle(self, views: Mapping[str, PoolView]) -> None:
         """After a readiness cycle: the wakes of every pool it found ready end.
@@ -95,12 +95,16 @@ class Waker:
         with self._lock:
             for pool, view in views.items():
                 observed_at = view.observed_at
-                if not view.ready or observed_at is None:
+                if observed_at is None:
                     continue
-                ended = [max(observed_at, at) for at in self._pending[pool] if observed_at - at < EXPLICIT_WAKE_SECONDS]
+                live = [at for at in self._pending[pool] if observed_at - at < EXPLICIT_WAKE_SECONDS]
+                if not view.ready:
+                    # Drop only what had expired by this observation: a later cycle observes later.
+                    self._pending[pool] = live
+                    continue
                 self._pending[pool] = []
-                if ended:
-                    self._ended_ready_at[pool] = max(ended)
+                if live:
+                    self._ended_ready_at[pool] = max(max(observed_at, at) for at in live)
 
     def _invoke(self, pool: str) -> None:
         try:
