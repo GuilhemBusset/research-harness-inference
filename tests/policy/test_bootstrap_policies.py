@@ -4,8 +4,8 @@ A merge to `main` is deployment rights in the account. CloudFormation deploys a 
 with the execution policy, and every role a deployment creates carries the permissions boundary,
 so each of the two policies of `setup/bootstrap/policies.yaml` must hold every denial alone:
 creating IAM users, access keys and login profiles; creating SAML and OpenID Connect providers;
-creating a role without the boundary; removing or replacing a role's boundary; changing or
-deleting either policy.
+creating a role without the boundary, which a service-linked role always is; removing or replacing
+a role's boundary; changing or deleting either policy.
 
 This invariant reads that template, not a synthesized one. Trust to another account is not here:
 no IAM condition key reads a role's trust policy, so `test_trust.py` holds it over the templates.
@@ -49,6 +49,8 @@ DENIALS: dict[str, tuple[list[Any], dict[str, Any] | None]] = {
     "iam:CreateOpenIDConnectProvider": (EVERYTHING, None),
     "iam:CreateRole": (EVERYTHING, NOT_THE_BOUNDARY),
     "iam:PutRolePermissionsBoundary": (EVERYTHING, NOT_THE_BOUNDARY),
+    # This call takes no boundary: the role it creates is always one without it.
+    "iam:CreateServiceLinkedRole": (EVERYTHING, None),
     "iam:DeleteRolePermissionsBoundary": (EVERYTHING, None),
     "iam:CreatePolicyVersion": (THE_TWO_POLICIES, None),
     "iam:DeletePolicyVersion": (THE_TWO_POLICIES, None),
