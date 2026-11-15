@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.7 |
+| Engine version here | 1.2.8 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -546,6 +546,21 @@ Behaviour an upstream reader would not expect: a plan or build may run on the fa
 and nothing but `agents.jsonl` says which one did. The examiner, the gates and the ceilings are
 the same whichever model built. The per-call and per-issue dollar ceilings are unchanged.
 
+### 1.2.8: #92's refused builds, replayed (2026-11-15)
+
+The repair of fault 5500f31f10. On engine 1.2.4, #92 failed with `ceiling`: its ten failed
+attempts were ten `build` calls on Claude, each refused for the account's usage limit (exit 1, an
+empty stderr, 429 `usage_limit_reached` in the JSON result, no cost), each charged to the
+infrastructure budget as a crash because `classify_failure` reads stderr only. That cause is the
+one 1.2.7 repairs (`live.claude_refused`, the fallback in `loop.toml`, the outage wait in
+`Engine._finished`), and those files are on the safety surface: nothing in them changes here. What
+1.2.7 did not cover is #92's own path, the `build` role through the engine's meter; the test below
+does.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.7 → 1.2.8. | A new engine version: #92 is revived once, with fresh ceilings, and resumes its build. |
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -744,6 +759,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_claude_fallback.py` (6) | Added. | The live adapter against a fake `claude` that refuses one model as Claude Code 2.1 does (exit 1, empty stderr, the reason only in its JSON result). A refused model is replaced at once by the fallback, with no backoff, and the refused attempt is an outage charged to nothing; the role keeps the fallback until `REFUSED_RETRY_S` has passed, then asks its own model again; with both refusing, the call is an outage after its retries, with the usual backoff; without a fallback, a refusal is an outage, not a crash; what counts as a refusal; and the checked-in `loop.toml` falls back from Fable to Opus for `plan` and `build` only. On 1.2.6 all six fail. |
+
+### 1.2.8
+
+655 collected tests: the 653 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_refused_build.py` (2) | Added. | The regression of fault 5500f31f10: the live adapter with the checked-in `build` settings, against a fake `claude` that refuses as #92's call records show (scrubbed), metered by a real `Engine` (`before`, `after`) and its failure handled by `_finished`. A refused Fable build is answered on Opus with nothing charged to the infrastructure budget; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed with `ceiling`. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #92's own message. |
 
 ## Kept as recorded
 
