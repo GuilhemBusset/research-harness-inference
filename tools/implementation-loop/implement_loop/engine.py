@@ -2366,12 +2366,22 @@ class Engine:
             expanded = []
             for tok in tokens:
                 tok = tok.split("::")[0]
-                expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
-                             else [tok])
+                try:
+                    expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
+                                 else [tok])
+                except (OSError, ValueError, NotImplementedError):
+                    # A pattern the file system or pathlib refuses (an overlong name, an absolute
+                    # pattern) names no test file: it is the builder's text, not an engine fault.
+                    continue
             for tok in expanded:
                 rel = Path(c.get("cwd") or ".") / tok
-                path = (wt / rel).resolve()
-                if not path.is_file() or not path.is_relative_to(wt.resolve()):
+                try:
+                    path = (wt / rel).resolve()
+                    if not path.is_file() or not path.is_relative_to(wt.resolve()):
+                        continue
+                except (OSError, ValueError):
+                    # A token the file system refuses (a name longer than it takes, an embedded
+                    # NUL) names no test file either. Nothing of what the system said is kept.
                     continue
                 rel_s = str(path.relative_to(wt.resolve()))
                 name = path.name

@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.11 |
+| Engine version here | 1.2.12 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -854,3 +854,20 @@ anyway, through `_open_feedback`.
 Behaviour an upstream reader would not expect: a revived build's feedback starts with the revival
 note and then holds up to eight entries of the failed round's feedback. Not changed, on purpose:
 the verifier, the gate, the live adapter, `config.py`, `loop.toml` and the prompts.
+
+### 1.2.12: a command token the file system refuses (2026-11-15)
+
+The repair of fault a73189e271 (issue #318). On engine 1.2.4, the first examination of #69
+crashed with `OSError` in `_command_tests`, which `_lock_and_adopt` calls to lock the test files
+the builder's commands name: a token of one command, globbed or stat'ed against the worktree, was
+one the file system refused. The run log was not read for this repair; nothing of it is copied
+here.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.11 → 1.2.12. | A new engine version: the issues that wait for this repair resume. |
+| `implement_loop/engine.py` | `_command_tests` skips a token whose glob, `resolve()` or `is_file()` raises (`OSError`, `ValueError`, and `NotImplementedError` from a pattern pathlib refuses), as it already skips a command `shlex` cannot split and a token that names no file. | A token is the builder's text: one no file can have names no test file to lock, and is not an engine fault. Nothing of what the system said is kept, as in 1.2.1. |
+| `tests/test_command_tests_oserror.py` | New. `_command_tests` over a worktree with one real test file and a command that also carries a name longer than any Linux file system takes, plain and in glob patterns: only the real file is returned. On 1.2.11 it raises `OSError`. The module comes from `test_deploying.py`'s loader, so the test judges the engine beside it under the verifier too. | The regression test of this repair. |
+
+Not changed, on purpose: the verifier, the gate, the live adapter, `config.py`, `loop.toml` and
+the prompts.
