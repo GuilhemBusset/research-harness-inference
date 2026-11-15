@@ -140,10 +140,15 @@ def test_exposed_vpc_can_be_consumed_across_stacks(app_module: ModuleType, tmp_p
     assert "Fn::ImportValue" in vpc_id
 
 
-def test_raw_nag_findings_have_module_reasons(app_module: ModuleType, tmp_path: Path) -> None:
+def test_raw_nag_findings_have_module_reasons(
+    app_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import aws_cdk as cdk
     import cdk_nag
 
+    # Since #32 `build` runs the pack with the module files' acknowledgements, which hide the raw
+    # findings this witness reads: it builds the app without that wiring and adds the bare pack.
+    monkeypatch.setattr(app_module, "add_nag", lambda app: None)
     app = app_module.build(load({"RHI_CONFIG": "example"}), outdir=str(tmp_path), context=context())
     cdk.Validations.of(app).add_plugins(cdk_nag.AwsSolutionsChecks(app))
     try:
