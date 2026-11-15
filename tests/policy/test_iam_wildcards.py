@@ -9,11 +9,15 @@ What is read: the identity policies, which are `AWS::IAM::Policy`, `AWS::IAM::Ma
 the inline policies of `AWS::IAM::Role`, and the same of a user or a group. A resource policy,
 such as a KMS key policy, names its own resource as `*` and is not read. An action with a wildcard
 in its name (`s3:GetObject*`) is not every action: only `*` is.
+
+A statement is on every resource unless its `Resource` is shown to be something else, whatever is
+chosen when the stack is deployed: `narrowed` says which expressions show it.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -27,6 +31,8 @@ if TYPE_CHECKING:
     Templates = dict[str, dict[str, Any]]
     CreatedBy = dict[tuple[str, str], str]
     Acknowledged = dict[str, dict[str, Any]]
+    # The value each stack exports under a name, with the template that exports it.
+    Exports = dict[str, tuple[Any, Mapping[str, Any]]]
 
 # The resources whose `PolicyDocument` is an identity policy, and those that hold inline ones.
 POLICIES = (
@@ -37,6 +43,8 @@ POLICIES = (
     "AWS::IAM::GroupPolicy",
 )
 WITH_INLINE_POLICIES = ("AWS::IAM::Role", "AWS::IAM::User", "AWS::IAM::Group")
+
+SUBSTITUTION = re.compile(r"\$\{[^}]*\}")
 
 EVERY_ACTION = "allows every action"
 NOT_WRITTEN_OUT = "holds a statement the test cannot read"
@@ -76,9 +84,39 @@ def statements(resource: Mapping[str, Any]) -> list[Any]:
     ]
 
 
-def problems(statement: Any, admitted: Mapping[str, Any]) -> list[str]:
+def narrowed(value: Any, template: Mapping[str, Any], exports: Exports) -> bool:
+    """Whether a `Resource` is shown to be text other than `*`, whatever is chosen at deployment.
+
+    Text is shown to be so when some of it is written out and is not `*`, or when it is the name
+    or an attribute of a resource, or a pseudo parameter. A list is when every member is, a
+    condition when every branch is, a join when one part is, and an import when the value its
+    stack exports is. Anything else is not: a parameter, whose value is chosen at deployment, a
+    function this test does not read, and an export of no template of the app."""
+    if isinstance(value, str):
+        return value.strip("*") != ""
+    if isinstance(value, list):
+        return all(narrowed(member, template, exports) for member in value)
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    match next(iter(value.items())):
+        case ("Fn::GetAtt", _):
+            return True
+        case ("Ref", str(name)):
+            return name in template.get("Resources", {}) or (name.startswith("AWS::") and name != "AWS::NoValue")
+        case ("Fn::Join", [str(), [*parts]]):
+            return any(narrowed(part, template, exports) for part in parts if not isinstance(part, list))
+        case ("Fn::Sub", str(text) | [str(text), _]):
+            return SUBSTITUTION.sub("", text).strip("*") != ""
+        case ("Fn::If", [_, chosen, otherwise]):
+            return narrowed([chosen, otherwise], template, exports)
+        case ("Fn::ImportValue", str(name)) if name in exports:
+            return narrowed(*exports[name], exports)
+    return False
+
+
+def problems(statement: Any, admitted: Mapping[str, Any], template: Mapping[str, Any], exports: Exports) -> list[str]:
     """What one statement allows that it may not. `admitted` is the `[wildcard_actions]` table of
-    the module that created the resource holding the statement."""
+    the module that created the resource holding the statement, in `template`."""
     if not isinstance(statement, dict) or "Effect" not in statement:
         return [NOT_WRITTEN_OUT]
     if statement.get("Effect") == "Deny":
@@ -93,7 +131,7 @@ def problems(statement: Any, admitted: Mapping[str, Any]) -> list[str]:
     if not all(isinstance(action, str) for action in actions):
         found.append(NOT_WRITTEN_OUT)
     # A statement with no `Resource` has `NotResource`: every resource but those it names.
-    if "*" in as_list(statement.get("Resource", "*")):
+    if not narrowed(statement.get("Resource", "*"), template, exports):
         found.extend(
             on_every_resource(action)
             for action in actions
@@ -104,13 +142,19 @@ def problems(statement: Any, admitted: Mapping[str, Any]) -> list[str]:
 
 def violations(templates: Templates, created_by: CreatedBy, acknowledged: Acknowledged) -> list[Finding]:
     """Every wildcard of the templates' identity policies that no acknowledgement admits."""
+    exports: Exports = {
+        output["Export"]["Name"]: (output.get("Value"), template)
+        for template in templates.values()
+        for output in template.get("Outputs", {}).values()
+        if isinstance(output.get("Export", {}).get("Name"), str)
+    }
     return [
         Finding(path, logical_id, problem)
         for path, template in templates.items()
         for logical_id, resource in template.get("Resources", {}).items()
         for statement in statements(resource)
         for problem in problems(
-            statement, acknowledged.get(created_by[path, logical_id], {}).get("wildcard_actions", {})
+            statement, acknowledged.get(created_by[path, logical_id], {}).get("wildcard_actions", {}), template, exports
         )
     ]
 
@@ -153,10 +197,14 @@ BUCKET = {"Fn::GetAtt": ["Bucket", "Arn"]}
 DESCRIBE = "ec2:DescribeInstances"
 
 
-def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None) -> list[str]:
-    """The problems of one resource, built in the test and created by the module `stage`."""
+def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None, exported: Any = None) -> list[str]:
+    """The problems of one resource, built in the test and created by the module `stage`. Another
+    template of the same app exports `exported` under the name `Exported`."""
     acknowledged = {"stage": {"wildcard_actions": admitted or {}}}
-    templates = {"built.template.json": {"Resources": {"Built": resource}}}
+    templates = {
+        "built.template.json": {"Resources": {"Built": resource}},
+        "other.template.json": {"Outputs": {"Output": {"Value": exported, "Export": {"Name": "Exported"}}}},
+    }
     return [
         finding.problem for finding in violations(templates, {("built.template.json", "Built"): "stage"}, acknowledged)
     ]
@@ -198,6 +246,24 @@ def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None
             id="an action on every resource but some",
         ),
         pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::If": ["Condition", "*", BUCKET]}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on every resource under a condition",
+        ),
+        pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": [BUCKET, {"Ref": "Parameter"}]},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on a resource chosen at deployment",
+        ),
+        pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::Join": ["", ["*", {"Ref": "Parameter"}]]}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on a resource joined from nothing but a wildcard",
+        ),
+        pytest.param(
             {"Fn::If": ["Condition", {}, {}]}, {}, [NOT_WRITTEN_OUT], id="a statement that is not written out"
         ),
     ],
@@ -215,6 +281,20 @@ def test_detects_a_wildcard(
             HOLDERS["a policy"]({"Effect": "Allow", "Action": ["s3:GetObject*", "s3:List*"], "Resource": BUCKET}),
             id="actions with a wildcard in their names, on one resource",
         ),
+        pytest.param(
+            HOLDERS["a policy"](
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:GetObject",
+                    "Resource": [
+                        {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":s3:::", {"Ref": "Parameter"}, "/*"]]},
+                        {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/example-${AWS::Region}"},
+                        {"Fn::If": ["Condition", BUCKET, {"Ref": "Built"}]},
+                    ],
+                }
+            ),
+            id="resources written as the functions that name them",
+        ),
         pytest.param(HOLDERS["a policy"]({"Effect": "Deny", "Action": "*", "Resource": "*"}), id="a denial"),
         pytest.param(
             {
@@ -227,6 +307,17 @@ def test_detects_a_wildcard(
 )
 def test_admits_what_is_not_a_wildcard(resource: dict[str, Any]) -> None:
     assert found_in(resource) == []
+
+
+def test_an_import_is_what_its_stack_exports() -> None:
+    importing = HOLDERS["a policy"](
+        {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::ImportValue": "Exported"}}
+    )
+    assert found_in(importing, exported=BUCKET) == []
+    assert found_in(importing, exported="*") == [on_every_resource(DESCRIBE)]
+    # No template of the app exports it: nothing shows what it is.
+    absent = HOLDERS["a policy"]({"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::ImportValue": "Absent"}})
+    assert found_in(absent, exported=BUCKET) == [on_every_resource(DESCRIBE)]
 
 
 # The source tree of an app built in the test: a construct module in a folder, and the stage.
