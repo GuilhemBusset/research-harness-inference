@@ -66,7 +66,8 @@ def example_parameters() -> dict[str, str]:
     values = tomllib.loads((config.REPO_ROOT / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
     assert values.pop("pools") == []  # an empty table: no parameter
     assert values.pop("session_windows") == []
-    typed = {f"/rhi/config/{key}": str(value) for key, value in values.items()}
+    # A boolean as the owner types it: `true` or `false`.
+    typed = {f"/rhi/config/{key}": str(value).lower() if type(value) is bool else str(value) for key, value in values.items()}
     return typed | {"/rhi/config/session_windows": "[]"}
 
 
@@ -118,6 +119,13 @@ def test_the_layout() -> None:
     assert {request["Path"] for _, request in beside.calls} == {"/rhi/config/"}
 
 
+def test_a_missing_https_listener_parameter_reads_false() -> None:
+    stand_in = StandIn(example_parameters())
+    assert config.read_ssm(stand_in).https_listener is True
+    del stand_in.parameters["/rhi/config/https_listener"]
+    assert config.read_ssm(stand_in) == dataclasses.replace(EXAMPLE, https_listener=False)
+
+
 def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -> None:
     other = dataclasses.replace(
         EXAMPLE,
@@ -125,6 +133,7 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         monthly_budget_usd=17,
         time_zone="Europe/Paris",
         course_end=datetime.date(2031, 2, 3),
+        https_listener=False,
     )
     stand_in = StandIn()
     for written in (EXAMPLE, other):  # the second writing goes over the first
@@ -156,6 +165,8 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         ("'course_end'", {"/rhi/config/course_end": f"{MARK}0101"}),
         ("'time_zone'", {"/rhi/config/time_zone": f"Nowhere/City{MARK}"}),
         ("'session_windows'", {"/rhi/config/session_windows": f'["{MARK}"]'}),
+        ("'https_listener'", {"/rhi/config/https_listener": "TRUE"}),
+        ("'https_listener'", {"/rhi/config/https_listener": f"{MARK}"}),
         # A pool entry is its own parameter, and the loader refuses one until entries have a shape.
         ("'pools'", {"/rhi/config/pools/mock": f"entry{MARK}"}),
         # A parameter that is not a String.
@@ -190,6 +201,7 @@ def test_a_missing_an_unknown_or_a_wrongly_typed_parameter_raises(
         ("time_zone", f"Nowhere/City{MARK}"),
         ("pools", (f"entry{MARK}",)),
         ("session_windows", None),
+        ("https_listener", 1),
     ],
 )
 def test_a_writer_refuses_what_its_source_would_not_load(tmp_path: Path, key: str, value: object) -> None:

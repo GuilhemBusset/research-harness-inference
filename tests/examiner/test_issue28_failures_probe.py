@@ -11,7 +11,9 @@ from rhi import config
 def test_missing_and_wrong_types_are_sanitized(tmp_path, key):
     text = Path('config.example.toml').read_text()
     path = tmp_path / 'config.toml'
-    for replacement in ('', f'{key} = {{ marker = "PRIVATE_SENTINEL" }}'):
+    # A key with a default may be left out (issue E2-47 added one): only a required key's absence raises.
+    replacements = ([''] if key in config.required_keys() else []) + [f'{key} = {{ marker = "PRIVATE_SENTINEL" }}']
+    for replacement in replacements:
         path.write_text(re.sub(rf'^{key} = .*$', replacement, text, flags=re.MULTILINE))
         with pytest.raises(config.ConfigError) as caught:
             config.load({'RHI_CONFIG': 'file', 'RHI_CONFIG_FILE': str(path)})
