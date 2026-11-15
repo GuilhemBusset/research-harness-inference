@@ -123,20 +123,28 @@ def save_key(key: str) -> str:
         else:
             path.unlink(missing_ok=True)  # an older key left in the file by an earlier login
             return "the keychain"
+        try:  # the keychain refused the new key: drop the one it holds, which is now superseded
+            keyring.delete_password(SERVICE, USERNAME)
+        except keyring.errors.KeyringError:
+            pass
     _write_private(_private_folder() / KEY_FILE, key)
     return str(path)
 
 
 def load_key() -> str | None:
-    """The stored key: from the keychain when it holds one, otherwise from the file; None if neither.
+    """The stored key, None if there is none.
 
-    A key file that other users can read raises `StoreError`.
+    The file exists only when the last login could not use the keychain (`save_key` removes it
+    whenever the keychain takes the key), so a key in the file is the latest and comes first; the
+    keychain is read otherwise. A key file that other users can read raises `StoreError`.
     """
+    key = _read_private(config_dir() / KEY_FILE)
+    if key is not None:
+        return key
     if has_keychain():
         try:
             key = keyring.get_password(SERVICE, USERNAME)
         except keyring.errors.KeyringError:
             key = None
-        if key:
-            return key
-    return _read_private(config_dir() / KEY_FILE)
+        return key or None
+    return None
