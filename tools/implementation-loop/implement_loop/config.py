@@ -146,7 +146,7 @@ class Caps:
     reverts: int = 1
     merge_refusals: int = 3
     run_ceiling_factor: float = 1.2
-    max_parallel_writers: int = 3
+    max_parallel_writers: int = 1     # one issue built at a time: three at once ran the host out of memory (2026-11-15)
     max_parallel_agents: int = 6
     check_timeout_s: int = 900
     max_check_timeout_s: int = 1800
