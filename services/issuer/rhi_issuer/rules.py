@@ -14,8 +14,18 @@ every key of the student through the keys table's index by student, then:
 - otherwise stores the new key, and revokes every active key of the same installation in the
   same write: one `TransactWriteItems` that either does both or neither, so the store never
   holds the new key beside an unrevoked old key of its installation. A revoked key keeps its
-  item, with `revoked_at` set, which the gateway refuses. With nothing to revoke, the write is
-  the key's own `PutItem`.
+  item, with `revoked_at` set, which the gateway refuses.
+
+Two logins of one student may run at the same time, in two workers of the function. The rules
+hold across them because a student's issuances happen one after the other: every key issued at
+a login names, in its item's `successor`, the key issued next to the same student, and the write
+that stores a key also sets `successor` on the student's latest key, on condition that it has
+none yet. Of two logins that read the same keys, one write lands and the other is cancelled; the
+cancelled login reads the keys again and applies the rules to what it now finds. A student with
+no key from a login has no latest key to name: the first issuance holds a short lock instead, an
+item under `lock#` and the student's GitHub ID, taken before the keys are read again and deleted
+in the write that stores the key. A lock older than `LOCK_SECONDS` is taken over. A login that
+loses this race `ATTEMPTS` times is refused with `Refusal.LOGIN_CONFLICT`.
 
 This module logs nothing, and the key is in what `issue` returns and nowhere else.
 """
@@ -23,7 +33,12 @@ This module logs nothing, and the key is in what `issue` returns and nowhere els
 from __future__ import annotations
 
 import datetime
+import secrets
+import time
+from dataclasses import dataclass
 from typing import Any
+
+from botocore.exceptions import ClientError
 
 from rhi_common.records import RecordError
 from rhi_common.students import RosterEntry, StudentKey
@@ -33,13 +48,38 @@ from rhi_issuer.redeem import Refusal, Refused
 
 DEFAULT_ISSUANCES_PER_DAY = 5
 MAX_INSTALLATIONS = 2
+ATTEMPTS = 12
+LOCK_SECONDS = 30
 _DAY_SECONDS = 86400
 
 _REVOKED_AT = "revoked_at"
+_SUCCESSOR = "successor"
+_LOCK_PREFIX = "lock#"
+_LOCKED_AT = "locked_at"
+_HOLDER = "holder"
+# What a cancelled write may report for an item and still be a race lost, to be tried again.
+_RACE_REASONS = frozenset({"None", "ConditionalCheckFailed", "TransactionConflict"})
 
 
-def _student_keys(github_id: int, keys: Any) -> list[StudentKey]:
-    """Every key of the student, read through the index by student. An item that is not a key is skipped."""
+@dataclass(frozen=True)
+class _Known:
+    """A key of the student, and the key issued after it, if any."""
+
+    record: StudentKey
+    successor: str | None
+
+
+def _known(item: dict[str, Any]) -> _Known | None:
+    try:
+        record = StudentKey.from_item(item)
+    except RecordError:
+        return None
+    successor = item.get(_SUCCESSOR)
+    return _Known(record, successor if isinstance(successor, str) else None)
+
+
+def _student_keys(github_id: int, keys: Any) -> dict[str, _Known]:
+    """Every key of the student, by SHA-256, read through the index by student. An item that is not a key is skipped."""
     index = KEYS.index(BY_STUDENT)
     query: dict[str, Any] = {
         "IndexName": index.name,
@@ -47,17 +87,41 @@ def _student_keys(github_id: int, keys: Any) -> list[StudentKey]:
         "ExpressionAttributeNames": {"#student": index.partition_key.name},
         "ExpressionAttributeValues": {":student": github_id},
     }
-    found: list[StudentKey] = []
+    found: dict[str, _Known] = {}
     while True:
         answer = keys.query(**query)
         for item in answer.get("Items") or []:
-            try:
-                found.append(StudentKey.from_item(item))
-            except RecordError:
-                continue
+            known = _known(item)
+            if known is not None:
+                found[known.record.key_hash] = known
         if "LastEvaluatedKey" not in answer:
             return found
         query["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
+
+
+def _latest(found: dict[str, _Known], keys: Any) -> _Known | None:
+    """The student's latest key from a login, the one with no successor; `None` when there is none.
+
+    The walk starts at the newest key the index shows and follows `successor`, reading with a
+    consistent read a key the index does not show yet. The keys it reads are added to `found`.
+    """
+    issued = [known for known in found.values() if known.record.installation is not None]
+    if not issued:
+        return None
+    current = max(issued, key=lambda known: (known.record.issued_at, known.record.key_hash))
+    walked = {current.record.key_hash}
+    while current.successor is not None and current.successor not in walked:
+        following = found.get(current.successor)
+        if following is None:
+            item = keys.get_item(Key={KEYS.partition_key.name: current.successor}, ConsistentRead=True).get("Item")
+            following = None if item is None else _known(item)
+            if following is None:
+                # A successor that is gone: the write's condition names the value this key holds.
+                return current
+            found[following.record.key_hash] = following
+        current = following
+        walked.add(current.record.key_hash)
+    return current
 
 
 def _day_start(now: int) -> int:
@@ -69,39 +133,147 @@ def _is_active(record: StudentKey, now: int) -> bool:
     return record.revoked_at is None and record.expires_at > now
 
 
-def _store(record: StudentKey, replaced: list[StudentKey], now: int, keys: Any) -> None:
-    """Writes the new key, and revokes the replaced ones, in one write."""
+def _apply_rules(records: list[StudentKey], installation: str, now: int, issuances_per_day: int) -> None:
+    """Raises `Refused` when a rule forbids a new key on that installation."""
+    active = [record for record in records if _is_active(record, now)]
+    others = {record.installation for record in active if record.installation not in (None, installation)}
+    if len(others) >= MAX_INSTALLATIONS:
+        raise Refused(Refusal.TOO_MANY_INSTALLATIONS)
+    day_start = _day_start(now)
+    issued_today = sum(1 for record in records if day_start <= record.issued_at < day_start + _DAY_SECONDS)
+    if issued_today >= issuances_per_day:
+        raise Refused(Refusal.TOO_MANY_ISSUANCES)
+
+
+def _lock_key(github_id: int) -> dict[str, str]:
+    return {KEYS.partition_key.name: f"{_LOCK_PREFIX}{github_id}"}
+
+
+def _take_lock(github_id: int, now: int, keys: Any) -> str | None:
+    """Takes the student's lock, unless another login holds it; the holder's token, or `None`."""
+    holder = secrets.token_hex(16)
+    try:
+        keys.put_item(
+            Item={**_lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder},
+            ConditionExpression="attribute_not_exists(#hash) OR #locked < :stale",
+            ExpressionAttributeNames={"#hash": KEYS.partition_key.name, "#locked": _LOCKED_AT},
+            ExpressionAttributeValues={":stale": now - LOCK_SECONDS},
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
+    return holder
+
+
+def _release_lock(github_id: int, holder: str, keys: Any) -> None:
+    """Deletes the student's lock, if this login still holds it."""
+    try:
+        keys.delete_item(
+            Key=_lock_key(github_id),
+            ConditionExpression="#holder = :holder",
+            ExpressionAttributeNames={"#holder": _HOLDER},
+            ExpressionAttributeValues={":holder": holder},
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+
+
+def _store(
+    record: StudentKey,
+    replaced: list[StudentKey],
+    latest: _Known | None,
+    holder: str | None,
+    now: int,
+    keys: Any,
+) -> bool:
+    """Writes the new key, revokes the replaced ones and names the new key as the latest key's successor, in one write.
+
+    `False` when the write is cancelled because another login wrote first.
+    """
     hash_name = KEYS.partition_key.name
     names = {"#hash": hash_name}
-    # Never over an item that is there: two keys do not share a SHA-256.
-    condition = "attribute_not_exists(#hash)"
-    if not replaced:
-        keys.put_item(Item=record.to_item(), ConditionExpression=condition, ExpressionAttributeNames=names)
-        return
-    put = {
-        "Put": {
-            "TableName": keys.name,
-            "Item": record.to_item(),
-            "ConditionExpression": condition,
-            "ExpressionAttributeNames": names,
-        }
-    }
-    revocations = [
+    items: list[dict[str, Any]] = [
         {
-            "Update": {
+            "Put": {
                 "TableName": keys.name,
-                "Key": {hash_name: old.key_hash},
-                # A revocation that landed in the meantime keeps its own time.
-                "UpdateExpression": "SET #revoked = if_not_exists(#revoked, :now)",
-                "ConditionExpression": "attribute_exists(#hash)",
-                "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT},
-                "ExpressionAttributeValues": {":now": now},
+                "Item": record.to_item(),
+                # Never over an item that is there: two keys do not share a SHA-256.
+                "ConditionExpression": "attribute_not_exists(#hash)",
+                "ExpressionAttributeNames": names,
             }
         }
-        for old in replaced
     ]
-    # The table resource's client, which takes the item's values as the table resource does.
-    keys.meta.client.transact_write_items(TransactItems=[put, *revocations])
+    revoked = {old.key_hash for old in replaced}
+    revoke = "#revoked = if_not_exists(#revoked, :now)"
+    for key_hash in revoked - ({latest.record.key_hash} if latest else set()):
+        items.append(
+            {
+                "Update": {
+                    "TableName": keys.name,
+                    "Key": {hash_name: key_hash},
+                    # A revocation that landed in the meantime keeps its own time.
+                    "UpdateExpression": f"SET {revoke}",
+                    "ConditionExpression": "attribute_exists(#hash)",
+                    "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT},
+                    "ExpressionAttributeValues": {":now": now},
+                }
+            }
+        )
+    if latest is not None:
+        assignments = ["#successor = :new"]
+        values: dict[str, Any] = {":new": record.key_hash}
+        update_names = {**names, "#successor": _SUCCESSOR}
+        if latest.record.key_hash in revoked:
+            assignments.append(revoke)
+            values[":now"] = now
+            update_names["#revoked"] = _REVOKED_AT
+        if latest.successor is None:
+            condition = "attribute_exists(#hash) AND attribute_not_exists(#successor)"
+        else:
+            condition = "attribute_exists(#hash) AND #successor = :seen"
+            values[":seen"] = latest.successor
+        items.append(
+            {
+                "Update": {
+                    "TableName": keys.name,
+                    "Key": {hash_name: latest.record.key_hash},
+                    "UpdateExpression": "SET " + ", ".join(assignments),
+                    "ConditionExpression": condition,
+                    "ExpressionAttributeNames": update_names,
+                    "ExpressionAttributeValues": values,
+                }
+            }
+        )
+    if holder is not None:
+        items.append(
+            {
+                "Delete": {
+                    "TableName": keys.name,
+                    "Key": _lock_key(record.github_id),
+                    "ConditionExpression": "#holder = :holder",
+                    "ExpressionAttributeNames": {"#holder": _HOLDER},
+                    "ExpressionAttributeValues": {":holder": holder},
+                }
+            }
+        )
+    try:
+        # The table resource's client, which takes the item's values as the table resource does.
+        keys.meta.client.transact_write_items(TransactItems=items)
+    except ClientError as error:
+        reasons = error.response.get("CancellationReasons") or []
+        if error.response.get("Error", {}).get("Code") == "TransactionCanceledException" and all(
+            reason.get("Code", "None") in _RACE_REASONS for reason in reasons
+        ):
+            return False
+        raise
+    return True
+
+
+def _pause(attempt: int) -> None:
+    """A short wait before trying again, longer at each attempt, with jitter."""
+    time.sleep(min(0.02 * 2**attempt, 0.5) * (1 + secrets.randbelow(100) / 100))
 
 
 def issue(
@@ -119,20 +291,33 @@ def issue(
     whole seconds since the epoch, `keys` the keys table, as the table resource of the AWS SDK, and
     `issuances_per_day` the most keys the student may be issued over one UTC day.
     """
-    existing = _student_keys(entry.github_id, keys)
-    active = [record for record in existing if _is_active(record, now)]
-
-    others = {record.installation for record in active if record.installation not in (None, installation)}
-    if len(others) >= MAX_INSTALLATIONS:
-        raise Refused(Refusal.TOO_MANY_INSTALLATIONS)
-
-    day_start = _day_start(now)
-    issued_today = sum(1 for record in existing if day_start <= record.issued_at < day_start + _DAY_SECONDS)
-    if issued_today >= issuances_per_day:
-        raise Refused(Refusal.TOO_MANY_ISSUANCES)
-
-    key, record = mint(entry, installation, course_end=course_end, now=now)
-    replaced = [old for old in active if old.installation == installation]
-    _store(record, replaced, now, keys)
-    previous = max((old.issued_at for old in existing), default=None)
-    return Minted(key=key, issued_at=record.issued_at, expires_at=record.expires_at, previous_issued_at=previous)
+    for attempt in range(ATTEMPTS):
+        if attempt:
+            _pause(attempt)
+        found = _student_keys(entry.github_id, keys)
+        latest = _latest(found, keys)
+        holder = None
+        if latest is None:
+            holder = _take_lock(entry.github_id, now, keys)
+            if holder is None:
+                continue
+            # What another login stored before the lock was taken.
+            found = _student_keys(entry.github_id, keys)
+            latest = _latest(found, keys)
+        existing = [known.record for known in found.values()]
+        try:
+            _apply_rules(existing, installation, now, issuances_per_day)
+        except Refused:
+            if holder is not None:
+                _release_lock(entry.github_id, holder, keys)
+            raise
+        key, record = mint(entry, installation, course_end=course_end, now=now)
+        replaced = [old for old in existing if _is_active(old, now) and old.installation == installation]
+        if _store(record, replaced, latest, holder, now, keys):
+            previous = max((old.issued_at for old in existing), default=None)
+            return Minted(
+                key=key, issued_at=record.issued_at, expires_at=record.expires_at, previous_issued_at=previous
+            )
+        if holder is not None:
+            _release_lock(entry.github_id, holder, keys)
+    raise Refused(Refusal.LOGIN_CONFLICT)

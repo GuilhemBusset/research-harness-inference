@@ -86,6 +86,11 @@ class Refusal(StrEnum):
         429,
         "This account has been issued as many keys as it may today: log in again after midnight UTC.",
     )
+    LOGIN_CONFLICT = (
+        "login_conflict",
+        409,
+        "Other logins of this account were under way at the same time: log in again.",
+    )
 
 
 # What GitHub answers for a device code it does not redeem yet, or any more. Any other error of
