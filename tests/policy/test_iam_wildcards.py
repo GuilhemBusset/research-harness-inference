@@ -46,6 +46,36 @@ WITH_INLINE_POLICIES = ("AWS::IAM::Role", "AWS::IAM::User", "AWS::IAM::Group")
 
 SUBSTITUTION = re.compile(r"\$\{[^}]*\}")
 
+# The resources whose `Ref` is their ARN (the CloudFormation reference, "Return values" of each).
+# The `Ref` of any other is a name or an identifier, which its template may choose: alone it is
+# no ARN, and IAM reads a `Resource` that is no ARN only when it is `*`.
+REF_IS_AN_ARN = frozenset(
+    {
+        "AWS::CertificateManager::Certificate",
+        "AWS::CodeConnections::Connection",
+        "AWS::CodeStarConnections::Connection",
+        "AWS::ECS::Service",
+        "AWS::ECS::TaskDefinition",
+        "AWS::ElasticLoadBalancingV2::Listener",
+        "AWS::ElasticLoadBalancingV2::ListenerRule",
+        "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        "AWS::ElasticLoadBalancingV2::TargetGroup",
+        "AWS::IAM::ManagedPolicy",
+        "AWS::Lambda::Alias",
+        "AWS::Lambda::Version",
+        "AWS::SNS::Topic",
+        "AWS::SecretsManager::Secret",
+        "AWS::StepFunctions::StateMachine",
+    }
+)
+# The resources of AWS whose attributes are what the code of a provider or another template
+# gives, as those of a resource that is not of AWS are.
+NOT_MADE_BY_A_SERVICE = (
+    "AWS::CloudFormation::CustomResource",
+    "AWS::CloudFormation::Stack",
+    "AWS::ServiceCatalog::CloudFormationProvisionedProduct",
+)
+
 EVERY_ACTION = "allows every action"
 NOT_WRITTEN_OUT = "holds a statement the test cannot read"
 
@@ -84,14 +114,35 @@ def statements(resource: Mapping[str, Any]) -> list[Any]:
     ]
 
 
+def arn_attribute(name: str, attribute: str, template: Mapping[str, Any], exports: Exports) -> bool:
+    """Whether an attribute of a resource of the template is shown to be an ARN a service made.
+
+    It is when the resource is one of an AWS service and the attribute's name ends in `Arn`. The
+    name alone shows nothing of an attribute that is a property the template wrote: that one is
+    what the template wrote there."""
+    resource = template.get("Resources", {}).get(name, {})
+    kind = resource.get("Type", "")
+    if not kind.startswith("AWS::") or kind in NOT_MADE_BY_A_SERVICE or not attribute.endswith("Arn"):
+        return False
+    written = resource.get("Properties", {})
+    for key in attribute.split("."):
+        if not isinstance(written, dict) or key not in written:
+            return True
+        written = written[key]
+    return narrowed(written, template, exports)
+
+
 def narrowed(value: Any, template: Mapping[str, Any], exports: Exports) -> bool:
     """Whether a `Resource` is shown to be text other than `*`, whatever is chosen at deployment.
 
-    Text is shown to be so when some of it is written out and is not `*`, or when it is the name
-    or an attribute of a resource, or a pseudo parameter. A list is when every member is, a
-    condition when every branch is, a join when one part is, and an import when the value its
-    stack exports is. Anything else is not: a parameter, whose value is chosen at deployment, a
-    function this test does not read, and an export of no template of the app."""
+    Text is shown to be so when some of it is written out and is not `*`, or when it is an ARN
+    that a service made, which is never `*`: an attribute that `arn_attribute` admits, or the
+    `Ref` of a resource whose `Ref` is its ARN. A pseudo parameter is never `*` either. A list is
+    shown to be so when every member is, a condition when every branch is, a join when one part
+    is, and an import when the value its stack exports is. Anything else is not: any other
+    attribute or `Ref` of a resource, which may be whatever its template or its provider wrote, a
+    parameter, whose value is chosen at deployment, a function this test does not read, and an
+    export of no template of the app."""
     if isinstance(value, str):
         return value.strip("*") != ""
     if isinstance(value, list):
@@ -99,10 +150,12 @@ def narrowed(value: Any, template: Mapping[str, Any], exports: Exports) -> bool:
     if not isinstance(value, dict) or len(value) != 1:
         return False
     match next(iter(value.items())):
-        case ("Fn::GetAtt", _):
-            return True
+        case ("Fn::GetAtt", [str(name), str(attribute)]):
+            return arn_attribute(name, attribute, template, exports)
+        case ("Ref", str(name)) if name in template.get("Resources", {}):
+            return template["Resources"][name].get("Type") in REF_IS_AN_ARN
         case ("Ref", str(name)):
-            return name in template.get("Resources", {}) or (name.startswith("AWS::") and name != "AWS::NoValue")
+            return name.startswith("AWS::") and name != "AWS::NoValue"
         case ("Fn::Join", [str(), [*parts]]):
             return any(narrowed(part, template, exports) for part in parts if not isinstance(part, list))
         case ("Fn::Sub", str(text) | [str(text), _]):
@@ -195,6 +248,16 @@ HOLDERS = {
 }
 BUCKET = {"Fn::GetAtt": ["Bucket", "Arn"]}
 DESCRIBE = "ec2:DescribeInstances"
+# What the statements of the tests name, in each template built here. Four of them hold a `*`
+# that a statement could take for its `Resource`.
+NAMED = {
+    "Bucket": {"Type": "AWS::S3::Bucket"},
+    "Topic": {"Type": "AWS::SNS::Topic"},
+    "Scope": {"Type": "AWS::SSM::Parameter", "Properties": {"Type": "String", "Value": "*"}},
+    "Alarm": {"Type": "AWS::CloudWatch::Alarm", "Properties": {"AlarmName": "*"}},
+    "Permission": {"Type": "AWS::Lambda::Permission", "Properties": {"SourceArn": "*"}},
+    "Provided": {"Type": "Custom::Provided"},
+}
 
 
 def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None, exported: Any = None) -> list[str]:
@@ -202,12 +265,16 @@ def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None
     template of the same app exports `exported` under the name `Exported`."""
     acknowledged = {"stage": {"wildcard_actions": admitted or {}}}
     templates = {
-        "built.template.json": {"Resources": {"Built": resource}},
-        "other.template.json": {"Outputs": {"Output": {"Value": exported, "Export": {"Name": "Exported"}}}},
+        "built.template.json": {"Resources": NAMED | {"Built": resource}},
+        "other.template.json": {
+            "Resources": NAMED,
+            "Outputs": {"Output": {"Value": exported, "Export": {"Name": "Exported"}}},
+        },
     }
-    return [
-        finding.problem for finding in violations(templates, {("built.template.json", "Built"): "stage"}, acknowledged)
-    ]
+    created_by = {
+        (path, logical_id): "stage" for path, template in templates.items() for logical_id in template["Resources"]
+    }
+    return [finding.problem for finding in violations(templates, created_by, acknowledged)]
 
 
 @pytest.mark.parametrize("holder", HOLDERS)
@@ -264,6 +331,30 @@ def found_in(resource: dict[str, Any], admitted: Mapping[str, str] | None = None
             id="an action on a resource joined from nothing but a wildcard",
         ),
         pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::GetAtt": ["Scope", "Value"]}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on an attribute that is no ARN",
+        ),
+        pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::GetAtt": ["Permission", "SourceArn"]}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on an attribute that its template wrote",
+        ),
+        pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Fn::GetAtt": ["Provided", "Arn"]}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on an attribute that a provider gives",
+        ),
+        pytest.param(
+            {"Effect": "Allow", "Action": DESCRIBE, "Resource": {"Ref": "Alarm"}},
+            {},
+            [on_every_resource(DESCRIBE)],
+            id="an action on the name of a resource",
+        ),
+        pytest.param(
             {"Fn::If": ["Condition", {}, {}]}, {}, [NOT_WRITTEN_OUT], id="a statement that is not written out"
         ),
     ],
@@ -289,7 +380,7 @@ def test_detects_a_wildcard(
                     "Resource": [
                         {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":s3:::", {"Ref": "Parameter"}, "/*"]]},
                         {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/example-${AWS::Region}"},
-                        {"Fn::If": ["Condition", BUCKET, {"Ref": "Built"}]},
+                        {"Fn::If": ["Condition", BUCKET, {"Ref": "Topic"}]},
                     ],
                 }
             ),
