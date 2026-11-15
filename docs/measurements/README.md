@@ -149,3 +149,34 @@ conditions of the design: no host name, no resource id, no account, no student.
 
 A change to a record goes through a pull request like any other change, and the test above runs
 on it.
+
+### From the statuses of a commit
+
+A measurement's job posts each run as commit statuses, under the contexts
+`measure/<id>/<run label>/<part>`: `measure/S5/8bit/1`, `measure/S5/8bit/2`, `measure/S1/cold/1`
+([`services/reporter/rhi_reporter/measure.py`](../../services/reporter/rhi_reporter/measure.py)).
+The id is one of `S1` to `S11`, `gpu-canary` for the weekly canary and `dry-run-class` for the
+dry-run class. The state is the run's verdict, success for a pass, failure for a fail and error
+when the job could not measure, and the description holds the numbers as `name=number` pairs.
+
+[`tools/measurements/record.py`](../../tools/measurements/record.py) writes the statuses of one
+commit into the records of this folder. It reads the list GitHub's API gives, and needs the
+standard library only:
+
+```sh
+gh api --paginate "repos/{owner}/{repo}/commits/<sha>/statuses" |
+    uv run --locked python tools/measurements/record.py --commit <sha> \
+        --unit load_time=s --pass-condition "S4=Under 100 s for the coursework model's 31 GB"
+```
+
+- Each run on the commit becomes the run of its label, with the commit and the day, in UTC, of
+  its newest status, and one row for each number, labelled `run` only. It replaces the run of
+  that label and its rows, and leaves the other runs, the pass condition, a waiver and the prose
+  as they are. A person adds the other labels of a row afterwards.
+- A run posted as error becomes a pending run with the reason `not measured`, and has no row.
+- The record's verdict is set by the rule above. A record the owner waived stays waived.
+- A status holds no unit and no pass condition. `--unit name=unit` gives the unit of a number;
+  without it, the number takes the unit of a row of that name the record already holds.
+  `--pass-condition ID=text` gives the pass condition of a record that does not exist yet.
+  A number with no unit, and a new record with no pass condition, are refused, and nothing is
+  written.

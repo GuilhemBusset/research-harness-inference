@@ -41,6 +41,7 @@ backlog/                    the issue format, and drafts waiting to be published
 tools/implementation-loop/  the implement loop engine, vendored (see its UPSTREAM.md)
 tools/hygiene/              the public-repository scanner: no account ID, ARN or secret gets committed
 tools/backlog/              lints and publishes the backlog
+tools/measurements/         writes the numbers a spike or a canary posted into docs/measurements/
 scripts/                    check.sh (the one gate script), implement.sh, ship.sh, backlog.sh
 setup/                      one-time setup: git hooks, the GitHub ruleset
 .githooks/, .github/        the local and server-side gates
