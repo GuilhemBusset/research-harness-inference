@@ -7,6 +7,9 @@ which runs the configuration module on the test's own interpreter and, as uv doe
 project environment where `UV_PROJECT_ENVIRONMENT` says, or else in `.venv` in the tree. It
 records the module that stores the reporter's secret and never runs it. One test runs the real uv
 instead, offline. After every run the scratch copy is compared with what it was, byte for byte.
+
+The scanner's list of local values is a file in the test's temporary folder in every run: by
+`HYGIENE_LOCAL_VALUES`, or, for the scanner's default file, under a home directory made there.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +40,9 @@ SECRET = "rhi/reporter/github-app"
 # What stands for the reporter's private key: no real key, and a mark no output may repeat.
 KEY_MARK = "stand-in-for-a-key"
 KEY = f"{KEY_MARK} first line\n{KEY_MARK} last line\n"
+# The values of the example configuration's private keys, and one the owner enters at the prompt.
+PRIVATE = sorted(str(getattr(config.load({"RHI_CONFIG": "example"}), key)) for key in config.PRIVATE_KEYS)
+ENTERED = "Entered At The Prompt"
 
 
 def snapshot(tree: Path) -> dict[str, bytes | None]:
@@ -55,6 +62,8 @@ class Walkthrough:
         self.outside.mkdir()
         (tmp_path / "tmp").mkdir()
         self.tmp_path = tmp_path
+        # The list of local values of every run, unless the run names another. Its folder is absent.
+        self.values = tmp_path / "scanner" / "hygiene-values"
         self.calls = tmp_path / "calls"
         self.stand_ins = tmp_path / "bin"
         self.stand_ins.mkdir()
@@ -96,19 +105,25 @@ class Walkthrough:
         path.write_text(text, encoding="utf-8")
         return path
 
-    def run(self, *arguments: object, answers: str = "", real_uv: bool = False) -> subprocess.CompletedProcess[str]:
-        """Run the walkthrough in the scratch copy, and check that the copy is as it was."""
+    def run(
+        self, *arguments: object, answers: str = "", real_uv: bool = False, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the walkthrough in the scratch copy, and check that the copy is as it was. `env` is
+        added to the environment of the run, after the list of local values."""
         if real_uv:
             (self.stand_ins / "uv").unlink()
         # Nothing the caller's shell sets may keep bytecode or an environment out of the tree: the
         # script has to. The real uv finds everything it installs in its cache.
         dropped = ("PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV")
+        added = env or {}
         env = {name: value for name, value in os.environ.items() if name not in dropped}
         env |= {
             "PATH": f"{self.stand_ins}{os.pathsep}{env['PATH']}",
             "TMPDIR": str(self.tmp_path / "tmp"),
             "UV_OFFLINE": "1",
+            "HYGIENE_LOCAL_VALUES": str(self.values),
         }
+        env |= added
         self.calls.write_text("", encoding="utf-8")
         before = snapshot(self.tree)
         done = subprocess.run(
@@ -167,9 +182,14 @@ def test_the_dry_run_prints_the_nine_steps_in_order(walkthrough: Walkthrough) ->
     printed = commands(done.stdout)
     started = "aws service-quotas, aws ssm, aws cloudformation, cdk bootstrap, gh repo edit, setup/apply-ruleset.sh"
     started += f", gh api 'apps/<slug>', rhi.owner_secret {SECRET}, aws secretsmanager"
+    started += ", rhi.owner_config values"
     for tool in started.split(", "):
         assert any(tool in command for command in printed), tool
     assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+    # The list of local values is the second half of step 4: after the configuration, before step 5.
+    in_order = r"^== Step 4 of 9: .*^== Step 4b of 9: [^\n]*values[^\n]* ==$.*^== Step 5 of 9: "
+    assert re.search(in_order, done.stdout, flags=re.MULTILINE | re.DOTALL)
+    assert not walkthrough.values.parent.exists()
 
 
 @pytest.mark.parametrize(
@@ -445,6 +465,115 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
     file.write_text(EXAMPLE.replace("pools = []", "pools = [1]"), encoding="utf-8")
     assert owner_config.main(["write", str(file)], untouched) == 1
     assert untouched.put == []
+
+
+def scan(file: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """The repository's own scanner, on one file, in this environment."""
+    scanner = [sys.executable, str(REPO / "tools/hygiene/scan.py"), "--paths", str(file)]
+    return subprocess.run(scanner, env=os.environ | env, capture_output=True, text=True, check=False)
+
+
+@pytest.mark.parametrize("named", ["by the variable", "by default"])
+def test_the_step_writes_each_private_value_once(walkthrough: Walkthrough, named: str) -> None:
+    # The two ways the scanner finds its list. An empty variable is an unset one, for both.
+    home = walkthrough.tmp_path / "home"
+    if named == "by the variable":
+        values, env = walkthrough.values, {"HYGIENE_LOCAL_VALUES": str(walkthrough.values)}
+    else:
+        values = home / ".config" / "research-harness-inference" / "hygiene-values"
+        env = {"HOME": str(home), "HYGIENE_LOCAL_VALUES": "", "XDG_CONFIG_HOME": ""}
+    file = walkthrough.owner_file()
+    scratch = walkthrough.outside / "scratch.txt"
+    scratch.write_text(f"served under {PRIVATE[0]}\n", encoding="utf-8")
+    # No list yet, so no finding: the rule is off, or the scan refuses the absent file the variable names.
+    assert scan(scratch, env).returncode == (2 if named == "by the variable" else 0)
+
+    # The owner enters one value more and one the configuration holds already, then says yes.
+    done = walkthrough.run("--step", "values", "--config", file, answers=f"{ENTERED}\n{PRIVATE[0]}\n\ny\n", env=env)
+    assert done.returncode == 0, done.stderr
+    assert sorted(values.read_text(encoding="utf-8").splitlines()) == sorted([*PRIVATE, ENTERED])
+    assert stat.S_IMODE(values.stat().st_mode) == 0o600
+    assert stat.S_IMODE(values.parent.stat().st_mode) == 0o700
+    # It prints how many values the list holds, and no value.
+    assert f"holds {len(PRIVATE) + 1} values" in done.stdout
+    assert not [value for value in [*PRIVATE, ENTERED] if value in done.stdout + done.stderr]
+
+    # Run again, the list is what it was. One that others could read is the owner's alone again.
+    written = values.read_bytes()
+    values.chmod(0o644)
+    done = walkthrough.run("--step", "values", "--config", file, answers=f"{ENTERED.upper()}\n\ny\n", env=env)
+    assert done.returncode == 0, done.stderr
+    assert values.read_bytes() == written
+    assert stat.S_IMODE(values.stat().st_mode) == 0o600
+    assert f"holds {len(PRIVATE) + 1} values" in done.stdout
+
+    # The scanner now reports the scratch file, under the rule, without showing the value.
+    found = scan(scratch, env)
+    assert found.returncode == 1, found.stderr
+    assert f"{scratch}:1: local-value: " in found.stdout
+    assert PRIVATE[0] not in found.stdout + found.stderr
+
+
+def test_a_list_that_exists_keeps_its_lines(walkthrough: Walkthrough) -> None:
+    walkthrough.values.parent.mkdir()
+    walkthrough.values.write_text("# the owner's own\nkept by the owner", encoding="utf-8")  # no end of line
+
+    done = walkthrough.run("--step", "values", "--config", walkthrough.owner_file(), answers="\ny\n")
+    assert done.returncode == 0, done.stderr
+    lines = walkthrough.values.read_text(encoding="utf-8").splitlines()
+    assert lines[:2] == ["# the owner's own", "kept by the owner"]
+    assert sorted(lines[2:]) == PRIVATE
+    assert f"holds {len(PRIVATE) + 1} values" in done.stdout  # a comment is not a value
+
+
+def test_the_values_step_asks_before_it_writes(walkthrough: Walkthrough) -> None:
+    file = walkthrough.owner_file()
+
+    # No further value, then no to the writing: nothing is started and there is no list.
+    done = walkthrough.run("--step", "values", "--config", file, answers="\nn\n")
+    assert done.returncode == 0, done.stderr
+    assert walkthrough.called("uv") == []
+
+    # A value the scanner would refuse to read, which would stop every scan: nothing is written,
+    # and the refusal does not repeat it.
+    done = walkthrough.run("--step", "values", "--config", file, answers=f"{MARK[:3]}\n\ny\n")
+    assert done.returncode != 0
+    assert "refused" in done.stderr
+    assert MARK[:3] not in done.stdout + done.stderr
+    assert not walkthrough.values.parent.exists()
+
+
+def test_a_dry_run_of_the_values_step_writes_no_file(walkthrough: Walkthrough) -> None:
+    done = walkthrough.run("--dry-run", "--step", "values", "--config", walkthrough.owner_file())
+
+    assert done.returncode == 0, done.stderr
+    # What it would do: the command, which names the list. It read no answer and started nothing.
+    (writer,) = [command for command in commands(done.stdout) if "rhi.owner_config values" in command]
+    assert writer.endswith(f"--list {walkthrough.values}")
+    assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+    assert not walkthrough.values.parent.exists()  # neither the list nor its folder
+
+
+def test_the_list_is_never_written_in_the_repository(walkthrough: Walkthrough) -> None:
+    file = walkthrough.owner_file()
+    # In the tree: by its path, by a path from the folder the step is started in, by a link in the
+    # tree to a file outside it, and by a link outside the tree to a file in it.
+    target = walkthrough.outside / "hygiene-values"
+    target.write_text("", encoding="utf-8")
+    (walkthrough.tree / "link-values").symlink_to(target)
+    (walkthrough.outside / "link-values").symlink_to(walkthrough.tree / "hygiene-values")
+    inside = (walkthrough.tree / "hygiene-values", "docs/hygiene-values", walkthrough.tree / "link-values")
+
+    for named in (*inside, walkthrough.outside / "link-values"):
+        for options in (["--dry-run"], []):
+            # `run` checks that the scratch copy is as it was: no list in it.
+            step = [*options, "--step", "values", "--config", file]
+            refused = walkthrough.run(*step, answers="\ny\n", env={"HYGIENE_LOCAL_VALUES": str(named)})
+            assert refused.returncode != 0, named
+            assert "inside the working tree" in refused.stderr
+            assert "rhi.owner_config" not in refused.stdout  # the writing is not offered
+            assert walkthrough.called("uv") == []
+    assert target.read_text(encoding="utf-8") == ""
 
 
 def test_the_scratch_copy_is_byte_identical_afterwards(walkthrough: Walkthrough) -> None:
