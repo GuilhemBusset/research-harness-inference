@@ -346,10 +346,13 @@ billing alerts; `cdk bootstrap` with the project's execution policy and permissi
 then `cdk deploy` the pipeline stack once; authorize the GitHub connection for this repository
 only; enter the roster.
 
-The design is the reference for that list, and the exact commands arrive with the backlog: the
-pipeline epic delivers the script that walks through these steps and writes nothing
-account-specific to the working tree. They do not exist yet. Two rules hold whatever the
-commands turn out to be:
+The design is the reference for that list. [`setup/owner-setup.sh`](../../setup/owner-setup.sh)
+walks through these steps and writes nothing account-specific to the working tree, and
+[`docs/runbooks/owner-setup.md`](../runbooks/owner-setup.md) describes each one and how to check
+it. Start with `setup/owner-setup.sh --dry-run`, which prints every step and every command and
+calls neither AWS nor GitHub. The commands of the steps whose code is not in the repository yet
+(the first deployment of the pipeline stack, the roster) arrive with that code. Two rules hold
+for every command:
 
 - Nothing they print (the account ID, ARNs, host names) is ever pasted into a file, an issue, a
   pull request or a commit message.
