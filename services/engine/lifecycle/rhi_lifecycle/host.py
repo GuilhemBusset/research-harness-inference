@@ -1,0 +1,102 @@
+"""The host, as the lifecycle agent acts on it: its docker and its systemd, through nsenter.
+
+The agent runs in a container, and the engine is a systemd unit of the host (system design,
+section 4.3). So every action on the host runs the host's own `docker` or `systemctl` in the
+host's namespaces, with `nsenter` on the host's first process: the agent's container is privileged
+and shares the host's process namespace for that. Every other module of the agent acts on the host
+through this one, so a test replaces one module.
+
+The engine image is in the account's ECR, and the host's docker holds no credentials for it. So a
+pull first asks ECR for an authorization token, with the instance role, and logs the host's docker
+in to the image's registry. The token's password reaches docker on its standard input, never in a
+command's arguments, where any process of the host could read it.
+
+A command that fails raises `HostError`, which names the action and the exit status and repeats
+nothing the command or AWS printed.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import re
+import subprocess
+from typing import Any
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+ENGINE_UNIT = "rhi-engine"
+
+# The host's first process, and the namespaces of it a command enters.
+HOST_NAMESPACES = ("--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid")
+
+# The registry of an image reference: what comes before the first slash.
+_REGISTRY = re.compile(r"([A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?)/\S+", re.ASCII)
+
+
+class HostError(Exception):
+    """An action on the host failed. `action` is `login`, `pull`, `start`, `restart` or `stop`;
+    `returncode` is the command's exit status, or None when no command ran to its end."""
+
+    def __init__(self, action: str, returncode: int | None = None) -> None:
+        how = "could not be run" if returncode is None else f"exited with status {returncode}"
+        super().__init__(f"{action}: the command {how}")
+        self.action = action
+        self.returncode = returncode
+
+
+class Host:
+    """The host's docker and systemd. `ecr` is an ECR client of the AWS SDK; without one, the
+    instance role and the region of the environment make it at the first pull. `nsenter` is the
+    program that enters the host's namespaces."""
+
+    def __init__(self, ecr: Any = None, *, nsenter: str = "nsenter") -> None:
+        self._ecr = ecr
+        self._nsenter = nsenter
+
+    def pull(self, image: str) -> None:
+        """Log the host's docker in to the registry of `image`, then pull `image`."""
+        found = _REGISTRY.fullmatch(image)
+        if found is None:
+            raise HostError("login")
+        registry = found.group(1)
+        user, password = self._credentials()
+        self._run("login", ("docker", "login", "--username", user, "--password-stdin", registry), password)
+        self._run("pull", ("docker", "pull", image))
+
+    def start_engine(self) -> None:
+        self._run("start", ("systemctl", "start", ENGINE_UNIT))
+
+    def restart_engine(self) -> None:
+        self._run("restart", ("systemctl", "restart", ENGINE_UNIT))
+
+    def stop_engine(self) -> None:
+        self._run("stop", ("systemctl", "stop", ENGINE_UNIT))
+
+    def _credentials(self) -> tuple[str, str]:
+        """The user and the password of an authorization token from ECR."""
+        try:
+            if self._ecr is None:
+                self._ecr = boto3.client("ecr")
+            token = self._ecr.get_authorization_token()["authorizationData"][0]["authorizationToken"]
+            # The token is `<user>:<password>` in base64.
+            user, colon, password = base64.b64decode(token, validate=True).decode("utf-8").partition(":")
+        except (BotoCoreError, ClientError, LookupError, TypeError, binascii.Error, UnicodeDecodeError):
+            raise HostError("login") from None
+        if not (user and colon and password):
+            raise HostError("login")
+        return user, password
+
+    def _run(self, action: str, command: tuple[str, ...], given: str | None = None) -> None:
+        """Run `command` in the host's namespaces, with `given` on its standard input."""
+        arguments = (self._nsenter, *HOST_NAMESPACES, "--", *command)
+        try:
+            if given is None:
+                done = subprocess.run(arguments, stdin=subprocess.DEVNULL, check=False)
+            else:
+                done = subprocess.run(arguments, input=given.encode("utf-8"), check=False)
+        except OSError:
+            raise HostError(action) from None
+        if done.returncode != 0:
+            raise HostError(action, done.returncode)
