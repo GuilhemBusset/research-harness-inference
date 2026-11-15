@@ -38,6 +38,9 @@ dev = [
     "ty==0.0.95",
     # An in-process DynamoDB that evaluates condition expressions, which botocore's Stubber cannot.
     "moto[dynamodb]==5.2.5",
+    # Lints every synthesized template and the templates under setup/, in
+    # tests/synth/test_cfn_lint.py (system design, section 8.3).
+    "cfn-lint==1.60.1",
     # Every service group, so that the tests and ty see every library a service imports.
     { include-group = "gateway" },
     { include-group = "mock-engine" },
