@@ -1,0 +1,57 @@
+"""The VPC of the endpoint (system design, section 6.5).
+
+GPU instances and Fargate tasks run in private subnets and reach out through one NAT gateway:
+without it they would need public addresses, and a security group would be the only thing between
+the internet and an engine with unauthenticated routes. The public subnets hold the load balancer
+and the NAT gateway. Pools span three zones (section 5.4), and instances read weights through the
+S3 gateway endpoint (section 4.4).
+
+The zones are those of the stack that holds the VPC, which `rhi.network.stack` takes from the
+deploying region at deployment time.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from aws_cdk import aws_ec2 as ec2
+from constructs import Construct
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+# The CIDR of the VPC, private address space that names nothing.
+CIDR = "10.0.0.0/16"
+ZONES = 3
+
+
+class Network(Construct):
+    """A VPC over three zones: a public and a private subnet in each, one NAT gateway, and a
+    gateway endpoint for S3 on the private subnets' route tables."""
+
+    def __init__(self, scope: Construct, construct_id: str, *, availability_zones: Sequence[str]) -> None:
+        super().__init__(scope, construct_id)
+        if len(availability_zones) != ZONES:
+            raise ValueError(f"the VPC spans {ZONES} zones, not {len(availability_zones)}")
+        self.vpc = ec2.Vpc(
+            self,
+            "Vpc",
+            ip_addresses=ec2.IpAddresses.cidr(CIDR),
+            availability_zones=list(availability_zones),
+            nat_gateways=1,
+            subnet_configuration=[
+                # The load balancer's side, and the NAT gateway's. Neither needs an address given
+                # at launch: the NAT gateway has its Elastic IP, the load balancer its own.
+                ec2.SubnetConfiguration(
+                    name="Public", subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=24, map_public_ip_on_launch=False
+                ),
+                # Tasks and instances: no public address, outbound calls through the NAT gateway.
+                ec2.SubnetConfiguration(name="Private", subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS, cidr_mask=20),
+            ],
+            gateway_endpoints={
+                "S3": ec2.GatewayVpcEndpointOptions(
+                    service=ec2.GatewayVpcEndpointAwsService.S3,
+                    subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)],
+                )
+            },
+        )

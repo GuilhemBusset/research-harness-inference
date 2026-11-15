@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-VPC7" = "The VPC keeps no flow log: no security group admits traffic from the internet to a task or an instance, the gateway records every request it serves, and a flow log would add a log group and its cost that nothing in the design reads."
