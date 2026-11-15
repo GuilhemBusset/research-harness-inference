@@ -398,10 +398,11 @@ class FakeAgents:
                     f = self.probe_file(n) if k2 == 0 else f"checks/probe_{n}_{crit}.sh"
                     probes.append(Probe(f, crit, f"bash {f}", content=body))
             verdicts = []
-            judged = [p["id"] for p in plan["items"] if p["proof"] == "review"
-                      or (p["proof"] == "owner" and (p.get("agent_part") or "none") != "none")]
-            for i in judged:
-                text = next(li.text for li in req.spec.ledger if li.id == i)
+            judged = {p["id"]: p for p in plan["items"] if p["proof"] == "review"
+                      or (p["proof"] == "owner" and (p.get("agent_part") or "none") != "none")}
+            for i, planned in judged.items():   # an owner item is judged on its agent part, and quotes it
+                text = (planned["agent_part"] if planned["proof"] == "owner"
+                        else next(li.text for li in req.spec.ledger if li.id == i))
                 verdict = "unmet" if k < s.unmet_review else "met"
                 verdicts.append({"item": i, "verdict": verdict, "quote": " ".join(text.split()[:4]), "note": "fake"})
             decisions = [Decision(r["id"], True, "the path is the suite registry") for r in requests]

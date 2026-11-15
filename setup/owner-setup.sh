@@ -4,15 +4,21 @@
 #   setup/owner-setup.sh --dry-run        print every step and every command, and run none
 #   setup/owner-setup.sh                  the walkthrough: asks before each command it runs
 #   setup/owner-setup.sh --step configuration --config <file>     one step on its own
+#   setup/owner-setup.sh --step values --config <file>            the scanner's list of real values
+#   setup/owner-setup.sh --step apps --reporter-key <file>        the Apps, read back from GitHub
 #
 # The owner runs it, from a shell no agent runs in, with their own AWS credentials and `gh` login.
 # docs/runbooks/owner-setup.md describes each step: what it needs, how to check it and the
 # decision of the design it rests on.
 #
-# What the script learns (the account, a quota's code, an address) goes to the terminal or, for
-# the configuration, to SSM. Nothing is written to the working tree, by the script or by the tools
-# it starts: Python keeps no bytecode, and uv's project environment and the CDK's output go to a
-# temporary folder that is removed when the script ends.
+# What the script learns (the account, a quota's code, an address, an App's ID) goes to the
+# terminal, the configuration goes to SSM, and the status reporter's credentials go to Secrets
+# Manager: the reporter's private key is read from its file and never printed. The private values
+# of the configuration go to the hygiene scanner's list of local values, a file outside the
+# repository that only you can read, and are never printed. Nothing is written
+# to the working tree, by the script or by the tools it starts: Python keeps no bytecode, and uv's
+# project environment and the CDK's output go to a temporary folder that is removed when the
+# script ends.
 #
 # With --dry-run no answer is read and neither AWS nor GitHub is called: `aws`, `gh` and `cdk` are
 # never started. The one command a dry run does run is the configuration loader, on the file
@@ -23,7 +29,10 @@ started_in="$PWD"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo_root"
 
-steps=(quotas domain apps configuration billing bootstrap connection repository roster)
+# The nine steps of section 8.6, in their order. `values` is the second half of the fourth: it
+# has a name of its own, to run alone, and the number 4b.
+steps=(quotas domain apps configuration values billing bootstrap connection repository roster)
+numbered=9
 
 usage() {
   cat <<EOF
@@ -34,7 +43,8 @@ usage: setup/owner-setup.sh [--dry-run] [--step <name>] [options]
   --max-instances <n>  quotas: the coursework pool's max_instances (asked for when not given)
   --upgrade-pool       quotas: the upgrade pool is wanted (96 more G-family vCPUs)
   --xl-pool            quotas: the xl pool is wanted (a P-family quota)
-  --config <file>      configuration: the owner's file, kept outside the working tree
+  --config <file>      configuration, values: the owner's file, kept outside the working tree
+  --reporter-key <file>  apps: the status reporter's private key file, kept outside the working tree
 EOF
 }
 
@@ -49,17 +59,19 @@ max_instances=""
 upgrade_pool=""
 xl_pool=""
 config_file=""
+reporter_key=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --upgrade-pool) upgrade_pool=1 ;;
     --xl-pool) xl_pool=1 ;;
-    --step | --max-instances | --config)
+    --step | --max-instances | --config | --reporter-key)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$1" in
         --step) only="$2" ;;
         --max-instances) max_instances="$2" ;;
         --config) config_file="$2" ;;
+        --reporter-key) reporter_key="$2" ;;
       esac
       shift
       ;;
@@ -95,7 +107,7 @@ say() {
 }
 
 heading() {   # heading <number> <title>
-  printf '\n== Step %s of %s: %s ==\n\n' "$1" "${#steps[@]}" "$2"
+  printf '\n== Step %s of %s: %s ==\n\n' "$1" "$numbered" "$2"
 }
 
 show() {   # print a command as a line a shell would read the same way
@@ -147,6 +159,28 @@ capture() {   # capture <variable> <command...>: as `run`, and keeps what the co
   fi
   into="$("$@")" || die "that command failed. Nothing after it was run."
   say "      $into"
+}
+
+outside_path() {   # outside_path <variable> <what the file is>: refuses a path in the working tree
+  # The variable holds the path as it was given and, afterwards, as an absolute path. Both the
+  # path as it was given and the file it leads to are checked: a link in the tree is in the tree.
+  # The file need not exist, and is not opened.
+  local -n the_path="$1"
+  local path
+  [[ $the_path == /* ]] || the_path="$started_in/$the_path"
+  for path in "$(realpath -m -s -- "$the_path")" "$(realpath -m -- "$the_path")"; do
+    case "$path/" in
+      "$repo_root"/*) die "refused: the $2 is inside the working tree. Keep it outside." ;;
+    esac
+  done
+}
+
+outside_file() {   # outside_file <variable> <what the file is>: as `outside_path`, for a file
+  # that exists. Afterwards the variable holds the file's real path.
+  local -n the_file="$1"
+  outside_path "$1" "$2"
+  [ -f "$the_file" ] || die "refused: the $2 is not a file that can be read."
+  the_file="$(realpath -- "$the_file")"
 }
 
 pause() {   # between the steps of the whole walkthrough, so that no step scrolls past unread
@@ -237,6 +271,79 @@ EOF
   pause
 }
 
+read_app() {   # read_app <variable for the App's ID> <the permissions of section 8.6, sorted>
+  # Reads one App back from GitHub and judges its permissions. The variable stays empty when the
+  # App was not read back. A dry run prints the command, with a placeholder for the slug.
+  local -n app_id_into="$1"
+  local expected="$2" slug="<slug>" found="" permissions="" counted=""
+  if [ "$dry_run" = 0 ]; then
+    printf '    Its slug (nothing, when the App is not registered yet): '
+    read -r slug || true
+    if [ -z "$slug" ]; then
+      say "      (not read back)"
+      return 0
+    fi
+    [[ $slug =~ ^[A-Za-z0-9-]+$ ]] || die "a slug holds letters, digits and hyphens only."
+  fi
+  # One line: the App's ID, then each permission as name=access, in the order of their names.
+  capture found gh api "apps/$slug" \
+    --jq '"\(.id) \(.permissions | to_entries | map("\(.key)=\(.value)") | sort | join(" "))"' || return 0
+  [ "$dry_run" = 0 ] || return 0
+  read -r app_id_into permissions <<<"$found" || true
+  [[ $app_id_into =~ ^[0-9]+$ ]] || die "GitHub's answer holds no App ID."
+  say "      The App's ID: $app_id_into"
+  say "      Its permissions: ${permissions:-none}"
+  # Metadata, read-only, is not a permission anyone chose when the App has another one.
+  counted=" $permissions "
+  [ -z "$expected" ] || counted="${counted/ metadata=read / }"
+  read -r counted <<<"$counted" || true
+  if [ "$counted" = "$expected" ]; then
+    say "      These are the permissions of section 8.6."
+  else
+    say "      These are NOT the permissions of section 8.6, which gives: ${expected:-none}."
+    say "      Correct them on the App's settings page (Permissions & events), then run this step again."
+  fi
+}
+
+store_reporter() {   # store_reporter <the reporter's App ID as read back, or nothing>
+  # The reporter's construct refers to this secret by its name and does not create it.
+  local secret="rhi/reporter/github-app"
+  local app_id="$1" installation="<installation id>" file="$reporter_key"
+  local tool=(env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_secret)
+  if [ "$dry_run" = 1 ]; then
+    app_id="<app id>"
+  elif [ -z "$app_id" ]; then
+    say "    The reporter was not read back, so its credentials are not stored."
+    return 0
+  else
+    printf "    The reporter's installation ID on this repository (nothing, when it is not installed yet): "
+    read -r installation || true
+    if [ -z "$installation" ]; then
+      say "      (not stored)"
+      return 0
+    fi
+    [[ $installation =~ ^[0-9]+$ ]] || die "an installation ID is a number."
+    if [ -z "$file" ]; then
+      printf "    The reporter's private key file, outside the working tree: "
+      read -r file || true
+      [ -n "$file" ] || die "no private key file was named."
+    fi
+  fi
+  if [ -z "$file" ]; then
+    say "    No --reporter-key was given: this dry run checks no file."
+    file="<private key file>"
+  else
+    outside_file file "private key file"
+  fi
+  [ "$dry_run" = 1 ] || outside_the_tree
+  say "    The secret $secret, created if it is absent. The key is read from its file, not printed."
+  if run "${tool[@]}" "$secret" --app-id "$app_id" --installation-id "$installation" \
+    --private-key-file "$file"; then
+    say "    To check: the secret's name, not its value."
+    run aws secretsmanager describe-secret --secret-id "$secret" --query Name --output text || true
+  fi
+}
+
 step_apps() {
   heading 3 "Create the three GitHub Apps"
   cat <<'EOF'
@@ -256,8 +363,7 @@ For each App: any name and homepage URL, Webhook not active, installable only on
 2. The status reporter
    Permissions: Commit statuses, read and write. Nothing else.
    Install it on "Only select repositories", with this repository alone.
-   Keep its private key outside every checkout. A later step of this walkthrough, which arrives
-   with the reporter, reads the App back and stores its credentials in the reporter's secret.
+   Keep its private key outside every checkout. This step stores it in the reporter's secret.
 
 3. The factory's identity (ADR 0001, amendment 2; docs/factory/green-light.md, step 7)
    Permissions: Contents, Pull requests and Issues, read and write; Commit statuses, Checks and
@@ -265,7 +371,34 @@ For each App: any name and homepage URL, Webhook not active, installable only on
    Install it on "Only select repositories", with this repository alone.
    Its private key stays on the factory's host, outside every checkout, readable by you alone.
    It never goes to AWS and never into the repository.
+
+Once an App is registered, this step reads it back from GitHub with your `gh` login, by its slug:
+the last part of the address of the App's settings page, https://github.com/settings/apps/<slug>.
+It prints the App's ID and its permissions as GitHub's API names them (`statuses` is Commit
+statuses, `write` is read and write), and says whether they are those of section 8.6. GitHub
+grants Metadata, read-only, by itself to an App that has a repository permission.
+
+What GitHub's answer does not hold, check on the App's own pages: that the device flow is on for
+the login App, and that the reporter and the factory's App are installed on this repository alone.
+
+For the status reporter the step then stores what the reporter posts a status with, in a Secrets
+Manager secret in the region of your credentials: the App's ID as it was read back, the
+installation ID and the private key. The installation ID is the number that ends the address of
+the installation's page (GitHub, Settings, Applications, Installed GitHub Apps, Configure):
+https://github.com/settings/installations/<installation id>. The key is read from its file,
+which stays where it is, and is never printed. Until it is stored, the reporter posts nothing.
 EOF
+  local login_id="" reporter_id="" factory_id=""
+  say ""
+  say "Reading back the student login App."
+  read_app login_id ""
+  say ""
+  say "Reading back the status reporter."
+  read_app reporter_id "statuses=write"
+  store_reporter "$reporter_id"
+  say ""
+  say "Reading back the factory's identity."
+  read_app factory_id "actions=read checks=read contents=write issues=write pull_requests=write statuses=read"
   pause
 }
 
@@ -287,6 +420,7 @@ EOF
     printf '\nThe configuration file, outside the working tree: '
     read -r file || true
     [ -n "$file" ] || die "no configuration file was named."
+    config_file="$file"   # the next step reads the same file
   fi
   say ""
   if [ -z "$file" ]; then
@@ -295,16 +429,7 @@ EOF
     show "${tool[@]}" check "$file"
     say "      (dry run: not run)"
   else
-    # Both the path as it was given and the file it leads to: a link in the tree is in the tree.
-    local path
-    [[ $file == /* ]] || file="$started_in/$file"
-    for path in "$(realpath -m -s -- "$file")" "$(realpath -m -- "$file")"; do
-      case "$path/" in
-        "$repo_root"/*) die "refused: the configuration file is inside the working tree. Keep it outside." ;;
-      esac
-    done
-    [ -f "$file" ] || die "refused: the configuration file is not a file that can be read."
-    file="$(realpath -- "$file")"
+    outside_file file "configuration file"
     outside_the_tree
     if [ "$dry_run" = 1 ]; then
       show "${tool[@]}" check "$file"
@@ -320,6 +445,69 @@ EOF
     say "    To check: the names of the parameters, not their values."
     run aws ssm get-parameters-by-path --path /rhi/config/ --recursive \
       --query 'Parameters[].Name' --output text || true
+  fi
+  pause
+}
+
+step_values() {
+  heading 4b "Write the list of real values the hygiene scanner checks for"
+  cat <<'EOF'
+No public pattern can name your domain or your address: writing the pattern would publish the
+value (system design, section 10). The hygiene scanner therefore also reads a list of real values
+that is kept outside the repository, and reports each of them as `local-value` in every scan on
+this machine: your hooks, your scripts/check.sh, the implement loop before each push
+(tools/hygiene/README.md, "Values only the owner knows").
+
+This step writes that list: the value of each private key of the configuration file of step 4
+(the domain, the hosted zone ID, the admin e-mail address, the instructor's phone number and the
+login app's client ID), and any further value you enter here, such as a student's name. A value
+is added once, however often the step runs, and none is printed.
+EOF
+  # Where the scanner looks: tools/hygiene/scan.py, `load_local_values`.
+  local home="${HOME:-}"
+  [ -n "$home" ] || home=~
+  local list="${HYGIENE_LOCAL_VALUES:-${XDG_CONFIG_HOME:-$home/.config}/research-harness-inference/hygiene-values}"
+  local file="$config_file" further="" value=""
+  local tool=(env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config)
+  outside_path list "list of local values"
+  say ""
+  if [ -n "${HYGIENE_LOCAL_VALUES:-}" ]; then
+    say "The list is the file HYGIENE_LOCAL_VALUES names. It is created if it is absent, for you alone:"
+  else
+    say "The list is the scanner's default file. It is created if it is absent, for you alone:"
+  fi
+  say "    $list"
+  if [ -z "$file" ] && [ "$dry_run" = 0 ]; then
+    printf '\nThe configuration file, outside the working tree: '
+    read -r file || true
+    [ -n "$file" ] || die "no configuration file was named."
+  fi
+  if [ -z "$file" ]; then
+    say "No --config was given: this dry run checks no file."
+    file="<your configuration file>"
+  else
+    outside_file file "configuration file"
+  fi
+  if [ "$dry_run" = 0 ]; then
+    say "Further values to check for, one per line. An empty line ends them:"
+    while read -r value && [ -n "$value" ]; do
+      further+="$value"$'\n'
+    done
+  fi
+  say ""
+  # The further values reach the module on its standard input: no command line holds one.
+  show "${tool[@]}" values "$file" --list "$list"
+  if [ "$dry_run" = 1 ]; then
+    say "      (dry run: not run, and no file is written)"
+  elif ! confirm "    Run it?"; then
+    say "      (not run)"
+  else
+    outside_the_tree
+    printf '%s' "$further" | "${tool[@]}" values "$file" --list "$list" ||
+      die "that command failed. Nothing after it was run."
+    say "    To check: write one of the values to a scratch file outside the working tree, and scan it."
+    say "    The scan must report it as local-value:"
+    show python3 tools/hygiene/scan.py --paths "<scratch file>"
   fi
   pause
 }

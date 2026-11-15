@@ -1,0 +1,127 @@
+#!/bin/bash
+# The boot program: at every start of an instance it fetches the pool's current release, checks
+# it and starts it (system design, "What happens on an instance"). rhi-boot.service runs it.
+#
+# The instance's tag rhi-release-parameter names the pool's release parameter. The tag and the
+# region come from the instance metadata, read with a session token. Everything else comes from
+# the parameter: the bucket, the key and the SHA-256 digest of the release's archive, the engine
+# image, and the settings, which every unit reads from /run/rhi/release.env. The archive holds
+# units/, collector/config.yaml and agent/.
+#
+# Nothing of the archive is unpacked, installed or started unless its bytes have the digest the
+# parameter names. Whatever fails, the program ends with a failure before it starts a unit.
+#
+# It runs before any container, on both machine images, so it uses only bash, coreutils, tar,
+# curl, the AWS CLI and the image's python3 with its standard library.
+#
+# RHI_BOOT_ROOT and RHI_BOOT_METADATA are for the tests, which run the program in a temporary
+# root against a stand-in for the instance metadata. The unit sets neither.
+
+set -euo pipefail
+
+root="${RHI_BOOT_ROOT:-}"
+metadata="${RHI_BOOT_METADATA:-http://169.254.169.254}"
+release="$root/opt/rhi/release"
+units="$root/run/systemd/system"
+settings="$root/run/rhi/release.env"
+
+fail() {
+  echo "rhi-boot: $1" >&2
+  exit 1
+}
+
+fetch() {   # fetch <curl arguments>: one answer of the instance metadata, which no proxy serves
+  curl --silent --show-error --fail --noproxy '*' --connect-timeout 2 --max-time 10 --retry 3 "$@"
+}
+
+# The release of an earlier start goes first: a start that fails leaves none behind. The work
+# folder is on the release's own volume, so the checked release moves into place in one step.
+mkdir -p "$root/opt/rhi"
+rm -rf "$release" "$root/opt/rhi"/boot.*
+work="$(mktemp -d "$root/opt/rhi/boot.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+token="$(fetch --request PUT --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$metadata/latest/api/token")" \
+  || fail "the instance metadata gives no session token"
+parameter="$(fetch --header "X-aws-ec2-metadata-token: $token" \
+  "$metadata/latest/meta-data/tags/instance/rhi-release-parameter")" \
+  || fail "the tag rhi-release-parameter cannot be read"
+region="$(fetch --header "X-aws-ec2-metadata-token: $token" "$metadata/latest/meta-data/placement/region")" \
+  || fail "the region cannot be read"
+
+aws ssm get-parameter --region "$region" --name "$parameter" --output json >"$work/parameter.json" \
+  || fail "the release parameter cannot be read"
+
+# The parameter's value is JSON (services/engine/lifecycle/rhi_lifecycle/release.py gives its
+# keys). This writes the settings, one NAME=value line each, and where the archive is.
+python3 -I - "$work" "$region" "$parameter" <<'PY' || fail "the release parameter does not hold a release"
+import json
+import os
+import sys
+
+work, region, parameter = sys.argv[1:]
+SETTINGS = (
+    "group", "launch_hook", "termination_hook", "log_group", "workspace_url", "heartbeat_table", "secret_id",
+)
+
+
+def text(value, name):
+    # A value is one line of release.env, so it is a string with no control character.
+    if not isinstance(value, str) or value == "" or not value.isprintable():
+        raise ValueError(name)
+    return value
+
+
+try:
+    with open(os.path.join(work, "parameter.json"), encoding="utf-8") as stream:
+        release = json.loads(json.load(stream)["Parameter"]["Value"])
+    files, settings = release["files"], release["settings"]
+    variables = [
+        ("RHI_POOL", text(settings["pool"], "settings.pool")),
+        ("RHI_REGION", text(region, "the region")),
+        ("RHI_RELEASE_PARAMETER", text(parameter, "the tag")),
+        ("RHI_ENGINE_IMAGE", text(release["engine_image"], "engine_image")),
+    ]
+    variables += [("RHI_" + name.upper(), text(settings[name], "settings." + name)) for name in SETTINGS]
+    measured = release.get("measured_start_seconds")
+    if measured is not None:
+        if isinstance(measured, bool) or not isinstance(measured, int) or measured < 1:
+            raise ValueError("measured_start_seconds")
+        variables.append(("RHI_MEASURED_START", str(measured)))
+    archive = [text(files[name], "files." + name) for name in ("bucket", "key", "sha256")]
+except (KeyError, TypeError, ValueError) as error:
+    # The message names a key or a place in the text, never a value.
+    sys.exit("rhi-boot: " + type(error).__name__ + ": " + str(error))
+
+with open(os.path.join(work, "release.env"), "w", encoding="utf-8") as stream:
+    stream.writelines(name + "=" + value + "\n" for name, value in variables)
+with open(os.path.join(work, "archive"), "w", encoding="utf-8") as stream:
+    stream.writelines(line + "\n" for line in archive)
+PY
+mapfile -t archive <"$work/archive"
+
+aws s3 cp --region "$region" --only-show-errors "s3://${archive[0]}/${archive[1]}" "$work/release.tar" \
+  || fail "the release's archive cannot be fetched"
+
+# The digest is that of the archive's bytes, as they were fetched: nothing is unpacked before.
+digest="$(sha256sum <"$work/release.tar")"
+[ "${digest%% *}" = "${archive[2]}" ] || fail "the archive does not have the digest the release parameter names"
+
+mkdir "$work/release"
+tar --extract --file "$work/release.tar" --directory "$work/release" --no-same-owner \
+  || fail "the release's archive cannot be unpacked"
+[ -d "$work/release/units" ] || fail "the release's archive holds no folder units"
+
+mv "$work/release" "$release"
+mkdir -p "$units" "${settings%/*}"
+install -m 0644 "$work/release.env" "$settings"
+# The unit files at the top of units/; a subfolder is left to the issue that adds it.
+for unit in "$release/units"/*; do
+  if [ -f "$unit" ]; then
+    install -m 0644 "$unit" "$units/"
+  fi
+done
+
+systemctl daemon-reload
+# Without waiting for them: a unit ordered after this one would otherwise never start.
+systemctl start --no-block rhi-collector.service rhi-lifecycle.service

@@ -214,6 +214,8 @@ CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item 
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+# One more item id of the list a criterion leads with, after `,`, `;`, `/`, `&`, `+` or `and`.
+CRITERION_NEXT = re.compile(r"\s*(?:(?:[,;/&+]|and\b)\s*)*([A-Za-z]+\d+)\b")
 
 
 class CommittedFile(Path):
@@ -777,6 +779,16 @@ class Engine:
     def _behavioural_items(self, st: IssueState) -> set[str]:
         """Items proven by a durable test: each gets at least one independent probe."""
         return {i["id"] for i in self._items(st) if i["proof"] == "test"}
+
+    def _probed(self, st: IssueState) -> set[str]:
+        """What the examiner's adopted probes cover: every plan item a probe's criterion names
+        (`criterion_items`: one file may prove several), and each criterion as it was written."""
+        items = {i["id"] for i in self._items(st)}
+        covered: set[str] = set()
+        for c in st.commands:
+            if c.get("author") == "examiner":
+                covered |= {c["criterion"]} | criterion_items(c["criterion"], items)
+        return covered
 
     def _agent_part_items(self, st: IssueState) -> set[str]:
         """Owner items whose agent part must still be proven (by a command or a verdict)."""
@@ -1729,7 +1741,8 @@ class Engine:
         self.store.put(st)
         if others:
             with self.ws.disposable(wt) as scratch:
-                decisions = self.agents.decide(self.other, self._req(n), scratch, others)
+                shown = [self._shown_request(scratch, r) for r in others]
+                decisions = self.agents.decide(self.other, self._req(n), scratch, shown)
             by_id = {d.request: d for d in decisions}
             for r in others:
                 d = by_id.get(r["id"])
@@ -1754,8 +1767,37 @@ class Engine:
             else:
                 r["status"], r["reason"] = "ruled_for", f"the arbiter ruled the item does not require it: {ruling.reason}"
                 f["status"], f["blocking"], f["reason"] = "closed", False, f"ruled out by the arbiter: {ruling.reason}"
+                f.pop(VERIFIER_RUN, None)
         self.store.put(st)
         self.store.event("requests_decided", issue=n, decided={r["id"]: r["status"] for r in pending})
+
+    def _shown_request(self, scratch: Path, r: dict) -> dict:
+        """A request as its decider gets it. The builder's edit to a locked test is reverted before
+        the decision, so the decider's throwaway copy would hold the locked version, and the proposed
+        file would reach it only as text inside the requests, which an adapter may cut to fit its
+        prompt: #42's examiner was given a replacement that stopped mid-function, and none of the
+        requests listed after it, five builds in a row. So the proposal is put in that copy, where
+        the decider reads and runs it, and the request names its files without their text. The
+        stored request keeps the text, for `_apply_request`."""
+        if r["kind"] != "test_change":
+            return r
+        placed = self._write_proposal(scratch, r)
+        return {k: v for k, v in r.items() if k != "content"} | {
+            "proposed": {p: "deleted" if text is None else "replaced" for p, text in placed.items()}}
+
+    def _write_proposal(self, root: Path, r: dict) -> dict[str, str | None]:
+        """Put the files a `test_change` request proposes in `root` (None: the file is deleted).
+        Returns what was put there: never a path outside `root`, nor the safety surface in a
+        fault-repair run."""
+        content = {p: c for p, c in (r.get("content") or {}).items()
+                   if self._inside(root, p) and (not self.repair or not is_safety_surface(p))}
+        for p, text in content.items():
+            target = root / p
+            if target.is_symlink() or text is None:
+                target.unlink(missing_ok=True)   # replace a link itself, never write through it
+            if text is not None:
+                self._replace_file(target, text)
+        return content
 
     def _engine_refusal(self, st: IssueState, r: dict) -> str | None:
         paths = r.get("paths") or []
@@ -1796,14 +1838,7 @@ class Engine:
         elif kind == "depends":
             self._depend(n, st, r.get("item") or "", int(r["depends_on"]), r.get("depends_quote") or "")
         elif kind == "test_change":
-            content = {p: c for p, c in (r.get("content") or {}).items()
-                       if self._inside(wt, p) and (not self.repair or not is_safety_surface(p))}
-            for p, text in content.items():
-                target = wt / p
-                if target.is_symlink() or text is None:
-                    target.unlink(missing_ok=True)   # replace a link itself, never write through it
-                if text is not None:
-                    self._replace_file(target, text)
+            content = self._write_proposal(wt, r)
             removed = [p for p, t in content.items() if t is None]
             sha = self.ws.commit_all(wt, f"Change locked tests for #{n} (approved {r['id']})", "acceptance-checks", n,
                                      unlocks=removed or None,
@@ -1832,9 +1867,16 @@ class Engine:
             if f.get("status") == "open":
                 where = f"item {f['item']} (\"{f.get('quote')}\")" if f.get("item") else f"invariant: {f.get('invariant')}"
                 repro = f.get("reproduction") or (f"bash {f['probe']}" if f.get("probe") else "")
+                # What the engine's own run of the reproduction printed: #32's builder was told ten
+                # times that a finding "still reproduces" and answered nine times that the command
+                # passed in its worktree. It fails where the verifier runs it, and only this shows why.
+                ran = f.get(VERIFIER_RUN)
+                said = (f" The verifier ran that reproduction on a copy of `{str(ran.get('head_sha'))[:12]}`, in its own "
+                        f"environment, which is where it has to pass, whatever it does in your worktree: "
+                        f"{run_said(ran)}") if ran else ""
                 out.append(f"Open finding {f['id']} on {where}: {f['title']}. Observed: {f['observed']}. "
                            f"Expected: {f['expected']}. Reproduce: {repro}. It closes when that passes, or dispute it "
-                           f"with a `dispute` request if the item as written does not require it.")
+                           f"with a `dispute` request if the item as written does not require it.{said}")
         for i, v in st.verdicts.items():
             if v.get("verdict") == "unmet":
                 out.append(f"The examiner judges {i} unmet (\"{v.get('quote')}\"): {v.get('note', '')[:400]}")
@@ -2040,12 +2082,17 @@ class Engine:
         env = environment_problem(evidence)
         if env:
             return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}", resume=Phase.VERIFY)
-        self._round_failed(n, problems, [f["id"] for f in still], notes=notes)
+        # The feedback here is what the build left for its builder: the decisions on its requests
+        # (and the notes above). A failed verification used to replace it, so #32's builder never
+        # learnt that its restated commands were refused, nor why, and restated them nine times.
+        self._round_failed(n, problems, [f["id"] for f in still], notes=notes,
+                           told=[f for f in st.feedback if f not in notes] + failed_output(evidence))
 
     def _close_findings(self, n: int, st: IssueState, wt: Path, evidence: list[dict]) -> list[str]:
         """An open finding closes only when its reproduction passes on the new head (a probe-based
         one when its probe passes)."""
         closed = []
+        kept = False
         passed_probe = {c["command"] for c in st.commands if c.get("author") == "examiner"} & {
             e["command"] for e in evidence if e.get("passed")}
         for f in st.findings:
@@ -2059,17 +2106,26 @@ class Engine:
                     closed.append(f["id"])
                 continue
             if f.get("reproduction"):
-                still = self._reproduces(wt, f.get("reproduction"), f.get("cwd") or ".", None)
-                if still is False:
+                ran = self._reproduction(wt, f.get("reproduction"), f.get("cwd") or ".", None)
+                if run_verdict(ran) is False:
                     f["status"], f["reason"] = "closed", "its reproduction passes"
+                    f.pop(VERIFIER_RUN, None)
                     closed.append(f["id"])
-        if closed:
+                elif ran is not None:   # still open: the builder is given this run with the finding
+                    f[VERIFIER_RUN] = run_record(ran)
+                    kept = True
+        if closed or kept:
             self.store.put(st)
         return closed
 
     def _reproduces(self, wt: Path, command: str | None, cwd: str, probe: tuple[str, str] | None) -> bool | None:
         """Run a reproduction (and an optional probe file) in a throwaway copy of the head: True
         when it fails (the finding holds), False when it passes, None when it cannot run."""
+        return run_verdict(self._reproduction(wt, command, cwd, probe))
+
+    def _reproduction(self, wt: Path, command: str | None, cwd: str, probe: tuple[str, str] | None) -> Evidence | None:
+        """The verifier's run of a reproduction (and an optional probe file) in a throwaway copy of
+        the head, or None when there is nothing to run or the probe's path is refused."""
         if not command:
             return None
         if probe and not self._inside(Path("/nonexistent-root"), probe[0]):
@@ -2086,9 +2142,7 @@ class Engine:
             spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
             ev, _ = verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
                                      self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
-        if ev.exit_code is None and "timed out" not in (ev.output_tail or ""):
-            return None
-        return not ev.passed
+        return ev
 
     @staticmethod
     def _replace_file(target: Path, text: str) -> None:
@@ -2116,10 +2170,16 @@ class Engine:
             return False
 
     def _round_failed(self, n: int, problems: list[str], open_ids: list[str] | None = None,
-                      unmet: list[str] | None = None, notes: list[str] | None = None) -> None:
+                      unmet: list[str] | None = None, notes: list[str] | None = None,
+                      told: list[str] | None = None) -> None:
         """The progress rule: a round is productive when what fails changes. Two unproductive
         rounds bring a replan on the branch, two more end the issue `failed`. Notes reach the
-        builder but are not failures, so they stay out of the signature."""
+        builder but are not failures, so they stay out of the signature.
+
+        `told` is what the next call is given after the failures: the decisions on the last
+        build's requests, and what the verifier's failed runs printed. It is feedback and nothing
+        else: a command's output changes from run to run and is nobody's to publish, so it is
+        in no signature, no event of the round and no failure's detail."""
         st = self.store.issue(n)
         sig = gate.signature(problems, open_ids or [], unmet or [])
         st.unproductive = st.unproductive + 1 if sig == st.signature else 0
@@ -2136,8 +2196,8 @@ class Engine:
             return self._set_phase(n, Phase.PLAN, feedback=[
                 "Two rounds changed nothing. Replan on your branch: the same failure keeps coming back. "
                 "Keep what works; change the approach, the zones or the proof kinds (classification changes go through "
-                "a request). The failures were: " + "; ".join(problems)[:1500]])
-        self._set_phase(n, Phase.BUILD, feedback=problems)
+                "a request). The failures were: " + "; ".join(problems)[:1500]] + list(told or []))
+        self._set_phase(n, Phase.BUILD, feedback=problems + [t for t in told or [] if t not in problems])
 
     # ------------------------------------------------------------------ examine
     def _step_examine(self, n: int) -> None:
@@ -2176,6 +2236,7 @@ class Engine:
                 continue
             probe_results[p.file] = self._reproduces(wt, p.command, p.cwd, (p.file, p.content)) is False
         new: list[Finding] = []
+        runs: dict[str, dict] = {}   # the engine's run of a finding's own reproduction, when it failed
         for i, f in enumerate(res.findings):
             f.id = f"E{n}-{rnd}-{i + 1}"
             f.round = rnd
@@ -2185,20 +2246,35 @@ class Engine:
             if probe and probe.file in probe_results:
                 reproduced = not probe_results[probe.file]
             else:
-                reproduced = self._reproduces(wt, f.reproduction, f.cwd or ".", None)
+                ran = self._reproduction(wt, f.reproduction, f.cwd or ".", None)
+                reproduced = run_verdict(ran)
+                if ran is not None and reproduced:
+                    runs[f.id] = run_record(ran)
             new.append(gate.classify(f, item_text, self.invariants, reproduced, self._agent_items(st),
                                      self._owner_items(st), {i["id"]: i.get("agent_part") or "" for i in self._items(st)}))
-        accepted, unmet, missing = gate.review_verdicts(res.verdicts, item_text, self._verdict_items(st))
+        # An owner item is judged on its agent part alone, like a finding on one (`gate.classify`):
+        # the words an `unmet` must quote are that part's. One that quotes anything else is about
+        # what the owner still owes, which is an obligation and nothing the builder can change (#20
+        # was sent back four times for one). It is no verdict: the examiner still owes one, and is
+        # asked again below.
+        parts = {i["id"]: i.get("agent_part") or "" for i in self._items(st) if i["id"] in self._agent_part_items(st)}
+        accepted, unmet, missing = gate.review_verdicts(res.verdicts, {**item_text, **parts}, self._verdict_items(st))
+        misjudged = sorted(i for i in missing if i in parts
+                           and any(v.get("item") == i and v.get("verdict") == "unmet" for v in res.verdicts))
         for i, v in accepted.items():
             st.verdicts[i] = {**v, "head": head}
-        st.findings += [asdict(f) for f in new]
+        st.findings += [asdict(f) | ({VERIFIER_RUN: runs[f.id]} if f.status == "open" and f.id in runs else {})
+                        for f in new]
         # A follow-up examination adopts only probes that reproduce a blocking finding, or that cover
         # an item still without one, so certification converges.
-        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
+        # A probe covers every plan item its criterion names, so one file may prove several.
+        covered = self._probed(st)
+        ids = {i["id"] for i in self._items(st)}
         # A probe the lint refused is not written to the worktree either, whatever finding names it.
         adopt = [p for p in candidates if p.file not in unclean and (
             any(f.blocking and f.probe == p.file for f in new)
-            or (probe_results.get(p.file) is True and (since is None or p.criterion not in covered)))]
+            or (probe_results.get(p.file) is True
+                and (since is None or (criterion_items(p.criterion, ids) or {p.criterion}) - covered)))]
         first = st.examined_sha is None
         st.examined_sha = head
         self.store.put(st)
@@ -2209,7 +2285,7 @@ class Engine:
                                                      and f.get("round") != rnd]
         self.store.event("examined", issue=n, head=head, findings={f.id: f.status for f in new},
                          unmet=unmet, missing=missing, certify=res.certify, adopted=[p.file for p in adopt],
-                         rejected=rejected)
+                         rejected=rejected, **({"owner_evidence": misjudged} if misjudged else {}))
         problems = []
         if unmet:
             problems += [f"{i} judged unmet by the examiner" for i in unmet]
@@ -2226,9 +2302,10 @@ class Engine:
         # What the examiner still owes (a verdict, an independent probe) is asked of it again, at
         # most twice; it is not the builder's failure.
         st = self.store.issue(n)
-        covered = {c["criterion"] for c in st.commands if c.get("author") == "examiner"}
-        unprobed = sorted(self._behavioural_items(st) - covered)
+        unprobed = sorted(self._behavioural_items(st) - self._probed(st))
         owed = ([f"give a verdict on {', '.join(missing)}"] if missing else []) + (
+            [f"judge {i} on its agent part alone (\"{parts[i][:300]}\"): `met` when that part is delivered on this "
+             f"commit, whatever the owner still owes; `unmet` only with a quote of that part" for i in misjudged]) + (
             [f"write an independent probe for {', '.join(unprobed)}"] if unprobed else [])
         if owed and st.exam_retries < 2:
             self.store.event("examination_incomplete", issue=n, missing=missing, unprobed=unprobed, retry=st.exam_retries + 1)
@@ -3399,6 +3476,18 @@ def conflict_feedback(files: list[str], locked: list[str]) -> str:
     return text + " Do not run git merge, commit or abort: the engine concludes the merge."
 
 
+def criterion_items(criterion: str | None, items: set[str]) -> set[str]:
+    """The plan items a probe proves: the list of item ids its criterion leads with ("D1, D2, A1;
+    A3 agent portion" names the four; "D1: as D2 does" names D1). An id the plan does not have
+    names nothing."""
+    named: set[str] = set()
+    m = CRITERION_LEAD.match(criterion or "")
+    while m:
+        named.add(m.group(1))
+        m = CRITERION_NEXT.match(criterion or "", m.end())
+    return named & items
+
+
 def criterion_item(criterion: str | None, items: set[str]) -> str | None:
     """The plan item a command proves: its criterion, or the item id it leads with ("D2, D3: the
     probes" proves D2). None when it names no item."""
@@ -3419,6 +3508,55 @@ def _names_probe(command: dict, probe: str) -> bool:
         if path and posixpath.normpath(posixpath.join(cwd, path)) == target:
             return True
     return False
+
+
+VERIFIER_RUN = "verifier_run"   # on an open finding: the engine's last run of its reproduction (`run_record`)
+RUN_OUTPUT = 1500               # the characters of a run's output a builder is given, as for a standing check
+FAILED_RUNS = 4                 # the failed commands of one verification whose output a builder is given
+
+
+def run_verdict(ran: Evidence | None) -> bool | None:
+    """What a run of a reproduction says of its finding: True when it failed (the finding holds),
+    False when it passed, None when there was no run or it could not start."""
+    if ran is None or (ran.exit_code is None and "timed out" not in (ran.output_tail or "")):
+        return None
+    return not ran.passed
+
+
+def run_record(ran: Evidence) -> dict:
+    """What is kept of a verifier's run for the builder: where it ran, how it ended, and the end
+    of what it printed."""
+    return {"head_sha": ran.head_sha, "exit_code": ran.exit_code, "note": ran.note,
+            "output_tail": (ran.output_tail or "")[-RUN_OUTPUT:]}
+
+
+def run_said(ran: Mapping) -> str:
+    """How a run ended and what it printed last, from its evidence record or its `run_record`."""
+    ended = ran.get("note") or f"exit {ran.get('exit_code')}"
+    printed = (ran.get("output_tail") or "")[-RUN_OUTPUT:].strip()
+    return f"it ended with {ended}" + (f", and its output ends with:\n{printed}" if printed else ", and printed nothing")
+
+
+def failed_output(evidence: list[dict]) -> list[str]:
+    """For the builder: what each command that failed a verification printed where the verifier
+    ran it. The verifier's problem is `<item> failed: exit 1` and no more, and a command that
+    passes in the builder's worktree gives it nothing to act on (#32: three such rounds). A
+    command that proves several items is given once, with the items. A standing check is left
+    out: its problem carries its output already."""
+    failed: dict[tuple[str, str], dict] = {}
+    items: dict[tuple[str, str], list[str]] = {}
+    for e in evidence:
+        if e.get("passed") or not e.get("command") or str(e.get("criterion") or "").startswith(verify.STANDING):
+            continue
+        run = (e["command"], e.get("cwd") or ".")
+        failed.setdefault(run, e)
+        items.setdefault(run, []).append(str(e.get("criterion")))
+    out = [(f"The verifier's run of `{command}` for {', '.join(items[command, cwd])}, in `{cwd}` of a copy of "
+            f"`{str(e.get('head_sha'))[:12]}` and in its own environment, is the one that counts: {run_said(e)}")
+           for (command, cwd), e in list(failed.items())[:FAILED_RUNS]]
+    if len(failed) > FAILED_RUNS:
+        out.append(f"{len(failed) - FAILED_RUNS} more commands failed; their output is not repeated here.")
+    return out
 
 
 def history_findings(evidence: list[dict]) -> list[str]:

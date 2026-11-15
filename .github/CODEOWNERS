@@ -1,0 +1,22 @@
+# The owner reviews a change to the trust boundary, and nothing else (system design, section 8.4,
+# control 5; ADR 0001, amendment 3). The paths are the protected prefixes and files of the engine,
+# PROTECTED_PREFIXES and PROTECTED_FILES in tools/implementation-loop/implement_loop/config.py, and
+# no other: tests/policy/test_codeowners.py holds this file to those two lists. The ruleset,
+# setup/pr-only-main.json, is what makes the review required.
+
+/tools/implementation-loop/ @GuilhemBusset
+/tools/hygiene/ @GuilhemBusset
+/.github/ @GuilhemBusset
+/.githooks/ @GuilhemBusset
+/tests/policy/ @GuilhemBusset
+/.claude/ @GuilhemBusset
+/.agents/ @GuilhemBusset
+/.codex/ @GuilhemBusset
+/src/rhi/pipeline/ @GuilhemBusset
+/setup/bootstrap/ @GuilhemBusset
+
+/scripts/check.sh @GuilhemBusset
+/scripts/check-loop-guard.sh @GuilhemBusset
+/scripts/implement.sh @GuilhemBusset
+/scripts/ship.sh @GuilhemBusset
+/setup/pr-only-main.json @GuilhemBusset
