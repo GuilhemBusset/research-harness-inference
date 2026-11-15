@@ -15,8 +15,8 @@ it.
 
 **The configuration in SSM.** One String parameter per key, named `SSM_PREFIX` followed by the
 key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the entry: an
-empty table has none. A string is stored as it is, a number in digits, a date as YYYY-MM-DD and
-an empty list as `[]`. The prefix holds the configuration and nothing else. The source reads the
+empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
+`false` (`True` and `False` are read too), a date as YYYY-MM-DD and an empty list as `[]`. The prefix holds the configuration and nothing else. The source reads the
 prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
 no key, like an unknown key. No value is a credential (system design, section 10), so none is a
 SecureString. The module names no region and no account.
@@ -87,6 +87,10 @@ class Config:
     session_windows: tuple[()]
     # One entry per pool.
     pools: tuple[()]
+    # Whether the public load balancer has its certificate, its HTTPS listener and the domain's
+    # alias record. Off until the owner's domain resolves through the hosted zone: before that,
+    # the certificate's DNS validation never completes and the deployment fails.
+    https_listener: bool
 
 
 def _as_stored(text: str) -> object:
@@ -135,6 +139,12 @@ def _time_zone(value: object) -> str:
     return value
 
 
+def _boolean(value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError
+    return value
+
+
 def _no_entries(value: object) -> tuple[()]:
     # Entries get their shape, and their parser, in the issue that introduces them. Until then
     # an entry is refused, so that no source holds one a later, stricter parser could refuse.
@@ -155,6 +165,11 @@ def _date_from_text(text: str) -> object:
         return datetime.date.fromisoformat(text)
     except ValueError:
         return text
+
+
+def _boolean_from_text(text: str) -> object:
+    # TOML's spelling, which the writer uses, or Python's.
+    return {"true": True, "True": True, "false": False, "False": False}.get(text, text)
 
 
 def _list_from_text(text: str) -> object:
@@ -178,13 +193,18 @@ KEYS: dict[str, Key] = {
     "course_end": Key("a date, written YYYY-MM-DD without quotes", _date, _date_from_text),
     "session_windows": _EMPTY_LIST,
     "pools": _EMPTY_LIST,
+    "https_listener": Key("true or false, without quotes", _boolean, _boolean_from_text),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
 # default the design states for that setting (most are in section 17) or, where the design gives
 # none, the one the issue that added the key chose and stated. It is checked like a value from a
 # source. The owner's keys have no entry.
-DEFAULTS: dict[str, object] = {}
+DEFAULTS: dict[str, object] = {
+    # The design gives no such key (issue E2-47): off keeps a deployed stage as it was, with no
+    # certificate waiting on a domain that does not resolve yet.
+    "https_listener": False,
+}
 
 # Keys a source may leave out without a default: the field is then None.
 OPTIONAL: frozenset[str] = frozenset()
@@ -322,6 +342,8 @@ def _ssm_text(value: object) -> str:
     if isinstance(value, str):
         value.encode()  # a string that is not text is a ValueError here, not in the middle of the writing
         return value
+    if type(value) is bool:
+        return "true" if value else "false"
     if type(value) is int:
         return str(value)
     if type(value) is datetime.date:

@@ -164,6 +164,9 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("course_end", f"{MARK}-01-01T10:00:00"),
         ("session_windows", f'"{MARK}"'),
         ("pools", f'"{MARK}"'),
+        ("https_listener", f'"{MARK}"'),
+        ("https_listener", '"true"'),
+        ("https_listener", "1"),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -191,6 +194,15 @@ def test_a_default_fills_a_missing_key(tmp_path: Path, monkeypatch: pytest.Monke
     assert MARK not in message
 
 
+def test_https_listener_reads_false_when_left_out(tmp_path: Path) -> None:
+    # The owner's configuration leaves the key out until the domain resolves (issue E2-47).
+    assert config.DEFAULTS["https_listener"] is False
+    assert load_text(tmp_path, example_with(https_listener=None)).https_listener is False
+    # The example turns the listener on, so that synthesis sees it.
+    assert config.load({"RHI_CONFIG": "example"}).https_listener is True
+    assert load_text(tmp_path, example_with(https_listener="false")).https_listener is False
+
+
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     later = dataclasses.make_dataclass("Later", [("later_key", str | None)], bases=(config.Config,), frozen=True)
     monkeypatch.setattr(config, "Config", later)
@@ -202,12 +214,18 @@ def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.Mon
     assert getattr(load_text(tmp_path, example_with()), "later_key", "unset") is None
 
 
+# Keys the example sets away from their default on purpose: the listener is off by default and on
+# in the example, so that every synthesis and policy test sees it (issue E2-47).
+NOT_THE_DEFAULT_IN_THE_EXAMPLE = {"https_listener": True}
+
+
 def example_problems(text: str) -> list[str]:
     """What is wrong with this text as the example configuration."""
     data = tomllib.loads(text)
     problems = [f"missing key: {key}" for key in sorted(set(config.KEYS) - set(data))]
     problems += [f"unknown key: {key}" for key in sorted(set(data) - set(config.KEYS))]
-    problems += [f"not the default: {key}" for key, value in config.DEFAULTS.items() if key in data and data[key] != value]
+    expected = config.DEFAULTS | NOT_THE_DEFAULT_IN_THE_EXAMPLE
+    problems += [f"not the default: {key}" for key, value in expected.items() if key in data and data[key] != value]
     hosts = [str(data.get("domain", "example.com")), *(host.rstrip(".") for host in re.findall(r"@([\w.-]+)", text))]
     problems += [
         f"outside example.com: {host}" for host in hosts if host != "example.com" and not host.endswith(".example.com")
