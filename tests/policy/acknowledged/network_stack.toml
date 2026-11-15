@@ -1,0 +1,4 @@
+[wildcard_actions]
+"logs:CreateLogGroup" = "The CDK's provider that strips the VPC's default security group of its rules runs as a role with the AWS managed policy AWSLambdaBasicExecutionRole, which grants this action on every resource so that the function can create its own log group; the function's name is generated at deployment and its role exists before it, so the role cannot name that log group."
+"logs:CreateLogStream" = "The same provider role's AWSLambdaBasicExecutionRole grants this action on every resource so that the function can open a stream in its own log group, whose name is generated at deployment after the role exists."
+"logs:PutLogEvents" = "The same provider role's AWSLambdaBasicExecutionRole grants this action on every resource so that the function can write its log events to its own log group, whose name is generated at deployment after the role exists."
