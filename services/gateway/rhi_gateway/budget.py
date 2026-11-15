@@ -25,9 +25,21 @@ reads the tokens a student has left of the day (`tokens_left`), and that writes 
 **The record** is the usage item of `rhi_common.students`, one per student and UTC day: `tokens`
 holds what was charged and what is reserved, `leases` the requests in flight. A request belongs
 to the day it started: its lease stays in that day's item, and its settlement goes there even
-after midnight. The limit is therefore counted per day, and a request still running at midnight
-holds no slot of the new day. The item expires 90 days after the key's course end, the retention
-of every store (section 6.6).
+after midnight. The item expires 90 days after the key's course end, the retention of every store
+(section 6.6).
+
+**Midnight.** The budget is the day's and starts again at midnight UTC; the concurrency limit is
+the student's and does not. So the first reservation of a day reads the item of the day before
+and writes the new day's item with a stand-in for each lease still live there: a lease under the
+day and the request's ID (`2026-11-15/<request>`) that reserves no tokens and expires when the
+request's own lease does. The reservation's condition counts it like any lease, so a request
+still running at midnight keeps its slot in the new day, at no extra call for the requests that
+follow. Its settlement is still one write, to the item of its own day, which leaves the stand-in
+behind: a reservation that stand-ins refuse reads the day before again and removes, in its own
+single write, those whose request has ended. No request of a day is admitted once the day is
+over, so the leases of the day before can only go, and a stand-in is never missing. That rests
+on the clocks of the gateway's tasks agreeing on the day: a reservation written to the old day
+by a task whose clock is behind, after another task has read that day, has no stand-in.
 
 **The input estimate** is computed from the request body alone, before any call to the engine: a
 token for every four bytes, rounded up. The design gives no rule. Four bytes a token is the usual
@@ -42,7 +54,8 @@ reader and writer of the record:
 
 - the read counts it so;
 - a reservation that the record as written would refuse removes the expired leases, each charged
-  its estimate, in its own single write, and is admitted if that makes room;
+  its estimate, in its own single write, and is admitted if that makes room; an expired stand-in
+  goes the same way, and gives back no tokens, having reserved none;
 - a settlement that comes after the expiry removes the lease and charges the estimate.
 
 An expired lease can thus stay in the item until one of these writes removes it, and it never
@@ -60,10 +73,12 @@ That is not built here.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from typing import Any, Protocol
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
@@ -81,6 +96,8 @@ USAGE_RETENTION_SECONDS = 90 * 86_400
 
 # How many times the DynamoDB ledger sends a reservation whose record changed under it.
 _ATTEMPTS = 10
+# What the name of a stand-in begins with: the day of the request it stands for.
+_STAND_IN = re.compile(r"\d{4}-\d{2}-\d{2}/", re.ASCII)
 
 
 def estimate_input_tokens(body: bytes) -> int:
@@ -121,7 +138,8 @@ class Ledger(Protocol):
         """Reserve the estimate of `body` plus `output_limit`, and a slot, or raise the refusal.
 
         `request_id` is the gateway's own ID for the request, `hold_seconds` the pool's, and
-        `longest_request_seconds` the gateway's setting.
+        `longest_request_seconds` the gateway's setting. An ID that is empty, that holds a
+        reservation already, or that reads as a stand-in (a date, then `/`) is a `ValueError`.
         """
         ...
 
@@ -145,13 +163,26 @@ class Ledger(Protocol):
 # What both ledgers decide with: what a reservation, a settlement and a read do to a day.
 
 
-def _new_day(student: StudentKey, day: str) -> UsageDay:
+def _day_before(day: str) -> str:
+    return (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+
+
+def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
+    return {} if day is None else {request: lease for request, lease in day.leases.items() if lease.expires > now}
+
+
+def _new_day(student: StudentKey, day: str, before: UsageDay | None, now: int) -> UsageDay:
+    """A day as its first reservation finds it: no tokens, and a stand-in for each live lease of `before`."""
     return UsageDay(
         github_id=student.github_id,
         day=day,
         alias=student.alias,
         tokens=0,
         expires_at=student.expires_at + USAGE_RETENTION_SECONDS,
+        leases={
+            f"{_day_before(day)}/{request}": Lease(tokens=0, estimate=0, expires=lease.expires)
+            for request, lease in _live(before, now).items()
+        },
     )
 
 
@@ -186,22 +217,46 @@ def _refusal(day: UsageDay, student: StudentKey, amount: int) -> Cause | None:
     return None
 
 
-def _to_remove(day: UsageDay, student: StudentKey, request_id: str, lease: Lease, now: int) -> dict[str, Lease]:
-    """The expired leases a reservation removes to be admitted to this day; raises the refusal.
+def _ended(day: UsageDay, before: Callable[[], UsageDay | None], now: int) -> dict[str, Lease]:
+    """The stand-ins of this day, not yet expired, whose request holds no live lease in the day before.
 
-    None when the day as written admits it. All of them when only that makes room.
+    `before` reads the item of the day before, and is called only if the day holds such a stand-in.
     """
-    if not request_id:
-        raise ValueError("a reservation needs the request's ID")
+    prefix = _day_before(day.day) + "/"
+    stand_ins = {name: lease for name, lease in _live(day, now).items() if name.startswith(prefix)}
+    if not stand_ins:
+        return {}
+    live = _live(before(), now)
+    return {name: lease for name, lease in stand_ins.items() if name.removeprefix(prefix) not in live}
+
+
+def _to_remove(
+    day: UsageDay,
+    student: StudentKey,
+    request_id: str,
+    lease: Lease,
+    now: int,
+    before: Callable[[], UsageDay | None],
+) -> dict[str, Lease]:
+    """The leases a reservation removes to be admitted to this day; raises the refusal.
+
+    None when the day as written admits it. The expired ones when only that makes room, and with
+    them the stand-ins of requests that have ended when only that gives a slot.
+    """
+    if not request_id or _STAND_IN.match(request_id):
+        raise ValueError("a reservation needs the request's ID, and one that is not a stand-in's")
     if request_id in day.leases:
         raise ValueError("this request holds a reservation already")
     if _refusal(day, student, lease.tokens) is None:
         return {}
-    expired = _expired(day, now)
-    cause = _refusal(_without(day, expired), student, lease.tokens)
+    gone = _expired(day, now)
+    cause = _refusal(_without(day, gone), student, lease.tokens)
+    if cause is Cause.CONCURRENCY_LIMIT:
+        gone |= _ended(day, before, now)
+        cause = _refusal(_without(day, gone), student, lease.tokens)
     if cause is not None:
         raise GatewayError(cause, "the student's day does not admit this request")
-    return expired
+    return gone
 
 
 def _reserved(day: UsageDay, request_id: str, lease: Lease, expired: Mapping[str, Lease]) -> UsageDay:
@@ -255,9 +310,15 @@ class InMemoryLedger:
         lease = _new_lease(body, output_limit, now + lease_seconds(hold_seconds, longest_request_seconds))
         reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
         with self._lock:
-            day = self._days.get((reservation.github_id, reservation.day)) or _new_day(student, reservation.day)
-            expired = _to_remove(day, student, request_id, lease, now)
-            self._write(_reserved(day, request_id, lease, expired))
+
+            def before() -> UsageDay | None:
+                return self._days.get((reservation.github_id, _day_before(reservation.day)))
+
+            day = self._days.get((reservation.github_id, reservation.day))
+            if day is None:
+                day = _new_day(student, reservation.day, before(), now)
+            gone = _to_remove(day, student, request_id, lease, now, before)
+            self._write(_reserved(day, request_id, lease, gone))
         return reservation
 
     def settle(
@@ -300,10 +361,11 @@ class DynamoDBLedger:
 
     `client` is a DynamoDB client of the AWS SDK, which threads may share, and `table_name` the
     deployed table's name. A reservation is one call, and more only when that call writes
-    nothing: for the student's first request of a day, whose item is not there yet, and for a
-    request that expired leases stand in the way of. It gives up, with `concurrency_limit`, after
-    ten calls that each found the record changed by another request. A settlement is one call,
-    and the read one consistent read.
+    nothing: for the student's first request of a day, whose item is not there yet and is written
+    after one read of the day before, and for a request that expired leases or stand-ins are in
+    the way of (for stand-ins, with one read of the day before). It gives up, with
+    `concurrency_limit`, after ten calls that each found the record changed by another request. A
+    settlement is one call, and the read one consistent read.
 
     An error of DynamoDB other than a failed condition is raised as the SDK raised it. It carries
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
@@ -327,20 +389,24 @@ class DynamoDBLedger:
         now = int(self._clock())
         lease = _new_lease(body, output_limit, now + lease_seconds(hold_seconds, longest_request_seconds))
         reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
-        _to_remove(_new_day(student, reservation.day), student, request_id, lease, now)
-        expired: dict[str, Lease] = {}
+
+        def before() -> UsageDay | None:
+            return self._read(reservation.github_id, _day_before(reservation.day))
+
+        # What no day admits is refused before any call.
+        _to_remove(_new_day(student, reservation.day, None, now), student, request_id, lease, now, before)
+        gone: dict[str, Lease] = {}
         for _ in range(_ATTEMPTS):
-            written, found = self._add_lease(student, reservation, expired)
+            written, found = self._add_lease(student, reservation, gone)
             if written:
                 return reservation
             if found is None:
-                # The student's first request of the day: the item is written whole.
-                written, found = self._create(_reserved(_new_day(student, reservation.day), request_id, lease, {}))
+                written, found = self._open_day(student, reservation, now)
                 if written:
                     return reservation
             # The write changed nothing. Decide from the day it found: refuse, or send it again
-            # without the leases that have expired.
-            expired = {} if found is None else _to_remove(found, student, request_id, lease, now)
+            # without the leases that have expired and the stand-ins of requests that have ended.
+            gone = {} if found is None else _to_remove(found, student, request_id, lease, now, before)
         # Every attempt found a record that another request had just changed.
         raise GatewayError(Cause.CONCURRENCY_LIMIT, "the student's day kept changing under this request")
 
@@ -361,22 +427,24 @@ class DynamoDBLedger:
 
     def tokens_left(self, student: StudentKey) -> int:
         now = int(self._clock())
-        answer = self._client.get_item(
-            TableName=self._table, Key=self._key(student.github_id, utc_day(now)), ConsistentRead=True
-        )
+        return _left(self._read(student.github_id, utc_day(now)), student, now)
+
+    def _read(self, github_id: int, day: str) -> UsageDay | None:
+        """A student's day as it is written, in one consistent read."""
+        answer = self._client.get_item(TableName=self._table, Key=self._key(github_id, day), ConsistentRead=True)
         item = answer.get("Item")
-        return _left(None if not item else _day(item), student, now)
+        return None if not item else _day(item)
 
     def _add_lease(
-        self, student: StudentKey, reservation: Reservation, expired: Mapping[str, Lease]
+        self, student: StudentKey, reservation: Reservation, gone: Mapping[str, Lease]
     ) -> tuple[bool, UsageDay | None]:
         """The reservation as one write to an item that is there: `_refusal` and `_reserved`, restated.
 
-        Removing `expired` gives back their tokens and their slots, so the condition allows for
+        Removing `gone` gives back their tokens and their slots, so the condition allows for
         both, and holds only while each of them is still in the item.
         """
         lease = reservation.lease
-        removed = {f"#expired{number}": request for number, request in enumerate(expired)}
+        removed = {f"#gone{number}": request for number, request in enumerate(gone)}
         update = "SET #leases.#request = :lease ADD #tokens :change"
         condition = "#tokens <= :room AND size(#leases) < :slots AND attribute_not_exists(#leases.#request)"
         if removed:
@@ -391,15 +459,23 @@ class DynamoDBLedger:
             ExpressionAttributeValues=_values(
                 {
                     ":lease": lease.to_map(),
-                    ":change": lease.tokens - _released(expired),
-                    ":room": student.daily_token_budget - lease.tokens + _released(expired),
-                    ":slots": student.concurrency_limit + len(expired),
+                    ":change": lease.tokens - _released(gone),
+                    ":room": student.daily_token_budget - lease.tokens + _released(gone),
+                    ":slots": student.concurrency_limit + len(gone),
                 }
             ),
         )
 
-    def _create(self, day: UsageDay) -> tuple[bool, UsageDay | None]:
-        """Write a day's item, only if the day has none."""
+    def _open_day(self, student: StudentKey, reservation: Reservation, now: int) -> tuple[bool, UsageDay | None]:
+        """The student's first reservation of a day: the item written whole, only if the day has none.
+
+        It holds a stand-in for each request still running from the day before, read here, and
+        the refusal is raised if those leave no slot.
+        """
+        before = self._read(reservation.github_id, _day_before(reservation.day))
+        fresh = _new_day(student, reservation.day, before, now)
+        _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
+        day = _reserved(fresh, reservation.request_id, reservation.lease, {})
         return self._conditional(
             self._client.put_item,
             Item=_values(day.to_item()),
