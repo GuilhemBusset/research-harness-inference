@@ -1741,7 +1741,8 @@ class Engine:
         self.store.put(st)
         if others:
             with self.ws.disposable(wt) as scratch:
-                decisions = self.agents.decide(self.other, self._req(n), scratch, others)
+                shown = [self._shown_request(scratch, r) for r in others]
+                decisions = self.agents.decide(self.other, self._req(n), scratch, shown)
             by_id = {d.request: d for d in decisions}
             for r in others:
                 d = by_id.get(r["id"])
@@ -1768,6 +1769,34 @@ class Engine:
                 f["status"], f["blocking"], f["reason"] = "closed", False, f"ruled out by the arbiter: {ruling.reason}"
         self.store.put(st)
         self.store.event("requests_decided", issue=n, decided={r["id"]: r["status"] for r in pending})
+
+    def _shown_request(self, scratch: Path, r: dict) -> dict:
+        """A request as its decider gets it. The builder's edit to a locked test is reverted before
+        the decision, so the decider's throwaway copy would hold the locked version, and the proposed
+        file would reach it only as text inside the requests, which an adapter may cut to fit its
+        prompt: #42's examiner was given a replacement that stopped mid-function, and none of the
+        requests listed after it, five builds in a row. So the proposal is put in that copy, where
+        the decider reads and runs it, and the request names its files without their text. The
+        stored request keeps the text, for `_apply_request`."""
+        if r["kind"] != "test_change":
+            return r
+        placed = self._write_proposal(scratch, r)
+        return {k: v for k, v in r.items() if k != "content"} | {
+            "proposed": {p: "deleted" if text is None else "replaced" for p, text in placed.items()}}
+
+    def _write_proposal(self, root: Path, r: dict) -> dict[str, str | None]:
+        """Put the files a `test_change` request proposes in `root` (None: the file is deleted).
+        Returns what was put there: never a path outside `root`, nor the safety surface in a
+        fault-repair run."""
+        content = {p: c for p, c in (r.get("content") or {}).items()
+                   if self._inside(root, p) and (not self.repair or not is_safety_surface(p))}
+        for p, text in content.items():
+            target = root / p
+            if target.is_symlink() or text is None:
+                target.unlink(missing_ok=True)   # replace a link itself, never write through it
+            if text is not None:
+                self._replace_file(target, text)
+        return content
 
     def _engine_refusal(self, st: IssueState, r: dict) -> str | None:
         paths = r.get("paths") or []
@@ -1808,14 +1837,7 @@ class Engine:
         elif kind == "depends":
             self._depend(n, st, r.get("item") or "", int(r["depends_on"]), r.get("depends_quote") or "")
         elif kind == "test_change":
-            content = {p: c for p, c in (r.get("content") or {}).items()
-                       if self._inside(wt, p) and (not self.repair or not is_safety_surface(p))}
-            for p, text in content.items():
-                target = wt / p
-                if target.is_symlink() or text is None:
-                    target.unlink(missing_ok=True)   # replace a link itself, never write through it
-                if text is not None:
-                    self._replace_file(target, text)
+            content = self._write_proposal(wt, r)
             removed = [p for p, t in content.items() if t is None]
             sha = self.ws.commit_all(wt, f"Change locked tests for #{n} (approved {r['id']})", "acceptance-checks", n,
                                      unlocks=removed or None,
