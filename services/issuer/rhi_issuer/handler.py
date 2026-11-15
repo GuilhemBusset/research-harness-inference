@@ -1,9 +1,11 @@
-"""The key issuer's function: two routes behind the load balancer (system design, section 6.4).
+"""The key issuer's function: four routes behind the load balancer (system design, section 6.4).
 
 | Route | Takes | Answers |
 | --- | --- | --- |
 | `GET /auth/config` | nothing | `{"client_id"}`: the login app's client ID, and nothing else |
 | `POST /auth/login` | `{"device_code", "installation"}` | `{"key", "issued_at", "expires_at", "previous_issued_at"}` |
+| `POST /auth/revoke` | the key, in `Authorization: Bearer <key>` | `{"revoked": 1}` |
+| `POST /auth/revoke-all` | `{"device_code"}` | `{"revoked"}`: how many keys it revoked |
 
 The CLI reads the client ID here because it is not in the repository, starts a device flow with
 GitHub, and sends the device code with the identifier of its installation. A login redeems the
@@ -12,9 +14,15 @@ one key per installation, two installations, a daily limit. The key is in that o
 nowhere else. The three times are whole seconds since the epoch, and `previous_issued_at` is
 `null` for a student's first key.
 
+`rhi revoke` revokes the installation's own key, authenticated by that key and by nothing else
+(`rhi_issuer.revoke`). `rhi revoke --all` must work when a key is lost, so it takes a fresh device
+code instead: the code is redeemed and checked against the roster exactly as a login's is, then
+every key of that student is revoked. A key is never taken in place of the device code: a body
+without a device code of the right shape is refused, whatever key the request carries.
+
 Every other answer is `{"error": {"code", "message"}}`, with a code and a sentence that are
 constants of this package: a `rhi_issuer.redeem.Refusal`, or `not_found` for any other path or
-method. A body that is not the JSON object above, with both members of the right shape, is
+method. A body that is not the JSON object above, with its members of the right shape, is
 refused before any call to GitHub or to a table.
 
 What the function reads from its environment, which the stack sets:
@@ -25,7 +33,7 @@ What the function reads from its environment, which the stack sets:
 - `RHI_ISSUANCES_PER_DAY`, the most keys a student may be issued over one UTC day, 5 when unset.
 
 The function is the target of a load balancer, with multi-value headers off: `handler` takes the
-load balancer's event (`httpMethod`, `path`, `body`, `isBase64Encoded`) and returns its answer
+load balancer's event (`httpMethod`, `path`, `headers`, `body`, `isBase64Encoded`) and returns its answer
 (`statusCode`, `headers`, `body`, `isBase64Encoded`). This module logs nothing.
 """
 
@@ -45,6 +53,7 @@ from typing import Any
 import boto3
 
 from rhi_issuer.redeem import GitHub, Refusal, Refused, is_device_code, is_installation, redeem
+from rhi_issuer.revoke import revoke_all, revoke_key
 from rhi_issuer.rules import DEFAULT_ISSUANCES_PER_DAY, issue
 
 CLIENT_ID_VARIABLE = "RHI_CLIENT_ID"
@@ -55,6 +64,8 @@ ISSUANCES_PER_DAY_VARIABLE = "RHI_ISSUANCES_PER_DAY"
 
 CONFIG_PATH = "/auth/config"
 LOGIN_PATH = "/auth/login"
+REVOKE_PATH = "/auth/revoke"
+REVOKE_ALL_PATH = "/auth/revoke-all"
 
 type Answer = dict[str, Any]
 
@@ -73,8 +84,8 @@ def _error(status: int, code: str, sentence: str) -> Answer:
     return _answer(status, {"error": {"code": code, "message": sentence}})
 
 
-def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
-    """The device code and the installation's identifier of a login; `Refused` for any other body."""
+def _request(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The JSON object of the event's body; `Refused` for any other body."""
     body = event.get("body")
     try:
         if event.get("isBase64Encoded") and isinstance(body, str):
@@ -84,10 +95,37 @@ def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
         request = None
     if not isinstance(request, dict):
         raise Refused(Refusal.INVALID_REQUEST)
+    return request
+
+
+def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
+    """The device code and the installation's identifier of a login; `Refused` for any other body."""
+    request = _request(event)
     device_code, installation = request.get("device_code"), request.get("installation")
     if not is_device_code(device_code) or not is_installation(installation):
         raise Refused(Refusal.INVALID_REQUEST)
     return device_code, installation
+
+
+def _revoke_all_request(event: Mapping[str, Any]) -> str:
+    """The device code of a revocation of every key; `Refused` for any other body, a key included."""
+    device_code = _request(event).get("device_code")
+    if not is_device_code(device_code):
+        raise Refused(Refusal.INVALID_REQUEST)
+    return device_code
+
+
+def _bearer_key(event: Mapping[str, Any]) -> str | None:
+    """The key in the event's `Authorization: Bearer` header; `None` when there is no such header."""
+    headers = event.get("headers")
+    if not isinstance(headers, Mapping):
+        return None
+    # The load balancer passes header names as the client wrote them; HTTP does not tell cases apart.
+    values = [value for name, value in headers.items() if isinstance(name, str) and name.lower() == "authorization"]
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    scheme, _, key = values[0].partition(" ")
+    return key if scheme.lower() == "bearer" else None
 
 
 @dataclass(frozen=True)
@@ -112,13 +150,15 @@ class Issuer:
         route = (event.get("httpMethod"), event.get("path"))
         if route == ("GET", CONFIG_PATH):
             return _answer(200, {"client_id": self.client_id})
-        if route == ("POST", LOGIN_PATH):
-            try:
-                return _answer(200, self._login(event))
-            except Refused as refused:
-                refusal = refused.refusal
-            return _error(refusal.status, refusal.value, refusal.sentence)
-        return _error(404, "not_found", "The issuer has no such route.")
+        actions = {LOGIN_PATH: self._login, REVOKE_PATH: self._revoke, REVOKE_ALL_PATH: self._revoke_all}
+        action = actions.get(route[1]) if route[0] == "POST" and isinstance(route[1], str) else None
+        if action is None:
+            return _error(404, "not_found", "The issuer has no such route.")
+        try:
+            return _answer(200, action(event))
+        except Refused as refused:
+            refusal = refused.refusal
+        return _error(refusal.status, refusal.value, refusal.sentence)
 
     def _login(self, event: Mapping[str, Any]) -> dict[str, object]:
         device_code, installation = _login_request(event)
@@ -137,6 +177,15 @@ class Issuer:
             "expires_at": minted.expires_at,
             "previous_issued_at": minted.previous_issued_at,
         }
+
+    def _revoke(self, event: Mapping[str, Any]) -> dict[str, object]:
+        revoke_key(_bearer_key(event), keys=self.keys, now=int(self.clock()))
+        return {"revoked": 1}
+
+    def _revoke_all(self, event: Mapping[str, Any]) -> dict[str, object]:
+        device_code = _revoke_all_request(event)
+        entry = redeem(device_code, client_id=self.client_id, roster=self.roster, github=self.github)
+        return {"revoked": revoke_all(entry.github_id, keys=self.keys, now=int(self.clock()))}
 
 
 @functools.cache
