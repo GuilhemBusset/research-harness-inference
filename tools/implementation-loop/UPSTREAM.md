@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.14 |
+| Engine version here | 1.2.15 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -912,3 +912,16 @@ defect in the engine on that path, so `engine.py` does not change.
 
 Not changed, on purpose: the engine's code, the verifier, the gate, the live adapter, `config.py`,
 `loop.toml` and the prompts.
+
+### 1.2.15: one issue built at a time (2026-11-15)
+
+On the owner's instruction. Three supervisions, each building up to three issues at once, ran the
+host out of memory: about 150 test processes held some 24 GB, the swap was full, and the kernel
+killed processes until the machine's Linux environment restarted. One supervision now runs, and
+it builds one issue at a time; planning ahead stays parallel.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/config.py` | `Caps.max_parallel_writers` 3 → 1. | One issue in build, verify and examine at a time. |
+| `implement_loop/__init__.py` | `VERSION` 1.2.14 → 1.2.15. | A new engine version. |
+| `tests/test_engine.py` | `test_independent_disjoint_issues_overlap_in_time` now asks for two writers; new `test_by_default_one_issue_is_built_at_a_time`. | Parallel writing still works when asked for; the default builds one issue at a time. |
