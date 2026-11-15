@@ -3,7 +3,8 @@
 What only the owner can do, once, in this order (system design, section 8.6).
 [`setup/owner-setup.sh`](../../setup/owner-setup.sh) walks through the nine steps. This page says,
 for each one, what it needs, the command, how to check it, and the decision of section 15 of the
-design that it rests on.
+design that it rests on. Step 4 has a second half, 4b, which is not a step of section 8.6: it
+writes the list of real values that the hygiene scanner checks for on your machine.
 
 **The owner runs the script, from a shell no agent runs in.** No agent runs it, and nothing here
 is claimed as done until the owner has seen the check.
@@ -19,6 +20,7 @@ pull request or a commit message, and neither is anything AWS prints.
 setup/owner-setup.sh --dry-run                                  # print every step and every command
 setup/owner-setup.sh                                            # the walkthrough
 setup/owner-setup.sh --step configuration --config <file>       # one step on its own
+setup/owner-setup.sh --step values --config <file>              # the scanner's list of real values
 setup/owner-setup.sh --step apps --reporter-key <file>          # the Apps, read back from GitHub
 ```
 
@@ -27,14 +29,15 @@ setup/owner-setup.sh --step apps --reporter-key <file>          # the Apps, read
 - `--dry-run` reads no answer and calls neither AWS nor GitHub: `aws`, `gh` and `cdk` are never
   started. It prints `123456789012`, `us-east-1`, `<quota code>` and `<app id>` where a real run
   reads the value from your credentials or from GitHub. Start with it.
-- `--step <name>` runs one step: `quotas`, `domain`, `apps`, `configuration`, `billing`,
+- `--step <name>` runs one step: `quotas`, `domain`, `apps`, `configuration`, `values`, `billing`,
   `bootstrap`, `connection`, `repository` or `roster`. A step can be repeated.
 - It writes nothing to the working tree. What it learns (the account, a quota's code, an address,
-  an App's ID) goes to the terminal, the configuration goes to SSM, and the status reporter's
-  credentials go to Secrets Manager. The tools it starts write nothing there either: Python keeps
-  no bytecode, and uv's project environment and the CDK's output go to a temporary folder that is
-  removed when the script ends. So the script needs no `uv sync` first and leaves no `.venv` and
-  no `cdk.out` behind.
+  an App's ID) goes to the terminal, the configuration goes to SSM, the status reporter's
+  credentials go to Secrets Manager, and the configuration's private values go to the scanner's
+  list, a file outside the repository (step 4b). The tools it starts write nothing to the working
+  tree either: Python keeps no bytecode, and uv's project environment and the CDK's output go to
+  a temporary folder that is removed when the script ends. So the script needs no `uv sync` first
+  and leaves no `.venv` and no `cdk.out` behind.
 
 It needs, on the machine: the AWS CLI with your credentials and their region set, `gh` logged in
 as the repository's admin, `uv`, and for step 6 the CDK CLI (`npm ci --ignore-scripts`,
@@ -248,6 +251,68 @@ aws ssm get-parameters-by-path --path /rhi/config/ --recursive --query 'Paramete
 **Decision.** 10, for the domain. 1, dates, for the course end date and, later, the session
 windows. 6, money, for the monthly budget and, later, each pool's GPU-hour ceilings. 9, for the
 region the parameters are written in. The first deployment of step 6 reads this configuration.
+
+## 4b. Write the list of real values the scanner checks for
+
+No public pattern can name your domain or the admin's address: writing the pattern would publish
+the value (system design, section 10). The hygiene scanner therefore also reads a list of real
+values, kept outside the repository, and reports each one as `local-value` in every scan on your
+machine: the git hooks, `scripts/check.sh`, and the implement loop before each push
+([`tools/hygiene/README.md`](../../tools/hygiene/README.md), "Values only the owner knows"). This
+step writes that list, so that the check does not depend on your remembering to create it. The
+second check of section 10, in the pipeline's synth step, looks for the same values.
+
+**Needs.** The configuration file of step 4. No AWS credentials: the step calls nothing.
+
+**Command.**
+
+```sh
+setup/owner-setup.sh --step values --config "$HOME/.config/rhi/config.toml"
+```
+
+The whole walkthrough runs it right after step 4, with the same file. The list is the file the
+environment variable `HYGIENE_LOCAL_VALUES` names or, when it is unset, the scanner's default
+file: `research-harness-inference/hygiene-values` under `$XDG_CONFIG_HOME`, which is
+`$HOME/.config` by default. The step prints that path, then asks for further values, one per
+line, ended by an empty line: anything else no file of the repository may hold, a student's name
+for instance. Then, after a `y`:
+
+```sh
+env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config values <file> --list <list>
+```
+
+- It adds the value of each private key of the configuration (`domain`, `hosted_zone_id`,
+  `admin_email`, `instructor_phone` and `login_client_id`: `PRIVATE_KEYS` in `src/rhi/config.py`)
+  and each value you entered. The further values reach the command on its standard input, not on
+  its command line.
+- A value is added once, however often the step runs: one the list holds already, in any letter
+  case, is not added again. The lines and the comments the list holds are kept. After a change to
+  one of the private keys, run the step again: the new value is added, and the old one stays.
+- The list is created readable and writable by you alone (mode `600`, its folder `700`), and a
+  list that exists is set to that mode.
+- It prints how many values the list holds, and never a value.
+- It refuses a list whose path is inside the working tree, and a link in the tree to a file
+  outside it: nothing is written, in a dry run either.
+- It refuses a value the scanner could not read as one line of the list: shorter than four
+  characters, or starting with `#`. The refusal names the key, or the number of the entered value.
+
+A dry run prints the path of the list and the command, reads no answer and writes no file.
+
+**Check.** Write one of the values to a scratch file outside the working tree, the real domain
+for instance, and scan that file. The scan exits 1 and reports the file under the rule
+`local-value`, with the value masked:
+
+```sh
+scratch="$(mktemp)"
+cat > "$scratch"          # type the domain, then Enter and Ctrl-D: it stays out of the shell's history
+python3 tools/hygiene/scan.py --paths "$scratch"      # <scratch file>:1: local-value: ...
+rm -- "$scratch"
+ls -l "${HYGIENE_LOCAL_VALUES:-${XDG_CONFIG_HOME:-$HOME/.config}/research-harness-inference/hygiene-values}"
+```
+
+The last command shows the list as `-rw-------`.
+
+**Decision.** None of section 15. It is the owner-local check of section 10 of the design.
 
 ## 5. Turn on billing alerts
 
