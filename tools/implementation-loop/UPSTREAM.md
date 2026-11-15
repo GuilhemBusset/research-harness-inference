@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.10 |
+| Engine version here | 1.2.11 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -829,3 +829,28 @@ repository, made with `implement record-fixture`. It is test input for the graph
 and is not edited: its issues talk about sessions, HTML pages and upstream paths, and it carries
 many external links. Several tests also keep upstream's capability names (`hardware:laptop`,
 `human:rehearsal`) and example file names as arbitrary test data.
+
+### 1.2.11: #85's revived build, told what its failed round said (2026-11-15)
+
+The repair of fault 8a5fa42bd3 (issue #317). On engine 1.2.4, #85 failed with `ceiling`. Its run
+log (the events of the issue and its calls in the run for #2) was read when this repair was
+planned; nothing of it is copied here. Its last answered call was an examination that left a
+blocking finding open, after a build whose requests the other vendor had decided, two of them
+refused. Then main was merged, and ten `build` calls on Claude were refused for the account's
+usage limit, each charged to the infrastructure budget as a crash, as for #92 and #90. That cause
+is the one 1.2.7 repairs, in files on the safety surface, which do not change here. What #85 adds
+is the feedback its next build would have had. The failed examination called `_round_failed`
+without the decisions on the last build's requests, so they were replaced, as 1.2.6 found after a
+failed verification. And a revival replaced the feedback again with its one note, so the revived
+build would not have heard the problems of the round that failed either. Open findings reach it
+anyway, through `_open_feedback`.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.10 → 1.2.11. | A new engine version: #85 is revived once, with fresh ceilings, and resumes its build on the branch that keeps its work. |
+| `implement_loop/engine.py` | `_step_examine` hands the feedback the build left (the decisions on its requests) to `_round_failed` as `told` when the examination fails the round. `_maybe_revive` puts its note first and keeps after it what the failed round left, without duplicates and at most `REVIVED_FEEDBACK` (8) entries. | A refused request that the next build does not hear of is asked for again, and costs a decision each time (#32). The revived build is the one try a new version gives: it starts from where the failed round left off. |
+| `tests/test_revived_finding_build.py` | New. A real engine run where a refused request is followed by a failed examination and the next build is told both. Then #85's path: builds refused until the infrastructure ceiling on 1.2.4, a run on this version that revives it, and a revived build told the revival, the refusal and the failed examination, with its locks kept. | The regression test of this repair. |
+
+Behaviour an upstream reader would not expect: a revived build's feedback starts with the revival
+note and then holds up to eight entries of the failed round's feedback. Not changed, on purpose:
+the verifier, the gate, the live adapter, `config.py`, `loop.toml` and the prompts.
