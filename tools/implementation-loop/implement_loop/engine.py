@@ -169,6 +169,7 @@ EXPLORE_QUESTIONS = (
     "External references the issues cite: what do they establish that the work depends on?",
 )
 MERGE_QUEUE = "merge-queue"
+REVIVED_FEEDBACK = 8   # the most entries of a failed round's feedback a revival keeps after its note (#85)
 # Deployment verdicts still awaited, one file per issue, under the runs' root. The merge-queue claim
 # belongs to a process: the run frees it when it ends, and a claim whose process died is taken
 # over. A verdict can outlast the run that merged (`WAIT_DEPLOY`), so what keeps the landing claim
@@ -557,8 +558,12 @@ class Engine:
                    for p, text in (r.get("content") or {}).items() if text is None}
         self._retire_probe_commands(st.number, st, sorted(deleted - set(st.probes)))
         retired = self._retire_uncommanded(st)   # heals a state saved before the fix (#148)
-        st.feedback = [(f"An earlier attempt failed ({f.get('cause')}): {str(f.get('detail'))[:500]}. "
-                        f"A new engine version gives it one more try.")]
+        # What the failed round left (its problems, the decisions on the last build's requests) is
+        # kept after the note: #85 was revived straight after a failed examination, and replacing
+        # its feedback would have sent the build back without the refusals it had been given.
+        note = (f"An earlier attempt failed ({f.get('cause')}): {str(f.get('detail'))[:500]}. "
+                f"A new engine version gives it one more try.")
+        st.feedback = [note] + list(dict.fromkeys(t for t in st.feedback if t != note))[-REVIVED_FEEDBACK:]
         if retired:
             st.feedback.append(f"These commands were retired, because the plan no longer proves their items by "
                                f"a command: {retired[:6]}.")
@@ -2301,7 +2306,9 @@ class Engine:
             if bundled:
                 problems += [f"also worth fixing (not blocking): {f.title}" for f in bundled]
             self._set_phase(n, Phase.EXAMINE, exam_feedback=[], exam_retries=0)
-            return self._round_failed(n, problems, [f.id for f in blocking], unmet)
+            # As after a failed verification (#32): the decisions on the last build's requests
+            # reach the next build. #85's refusals were dropped here, then again by its revival.
+            return self._round_failed(n, problems, [f.id for f in blocking], unmet, told=list(st.feedback))
         # What the examiner still owes (a verdict, an independent probe) is asked of it again, at
         # most twice; it is not the builder's failure.
         st = self.store.issue(n)
