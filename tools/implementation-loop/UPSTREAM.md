@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.4 |
+| Engine version here | 1.2.5 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -446,6 +446,38 @@ Not changed, on purpose: the ceilings (`config.py`), the gate and the live adapt
 resumes in `build` with its saved commands, and its adopted probe counts for the items its
 criterion lists.
 
+### 1.2.5: a proposed test change the decider can read (2026-11-15)
+
+The repair of the engine fault 10fcb07f92 (issue #274): issue #42 ended `no_progress`. Its run log
+(the events of the issue and its calls) shows a first build that verified, and an examination
+that left two blocking findings on D2 and adopted probes, which locked the issue's own test,
+`tests/policy/test_pipeline.py`. The repair of the findings needed a change to that test. In each
+of the five builds that followed, the builder edited the test and asked with a `test_change`
+request, and each time the examiner refused it for the same reason: the replacement it was given
+stopped in the middle of a function, and its working directory held the locked version.
+
+The engine reverts a builder's edit to a locked test before the request is decided, so the
+decider's throwaway copy never held the proposal. The proposed file reached the decider only as
+text inside the requests, and the live adapter cuts the requests at 20,000 characters to fit its
+prompt. The cut also took the `command_change` requests listed after the test change: they got
+no decision and were refused for that. Everything else the fault quotes follows from the change
+never landing: the two D2 probes that kept failing, the open findings, and the tests of a locked
+file that no command selected (a test counts as selected once it has run and passed). One replan
+changed nothing, because the plan was not the cause.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.4 → 1.2.5. | A new engine version: a failed issue is revived once by it, with fresh ceilings. |
+| `implement_loop/engine.py` | New: `Engine._shown_request`, a request as its decider gets it. For a `test_change`, the proposed files are put in the decider's throwaway copy (a replacement is written, a deleted test is removed), and the request carries `proposed`, each path with `replaced` or `deleted`, in place of `content`, the files' text. `_decide_requests` hands the decider those. The stored request is unchanged and keeps the text. New: `_write_proposal`, the writing of a proposal's files into a tree, taken out of `_apply_request` as it was; both use it, so the decider's copy holds what an approval lands. | The decider reads, diffs and runs the proposal where it runs everything else, whatever its size, and the requests that share its call fit the prompt. Nothing is written to the builder's worktree before an approval: the copy is deleted after the call. A path outside the tree, and the safety surface in a fault-repair run, are left out of the copy as they are left out of an approved change. |
+| `prompts/decide.md` | The first paragraph says that a proposed test change is in the working directory, uncommitted, that `proposed` lists its paths, that `git diff` shows it against the locked version, and that the builder's branch keeps the locked version until the approval. It said "proposed test changes are in the requests". The placeholders and the answer format are unchanged. | The examiner has to know where the proposal is, and that a locked version on the builder's branch is not a missing edit. |
+
+Behaviour an upstream reader would not expect: the decider's copy of the worktree is no longer at
+the builder's head when a `test_change` is pending; it holds the proposal as uncommitted changes.
+Not changed, on purpose: the live adapter and its cut (`live.py` is on the safety surface), the
+verifier, the gate and `config.py`. Requests whose own text is longer than the cut are still cut.
+Issue #42 resumes in `build` with its branch as it was. Whether its examiner approves the proposal
+it can now read is that issue's round.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -620,6 +652,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_examination_reasks.py` (10) | Added. | The regression of fault b3ce2cd831, in real engine runs with the fake agents, on an issue with two tested items and an owner item, and an examiner that answers as #20's did. One probe file whose criterion lists the tested items and says more, returned again at the follow-up with another wording: on 1.2.3 the engine asks for probes twice and then for a waiver; now nothing is owed, no arbiter is called, the probe is adopted once, and the issue is delivered with one build and two examinations. An `unmet` on the owner item that quotes the item: on 1.2.3 a failed round and a second build; now no round fails, the examiner is asked again with the agent part, and its `met` delivers the issue. An `unmet` that quotes the agent part still sends the builder back. And `criterion_items` on seven criteria (7 of the 10). The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
+
+### 1.2.5
+
+643 collected tests: the 641 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_test_change_proposals.py` (2) | Added. | The regression of fault 10fcb07f92, in real engine runs with the fake agents, on an issue whose second build changes the test its first examination locked and asks with a `test_change` request, followed by a `paths` request. The fake decider keeps what it is given, and the prompt the live adapter writes for those requests (`LiveAgents.decide`, with the call itself replaced). A replacement of more than 100,000 characters: on 1.2.4 the decider's copy holds the locked test; now it holds the proposal to its last line while the builder's worktree holds the locked test, the request names the file as `replaced` and carries none of its text, the requests in the adapter's prompt are valid JSON with both requests, and the approved proposal lands whole on `main`. A locked test the builder deletes is absent from the decider's copy and named as `deleted`; refused, the locked test lands as it was. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
 
 ## Kept as recorded
 
