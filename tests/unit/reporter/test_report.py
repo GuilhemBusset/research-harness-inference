@@ -16,7 +16,6 @@ from rhi_reporter import report as module
 from rhi_reporter.report import (
     FAILED_STATUSES,
     RESOURCE_EVENT_FIELDS,
-    SHORTENED,
     Report,
     ResourceStatus,
     build_report,
@@ -192,39 +191,63 @@ def test_each_part_has_its_own_filter() -> None:
 
 
 def test_every_fact_has_a_context_and_a_description_github_accepts() -> None:
-    # Names as long as CloudFormation and CodePipeline allow them, and two that differ by case alone.
-    long_ids = ["Gateway" + "Nested" * 40 + "9F2C61B7", "Gateway" + "Nested" * 40 + "0C55D1F2", "Queue1A", "QUEUE1A"]
-    long_test = "tests/smoke/" + "a-long-folder/" * 12 + "test_chat.py::test_a_completion_streams"
-    stage, action = "Stage." + "s" * 94, "Action." + "a" * 93
-    events = [resource(name, code) for name in long_ids for code in ("CREATE_FAILED", "DELETE_FAILED")]
+    # Names that fill a description to its last character, and two that differ by case alone.
+    code = ResourceStatus.UPDATE_ROLLBACK_FAILED
+    room = DESCRIPTION_LIMIT - len(code) - 1
+    whole_ids = ["Gateway" + "N" * (room - 7), "Queue1A", "QUEUE1A"]
+    whole_test = "tests/smoke/test_chat.py::" + "t" * (DESCRIPTION_LIMIT - 26)
+    stage, action = "Stage." + "s" * 94, "Action." + "a" * 32
     report = build_report(
         failed(action, stage=stage),
-        [*events, resource("x", "?")],
-        [long_test],
-        "l" * 200,
-        logical_ids=long_ids,
-        smoke_test_ids=[long_test],
-        lifecycle_stages=["l" * 200],
+        [resource(name, str(code)) for name in whole_ids],
+        [whole_test],
+        "l" * DESCRIPTION_LIMIT,
+        logical_ids=whole_ids,
+        smoke_test_ids=[whole_test],
+        lifecycle_stages=["l" * DESCRIPTION_LIMIT],
     )
     statuses = statuses_of(report)
-
-    # No fact is lost to the limit: eight resources, and the action, the test, the stage, the count.
-    assert (len(report.resources), report.dropped, len(statuses)) == (8, 1, 12)
-    assert all(isinstance(status, CommitStatus) for status in statuses)
+    assert (report.dropped, len(statuses)) == (0, 6)
     assert {(status.commit, status.state) for status in statuses} == {(SHA, State.FAILURE)}
     # GitHub reads a context without regard to case.
     contexts = [status.context.lower() for status in statuses]
     assert len(set(contexts)) == len(contexts)
     assert all(context.startswith(f"deploy/{stage}/".lower()) for context in contexts)
-    assert all(len(status.description) <= DESCRIPTION_LIMIT == 140 for status in statuses)
-    # A name that fits is whole. One that does not keeps its end, where such names differ.
+    # Every name is whole in its description.
     descriptions = [status.description for status in statuses]
-    assert {"Queue1A CREATE_FAILED", "QUEUE1A DELETE_FAILED"} <= set(descriptions)
-    for name in long_ids[:2]:
-        assert [d for d in descriptions if d.startswith(SHORTENED) and d.endswith(f"{name[-80:]} CREATE_FAILED")], name
-    assert descriptions[0] == f"{stage} {SHORTENED}{action[-36:]}"
-    assert f"{SHORTENED}{long_test[-(DESCRIPTION_LIMIT - len(SHORTENED)) :]}" in descriptions
-    assert len(set(descriptions)) == len(descriptions)
+    assert sorted(descriptions) == sorted(
+        [f"{stage} {action}", *(f"{name} {code}" for name in whole_ids), whole_test, "l" * DESCRIPTION_LIMIT]
+    )
+    assert max(len(description) for description in descriptions) == DESCRIPTION_LIMIT == 140
+
+
+def test_a_fact_too_long_for_a_description_is_dropped_and_never_shortened() -> None:
+    # Two names of each kind, in the caller's lists, that differ only at their start: a shortened
+    # form would be the same for both. Each is a character or more past what its description holds.
+    ids = [start + "Shared" * 30 for start in ("Alpha", "Bravo")]
+    stage = "Stage." + "s" * 94
+    for name in ids:
+        lists = {"logical_ids": ids, "smoke_test_ids": ids, "lifecycle_stages": ids}
+        report = build_report(failed(stage=stage), [resource(name, "CREATE_FAILED")], [name], name, **lists)
+        assert (report.resources, report.tests, report.lifecycle_stage, report.dropped) == ((), (), None, 3)
+        assert [(status.context, status.description) for status in statuses_of(report)] == [
+            (f"deploy/{stage}/action", f"{stage} Deploy"),
+            (f"deploy/{stage}/dropped", "3"),
+        ]
+        assert "Shared" not in written(report)
+        # The stage and the action share one description.
+        long_action = build(failed(name[:40], stage=stage))
+        assert (long_action.action, long_action.dropped, len(statuses_of(long_action))) == (None, 1, 1)
+        assert build(failed(name[:39], stage=stage)).action == name[:39]
+    # The same name fits with one code and not with a longer one.
+    name = "N" * (DESCRIPTION_LIMIT - len("CREATE_FAILED") - 1)
+    events = [resource(name, "CREATE_FAILED"), resource(name, "UPDATE_ROLLBACK_FAILED")]
+    report = build_report(failed(), events, logical_ids=[name], smoke_test_ids=[], lifecycle_stages=[])
+    assert (report.resources, report.dropped) == (((name, ResourceStatus.CREATE_FAILED),), 1)
+    # A report made by hand with a fact that does not fit is refused, not shortened.
+    by_hand = dataclasses.replace(report, tests=("t" * (DESCRIPTION_LIMIT + 1),))
+    with pytest.raises(ValueError, match="^a fact of the report does not fit in a description$"):
+        statuses_of(by_hand)
 
 
 def test_the_module_writes_nothing_but_statuses() -> None:
