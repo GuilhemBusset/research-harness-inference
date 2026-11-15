@@ -52,7 +52,7 @@ _INSTALLATION = re.compile(r"[0-9A-Za-z_-]{16,64}", re.ASCII)
 
 
 class Refusal(StrEnum):
-    """Why a login gave no key; the value is the code the answer carries."""
+    """Why a login gave no key, or a revocation revoked nothing; the value is the code the answer carries."""
 
     status: int
     sentence: str
@@ -90,6 +90,12 @@ class Refusal(StrEnum):
         "login_conflict",
         409,
         "Other logins of this account were under way at the same time: log in again.",
+    )
+    # A revocation by a key, applied by `rhi_issuer.revoke`: one answer for every key it refuses.
+    INVALID_KEY = (
+        "invalid_key",
+        401,
+        "The key is missing, malformed, unknown or already revoked: run rhi revoke --all to revoke every key.",
     )
 
 
