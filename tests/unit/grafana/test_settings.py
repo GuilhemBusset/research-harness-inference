@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import pytest
 import yaml
@@ -79,6 +80,8 @@ def datasource_problems(provisioning: Path) -> list[str]:
         for key, value in walk_keys(source):
             if key.lower() in CREDENTIAL_KEYS:
                 problems.append(f"{uid} carries {key}")
+            if isinstance(value, str) and (urlsplit(value).username or urlsplit(value).password):
+                problems.append(f"{uid} carries a credential in its {key}")
             if key == "basicAuth" and value:
                 problems.append(f"{uid} uses basic authentication")
             if key in {"authType", "sigV4AuthType"} and value != "default":
@@ -172,6 +175,8 @@ def _edit(change: str) -> Any:
             prometheus.update(basicAuth=True, basicAuthUser="viewer")
         elif change == "keys":
             cloudwatch["jsonData"]["authType"] = "keys"
+        elif change == "url-credential":
+            prometheus["url"] = "https://viewer:" + uuid4().hex + "@example.com/"
         elif change == "no-uid":
             del prometheus["uid"]
         path.write_text(yaml.safe_dump(document), encoding="utf-8")
@@ -181,8 +186,8 @@ def _edit(change: str) -> Any:
 
 @pytest.mark.parametrize(
     "mutate",
-    [_third_source, _edit("credential"), _edit("basic-auth"), _edit("keys"), _edit("no-uid")],
-    ids=["third-source", "credential", "basic-auth", "keys", "no-uid"],
+    [_third_source, _edit("credential"), _edit("basic-auth"), _edit("keys"), _edit("url-credential"), _edit("no-uid")],
+    ids=["third-source", "credential", "basic-auth", "keys", "url-credential", "no-uid"],
 )
 def test_only_two_data_sources_refuses(tmp_path: Path, mutate: Any) -> None:
     root = tmp_path / "provisioning"
