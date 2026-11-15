@@ -14,7 +14,7 @@ from rhi_gateway.formats.chat import ChatBodyFilter, ChatForwarded
 
 def send(body: dict[str, Any]) -> ChatForwarded:
     pools = parse_pools({"probe": {
-        "engine": "mock", "instance_types": ["t3.small"], "max_instances": 1,
+        "engine": "mock", "instance_types": ["t3.small"], "prices": {"t3.small": 0.0208}, "max_instances": 1,
         "warm_instances": 0, "wake": "on-demand", "target_concurrency": 1,
         "context_length": 131072, "largest_output": 4096,
     }})

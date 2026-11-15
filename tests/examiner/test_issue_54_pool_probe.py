@@ -13,6 +13,7 @@ def coursework():
 engine = "vllm"
 model = "Qwen/Qwen3.8-27B-FP8"
 instance_types = ["g7e.2xlarge"]
+prices = { "g7e.2xlarge" = 3.36 }
 max_instances = 2
 warm_instances = 2
 wake = "on-demand"
@@ -31,7 +32,7 @@ def test_coursework_and_defaults(explicit):
         entry.update(defaults)
     (pool,) = parse_pools({"coursework": entry})
     assert isinstance(pool, Pool)
-    expected = entry | defaults | dict(name="coursework", measured_start_seconds=None)
+    expected = entry | defaults | dict(name="coursework", measured_start_seconds=None, expected=None)
     expected["instance_types"] = ("g7e.2xlarge",)
     assert asdict(pool) == expected
 

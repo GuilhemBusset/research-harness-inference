@@ -19,6 +19,7 @@ def send(payload: dict[str, Any], spec: Fields = MESSAGES) -> dict[str, Any]:
             "probe": {
                 "engine": "mock",
                 "instance_types": ["t3.small"],
+                "prices": {"t3.small": 0.0208},
                 "max_instances": 1,
                 "warm_instances": 0,
                 "wake": "on-demand",

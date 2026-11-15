@@ -13,6 +13,7 @@ POOL = parse_pools(
         "mock": {
             "engine": "mock",
             "instance_types": ["t4g.small"],
+            "prices": {"t4g.small": 0.0168},
             "max_instances": 2,
             "warm_instances": 1,
             "wake": "on-demand",

@@ -14,7 +14,7 @@ from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Supply
 START = 2_000_000
 EMPTY_MEMORY = Memory()
 CONFIG = parse_pools(
-    {"probe": {"engine": "mock", "instance_types": ["g6e.xlarge"], "max_instances": 4,
+    {"probe": {"engine": "mock", "instance_types": ["g6e.xlarge"], "prices": {"g6e.xlarge": 1.86}, "max_instances": 4,
                "warm_instances": 1, "wake": "on-demand", "target_concurrency": 4,
                "context_length": 4096, "largest_output": 512}}
 )[0]

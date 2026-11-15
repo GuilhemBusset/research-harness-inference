@@ -11,7 +11,7 @@ from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, S
 
 START = 1_800_000_000
 CONFIG = parse_pools(
-    {"review": {"engine": "mock", "instance_types": ["g6e.xlarge"], "max_instances": 4,
+    {"review": {"engine": "mock", "instance_types": ["g6e.xlarge"], "prices": {"g6e.xlarge": 1.86}, "max_instances": 4,
                 "warm_instances": 1, "wake": "on-demand", "target_concurrency": 8,
                 "context_length": 32768, "largest_output": 4096}}
 )[0]

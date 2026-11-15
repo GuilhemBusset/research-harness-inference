@@ -12,16 +12,29 @@ time and the drain. `target_concurrency` and `gpu_hours_per_day` are a pool's ow
 every pool gives the first and every vllm pool the second. A mock pool serves canned responses
 from no model repository: it may leave out `model`, `revision` and `gpu_hours_per_day`.
 
+Each pool prices every instance type it lists, in dollars an hour (sections 5.4 and 7.2): the
+first listed type is the one it runs, the others are its fallbacks, the next sizes of the same GPU,
+which cost more. The scaler accrues what actually ran at these prices. A fallback is a price the
+pool can run at, so every listed type is held to the on-demand price limit: a pool priced above it
+may only wake on schedule (sections 11.3 and 17). The limit is the caller's, 5 dollars an hour
+when none is given.
+
+A pool may give `expected`, the values the inference dashboard draws beside the measured series
+(sections 4.7 and 7.3): each of speed per stream, time to first token and cache capacity is
+optional, and is a low and a high bound.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
 **Adding a field.** The configuration is written once and loaded on every deployment by a loader
 that fails closed. A field added after the first pool was written therefore has a default or is
-optional: one that every pool had to give would fail the next deployment.
+optional: one that every pool had to give would fail the next deployment. `prices` is required
+because it came before the first pool reached the deployed configuration.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
@@ -34,6 +47,11 @@ DEFAULT_HOLD_SECONDS = 420
 DEFAULT_HOLD_SECONDS_NON_STREAMING = 240
 DEFAULT_IDLE_MINUTES = 20
 DEFAULT_DRAIN_SECONDS = 300
+# Dollars an hour: a pool with an instance type priced above it may not wake on demand (11.3, 17).
+DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
+
+# The keys of `expected`, each a low and a high bound (section 4.7).
+EXPECTED_KEYS = ("stream_tokens_per_second", "time_to_first_token_seconds", "cache_tokens")
 
 # Students choose a pool by model name, and Claude Code requires a served name without a slash
 # (section 4.2): the pool's name is that model name.
@@ -56,6 +74,18 @@ class PoolConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class ExpectedValues:
+    """What a pool is expected to measure, each a (low, high) pair, or None when it gives no estimate."""
+
+    # Tokens a second, per stream, at the pool's target concurrency.
+    stream_tokens_per_second: tuple[float, float] | None
+    # Seconds to the first token of a turn whose transcript is cached.
+    time_to_first_token_seconds: tuple[float, float] | None
+    # Tokens of cache.
+    cache_tokens: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
 class Pool:
     """One pool, typed. Its fields other than `name` are the fields an entry may hold."""
 
@@ -65,7 +95,10 @@ class Pool:
     # The model repository and its pinned commit. A vllm pool has both.
     model: str | None
     revision: str | None
+    # The type it runs first, then its fallbacks.
     instance_types: tuple[str, ...]
+    # Dollars an hour for each instance type, in the order of `instance_types`.
+    prices: dict[str, float]
     max_instances: int
     # Prepared instances, running or stopped, that the group keeps: from 0 to `max_instances`.
     warm_instances: int
@@ -84,6 +117,8 @@ class Pool:
     # None until a start has been measured (spike S1): the launch hook's deadline becomes twice
     # this (sections 4.3 and 17).
     measured_start_seconds: int | None
+    # None when the pool gives no estimate (the mock).
+    expected: ExpectedValues | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -132,7 +167,63 @@ def _instance_types(pool: str, entry: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _parse_pool(name: str, entry: object) -> Pool:
+def _number(value: object) -> float | None:
+    """The value as a finite number, or None when it is not one (a boolean, text, NaN, infinity)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value
+
+
+def _prices(pool: str, entry: Mapping[str, object], instance_types: tuple[str, ...]) -> dict[str, float]:
+    field = "prices"
+    if field not in entry:
+        raise PoolConfigError(pool, field, "is missing")
+    value = entry[field]
+    if not isinstance(value, Mapping):
+        raise PoolConfigError(pool, field, "must be a table of instance types and their prices")
+    if any(kind not in instance_types for kind in value):
+        raise PoolConfigError(pool, field, "prices an instance type the pool does not list")
+    prices: dict[str, float] = {}
+    for kind in instance_types:
+        if kind not in value:
+            raise PoolConfigError(pool, field, "must price every listed instance type")
+        price = _number(value[kind])
+        if price is None:
+            raise PoolConfigError(pool, field, "must hold numbers, in dollars an hour")
+        if price < 0:
+            raise PoolConfigError(pool, field, "must hold prices of at least 0")
+        prices[kind] = price
+    return prices
+
+
+def _bounds(pool: str, value: object) -> tuple[float, float]:
+    field = "expected"
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise PoolConfigError(pool, field, "must give each quantity as a low and a high bound")
+    low, high = _number(value[0]), _number(value[1])
+    if low is None or high is None:
+        raise PoolConfigError(pool, field, "must give bounds that are numbers")
+    if low < 0 or high <= 0:
+        raise PoolConfigError(pool, field, "must give a low bound of at least 0 and a high bound above 0")
+    if low > high:
+        raise PoolConfigError(pool, field, "must give a low bound at most its high bound")
+    return (low, high)
+
+
+def _expected(pool: str, entry: Mapping[str, object]) -> ExpectedValues | None:
+    field = "expected"
+    if field not in entry:
+        return None
+    value = entry[field]
+    if not isinstance(value, Mapping):
+        raise PoolConfigError(pool, field, f"must be a table of: {', '.join(EXPECTED_KEYS)}")
+    if any(key not in EXPECTED_KEYS for key in value):
+        raise PoolConfigError(pool, field, f"may only hold: {', '.join(EXPECTED_KEYS)}")
+    given = {key: _bounds(pool, value[key]) if key in value else None for key in EXPECTED_KEYS}
+    return ExpectedValues(**given)
+
+
+def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
     if not isinstance(entry, Mapping):
@@ -153,15 +244,22 @@ def _parse_pool(name: str, entry: object) -> Pool:
     if warm_instances > max_instances:
         raise PoolConfigError(name, "warm_instances", "must be at most max_instances")
 
+    instance_types = _instance_types(name, entry)
+    prices = _prices(name, entry, instance_types)
+    wake = _choice(name, entry, "wake", WAKES)
+    if wake == "on-demand" and any(price > on_demand_price_limit for price in prices.values()):
+        raise PoolConfigError(name, "wake", "must be scheduled-only: an instance type is priced above the limit")
+
     return Pool(
         name=name,
         engine=engine,
         model=model,
         revision=revision,
-        instance_types=_instance_types(name, entry),
+        instance_types=instance_types,
+        prices=prices,
         max_instances=max_instances,
         warm_instances=warm_instances,
-        wake=_choice(name, entry, "wake", WAKES),
+        wake=wake,
         target_concurrency=_whole(name, entry, "target_concurrency", least=1),
         context_length=_whole(name, entry, "context_length", least=1),
         largest_output=_whole(name, entry, "largest_output", least=1),
@@ -179,13 +277,17 @@ def _parse_pool(name: str, entry: object) -> Pool:
         measured_start_seconds=(
             _whole(name, entry, "measured_start_seconds", least=1) if "measured_start_seconds" in entry else None
         ),
+        expected=_expected(name, entry),
     )
 
 
-def parse_pools(table: Mapping[str, object]) -> tuple[Pool, ...]:
+def parse_pools(
+    table: Mapping[str, object], *, on_demand_price_limit: float = DEFAULT_ON_DEMAND_PRICE_LIMIT
+) -> tuple[Pool, ...]:
     """The pools of the configuration's `pools` table, typed, in the table's order.
 
-    `table` maps each pool's name to its entry, as TOML reads `[pools.<name>]`. The first entry
-    that breaks a rule raises `PoolConfigError`.
+    `table` maps each pool's name to its entry, as TOML reads `[pools.<name>]`. A pool that wakes
+    on demand may price no instance type above `on_demand_price_limit`, in dollars an hour. The
+    first entry that breaks a rule raises `PoolConfigError`.
     """
-    return tuple(_parse_pool(name, entry) for name, entry in table.items())
+    return tuple(_parse_pool(name, entry, on_demand_price_limit) for name, entry in table.items())

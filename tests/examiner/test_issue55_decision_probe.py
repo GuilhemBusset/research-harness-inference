@@ -17,6 +17,7 @@ POOL = parse_pools(
         "probe": {
             "engine": "mock",
             "instance_types": ["g6e.xlarge"],
+            "prices": {"g6e.xlarge": 1.86},
             "max_instances": 2,
             "warm_instances": 0,
             "wake": "on-demand",

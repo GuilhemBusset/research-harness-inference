@@ -23,7 +23,7 @@ from rhi_scaler.settings import SettingsError, read_settings
 NOW = 1_800_000_000
 URL = "https://aps.example.com/workspaces/ws-example/api/v1/remote_write"
 ENTRY = {
-    "engine": "mock", "instance_types": ["t4g.small"], "max_instances": 1,
+    "engine": "mock", "instance_types": ["t4g.small"], "prices": {"t4g.small": 0.0168}, "max_instances": 1,
     "warm_instances": 1, "wake": "on-demand", "target_concurrency": 4,
     "context_length": 32768, "largest_output": 4096,
 }

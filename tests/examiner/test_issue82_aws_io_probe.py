@@ -21,7 +21,7 @@ EMPTY_MEMORY = Memory()
 
 def settings(name: str) -> PoolSettings:
     pool = parse_pools({name: {
-        "engine": "mock", "instance_types": ["g6e.xlarge"], "max_instances": 4,
+        "engine": "mock", "instance_types": ["g6e.xlarge"], "prices": {"g6e.xlarge": 1.86}, "max_instances": 4,
         "warm_instances": 2, "wake": "on-demand", "target_concurrency": 8,
         "context_length": 32768, "largest_output": 4096,
     }})[0]
