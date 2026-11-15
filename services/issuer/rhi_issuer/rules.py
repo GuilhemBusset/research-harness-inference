@@ -21,11 +21,23 @@ hold across them because a student's issuances happen one after the other: every
 a login names, in its item's `successor`, the key issued next to the same student, and the write
 that stores a key also sets `successor` on the student's latest key, on condition that it has
 none yet. Of two logins that read the same keys, one write lands and the other is cancelled; the
-cancelled login reads the keys again and applies the rules to what it now finds. A student with
-no key from a login has no latest key to name: the first issuance holds a short lock instead, an
-item under `lock#` and the student's GitHub ID, taken before the keys are read again and deleted
-in the write that stores the key. A lock older than `LOCK_SECONDS` is taken over. A login that
-loses this race `ATTEMPTS` times is refused with `Refusal.LOGIN_CONFLICT`.
+cancelled login reads the keys again, following `successor` with consistent reads, and applies
+the rules to what it now finds. A student with no key from a login has no latest key to name:
+the first issuance holds a short lock instead, an item under `lock#` and the student's GitHub ID,
+taken before the keys are read again and deleted in the write that stores the key. A lock older
+than `LOCK_SECONDS` is taken over. A login that loses this race `ATTEMPTS` times is refused with
+`Refusal.LOGIN_CONFLICT`.
+
+The index by student is updated after the table, so it may not show yet a key stored a moment
+before, or show only some of the student's keys. The rules do not rest on it alone:
+
+- every key issued at a login carries, in its item's `ledger`, the SHA-256 of each key of the
+  student that the rules must still see: the keys left active, and the keys issued over the same
+  UTC day, itself included. A login reads the ledger of the latest key and reads, with a
+  consistent read, every key it names that the index did not show;
+- when the index shows no key from a login, the student's keys are read with a consistent scan
+  of the table before the student is taken for one who has none. This happens at a student's
+  first login, or when the index has not caught up with it.
 
 This module logs nothing, and the key is in what `issue` returns and nowhere else.
 """
@@ -54,6 +66,7 @@ _DAY_SECONDS = 86400
 
 _REVOKED_AT = "revoked_at"
 _SUCCESSOR = "successor"
+_LEDGER = "ledger"
 _LOCK_PREFIX = "lock#"
 _LOCKED_AT = "locked_at"
 _HOLDER = "holder"
@@ -67,6 +80,7 @@ class _Known:
 
     record: StudentKey
     successor: str | None
+    ledger: tuple[str, ...] = ()
 
 
 def _known(item: dict[str, Any]) -> _Known | None:
@@ -75,7 +89,15 @@ def _known(item: dict[str, Any]) -> _Known | None:
     except RecordError:
         return None
     successor = item.get(_SUCCESSOR)
-    return _Known(record, successor if isinstance(successor, str) else None)
+    ledger = item.get(_LEDGER)
+    named = tuple(value for value in ledger if isinstance(value, str)) if isinstance(ledger, (list, set)) else ()
+    return _Known(record, successor if isinstance(successor, str) else None, named)
+
+
+def _read(key_hash: str, keys: Any) -> _Known | None:
+    """The key under that SHA-256, read with a consistent read; `None` when there is none."""
+    item = keys.get_item(Key={KEYS.partition_key.name: key_hash}, ConsistentRead=True).get("Item")
+    return None if item is None else _known(item)
 
 
 def _student_keys(github_id: int, keys: Any) -> dict[str, _Known]:
@@ -99,29 +121,66 @@ def _student_keys(github_id: int, keys: Any) -> dict[str, _Known]:
         query["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
-def _latest(found: dict[str, _Known], keys: Any) -> _Known | None:
+def _scanned_keys(github_id: int, keys: Any) -> dict[str, _Known]:
+    """Every key of the student, by SHA-256, read with a consistent scan of the table."""
+    scan: dict[str, Any] = {
+        "ConsistentRead": True,
+        "FilterExpression": "#student = :student",
+        "ExpressionAttributeNames": {"#student": KEYS.index(BY_STUDENT).partition_key.name},
+        "ExpressionAttributeValues": {":student": github_id},
+    }
+    found: dict[str, _Known] = {}
+    while True:
+        answer = keys.scan(**scan)
+        for item in answer.get("Items") or []:
+            known = _known(item)
+            if known is not None and known.record.github_id == github_id:
+                found[known.record.key_hash] = known
+        if "LastEvaluatedKey" not in answer:
+            return found
+        scan["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
+
+
+def _latest(found: dict[str, _Known], keys: Any, *, consistent: bool) -> _Known | None:
     """The student's latest key from a login, the one with no successor; `None` when there is none.
 
-    The walk starts at the newest key the index shows and follows `successor`, reading with a
-    consistent read a key the index does not show yet. The keys it reads are added to `found`.
+    The walk starts at the newest key in `found` and follows `successor`, reading with a
+    consistent read a key that `found` lacks, or, when `consistent`, every key it walks. The keys
+    it reads replace or join those in `found`.
     """
     issued = [known for known in found.values() if known.record.installation is not None]
     if not issued:
         return None
-    current = max(issued, key=lambda known: (known.record.issued_at, known.record.key_hash))
-    walked = {current.record.key_hash}
-    while current.successor is not None and current.successor not in walked:
+    current: _Known | None = max(issued, key=lambda known: (known.record.issued_at, known.record.key_hash))
+    walked: set[str] = set()
+    while current is not None:
+        if consistent:
+            fresh = _read(current.record.key_hash, keys)
+            if fresh is not None:
+                current = fresh
+                found[current.record.key_hash] = current
+        walked.add(current.record.key_hash)
+        if current.successor is None or current.successor in walked:
+            return current
         following = found.get(current.successor)
-        if following is None:
-            item = keys.get_item(Key={KEYS.partition_key.name: current.successor}, ConsistentRead=True).get("Item")
-            following = None if item is None else _known(item)
+        if following is None or consistent:
+            following = _read(current.successor, keys)
             if following is None:
                 # A successor that is gone: the write's condition names the value this key holds.
                 return current
             found[following.record.key_hash] = following
         current = following
-        walked.add(current.record.key_hash)
-    return current
+    return None
+
+
+def _recall(latest: _Known, found: dict[str, _Known], github_id: int, keys: Any) -> None:
+    """Adds to `found` every key the latest key's ledger names that `found` lacks, read with a consistent read."""
+    for key_hash in latest.ledger:
+        if key_hash in found:
+            continue
+        known = _read(key_hash, keys)
+        if known is not None and known.record.github_id == github_id:
+            found[key_hash] = known
 
 
 def _day_start(now: int) -> int:
@@ -180,8 +239,22 @@ def _release_lock(github_id: int, holder: str, keys: Any) -> None:
             raise
 
 
+def _ledger(record: StudentKey, existing: list[StudentKey], replaced: list[StudentKey], now: int) -> list[str]:
+    """What the new key's `ledger` names: the keys left active, and the keys issued over this UTC day, itself included."""
+    revoked = {old.key_hash for old in replaced}
+    day_start = _day_start(now)
+    named = {record.key_hash}
+    for old in existing:
+        if (
+            _is_active(old, now) and old.key_hash not in revoked
+        ) or day_start <= old.issued_at < day_start + _DAY_SECONDS:
+            named.add(old.key_hash)
+    return sorted(named)
+
+
 def _store(
     record: StudentKey,
+    ledger: list[str],
     replaced: list[StudentKey],
     latest: _Known | None,
     holder: str | None,
@@ -198,7 +271,7 @@ def _store(
         {
             "Put": {
                 "TableName": keys.name,
-                "Item": record.to_item(),
+                "Item": {**record.to_item(), _LEDGER: ledger},
                 # Never over an item that is there: two keys do not share a SHA-256.
                 "ConditionExpression": "attribute_not_exists(#hash)",
                 "ExpressionAttributeNames": names,
@@ -294,16 +367,24 @@ def issue(
     for attempt in range(ATTEMPTS):
         if attempt:
             _pause(attempt)
+        # A login that lost a race reads the chain of keys again with consistent reads.
+        consistent = attempt > 0
         found = _student_keys(entry.github_id, keys)
-        latest = _latest(found, keys)
+        latest = _latest(found, keys, consistent=consistent)
         holder = None
+        if latest is None:
+            # The index may not show yet a key stored a moment before.
+            found = _scanned_keys(entry.github_id, keys)
+            latest = _latest(found, keys, consistent=consistent)
         if latest is None:
             holder = _take_lock(entry.github_id, now, keys)
             if holder is None:
                 continue
             # What another login stored before the lock was taken.
-            found = _student_keys(entry.github_id, keys)
-            latest = _latest(found, keys)
+            found = _scanned_keys(entry.github_id, keys)
+            latest = _latest(found, keys, consistent=True)
+        if latest is not None:
+            _recall(latest, found, entry.github_id, keys)
         existing = [known.record for known in found.values()]
         try:
             _apply_rules(existing, installation, now, issuances_per_day)
@@ -313,7 +394,7 @@ def issue(
             raise
         key, record = mint(entry, installation, course_end=course_end, now=now)
         replaced = [old for old in existing if _is_active(old, now) and old.installation == installation]
-        if _store(record, replaced, latest, holder, now, keys):
+        if _store(record, _ledger(record, existing, replaced, now), replaced, latest, holder, now, keys):
             previous = max((old.issued_at for old in existing), default=None)
             return Minted(
                 key=key, issued_at=record.issued_at, expires_at=record.expires_at, previous_issued_at=previous
