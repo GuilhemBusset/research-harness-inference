@@ -7,6 +7,7 @@ from pathlib import Path
 def wiring(monkeypatch):
     monkeypatch.setenv("JSII_RUNTIME_PACKAGE_CACHE", "disabled")
     spec = importlib.util.spec_from_file_location("examiner32_app", Path("app.py"))
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -25,6 +26,7 @@ def test_nearest_module_entries_are_exact(monkeypatch, tmp_path):
         path = source / f"{name}.py"
         path.write_text("from constructs import Construct\nclass Scope(Construct): pass\n")
         spec = importlib.util.spec_from_file_location(f"examiner32_{name}", path)
+        assert spec is not None and spec.loader is not None
         loaded = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, loaded)
         spec.loader.exec_module(loaded)

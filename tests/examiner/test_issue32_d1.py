@@ -9,6 +9,7 @@ import pytest
 def wiring(monkeypatch):
     monkeypatch.setenv("JSII_RUNTIME_PACKAGE_CACHE", "disabled")
     spec = importlib.util.spec_from_file_location("examiner32_app", Path("app.py"))
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
