@@ -1,29 +1,39 @@
-"""The key issuer's function: two routes behind the load balancer (system design, section 6.4).
+"""The key issuer's function: four routes behind the load balancer (system design, section 6.4).
 
 | Route | Takes | Answers |
 | --- | --- | --- |
 | `GET /auth/config` | nothing | `{"client_id"}`: the login app's client ID, and nothing else |
 | `POST /auth/login` | `{"device_code", "installation"}` | `{"key", "issued_at", "expires_at", "previous_issued_at"}` |
+| `POST /auth/revoke` | the key, in `Authorization: Bearer <key>` | `{"revoked": 1}` |
+| `POST /auth/revoke-all` | `{"device_code"}` | `{"revoked"}`: how many keys it revoked |
 
 The CLI reads the client ID here because it is not in the repository, starts a device flow with
 GitHub, and sends the device code with the identifier of its installation. A login redeems the
-code (`rhi_issuer.redeem`) and mints a key (`rhi_issuer.mint`). The key is in that one answer and
+code (`rhi_issuer.redeem`) and issues a key under the rules of an issuance (`rhi_issuer.rules`):
+one key per installation, two installations, a daily limit. The key is in that one answer and
 nowhere else. The three times are whole seconds since the epoch, and `previous_issued_at` is
 `null` for a student's first key.
 
+`rhi revoke` revokes the installation's own key, authenticated by that key and by nothing else
+(`rhi_issuer.revoke`). `rhi revoke --all` must work when a key is lost, so it takes a fresh device
+code instead: the code is redeemed and checked against the roster exactly as a login's is, then
+every key of that student is revoked. A key is never taken in place of the device code: a body
+without a device code of the right shape is refused, whatever key the request carries.
+
 Every other answer is `{"error": {"code", "message"}}`, with a code and a sentence that are
 constants of this package: a `rhi_issuer.redeem.Refusal`, or `not_found` for any other path or
-method. A body that is not the JSON object above, with both members of the right shape, is
+method. A body that is not the JSON object above, with its members of the right shape, is
 refused before any call to GitHub or to a table.
 
 What the function reads from its environment, which the stack sets:
 
 - `RHI_CLIENT_ID`, the login app's client ID;
 - `RHI_COURSE_END`, the course end date, as YYYY-MM-DD;
-- `RHI_ROSTER_TABLE` and `RHI_KEYS_TABLE`, the names of the two tables.
+- `RHI_ROSTER_TABLE` and `RHI_KEYS_TABLE`, the names of the two tables;
+- `RHI_ISSUANCES_PER_DAY`, the most keys a student may be issued over one UTC day, 5 when unset.
 
 The function is the target of a load balancer, with multi-value headers off: `handler` takes the
-load balancer's event (`httpMethod`, `path`, `body`, `isBase64Encoded`) and returns its answer
+load balancer's event (`httpMethod`, `path`, `headers`, `body`, `isBase64Encoded`) and returns its answer
 (`statusCode`, `headers`, `body`, `isBase64Encoded`). This module logs nothing.
 """
 
@@ -42,16 +52,20 @@ from typing import Any
 
 import boto3
 
-from rhi_issuer.mint import mint
 from rhi_issuer.redeem import GitHub, Refusal, Refused, is_device_code, is_installation, redeem
+from rhi_issuer.revoke import revoke_all, revoke_key
+from rhi_issuer.rules import DEFAULT_ISSUANCES_PER_DAY, issue
 
 CLIENT_ID_VARIABLE = "RHI_CLIENT_ID"
 COURSE_END_VARIABLE = "RHI_COURSE_END"
 ROSTER_TABLE_VARIABLE = "RHI_ROSTER_TABLE"
 KEYS_TABLE_VARIABLE = "RHI_KEYS_TABLE"
+ISSUANCES_PER_DAY_VARIABLE = "RHI_ISSUANCES_PER_DAY"
 
 CONFIG_PATH = "/auth/config"
 LOGIN_PATH = "/auth/login"
+REVOKE_PATH = "/auth/revoke"
+REVOKE_ALL_PATH = "/auth/revoke-all"
 
 type Answer = dict[str, Any]
 
@@ -70,8 +84,8 @@ def _error(status: int, code: str, sentence: str) -> Answer:
     return _answer(status, {"error": {"code": code, "message": sentence}})
 
 
-def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
-    """The device code and the installation's identifier of a login; `Refused` for any other body."""
+def _request(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The JSON object of the event's body; `Refused` for any other body."""
     body = event.get("body")
     try:
         if event.get("isBase64Encoded") and isinstance(body, str):
@@ -81,17 +95,45 @@ def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
         request = None
     if not isinstance(request, dict):
         raise Refused(Refusal.INVALID_REQUEST)
+    return request
+
+
+def _login_request(event: Mapping[str, Any]) -> tuple[str, str]:
+    """The device code and the installation's identifier of a login; `Refused` for any other body."""
+    request = _request(event)
     device_code, installation = request.get("device_code"), request.get("installation")
     if not is_device_code(device_code) or not is_installation(installation):
         raise Refused(Refusal.INVALID_REQUEST)
     return device_code, installation
 
 
+def _revoke_all_request(event: Mapping[str, Any]) -> str:
+    """The device code of a revocation of every key; `Refused` for any other body, a key included."""
+    device_code = _request(event).get("device_code")
+    if not is_device_code(device_code):
+        raise Refused(Refusal.INVALID_REQUEST)
+    return device_code
+
+
+def _bearer_key(event: Mapping[str, Any]) -> str | None:
+    """The key in the event's `Authorization: Bearer` header; `None` when there is no such header."""
+    headers = event.get("headers")
+    if not isinstance(headers, Mapping):
+        return None
+    # The load balancer passes header names as the client wrote them; HTTP does not tell cases apart.
+    values = [value for name, value in headers.items() if isinstance(name, str) and name.lower() == "authorization"]
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    scheme, _, key = values[0].partition(" ")
+    return key if scheme.lower() == "bearer" else None
+
+
 @dataclass(frozen=True)
 class Issuer:
     """The issuer, with what its environment gives it.
 
-    `roster` and `keys` are the two tables, as table resources of the AWS SDK. `github` and
+    `roster` and `keys` are the two tables, as table resources of the AWS SDK.
+    `issuances_per_day` is the most keys a student may be issued over one UTC day. `github` and
     `clock` are for the tests.
     """
 
@@ -99,6 +141,7 @@ class Issuer:
     course_end: datetime.date
     roster: Any
     keys: Any
+    issuances_per_day: int = DEFAULT_ISSUANCES_PER_DAY
     github: GitHub = field(default_factory=GitHub)
     clock: Callable[[], float] = time.time
 
@@ -107,24 +150,42 @@ class Issuer:
         route = (event.get("httpMethod"), event.get("path"))
         if route == ("GET", CONFIG_PATH):
             return _answer(200, {"client_id": self.client_id})
-        if route == ("POST", LOGIN_PATH):
-            try:
-                return _answer(200, self._login(event))
-            except Refused as refused:
-                refusal = refused.refusal
-            return _error(refusal.status, refusal.value, refusal.sentence)
-        return _error(404, "not_found", "The issuer has no such route.")
+        actions = {LOGIN_PATH: self._login, REVOKE_PATH: self._revoke, REVOKE_ALL_PATH: self._revoke_all}
+        action = actions.get(route[1]) if route[0] == "POST" and isinstance(route[1], str) else None
+        if action is None:
+            return _error(404, "not_found", "The issuer has no such route.")
+        try:
+            return _answer(200, action(event))
+        except Refused as refused:
+            refusal = refused.refusal
+        return _error(refusal.status, refusal.value, refusal.sentence)
 
     def _login(self, event: Mapping[str, Any]) -> dict[str, object]:
         device_code, installation = _login_request(event)
         entry = redeem(device_code, client_id=self.client_id, roster=self.roster, github=self.github)
-        minted = mint(entry, installation, course_end=self.course_end, now=int(self.clock()), keys=self.keys)
+        minted = issue(
+            entry,
+            installation,
+            course_end=self.course_end,
+            now=int(self.clock()),
+            keys=self.keys,
+            issuances_per_day=self.issuances_per_day,
+        )
         return {
             "key": minted.key,
             "issued_at": minted.issued_at,
             "expires_at": minted.expires_at,
             "previous_issued_at": minted.previous_issued_at,
         }
+
+    def _revoke(self, event: Mapping[str, Any]) -> dict[str, object]:
+        revoke_key(_bearer_key(event), keys=self.keys, now=int(self.clock()))
+        return {"revoked": 1}
+
+    def _revoke_all(self, event: Mapping[str, Any]) -> dict[str, object]:
+        device_code = _revoke_all_request(event)
+        entry = redeem(device_code, client_id=self.client_id, roster=self.roster, github=self.github)
+        return {"revoked": revoke_all(entry.github_id, keys=self.keys, now=int(self.clock()))}
 
 
 @functools.cache
@@ -134,14 +195,20 @@ def _dynamodb() -> Any:
 
 
 def from_environment(*, github: GitHub | None = None, clock: Callable[[], float] = time.time) -> Issuer:
-    """The issuer its environment describes. A variable that is absent, and a course end that is
-    not a date, raise: the function then answers nothing."""
+    """The issuer its environment describes. A variable that is absent (except the daily limit),
+    a course end that is not a date and a daily limit that is not a whole number above zero raise:
+    the function then answers nothing."""
+    limit = os.environ.get(ISSUANCES_PER_DAY_VARIABLE)
+    issuances_per_day = DEFAULT_ISSUANCES_PER_DAY if limit is None else int(limit)
+    if issuances_per_day < 1:
+        raise ValueError(f"{ISSUANCES_PER_DAY_VARIABLE} is not a whole number above zero")
     dynamodb = _dynamodb()
     return Issuer(
         client_id=os.environ[CLIENT_ID_VARIABLE],
         course_end=datetime.date.fromisoformat(os.environ[COURSE_END_VARIABLE]),
         roster=dynamodb.Table(os.environ[ROSTER_TABLE_VARIABLE]),
         keys=dynamodb.Table(os.environ[KEYS_TABLE_VARIABLE]),
+        issuances_per_day=issuances_per_day,
         github=github or GitHub(),
         clock=clock,
     )
