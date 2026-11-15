@@ -43,19 +43,19 @@ _LOG = logging.getLogger(__name__)
 class PoolView:
     """What the last cycle left for one pool.
 
-    `ready` is whether the target group had a healthy target; `mode` and `note` are the last
-    records read, `None` when the table holds none (or nothing was read yet). `read_at` is when the
-    cycle that set these values started, `None` before the first one.
+    `ready` is whether the target group had a healthy target, and `observed_at` when that answer
+    came back (the moment the gateway learnt it), `None` before the first read. `mode` and `note`
+    are the last records read, `None` when the table holds none (or nothing was read yet).
     """
 
     ready: bool = False
     mode: PoolState | None = None
     note: ScalerNote | None = None
-    read_at: float | None = None
+    observed_at: float | None = None
 
 
-# Called after each cycle with the new views and the time the cycle started.
-Subscriber = Callable[[Mapping[str, PoolView], float], None]
+# Called after each cycle with the new views.
+Subscriber = Callable[[Mapping[str, PoolView]], None]
 
 
 class Readiness:
@@ -93,42 +93,43 @@ class Readiness:
         return self._views
 
     def subscribe(self, subscriber: Subscriber) -> None:
-        """Call `subscriber` after every cycle, with the new views and the time the cycle started."""
+        """Call `subscriber` after every cycle, with the new views."""
         self._subscribers.append(subscriber)
 
     def refresh(self) -> None:
         """One cycle: read every pool, then keep the values and tell the subscribers."""
-        self._apply(*self._read_all())
+        self._apply(self._read_all())
 
     async def run(self, sleep: Callable[[float], Awaitable[object]] = asyncio.sleep) -> None:
         """Repeat the cycle every 5 seconds until cancelled. The blocking reads run in a worker thread."""
         next_at = self._clock()
         while True:
-            self._apply(*await asyncio.to_thread(self._read_all))
+            self._apply(await asyncio.to_thread(self._read_all))
             # A fixed cadence: the time a cycle takes is not added to the interval.
             next_at = max(next_at + INTERVAL_SECONDS, self._clock())
             await sleep(next_at - self._clock())
 
-    def _read_all(self) -> tuple[dict[str, PoolView], float]:
-        started = self._clock()
+    def _read_all(self) -> dict[str, PoolView]:
         previous = self._views
         views = {}
         for pool, target_group in self._target_groups.items():
             before = previous[pool]
+            ready = self._read_health(pool, target_group)
+            observed_at = self._clock()
             views[pool] = PoolView(
-                ready=self._read_health(pool, target_group),
+                ready=ready,
                 mode=self._read_record(pool, MODE_RECORD, PoolState.from_item, before.mode),
                 note=self._read_record(pool, NOTE_RECORD, ScalerNote.from_item, before.note),
-                read_at=started,
+                observed_at=observed_at,
             )
-        return views, started
+        return views
 
-    def _apply(self, views: dict[str, PoolView], started: float) -> None:
+    def _apply(self, views: dict[str, PoolView]) -> None:
         # One assignment: a caller sees either the previous cycle or this one, never a mix.
         self._views = MappingProxyType(views)
         for subscriber in self._subscribers:
             try:
-                subscriber(self._views, started)
+                subscriber(self._views)
             except Exception:  # noqa: BLE001 - a failing subscriber must not stop the reads
                 _LOG.exception("a readiness subscriber failed")
 

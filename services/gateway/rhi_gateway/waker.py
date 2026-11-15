@@ -8,7 +8,9 @@ holds a request repeats the wake every 15 seconds (section 5.1).
 The same module keeps the explicit wakes, those a student asked for with `POST /wake`. One counts
 as demand until its pool is ready or 10 minutes have passed, whichever comes first (section 5.3).
 The waker learns readiness from `rhi_gateway.readiness`: after every cycle that finds a pool ready,
-the pool's pending wakes end, at the time of that cycle. `pending` says how many are still pending
+the pool's pending wakes end at the moment the health answer came back, or at their own recording
+if that came later. A wake whose 10 minutes ran out before that moment expired and does not count
+as ended ready. `pending` says how many are still pending
 for a pool and `ended_ready_at` when the last one ended with its pool ready. The hold, the local
 routes and the demand report all read these, and none of them reads AWS.
 
@@ -83,13 +85,22 @@ class Waker:
         self._pending[pool] = kept
         return kept
 
-    def _settle(self, views: Mapping[str, PoolView], started: float) -> None:
-        """After a readiness cycle: the wakes of every pool it found ready end, at the time of the cycle."""
+    def _settle(self, views: Mapping[str, PoolView]) -> None:
+        """After a readiness cycle: the wakes of every pool it found ready end.
+
+        A wake ends at the moment the pool was observed ready, or at its recording when that came
+        later (the pool was already known ready then, as in `record`); never before it was
+        recorded. A wake already 10 minutes old at the observation expired instead.
+        """
         with self._lock:
             for pool, view in views.items():
-                if view.ready and self._unexpired(pool, started):
-                    self._pending[pool] = []
-                    self._ended_ready_at[pool] = started
+                observed_at = view.observed_at
+                if not view.ready or observed_at is None:
+                    continue
+                ended = [max(observed_at, at) for at in self._pending[pool] if observed_at - at < EXPLICIT_WAKE_SECONDS]
+                self._pending[pool] = []
+                if ended:
+                    self._ended_ready_at[pool] = max(ended)
 
     def _invoke(self, pool: str) -> None:
         try:
