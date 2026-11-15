@@ -5,11 +5,25 @@ owner can supply come from a source the environment variable `RHI_CONFIG` names:
 
 - `example`: the committed `config.example.toml`, which every test and every agent uses;
 - `file`: a TOML file git does not track, `config.local.toml` at the repository root or the file
-  `RHI_CONFIG_FILE` names. The pipeline's synth step writes it from SSM, outside its checkout.
+  `RHI_CONFIG_FILE` names. The pipeline's synth step writes it from SSM, outside its checkout;
+- `ssm`: the parameters the owner wrote to SSM, read with the caller's credentials and region.
 
 An unset `RHI_CONFIG`, any other source, a source that cannot be read, an unknown key, a missing
 key that has no default and a value of the wrong type all raise `ConfigError`. Nothing falls back
-to the example. An error names a key or a source and never a value: build logs show it.
+to the example. An error names a key, a parameter or a source and never a value: build logs show
+it.
+
+**The configuration in SSM.** One String parameter per key, named `SSM_PREFIX` followed by the
+key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the entry: an
+empty table has none. A string is stored as it is, a number in digits, a date as YYYY-MM-DD and
+an empty list as `[]`. The prefix holds the configuration and nothing else. The source reads the
+prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
+no key, like an unknown key. No value is a credential (system design, section 10), so none is a
+SecureString. The module names no region and no account.
+
+`write_ssm` and `write_file` write a configuration back out, in the form the ssm source and the
+file source read: each source loads what its writer wrote as the same object. The AWS SDK is
+imported by the ssm source and by `write_ssm` only, when one of them runs.
 
 The region and the account are not configuration. They come from the deploying credentials
 (assumption A4), so no key holds either.
@@ -23,7 +37,9 @@ It is added to `Config`, to `KEYS` and to `config.example.toml` together.
 from __future__ import annotations
 
 import datetime
+import json
 import os
+import re
 import tomllib
 import zoneinfo
 from dataclasses import dataclass
@@ -36,6 +52,11 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_FILE = "config.example.toml"
 LOCAL_FILE = "config.local.toml"
+
+# Where the configuration is in SSM: one parameter per key under the first, one per entry of the
+# pools table under the second. Other parameters of the system live beside the first, never below.
+SSM_PREFIX = "/rhi/config/"
+SSM_POOLS_PREFIX = SSM_PREFIX + "pools/"
 
 
 class ConfigError(Exception):
@@ -68,13 +89,20 @@ class Config:
     pools: tuple[()]
 
 
+def _as_stored(text: str) -> object:
+    return text
+
+
 @dataclass(frozen=True)
 class Key:
     """How one key is read: `parse` returns the typed value or raises ValueError, and `expected`
-    is what the error then says the value must be."""
+    is what the error then says the value must be. `from_text` turns the text of the key's SSM
+    parameter into the value a TOML file would hold, for `parse` to check; it returns a text that
+    is not of the key's form as it is, which `parse` then refuses."""
 
     expected: str
     parse: Callable[[object], object]
+    from_text: Callable[[str], object] = _as_stored
 
 
 def _string(value: object) -> str:
@@ -115,8 +143,26 @@ def _no_entries(value: object) -> tuple[()]:
     return ()
 
 
+def _number_from_text(text: str) -> object:
+    # ASCII digits only, and few enough that `int` accepts them.
+    return int(text) if re.fullmatch(r"[0-9]{1,18}", text) else text
+
+
+def _date_from_text(text: str) -> object:
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", text):
+        return text
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return text
+
+
+def _list_from_text(text: str) -> object:
+    return [] if text == "[]" else text
+
+
 _STRING = Key("a string that is not empty", _string)
-_EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries)
+_EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -127,9 +173,9 @@ KEYS: dict[str, Key] = {
     "github_owner": _STRING,
     "github_repo": _STRING,
     "login_client_id": _STRING,
-    "monthly_budget_usd": Key("a whole number of US dollars above zero", _whole_dollars),
+    "monthly_budget_usd": Key("a whole number of US dollars above zero", _whole_dollars, _number_from_text),
     "time_zone": Key("an IANA time zone name that this host's time zone database knows", _time_zone),
-    "course_end": Key("a date, written YYYY-MM-DD without quotes", _date),
+    "course_end": Key("a date, written YYYY-MM-DD without quotes", _date, _date_from_text),
     "session_windows": _EMPTY_LIST,
     "pools": _EMPTY_LIST,
 }
@@ -199,7 +245,7 @@ def load(environ: Mapping[str, str] | None = None) -> Config:
     env = os.environ if environ is None else environ
     source = env.get("RHI_CONFIG")
     if source is None:
-        raise ConfigError("RHI_CONFIG is not set: it names the configuration source, example or file")
+        raise ConfigError("RHI_CONFIG is not set: it names the configuration source, example, file or ssm")
     if source == "example":
         return parse(_read(REPO_ROOT / EXAMPLE_FILE, source, EXAMPLE_FILE), source)
     if source == "file":
@@ -207,4 +253,133 @@ def load(environ: Mapping[str, str] | None = None) -> Config:
         if named is None:
             return parse(_read(REPO_ROOT / LOCAL_FILE, source, f"{LOCAL_FILE} at the repository root"), source)
         return parse(_read(Path(named), source, "the file RHI_CONFIG_FILE names"), source)
-    raise ConfigError("RHI_CONFIG names an unknown configuration source: it must be example or file")
+    if source == "ssm":
+        return read_ssm()
+    raise ConfigError("RHI_CONFIG names an unknown configuration source: it must be example, file or ssm")
+
+
+def _ssm(client: Any) -> tuple[Any, tuple[type[Exception], ...]]:
+    """The SSM client, the caller's or one made with the caller's own credentials and region, and
+    the errors a call to it raises. Their messages are AWS's and can hold a value or the account:
+    every caller replaces them."""
+    # Imported here: only the ssm source and its writer load the SDK.
+    import boto3
+    import botocore.exceptions
+
+    errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
+    try:
+        return (boto3.client("ssm") if client is None else client), errors
+    except errors:
+        raise ConfigError("no SSM client can be made: the caller's AWS configuration must give a region") from None
+
+
+def read_ssm(client: Any = None) -> Config:
+    """The configuration the parameters under `SSM_PREFIX` hold: the source `ssm`. `client` is an
+    SSM client of the AWS SDK; without one, the caller's credentials and region make it."""
+    client, errors = _ssm(client)
+    stored: list[Mapping[str, Any]] = []
+    request: dict[str, Any] = {"Path": SSM_PREFIX, "Recursive": True}
+    try:
+        while True:
+            page = client.get_parameters_by_path(**request)
+            stored += page["Parameters"]
+            if not page.get("NextToken"):
+                break
+            request["NextToken"] = page["NextToken"]
+    except errors:
+        raise ConfigError(f"the configuration source 'ssm' cannot be read: the parameters under {SSM_PREFIX}") from None
+
+    data: dict[str, object] = {}
+    entries: list[object] = []
+    stray: list[str] = []
+    not_strings: list[str] = []
+    for parameter in sorted(stored, key=lambda parameter: parameter["Name"]):
+        name: str = parameter["Name"]
+        key = name.removeprefix(SSM_PREFIX)
+        entry = name.removeprefix(SSM_POOLS_PREFIX)
+        is_entry = name.startswith(SSM_POOLS_PREFIX) and entry != "" and "/" not in entry
+        # The pools table is a key with no parameter of its own.
+        is_key = name.startswith(SSM_PREFIX) and key in KEYS and key != "pools"
+        if not is_entry and not is_key:
+            stray.append(name)
+        elif parameter.get("Type") != "String":
+            not_strings.append(name)
+        elif is_entry:
+            entries.append(parameter["Value"])
+        else:
+            data[key] = KEYS[key].from_text(parameter["Value"])
+    for names, problem in ((stray, "that names no key"), (not_strings, "that is not of type String")):
+        if names:
+            listed = ", ".join(repr(name) for name in names)
+            raise ConfigError(f"the configuration source 'ssm' holds a parameter {problem}: {listed}")
+    # The pools table is its entries. `parse` refuses one until entries have a shape.
+    data["pools"] = entries
+    return parse(data, "ssm")
+
+
+def _ssm_text(value: object) -> str:
+    """The value as the text of its SSM parameter, which `Key.from_text` reads."""
+    if isinstance(value, str):
+        value.encode()  # a string that is not text is a ValueError here, not in the middle of the writing
+        return value
+    if type(value) is int:
+        return str(value)
+    if type(value) is datetime.date:
+        return value.isoformat()
+    if isinstance(value, tuple) and not value:
+        return "[]"
+    raise ValueError
+
+
+def _toml_text(value: object) -> str:
+    """The value as TOML writes it."""
+    if isinstance(value, str):
+        # A JSON string is a TOML basic string, but for U+007F, which TOML has escaped.
+        return json.dumps(_ssm_text(value), ensure_ascii=False).replace("\x7f", "\\u007f")
+    return _ssm_text(value)
+
+
+def _written(
+    config: Config, write: Callable[[object], str], read: Callable[[Key, str], object], where: str
+) -> dict[str, str]:
+    """Each key with its value as `write` writes it. A key whose written value `read` and the
+    key's parser do not give back is refused: a writer writes only what its source will load."""
+    texts: dict[str, str] = {}
+    for name, key in KEYS.items():
+        value = getattr(config, name, None)
+        if value is None and name in OPTIONAL:
+            continue  # the source leaves the key out
+        try:
+            text = write(value)
+            same = key.parse(read(key, text)) == value
+        except (ValueError, tomllib.TOMLDecodeError):
+            same = False
+        if not same:
+            raise ConfigError(f"the key {name!r} cannot be written to {where}: it must be {key.expected}")
+        texts[name] = text
+    return texts
+
+
+def write_ssm(config: Config, client: Any = None) -> None:
+    """Writes the configuration to the parameters the source `ssm` reads, over those that exist.
+    It deletes none. `client` is as for `read_ssm`. Nothing is written when a key is refused; a
+    parameter SSM refuses stops the writing there."""
+    texts = _written(config, _ssm_text, lambda key, text: key.from_text(text), "SSM")
+    # The pools table has no parameter of its own: each entry is one, and the table has none.
+    del texts["pools"]
+    client, errors = _ssm(client)
+    for key, text in texts.items():
+        name = SSM_PREFIX + key
+        try:
+            client.put_parameter(Name=name, Value=text, Type="String", Overwrite=True)
+        except errors:
+            raise ConfigError(f"the parameter {name!r} cannot be written") from None
+
+
+def write_file(config: Config, path: Path) -> None:
+    """Writes the configuration to a TOML file the source `file` reads, over the file if it exists."""
+    texts = _written(config, _toml_text, lambda _key, text: tomllib.loads(f"value = {text}")["value"], "a file")
+    try:
+        path.write_text("".join(f"{key} = {text}\n" for key, text in texts.items()), encoding="utf-8")
+    except OSError:
+        raise ConfigError("the configuration cannot be written to the file") from None
