@@ -13,8 +13,9 @@ What the group does, as section 5 describes it:
   started, a cold launch after `cold_start_seconds`. Every instance in service is protected from
   scale-in.
 - An instance that never becomes healthy is abandoned by the launch hook after
-  `launch_hook_seconds` (15 minutes) and terminated; the group then launches a replacement, while
-  launches are not suspended.
+  `launch_hook_seconds` (15 minutes) and terminated, which takes `TERMINATE_SECONDS`. The group
+  launches its replacement once it is gone, while launches are not suspended. A minute's schedule
+  therefore always runs between an abandon and its replacement.
 - When the desired capacity is below the instances counted (in service and starting), the group
   releases instances whose protection is lifted, and only those. A released instance is
   deregistered at once, so it takes no new request, and drains: once its engine reports nothing
@@ -42,6 +43,7 @@ HEARTBEAT_SECONDS = 5
 SCHEDULE_SECONDS = 60
 WAKE_REPEAT_SECONDS = 15
 LAUNCH_HOOK_SECONDS = 15 * 60
+TERMINATE_SECONDS = 60
 IMAGE_DIGEST = "sha256:" + "ab" * 32
 
 
@@ -60,9 +62,10 @@ class Request:
 @dataclass
 class Instance:
     name: str
-    state: str  # "warm", "starting", "in-service" or "draining"
+    state: str  # "warm", "starting", "in-service", "draining" or "terminating"
     started_at: int = 0
     ready_at: int = 0
+    gone_at: int = 0  # when a terminating instance is gone
     healthy: bool = True
     protected: bool = False
 
@@ -231,7 +234,8 @@ class Sim:
             for name in [n for n in counted if not self.instances[n].protected][: len(counted) - self.desired]:
                 self.instances[name].state = "draining"
                 self.released.append((self.now, name))
-        for _ in range(self.desired - len(counted)):
+        # An abandoned instance still terminating is replaced only once it is gone.
+        for _ in range(self.desired - len(counted) - len(self._named("terminating"))):
             if self.launches_suspended:
                 break
             warm = self.warm()
@@ -281,8 +285,10 @@ class Sim:
                 self.history.append((now, "in-service"))
             elif instance.state == "starting" and now >= instance.started_at + LAUNCH_HOOK_SECONDS:
                 # The launch hook times out and abandons it; the instance is terminated.
-                del self.instances[instance.name]
+                instance.state, instance.gone_at, instance.protected = "terminating", now + TERMINATE_SECONDS, False
                 self.history.append((now, "abandoned"))
+            elif instance.state == "terminating" and now >= instance.gone_at:
+                del self.instances[instance.name]
             elif instance.state == "draining" and not self._on(instance.name):
                 # The termination hook completes: back to the warm pool.
                 instance.state, instance.protected = "warm", False
