@@ -5,7 +5,7 @@
 #   setup/owner-setup.sh                  the walkthrough: asks before each command it runs
 #   setup/owner-setup.sh --step configuration --config <file>     one step on its own
 #   setup/owner-setup.sh --step values --config <file>            the scanner's list of real values
-#   setup/owner-setup.sh --step apps --reporter-key <file>        the Apps, read back from GitHub
+#   setup/owner-setup.sh --step apps --reporter-key <file> --factory-key <file>   the Apps, read back
 #
 # The owner runs it, from a shell no agent runs in, with their own AWS credentials and `gh` login.
 # docs/runbooks/owner-setup.md describes each step: what it needs, how to check it and the
@@ -13,7 +13,8 @@
 #
 # What the script learns (the account, a quota's code, an address, an App's ID) goes to the
 # terminal, the configuration goes to SSM, and the status reporter's credentials go to Secrets
-# Manager: the reporter's private key is read from its file and never printed. The private values
+# Manager: the reporter's private key is read from its file and never printed. The Apps are read
+# back with their own keys, which only `openssl` reads, to sign; no key or token is printed. The private values
 # of the configuration go to the hygiene scanner's list of local values, a file outside the
 # repository that only you can read, and are never printed. Nothing is written
 # to the working tree, by the script or by the tools it starts: Python keeps no bytecode, and uv's
@@ -45,6 +46,7 @@ usage: setup/owner-setup.sh [--dry-run] [--step <name>] [options]
   --xl-pool            quotas: the xl pool is wanted (a P-family quota)
   --config <file>      configuration, values: the owner's file, kept outside the working tree
   --reporter-key <file>  apps: the status reporter's private key file, kept outside the working tree
+  --factory-key <file>   apps: the factory's App's private key file, kept outside the working tree
 EOF
 }
 
@@ -60,18 +62,20 @@ upgrade_pool=""
 xl_pool=""
 config_file=""
 reporter_key=""
+factory_key=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --upgrade-pool) upgrade_pool=1 ;;
     --xl-pool) xl_pool=1 ;;
-    --step | --max-instances | --config | --reporter-key)
+    --step | --max-instances | --config | --reporter-key | --factory-key)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$1" in
         --step) only="$2" ;;
         --max-instances) max_instances="$2" ;;
         --config) config_file="$2" ;;
         --reporter-key) reporter_key="$2" ;;
+        --factory-key) factory_key="$2" ;;
       esac
       shift
       ;;
@@ -271,12 +275,110 @@ EOF
   pause
 }
 
-read_app() {   # read_app <variable for the App's ID> <the permissions of section 8.6, sorted>
-  # Reads one App back from GitHub and judges its permissions. The variable stays empty when the
-  # App was not read back. A dry run prints the command, with a placeholder for the slug.
-  local -n app_id_into="$1"
-  local expected="$2" slug="<slug>" found="" permissions="" counted=""
+# The module that reads an App back from GitHub, with the App's own tokens. A private App answers
+# no one else: not your `gh` login, which no command of the apps step uses.
+apps_tool=(env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_apps)
+this_repository=""    # <owner>/<name>, once `repository` has found it
+app_installation=""   # what `read_app` read: the App's installation on this repository
+
+repository() {   # sets this_repository: from the `origin` remote of this clone, or asked
+  # git reads its own configuration, and calls nobody.
+  [ -z "$this_repository" ] || return 0
+  local top="" url=""
+  top="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" || top=""
+  if [ "$top" = "$repo_root" ]; then
+    url="$(git -C "$repo_root" remote get-url origin 2>/dev/null)" || url=""
+  fi
+  if [[ $url =~ ^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?$ ]]; then
+    this_repository="${BASH_REMATCH[2]%.git}"
+    say "    This repository, as the origin remote names it: $this_repository"
+  elif [ "$dry_run" = 1 ]; then
+    this_repository="<owner>/<name>"
+  else
+    printf '    This repository on GitHub, as <owner>/<name> (no origin remote names it): '
+    read -r this_repository || true
+    [[ $this_repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "a repository is named <owner>/<name>."
+  fi
+}
+
+app_key() {   # app_key <variable: the file an option named, or nothing> <the option>
+  # Asks for the file when no option named it, and refuses one in the working tree. The file is
+  # not opened here: `openssl` reads it, to sign, and nothing prints it.
+  local -n key_into="$1"
+  if [ -z "$key_into" ] && [ "$dry_run" = 1 ]; then
+    say "    No $2 was given: this dry run checks no file."
+    key_into="<private key file>"
+    return 0
+  fi
+  if [ -z "$key_into" ]; then
+    printf '    Its private key file, outside the working tree: '
+    read -r key_into || true
+    [ -n "$key_into" ] || die "no private key file was named."
+  fi
+  outside_file "$1" "private key file"
+}
+
+read_back() {   # read_back <variable> <command...>: as `capture`, but a refusal stops this App only.
+  # Returns 1 when the command was not run, or when it refused the App or could not read it.
+  local -n read_into="$1"
+  shift
+  show "$@"
+  if [ "$dry_run" = 1 ]; then
+    say "      (dry run: not run)"
+    return 0
+  fi
+  if ! confirm "    Run it?"; then
+    say "      (not run)"
+    return 1
+  fi
+  local status=0 line=""
+  read_into="$("$@")" || status=$?
+  while IFS= read -r line; do
+    [ -z "$line" ] || say "      $line"
+  done <<<"$read_into"
+  if [ "$status" != 0 ]; then
+    say "      Not read back, or refused: nothing more is done with this App."
+    return 1
+  fi
+}
+
+read_app() {   # read_app <reporter|factory> <variable for its ID> <variable for its key file> <option>
+  # Reads the App back by its ID, with a token its own key signs. Afterwards app_installation
+  # holds the ID of its installation on this repository, as GitHub reported it, or nothing.
+  # Returns 1 when the App was not read back, or was refused. A dry run prints the command, with
+  # placeholders.
+  local -n id_into="$2"
+  local -n key_of="$3"
+  local found="" line=""
+  app_installation=""
+  id_into="<app id>"
   if [ "$dry_run" = 0 ]; then
+    printf "    Its App ID, on the App's settings page (nothing, when the App is not registered yet): "
+    read -r id_into || true
+    if [ -z "$id_into" ]; then
+      say "      (not read back)"
+      return 1
+    fi
+    [[ $id_into =~ ^[0-9]+$ ]] || die "an App ID is a number."
+  fi
+  app_key "$3" "$4"
+  repository
+  [ "$dry_run" = 1 ] || outside_the_tree
+  read_back found "${apps_tool[@]}" "$1" --app-id "$id_into" --key-file "$key_of" \
+    --repository "$this_repository" || return 1
+  while IFS= read -r line; do
+    [[ ! $line =~ ^\ *Installation\ ([0-9]+): ]] || app_installation="${BASH_REMATCH[1]}"
+  done <<<"$found"
+}
+
+read_login() {   # read_login <the reporter's App ID, or nothing when it was not read back>
+  # The login App has no key: a token of the status reporter reads it, by its slug.
+  local slug="<slug>" found=""
+  if [ "$dry_run" = 0 ]; then
+    if [ -z "$1" ]; then
+      say "    Its reader is a token of the status reporter, which was not read back: not read back."
+      return 0
+    fi
     printf '    Its slug (nothing, when the App is not registered yet): '
     read -r slug || true
     if [ -z "$slug" ]; then
@@ -285,60 +387,25 @@ read_app() {   # read_app <variable for the App's ID> <the permissions of sectio
     fi
     [[ $slug =~ ^[A-Za-z0-9-]+$ ]] || die "a slug holds letters, digits and hyphens only."
   fi
-  # One line: the App's ID, then each permission as name=access, in the order of their names.
-  capture found gh api "apps/$slug" \
-    --jq '"\(.id) \(.permissions | to_entries | map("\(.key)=\(.value)") | sort | join(" "))"' || return 0
-  [ "$dry_run" = 0 ] || return 0
-  read -r app_id_into permissions <<<"$found" || true
-  [[ $app_id_into =~ ^[0-9]+$ ]] || die "GitHub's answer holds no App ID."
-  say "      The App's ID: $app_id_into"
-  say "      Its permissions: ${permissions:-none}"
-  # Metadata, read-only, is not a permission anyone chose when the App has another one.
-  counted=" $permissions "
-  [ -z "$expected" ] || counted="${counted/ metadata=read / }"
-  read -r counted <<<"$counted" || true
-  if [ "$counted" = "$expected" ]; then
-    say "      These are the permissions of section 8.6."
-  else
-    say "      These are NOT the permissions of section 8.6, which gives: ${expected:-none}."
-    say "      Correct them on the App's settings page (Permissions & events), then run this step again."
-  fi
+  read_back found "${apps_tool[@]}" login --slug "$slug" --app-id "${1:-<app id>}" \
+    --key-file "$reporter_key" || true
 }
 
-store_reporter() {   # store_reporter <the reporter's App ID as read back, or nothing>
+store_reporter() {   # store_reporter <the reporter's App ID> <its installation ID, as GitHub reported it>
   # The reporter's construct refers to this secret by its name and does not create it.
   local secret="rhi/reporter/github-app"
-  local app_id="$1" installation="<installation id>" file="$reporter_key"
+  local app_id="$1" installation="$2"
   local tool=(env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_secret)
   if [ "$dry_run" = 1 ]; then
-    app_id="<app id>"
-  elif [ -z "$app_id" ]; then
-    say "    The reporter was not read back, so its credentials are not stored."
+    installation="<installation id>"
+  elif [ -z "$installation" ]; then
+    say "    The reporter has no installation on this repository yet, so its credentials are not stored."
     return 0
-  else
-    printf "    The reporter's installation ID on this repository (nothing, when it is not installed yet): "
-    read -r installation || true
-    if [ -z "$installation" ]; then
-      say "      (not stored)"
-      return 0
-    fi
-    [[ $installation =~ ^[0-9]+$ ]] || die "an installation ID is a number."
-    if [ -z "$file" ]; then
-      printf "    The reporter's private key file, outside the working tree: "
-      read -r file || true
-      [ -n "$file" ] || die "no private key file was named."
-    fi
   fi
-  if [ -z "$file" ]; then
-    say "    No --reporter-key was given: this dry run checks no file."
-    file="<private key file>"
-  else
-    outside_file file "private key file"
-  fi
-  [ "$dry_run" = 1 ] || outside_the_tree
-  say "    The secret $secret, created if it is absent. The key is read from its file, not printed."
+  say "    The secret $secret, created if it is absent, with the App's ID and its installation's ID"
+  say "    as GitHub reported them. The key is read from its file, not printed."
   if run "${tool[@]}" "$secret" --app-id "$app_id" --installation-id "$installation" \
-    --private-key-file "$file"; then
+    --private-key-file "$reporter_key"; then
     say "    To check: the secret's name, not its value."
     run aws secretsmanager describe-secret --secret-id "$secret" --query Name --output text || true
   fi
@@ -372,33 +439,45 @@ For each App: any name and homepage URL, Webhook not active, installable only on
    Its private key stays on the factory's host, outside every checkout, readable by you alone.
    It never goes to AWS and never into the repository.
 
-Once an App is registered, this step reads it back from GitHub with your `gh` login, by its slug:
-the last part of the address of the App's settings page, https://github.com/settings/apps/<slug>.
-It prints the App's ID and its permissions as GitHub's API names them (`statuses` is Commit
-statuses, `write` is read and write), and says whether they are those of section 8.6. GitHub
-grants Metadata, read-only, by itself to an App that has a repository permission.
+Once the Apps are registered, this step reads each one back from GitHub. An App installable only
+on this account is private: GitHub answers for it to the App's own tokens only, and your `gh`
+login gets nothing, so no command here uses it.
 
-What GitHub's answer does not hold, check on the App's own pages: that the device flow is on for
-the login App, and that the reporter and the factory's App are installed on this repository alone.
+- The status reporter and the factory's App are read by their App ID (the App's settings page,
+  About), with a token signed by their own private key: --reporter-key and --factory-key name the
+  key files, or the step asks for them. `openssl` signs with a key; nothing prints it.
+- The login App is read by its slug, the last part of the address of its settings page
+  (https://github.com/settings/apps/<slug>), with a token of the status reporter. Its device flow
+  is checked by asking GitHub for a device code with its client ID, which is never printed.
+
+For each App the step prints its slug, its ID and its permissions as GitHub's API names them
+(`statuses` is Commit statuses, `write` is read and write), and says whether they are those of
+section 8.6. GitHub grants Metadata, read-only, by itself to an App that has a repository
+permission. For the reporter and the factory's App it prints each installation with the
+repositories it reaches. It refuses an App installed on anything other than this repository
+alone, and a login App whose device flow is off.
 
 For the status reporter the step then stores what the reporter posts a status with, in a Secrets
-Manager secret in the region of your credentials: the App's ID as it was read back, the
-installation ID and the private key. The installation ID is the number that ends the address of
-the installation's page (GitHub, Settings, Applications, Installed GitHub Apps, Configure):
-https://github.com/settings/installations/<installation id>. The key is read from its file,
-which stays where it is, and is never printed. Until it is stored, the reporter posts nothing.
+Manager secret in the region of your credentials: the App's ID and the ID of its installation on
+this repository, both as GitHub reported them, and the private key. The key is read from its
+file, which stays where it is, and is never printed. Until it is stored, the reporter posts
+nothing.
 EOF
-  local login_id="" reporter_id="" factory_id=""
+  local reporter_id="" factory_id="" reporter_read=""
   say ""
-  say "Reading back the student login App."
-  read_app login_id ""
+  say "Reading back the status reporter, with its own key."
+  if read_app reporter reporter_id reporter_key --reporter-key; then
+    reporter_read="$reporter_id"
+    store_reporter "$reporter_id" "$app_installation"
+  else
+    say "    The reporter was not read back, or was refused, so its credentials are not stored."
+  fi
   say ""
-  say "Reading back the status reporter."
-  read_app reporter_id "statuses=write"
-  store_reporter "$reporter_id"
+  say "Reading back the student login App, with a token of the status reporter."
+  read_login "$reporter_read"
   say ""
-  say "Reading back the factory's identity."
-  read_app factory_id "actions=read checks=read contents=write issues=write pull_requests=write statuses=read"
+  say "Reading back the factory's identity, with its own key."
+  read_app factory factory_id factory_key --factory-key || true
   pause
 }
 
