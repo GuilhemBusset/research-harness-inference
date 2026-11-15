@@ -58,15 +58,24 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
 
 
 def run_cycle(
-    settings: Settings, clients: aws_io.Clients, writer: RemoteWriter, now: int, counts: DecisionCounts
+    settings: Settings,
+    clients: aws_io.Clients,
+    writer: RemoteWriter,
+    now: int,
+    counts: DecisionCounts,
+    milliseconds: int | None = None,
 ) -> Decision:
-    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics."""
+    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics.
+
+    `now` is the decision clock, in whole seconds; `milliseconds`, the run's time for the
+    metrics' samples (by default, `now`'s second).
+    """
     run = aws_io.read(clients, settings.tables, settings.pools, now)
     decision = decide(run.inputs)
     aws_io.apply(clients, settings.tables, run, decision)
     log_decisions(run, decision)
     try:
-        writer.push(fleet_series(run.inputs, decision, counts))
+        writer.push(fleet_series(run.inputs, decision, counts, milliseconds))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     return decision
@@ -88,5 +97,6 @@ def handler(event: object, context: object, environ: Mapping[str, str] | None = 
     del event, context
     settings = read_settings(os.environ if environ is None else environ)
     clients, writer = connect(settings)
-    decision = run_cycle(settings, clients, writer, int(time.time()), COUNTS)
+    moment = time.time()
+    decision = run_cycle(settings, clients, writer, int(moment), COUNTS, int(moment * 1000))
     return {"pools": [{"pool": pool.pool, "desired": pool.desired, "reason": pool.reason.value} for pool in decision.pools]}

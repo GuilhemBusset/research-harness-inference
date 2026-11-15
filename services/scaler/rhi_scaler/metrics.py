@@ -17,6 +17,10 @@ the process's start, and Prometheus reads a smaller value as a restart (as it do
 process). A series a process sends for the first time starts with a zero one millisecond before
 its first value, so that the first decision of a process is counted by `increase()` too.
 
+The samples carry the run's time in milliseconds, not the decision clock's whole second: two runs
+in one second would otherwise send two values of a counter at one timestamp, and Prometheus keeps
+only the first. Within a process the timestamps only grow, by at least a millisecond a run.
+
 Remote write is a protobuf `WriteRequest`, compressed with snappy's block format and sent by an
 HTTP POST signed with SigV4 for the service `aps`. The message types are declared here from a
 descriptor, at import: nothing runs protoc and no generated code is checked in.
@@ -103,14 +107,28 @@ class DecisionCounts:
     """The decisions this process has made, by pool and reason."""
 
     counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    # The timestamp of this process's last run, so that no two runs share one.
+    last_milliseconds: int | None = None
 
     def add(self, pool: str, reason: str) -> None:
         self.counts[(pool, reason)] = self.counts.get((pool, reason), 0) + 1
 
+    def stamp(self, milliseconds: int) -> int:
+        """The timestamp for a run at `milliseconds`: later than every run before it."""
+        if self.last_milliseconds is not None and milliseconds <= self.last_milliseconds:
+            milliseconds = self.last_milliseconds + 1
+        self.last_milliseconds = milliseconds
+        return milliseconds
 
-def fleet_series(inputs: Inputs, decision: Decision, counts: DecisionCounts) -> list[Series]:
-    """Counts this run's decisions, and returns every series to send for it, pool by pool."""
-    milliseconds = inputs.now * 1000
+
+def fleet_series(
+    inputs: Inputs, decision: Decision, counts: DecisionCounts, milliseconds: int | None = None
+) -> list[Series]:
+    """Counts this run's decisions, and returns every series to send for it, pool by pool.
+
+    `milliseconds` is the run's time; without it, the decision clock's second.
+    """
+    milliseconds = counts.stamp(inputs.now * 1000 if milliseconds is None else milliseconds)
     supplies = {pool.config.name: pool.supply for pool in inputs.pools}
     out: list[Series] = []
     for pool in decision.pools:
