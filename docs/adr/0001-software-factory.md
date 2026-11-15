@@ -319,6 +319,11 @@ are recorded here as proposed and are part of what the owner approves.
    the reason `history`, and a retry starts a new branch. The engine's commits carry the
    repository's git identity, which the doctor checks against the scanner's allow-list: it must
    be a no-reply address before the first run.
+8. **The builder falls back to Claude Opus while Fable refuses calls.** When the account's usage
+   limit for Fable is reached, or the API rate limits it, `plan` and `build` run on
+   `claude-opus-5-5` (`loop.toml`, `claude_fallback_model`) and go back to Fable 30 minutes
+   later. A refused call did no work and is charged to no budget. Decision 2's division of roles
+   between the vendors is unchanged: the builder stays a Claude model and the examiner Codex.
 
 ## Verified and taken on trust
 
