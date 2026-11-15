@@ -75,6 +75,17 @@ class Refusal(StrEnum):
     LOGIN_REFUSED = ("login_refused", 400, "GitHub did not accept the code: start the login again.")
     GITHUB_UNAVAILABLE = ("github_unavailable", 502, "GitHub could not be reached: try again later.")
     NOT_ENROLLED = ("not_enrolled", 403, "This GitHub account cannot log in to this endpoint.")
+    # The rules of an issuance, applied by `rhi_issuer.rules`.
+    TOO_MANY_INSTALLATIONS = (
+        "too_many_installations",
+        403,
+        "This account already has keys on two installations: run rhi revoke --all, then log in again.",
+    )
+    TOO_MANY_ISSUANCES = (
+        "too_many_issuances",
+        429,
+        "This account has been issued as many keys as it may today: log in again after midnight UTC.",
+    )
 
 
 # What GitHub answers for a device code it does not redeem yet, or any more. Any other error of
