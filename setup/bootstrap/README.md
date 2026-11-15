@@ -14,8 +14,8 @@ everything else and denies:
 
 - creating an IAM user, an access key or a login profile;
 - creating a SAML or an OpenID Connect provider;
-- creating a role without the boundary, and removing a role's boundary or replacing it with
-  another;
+- creating a role without the boundary, which includes every service-linked role (that call
+  takes no boundary), and removing a role's boundary or replacing it with another;
 - changing or deleting either policy.
 
 So a role that a deployment creates is refused without the boundary, and with it the role is held
@@ -82,5 +82,18 @@ names `rhi-permissions-boundary`.
 The denials keep a deployment from changing either policy, so a change is the owner's too: merge
 the change to `policies.yaml`, then run the first command again.
 
+## What a deployment has to do from then on
+
 From the bootstrap on, a deployment that creates a role without the boundary fails. The app
 therefore has to put the boundary on every role it creates, by the name above.
+
+A deployment cannot create a service-linked role either: not as a resource of a template, and not
+through a service that creates its own role the first time it is used, since it does so with the
+permissions of whoever calls it. Such a role is the owner's to create, once, before the first
+deployment that uses the service (`autoscaling.amazonaws.com` is an example):
+
+```sh
+aws iam create-service-linked-role --aws-service-name autoscaling.amazonaws.com
+```
+
+The change that first uses such a service names the role as an obligation of the owner.

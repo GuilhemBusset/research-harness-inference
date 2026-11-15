@@ -53,6 +53,11 @@ Resources:
             Condition:
               StringNotEquals:
                 iam:PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary
+          # That call takes no boundary, so the role it creates could never carry this one.
+          - Sid: DenyAServiceLinkedRole
+            Effect: Deny
+            Action: iam:CreateServiceLinkedRole
+            Resource: "*"
           - Sid: DenyRemovingABoundary
             Effect: Deny
             Action: iam:DeleteRolePermissionsBoundary
@@ -102,6 +107,10 @@ Resources:
             Condition:
               StringNotEquals:
                 iam:PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/rhi-permissions-boundary
+          - Sid: DenyAServiceLinkedRole
+            Effect: Deny
+            Action: iam:CreateServiceLinkedRole
+            Resource: "*"
           - Sid: DenyRemovingABoundary
             Effect: Deny
             Action: iam:DeleteRolePermissionsBoundary
