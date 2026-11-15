@@ -32,6 +32,22 @@ You are the builder. Build this issue in your working directory, following your 
   your proposed version in the worktree); the other vendor decides.
   Every test function in them (the examiner's probes too) must also be selected by a command (a
   pytest command naming the file) or given a disposition.
+- After the first examination your commands are locked as well. Leave an item out of `commands`
+  to keep its commands, or repeat them character for character: any other wording is a request to
+  change them, which the other vendor decides in a call of this issue's ceiling. The feedback
+  says what was decided on your requests; do not ask again for what was refused unless you bring
+  new evidence.
+- A command, and the reproduction of an open finding, count where the verifier runs them: in a
+  throwaway copy of your commit, in the verifier's own environment, not in your worktree. When
+  one fails there, the feedback carries what that run printed. Read it first. "It passes here"
+  is not an answer, and `done` with nothing changed gets the same failure back: find what
+  differs. One difference is known: the verifier puts its own engine's directory first on
+  `PYTHONPATH`, and the type checker reads it, so `scripts/check.sh types` and `fast` report
+  unresolved imports in the engine's files there on any commit; as a command of yours, write
+  `env -u PYTHONPATH scripts/check.sh types`. If what a finding's reproduction prints is not this
+  change's doing and is not yours to repair (it fails the same way on `main`, or for files
+  outside your zones), say so in this round with a `dispute` request, with that output as your
+  evidence.
 - `requests`, typed, each decided by the other vendor (or the arbiter):
   - `paths` / `protected_change`: a path outside your zones you must change (say why);
   - `command_change`: add a command to a locked `item` (give `command`, `cwd`); it is kept beside
