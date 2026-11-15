@@ -7,7 +7,7 @@ You are the builder. Build this issue in your working directory, following your 
 - Write the code, **your own tests** for `test` items, any registration they need, and one or more
   commands per `test`/`command` item that prove it (each is kept and run; exact shell, `cwd` relative to the repo root, optional
   `timeout_s` up to 1800). Each command's `criterion` is exactly one item id (`D2`, not a sentence);
-  a command that proves several items names the first. Run every command yourself until it passes.
+  a command that proves several items is listed once for each. Run every command yourself until it passes.
   - Python tests: pytest through uv (`uv run --locked pytest ...` in the repository's project, or
     `uv run --no-project --with pytest==8.3.5 pytest ...` for a tool that has no dependencies);
     there may be no bare `python`. Run each pytest selection as its own command rather than
@@ -24,14 +24,18 @@ You are the builder. Build this issue in your working directory, following your 
     `required` check on the pull request runs the same script, and a red check costs a round.
   - Tests in proportion: for small issues aim for fewer test lines than deliverable lines; no
     byte-pinning of text the issue does not change; prose is reviewed, not keyword-matched.
+  - Tests live where AGENTS.md "Where tests live" says, named after the behaviour they guard:
+    no test file per issue or per acceptance item, and no issue number in a test's name. A
+    defect a finding showed is covered by such a behaviour test; the examiner's probe is never
+    committed.
 - `tests`: the test files you own. Every test function in them must be selected by one of your
   commands, or listed in `dispositions` as `owner-run` (only the owner can run it) or
   `excluded: <reason>`.
 - Locked tests (the engine names them in the feedback after the first examination) are not yours
   to change: an edit is reverted unless you ask with a `test_change` request naming the file (leave
   your proposed version in the worktree); the other vendor decides.
-  Every test function in them (the examiner's probes too) must also be selected by a command (a
-  pytest command naming the file) or given a disposition.
+  Every test function in them must also be selected by a command (a pytest command naming the
+  file) or given a disposition.
 - After the first examination your commands are locked as well. Leave an item out of `commands`
   to keep its commands, or repeat them character for character: any other wording is a request to
   change them, which the other vendor decides in a call of this issue's ceiling. The feedback
