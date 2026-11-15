@@ -36,10 +36,18 @@ request's own lease does. The reservation's condition counts it like any lease, 
 still running at midnight keeps its slot in the new day, at no extra call for the requests that
 follow. Its settlement is still one write, to the item of its own day, which leaves the stand-in
 behind: a reservation that stand-ins refuse reads the day before again and removes, in its own
-single write, those whose request has ended. No request of a day is admitted once the day is
-over, so the leases of the day before can only go, and a stand-in is never missing. That rests
-on the clocks of the gateway's tasks agreeing on the day: a reservation written to the old day
-by a task whose clock is behind, after another task has read that day, has no stand-in.
+single write, those whose request has ended.
+
+A stand-in is never missing, because no request is admitted to a day once the day is over. A
+write can be sent before midnight and made after it, when another task has already read the day
+and opened the next one, so the ledger reads the clock again when the write has answered. If the
+day has changed, the reservation does not count: one more write takes the lease and its tokens
+back, and the request reserves again, in the new day, where it is admitted or refused like any
+other. Such a request makes two writes more than the two of every other, and only a write in
+flight at midnight is one. So the leases that count in a day were all written before it ended,
+the first reservation of the next day reads them all, and from then on they can only go. That
+rests on the clocks of the gateway's tasks agreeing on the day: a reservation that a task whose
+clock is behind confirms in the old day, after another task has read that day, has no stand-in.
 
 **The input estimate** is computed from the request body alone, before any call to the engine: a
 token for every four bytes, rounded up. The design gives no rule. Four bytes a token is the usual
@@ -94,7 +102,8 @@ LEASE_MARGIN_SECONDS = 60
 # The retention of every store: the course end plus 90 days (section 6.6).
 USAGE_RETENTION_SECONDS = 90 * 86_400
 
-# How many times the DynamoDB ledger sends a reservation whose record changed under it.
+# How many times the DynamoDB ledger sends a reservation whose record changed under it, and how
+# many times a ledger makes again a reservation that was confirmed after its day.
 _ATTEMPTS = 10
 # What the name of a stand-in begins with: the day of the request it stands for.
 _STAND_IN = re.compile(r"\d{4}-\d{2}-\d{2}/", re.ASCII)
@@ -264,6 +273,36 @@ def _reserved(day: UsageDay, request_id: str, lease: Lease, expired: Mapping[str
     return replace(swept, tokens=swept.tokens + lease.tokens, leases={**swept.leases, request_id: lease})
 
 
+def _reserve_within_the_day(
+    clock: Callable[[], float],
+    student: StudentKey,
+    request_id: str,
+    body: bytes,
+    output_limit: int,
+    seconds: int,
+    write: Callable[[Reservation, int], None],
+    take_back: Callable[[Reservation], object],
+) -> Reservation:
+    """A reservation that `write` made, and that was confirmed before its day ended.
+
+    `write` adds the reservation to the record of its day, or raises the refusal. The clock is read
+    again when it returns. If the day has changed, another task may have read the old day before
+    the write was made, and opened the new day without it: `take_back` removes the lease and its
+    tokens, and the reservation is made again in the new day.
+    """
+    now = int(clock())
+    for _ in range(_ATTEMPTS):
+        lease = _new_lease(body, output_limit, now + seconds)
+        reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
+        write(reservation, now)
+        now = int(clock())
+        if utc_day(now) == reservation.day:
+            return reservation
+        take_back(reservation)
+    # No clock changes its day this often.
+    raise GatewayError(Cause.CONCURRENCY_LIMIT, "no reservation was confirmed within its day")
+
+
 def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: bool, now: int) -> int:
     """What a request is charged when it is settled at `now`."""
     if input_tokens < 0 or output_tokens < 0:
@@ -306,33 +345,43 @@ class InMemoryLedger:
         hold_seconds: int,
         longest_request_seconds: int,
     ) -> Reservation:
-        now = int(self._clock())
-        lease = _new_lease(body, output_limit, now + lease_seconds(hold_seconds, longest_request_seconds))
-        reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
-        with self._lock:
-
+        def write(reservation: Reservation, now: int) -> None:
             def before() -> UsageDay | None:
                 return self._days.get((reservation.github_id, _day_before(reservation.day)))
 
-            day = self._days.get((reservation.github_id, reservation.day))
-            if day is None:
-                day = _new_day(student, reservation.day, before(), now)
-            gone = _to_remove(day, student, request_id, lease, now, before)
-            self._write(_reserved(day, request_id, lease, gone))
-        return reservation
+            with self._lock:
+                day = self._days.get((reservation.github_id, reservation.day))
+                if day is None:
+                    day = _new_day(student, reservation.day, before(), now)
+                gone = _to_remove(day, student, request_id, reservation.lease, now, before)
+                self._write(_reserved(day, request_id, reservation.lease, gone))
+
+        return _reserve_within_the_day(
+            self._clock,
+            student,
+            request_id,
+            body,
+            output_limit,
+            lease_seconds(hold_seconds, longest_request_seconds),
+            write,
+            lambda reservation: self._remove(reservation, 0),
+        )
 
     def settle(
         self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool
     ) -> int | None:
-        lease = reservation.lease
-        charge = _charge(lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
+        charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
+        return charge if self._remove(reservation, charge) else None
+
+    def _remove(self, reservation: Reservation, charge: int) -> bool:
+        """Remove the lease and replace its tokens by `charge`, if the lease is still there."""
         with self._lock:
             day = self._days.get((reservation.github_id, reservation.day))
             if day is None or reservation.request_id not in day.leases:
-                return None
+                return False
             leases = {request: held for request, held in day.leases.items() if request != reservation.request_id}
-            self._write(replace(day, tokens=day.tokens + charge - lease.tokens, leases=leases))
-        return charge
+            self._write(replace(day, tokens=day.tokens + charge - reservation.lease.tokens, leases=leases))
+        return True
 
     def tokens_left(self, student: StudentKey) -> int:
         now = int(self._clock())
@@ -365,7 +414,8 @@ class DynamoDBLedger:
     after one read of the day before, and for a request that expired leases or stand-ins are in
     the way of (for stand-ins, with one read of the day before). It gives up, with
     `concurrency_limit`, after ten calls that each found the record changed by another request. A
-    settlement is one call, and the read one consistent read.
+    reservation whose write answers after its day has ended is taken back, in one call, and made
+    again in the new day. A settlement is one call, and the read one consistent read.
 
     An error of DynamoDB other than a failed condition is raised as the SDK raised it. It carries
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
@@ -386,9 +436,30 @@ class DynamoDBLedger:
         hold_seconds: int,
         longest_request_seconds: int,
     ) -> Reservation:
+        return _reserve_within_the_day(
+            self._clock,
+            student,
+            request_id,
+            body,
+            output_limit,
+            lease_seconds(hold_seconds, longest_request_seconds),
+            lambda reservation, now: self._write_reservation(student, reservation, now),
+            lambda reservation: self._remove(reservation, 0),
+        )
+
+    def settle(
+        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool
+    ) -> int | None:
+        charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
+        return charge if self._remove(reservation, charge) else None
+
+    def tokens_left(self, student: StudentKey) -> int:
         now = int(self._clock())
-        lease = _new_lease(body, output_limit, now + lease_seconds(hold_seconds, longest_request_seconds))
-        reservation = Reservation(student.github_id, utc_day(now), request_id, lease)
+        return _left(self._read(student.github_id, utc_day(now)), student, now)
+
+    def _write_reservation(self, student: StudentKey, reservation: Reservation, now: int) -> None:
+        """Add the reservation to the item of its day, or raise the refusal."""
+        request_id, lease = reservation.request_id, reservation.lease
 
         def before() -> UsageDay | None:
             return self._read(reservation.github_id, _day_before(reservation.day))
@@ -399,35 +470,28 @@ class DynamoDBLedger:
         for _ in range(_ATTEMPTS):
             written, found = self._add_lease(student, reservation, gone)
             if written:
-                return reservation
+                return
             if found is None:
                 written, found = self._open_day(student, reservation, now)
                 if written:
-                    return reservation
+                    return
             # The write changed nothing. Decide from the day it found: refuse, or send it again
             # without the leases that have expired and the stand-ins of requests that have ended.
             gone = {} if found is None else _to_remove(found, student, request_id, lease, now, before)
         # Every attempt found a record that another request had just changed.
         raise GatewayError(Cause.CONCURRENCY_LIMIT, "the student's day kept changing under this request")
 
-    def settle(
-        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool
-    ) -> int | None:
-        lease = reservation.lease
-        charge = _charge(lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
+    def _remove(self, reservation: Reservation, charge: int) -> bool:
+        """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there."""
         written, _ = self._conditional(
             self._client.update_item,
             Key=self._key(reservation.github_id, reservation.day),
             UpdateExpression="REMOVE #leases.#request ADD #tokens :change",
             ConditionExpression="attribute_exists(#leases.#request)",
             ExpressionAttributeNames={**_NAMES, "#request": reservation.request_id},
-            ExpressionAttributeValues=_values({":change": charge - lease.tokens}),
+            ExpressionAttributeValues=_values({":change": charge - reservation.lease.tokens}),
         )
-        return charge if written else None
-
-    def tokens_left(self, student: StudentKey) -> int:
-        now = int(self._clock())
-        return _left(self._read(student.github_id, utc_day(now)), student, now)
+        return written
 
     def _read(self, github_id: int, day: str) -> UsageDay | None:
         """A student's day as it is written, in one consistent read."""
