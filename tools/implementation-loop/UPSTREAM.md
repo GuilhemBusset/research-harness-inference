@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.5 |
+| Engine version here | 1.2.6 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -478,6 +478,52 @@ verifier, the gate and `config.py`. Requests whose own text is longer than the c
 Issue #42 resumes in `build` with its branch as it was. Whether its examiner approves the proposal
 it can now read is that issue's round.
 
+### 1.2.6: what the verifier's own runs printed, and the decisions on a build's requests (2026-11-15)
+
+The repair of the engine fault ed072b1fa9 (issue #276): issue #32 spent its ceiling of 30 calls.
+Its run log (the events of the issue and its 30 answered calls) was read when this repair was
+planned; nothing of it is copied here. It shows a first examination whose finding had the type
+gate, `scripts/check.sh types`, as its reproduction, because the examiner's own probes failed it.
+The probes were repaired at the seventh call. The reproduction went on failing where the verifier
+runs it, on every head, for files the change did not touch, while it passed in the builder's
+worktree. Ten builds were told that the finding "still reproduces", and three times that a
+command "failed: exit 1", with nothing of what those runs printed; nine answered that it passed
+for them and changed nothing. Each build also said its locked commands again in other words,
+which the engine turns into a request: nine decisions, each refused. No refusal reached the next
+build, because the failed verification replaced the feedback that carried it. The dispute that
+closed the finding came at the 27th call.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.5 → 1.2.6. | A new engine version: a failed issue is revived once by it, with fresh ceilings. |
+| `implement_loop/engine.py` | New: `Engine._reproduction`, the verifier's run of a reproduction, which returns its evidence; `_reproduces` is its verdict (`run_verdict`), as before. `_step_examine` and `_close_findings` keep, on a finding that is open, the engine's last run of its own reproduction (`verifier_run`, from `run_record`: the head, the exit status, the verifier's note, the last 1,500 characters of the output); it is dropped when the finding closes. `_open_feedback` adds that run to the finding's feedback, and says that the verifier's run is the one that has to pass. | The builder was told that a reproduction fails and never how. The run that keeps a finding open is the engine's, in the verifier's environment: only its output shows a failure that the builder's worktree does not have. A finding whose reproduction is an adopted probe has no such record: the probe's command is one of the issue's commands, and the next row covers it. |
+| `implement_loop/engine.py` | New: `failed_output`, what each command that failed a verification printed, once per command, for at most four commands, standing checks left out (their problem carries their output). `_step_verify` hands it to `_round_failed`, with the feedback the build left (the decisions on its requests), in a new argument, `told`. `_round_failed` appends `told` to the next build's feedback, and to the planner's on a replan. | "`A4` failed: exit 1" is all the verifier's problem says (`verify.py`, which is on the safety surface and is not changed). And a failed verification replaced the feedback, so a refused request was never heard of again. `told` is in no signature of the progress rule (a command's output changes from run to run), in no event of the round and in no failure's detail, which a fault issue publishes. |
+| `prompts/build.md` | Two paragraphs added. After the first examination the commands are locked: an item left out of `commands` keeps its commands, any other wording is a request that costs a call, and what was refused is not asked again without new evidence. A command and a finding's reproduction count where the verifier runs them; the feedback carries what that run printed; `done` with nothing changed gets the same failure back; the one known difference of the verifier's environment (below) and the command that avoids it; a reproduction that fails for what the change did not do is disputed in the same round. | The builder of #32 had none of this in its prompt: it restated its commands in every build, and answered "it passes here" nine times. |
+| `prompts/examine.md` | `findings`: the engine runs each reproduction itself on every later commit, without asking the examiner again; a reproduction fails for the problem it witnesses and nothing else; a repository-wide gate is a poor one, and the type gate fails under the verifier on any commit. `probes`: an adopted probe is locked, so it passes the repository's lint and type checks before it is returned. | The finding that cost #32 its ceiling had a whole gate as its reproduction, and was raised for the examiner's own probes. |
+
+Behaviour an upstream reader would not expect: the builder's feedback now holds command output
+(up to 1,500 characters for each open finding and for each of four failed commands), and an open
+finding in the run's state has one more key. That output reaches agents only: the builder, the
+planner of a replan, the examiner (in its memory of findings) and the arbiter of a dispute.
+Not changed, on purpose: the verifier, the gate, the live adapter and `config.py`. In particular
+the cause of the failure itself is still there. `verify.run_check` puts the running engine's
+directory first on `PYTHONPATH`, for its result plugin, and ty reads that variable. With a second
+copy of the engine there, as under the verifier, `scripts/check.sh types` fails on this head with
+59 `unresolved-import` diagnostics, all in files under `tools/implementation-loop/implement_loop/`;
+without the variable it passes. To see it, from the repository root:
+
+```sh
+git archive HEAD tools/implementation-loop | tar -x -C <empty dir>
+PYTHONPATH=<empty dir>/tools/implementation-loop scripts/check.sh types
+```
+
+Removing that needs `verify.py` or `scripts/check.sh`, which are on the safety surface, or
+`ty.toml`: it is the owner's, and the sentence about it in the two prompts goes when it is done.
+Until then the prompts name the trap and `env -u PYTHONPATH scripts/check.sh types` as the command
+that runs the gate as CI does, and a finding whose reproduction is the bare gate closes only by a
+dispute, which the builder can now make in its first round. Issue #32 resumes with its branch and
+its findings as they were.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -660,6 +706,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_test_change_proposals.py` (2) | Added. | The regression of fault 10fcb07f92, in real engine runs with the fake agents, on an issue whose second build changes the test its first examination locked and asks with a `test_change` request, followed by a `paths` request. The fake decider keeps what it is given, and the prompt the live adapter writes for those requests (`LiveAgents.decide`, with the call itself replaced). A replacement of more than 100,000 characters: on 1.2.4 the decider's copy holds the locked test; now it holds the proposal to its last line while the builder's worktree holds the locked test, the request names the file as `replaced` and carries none of its text, the requests in the adapter's prompt are valid JSON with both requests, and the approved proposal lands whole on `main`. A locked test the builder deletes is absent from the decider's copy and named as `deleted`; refused, the locked test lands as it was. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
+
+### 1.2.6
+
+647 collected tests: the 643 before it, none removed and none changed, and 4 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_verifier_feedback.py` (4) | Added. | The regression of fault ed072b1fa9, in real engine runs with the fake agents, on an issue whose first examination leaves a finding with a reproduction that fails on every head and prints why, and which build it ran on. The fake builder acts on a fact once its feedback holds it. On 1.2.5 all four fail. The build after the examination is given the output of the run that made the finding blocking, disputes at once, and the issue is delivered in two builds. A second build that restates its commands (refused) and does not dispute fails verification; the third is given the refusal with its reason and the run on the second build's commit, asks nothing again, and the issue is delivered with one decision. A command that fails a verification reaches the next build once, with its command and what it printed. A builder that never disputes still ends `no_progress`, though every round printed something else, and the output is in nothing the fake GitHub received nor in the failure's detail. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
 
 ## Kept as recorded
 
