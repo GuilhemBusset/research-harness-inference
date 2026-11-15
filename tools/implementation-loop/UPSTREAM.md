@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.6 |
+| Engine version here | 1.2.7 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -524,6 +524,28 @@ that runs the gate as CI does, and a finding whose reproduction is the bare gate
 dispute, which the builder can now make in its first round. Issue #32 resumes with its branch and
 its findings as they were.
 
+### 1.2.7: a Claude model that refuses calls, and its fallback (2026-11-15)
+
+A change made by the owner's decision, not a fault repair. On 2026-11-15 the account reached its
+usage limit for Claude Fable, the model of the plan and build roles. From then on every Claude
+call ended in under two seconds: Claude Code exits 1 with an empty stderr, and its JSON result
+carries `is_error`, `api_error_status` 429, `api_error_type` `rate_limit_error` and `api_error`
+`usage_limit_reached`. `classify_failure` reads stderr only, so each attempt was a `crash`,
+charged to the issue's budget of 10 failed attempts. Ten issues and four repair runs failed on
+that budget, 139 refused attempts in all, none of them for their own work. Claude Code's own
+`--fallback-model` does not switch on this error: tried on that day, a call with
+`--model claude-fable-5-2 --fallback-model claude-opus-5-5` returned the same refusal.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.6 → 1.2.7. | A new engine version: the issues the refusals failed are revived once, with fresh ceilings, and the ones waiting resume. |
+| `implement_loop/live.py` | New: `claude_refused`, which reads that refusal from the JSON result; `REFUSED_RETRY_S` (30 minutes); `RoleSettings.claude_fallback_model`; `LiveAgents._claude_model`, the model a call of a role asks for; a `clock` argument. `_parse` marks a refused result (`refused`, no answer). `call`: a refused attempt is an `outage`, charged to nothing, with the model it asked for in its record. When the role has a fallback and the refused model is the role's own, the same attempt is made again at once on the fallback, without a backoff and without counting a retry, and the role asks for the fallback until 30 minutes after the refusal. Without a fallback, or with the fallback refusing too, the call ends as an outage after its retries, and the issue waits for the vendor as before. `_command` takes the model to ask for. Every attempt's record in `agents.jsonl` now names the Claude model it asked for. | A refusal is the account's state, not the agent's failure, and the builder's work can go on on another model. The record of the model keeps the cost per model readable. |
+| `loop.toml` | `claude_fallback_model = "claude-opus-5-5"` for `plan` and `build`, and its description in the header. | The owner's choice of fallback. |
+
+Behaviour an upstream reader would not expect: a plan or build may run on the fallback model,
+and nothing but `agents.jsonl` says which one did. The examiner, the gates and the ceilings are
+the same whichever model built. The per-call and per-issue dollar ceilings are unchanged.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -714,6 +736,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_verifier_feedback.py` (4) | Added. | The regression of fault ed072b1fa9, in real engine runs with the fake agents, on an issue whose first examination leaves a finding with a reproduction that fails on every head and prints why, and which build it ran on. The fake builder acts on a fact once its feedback holds it. On 1.2.5 all four fail. The build after the examination is given the output of the run that made the finding blocking, disputes at once, and the issue is delivered in two builds. A second build that restates its commands (refused) and does not dispute fails verification; the third is given the refusal with its reason and the run on the second build's commit, asks nothing again, and the issue is delivered with one decision. A command that fails a verification reaches the next build once, with its command and what it printed. A builder that never disputes still ends `no_progress`, though every round printed something else, and the output is in nothing the fake GitHub received nor in the failure's detail. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
+
+### 1.2.7
+
+653 collected tests: the 647 before it, none removed and none changed, and 6 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_claude_fallback.py` (6) | Added. | The live adapter against a fake `claude` that refuses one model as Claude Code 2.1 does (exit 1, empty stderr, the reason only in its JSON result). A refused model is replaced at once by the fallback, with no backoff, and the refused attempt is an outage charged to nothing; the role keeps the fallback until `REFUSED_RETRY_S` has passed, then asks its own model again; with both refusing, the call is an outage after its retries, with the usual backoff; without a fallback, a refusal is an outage, not a crash; what counts as a refusal; and the checked-in `loop.toml` falls back from Fable to Opus for `plan` and `build` only. On 1.2.6 all six fail. |
 
 ## Kept as recorded
 
