@@ -180,7 +180,10 @@ do_synth() {
   if [ -n "${CI:-}" ] || [ ! -x node_modules/.bin/cdk ]; then
     npm ci --ignore-scripts --no-audit --no-fund || return 1
   fi
-  node_modules/.bin/cdk synth --lookups=false --quiet
+  # Against the example configuration, whatever source the caller's environment names
+  # (docs/design/system-design.md, "Checks on a pull request"): the loader fails closed when
+  # RHI_CONFIG is unset. The variable is set for this command only, so no other step sees it.
+  RHI_CONFIG=example node_modules/.bin/cdk synth --lookups=false --quiet
 }
 
 usage() {
