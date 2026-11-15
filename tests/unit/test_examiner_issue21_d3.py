@@ -9,7 +9,9 @@ from pathlib import Path
 def test_default_collection_and_parser_pin(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    pins = [entry for entry in project["dependency-groups"]["dev"] if entry.lower().startswith("pyyaml==")]
+    # An entry that includes another group is a table, not a requirement.
+    requirements = [entry for entry in project["dependency-groups"]["dev"] if isinstance(entry, str)]
+    pins = [entry for entry in requirements if entry.lower().startswith("pyyaml==")]
     assert len(pins) == 1
     version = pins[0].split("==")[1]
     locked = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
