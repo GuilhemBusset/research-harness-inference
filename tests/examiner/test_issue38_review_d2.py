@@ -31,13 +31,19 @@ class MemorySSM:
         return {"Version": 1}
 
 
+def text(value):
+    if isinstance(value, dict):  # a table, as a TOML inline table
+        return "{ " + ", ".join(f"{k} = {v}" for k, v in value.items()) + " }"
+    return str(value)
+
+
 def seed():
     raw = tomllib.loads(Path("config.example.toml").read_text())
     return {
         "/rhi/config/" + key: {
             "Name": "/rhi/config/" + key,
             "Type": "String",
-            "Value": "[]" if value == [] else str(value),
+            "Value": "[]" if value == [] else text(value),
         }
         for key, value in raw.items() if key != "pools"
     }
@@ -58,5 +64,5 @@ def test_source_uses_caller_configuration_and_reads_every_page(monkeypatch):
     assert all(type(getattr(actual, f.name)) is type(getattr(expected, f.name))
                for f in dataclasses.fields(expected))
     assert calls == [(("ssm",), {})]
-    assert len(client.reads) == 3
+    assert len(client.reads) == -(-len(client.parameters) // 4)  # every page of four, and no more
     assert client.writes == []

@@ -1,5 +1,5 @@
-"""The network stack: the VPC, the security groups and the public load balancer (system design,
-section 6.5).
+"""The network stack: the VPC, the security groups, the public load balancer and its web ACL
+(system design, section 6.5).
 
 The stack is environment-agnostic, and the CDK gives such a stack two zones. This one has three:
 the first three that `Fn::GetAZs` lists for the deploying region, which CloudFormation resolves at
@@ -15,6 +15,7 @@ import aws_cdk as cdk
 from rhi.network.edge import Edge
 from rhi.network.security import SecurityGroups
 from rhi.network.vpc import ZONES, Network
+from rhi.network.waf import WebAcl
 
 if TYPE_CHECKING:
     from aws_cdk import aws_ec2 as ec2
@@ -41,6 +42,8 @@ class NetworkStack(cdk.Stack):
         # The listener a service adds its rule and its target group to, or None while the
         # configuration's `https_listener` is false: a service then adds neither.
         self.https_listener: elbv2.ApplicationListener | None = edge.https_listener
+        # The web ACL limits rates on the load balancer, with the listener on or off (waf.py).
+        self.web_acl = WebAcl(self, "Waf", load_balancer=self.load_balancer, rate_limits=config.rate_limits).web_acl
         # The VPC strips its default security group of every rule (the flag of `cdk.json`), through
         # a function the CDK puts at the stack's root. That function names its role's ARN, which
         # orders the two already; its `DependsOn` on the role repeats it, and cfn-lint warns

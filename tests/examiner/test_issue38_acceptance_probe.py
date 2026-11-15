@@ -9,8 +9,13 @@ from rhi import config
 
 def test_typed_source_and_file_round_trip_and_parameter_errors(tmp_path):
     raw = tomllib.loads(Path('config.example.toml').read_text())
+    def text(value):
+        if isinstance(value, dict):  # a table, as a TOML inline table
+            return '{ ' + ', '.join(f'{k} = {v}' for k, v in value.items()) + ' }'
+        return '[]' if value == [] else str(value)
+
     parameters = [{'Name': '/rhi/config/' + key, 'Type': 'String',
-                   'Value': '[]' if value == [] else str(value)}
+                   'Value': text(value)}
                   for key, value in raw.items() if key != 'pools']
 
     class Client:

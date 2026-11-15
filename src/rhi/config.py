@@ -16,8 +16,9 @@ it.
 **The configuration in SSM.** One String parameter per key, named `SSM_PREFIX` followed by the
 key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the entry: an
 empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
-`false` (`True` and `False` are read too), a date as YYYY-MM-DD and an empty list as `[]`. The prefix holds the configuration and nothing else. The source reads the
-prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
+`false` (`True` and `False` are read too), a date as YYYY-MM-DD, an empty list as `[]` and a
+table as a TOML inline table (`{ issuer = 100 }`). The prefix holds the configuration and
+nothing else. The source reads the prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
 no key, like an unknown key. No value is a credential (system design, section 10), so none is a
 SecureString. The module names no region and no account.
 
@@ -64,6 +65,16 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class RateLimits:
+    """The web ACL's rate limits, in requests per 5 minutes per source address (system design,
+    sections 6.5 and 17): every request, the issuer's under `/auth/`, Grafana's under `/grafana/`."""
+
+    per_address: int
+    issuer: int
+    grafana: int
+
+
+@dataclass(frozen=True)
 class Config:
     """The typed configuration. One field per key of `KEYS`, under the same name."""
 
@@ -91,6 +102,8 @@ class Config:
     # alias record. Off until the owner's domain resolves through the hosted zone: before that,
     # the certificate's DNS validation never completes and the deployment fails.
     https_listener: bool
+    # The web ACL's three rate limits, read at synthesis only.
+    rate_limits: RateLimits
 
 
 def _as_stored(text: str) -> object:
@@ -153,6 +166,22 @@ def _no_entries(value: object) -> tuple[()]:
     return ()
 
 
+# What WAF accepts as the limit of a rate-based rule.
+RATE_LIMIT_RANGE = range(10, 2_000_000_001)
+# Section 17's rate limits.
+_RATE_LIMIT_DEFAULTS: dict[str, int] = {"per_address": 2000, "issuer": 100, "grafana": 300}
+
+
+def _rate_limits(value: object) -> RateLimits:
+    # Each entry of the table is optional: the one left out takes its default.
+    if not isinstance(value, dict) or set(value) - set(_RATE_LIMIT_DEFAULTS):
+        raise ValueError
+    limits = _RATE_LIMIT_DEFAULTS | value
+    if any(type(limit) is not int or limit not in RATE_LIMIT_RANGE for limit in limits.values()):
+        raise ValueError
+    return RateLimits(**limits)
+
+
 def _number_from_text(text: str) -> object:
     # ASCII digits only, and few enough that `int` accepts them.
     return int(text) if re.fullmatch(r"[0-9]{1,18}", text) else text
@@ -176,6 +205,14 @@ def _list_from_text(text: str) -> object:
     return [] if text == "[]" else text
 
 
+def _table_from_text(text: str) -> object:
+    # A TOML inline table, as `write_ssm` writes it.
+    try:
+        return tomllib.loads(f"value = {text}")["value"]
+    except tomllib.TOMLDecodeError:
+        return text
+
+
 _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
 
@@ -194,6 +231,11 @@ KEYS: dict[str, Key] = {
     "session_windows": _EMPTY_LIST,
     "pools": _EMPTY_LIST,
     "https_listener": Key("true or false, without quotes", _boolean, _boolean_from_text),
+    "rate_limits": Key(
+        "a table whose optional entries per_address, issuer and grafana are whole numbers from 10 to 2000000000",
+        _rate_limits,
+        _table_from_text,
+    ),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -204,6 +246,9 @@ DEFAULTS: dict[str, object] = {
     # The design gives no such key (issue E2-47): off keeps a deployed stage as it was, with no
     # certificate waiting on a domain that does not resolve yet.
     "https_listener": False,
+    # Section 17: generous per address, since a campus shares one address; tighter on the issuer
+    # and on Grafana.
+    "rate_limits": dict(_RATE_LIMIT_DEFAULTS),
 }
 
 # Keys a source may leave out without a default: the field is then None.
@@ -350,6 +395,9 @@ def _ssm_text(value: object) -> str:
         return value.isoformat()
     if isinstance(value, tuple) and not value:
         return "[]"
+    if isinstance(value, RateLimits):
+        # A TOML inline table, in SSM as in a file.
+        return "{ " + ", ".join(f"{name} = {_ssm_text(limit)}" for name, limit in vars(value).items()) + " }"
     raise ValueError
 
 

@@ -68,7 +68,9 @@ def example_parameters() -> dict[str, str]:
     assert values.pop("session_windows") == []
     # A boolean as the owner types it: `true` or `false`.
     typed = {f"/rhi/config/{key}": str(value).lower() if type(value) is bool else str(value) for key, value in values.items()}
-    return typed | {"/rhi/config/session_windows": "[]"}
+    # A table as a TOML inline table.
+    table = ", ".join(f"{name} = {limit}" for name, limit in values["rate_limits"].items())
+    return typed | {"/rhi/config/session_windows": "[]", "/rhi/config/rate_limits": f"{{ {table} }}"}
 
 
 def as_logged(error: BaseException) -> str:
@@ -134,6 +136,7 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         time_zone="Europe/Paris",
         course_end=datetime.date(2031, 2, 3),
         https_listener=False,
+        rate_limits=config.RateLimits(per_address=5000, issuer=20, grafana=150),
     )
     stand_in = StandIn()
     for written in (EXAMPLE, other):  # the second writing goes over the first
