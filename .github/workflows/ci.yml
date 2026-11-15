@@ -131,6 +131,40 @@ jobs:
   # script's test, which runs offline against a throwaway remote with the real git hooks.
   tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      # The synthesis and policy tests run aws-cdk-lib through jsii, which needs Node: the same
+      # Node 24, from the same pinned action, as the job `synth`.
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Tests
+        run: bash scripts/check.sh tests
+
+      - name: Ship script behaviour
+        run: bash scripts/check.sh ship-tests
+
+  # The tests that can only be made by starting a container (tests/container/), on the runner's
+  # Docker. They are in no local gate: the agents' host has no container runtime. The implement
+  # loop reads this job's check run by its name, so its id and its name are both
+  # `container-tests` (docs/adr/0001-software-factory.md, amendment 5). Like every job here, it
+  # is given no secret and no AWS credential.
+  container-tests:
+    name: container-tests
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,11 +177,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
 
-      - name: Tests
-        run: bash scripts/check.sh tests
+      # The job is about the runner's container runtime: without one it fails here, also while
+      # tests/container/ holds no test and the gate step has nothing to start.
+      - name: The container runtime answers
+        run: docker info
 
-      - name: Ship script behaviour
-        run: bash scripts/check.sh ship-tests
+      # A skipped test fails this step (scripts/check.sh container-tests, under CI).
+      - name: Tests that start a container
+        run: bash scripts/check.sh container-tests
 
   # The implement loop engine's own tests (tools/implementation-loop/). A skipped test fails
   # this job (scripts/check.sh engine-tests, under CI), so everything they need is prepared here.
@@ -253,7 +290,7 @@ jobs:
   # cancelled or failed result never counts as green.
   required:
     if: always()
-    needs: [hygiene, history, checks, tests, engine-tests, synth]
+    needs: [hygiene, history, checks, tests, container-tests, engine-tests, synth]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -264,6 +301,6 @@ jobs:
           set -euo pipefail
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           echo "$NEEDS" | jq -e '
-            (["hygiene", "history", "checks", "tests", "engine-tests", "synth"] - keys == [])
+            (["hygiene", "history", "checks", "tests", "container-tests", "engine-tests", "synth"] - keys == [])
             and all(.[]; .result == "success")
           ' > /dev/null
