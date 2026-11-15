@@ -219,16 +219,25 @@ class StatusClient:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+        # The answer is read outside the handlers below, so that no error raised from here has
+        # urllib's error, which holds GitHub's reason text, as its context.
+        response: Any = None
+        try:
+            response = _OPENER.open(request, timeout=TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as error:
+            response = error
+        except (OSError, http.client.HTTPException):
+            pass
         status: int | None = None
         text = b""
-        try:
-            with _OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
-                status, text = response.status, response.read(ANSWER_BYTES)
-        except urllib.error.HTTPError as error:
-            with error:
-                status, text = error.code, error.read(ANSWER_BYTES)
-        except (OSError, http.client.HTTPException):
-            status = None
+        if response is not None:
+            # The status is known before the text is read: an answer that breaks off keeps it.
+            status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
+            try:
+                with response:
+                    text = response.read(ANSWER_BYTES)
+            except (OSError, http.client.HTTPException):
+                text = b""
         try:
             answer = json.loads(text)
         except ValueError:
