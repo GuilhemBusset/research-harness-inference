@@ -4,6 +4,7 @@
 #   setup/owner-setup.sh --dry-run        print every step and every command, and run none
 #   setup/owner-setup.sh                  the walkthrough: asks before each command it runs
 #   setup/owner-setup.sh --step configuration --config <file>     one step on its own
+#   setup/owner-setup.sh --step values --config <file>            the scanner's list of real values
 #   setup/owner-setup.sh --step apps --reporter-key <file>        the Apps, read back from GitHub
 #
 # The owner runs it, from a shell no agent runs in, with their own AWS credentials and `gh` login.
@@ -12,7 +13,9 @@
 #
 # What the script learns (the account, a quota's code, an address, an App's ID) goes to the
 # terminal, the configuration goes to SSM, and the status reporter's credentials go to Secrets
-# Manager: the reporter's private key is read from its file and never printed. Nothing is written
+# Manager: the reporter's private key is read from its file and never printed. The private values
+# of the configuration go to the hygiene scanner's list of local values, a file outside the
+# repository that only you can read, and are never printed. Nothing is written
 # to the working tree, by the script or by the tools it starts: Python keeps no bytecode, and uv's
 # project environment and the CDK's output go to a temporary folder that is removed when the
 # script ends.
@@ -26,7 +29,10 @@ started_in="$PWD"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo_root"
 
-steps=(quotas domain apps configuration billing bootstrap connection repository roster)
+# The nine steps of section 8.6, in their order. `values` is the second half of the fourth: it
+# has a name of its own, to run alone, and the number 4b.
+steps=(quotas domain apps configuration values billing bootstrap connection repository roster)
+numbered=9
 
 usage() {
   cat <<EOF
@@ -37,7 +43,7 @@ usage: setup/owner-setup.sh [--dry-run] [--step <name>] [options]
   --max-instances <n>  quotas: the coursework pool's max_instances (asked for when not given)
   --upgrade-pool       quotas: the upgrade pool is wanted (96 more G-family vCPUs)
   --xl-pool            quotas: the xl pool is wanted (a P-family quota)
-  --config <file>      configuration: the owner's file, kept outside the working tree
+  --config <file>      configuration, values: the owner's file, kept outside the working tree
   --reporter-key <file>  apps: the status reporter's private key file, kept outside the working tree
 EOF
 }
@@ -101,7 +107,7 @@ say() {
 }
 
 heading() {   # heading <number> <title>
-  printf '\n== Step %s of %s: %s ==\n\n' "$1" "${#steps[@]}" "$2"
+  printf '\n== Step %s of %s: %s ==\n\n' "$1" "$numbered" "$2"
 }
 
 show() {   # print a command as a line a shell would read the same way
@@ -155,18 +161,24 @@ capture() {   # capture <variable> <command...>: as `run`, and keeps what the co
   say "      $into"
 }
 
-outside_file() {   # outside_file <variable> <what the file is>: refuses a file in the working tree
-  # The variable holds the path as it was given and, afterwards, the file's real path. Both the
+outside_path() {   # outside_path <variable> <what the file is>: refuses a path in the working tree
+  # The variable holds the path as it was given and, afterwards, as an absolute path. Both the
   # path as it was given and the file it leads to are checked: a link in the tree is in the tree.
-  # The file is not opened.
-  local -n the_file="$1"
+  # The file need not exist, and is not opened.
+  local -n the_path="$1"
   local path
-  [[ $the_file == /* ]] || the_file="$started_in/$the_file"
-  for path in "$(realpath -m -s -- "$the_file")" "$(realpath -m -- "$the_file")"; do
+  [[ $the_path == /* ]] || the_path="$started_in/$the_path"
+  for path in "$(realpath -m -s -- "$the_path")" "$(realpath -m -- "$the_path")"; do
     case "$path/" in
       "$repo_root"/*) die "refused: the $2 is inside the working tree. Keep it outside." ;;
     esac
   done
+}
+
+outside_file() {   # outside_file <variable> <what the file is>: as `outside_path`, for a file
+  # that exists. Afterwards the variable holds the file's real path.
+  local -n the_file="$1"
+  outside_path "$1" "$2"
   [ -f "$the_file" ] || die "refused: the $2 is not a file that can be read."
   the_file="$(realpath -- "$the_file")"
 }
@@ -408,6 +420,7 @@ EOF
     printf '\nThe configuration file, outside the working tree: '
     read -r file || true
     [ -n "$file" ] || die "no configuration file was named."
+    config_file="$file"   # the next step reads the same file
   fi
   say ""
   if [ -z "$file" ]; then
@@ -432,6 +445,69 @@ EOF
     say "    To check: the names of the parameters, not their values."
     run aws ssm get-parameters-by-path --path /rhi/config/ --recursive \
       --query 'Parameters[].Name' --output text || true
+  fi
+  pause
+}
+
+step_values() {
+  heading 4b "Write the list of real values the hygiene scanner checks for"
+  cat <<'EOF'
+No public pattern can name your domain or your address: writing the pattern would publish the
+value (system design, section 10). The hygiene scanner therefore also reads a list of real values
+that is kept outside the repository, and reports each of them as `local-value` in every scan on
+this machine: your hooks, your scripts/check.sh, the implement loop before each push
+(tools/hygiene/README.md, "Values only the owner knows").
+
+This step writes that list: the value of each private key of the configuration file of step 4
+(the domain, the hosted zone ID, the admin e-mail address, the instructor's phone number and the
+login app's client ID), and any further value you enter here, such as a student's name. A value
+is added once, however often the step runs, and none is printed.
+EOF
+  # Where the scanner looks: tools/hygiene/scan.py, `load_local_values`.
+  local home="${HOME:-}"
+  [ -n "$home" ] || home=~
+  local list="${HYGIENE_LOCAL_VALUES:-${XDG_CONFIG_HOME:-$home/.config}/research-harness-inference/hygiene-values}"
+  local file="$config_file" further="" value=""
+  local tool=(env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config)
+  outside_path list "list of local values"
+  say ""
+  if [ -n "${HYGIENE_LOCAL_VALUES:-}" ]; then
+    say "The list is the file HYGIENE_LOCAL_VALUES names. It is created if it is absent, for you alone:"
+  else
+    say "The list is the scanner's default file. It is created if it is absent, for you alone:"
+  fi
+  say "    $list"
+  if [ -z "$file" ] && [ "$dry_run" = 0 ]; then
+    printf '\nThe configuration file, outside the working tree: '
+    read -r file || true
+    [ -n "$file" ] || die "no configuration file was named."
+  fi
+  if [ -z "$file" ]; then
+    say "No --config was given: this dry run checks no file."
+    file="<your configuration file>"
+  else
+    outside_file file "configuration file"
+  fi
+  if [ "$dry_run" = 0 ]; then
+    say "Further values to check for, one per line. An empty line ends them:"
+    while read -r value && [ -n "$value" ]; do
+      further+="$value"$'\n'
+    done
+  fi
+  say ""
+  # The further values reach the module on its standard input: no command line holds one.
+  show "${tool[@]}" values "$file" --list "$list"
+  if [ "$dry_run" = 1 ]; then
+    say "      (dry run: not run, and no file is written)"
+  elif ! confirm "    Run it?"; then
+    say "      (not run)"
+  else
+    outside_the_tree
+    printf '%s' "$further" | "${tool[@]}" values "$file" --list "$list" ||
+      die "that command failed. Nothing after it was run."
+    say "    To check: write one of the values to a scratch file outside the working tree, and scan it."
+    say "    The scan must report it as local-value:"
+    show python3 tools/hygiene/scan.py --paths "<scratch file>"
   fi
   pause
 }
