@@ -36,7 +36,8 @@ reference inside a tool result), and its `Tool` object.
   `diagnostics`, `inference_geo`, `service_tier` and `speed`; the tools Anthropic defines or runs
   (every kind of `tools` entry but `Tool`), and the blocks that carry their calls and results
   (`server_tool_use`, the `..._tool_result` blocks of web search, web fetch and code execution,
-  `container_upload`, `browser_state`). Such a block keeps the fields it shares with the blocks
+  `container_upload`, `browser_state`), and what only a citation of a web search result has
+  (`CitationWebSearchResultLocationParam`: `encrypted_index` and `url`). Such a block keeps the fields it shares with the blocks
   above and loses the others. One whose `content` is an object is refused, by the shared filter's
   rule for an object that stands where an array is described; the engine refuses every one of
   them by its type `[E28]`;
@@ -50,13 +51,13 @@ reasoning effort (`output_config.effort`; the vLLM project's replay of Claude Co
 records `{"effort":"high"}` there `[E28]`), a system message wherever it sits in `messages`, and a
 document block. This list refuses none of them, whatever the pool's model does with them.
 
-**Three entries are wider than their neighbours:**
+**Three entries are not like their neighbours:**
 
 - `thinking` is kept whole, with any type and any field: the engine reads it from vLLM 0.33 on
   (section 6.1). Its `budget_tokens` is not clamped with the output limit.
-- `citations` is kept whole. The reference gives the name two shapes, an array of locations on a
-  text block and an object with a switch on a document or a search result, and an allow-list
-  describes one shape for a name. It holds no media.
+- `citations` has two shapes in the reference, an array of locations on a text block and an
+  object with a switch on a document or a search result. Both are described (`Shapes`), so a
+  field the reference does not give a location or the switch is dropped like any other.
 - `source` is described as the object of an image or a document. On a search result it is a
   string, which the filter keeps as it is.
 
@@ -67,7 +68,7 @@ from __future__ import annotations
 
 from typing import Final
 
-from rhi_gateway.body import KEEP, Fields, Items, Limit, Spec
+from rhi_gateway.body import KEEP, Fields, Items, Limit, Shapes, Spec
 
 # `CacheControlEphemeral`: a cache breakpoint, on the request, a block or a tool.
 _CACHE_CONTROL: Final = Fields({"type": KEEP, "ttl": KEEP})
@@ -82,12 +83,40 @@ _SOURCE: Final[dict[str, Spec]] = {
     "file_id": KEEP,  # `FileImageSource`, `FileDocumentSource`
 }
 
+# `citations`. On a document or a search result: `CitationsConfigParam`, an object. On a text
+# block: an array of `TextCitationParam`, the places an earlier answer cited.
+_CITATIONS: Final = Shapes(
+    fields=Fields({"enabled": KEEP}),
+    items=Items(
+        Fields(
+            {
+                "type": KEEP,  # every location
+                "cited_text": KEEP,  # every location
+                # `CitationCharLocationParam`, `CitationPageLocationParam`, `CitationContentBlockLocationParam`
+                "document_index": KEEP,
+                "document_title": KEEP,
+                "start_char_index": KEEP,  # `CitationCharLocationParam`
+                "end_char_index": KEEP,
+                "start_page_number": KEEP,  # `CitationPageLocationParam`
+                "end_page_number": KEEP,
+                # `CitationContentBlockLocationParam`, `CitationSearchResultLocationParam`
+                "start_block_index": KEEP,
+                "end_block_index": KEEP,
+                # `CitationSearchResultLocationParam`
+                "search_result_index": KEEP,
+                "source": KEEP,
+                "title": KEEP,
+            }
+        )
+    ),
+)
+
 # `TextBlockParam`: in a message, in `system`, in a tool result, in a search result.
 _TEXT: Final[dict[str, Spec]] = {
     "type": KEEP,  # every block
     "text": KEEP,
     "cache_control": _CACHE_CONTROL,  # every block but the two thinking blocks
-    "citations": KEEP,  # `TextCitationParam`; on a document or a search result, `CitationsConfigParam`
+    "citations": _CITATIONS,  # and `DocumentBlockParam`, `SearchResultBlockParam`
 }
 
 # The blocks of a document given as content (`ContentBlockSource`, `content`): text and image.

@@ -32,7 +32,8 @@ a `Fields` (an object: the fields kept, and what describes each), which may hold
 array: what describes each item), `KEEP` (a value kept whole) and `Limit` (a number clamped).
 Where it describes an object, an object is filtered, a string, a number, a boolean or a null is
 kept as it is (it holds no field to drop), and an array is refused; the same holds, turned round,
-where it describes an array. `KEEP` is for a value that is data to the engine and holds no media:
+where it describes an array. A name the format gives both shapes is a `Shapes`, which describes
+the object and the array, each as strictly as it would be alone. `KEEP` is for a value that is data to the engine and holds no media:
 a tool's schema, a tool call's arguments. Nothing below a `KEEP` is looked at.
 
 **Media.** The engine can be made to fetch an address it is given, so a reference is forwarded
@@ -117,7 +118,21 @@ class Items:
     item: Spec
 
 
-type Spec = Fields | Items | Limit | _Keep
+@dataclass(frozen=True)
+class Shapes:
+    """In an allow-list: a name the format gives two shapes, an object and an array.
+
+    An object is kept as `fields` describes it, and an array as `items` does.
+    """
+
+    fields: Fields
+    items: Items
+
+    def of(self, value: Any) -> Fields | Items:
+        return self.items if isinstance(value, list) else self.fields
+
+
+type Spec = Fields | Items | Shapes | Limit | _Keep
 
 # A request profile's entry point: it gets the filtered body and returns the body to serialize.
 type Rewrite = Callable[[dict[str, Any]], dict[str, Any]]
@@ -243,6 +258,8 @@ def _keep(value: Any, spec: Spec, pool: Pool) -> Any:
         return value
     if isinstance(spec, Limit):
         return _clamp(value, spec.of(pool))
+    if isinstance(spec, Shapes):
+        spec = spec.of(value)
     if isinstance(spec, Fields):
         if isinstance(value, dict):
             return {name: _keep(inner, spec.fields[name], pool) for name, inner in value.items() if name in spec.fields}
@@ -258,6 +275,8 @@ def _keep(value: Any, spec: Spec, pool: Pool) -> Any:
 
 def _refuse_references(value: Any, spec: Spec) -> None:
     """Refuse a media reference that is not inline data, at every level the allow-list describes."""
+    if isinstance(spec, Shapes):
+        spec = spec.of(value)
     if isinstance(value, list) and isinstance(spec, Items):
         for inner in value:
             _refuse_references(inner, spec.item)
