@@ -124,6 +124,9 @@ remote:
 - every change to the default branch goes through a pull request;
 - the `required` status check, reported by GitHub Actions (`.github/workflows/ci.yml`), must be
   green on the head that is merged;
+- a pull request that changes a path listed in [`.github/CODEOWNERS`](../.github/CODEOWNERS), the
+  protected paths and nothing else, also needs the owner's approving review;
+  `tests/policy/test_codeowners.py` holds that file to the engine's lists;
 - no force-push, no deletion;
 - an empty bypass list: the rule binds the owner and the factory alike.
 
@@ -148,6 +151,10 @@ check it. The owner runs it, with their own credentials, from a shell no agent r
 It asks before each command it runs, and `--dry-run` prints every step and every command and
 calls neither AWS nor GitHub. One step runs on its own with `--step <name>`: the configuration
 step, `--step configuration --config <file>`, is also how the configuration is changed later.
+The Apps step, `--step apps --reporter-key <file>`, reads each GitHub App back with `gh` and
+stores the status reporter's credentials in the Secrets Manager secret the reporter reads.
+The values step, `--step values --config <file>`, adds the configuration's private values to the
+hygiene scanner's list of local values (`tools/hygiene/README.md`, "Values only the owner knows").
 
 It installs nothing and writes nothing to the working tree. Python keeps no bytecode, and uv's
 project environment and the CDK's output go to a temporary folder, under `TMPDIR`, that is removed
@@ -175,7 +182,7 @@ when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no 
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
 | Git hooks | Checked in under `.githooks/`; `git-hooks.sh` points this clone's `.git/config` at them |
 | GitHub ruleset | `pr-only-main.json`; applied to the `origin` repository only when an admin runs `apply-ruleset.sh` |
-| The owner's walkthrough | `owner-setup.sh` installs nothing. While it runs, uv installs the project's own dependencies, at the versions in `uv.lock`, into a temporary folder outside the working tree, which the script removes |
+| The owner's walkthrough | `owner-setup.sh` installs nothing. While it runs, uv installs the project's own dependencies, at the versions in `uv.lock`, into a temporary folder outside the working tree, which the script removes. Its values step writes one file, for the owner alone: the scanner's list of local values, which is the file `HYGIENE_LOCAL_VALUES` names or else `research-harness-inference/hygiene-values` under the owner's configuration folder (`XDG_CONFIG_HOME`, by default `.config` in the home directory). It refuses a list inside the working tree |
 | Hygiene scanner | Checked in under `tools/hygiene/` (standard-library Python); installs nothing |
 | Implement loop | Checked in under `tools/implementation-loop/` (standard-library Python); where its run state and worktrees live is described in `docs/factory/operating.md` |
 | Skills | Checked in under `.claude/skills/` and `.agents/skills/`; no global skill installation, no MCP server |

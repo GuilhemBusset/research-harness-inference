@@ -22,6 +22,7 @@ src = [
   "tools/implementation-loop", "tools/implementation-loop/tests",
   "tools/hygiene",
   "tools/backlog", "tools/backlog/tests",
+  "tools/measurements",
   "tests/examiner",
   "src",
   "services/common",
