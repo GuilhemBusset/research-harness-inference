@@ -12,6 +12,7 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import boto3
 import jwt
@@ -40,7 +41,7 @@ def rig(monkeypatch):
         "secretsmanager", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub"
     )
     with Stubber(aws) as stubber:
-        data = {"now": 1800000000.0, "calls": [], "tokens": [], "jwts": [], "fields": fields}
+        data: dict[str, Any] = {"now": 1800000000.0, "calls": [], "tokens": [], "jwts": [], "fields": fields}
 
         def open_request(request, timeout):
             assert request.get_method() == "POST"
@@ -127,7 +128,8 @@ def test_refusals_report_only_status_and_code(rig, monkeypatch, caplog, phase):
     body = json.dumps({"message": marker, "errors": [{"code": "invalid", "message": marker}]}).encode()
 
     def refuse(request, timeout):
-        raise urllib.error.HTTPError(request.full_url, 422, marker, {}, io.BytesIO(body))
+        headers: Any = {}  # a stand-in for the answer's headers, which nothing reads
+        raise urllib.error.HTTPError(request.full_url, 422, marker, headers, io.BytesIO(body))
 
     monkeypatch.setattr(github._OPENER, "open", refuse)
     with pytest.raises(github.RefusedError) as caught:
@@ -151,7 +153,7 @@ def test_interrupted_refusal_is_still_a_safe_refusal(rig, monkeypatch):
             self.wfile.write(b"7\r\npartial\r\n")
             self.close_connection = True  # the refusal body ends before its terminating chunk
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Refusal)
