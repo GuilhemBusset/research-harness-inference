@@ -11,10 +11,14 @@ requires-python = ">=3.12"
 # What the CDK app runs on, each pinned to an exact version (docs/design/evidence.md, E20).
 # constructs is pinned at the version the lock resolves for aws-cdk-lib: bump the two together.
 # The CDK CLI is pinned apart, in package.json. tests/unit/test_toolchain.py checks these pins.
+# boto3, the AWS SDK, is here for one use: the ssm source and the writer of src/rhi/config.py,
+# which read the configuration from SSM and write it there. It is the version the service groups
+# below carry (one lock holds one version); tests/unit/test_config_ssm.py checks this pin.
 dependencies = [
     "aws-cdk-lib==2.276.0",
     "constructs==10.8.1",
     "cdk-nag==3.0.2",
+    "boto3==1.43.126",
 ]
 
 # Exact pins, shared with the vendored implement loop (tools/implementation-loop/UPSTREAM.md) so
