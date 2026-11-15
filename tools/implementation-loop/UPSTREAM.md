@@ -386,6 +386,35 @@ and a new version revives every failed issue once.
 | --- | --- | --- |
 | `implement_loop/cli.py` | New command `costs <issue>` (`cmd_costs`, `cost_report`, `render_costs`), reached as `scripts/implement.sh costs <issue>`, with `--json` for the same figures as data. It reads the run's `agents.jsonl` and, since the run records do not keep an issue's size, each issue's `size:` label on GitHub, as `plan` reads issues and through the same client (`github_client`) (an issue without one counts as `M`, as for its ceilings). It prints, for each issue of the run, its size, its answered calls, its Claude dollars and its Codex tokens, with one line for the calls made for no issue; per role, the attempts and the answered calls, the Claude dollars and the Codex tokens with the median and the maximum per call; per size, the median and the maximum per issue. An attempt that reports no cost adds no dollar and is not among the calls its role's median is taken over; an issue no agent was called for is listed and left out of its size's figures. Nothing is written, and neither `config.py` nor `loop.toml` changes. | `status` shows each issue's calls and dollars and the run's totals, not what `USD_CEILINGS`, `CEILINGS` and `max_budget_usd` are set from: the cost per call of each role and the spread of an issue's cost within a size. Setting them stays the owner's (`docs/factory/green-light.md`, step 10). |
 
+### 1.2.3, patched again: the factory's GitHub App mints the engine's token (2026-11-15)
+
+ADR 0001's second amendment gives the factory a GitHub identity of its own: a GitHub App installed
+on this repository only, without the workflows and administration permissions. Issue #9 (draft
+E0-03) makes the engine act as it. Three environment variables name the App
+(`LOOP_GITHUB_APP_ID`, `LOOP_GITHUB_APP_INSTALLATION_ID`, `LOOP_GITHUB_APP_KEY_FILE`); with none
+of them set the engine keeps the login `gh` already has, as upstream does. The engine's version
+stays 1.2.3: nothing here repairs a failed issue.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/app_token.py` | New, standard library and the `openssl` program only. `configured` reads the three variables (all or none; some is an error). `jwt` has `openssl dgst -sha256 -sign` sign the App's statement with the key file, which Python never reads. `mint` exchanges it for an installation token and its expiry; `installation` reads the installation's permissions. `token` keeps one token in memory and replaces it when less than ten minutes remain. `gh_env` is the environment of one `gh` process (`GH_TOKEN` added to the engine's). `git_env` is the git configuration that makes this file github.com's credential helper, after an empty helper that drops those of git's own files; `credential`, with the file run as a program, answers git. `permission_problems` is the doctor's judgement. Errors are fixed text and an HTTP status, never what GitHub or openssl answered. `LOOP_GITHUB_API_URL` moves the API for the tests: https, or this host. | Amendment 2. The token is never put in the engine's own environment, which every process it starts inherits (the probe of the test runner, the tools the doctor asks for a version): `gh` gets it per process, and git asks the helper, a new process that mints one for each push and fetch. So the workspace module, the supervisor and `ship.sh` push and fetch as the App without a change, and nothing is written to disk. |
+| `implement_loop/github.py` | `GhCli` takes `env`, kept as an attribute of that name: a function asked before each `gh` process (`_api`, `failed_log`) for that process's environment; without it, or when it answers None, `gh` is started as before. A token that cannot be minted is a request not sent: retried, then `GitHubUnavailable`, when GitHub was unreachable or answered 429 or 5xx; `GitHubError` at once otherwise. | Every `gh` call gets a token with at least ten minutes left. The default leaves the client, and its tests, independent of the environment. |
+| `implement_loop/cli.py` | New: `github(slug)`, a `GhCli` whose `env` is `app_token.gh_env`. `github_client` wraps it in `RedactingGitHub` where it wrapped a bare `GhCli`, so `plan`, `run`, `record-fixture` and `costs` call GitHub as the App and what a run publishes is still masked first; `repo_slug` and the doctor's `gh` commands (`_out`) get the same environment. `git_as_the_app()` adds `app_token.git_env` to the engine's environment at the start of `run`, `supervise` and `doctor`, before `sandbox.engine_git_env` adds its own entries. The doctor gains two lines. `github identity`: the login `gh` has, named, without the variables; with them the App's name and installation, and a failure when the installation holds the workflows or the administration permission, cannot read checks, when no token can be minted, when only some variables are set, or when `origin` is not an `https://github.com/` URL (git would not ask the helper, and would push as someone else); a warning when the App is installed on every repository. `checks access`: a failure when the identity, App or login, cannot read the check runs of the base branch, asked as `required_check_run` asks. | The doctor says which identity a run would have and refuses one that could change the gates or could never land. A fine-grained personal token logs in and is still refused on check runs of a private repository: the second line catches that under either identity. |
+| `tests/test_app_token.py` | New, 11 tests, none skipped: a stub of GitHub's two App endpoints on the loopback interface that verifies each signature with the public half of a key `openssl` generates in the test, a `gh` script that records the token it is started with, and the real git. A mint; a renewal under ten minutes; `git credential fill` answered with a token minted after the first neared its end, for github.com only; a mint that fails; `test_the_token_stays_with_gh_and_git` (an engine run: the token in `gh`'s environment and git's answer, and not in the engine's environment, a process that inherits it, an agent's or a check's environment, any file of the run, or what was published); the doctor without the variables, with some, with the App, and its refusals (`test_doctor_refuses_a_workflows_permission`, administration, no checks, check runs unreadable). The file imports the engine beside it and holds it in `sys.modules` during its own tests (`the_engine_beside_these_tests`), then puts the process's modules back. | The verifier's result plugin (`loop_pytest.py`, loaded from the running engine on `PYTHONPATH`) drops the running engine's package only in the pytest process that records: an xdist worker of `scripts/check.sh engine-tests` keeps it, and every engine test file there imports the running engine, which has no `app_token`. The plugin is on the safety surface and is not changed here; the other test files still run on the running engine in those workers. |
+
+Outside this directory:
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `docs/factory/green-light.md` | Step 7 creates and installs the App, names the three variables and the doctor's lines, in place of the fine-grained token. | The checklist said this issue replaces its token. |
+
+Not changed, on purpose: `workspace.py`, `supervisor.py`, `scripts/ship.sh` and `sandbox.py`. The
+sandbox's scrub already drops every GitHub token variable and replaces the git configuration for
+agents and checks. It does not drop the three `LOOP_GITHUB_APP_*` variables: an agent can read
+the two numbers and the key file's path, and cannot read the file while it is under a directory
+the sandbox hides (`docs/factory/green-light.md`, step 7). The doctor's table in `README.md` does
+not list the two new lines yet.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -544,6 +573,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_costs.py` (11), `tests/fixtures/costs/agents.jsonl`, `tests/fixtures/costs/issues.json` | Added. The run log (twenty attempts) and the five issues with their `size:` labels are written for the test, not taken from a run. The test loads this tree's `implement_loop` under a name of its own: under the verifier an xdist worker keeps the running engine's package in its module cache (`loop_pytest` drops it only in the pytest that records), and that engine has no `costs` until this change runs. | The command on that log, with GitHub replaced by the recorded issues: each issue's size, answered calls and dollars; the totals; each role's median and maximum per call; each size's median and maximum per issue; an attempt that reports no cost (a timeout, a null cost, every Codex call) adds no dollar; an issue nothing ran for stays out of its size; `scripts/implement.sh costs` reaches the command. |
+
+### 1.2.3, patched again (2026-11-15)
+
+631 collected tests: the 620 before it, none removed and none changed, and 11 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_app_token.py` (11) | Added. What each test shows is in the patch's table above. | The factory's GitHub App: the mint, the renewal, git's credential helper, where the token is not, and the doctor's two lines. |
 
 ## Kept as recorded
 
