@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.13 |
+| Engine version here | 1.2.14 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -888,6 +888,27 @@ the engine on that path, so `engine.py` does not change.
 | --- | --- | --- |
 | `implement_loop/__init__.py` | `VERSION` 1.2.12 → 1.2.13. | A new engine version: #57 is revived once, with fresh ceilings, and plans again. |
 | `tests/test_revived_refused_plan.py` | New (2 tests). #57's record (no plan, no worktree, failed `ceiling` on 1.2.4 with its infrastructure budget spent), revived by a real `Engine` into `pending` with that budget at 0, then planned by the live adapter with the checked-in `plan` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A revived plan refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `plan`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #57's own message. | The regression test of this repair. |
+
+Not changed, on purpose: the engine's code, the verifier, the gate, the live adapter, `config.py`,
+`loop.toml` and the prompts.
+
+### 1.2.14: #101's revived first build, refused for the usage limit (2026-11-15)
+
+The repair of fault f5089187d5 (issue #320). On engine 1.2.4, #101 failed with `ceiling`. Its run
+log (the events of the issue and its calls in the run for #2) was read when this repair was
+planned; nothing of it is copied here. #101 was planned and had a worktree, but no build ever
+answered: its ten failed attempts were ten `build` calls on Claude refused for the account's usage
+limit (exit 1, an empty stderr, the reason only in the JSON result), each charged to the
+infrastructure budget as a crash, as for #92, #90, #85 and #57. That cause is the one 1.2.7
+repairs, in files on the safety surface, which do not change here. What #101 adds is its own path:
+a revival into `build` with no round behind it (no build commit, no feedback but the revival
+note, only the plan and triage calls spent), which no regression test covered. The test finds no
+defect in the engine on that path, so `engine.py` does not change.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.13 → 1.2.14. | A new engine version: #101 is revived once, with fresh ceilings, and builds again. |
+| `tests/test_revived_unbuilt_build.py` | New (2 tests). #101's record (planned, a worktree, two calls spent, no feedback, failed `ceiling` on 1.2.4 with its infrastructure budget spent), revived by a real `Engine` into `build` with that budget at 0 and only the revival note as feedback, then built by the live adapter with the checked-in `build` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A first build refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail. | The regression test of this repair. |
 
 Not changed, on purpose: the engine's code, the verifier, the gate, the live adapter, `config.py`,
 `loop.toml` and the prompts.
