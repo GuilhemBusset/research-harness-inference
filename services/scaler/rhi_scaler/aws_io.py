@@ -11,7 +11,7 @@ What is read, for each pool:
 | Desired capacity, instances by lifecycle state and their scale-in protection, suspended processes | `DescribeAutoScalingGroups` |
 | The warm pool's instances | `DescribeWarmPool` |
 | Which instances serve | `DescribeTargetHealth` on the pool's target group |
-| Launches abandoned in a row, the last launch that found no capacity | `DescribeScalingActivities`, newest first |
+| Launches abandoned in a row, the last launch that found no capacity | `DescribeScalingActivities` |
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
 | Mode (the configured mode when no record exists) and the scaler's memory | the pool-state table, by pool |
 
@@ -31,10 +31,13 @@ instance of the warm pool that is `Warmed:Running` or `Warmed:Pending*` (being p
 Abandoned launches (section 5.4). An abandoned launch is a launch activity, into service or into the
 warm pool, that failed or was cancelled because its launch hook was abandoned. A launch that found
 no capacity is not one, whatever else it says: it is only the time the note carries (section 5.3).
-The count walks the history from the newest activity and stops at the last launch that reached
-service; an abandon at or before `Memory.abandons_counted_from` does not count, since the group's
-history still holds the abandons that set the mark the admin cleared. A launch that failed for any
-other reason neither counts nor ends the row.
+The count reads the whole history the group returns and goes by the time each activity completed:
+Auto Scaling orders activities by the time they started, and launches that run side by side can
+complete in the other order. Only an abandon that completed after the later of the last launch that
+reached service and `Memory.abandons_counted_from` counts, since the group's history still holds
+the abandons that set the mark the admin cleared. A launch that failed for any other reason neither
+counts nor ends the row. The time of the last launch that found no capacity is read from the whole
+history too, whatever came after it.
 
 `apply` makes, for each pool, these calls and only those that change something, in this order:
 
@@ -226,8 +229,9 @@ class LaunchHistory:
 
 
 def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | None) -> LaunchHistory:
-    """Reads activities, newest first, back to the last launch that reached service."""
-    abandoned = 0
+    """Reads the activities, in any order, by the time each completed (its start while it runs)."""
+    reached_service: int | None = counted_from
+    abandons: list[int] = []
     no_capacity_at: int | None = None
     for activity in activities:
         description = str(activity.get("Description", "")).lower()
@@ -236,14 +240,18 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
         status = activity.get("StatusCode")
         message = str(activity.get("StatusMessage", ""))
         moment = _seconds(activity.get("EndTime") or activity["StartTime"])
-        if status == "Successful" and not _into_warm_pool(description):
-            break
+        if status == "Successful":
+            if not _into_warm_pool(description):
+                reached_service = moment if reached_service is None else max(reached_service, moment)
+            continue
         if status not in ("Failed", "Cancelled"):
             continue
         if NO_CAPACITY in message:
             no_capacity_at = moment if no_capacity_at is None else max(no_capacity_at, moment)
-        elif "abandon" in message.lower() and (counted_from is None or moment > counted_from):
-            abandoned += 1
+        elif "abandon" in message.lower():
+            abandons.append(moment)
+    # The row starts at the later of the last launch that reached service and the memory's start.
+    abandoned = sum(1 for moment in abandons if reached_service is None or moment > reached_service)
     return LaunchHistory(abandoned, no_capacity_at)
 
 
