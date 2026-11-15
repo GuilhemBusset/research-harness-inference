@@ -26,4 +26,4 @@ class EndpointStage(cdk.Stage):
     def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
         super().__init__(scope, construct_id)
         self.config = config
-        self.network = NetworkStack(self, "Network")
+        self.network = NetworkStack(self, "Network", config=config)
