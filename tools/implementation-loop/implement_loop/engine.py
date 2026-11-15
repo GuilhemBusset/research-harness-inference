@@ -2044,15 +2044,18 @@ class Engine:
             return self._history_refused(n, head, refused)
         problems += vproblems
         selected = {"*": sorted(set(ran) | {t for v in (st.manifest or {}).values() for t in v})}
-        unselected = verify.unselected(wt, [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")],
-                                       selected, st.dispositions)
+        base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
+        check_files = [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")]
+        # A test main already defines is not the issue's to select: a command that runs one test of
+        # an existing suite locks that file, and its other tests were charged to the issue (#51).
+        on_main = self._defined_at(wt, base, check_files)
+        unselected = [t for t in verify.unselected(wt, check_files, selected, st.dispositions) if t not in on_main]
         if unselected:
             problems.append(f"tests in locked files that no command selects: {unselected[:6]} — select each one in a "
                             f"command, or give it a disposition (owner-run, or excluded: <reason>)")
         closed = self._close_findings(n, st, wt, evidence)
         st = self.store.issue(n)
         still = [f for f in st.findings if f.get("status") == "open"]
-        base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
         changed = self.ws.changed_files(wt, base)
         problems += gate.zone_problems(changed, st.grants, st.probes, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
@@ -2392,6 +2395,19 @@ class Engine:
                 return "a probe file must be a path the file system can create"
             bad = verify.unconditional_failures(Path(tmp), [p.file])
         return f"it fails unconditionally: {bad[0]}" if bad else None
+
+    @staticmethod
+    def _defined_at(wt: Path, rev: str, files: list[str]) -> set[str]:
+        """The tests defined in these files as they stand at `rev` (a file it lacks defines none)."""
+        with tempfile.TemporaryDirectory(prefix="loop-base-") as tmp:
+            root, present = Path(tmp), []
+            for f in files:
+                proc = subprocess.run(["git", "show", f"{rev}:{f}"], cwd=wt, capture_output=True, check=False)
+                if proc.returncode == 0:
+                    (root / f).parent.mkdir(parents=True, exist_ok=True)
+                    (root / f).write_bytes(proc.stdout)
+                    present.append(f)
+            return set(verify.defined_tests(root, present))
 
     def _lock_and_adopt(self, n: int, wt: Path, probes, first: bool) -> str:
         """At the first examination the builder's tests, their configuration and the selection

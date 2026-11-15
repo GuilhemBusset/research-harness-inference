@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.9 |
+| Engine version here | 1.2.10 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -576,6 +576,29 @@ that path.
 | --- | --- | --- |
 | `implement_loop/__init__.py` | `VERSION` 1.2.8 → 1.2.9. | A new engine version: #90 is revived once, with fresh ceilings, and resumes its build. |
 
+### 1.2.10: the tests main already defines in a locked file (2026-11-15)
+
+The repair of fault 75fe7a2823 (issue #290). On engine 1.2.4, #51 ended `no_progress`. Its run log
+(the events of the issue and its calls in the run for #2) was read when this repair was planned;
+nothing of it is copied here. One of #51's commands ran a single test of the scanner's existing
+suite by node id (`tools/hygiene/tests/test_scan.py::test_this_repository_scans_clean`), a file
+the branch does not change. At the first examination `_lock_and_adopt` locked every file a command
+ran, that one included. From the next verification on, `_step_verify` handed every locked file to
+`verify.unselected`, which wants each test the file defines selected or disposed, so main's whole
+suite in that file was charged to the issue. The builder's only way out was a command change; the
+examiner refused each one, rightly, because each dropped another locked selection. A replan
+changed nothing, because the plan was not the cause.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.9 → 1.2.10. | A new engine version: #51 is revived once, with fresh ceilings, and resumes on the branch that keeps its work. |
+| `implement_loop/engine.py` | New: `Engine._defined_at`, the tests defined in some files as they stand at a revision (each read with `git show` into a throwaway directory, then `verify.defined_tests`). `_step_verify` takes the merge base before the selection check, no longer after it, and drops from what `verify.unselected` reports the test ids main already defines in those files. | The rule exists so that the issue's own check files cannot be quietly emptied (`verify.py`). A test main already defines is not the issue's to select, whichever command happens to lock its file. A test the branch adds, to a new file or to an existing one, is still required. |
+
+Behaviour an upstream reader would not expect: a test main already defines in a locked file may
+stay unselected and undisposed. What the selection manifest already holds must still run and
+pass. Not changed, on purpose: the verifier (`verify.unselected` and the manifest), the gate, the
+live adapter, `config.py` and the prompts.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -790,6 +813,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_revived_refused_build.py` (2) | Added. | The regression of fault 734810b2a3: #90's record (planned, a worktree, failed `ceiling` on 1.2.4 with its infrastructure budget spent) revived by a real `Engine` (`_maybe_revive`) into `build` with that budget at 0, then the live adapter with the checked-in `build` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A revived build refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #90's own message. |
+
+### 1.2.10
+
+659 collected tests: the 657 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_main_suite_selection.py` (2) | Added. | The regression of fault 75fe7a2823, in real engine runs with the fake agents, on a `main` whose test file defines three tests, of which the builder's command runs one by node id, and a first examination that leaves a finding. The file locks at that examination; the issue is delivered with no "no command selects" problem. A test the branch adds to that file and selects nowhere is still reported, alone, until the builder disposes of it. On 1.2.9 both fail. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
 
 ## Kept as recorded
 
