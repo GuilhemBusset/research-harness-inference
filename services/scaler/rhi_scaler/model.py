@@ -8,8 +8,7 @@ and carries a `Decision` out.
 A time is a whole number of seconds since the epoch, as in `rhi_common.records`, and `None` when
 it is unknown. An instance is named by its ID.
 
-The rules that come later (more than one instance, the fail-safes, the ceilings and the spend, the
-schedule) extend these shapes.
+The rules that come later (the ceilings and the spend, the schedule) extend these shapes.
 """
 
 from __future__ import annotations
@@ -61,6 +60,17 @@ class Memory:
     no run is known to have. `low_load_since` is the time of the first of the runs in a row that
     saw two instances or more in service and the requests in flight at most (n - 1) times half of
     `target_concurrency`, and `None` when the last run did not, or when it removed an instance.
+
+    The rest serve the fail-safes (section 5.1). `last_gateway_at` is the time of the last fresh
+    gateway heartbeat seen (when it was written), and `None` when no run has seen one: nobody can
+    reach the fleet without the gateway, so a pool none has reported on for 10 minutes goes to
+    zero. `launch_suspended` is the mark of the launch loop, the attribute
+    `rhi_common.tables.LAUNCH_SUSPENDED` of the pool's memory item: a run sets it when three
+    launches were abandoned in a row, and only the admin sets it back to false. `suspended_at` is
+    the time of the run that set it, and `None` while no mark stands: a mark that is false while
+    `suspended_at` is set is a mark the admin has cleared. `abandons_counted_from` is the time of the
+    run that found the mark cleared, and `None` before any did: the edge counts no abandoned launch
+    before it, since the group's activity history still holds the ones that set the mark.
     """
 
     last_request_at: int | None = None
@@ -69,6 +79,10 @@ class Memory:
     waiting_since: tuple[tuple[str, int], ...] = ()
     last_scale_out_at: int | None = None
     low_load_since: int | None = None
+    last_gateway_at: int | None = None
+    launch_suspended: bool = False
+    suspended_at: int | None = None
+    abandons_counted_from: int | None = None
 
 
 @dataclass(frozen=True)
@@ -77,7 +91,9 @@ class PoolInputs:
 
     `gateway_heartbeats` and `instance_heartbeats` are the pool's fresh rows of the heartbeats
     table (`rhi_common.records.is_fresh`); the decision counts no other. `abandoned_launches` is
-    the number of launches abandoned in a row, counted from the group's activity history.
+    the number of launches abandoned in a row, counted by the edge from the group's activity
+    history from `Memory.abandons_counted_from`: a launch that reaches service ends a row, and one
+    that found no capacity is not abandoned.
     """
 
     config: Pool
@@ -113,6 +129,11 @@ class Reason(StrEnum):
     SCALE_IN = "scale-in"
     # Requests are held for a pool at zero whose mode does not let them wake it.
     NOT_WOKEN = "not-woken"
+    # No fresh gateway heartbeat for 10 minutes: nobody can reach the fleet, the pool goes to zero.
+    GATEWAY_SILENT = "gateway-silent"
+    # Three launches abandoned in a row: the group's launches are suspended and nothing wakes or
+    # grows the pool until the admin clears the mark.
+    LAUNCH_SUSPENDED = "launch-suspended"
     # No rule asks for another size.
     UNCHANGED = "unchanged"
 
@@ -124,8 +145,9 @@ class PoolDecision:
     `desired` is the desired capacity to set, an absolute number: setting it again changes
     nothing. `lift_protection` names, in sorted order, every instance whose scale-in protection to
     lift before the capacity is lowered: Auto Scaling lowers the desired capacity of a group whose
-    instances are all protected and terminates none of them. `memory` is what to store for the
-    next run.
+    instances are all protected and terminates none of them. `suspend_launches` is whether the
+    group's launches are to be suspended (true) or resumed (false); setting it again changes
+    nothing. `memory` is what to store for the next run.
     """
 
     pool: str

@@ -151,7 +151,9 @@ def test_a_request_in_flight_keeps_the_pool() -> None:
 
     assert (busy.desired, busy.lift_protection, busy.reason) == (2, (), Reason.UNCHANGED)
     # One request on two instances is a low load too: its 10 minutes start.
-    assert busy.memory == Memory(last_request_at=long_ago, last_in_flight_at=NOW, low_load_since=NOW)
+    assert busy.memory == Memory(
+        last_request_at=long_ago, last_in_flight_at=NOW, low_load_since=NOW, last_gateway_at=NOW
+    )
 
     # The request has ended: the pool is idle from the last run that saw it, not from its arrival.
     def after(minutes: int) -> PoolDecision:
