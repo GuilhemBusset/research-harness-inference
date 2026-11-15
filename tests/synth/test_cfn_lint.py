@@ -105,6 +105,11 @@ def test_every_template_under_setup_passes() -> None:
     assert {path: of_path for path, of_path in found.items() if of_path} == {}
 
 
+def test_the_bootstrap_policies_are_among_the_templates_under_setup() -> None:
+    # The template the owner deploys by hand before the bootstrap (setup/bootstrap/README.md).
+    assert SETUP / "bootstrap" / "policies.yaml" in setup_templates(SETUP)
+
+
 def test_reports_an_error() -> None:
     template = {"Resources": {"Queue": {"Type": "AWS::SQS::Queue"}}}
     assert synthesized_findings(template) == []
