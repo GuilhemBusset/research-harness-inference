@@ -115,7 +115,7 @@ class World(Host):
 
     # The host module.
 
-    def holds(self, image: str) -> bool:
+    def holds(self, image: str, timeout: float | None = None) -> bool:
         return image == IMAGE and self.on_disk
 
     def pull(self, image: str, timeout: float | None = None) -> None:
