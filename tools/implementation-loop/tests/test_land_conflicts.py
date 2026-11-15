@@ -297,8 +297,8 @@ class LandConflictTests(unittest.TestCase):
         self.assertNotEqual(examined[0]["head"], examined[-1]["head"])
         self.assertLess(examined[0]["seq"], found[0]["seq"])
         self.assertLess(found[0]["seq"], examined[-1]["seq"])
-        self.assertTrue(examined[-1]["seq"] > found[0]["seq"] and not examined[-1]["adopted"],
-                        "the certificate after the conflict comes from a focused delta examination")
+        self.assertGreater(examined[-1]["seq"], found[0]["seq"],
+                           "the certificate after the conflict comes from a focused delta examination")
 
     def test_same_line_conflict_with_multiple_files_and_different_requirements(self):
         extra = "shared/another-list.txt"

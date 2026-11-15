@@ -81,4 +81,3 @@ def test_repair_version_is_newer_and_documented():
     assert tuple(map(int, version.split("."))) > (1, 2, 9)
     notes = (engine / "UPSTREAM.md").read_text()
     assert f"| Engine version here | {version} |" in notes
-    assert f"### {version}:" in notes

@@ -6,8 +6,10 @@ terminal, within fixed bounds (part of the safety surface: a repair run cannot r
 - before each run it fast-forwards the main checkout when it is clean and on `main`, so a new
   engine version, or a prerequisite merged elsewhere, is picked up;
 - an issue waiting on an outage is resumed only once that vendor answers the doctor's smoke call;
-- a loop fault the engine filed gets **one repair run per fault fingerprint**, on the fault issue,
-  in repair mode (the engine refuses any change to the safety surface); then the root resumes;
+- an engine exception the engine filed as a loop fault gets **one repair run per fault
+  fingerprint**, on the fault issue, in repair mode (the engine refuses any change to the safety
+  surface); then the root resumes. A stall (an issue `failed` on `ceiling`, `no_progress` and the
+  like) stays filed and gets no repair run: the operator reads it, and `retry` revives the issue;
 - a delivered issue with a deferred item resumes once that item's issue has landed (the engine
   reopens the item);
 - a crashed run is relaunched with backoff.
@@ -148,7 +150,7 @@ class Supervisor:
         done = state.get("repairs", {})
         return [(fp, entry["filed"]) for fp, entry in sorted(faults.items())
                 if isinstance(entry, dict) and entry.get("filed") and fp not in done
-                and self.root in (entry.get("runs") or [self.root])]
+                and self.root in (entry.get("runs") or [self.root]) and not _stall(entry)]
 
     # ------------------------------------------------------------------ side effects
     def _run_engine(self, args: list[str]) -> int:
@@ -231,3 +233,10 @@ class Supervisor:
         self._save(state)
         self.log(f"supervise #{self.root}: {reason}")
         return out
+
+
+def _stall(entry: dict) -> bool:
+    """A fault the engine filed for an issue it could not deliver (`Engine._fail`), not for an
+    exception: its title has said `#<n> not delivered (<cause>)` since the first version, and an
+    exception's says `<type> in the engine (<fingerprint>)`."""
+    return " not delivered (" in str(entry.get("title") or "")
