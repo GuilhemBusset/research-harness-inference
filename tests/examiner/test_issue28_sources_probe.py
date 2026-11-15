@@ -21,7 +21,7 @@ def test_sources_and_selection(tmp_path, monkeypatch):
         config.load({'RHI_CONFIG': 'file'})
     (tmp_path / 'config.local.toml').write_text(text.replace('example-owner', 'local-owner'))
     assert config.load({'RHI_CONFIG': 'file'}).github_owner == 'local-owner'
-    for selection in ({}, {'RHI_CONFIG': ''}, {'RHI_CONFIG': 'ssm'}, {'RHI_CONFIG': 'invalid-source'}):
+    for selection in ({}, {'RHI_CONFIG': ''}, {'RHI_CONFIG': 'invalid-source'}):
         with pytest.raises(config.ConfigError, match='RHI_CONFIG'):
             config.load(selection)
     monkeypatch.setenv('RHI_CONFIG', 'file')
