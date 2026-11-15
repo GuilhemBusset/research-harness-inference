@@ -55,12 +55,20 @@ class Memory:
     last run did not. `waiting_since` pairs, in sorted order, each instance in service that reports
     waiting requests while no instance of the pool has room with the time of the first of the runs
     in a row that saw it so. It is empty as soon as an instance has room.
+
+    The last two time how long a pool of two instances or more has been light, which is what makes
+    it shrink. `last_scale_out_at` is the time of the last run that grew the pool, and `None` when
+    no run is known to have. `low_load_since` is the time of the first of the runs in a row that
+    saw two instances or more in service and the requests in flight at most (n - 1) times half of
+    `target_concurrency`, and `None` when the last run did not, or when it removed an instance.
     """
 
     last_request_at: int | None = None
     last_in_flight_at: int | None = None
     above_target_since: int | None = None
     waiting_since: tuple[tuple[str, int], ...] = ()
+    last_scale_out_at: int | None = None
+    low_load_since: int | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +108,9 @@ class Reason(StrEnum):
     STOPPED = "stopped"
     # The instances in service have been full for 60 seconds: the pool grows by one instance.
     SCALE_OUT = "scale-out"
+    # The load has fit in one instance fewer at half of `target_concurrency` for 10 minutes, 15
+    # minutes after the last scale-out: one instance that reports nothing running leaves.
+    SCALE_IN = "scale-in"
     # Requests are held for a pool at zero whose mode does not let them wake it.
     NOT_WOKEN = "not-woken"
     # No rule asks for another size.

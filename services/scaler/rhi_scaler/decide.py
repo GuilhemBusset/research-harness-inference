@@ -10,6 +10,7 @@ The rules here take a pool from zero, grow it, and take it back:
 | --- | --- |
 | 0 to 1 | A held request for a pool in mode `enabled` at zero asks for one instance, however many are held |
 | 1 to n | The instances in service full for 60 seconds, in a pool nobody stopped: one more instance, up to `max_instances`, and none while one asked for is still starting |
+| n to n - 1 | Two instances or more in service and none starting or leaving, the requests in flight at most (n - 1) times half of `target_concurrency` for 10 minutes, 15 minutes after the last scale-out, in a pool nobody stopped: one instance fewer, one that reports nothing running and nothing waiting, and none when no instance does |
 | to 0 | No request received and none in flight or held for `idle_minutes`, in any mode: zero, naming every instance |
 | stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
 
@@ -25,7 +26,13 @@ rebalance transition moves students to the emptier one), and the time it spends 
 The 60 seconds are counted in the memory, from one run to the next.
 
 A decision that lowers the capacity names the instances whose scale-in protection to lift: the
-ones released by a stop, and every instance of the pool when it goes to zero.
+ones released by a stop, the one a scale-in removes, and every instance of the pool when it goes
+to zero.
+
+A scale-in removes only an instance whose fresh heartbeat reports nothing running and nothing
+waiting: the design does not lean on the load balancer's drain. An instance with no fresh heartbeat
+is not known to be idle, so it is not removed. The last instance never leaves by this rule, only by
+idleness. A scale-in starts the 10 minutes again, so the next one is judged on the smaller pool.
 """
 
 from __future__ import annotations
@@ -37,6 +44,10 @@ from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs,
 STOPPED_MODES = frozenset({Mode.DISABLED, Mode.BUDGET_LATCHED})
 # How long the instances in service must have been full before the pool grows.
 SCALE_OUT_SECONDS = 60
+# How long the load must have fit in one instance fewer before the pool shrinks.
+LOW_LOAD_SECONDS = 10 * 60
+# How long after the last scale-out the pool may shrink.
+AFTER_SCALE_OUT_SECONDS = 15 * 60
 
 
 def _every_instance(supply: Supply) -> tuple[str, ...]:
@@ -77,11 +88,17 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     waiting_before = dict(pool.memory.waiting_since)
     # A run that sees it for the first time starts the count; the runs after it keep that time.
     above_since = now if pool.memory.above_target_since is None else pool.memory.above_target_since
+    n = len(supply.in_service)
+    # The load fits in n - 1 instances at half of the target, without the division.
+    low_load = n >= 2 and 2 * in_flight <= (n - 1) * target
+    low_since = now if pool.memory.low_load_since is None else pool.memory.low_load_since
     memory = Memory(
         last_request_at=max((time for time in received if time is not None), default=None),
         last_in_flight_at=now if in_flight or held else pool.memory.last_in_flight_at,
         above_target_since=above_since if above_target else None,
         waiting_since=tuple((name, waiting_before.get(name, now)) for name in waiting),
+        last_scale_out_at=pool.memory.last_scale_out_at,
+        low_load_since=low_since if low_load else None,
     )
     full = _lasted(memory.above_target_since, SCALE_OUT_SECONDS, now) or any(
         _lasted(since, SCALE_OUT_SECONDS, now) for _, since in memory.waiting_since
@@ -95,6 +112,7 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     desired = supply.desired
     lift: tuple[str, ...] = ()
     reason = Reason.UNCHANGED
+    last_scale_out_at, low_load_since = memory.last_scale_out_at, memory.low_load_since
 
     # No request received and none in flight or held for `idle_minutes`, on what the gateways report.
     idle = (
@@ -111,6 +129,9 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         if heartbeat.instance in counted and is_fresh(heartbeat, now)
     ]
     working = {heartbeat.instance for heartbeat in reports if heartbeat.running or heartbeat.waiting}
+    # The instances in service that report nothing running and nothing waiting: the only ones a
+    # scale-in may remove.
+    unused = sorted({heartbeat.instance for heartbeat in serving if not heartbeat.running and not heartbeat.waiting})
 
     if pool.mode in STOPPED_MODES:
         # A stop comes before idleness: an instance that still reports work is kept, even when the
@@ -133,6 +154,19 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     elif full and not launching and desired < pool.config.max_instances:
         # One instance at a time: the next waits for this one to be in service.
         desired, reason = desired + 1, Reason.SCALE_OUT
+        last_scale_out_at = now
+    elif (
+        low_load
+        # Every instance asked for is in service: none starting, none already being removed.
+        and desired == n
+        and not supply.starting
+        and _lasted(low_load_since, LOW_LOAD_SECONDS, now)
+        and _older_than(last_scale_out_at, AFTER_SCALE_OUT_SECONDS, now)
+        and unused
+    ):
+        desired, lift, reason = n - 1, (unused[0],), Reason.SCALE_IN
+        # The next scale-in is judged on the smaller pool: its 10 minutes start again.
+        low_load_since = None
 
     return PoolDecision(
         pool=pool.config.name,
@@ -140,7 +174,14 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         lift_protection=lift,
         # The launch-loop rule sets it; no rule here does.
         suspend_launches=False,
-        memory=memory,
+        memory=Memory(
+            last_request_at=memory.last_request_at,
+            last_in_flight_at=memory.last_in_flight_at,
+            above_target_since=memory.above_target_since,
+            waiting_since=memory.waiting_since,
+            last_scale_out_at=last_scale_out_at,
+            low_load_since=low_load_since,
+        ),
         reason=reason,
     )
 
