@@ -33,6 +33,10 @@ committed".
 
 Return, in **one** pass:
 - `verdicts`: for every `review` item, `met` or `unmet`, with `quote` (words of the item) and a note.
+  An `owner` item whose `agent_part` no command proves needs a verdict too, on that part alone:
+  `met` when the agents' part is delivered on this commit, whatever the owner still owes; `unmet`
+  only when that part is not, with `quote` taken from the `agent_part` in the plan. What only the
+  owner can show is an obligation: it is never `unmet`.
 - `findings`: **every** problem you can demonstrate, at once. Each needs a behavioural witness:
   `observed` (what happens) against `expected` (what the item, or a safety invariant, requires), and
   a `reproduction` command that fails while the problem holds and passes once fixed (or a `probe`
@@ -45,9 +49,10 @@ Return, in **one** pass:
   something no item or invariant requires as if it were one; never write a reproduction that fails
   unconditionally.
 - `probes`: at least one independent test per behavioural item, written against the real code
-  (`file`, its full `content`, the `command` that runs it, `cwd`, the `criterion` it proves). A probe
-  must exercise the deliverable and assert the expected behaviour; it fails only when the behaviour
-  is wrong. Passing probes become locked evidence; a failing one reproduces a finding. A probe that
+  (`file`, its full `content`, the `command` that runs it, `cwd`, the `criterion` it proves: one
+  item id, `D2`, or, for a file that proves several items, their ids and nothing else, `D1, D2, A1`).
+  A probe must exercise the deliverable and assert the expected behaviour; it fails only when the
+  behaviour is wrong. Passing probes become locked evidence; a failing one reproduces a finding. A probe that
   defines test functions runs through pytest, so the engine counts each of its tests. For
   infrastructure, a probe synthesizes the stack and asserts on the template (who may reach what,
   which actions a policy grants on which resources, what is encrypted, what scales to zero); it

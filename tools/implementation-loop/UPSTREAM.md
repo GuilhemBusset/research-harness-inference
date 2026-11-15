@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.3 |
+| Engine version here | 1.2.4 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -415,6 +415,37 @@ the two numbers and the key file's path, and cannot read the file while it is un
 the sandbox hides (`docs/factory/green-light.md`, step 7). The doctor's table in `README.md` does
 not list the two new lines yet.
 
+### 1.2.4: what an examination still owes (2026-11-15)
+
+The repair of the engine fault b3ce2cd831 (issue #275): issue #20 spent its ceiling of 30 calls.
+Its run log (the events of the issue and its 30 answered calls) shows deliverables built at the
+third call and a head that never failed verification: 13 of the calls were examinations, 6 builds,
+5 decisions and 2 arbitrations. Two causes, both in the examine step.
+
+The examiner returned one probe file for all the tested items, with a criterion that listed them
+in one string. The probe was adopted and locked, but the engine compared the criterion with item
+ids, so no item ever counted as probed: seven times it asked the examiner for probes that existed,
+twice it asked the arbiter for a waiver, and one refused waiver cost a build, a decision and an
+examination. And the examiner answered `unmet` on an owner item, quoting what the owner still
+owes and noting that the agents' part was complete; the engine failed the round four times, and
+each time the builder answered that it had nothing to change.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.3 → 1.2.4. | A new engine version: a failed issue is revived once by it, with fresh ceilings. |
+| `implement_loop/engine.py` | New: `criterion_items`, the plan items in the list a probe's criterion leads with (ids separated by `,`, `;`, `/`, `&`, `+` or `and`; it stops at the first other word), and `Engine._probed`, what the examiner's adopted probes cover: those items, and each criterion as written. `_step_examine` takes "unprobed" and "already covered" from `_probed` instead of comparing criteria with item ids, so a follow-up examination adopts a probe only if it names an item no probe covers yet (or, when it names no item, a criterion not seen before, as upstream). The stored commands keep the criterion the examiner wrote. | One file may prove several items, and the examiner said so in the only field it has. The items are read when they are needed, not when the probe is adopted, so a probe an earlier engine adopted counts when its issue resumes. Only the leading list counts: prose that mentions another item does not probe it. |
+| `implement_loop/engine.py` | `_step_examine` gives `gate.review_verdicts` the agent part of an owner item as the text an `unmet` must quote, where it gave the item's own text. An `unmet` on such an item that quotes anything else is no verdict: the item is among the missing verdicts, the event `examined` lists it under `owner_evidence`, and the examiner is asked again (twice at most, as for any missing verdict) with the agent part and what `met` and `unmet` mean for it. | An owner item is the agents' for its agent part only; the rest is an obligation. A finding on an owner item already blocks only when it quotes the agent part (`gate.classify`); a verdict now follows the same rule. `gate.py` is on the safety surface and is not changed: it is called as before, with another text for these items. |
+| `implement_loop/agents.py` | The fake examiner quotes the plan's agent part in its verdict on an owner item, where it quoted the item. | So that the fake's `unmet` on an owner item (`unmet_review`) is still one the engine accepts: `test_10_an_owner_items_agent_part_blocks_until_a_met_verdict` passes unchanged. |
+| `prompts/examine.md` | `verdicts`: an owner item whose agent part no command proves needs a verdict, on that part alone, quoting it; what only the owner can show is never `unmet`. `probes`: the criterion is one item id, or the ids of the items one file proves and nothing else. | The prompt asked for verdicts on `review` items only and said nothing of a file that proves several items: the examiner had to guess both. |
+
+Behaviour an upstream reader would not expect: an `unmet` verdict on an owner item must quote the
+plan's agent part, not the issue's item, to send the builder back. An examiner that keeps
+answering `unmet` for the owner's evidence ends, after two requests, in the failed round of a
+missing verdict ("no verdict on ... after two requests"), as an examiner that gives none does.
+Not changed, on purpose: the ceilings (`config.py`), the gate and the live adapter. Issue #20
+resumes in `build` with its saved commands, and its adopted probe counts for the items its
+criterion lists.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -581,6 +612,14 @@ One probe outside the engine's tests is adapted with them (the last row).
 | Test | Change | Why |
 | --- | --- | --- |
 | `tests/test_app_token.py` (11) | Added. What each test shows is in the patch's table above. | The factory's GitHub App: the mint, the renewal, git's credential helper, where the token is not, and the doctor's two lines. |
+
+### 1.2.4
+
+641 collected tests: the 631 before it, none removed and none changed, and 10 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_examination_reasks.py` (10) | Added. | The regression of fault b3ce2cd831, in real engine runs with the fake agents, on an issue with two tested items and an owner item, and an examiner that answers as #20's did. One probe file whose criterion lists the tested items and says more, returned again at the follow-up with another wording: on 1.2.3 the engine asks for probes twice and then for a waiver; now nothing is owed, no arbiter is called, the probe is adopted once, and the issue is delivered with one build and two examinations. An `unmet` on the owner item that quotes the item: on 1.2.3 a failed round and a second build; now no round fails, the examiner is asked again with the agent part, and its `met` delivers the issue. An `unmet` that quotes the agent part still sends the builder back. And `criterion_items` on seven criteria (7 of the 10). The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
 
 ## Kept as recorded
 
