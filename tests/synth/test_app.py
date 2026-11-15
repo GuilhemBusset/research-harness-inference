@@ -71,15 +71,14 @@ def cdk_json_problems(cdk_json: dict[str, Any], flags: set[str]) -> list[str]:
     return problems
 
 
-def test_the_stage_holds_one_stack_with_no_resource_yet(
+def test_the_stage_holds_its_stacks_in_a_nested_assembly(
     templates: dict[str, dict[str, Any]], cloud_assembly: Path
 ) -> None:
-    in_a_stage = {path: template for path, template in templates.items() if "/" in path}
-    assert len(in_a_stage) == 1
-    (path, template), *_ = in_a_stage.items()
-    # The stage's assembly is nested in the app's, where the pipeline will deploy it from.
-    assert Path(path).parent.as_posix() + "/manifest.json" in manifests(cloud_assembly)
-    assert "Resources" not in template
+    in_a_stage = [path for path in templates if "/" in path]
+    assert in_a_stage
+    for path in in_a_stage:
+        # The stage's assembly is nested in the app's, where the pipeline will deploy it from.
+        assert Path(path).parent.as_posix() + "/manifest.json" in manifests(cloud_assembly)
 
 
 def test_the_detectors_find_what_they_look_for() -> None:

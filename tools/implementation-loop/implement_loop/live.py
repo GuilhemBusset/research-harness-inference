@@ -61,6 +61,20 @@ def classify_failure(code: int | None, stderr: str) -> str:
     return "timeout" if code is None else "crash"
 
 
+# How long a Claude model that refused a call (its usage limit reached, or rate limited) is passed
+# over for the role's fallback model before it is asked again.
+REFUSED_RETRY_S = 1800
+
+
+def claude_refused(data: dict) -> bool:
+    """Whether a Claude result says the model refused the call before any work: the account's
+    usage limit for that model is reached, or the API rate limited it. The CLI exits 1 with an
+    empty stderr and says so only in its JSON result, and `--fallback-model` does not cover it."""
+    return bool(data.get("is_error")) and (data.get("api_error") == "usage_limit_reached"
+                                           or data.get("api_error_type") == "rate_limit_error"
+                                           or data.get("api_error_status") == 429)
+
+
 @dataclass
 class RoleSettings:
     effort: str = "high"
@@ -68,6 +82,7 @@ class RoleSettings:
     claude_model: str | None = None
     codex_model: str | None = None
     max_budget_usd: float | None = None   # Claude only: `--max-budget-usd` for one call (ADR 0001, decision 8)
+    claude_fallback_model: str | None = None   # used while `claude_model` refuses calls (`claude_refused`)
 
 
 DEFAULT_ROLES = {
@@ -127,7 +142,8 @@ def render(name: str, **values) -> str:
 class LiveAgents:
     def __init__(self, operator: str, run_dir: Path, workspace, roles: dict[str, RoleSettings] | None = None,
                  claude_bin: str = "claude", codex_bin: str = "codex", retries: int = 2,
-                 backoff_s: tuple[float, ...] = (30, 90), sleep=time.sleep, extra_env: dict[str, str] | None = None):
+                 backoff_s: tuple[float, ...] = (30, 90), sleep=time.sleep, extra_env: dict[str, str] | None = None,
+                 clock=time.monotonic):
         if operator not in ("claude", "codex"):
             raise ValueError("operator must be 'claude' or 'codex'")
         self.operator = operator
@@ -136,6 +152,8 @@ class LiveAgents:
         self.roles = roles or load_roles()
         self.bins = {"claude": claude_bin, "codex": codex_bin}
         self.retries, self.backoff, self.sleep = retries, backoff_s, sleep
+        self.clock = clock
+        self._refused: dict[str, float] = {}   # Claude model -> when it last refused a call
         self.no_gh_dir = run_dir / "no-gh"
         self.extra_env = dict(extra_env or {})
         self.calls_dir = run_dir / "calls"
@@ -238,7 +256,17 @@ class LiveAgents:
         return [arg for name in names for arg in ("-c", f"mcp_servers.{name}.enabled=false")]
 
     # ---------------------------------------------------------------- one call
-    def _command(self, vendor: str, role: str, cwd: Path, schema: dict, out_file: Path) -> list[str]:
+    def _claude_model(self, role: str) -> str | None:
+        """The model a Claude call of `role` asks for: the role's own, or its fallback while the
+        role's own refused a call less than `REFUSED_RETRY_S` ago."""
+        s = self.roles[role]
+        refused_at = self._refused.get(s.claude_model or "")
+        if s.claude_fallback_model and refused_at is not None and self.clock() - refused_at < REFUSED_RETRY_S:
+            return s.claude_fallback_model
+        return s.claude_model
+
+    def _command(self, vendor: str, role: str, cwd: Path, schema: dict, out_file: Path,
+                 claude_model: str | None = None) -> list[str]:
         s = self.roles[role]
         write = role not in READ_ONLY
         if vendor == "claude":
@@ -249,8 +277,9 @@ class LiveAgents:
                    "--permission-mode", "acceptEdits" if write else "dontAsk"]
             if write:
                 cmd += ["--disallowedTools", *CLAUDE_DENY]
-            if s.claude_model:
-                cmd += ["--model", s.claude_model]
+            model = claude_model or s.claude_model
+            if model:
+                cmd += ["--model", model]
             if s.max_budget_usd:
                 cmd += ["--max-budget-usd", f"{s.max_budget_usd:g}"]
             return cmd
@@ -279,6 +308,9 @@ class LiveAgents:
                     "denials": len(data.get("permission_denials") or [])}
             if data.get("subtype") == OVER_BUDGET:
                 meta["over_budget"] = True
+            if claude_refused(data):
+                meta["refused"] = True
+                return None, meta
             value = data.get("structured_output")
             if value is None and isinstance(data.get("result"), str):
                 try:
@@ -304,11 +336,18 @@ class LiveAgents:
         neither; and what the attempt cost, when the vendor reports it, to the issue's dollar
         ceiling. After the retries, `AgentFailure` says which kind of failure it was. A call that
         stopped at its own dollar budget is not tried again. `SandboxUnavailable` is raised, and
-        nothing is run, when the sandbox cannot be built."""
+        nothing is run, when the sandbox cannot be built.
+
+        A Claude model that refuses the call (`claude_refused`: its usage limit is reached, or it
+        is rate limited) did no work: the attempt is an outage, charged to nothing. When the role
+        has a `claude_fallback_model`, the same attempt is made again at once on that model, and
+        the role keeps using it for `REFUSED_RETRY_S` before it asks its own model again."""
         schema = schemas.BY_ROLE[role]
         s = self.roles[role]
         last_error, kind = "", "crash"
-        for attempt in range(self.retries + 1):
+        attempt = 0
+        while attempt <= self.retries:
+            model = self._claude_model(role) if vendor == "claude" else None
             if self.meter:
                 self.meter.before(issue, role, vendor)
             seq = next(self._seq)
@@ -319,7 +358,7 @@ class LiveAgents:
             stem.with_suffix(".prompt.md").write_text(full_prompt)
             started = time.monotonic()
             try:
-                cmd = self._command(vendor, role, cwd, schema, out_file)
+                cmd = self._command(vendor, role, cwd, schema, out_file, model)
                 code, out, err = self._spawn(cmd, full_prompt, cwd, s.timeout_s, vendor,
                                              self._mounts(vendor, role, cwd, out_file))
             except AgentFailure as e:   # refused before it ran: charged like a crash, so it cannot spin
@@ -334,10 +373,12 @@ class LiveAgents:
             if vendor == "claude":
                 out_file.write_text(out)
             problems = schemas.validate(value, schema) if value is not None else ["no structured answer"]
-            outcome = "answered" if code == 0 else classify_failure(code, err)
+            refused = bool(meta.get("refused"))
+            outcome = "outage" if refused else "answered" if code == 0 else classify_failure(code, err)
             record = {"seq": seq, "role": role, "vendor": vendor, "issue": issue, "attempt": attempt + 1,
-                      "exit": code, "seconds": round(time.monotonic() - started, 1), "ok": code == 0 and not problems,
-                      "outcome": outcome, "problems": problems[:5], "stderr_tail": err[-400:], **meta}
+                      "exit": code, "seconds": round(time.monotonic() - started, 1),
+                      "ok": code == 0 and not refused and not problems, "outcome": outcome, "problems": problems[:5],
+                      "stderr_tail": err[-400:], **({"model": model} if model else {}), **meta}
             with self._lock, self.log_path.open("a") as f:
                 f.write(json.dumps(record, default=str) + "\n")
             spent = getattr(self.meter, "spent", None)
@@ -345,17 +386,23 @@ class LiveAgents:
                 spent(issue, role, vendor, float(meta["cost_usd"]))
             if self.meter:
                 self.meter.after(issue, role, vendor, outcome)
-            if code == 0 and value is not None and not problems:
+            if code == 0 and not refused and value is not None and not problems:
                 return value
             if meta.get("over_budget"):   # the same call would stop at the same place: no retry
                 raise AgentFailure(f"{vendor} {role} stopped at its budget of ${s.max_budget_usd:g} for one call "
                                    f"(loop.toml [roles.{role}] max_budget_usd)", kind="crash", vendor=vendor)
-            if code == 0:
+            if refused:
+                last_error, kind = f"{vendor} model {model or 'default'} refused the call (usage or rate limit)", "outage"
+                if model and model == s.claude_model and s.claude_fallback_model and s.claude_fallback_model != model:
+                    self._refused[model] = self.clock()
+                    continue   # the same attempt, at once, on the fallback model: not a retry
+            elif code == 0:
                 last_error, kind = "it did not match the schema: " + "; ".join(problems[:3]), "crash"
             else:
                 last_error, kind = f"{vendor} exited {code}: {err.strip()[-300:]}", outcome
-                if attempt < self.retries:
-                    self.sleep(self.backoff[min(attempt, len(self.backoff) - 1)])
+            if code != 0 and attempt < self.retries:
+                self.sleep(self.backoff[min(attempt, len(self.backoff) - 1)])
+            attempt += 1
         raise AgentFailure(f"{vendor} {role} failed after {self.retries + 1} attempts: {last_error}", kind=kind,
                            vendor=vendor)
 

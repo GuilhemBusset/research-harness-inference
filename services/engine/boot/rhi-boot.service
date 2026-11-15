@@ -1,0 +1,17 @@
+# The boot unit, the one thing user data installs (system design, "What happens on an instance").
+# systemd runs it at every boot, and a restart from the warm pool is a boot: nothing here limits
+# it to the first one. It runs the boot program once, which fetches the pool's current release,
+# checks its digest and starts its units.
+
+[Unit]
+Description=Fetch the pool's current release, check its digest and start its units
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/rhi-boot.sh
+
+[Install]
+WantedBy=multi-user.target

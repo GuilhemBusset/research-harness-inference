@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-EC23" = "The public load balancer's group admits HTTPS on port 443 from every address because it is the edge, the one thing of the endpoint that faces the internet; no other group admits an address range, which tests/policy/test_no_public_ingress.py asserts."

@@ -35,3 +35,9 @@ session_windows = []
 
 # One entry per pool. Entries have no shape yet: the loader refuses any.
 pools = []
+
+# Whether the public load balancer has its certificate, its HTTPS listener on 443 and the domain's
+# alias record. Left out, it reads false: the owner turns it on once the domain resolves through
+# the hosted zone above. The example turns it on, so that synthesis and the policy tests see the
+# listener and the rules on it.
+https_listener = true
