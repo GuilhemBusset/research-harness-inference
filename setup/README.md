@@ -124,6 +124,9 @@ remote:
 - every change to the default branch goes through a pull request;
 - the `required` status check, reported by GitHub Actions (`.github/workflows/ci.yml`), must be
   green on the head that is merged;
+- a pull request that changes a path listed in [`.github/CODEOWNERS`](../.github/CODEOWNERS), the
+  protected paths and nothing else, also needs the owner's approving review;
+  `tests/policy/test_codeowners.py` holds that file to the engine's lists;
 - no force-push, no deletion;
 - an empty bypass list: the rule binds the owner and the factory alike.
 
