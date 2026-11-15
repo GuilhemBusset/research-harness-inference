@@ -2,10 +2,12 @@
 
 import json
 import unittest
+from types import SimpleNamespace
 
 from helpers import TempRepo
+from implement_loop.engine import Engine
 from implement_loop.model import IssueState, Phase
-from implement_loop.state import RunStore, runs_root
+from implement_loop.state import FaultOutbox, RunStore, runs_root
 from implement_loop.supervisor import Supervisor
 
 ROOT = 1
@@ -77,6 +79,36 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.calls[0], ["run", "77", "--operator", "claude", "--yes", "--repair"])
         self.assertEqual([c for c in self.calls if "--repair" in c], [self.calls[0]], "one repair per fingerprint")
         self.assertEqual(out.repairs, ["abc123"])
+
+    def filed(self, stall: bool) -> None:
+        """Issue #2's fault, written by the engine itself and filed as #77: a stall (`_fail`) or an
+        engine exception (`_engine_fault`)."""
+        self.put(2, Phase.BUILD)
+        engine = Engine.__new__(Engine)
+        engine.store, engine.faults, engine.repo_root = RunStore.for_root(self.root, ROOT), FaultOutbox(self.root), self.root
+        engine.plan, engine.log = SimpleNamespace(root=ROOT), lambda m: None  # ty: ignore[invalid-assignment]  # test double
+        engine._set_phase = engine._wait = lambda *a, **k: None  # ty: ignore[invalid-assignment]  # test double
+        if stall:
+            engine._fail(2, "ceiling", "the issue spent its call ceiling")
+        else:
+            try:
+                raise KeyError("a crashed step")
+            except KeyError as exc:
+                engine._engine_fault(2, exc)
+        [(fingerprint, _)] = engine.faults.pending()
+        engine.faults.mark_reported(fingerprint, 77)
+
+    def supervise_filed(self, stall: bool):
+        self.filed(stall)
+        out = self.sup(lambda args: self.put(2, Phase.DONE) if "--repair" not in args else None).supervise()
+        self.assertTrue(out.finished)
+        return [c for c in self.calls if "--repair" in c]
+
+    def test_a_stall_fault_gets_no_repair_run(self):
+        self.assertEqual(self.supervise_filed(stall=True), [], "it stays filed for the operator")
+
+    def test_an_engine_exception_still_gets_its_repair_run(self):
+        self.assertEqual(self.supervise_filed(stall=False), [["run", "77", "--operator", "claude", "--yes", "--repair"]])
 
     def test_bounds_stop_a_supervision_that_never_settles(self):
         self.put(2, Phase.WAITING, wait={"kind": "ci", "resume": "land"})
