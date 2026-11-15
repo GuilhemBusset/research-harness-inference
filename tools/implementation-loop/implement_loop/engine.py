@@ -169,6 +169,7 @@ EXPLORE_QUESTIONS = (
     "External references the issues cite: what do they establish that the work depends on?",
 )
 MERGE_QUEUE = "merge-queue"
+REVIVED_FEEDBACK = 8   # the most entries of a failed round's feedback a revival keeps after its note (#85)
 # Deployment verdicts still awaited, one file per issue, under the runs' root. The merge-queue claim
 # belongs to a process: the run frees it when it ends, and a claim whose process died is taken
 # over. A verdict can outlast the run that merged (`WAIT_DEPLOY`), so what keeps the landing claim
@@ -557,8 +558,12 @@ class Engine:
                    for p, text in (r.get("content") or {}).items() if text is None}
         self._retire_probe_commands(st.number, st, sorted(deleted - set(st.probes)))
         retired = self._retire_uncommanded(st)   # heals a state saved before the fix (#148)
-        st.feedback = [(f"An earlier attempt failed ({f.get('cause')}): {str(f.get('detail'))[:500]}. "
-                        f"A new engine version gives it one more try.")]
+        # What the failed round left (its problems, the decisions on the last build's requests) is
+        # kept after the note: #85 was revived straight after a failed examination, and replacing
+        # its feedback would have sent the build back without the refusals it had been given.
+        note = (f"An earlier attempt failed ({f.get('cause')}): {str(f.get('detail'))[:500]}. "
+                f"A new engine version gives it one more try.")
+        st.feedback = [note] + list(dict.fromkeys(t for t in st.feedback if t != note))[-REVIVED_FEEDBACK:]
         if retired:
             st.feedback.append(f"These commands were retired, because the plan no longer proves their items by "
                                f"a command: {retired[:6]}.")
@@ -2044,15 +2049,18 @@ class Engine:
             return self._history_refused(n, head, refused)
         problems += vproblems
         selected = {"*": sorted(set(ran) | {t for v in (st.manifest or {}).values() for t in v})}
-        unselected = verify.unselected(wt, [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")],
-                                       selected, st.dispositions)
+        base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
+        check_files = [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")]
+        # A test main already defines is not the issue's to select: a command that runs one test of
+        # an existing suite locks that file, and its other tests were charged to the issue (#51).
+        on_main = self._defined_at(wt, base, check_files)
+        unselected = [t for t in verify.unselected(wt, check_files, selected, st.dispositions) if t not in on_main]
         if unselected:
             problems.append(f"tests in locked files that no command selects: {unselected[:6]} — select each one in a "
                             f"command, or give it a disposition (owner-run, or excluded: <reason>)")
         closed = self._close_findings(n, st, wt, evidence)
         st = self.store.issue(n)
         still = [f for f in st.findings if f.get("status") == "open"]
-        base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
         changed = self.ws.changed_files(wt, base)
         problems += gate.zone_problems(changed, st.grants, st.probes, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
@@ -2298,7 +2306,9 @@ class Engine:
             if bundled:
                 problems += [f"also worth fixing (not blocking): {f.title}" for f in bundled]
             self._set_phase(n, Phase.EXAMINE, exam_feedback=[], exam_retries=0)
-            return self._round_failed(n, problems, [f.id for f in blocking], unmet)
+            # As after a failed verification (#32): the decisions on the last build's requests
+            # reach the next build. #85's refusals were dropped here, then again by its revival.
+            return self._round_failed(n, problems, [f.id for f in blocking], unmet, told=list(st.feedback))
         # What the examiner still owes (a verdict, an independent probe) is asked of it again, at
         # most twice; it is not the builder's failure.
         st = self.store.issue(n)
@@ -2356,12 +2366,22 @@ class Engine:
             expanded = []
             for tok in tokens:
                 tok = tok.split("::")[0]
-                expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
-                             else [tok])
+                try:
+                    expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
+                                 else [tok])
+                except (OSError, ValueError, NotImplementedError):
+                    # A pattern the file system or pathlib refuses (an overlong name, an absolute
+                    # pattern) names no test file: it is the builder's text, not an engine fault.
+                    continue
             for tok in expanded:
                 rel = Path(c.get("cwd") or ".") / tok
-                path = (wt / rel).resolve()
-                if not path.is_file() or not path.is_relative_to(wt.resolve()):
+                try:
+                    path = (wt / rel).resolve()
+                    if not path.is_file() or not path.is_relative_to(wt.resolve()):
+                        continue
+                except (OSError, ValueError):
+                    # A token the file system refuses (a name longer than it takes, an embedded
+                    # NUL) names no test file either. Nothing of what the system said is kept.
                     continue
                 rel_s = str(path.relative_to(wt.resolve()))
                 name = path.name
@@ -2392,6 +2412,19 @@ class Engine:
                 return "a probe file must be a path the file system can create"
             bad = verify.unconditional_failures(Path(tmp), [p.file])
         return f"it fails unconditionally: {bad[0]}" if bad else None
+
+    @staticmethod
+    def _defined_at(wt: Path, rev: str, files: list[str]) -> set[str]:
+        """The tests defined in these files as they stand at `rev` (a file it lacks defines none)."""
+        with tempfile.TemporaryDirectory(prefix="loop-base-") as tmp:
+            root, present = Path(tmp), []
+            for f in files:
+                proc = subprocess.run(["git", "show", f"{rev}:{f}"], cwd=wt, capture_output=True, check=False)
+                if proc.returncode == 0:
+                    (root / f).parent.mkdir(parents=True, exist_ok=True)
+                    (root / f).write_bytes(proc.stdout)
+                    present.append(f)
+            return set(verify.defined_tests(root, present))
 
     def _lock_and_adopt(self, n: int, wt: Path, probes, first: bool) -> str:
         """At the first examination the builder's tests, their configuration and the selection

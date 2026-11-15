@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-ELB2" = "The public load balancer keeps no access logs: the design gives it no log bucket, and the gateway records every request it serves, so a bucket of access logs would add storage and its cost that nothing in the design reads."

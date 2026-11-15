@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.6 |
+| Engine version here | 1.2.14 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -524,6 +524,81 @@ that runs the gate as CI does, and a finding whose reproduction is the bare gate
 dispute, which the builder can now make in its first round. Issue #32 resumes with its branch and
 its findings as they were.
 
+### 1.2.7: a Claude model that refuses calls, and its fallback (2026-11-15)
+
+A change made by the owner's decision, not a fault repair. On 2026-11-15 the account reached its
+usage limit for Claude Fable, the model of the plan and build roles. From then on every Claude
+call ended in under two seconds: Claude Code exits 1 with an empty stderr, and its JSON result
+carries `is_error`, `api_error_status` 429, `api_error_type` `rate_limit_error` and `api_error`
+`usage_limit_reached`. `classify_failure` reads stderr only, so each attempt was a `crash`,
+charged to the issue's budget of 10 failed attempts. Ten issues and four repair runs failed on
+that budget, 139 refused attempts in all, none of them for their own work. Claude Code's own
+`--fallback-model` does not switch on this error: tried on that day, a call with
+`--model claude-fable-5-2 --fallback-model claude-opus-5-5` returned the same refusal.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.6 → 1.2.7. | A new engine version: the issues the refusals failed are revived once, with fresh ceilings, and the ones waiting resume. |
+| `implement_loop/live.py` | New: `claude_refused`, which reads that refusal from the JSON result; `REFUSED_RETRY_S` (30 minutes); `RoleSettings.claude_fallback_model`; `LiveAgents._claude_model`, the model a call of a role asks for; a `clock` argument. `_parse` marks a refused result (`refused`, no answer). `call`: a refused attempt is an `outage`, charged to nothing, with the model it asked for in its record. When the role has a fallback and the refused model is the role's own, the same attempt is made again at once on the fallback, without a backoff and without counting a retry, and the role asks for the fallback until 30 minutes after the refusal. Without a fallback, or with the fallback refusing too, the call ends as an outage after its retries, and the issue waits for the vendor as before. `_command` takes the model to ask for. Every attempt's record in `agents.jsonl` now names the Claude model it asked for. | A refusal is the account's state, not the agent's failure, and the builder's work can go on on another model. The record of the model keeps the cost per model readable. |
+| `loop.toml` | `claude_fallback_model = "claude-opus-5-5"` for `plan` and `build`, and its description in the header. | The owner's choice of fallback. |
+
+Behaviour an upstream reader would not expect: a plan or build may run on the fallback model,
+and nothing but `agents.jsonl` says which one did. The examiner, the gates and the ceilings are
+the same whichever model built. The per-call and per-issue dollar ceilings are unchanged.
+
+### 1.2.8: #92's refused builds, replayed (2026-11-15)
+
+The repair of fault 5500f31f10. On engine 1.2.4, #92 failed with `ceiling`: its ten failed
+attempts were ten `build` calls on Claude, each refused for the account's usage limit (exit 1, an
+empty stderr, 429 `usage_limit_reached` in the JSON result, no cost), each charged to the
+infrastructure budget as a crash because `classify_failure` reads stderr only. That cause is the
+one 1.2.7 repairs (`live.claude_refused`, the fallback in `loop.toml`, the outage wait in
+`Engine._finished`), and those files are on the safety surface: nothing in them changes here. What
+1.2.7 did not cover is #92's own path, the `build` role through the engine's meter; the test below
+does.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.7 → 1.2.8. | A new engine version: #92 is revived once, with fresh ceilings, and resumes its build. |
+
+### 1.2.9: #90's revived build, refused again (2026-11-15)
+
+The repair of fault 734810b2a3. On engine 1.2.4, #90 failed with `ceiling` in the same way #92
+did: its run log shows ten `build` calls on Claude, each refused for the account's usage limit
+(exit 1, an empty stderr, 429 `usage_limit_reached` in the JSON result, no cost, about half a
+second) and each charged to the infrastructure budget as a crash. 1.2.7 repairs that cause, in
+files on the safety surface, which do not change here. What #90 adds is its next step: a new
+engine version revives it, once, back into `build` on the branch that keeps its work, where the
+vendor may still refuse. A refusal there must not spend the one revival; the test below covers
+that path.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.8 → 1.2.9. | A new engine version: #90 is revived once, with fresh ceilings, and resumes its build. |
+
+### 1.2.10: the tests main already defines in a locked file (2026-11-15)
+
+The repair of fault 75fe7a2823 (issue #290). On engine 1.2.4, #51 ended `no_progress`. Its run log
+(the events of the issue and its calls in the run for #2) was read when this repair was planned;
+nothing of it is copied here. One of #51's commands ran a single test of the scanner's existing
+suite by node id (`tools/hygiene/tests/test_scan.py::test_this_repository_scans_clean`), a file
+the branch does not change. At the first examination `_lock_and_adopt` locked every file a command
+ran, that one included. From the next verification on, `_step_verify` handed every locked file to
+`verify.unselected`, which wants each test the file defines selected or disposed, so main's whole
+suite in that file was charged to the issue. The builder's only way out was a command change; the
+examiner refused each one, rightly, because each dropped another locked selection. A replan
+changed nothing, because the plan was not the cause.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.9 → 1.2.10. | A new engine version: #51 is revived once, with fresh ceilings, and resumes on the branch that keeps its work. |
+| `implement_loop/engine.py` | New: `Engine._defined_at`, the tests defined in some files as they stand at a revision (each read with `git show` into a throwaway directory, then `verify.defined_tests`). `_step_verify` takes the merge base before the selection check, no longer after it, and drops from what `verify.unselected` reports the test ids main already defines in those files. | The rule exists so that the issue's own check files cannot be quietly emptied (`verify.py`). A test main already defines is not the issue's to select, whichever command happens to lock its file. A test the branch adds, to a new file or to an existing one, is still required. |
+
+Behaviour an upstream reader would not expect: a test main already defines in a locked file may
+stay unselected and undisposed. What the selection manifest already holds must still run and
+pass. Not changed, on purpose: the verifier (`verify.unselected` and the manifest), the gate, the
+live adapter, `config.py` and the prompts.
+
 ## Tests removed or adapted
 
 ### 1.1.0
@@ -715,6 +790,38 @@ One probe outside the engine's tests is adapted with them (the last row).
 | --- | --- | --- |
 | `tests/test_verifier_feedback.py` (4) | Added. | The regression of fault ed072b1fa9, in real engine runs with the fake agents, on an issue whose first examination leaves a finding with a reproduction that fails on every head and prints why, and which build it ran on. The fake builder acts on a fact once its feedback holds it. On 1.2.5 all four fail. The build after the examination is given the output of the run that made the finding blocking, disputes at once, and the issue is delivered in two builds. A second build that restates its commands (refused) and does not dispute fails verification; the third is given the refusal with its reason and the run on the second build's commit, asks nothing again, and the issue is delivered with one decision. A command that fails a verification reaches the next build once, with its command and what it printed. A builder that never disputes still ends `no_progress`, though every round printed something else, and the output is in nothing the fake GitHub received nor in the failure's detail. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
 
+### 1.2.7
+
+653 collected tests: the 647 before it, none removed and none changed, and 6 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_claude_fallback.py` (6) | Added. | The live adapter against a fake `claude` that refuses one model as Claude Code 2.1 does (exit 1, empty stderr, the reason only in its JSON result). A refused model is replaced at once by the fallback, with no backoff, and the refused attempt is an outage charged to nothing; the role keeps the fallback until `REFUSED_RETRY_S` has passed, then asks its own model again; with both refusing, the call is an outage after its retries, with the usual backoff; without a fallback, a refusal is an outage, not a crash; what counts as a refusal; and the checked-in `loop.toml` falls back from Fable to Opus for `plan` and `build` only. On 1.2.6 all six fail. |
+
+### 1.2.8
+
+655 collected tests: the 653 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_refused_build.py` (2) | Added. | The regression of fault 5500f31f10: the live adapter with the checked-in `build` settings, against a fake `claude` that refuses as #92's call records show (scrubbed), metered by a real `Engine` (`before`, `after`) and its failure handled by `_finished`. A refused Fable build is answered on Opus with nothing charged to the infrastructure budget; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed with `ceiling`. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #92's own message. |
+
+### 1.2.9
+
+657 collected tests: the 655 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_revived_refused_build.py` (2) | Added. | The regression of fault 734810b2a3: #90's record (planned, a worktree, failed `ceiling` on 1.2.4 with its infrastructure budget spent) revived by a real `Engine` (`_maybe_revive`) into `build` with that budget at 0, then the live adapter with the checked-in `build` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A revived build refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #90's own message. |
+
+### 1.2.10
+
+659 collected tests: the 657 before it, none removed and none changed, and 2 added.
+
+| Test | Change | Why |
+| --- | --- | --- |
+| `tests/test_main_suite_selection.py` (2) | Added. | The regression of fault 75fe7a2823, in real engine runs with the fake agents, on a `main` whose test file defines three tests, of which the builder's command runs one by node id, and a first examination that leaves a finding. The file locks at that examination; the issue is delivered with no "no command selects" problem. A test the branch adds to that file and selects nowhere is still reported, alone, until the builder disposes of it. On 1.2.9 both fail. The modules come from `test_deploying.py`'s loader, so the tests judge the engine beside them under the verifier too. |
+
 ## Kept as recorded
 
 `tests/fixtures/epic10.json` is a recording of GitHub's answers for epic #10 of the upstream
@@ -722,3 +829,86 @@ repository, made with `implement record-fixture`. It is test input for the graph
 and is not edited: its issues talk about sessions, HTML pages and upstream paths, and it carries
 many external links. Several tests also keep upstream's capability names (`hardware:laptop`,
 `human:rehearsal`) and example file names as arbitrary test data.
+
+### 1.2.11: #85's revived build, told what its failed round said (2026-11-15)
+
+The repair of fault 8a5fa42bd3 (issue #317). On engine 1.2.4, #85 failed with `ceiling`. Its run
+log (the events of the issue and its calls in the run for #2) was read when this repair was
+planned; nothing of it is copied here. Its last answered call was an examination that left a
+blocking finding open, after a build whose requests the other vendor had decided, two of them
+refused. Then main was merged, and ten `build` calls on Claude were refused for the account's
+usage limit, each charged to the infrastructure budget as a crash, as for #92 and #90. That cause
+is the one 1.2.7 repairs, in files on the safety surface, which do not change here. What #85 adds
+is the feedback its next build would have had. The failed examination called `_round_failed`
+without the decisions on the last build's requests, so they were replaced, as 1.2.6 found after a
+failed verification. And a revival replaced the feedback again with its one note, so the revived
+build would not have heard the problems of the round that failed either. Open findings reach it
+anyway, through `_open_feedback`.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.10 → 1.2.11. | A new engine version: #85 is revived once, with fresh ceilings, and resumes its build on the branch that keeps its work. |
+| `implement_loop/engine.py` | `_step_examine` hands the feedback the build left (the decisions on its requests) to `_round_failed` as `told` when the examination fails the round. `_maybe_revive` puts its note first and keeps after it what the failed round left, without duplicates and at most `REVIVED_FEEDBACK` (8) entries. | A refused request that the next build does not hear of is asked for again, and costs a decision each time (#32). The revived build is the one try a new version gives: it starts from where the failed round left off. |
+| `tests/test_revived_finding_build.py` | New. A real engine run where a refused request is followed by a failed examination and the next build is told both. Then #85's path: builds refused until the infrastructure ceiling on 1.2.4, a run on this version that revives it, and a revived build told the revival, the refusal and the failed examination, with its locks kept. | The regression test of this repair. |
+
+Behaviour an upstream reader would not expect: a revived build's feedback starts with the revival
+note and then holds up to eight entries of the failed round's feedback. Not changed, on purpose:
+the verifier, the gate, the live adapter, `config.py`, `loop.toml` and the prompts.
+
+### 1.2.12: a command token the file system refuses (2026-11-15)
+
+The repair of fault a73189e271 (issue #318). On engine 1.2.4, the first examination of #69
+crashed with `OSError` in `_command_tests`, which `_lock_and_adopt` calls to lock the test files
+the builder's commands name: a token of one command, globbed or stat'ed against the worktree, was
+one the file system refused. The run log was not read for this repair; nothing of it is copied
+here.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.11 → 1.2.12. | A new engine version: the issues that wait for this repair resume. |
+| `implement_loop/engine.py` | `_command_tests` skips a token whose glob, `resolve()` or `is_file()` raises (`OSError`, `ValueError`, and `NotImplementedError` from a pattern pathlib refuses), as it already skips a command `shlex` cannot split and a token that names no file. | A token is the builder's text: one no file can have names no test file to lock, and is not an engine fault. Nothing of what the system said is kept, as in 1.2.1. |
+| `tests/test_command_tests_oserror.py` | New. `_command_tests` over a worktree with one real test file and a command that also carries a name longer than any Linux file system takes, plain and in glob patterns: only the real file is returned. On 1.2.11 it raises `OSError`. The module comes from `test_deploying.py`'s loader, so the test judges the engine beside it under the verifier too. | The regression test of this repair. |
+
+Not changed, on purpose: the verifier, the gate, the live adapter, `config.py`, `loop.toml` and
+the prompts.
+
+### 1.2.13: #57's revived plan, refused for the usage limit (2026-11-15)
+
+The repair of fault d8bf19bb40 (issue #319). On engine 1.2.4, #57 failed with `ceiling`. Its run
+log (the events of the issue and its calls in the run for #2) was read when this repair was
+planned; nothing of it is copied here. Its ten failed attempts were ten `plan` calls on Claude
+refused for the account's usage limit (exit 1, an empty stderr, the reason only in the JSON
+result), each charged to the infrastructure budget as a crash, as for #92, #90 and #85. That cause
+is the one 1.2.7 repairs, in files on the safety surface, which do not change here. What #57 adds
+is its own path: it had no plan and no worktree, so its revival sends it back to `pending`, and the
+refused calls are `plan` calls, which no regression test covered. The test finds no defect in
+the engine on that path, so `engine.py` does not change.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.12 → 1.2.13. | A new engine version: #57 is revived once, with fresh ceilings, and plans again. |
+| `tests/test_revived_refused_plan.py` | New (2 tests). #57's record (no plan, no worktree, failed `ceiling` on 1.2.4 with its infrastructure budget spent), revived by a real `Engine` into `pending` with that budget at 0, then planned by the live adapter with the checked-in `plan` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A revived plan refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `plan`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail, the second with #57's own message. | The regression test of this repair. |
+
+Not changed, on purpose: the engine's code, the verifier, the gate, the live adapter, `config.py`,
+`loop.toml` and the prompts.
+
+### 1.2.14: #101's revived first build, refused for the usage limit (2026-11-15)
+
+The repair of fault f5089187d5 (issue #320). On engine 1.2.4, #101 failed with `ceiling`. Its run
+log (the events of the issue and its calls in the run for #2) was read when this repair was
+planned; nothing of it is copied here. #101 was planned and had a worktree, but no build ever
+answered: its ten failed attempts were ten `build` calls on Claude refused for the account's usage
+limit (exit 1, an empty stderr, the reason only in the JSON result), each charged to the
+infrastructure budget as a crash, as for #92, #90, #85 and #57. That cause is the one 1.2.7
+repairs, in files on the safety surface, which do not change here. What #101 adds is its own path:
+a revival into `build` with no round behind it (no build commit, no feedback but the revival
+note, only the plan and triage calls spent), which no regression test covered. The test finds no
+defect in the engine on that path, so `engine.py` does not change.
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `implement_loop/__init__.py` | `VERSION` 1.2.13 → 1.2.14. | A new engine version: #101 is revived once, with fresh ceilings, and builds again. |
+| `tests/test_revived_unbuilt_build.py` | New (2 tests). #101's record (planned, a worktree, two calls spent, no feedback, failed `ceiling` on 1.2.4 with its infrastructure budget spent), revived by a real `Engine` into `build` with that budget at 0 and only the revival note as feedback, then built by the live adapter with the checked-in `build` settings against the fake `claude` of `test_refused_build.py`, metered by the engine and its failure handled by `_finished`. A first build refused on Fable is answered on Opus with nothing charged; with both models refusing, more refused attempts than the infrastructure budget leave that budget at 0 and the issue waiting `outage`, to resume in `build`, never failed again. With `claude_refused` reading nothing, as on 1.2.6, both fail. | The regression test of this repair. |
+
+Not changed, on purpose: the engine's code, the verifier, the gate, the live adapter, `config.py`,
+`loop.toml` and the prompts.

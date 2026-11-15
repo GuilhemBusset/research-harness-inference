@@ -1,0 +1,10 @@
+# Dashboards are files in the image, copied from the build context's dashboards folder.
+apiVersion: 1
+
+providers:
+  - name: rhi
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
