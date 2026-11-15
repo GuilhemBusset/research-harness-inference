@@ -16,9 +16,10 @@ that call them.** No agent runs them.
 | `setup/apply-ruleset.sh` | `gh` logged in as a repository admin, `jq` | Once per repository |
 | `cdk synth` and the synthesis tests | Node.js 24 with npm, as `node` on the `PATH` | The version [`.node-version`](../.node-version) names; Node 22 works too, and the CDK supports no other. See [Node and the CDK CLI](#node-and-the-cdk-cli) |
 | `scripts/check.sh container-tests` | A container runtime that answers `docker info` | Only for the tests under `tests/container/`, which CI runs. `fast` and `all` do not need it |
+| `setup/owner-setup.sh` | The AWS CLI with the owner's credentials, `gh` logged in as a repository admin, `uv`, and the CDK CLI for its bootstrap step | The owner's one-time steps. Its `--dry-run` needs `uv` alone |
 
-No AWS credentials are needed for anything in this repository, and none should be reachable from
-the shell an agent runs in. Deployment is CodePipeline's.
+No AWS credentials are needed for anything else in this repository, and none should be reachable
+from the shell an agent runs in. Deployment is CodePipeline's.
 
 ## Python environment
 
@@ -132,6 +133,26 @@ the fact. Re-running the script updates the ruleset in place; it fails if the ru
 applied. On a personal account without a paid plan, GitHub enforces rulesets on public
 repositories only: the green-light checklist says how to check that the rule really binds.
 
+## `owner-setup.sh`: the owner's one-time steps in the AWS account
+
+```sh
+setup/owner-setup.sh --dry-run
+```
+
+Walks through what only the owner can do, once (system design, section 8.6): the GPU quotas, the
+domain, the GitHub Apps, the configuration in SSM, billing alerts, the bootstrap, the GitHub
+connection, the repository's settings and the roster.
+[`docs/runbooks/owner-setup.md`](../docs/runbooks/owner-setup.md) describes each step and how to
+check it. The owner runs it, with their own credentials, from a shell no agent runs in.
+
+It asks before each command it runs, and `--dry-run` prints every step and every command and
+calls neither AWS nor GitHub. One step runs on its own with `--step <name>`: the configuration
+step, `--step configuration --config <file>`, is also how the configuration is changed later.
+
+It installs nothing and writes nothing to the working tree. Python keeps no bytecode, and uv's
+project environment and the CDK's output go to a temporary folder, under `TMPDIR`, that is removed
+when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no `cdk.out`.
+
 ## Installation inventory
 
 | Component | Source and destination |
@@ -154,6 +175,7 @@ repositories only: the green-light checklist says how to check that the rule rea
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
 | Git hooks | Checked in under `.githooks/`; `git-hooks.sh` points this clone's `.git/config` at them |
 | GitHub ruleset | `pr-only-main.json`; applied to the `origin` repository only when an admin runs `apply-ruleset.sh` |
+| The owner's walkthrough | `owner-setup.sh` installs nothing. While it runs, uv installs the project's own dependencies, at the versions in `uv.lock`, into a temporary folder outside the working tree, which the script removes |
 | Hygiene scanner | Checked in under `tools/hygiene/` (standard-library Python); installs nothing |
 | Implement loop | Checked in under `tools/implementation-loop/` (standard-library Python); where its run state and worktrees live is described in `docs/factory/operating.md` |
 | Skills | Checked in under `.claude/skills/` and `.agents/skills/`; no global skill installation, no MCP server |
