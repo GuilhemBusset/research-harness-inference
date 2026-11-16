@@ -44,6 +44,23 @@ It needs, on the machine: the AWS CLI with your credentials and their region set
 as the repository's admin (for step 8), `uv`, `openssl` (for step 3), and for step 6 the CDK CLI (`npm ci --ignore-scripts`,
 [`setup/README.md`](../../setup/README.md)).
 
+**The region and the sign-in.** Two kinds of command reach AWS, and they read the region from
+different places:
+
+- the AWS CLI (the `aws` commands, and the CDK CLI of step 6) reads `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`, then the `region` of your profile;
+- the AWS SDK of the Python steps (the reporter's secret in step 3, the configuration in step 4)
+  reads `AWS_DEFAULT_REGION`, then the `region` of your profile, and never `AWS_REGION`.
+
+A region in your profile, or `AWS_DEFAULT_REGION`, reaches both. When you set only `AWS_REGION`,
+the script copies it into `AWS_DEFAULT_REGION` before any step runs a command, so every step
+works in the same region. When both are set, the script changes neither: keep them equal.
+
+Any profile the AWS CLI accepts works in every step, a profile signed in with `aws login` (your
+console credentials) included: the project installs the SDK with its crt extra, which that
+sign-in needs. When the SDK cannot make a client, the step says so by the name of the SDK's error
+(for example `NoCredentialsError`), never by its text; a missing region it reports as such.
+
 ## 1. Request the GPU quotas
 
 **Needs.** The coursework pool's `max_instances`, whether the upgrade pool is wanted, and whether
