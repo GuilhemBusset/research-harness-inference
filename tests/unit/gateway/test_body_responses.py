@@ -172,14 +172,59 @@ def _image_in_tool_output(url: object, **extra: object) -> dict[str, Any]:
     return {"type": "function_call_output", "call_id": "c1", "output": [part]}
 
 
-@pytest.mark.parametrize("item", [_image_in_message, _image_in_tool_output])
+def _image_in_custom_tool_output(url: object, **extra: object) -> dict[str, Any]:
+    part = {"type": "input_image", "image_url": url, **extra}
+    return {"type": "custom_tool_call_output", "call_id": "c1", "output": [part]}
+
+
+def _screenshot_in_computer_call_output(url: object, **extra: object) -> dict[str, Any]:
+    return {
+        "type": "computer_call_output",
+        "call_id": "c1",
+        "output": {"type": "computer_screenshot", "image_url": url, **extra},
+    }
+
+
+def _image_in_code_interpreter_outputs(url: object, **extra: object) -> dict[str, Any]:
+    image = {"type": "image", "url": url, **extra}
+    return {"type": "code_interpreter_call", "id": "ci_1", "code": "plot()", "status": "completed", "outputs": [image]}
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        _image_in_message,
+        _image_in_tool_output,
+        _image_in_custom_tool_output,
+        _screenshot_in_computer_call_output,
+        _image_in_code_interpreter_outputs,
+    ],
+)
 def test_an_inline_image_passes_where_the_reference_allows_one(item: Any) -> None:
     sent = item(IMAGE)
     assert forwarded({"model": "coursework", "input": [sent]})["input"] == [sent]
-    for refused in (item("https://example.com/plot.png"), item(None, file_id="file-1")):
+    refused = [item("https://example.com/plot.png")]
+    if item is not _image_in_code_interpreter_outputs:  # the reference gives that image no stored file
+        refused.append(item(None, file_id="file-1"))
+    for body in refused:
         with pytest.raises(GatewayError) as caught:
-            forwarded({"model": "coursework", "input": [refused]})
+            forwarded({"model": "coursework", "input": [body]})
         assert caught.value.cause is Cause.REQUEST_REFUSED
+
+
+def test_the_client_tools_and_their_calls_keep_their_fields() -> None:
+    function = {"type": "function", "name": "read", "parameters": {"type": "object"}, "strict": False, "async": True}
+    tools = [{"type": "namespace", "name": "workspace", "description": "Workspace tools.", "tools": [function]}]
+    call = {
+        "type": "local_shell_call",
+        "id": "ls_1",
+        "call_id": "c1",
+        "status": "completed",
+        "action": {"type": "exec", "command": ["cat", "notes.txt"], "env": {}},
+    }
+    body = forwarded({"model": "coursework", "input": [call], "tools": tools})
+    assert body["tools"] == tools
+    assert body["input"] == [call]
 
 
 def test_the_output_limit_is_clamped_to_the_pool() -> None:
