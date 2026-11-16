@@ -1,5 +1,6 @@
-"""Files main deletes on purpose (the examiner's probes an earlier engine committed) are no
-regression of the next merge, and no change of a branch to a locked test."""
+"""Files and tests main deletes or renames on purpose (the examiner's probes an earlier engine
+committed, a test a reviewed merge replaced) are no regression of the next merge, and no change
+of a branch to a locked test."""
 
 import contextlib
 import shutil
@@ -13,7 +14,7 @@ import helpers  # noqa: F401 - puts the engine on sys.path
 from implement_loop import engine as engine_module
 from implement_loop import verify
 from implement_loop.config import Caps
-from implement_loop.engine import CommittedFile, Engine, named_tests
+from implement_loop.engine import CommittedFile, Engine, named_nodes, named_tests
 from implement_loop.model import IssueState
 from implement_loop.state import RunStore
 
@@ -30,16 +31,13 @@ class DeletedOnMainTests(unittest.TestCase):
                          ["tests/unit/test_a.py"])
         self.assertEqual(named_tests({"command": "bash checks/probe_2.sh", "cwd": "sub"}), ["sub/checks/probe_2.sh"])
         self.assertEqual(named_tests({"command": "uv run --locked pytest tests/", "cwd": "."}), [])
+        self.assertEqual(named_nodes({"command": "pytest -q tests/test_a.py::Case::test_x tests/test_b.py", "cwd": "."}),
+                         ["tests/test_a.py::Case::test_x"])
 
-    def test_regressions_skip_examiner_checks_and_checks_of_deleted_files(self):
-        coord = self.tmp / "coord"
-        (coord / "tests").mkdir(parents=True)
-        (coord / "tests/test_kept.py").write_text("def test_a():\n    pass\n")
-        self.engine.store.put_section("accepted_checks", "5", {"checks": [
-            {"criterion": "D1", "command": "pytest tests/test_kept.py", "cwd": ".", "author": "builder"},
-            {"criterion": "D2", "command": "pytest tests/test_gone.py", "cwd": ".", "author": "builder"},
-            {"criterion": "A1", "command": "bash checks/probe_5.sh", "cwd": ".", "author": "examiner"}],
-            "check_files": [], "manifest": {"*": ["tests/test_kept.py::test_a", "tests/test_gone.py::test_b"]}})
+    def regressions(self, coord, checks, manifest):
+        """The checks and manifest `_regressions` re-runs for an earlier issue #5, and those it skips."""
+        self.engine.store.put_section("accepted_checks", "5", {"checks": checks, "check_files": [],
+                                                               "manifest": manifest})
         ran = []
 
         def recorded(root, checks, head, work_dir, locked, files, manifest, *args, **kwargs):
@@ -50,9 +48,34 @@ class DeletedOnMainTests(unittest.TestCase):
         self.engine._mounts = lambda scratch: None  # ty: ignore[invalid-assignment]  # test double
         with mock.patch.object(engine_module.verify, "verify", recorded):
             self.assertEqual(self.engine._regressions(6, coord, "abc123"), [])
-        self.assertEqual(ran, [(["pytest tests/test_kept.py"], {"*": ["tests/test_kept.py::test_a"]})])
         [skipped] = [e for e in self.engine.store.events() if e["kind"] == "regression_check_skipped"]
-        self.assertEqual(skipped["checks"], ["pytest tests/test_gone.py", "bash checks/probe_5.sh"])
+        return ran, skipped["checks"]
+
+    def test_regressions_skip_examiner_checks_and_checks_of_deleted_files(self):
+        coord = self.tmp / "coord"
+        (coord / "tests").mkdir(parents=True)
+        (coord / "tests/test_kept.py").write_text("def test_a():\n    pass\n")
+        ran, skipped = self.regressions(coord, [
+            {"criterion": "D1", "command": "pytest tests/test_kept.py", "cwd": ".", "author": "builder"},
+            {"criterion": "D2", "command": "pytest tests/test_gone.py", "cwd": ".", "author": "builder"},
+            {"criterion": "A1", "command": "bash checks/probe_5.sh", "cwd": ".", "author": "examiner"}],
+            {"*": ["tests/test_kept.py::test_a", "tests/test_gone.py::test_b"]})
+        self.assertEqual(ran, [(["pytest tests/test_kept.py"], {"*": ["tests/test_kept.py::test_a"]})])
+        self.assertEqual(skipped, ["pytest tests/test_gone.py", "bash checks/probe_5.sh"])
+
+    def test_regressions_skip_checks_of_tests_main_removed_from_a_kept_file(self):
+        coord = self.tmp / "coord"
+        (coord / "tests").mkdir(parents=True)
+        (coord / "tests/test_kept.py").write_text("class Case:\n    def test_a(self):\n        pass\n")
+        ran, skipped = self.regressions(coord, [
+            {"criterion": "D1", "command": "pytest tests/test_kept.py::Case::test_a", "cwd": ".", "author": "builder"},
+            {"criterion": "D2", "command": "pytest tests/test_kept.py::Case::test_renamed", "cwd": ".",
+             "author": "builder"},
+            {"criterion": "D3", "command": "pytest tests/test_kept.py::test_b", "cwd": ".", "author": "builder"}],
+            {"*": ["tests/test_kept.py::Case::test_a", "tests/test_kept.py::Case::test_renamed[x]",
+                   "tests/test_kept.py::test_b"]})
+        self.assertEqual(ran, [(["pytest tests/test_kept.py::Case::test_a"], {"*": ["tests/test_kept.py::Case::test_a"]})])
+        self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed", "pytest tests/test_kept.py::test_b"])
 
     def test_a_locked_file_main_deleted_leaves_the_lock(self):
         wt = self.tmp / "wt"

@@ -3320,7 +3320,9 @@ class Engine:
     def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
         """Re-run the commands of the run's earlier issues on `main` after a merge. Not re-run: an
         examiner's check (a probe an earlier engine committed), and a check that names a test file
-        main no longer holds, with the tests of the files it names: main deleted them on purpose."""
+        or a test main no longer holds, with the tests of the files it names; nor is a locked test
+        main no longer defines required to run. A reviewed merge removed or renamed them on
+        purpose."""
         out = []
         fields = CheckSpec.__dataclass_fields__
         for key, entry in sorted(self.store.state.get("accepted_checks", {}).items()):
@@ -3329,12 +3331,13 @@ class Engine:
                 continue
             commands = [c for c in entry["checks"] if c.get("kind", "command") == "command"]
             skipped = [c for c in commands if c.get("author") == "examiner"
-                       or any(not (coord / f).exists() for f in named_tests(c))]
+                       or any(not (coord / f).exists() for f in named_tests(c))
+                       or any(not defines_test(coord, node) for node in named_nodes(c))]
             if skipped:
                 self.store.event("regression_check_skipped", issue=n, of=m,
                                  checks=[(c.get("command") or "")[:160] for c in skipped])
-            gone = {f for c in skipped for f in named_tests(c)}
-            manifest = {k: [i for i in v if i.split("::")[0] not in gone and (coord / i.split("::")[0]).is_file()]
+            gone = {f for c in skipped for f in named_tests(c) if c.get("author") == "examiner" or not (coord / f).exists()}
+            manifest = {k: [i for i in v if i.split("::")[0] not in gone and defines_test(coord, i)]
                         for k, v in (entry.get("manifest") or {}).items()}
             checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in commands if c not in skipped]
             if not checks:
@@ -3485,6 +3488,16 @@ def named_tests(check: dict) -> list[str]:
     """The test files a check's command names, from the repository's root, whether they exist or
     not: a path word named as a test is (`test_*.py`, `*_test.py`, `*.test.js`...) or one with a
     suffix under a `tests/` or `checks/` folder. A glob pattern or an option names none."""
+    return [path for path, _ in _named(check)]
+
+
+def named_nodes(check: dict) -> list[str]:
+    """The tests a check's command names by node id (`tests/test_a.py::Case::test_x`), from the
+    repository's root."""
+    return [f"{path}::{names}" for path, names in _named(check) if names]
+
+
+def _named(check: dict) -> list[tuple[str, str]]:
     import shlex
     try:
         words = shlex.split(check.get("command") or "")
@@ -3492,7 +3505,7 @@ def named_tests(check: dict) -> list[str]:
         return []
     out = []
     for word in words:
-        word = word.split("::")[0]
+        word, _, names = word.partition("::")
         if not word or word.startswith("-") or any(ch in word for ch in "*?["):
             continue
         path = posixpath.normpath(posixpath.join(check.get("cwd") or ".", word))
@@ -3501,8 +3514,25 @@ def named_tests(check: dict) -> list[str]:
             continue
         if (parts[-1].startswith("test_") or parts[-1].endswith(("_test.py", ".test.mjs", ".test.js", ".test.ts"))
                 or any(part in ("tests", "checks") for part in parts[:-1])):
-            out.append(path)
+            out.append((path, names))
     return out
+
+
+def defines_test(root: Path, node: str) -> bool:
+    """Whether the tree at `root` still holds the test a node id names: its file exists and, in a
+    Python file, each name after the path (a class, then a function; a parameter set dropped) is
+    defined in it. Read from the text, not collected: a test inherited from another module reads
+    as gone."""
+    path, *names = node.split("::")
+    try:
+        text = (root / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not path.endswith(".py"):
+        return True
+    return all(re.search(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(name.split('[')[0])}\b", text,
+                         re.MULTILINE)
+               for name in names)
 
 
 def _names_probe(command: dict, probe: str) -> bool:
