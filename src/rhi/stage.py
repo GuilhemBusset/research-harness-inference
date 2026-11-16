@@ -18,12 +18,19 @@ if TYPE_CHECKING:
 
     from rhi.config import Config
 
+# The name the bounded bootstrap gives the permissions boundary (`setup/bootstrap/policies.yaml`).
+PERMISSIONS_BOUNDARY = "rhi-permissions-boundary"
+
 
 class EndpointStage(cdk.Stage):
     """The endpoint, as one stage of stacks. Each construct arrives with its own issue and reads
     what it needs from `config`; a stack that needs the VPC takes it from `network.vpc`."""
 
     def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
-        super().__init__(scope, construct_id)
+        # Every role of the stage, those the CDK makes for its own functions included, carries the
+        # permissions boundary of the bounded bootstrap, by its fixed name, in the deploying account
+        # (`setup/bootstrap/README.md`).
+        boundary = cdk.PermissionsBoundary.from_name(PERMISSIONS_BOUNDARY)
+        super().__init__(scope, construct_id, permissions_boundary=boundary)
         self.config = config
         self.network = NetworkStack(self, "Network", config=config)

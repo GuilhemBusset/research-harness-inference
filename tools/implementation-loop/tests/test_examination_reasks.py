@@ -1,11 +1,7 @@
 """Regression for the engine fault b3ce2cd831 (#275): an issue spent its ceiling of 30 calls on a
-head that never failed verification. Its run log shows two causes, both in the examine step.
-
-The examiner returned one probe file whose criterion named several items. The engine compared
-that string with item ids, so no behavioural item ever counted as probed: it asked the examiner
-again twice, then the arbiter, at every examination. And the examiner answered `unmet` on an owner
-item while quoting what the owner still owes; the engine sent that to the builder as a failed
-round, and the builder had nothing to change.
+head that never failed verification. The examiner answered `unmet` on an owner item while quoting
+what the owner still owes; the engine sent that to the builder as a failed round, and the builder
+had nothing to change. (Its other cause, a probe owed per item, went with that rule.)
 
 The engine runs are real (git, the verifier, squash merges into a bare remote); the agents and
 GitHub are the fakes, and the examiner answers as that issue's examiner did."""
@@ -17,7 +13,6 @@ from test_deploying import L  # the `implement_loop` beside these tests (`loop_b
 
 EPIC, ISSUE = 1, 2
 OWNERS = "Runs under a second on a 2020 laptop."   # D2, an owner item; its agent part is the fake plan's
-PROBE = "checks/probe_2.sh"
 Phase = L.model.Phase
 
 
@@ -73,24 +68,6 @@ def loop():
     run.repo.cleanup()
 
 
-def test_one_probe_whose_criterion_names_several_items_covers_each_of_them(loop):
-    def one_file_for_every_item(result, req, since):
-        # the first examination names every item and says more; the later ones name the tested items
-        criterion = "D1, A1" if since else "D1, A1; D2 agent portion"
-        result.probes = [L.agents.Probe(PROBE, criterion, f"bash {PROBE}",
-                                        content="#!/usr/bin/env bash\nset -e\ntest -s docs/a.txt\n")]
-        return result
-
-    st = loop.run(one_file_for_every_item)
-
-    assert st.phase == Phase.DELIVERED, loop.events("round_failed")
-    assert loop.events("examination_incomplete") == [], "D1 and A1 each have a probe: nothing is owed"
-    assert loop.calls("arbitrate") == [], "no waiver is asked for items that are probed"
-    assert [e["probes"] for e in loop.events("tests_locked") if e["probes"]] == [[PROBE]], "adopted once"
-    assert len(loop.calls("examine")) == 2, "the examination, and the one of the head that adopted the probe"
-    assert len(loop.calls("build")) == 1
-
-
 def test_an_unmet_verdict_about_the_owners_evidence_is_asked_again_of_the_examiner(loop):
     def unmet_for_what_the_owner_owes(result, req, since):
         if not any("D2" in f for f in req.feedback):   # until the engine says what D2's verdict is about
@@ -118,16 +95,3 @@ def test_an_unmet_verdict_that_quotes_the_agent_part_still_sends_the_builder_bac
     assert len(loop.calls("build")) == 2
     assert st.verdicts["D2"]["verdict"] == "met"
     assert st.phase == Phase.DELIVERED
-
-
-@pytest.mark.parametrize(("criterion", "named"), [
-    ("D1", {"D1"}),
-    ("D1, D2, D3, A1, A2; A3 agent portion", {"D1", "D2", "D3", "A1", "A2", "A3"}),
-    ("D1 and A1: the file's content", {"D1", "A1"}),
-    ("D1: read as D2 reads it", {"D1"}),          # only the list it leads with
-    ("D1, D9", {"D1"}),                           # the plan has no D9
-    ("the file's content, as D1 asks", set()),
-    (None, set()),
-])
-def test_a_criterion_names_the_items_it_leads_with(criterion, named):
-    assert L.engine.criterion_items(criterion, {"D1", "D2", "D3", "A1", "A2", "A3"}) == named
