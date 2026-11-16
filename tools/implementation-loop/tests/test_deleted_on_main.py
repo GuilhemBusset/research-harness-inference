@@ -14,7 +14,7 @@ import helpers  # noqa: F401 - puts the engine on sys.path
 from implement_loop import engine as engine_module
 from implement_loop import verify
 from implement_loop.config import Caps
-from implement_loop.engine import CommittedFile, Engine, named_nodes, named_tests
+from implement_loop.engine import CommittedFile, Engine, in_tree, named_nodes, named_tests
 from implement_loop.model import IssueState
 from implement_loop.state import RunStore
 
@@ -84,6 +84,21 @@ class DeletedOnMainTests(unittest.TestCase):
                          "the tests of the files the skipped checks name are no longer required")
         self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed",
                                    "pytest tests/test_other.py tests/test_gone.py"])
+
+    def test_tests_that_ran_in_a_copy_outside_the_tree_are_never_required(self):
+        # a command that copies the tree to a fresh `mktemp -d` and runs pytest there: the plugin
+        # keeps those ids absolute, and the copy's path changes on every run
+        manifest = {"*": ["tests/test_a.py::test_x", "/tmp/tmp.AbC123/tests/test_a.py::test_x"]}
+        self.assertEqual(in_tree(manifest), {"*": ["tests/test_a.py::test_x"]})
+        self.engine.store.put(IssueState(number=9, manifest=manifest))
+        seen = []
+        self.engine._specs = lambda st: []  # ty: ignore[invalid-assignment]  # test double
+        self.engine.caps, self.engine.check_env = Caps(), {}
+        self.engine._mounts = lambda root: None  # ty: ignore[invalid-assignment]  # test double
+        with mock.patch.object(engine_module.verify, "verify",
+                               lambda root, checks, head, work_dir, locked, tests, manifest, *a, **k: seen.append(manifest)):
+            self.engine._verify_in(self.tmp, self.engine.store.issue(9), "abc123", self.tmp)
+        self.assertEqual(seen, [{"*": ["tests/test_a.py::test_x"]}])
 
     def test_a_locked_file_main_deleted_leaves_the_lock(self):
         wt = self.tmp / "wt"
