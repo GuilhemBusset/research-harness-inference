@@ -3493,8 +3493,10 @@ def in_tree(manifest: dict | None) -> dict:
 
 def named_tests(check: dict) -> list[str]:
     """The test files a check's command names, from the repository's root, whether they exist or
-    not: a path word named as a test is (`test_*.py`, `*_test.py`, `*.test.js`...) or one with a
-    suffix under a `tests/` or `checks/` folder. A glob pattern or an option names none."""
+    not: a path word named as a test is (`test_*.py`, `*_test.py`, `*.test.js`...), one with a
+    suffix under a `tests/` or `checks/` folder, or any source file (`.py`, `.sh`, `.js`, `.mjs`,
+    `.ts`): an earlier engine committed probes at the root (`examiner_probe_x.py`). A glob
+    pattern or an option names none."""
     return [path for path, _ in _named(check)]
 
 
@@ -3519,7 +3521,7 @@ def _named(check: dict) -> list[tuple[str, str]]:
         parts = path.split("/")
         if path.startswith(("/", "..")) or "." not in parts[-1]:
             continue
-        if (parts[-1].startswith("test_") or parts[-1].endswith(("_test.py", ".test.mjs", ".test.js", ".test.ts"))
+        if (parts[-1].startswith("test_") or parts[-1].endswith((".py", ".sh", ".js", ".mjs", ".ts"))
                 or any(part in ("tests", "checks") for part in parts[:-1])):
             out.append((path, names))
     return out
