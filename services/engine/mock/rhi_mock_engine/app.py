@@ -1,7 +1,8 @@
 """The mock engine: the engine contract's routes, answered with canned streams (system design, section 4.1).
 
 A CPU process that the gateway, the scaler and the tests can use in place of a model server. It
-serves the four inference routes in their three wire formats, streamed and not, and `GET /health`.
+serves the four inference routes in their three wire formats, streamed and not, `GET /health` and
+`GET /metrics`.
 
 | Route | Answer |
 | --- | --- |
@@ -10,6 +11,7 @@ serves the four inference routes in their three wire formats, streamed and not, 
 | `POST /v1/messages` | a message, or its events from `message_start` to `message_stop` |
 | `POST /v1/messages/count_tokens` | `{"input_tokens": n}` |
 | `GET /health` | 503 until the start delay has passed, then 200 |
+| `GET /metrics` | the contract's metrics in Prometheus' text format, to a loopback client; 404 to any other |
 | `POST /invocations`, `/pause`, `/tokenize` | 200, without the secret |
 
 **The canned turn.** The coursework model reasons before it answers (section 4.2), so every turn
@@ -38,9 +40,22 @@ block, and they do nothing here but answer.
 | `RHI_MOCK_TOKENS_PER_SECOND` | rate of a stream: one delta every 1/rate seconds | 50 |
 | `RHI_MOCK_START_SECONDS` | time after start during which `/health` answers 503 | 0 |
 | `RHI_MOCK_HANG` | `1`: an inference request is never answered, and `/health` still is | `0` |
+| `RHI_MOCK_MAX_RUNNING` | requests generated at once; the others wait for a slot | 8 |
 
-`main` serves the application on port 8000. Metrics, the limit on running requests, the handling
-of SIGTERM and the image are not here.
+**The limit and the metrics.** A request to one of the three generation routes waits for one of
+`max_running` slots, in the order it came, and holds it until its answer or its stream ends, or its
+client goes away; the token-counting route takes none. `GET /metrics` serves the quantities of the
+contract's metrics row under the mock's names in `rhi_common.engine_metrics`, and each follows the
+work done: the running and waiting requests; the time from a request's arrival to its first output
+token; the gap between two output tokens of a stream (a whole answer is not paced, so it has no
+gap); the input tokens of each request when it starts to run; each output token when it is sent.
+The mock has no cache, so the cached input tokens and the cache use stay at zero. The route answers
+only a client on a loopback address, where the node's collector scrapes it; any other gets the
+404 of a route that does not exist.
+
+**Shutdown.** `main` serves the application on port 8000 through `serve`. On SIGTERM the server
+accepts nothing new, lets every request already accepted run to its end, with no deadline that
+would cut a stream short, and then exits.
 """
 
 from __future__ import annotations
@@ -48,19 +63,25 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import uvicorn
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
+
+from rhi_common.engine_metrics import MOCK, Quantity, metric_names
 
 # Every engine listens here (system design, section 4.1).
 PORT = 8000
@@ -70,6 +91,7 @@ FIRST_BYTE_VARIABLE = "RHI_MOCK_FIRST_BYTE_SECONDS"
 RATE_VARIABLE = "RHI_MOCK_TOKENS_PER_SECOND"
 START_VARIABLE = "RHI_MOCK_START_SECONDS"
 HANG_VARIABLE = "RHI_MOCK_HANG"
+MAX_RUNNING_VARIABLE = "RHI_MOCK_MAX_RUNNING"
 
 INFERENCE_ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens")
 # The routes vLLM answers without its key (evidence E23).
@@ -94,13 +116,15 @@ class SettingsError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    """What the mock is started with: the pool's secret, and the four settings that shape its answers."""
+    """What the mock is started with: the pool's secret, and the five settings that shape its answers."""
 
     secret: str
     first_byte_seconds: float = 0.0
     tokens_per_second: float = 50.0
     start_seconds: float = 0.0
     hang: bool = False
+    # The coursework pool's engine runs at most 8 requests at once (system design, section 4.2).
+    max_running: int = 8
 
     def __post_init__(self) -> None:
         if not self.secret:
@@ -111,6 +135,8 @@ class Settings:
             raise SettingsError(f"{RATE_VARIABLE} must be a number of tokens per second above zero")
         if not (math.isfinite(self.start_seconds) and self.start_seconds >= 0):
             raise SettingsError(f"{START_VARIABLE} must be a number of seconds, zero or more")
+        if isinstance(self.max_running, bool) or not isinstance(self.max_running, int) or self.max_running < 1:
+            raise SettingsError(f"{MAX_RUNNING_VARIABLE} must be a whole number of requests, one or more")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -125,12 +151,17 @@ class Settings:
         hang = _HANG_VALUES.get(environ.get(HANG_VARIABLE, "").strip().lower())
         if hang is None:
             raise SettingsError(f"{HANG_VARIABLE} must be 0 or 1")
+        try:
+            max_running = int(environ.get(MAX_RUNNING_VARIABLE) or cls.max_running)
+        except ValueError:
+            raise SettingsError(f"{MAX_RUNNING_VARIABLE} must be a whole number") from None
         return cls(
             secret=environ.get(SECRET_VARIABLE, ""),
             first_byte_seconds=number(FIRST_BYTE_VARIABLE, cls.first_byte_seconds),
             tokens_per_second=number(RATE_VARIABLE, cls.tokens_per_second),
             start_seconds=number(START_VARIABLE, cls.start_seconds),
             hang=hang,
+            max_running=max_running,
         )
 
 
@@ -457,6 +488,100 @@ def _error(status: int, kind: str, message: str) -> JSONResponse:
     return JSONResponse({"type": "error", "error": {"type": kind, "message": message}}, status_code=status)
 
 
+class _Slots:
+    """`size` slots, handed out in the order they are asked for.
+
+    Bound to no event loop, unlike `asyncio.Semaphore`, so one application serves under any loop.
+    It never calls the application's `sleep`, which a test replaces.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._free = size
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    async def take(self) -> None:
+        if self._free and not self._waiters:
+            self._free -= 1
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            # A slot handed over as the request went away goes to the next one; a waiter that was
+            # cancelled stays in the queue, done, and `give_back` passes over it.
+            if waiter.done() and not waiter.cancelled():
+                self.give_back()
+            waiter.cancel()
+            raise
+
+    def give_back(self) -> None:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
+                return
+        self._free += 1
+
+
+# Seconds. Finer than Prometheus' defaults where a stream's pace lives (system design, section 7.2).
+_FIRST_TOKEN_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0)
+_TOKEN_GAP_BUCKETS = (0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0)
+
+
+class _Metrics:
+    """The quantities of the contract's metrics row, under the mock's names, in a registry of one application."""
+
+    def __init__(self) -> None:
+        names = metric_names(MOCK)
+        self.registry = CollectorRegistry(auto_describe=True)
+        registry = self.registry
+        self.running = Gauge(names[Quantity.RUNNING_REQUESTS], "Requests being generated.", registry=registry)
+        self.waiting = Gauge(names[Quantity.WAITING_REQUESTS], "Requests waiting for a slot.", registry=registry)
+        self.first_token = Histogram(
+            names[Quantity.TIME_TO_FIRST_TOKEN],
+            "Seconds from a request's arrival to its first output token.",
+            buckets=_FIRST_TOKEN_BUCKETS,
+            registry=registry,
+        )
+        self.token_gap = Histogram(
+            names[Quantity.TIME_PER_OUTPUT_TOKEN],
+            "Seconds between two output tokens of a stream.",
+            buckets=_TOKEN_GAP_BUCKETS,
+            registry=registry,
+        )
+        self.input_tokens = Counter(names[Quantity.INPUT_TOKENS], "Input tokens of the requests run.", registry=registry)
+        self.cached_input_tokens = Counter(
+            names[Quantity.CACHED_INPUT_TOKENS], "Input tokens read from the cache: none here.", registry=registry
+        )
+        self.output_tokens = Counter(names[Quantity.OUTPUT_TOKENS], "Output tokens sent.", registry=registry)
+        self.cache_usage = Gauge(names[Quantity.CACHE_USAGE], "Share of the cache in use: none here.", registry=registry)
+
+
+class _Holding:
+    """An answer that holds a slot until it has been sent, or its client has gone away."""
+
+    def __init__(self, response: Response, release: Callable[[], None]) -> None:
+        self._response = response
+        self._release = release
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            self._release()
+
+
+def _loopback(request: Request) -> bool:
+    """Whether the request comes from a loopback address. A client with no address does not."""
+    if request.client is None:
+        return False
+    try:
+        return ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
+
+
 def create_app(
     settings: Settings,
     *,
@@ -466,19 +591,31 @@ def create_app(
     """The mock engine as an ASGI application. `clock` and `sleep` are arguments so that a test waits for nothing."""
     started = clock()
     secret = settings.secret.encode()
+    slots = _Slots(settings.max_running)
+    metrics = _Metrics()
 
     def authorized(request: Request) -> bool:
         scheme, _, credential = request.headers.get("authorization", "").partition(" ")
         return scheme.lower() == "bearer" and hmac.compare_digest(credential.strip().encode(), secret)
 
-    async def paced(frames: Iterator[Frame]) -> AsyncIterator[bytes]:
+    async def paced(frames: Iterator[Frame], arrived: float) -> AsyncIterator[bytes]:
+        last: float | None = None
         for frame in frames:
             if frame.token:
                 await sleep(1 / settings.tokens_per_second)
+                now = clock()
+                if last is None:
+                    metrics.first_token.observe(now - arrived)
+                else:
+                    metrics.token_gap.observe(now - last)
+                last = now
+                metrics.output_tokens.inc()
             yield frame.data
 
-    def inference(respond: Callable[[Mapping[str, Any]], Response]) -> Callable[[Request], Awaitable[Response]]:
-        async def endpoint(request: Request) -> Response:
+    def inference(
+        respond: Callable[[Mapping[str, Any]], Awaitable[Response | _Holding]],
+    ) -> Callable[[Request], Awaitable[Response | _Holding]]:
+        async def endpoint(request: Request) -> Response | _Holding:
             if not authorized(request):
                 return _error(401, "authentication_error", "This route requires the pool's bearer secret.")
             if settings.hang:
@@ -493,25 +630,59 @@ def create_app(
                 body = None
             if not isinstance(body, dict):
                 return _error(400, "invalid_request_error", "The body must be a JSON object.")
-            await sleep(settings.first_byte_seconds)
-            return respond(body)
+            return await respond(body)
 
         return endpoint
 
-    def answer_in(wire: _Wire) -> Callable[[Mapping[str, Any]], Response]:
-        def respond(body: Mapping[str, Any]) -> Response:
-            turn = _turn(body, wire.tool(body))
-            if body.get("stream") is True:
-                return StreamingResponse(paced(wire.events(turn, body)), media_type="text/event-stream")
-            return JSONResponse(wire.answer(turn))
+    def answer_in(wire: _Wire) -> Callable[[Mapping[str, Any]], Awaitable[_Holding]]:
+        async def respond(body: Mapping[str, Any]) -> _Holding:
+            arrived = clock()
+            metrics.waiting.inc()
+            try:
+                await slots.take()
+            finally:
+                metrics.waiting.dec()
+            metrics.running.inc()
+            held = True
+
+            def release() -> None:
+                nonlocal held
+                if held:
+                    held = False
+                    metrics.running.dec()
+                    slots.give_back()
+
+            try:
+                turn = _turn(body, wire.tool(body))
+                metrics.input_tokens.inc(turn.input_tokens)
+                await sleep(settings.first_byte_seconds)
+                if body.get("stream") is True:
+                    response: Response = StreamingResponse(
+                        paced(wire.events(turn, body), arrived), media_type="text/event-stream"
+                    )
+                else:
+                    metrics.first_token.observe(clock() - arrived)
+                    metrics.output_tokens.inc(turn.output_tokens)
+                    response = JSONResponse(wire.answer(turn))
+            except BaseException:
+                release()
+                raise
+            return _Holding(response, release)
 
         return respond
 
-    def count_tokens(body: Mapping[str, Any]) -> Response:
+    async def count_tokens(body: Mapping[str, Any]) -> Response:
+        await sleep(settings.first_byte_seconds)
         return JSONResponse({"input_tokens": count_input_tokens(body)})
 
     async def health(request: Request) -> Response:
         return Response(status_code=200 if clock() - started >= settings.start_seconds else 503)
+
+    async def exposition(request: Request) -> Response:
+        if not _loopback(request):
+            # The answer of a route that does not exist.
+            return PlainTextResponse("Not Found", status_code=404)
+        return Response(generate_latest(metrics.registry), headers={"Content-Type": CONTENT_TYPE_LATEST})
 
     async def unguarded(request: Request) -> Response:
         return JSONResponse({"route": request.url.path, "secret_required": False})
@@ -521,15 +692,24 @@ def create_app(
             *(Route(path, inference(answer_in(wire)), methods=["POST"]) for path, wire in _WIRES.items()),
             Route("/v1/messages/count_tokens", inference(count_tokens), methods=["POST"]),
             Route("/health", health, methods=["GET"]),
+            Route("/metrics", exposition, methods=["GET"]),
             *(Route(path, unguarded, methods=["POST"]) for path in UNGUARDED_ROUTES),
         ]
     )
 
 
+def serve(settings: Settings, **where: Any) -> None:
+    """Serve the mock where `where` says: uvicorn's `host` and `port`, or `uds`.
+
+    On SIGTERM uvicorn stops accepting, waits for every request it has accepted to end, and exits.
+    `timeout_graceful_shutdown=None` says so: no deadline cuts a stream in flight.
+    """
+    uvicorn.run(create_app(settings), **where, timeout_graceful_shutdown=None)
+
+
 def main() -> None:
     """Serve the mock on port 8000. With no secret in the environment it raises before anything listens."""
-    settings = Settings.from_env(os.environ)
-    uvicorn.run(create_app(settings), host="0.0.0.0", port=PORT)
+    serve(Settings.from_env(os.environ), host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
