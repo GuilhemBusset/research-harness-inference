@@ -47,12 +47,12 @@ class Loop:
         self.agents = Agents({n: L.agents.Script(files={f"docs/f{n}.txt": f"text {n}"}) for n in issues})
         self.store = L.state.RunStore.for_root(self.repo.work, EPIC)
 
-    def run(self):
+    def run(self, **caps):
         self.store = L.state.RunStore.for_root(self.repo.work, EPIC)
         return L.engine.Engine(
             L.graph.build_plan(self.fake, EPIC, self.repo.work), self.store, self.fake,
             L.workspace.Workspace(self.repo.work, EPIC, SHIP, base_dir=self.repo.tmp / "loop"), self.agents,
-            L.config.Config(repo="test/test", caps=L.config.Caps(ci_poll_s=0, queue_poll_s=0)),
+            L.config.Config(repo="test/test", caps=L.config.Caps(ci_poll_s=0, queue_poll_s=0, **caps)),
             repo_root=self.repo.work, log=lambda m: None, sleep=lambda s: None, policy={"lacks": []}).run()
 
     def waits(self, n=ISSUE):
@@ -135,7 +135,8 @@ def test_a_review_owed_waits_for_the_owner_after_one_refusal():
                 run.fake.default_review = ""
             run.agents.before_build[OTHER] = once_the_first_waits
 
-            run.run()
+            run.run(max_parallel_writers=2)   # the other issue is built while this one is held: with
+            # one writer it would start only when the engine's 30-second wait for a finished call ends
 
             assert run.waits() == (Phase.WAITING, OWNER_REVIEW, Phase.LAND.value, 0), "no merge refusal is counted"
             kinds = run.kinds()

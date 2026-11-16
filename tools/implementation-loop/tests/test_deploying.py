@@ -321,7 +321,8 @@ def test_the_landing_claim_is_held():
             wait_until(lambda: run.issue(3).phase == Phase.LAND or 3 in run.fake.commits)
             seen.append((run.issue(3).phase, run.queue_claimed(), len(run.fake.merges())))
         run.fake.before_read = at_each_read
-        run.run()
+        run.run(max_parallel_writers=2)   # #3 is built while #2 waits: with one writer it would start
+        # only when the engine's 30-second wait for a finished call ends, as #2's call is held here
 
         [commit] = run.fake.commits[2]
         assert set(seen) == {(Phase.LAND, True, 1)}, "while #2 polls: #3 stays in land, the claim is held, one merge"
