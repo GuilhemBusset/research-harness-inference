@@ -31,6 +31,9 @@ class DeletedOnMainTests(unittest.TestCase):
                          ["tests/unit/test_a.py"])
         self.assertEqual(named_tests({"command": "bash checks/probe_2.sh", "cwd": "sub"}), ["sub/checks/probe_2.sh"])
         self.assertEqual(named_tests({"command": "uv run --locked pytest tests/", "cwd": "."}), [])
+        self.assertEqual(named_tests({"command": "uv run --no-project --python 3.12 --with pytest==8.3.5 python -m pytest -q "
+                                                 "examiner_probe_costs_cli.py", "cwd": "."}),
+                         ["examiner_probe_costs_cli.py"], "a probe an earlier engine committed at the root")
         self.assertEqual(named_nodes({"command": "pytest -q tests/test_a.py::Case::test_x tests/test_b.py", "cwd": "."}),
                          ["tests/test_a.py::Case::test_x"])
 
