@@ -156,7 +156,12 @@ def test_what_the_profile_rewrites_is_kept() -> None:
 
 
 def test_any_effort_and_a_system_message_anywhere_pass_as_sent() -> None:
-    sent_input = [message("user", "Hello."), message("system", "Answer in French."), message("user", "Bye.")]
+    earlier = {
+        **REASONING_ITEM,
+        "content": [{"type": "reasoning_text", "text": "The user wants French."}],
+        "status": "completed",
+    }
+    sent_input = [message("user", "Hello."), earlier, message("system", "Answer in French."), message("user", "Bye.")]
     body = forwarded({"model": "coursework", "input": sent_input, "reasoning": {"effort": "extreme-new-value"}})
     assert body["reasoning"]["effort"] == "extreme-new-value"
     assert body["input"] == sent_input
@@ -214,7 +219,8 @@ def test_an_inline_image_passes_where_the_reference_allows_one(item: Any) -> Non
 
 def test_the_client_tools_and_their_calls_keep_their_fields() -> None:
     function = {"type": "function", "name": "read", "parameters": {"type": "object"}, "strict": False, "async": True}
-    tools = [{"type": "namespace", "name": "workspace", "description": "Workspace tools.", "tools": [function]}]
+    custom = {"type": "custom", "name": "run", "async": True}
+    tools = [{"type": "namespace", "name": "workspace", "description": "Workspace tools.", "tools": [function]}, custom]
     call = {
         "type": "local_shell_call",
         "id": "ls_1",
