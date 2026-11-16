@@ -2,8 +2,9 @@
 
 CodePipeline V2 in queued execution, so that each commit has its own execution. The source is a
 connection the stack creates, on `main`, for the repository the configuration names. The synth
-step names no configuration source until issue E1-10 gives it one. The stage's stacks are deployed
-only by the pipeline, after the approval CDK Pipelines asks for when a change widens permissions.
+step synthesizes the app (its own tests are in test_pipeline_synth.py), and the self-update follows
+it. The stage's stacks are deployed only by the pipeline, after the approval CDK Pipelines asks for
+when a change widens permissions.
 """
 
 from __future__ import annotations
@@ -93,15 +94,12 @@ def test_one_source_on_main_from_the_stacks_connection(templates: dict[str, dict
             assert project.get("Triggers", {"Webhook": False}) == {"Webhook": False}, path
 
 
-def test_the_synth_step_names_no_configuration_source(templates: dict[str, dict[str, Any]]) -> None:
+def test_the_self_update_follows_the_synth_step(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     actions = actions_of(the_pipeline(templates))
     (synth,) = actions["Build"]
     commands = commands_of(template, synth)
     assert any("cdk synth --lookups=false" in command for command in commands)
-    project = template["Resources"][synth["Configuration"]["ProjectName"]["Ref"]]
-    assert "RHI_CONFIG" not in json.dumps(project) + json.dumps(synth)
-    # The self-update follows it.
     assert [action["Name"] for action in actions["UpdatePipeline"]] == ["SelfMutate"]
 
 

@@ -30,7 +30,13 @@ Rules hold those two, and every action:
 - no CodeBuild project has a webhook: on a public repository it would run a stranger's code with
   a role of the account (section 8.3);
 - every role of every template carries the permissions boundary of the bounded bootstrap, by its
-  fixed name, in the deploying account (`setup/bootstrap/README.md`).
+  fixed name, in the deploying account (`setup/bootstrap/README.md`);
+- the role of the synth step, the project of a CodeBuild action of the stage `Build`, may read the
+  parameters under /rhi/config/ and no other parameter or secret (section 8.2, step 2): every
+  statement it is allowed whose actions reach a read of a parameter or a secret, or assume another
+  role, which could read them in its place, names only parameters under that path, in the
+  deploying account. A statement written as `NotAction` or `NotResource`, and a managed policy the
+  template does not hold, are taken as reaching everything.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -38,6 +44,7 @@ pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeli
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from pathlib import Path
@@ -89,6 +96,24 @@ BRANCH = "main"
 BOUNDARY = "rhi-permissions-boundary"
 BOUNDARY_ARN = re.compile(r"arn:(aws[a-z-]*|\$\{AWS::Partition\}):iam::\$\{AWS::AccountId\}:policy/" + BOUNDARY)
 
+# What the synth role may read: the configuration's parameters, by path or by name, in the deploying
+# account, as `Fn::Sub` would write their ARNs.
+SYNTH_STAGE = "Build"
+CONFIGURATION = re.compile(
+    r"arn:(aws[a-z-]*|\$\{AWS::Partition\}):ssm:(\$\{AWS::Region\}|[a-z0-9-]+|\*):\$\{AWS::AccountId\}:"
+    r"parameter/rhi/config(/[\w./*-]*)?"
+)
+# The actions that read a parameter or a secret, or assume a role that could read them.
+READS = (
+    "ssm:GetParameter",
+    "ssm:GetParameters",
+    "ssm:GetParametersByPath",
+    "ssm:GetParameterHistory",
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:BatchGetSecretValue",
+    "sts:AssumeRole",
+)
+
 UNLISTED = "the pipeline has it and the reviewed list does not"
 MISSING = "the reviewed list has it and the pipeline does not"
 ANOTHER_ORDER = "the pipeline's stages and actions are not in the order of the reviewed list"
@@ -98,6 +123,7 @@ NOT_AFTER_THE_APPROVAL = "a CloudFormation action that does not come after the a
 ANOTHER_TRIGGER = "a trigger other than a push to `main`"
 WEBHOOK = "a CodeBuild project with a webhook"
 NO_BOUNDARY = "a role without the permissions boundary of the bounded bootstrap"
+READS_MORE = "a synth role that may read more than the parameters under /rhi/config/"
 
 
 def resources(templates: Templates, kind: str) -> list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]:
@@ -288,6 +314,66 @@ def written(value: Any) -> str | None:
     return None
 
 
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def synth_roles(template: Mapping[str, Any]) -> set[str]:
+    """The logical IDs of the roles of the projects that the CodeBuild actions of the stage `Build`
+    run, in the pipelines of a template."""
+    found = set()
+    for _, _, pipeline, _ in resources({"": template}, "AWS::CodePipeline::Pipeline"):
+        for stage, actions in stages_of(pipeline):
+            for action in actions:
+                project = action.get("Configuration", {}).get("ProjectName")
+                if stage != SYNTH_STAGE or type_of(action) != CODEBUILD or not isinstance(project, dict):
+                    continue
+                role = template["Resources"].get(project.get("Ref"), {}).get("Properties", {}).get("ServiceRole")
+                if isinstance(role, dict) and "Fn::GetAtt" in role:
+                    found.add(role["Fn::GetAtt"][0])
+    return found
+
+
+def statements_of(template: Mapping[str, Any], role: str) -> list[Mapping[str, Any]] | None:
+    """Every statement a role of the template is allowed: those of the policies attached to it and
+    of its own. None when it holds a managed policy the template does not."""
+    properties = template["Resources"][role].get("Properties", {})
+    held = {logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::IAM::ManagedPolicy")}
+    documents = [policy["PolicyDocument"] for policy in properties.get("Policies", [])]
+    for arn in properties.get("ManagedPolicyArns", []):
+        if not (isinstance(arn, dict) and arn.get("Ref") in held):
+            return None
+    for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
+        for _, logical_id, policy, _ in resources({"": template}, kind):
+            attached = {"Ref": role} in policy.get("Roles", []) or {"Ref": logical_id} in properties.get(
+                "ManagedPolicyArns", []
+            )
+            if attached:
+                documents.append(policy["PolicyDocument"])
+    return [
+        statement
+        for document in documents
+        for statement in as_list(document.get("Statement", []))
+        if statement.get("Effect") == "Allow"
+    ]
+
+
+def reads_more(statement: Mapping[str, Any]) -> bool:
+    """Whether an allowed statement reaches a read of a parameter or a secret, or a role, beyond
+    the parameters under /rhi/config/."""
+    if "NotAction" in statement or "NotResource" in statement:
+        return True
+    reaches = any(
+        fnmatch.fnmatchcase(read.lower(), action.lower())
+        for action in as_list(statement.get("Action", []))
+        for read in READS
+    )
+    if not reaches:
+        return False
+    named = [written(resource) for resource in as_list(statement.get("Resource", []))]
+    return not named or not all(arn is not None and CONFIGURATION.fullmatch(arn) for arn in named)
+
+
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """Everything of the templates that a rule refuses, as `(template path, what it is named,
     what is refused)`: an action by its stage and name, a resource by its logical ID."""
@@ -336,6 +422,11 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
         boundary = written(properties.get("PermissionsBoundary"))
         if boundary is None or BOUNDARY_ARN.fullmatch(boundary) is None:
             found.append((path, logical_id, NO_BOUNDARY))
+    for path, template in sorted(templates.items()):
+        for role in sorted(synth_roles(template)):
+            statements = statements_of(template, role)
+            if statements is None or any(reads_more(statement) for statement in statements):
+                found.append((path, role, READS_MORE))
     return found
 
 
@@ -580,6 +671,22 @@ def a_project_with_a_webhook(cdk: ModuleType, stack: Any, _pipeline: Any) -> Non
     codebuild.Project(stack, "OnAPullRequest", source=source, build_spec=codebuild.BuildSpec.from_object({}))
 
 
+def a_synth_role_that_reads(action: str, service: str, resource: str, name: str) -> Change:
+    """Allows the synth step's role one more action, on one resource of the deploying account."""
+
+    def change(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+        (project,) = [
+            node
+            for node in stack.node.find_all()
+            if isinstance(node, cdk.aws_codebuild.Project) and "/Build/Synth/" in node.node.path
+        ]
+        colon = cdk.ArnFormat.COLON_RESOURCE_NAME if service == "secretsmanager" else cdk.ArnFormat.SLASH_RESOURCE_NAME
+        arn = stack.format_arn(service=service, resource=resource, resource_name=name, arn_format=colon)
+        project.role.add_to_principal_policy(cdk.aws_iam.PolicyStatement(actions=[action], resources=[arn]))
+
+    return change
+
+
 def an_approval_in_the_asset_stage(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
     pipeline.stage(ASSET_STAGE).add_action(cdk.aws_codepipeline_actions.ManualApprovalAction(action_name="Extra"))
 
@@ -589,6 +696,11 @@ ON_MAIN = {"branches_includes": [BRANCH]}
 
 def test_keeps_a_trigger_on_a_push_to_main(cdk: ModuleType, tmp_path: Path) -> None:
     assert breaches(built(cdk, tmp_path, change=with_a_trigger(push=ON_MAIN))) == []
+
+
+def test_keeps_a_synth_role_that_reads_the_configuration(cdk: ModuleType, tmp_path: Path) -> None:
+    reads = a_synth_role_that_reads("ssm:GetParametersByPath", "ssm", "parameter", "rhi/config/*")
+    assert breaches(built(cdk, tmp_path, change=reads)) == []
 
 
 @pytest.mark.parametrize(
@@ -643,6 +755,16 @@ def test_keeps_a_trigger_on_a_push_to_main(cdk: ModuleType, tmp_path: Path) -> N
             id="an action of the asset stage that is not a CodeBuild action",
         ),
         pytest.param({"boundary": "another-boundary"}, NO_BOUNDARY, id="a boundary of another name"),
+        pytest.param(
+            {"change": a_synth_role_that_reads("ssm:GetParameter", "ssm", "parameter", "rhi/other")},
+            READS_MORE,
+            id="a synth role that reads another parameter",
+        ),
+        pytest.param(
+            {"change": a_synth_role_that_reads("secretsmanager:GetSecretValue", "secretsmanager", "secret", "rhi-*")},
+            READS_MORE,
+            id="a synth role that reads a secret",
+        ),
     ],
 )
 def test_each_rule_refuses_its_breach(cdk: ModuleType, tmp_path: Path, changes: dict[str, Any], expected: str) -> None:
