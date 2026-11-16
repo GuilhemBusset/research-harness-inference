@@ -5,10 +5,9 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
 
 - its source is this repository, on `main`, through a CodeConnections connection the stack
   creates. The connection starts pending until the owner authorizes it once (section 8.6).
-- a synth step. Its content is issue E1-10's: reading the configuration from SSM, the leak check,
-  synthesis and the tests. Until that issue lands, the step names no configuration source. An
-  execution started before then fails closed in the configuration loader instead of deploying
-  the example configuration.
+- the synth step of `rhi.pipeline.synth`: it reads the configuration from SSM into a file outside
+  the source tree, checks that no private value of it is in the tree, synthesizes from that file
+  and runs the tests.
 - the self-update, which CDK Pipelines adds.
 - the stage, `EndpointStage`, whose deployment waits for the approval CDK Pipelines asks for
   when a change widens permissions. That approval is a tripwire for honest mistakes. It does not
@@ -34,6 +33,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
+from rhi.pipeline.synth import synth_step
 from rhi.stage import PERMISSIONS_BOUNDARY
 
 if TYPE_CHECKING:
@@ -47,8 +47,6 @@ BRANCH = "main"
 CONNECTION_NAME = "rhi-github"
 # The name of the source's action in the pipeline.
 SOURCE_ACTION = "GitHub"
-# The uv the synth step installs: the one CI pins (`.github/workflows/ci.yml`).
-UV_VERSION = "0.11.28"
 
 
 class PipelineStack(cdk.Stack):
@@ -70,14 +68,7 @@ class PipelineStack(cdk.Stack):
             connection_arn=connection.attr_connection_arn,
             action_name=SOURCE_ACTION,
         )
-        # No configuration source is named here, neither `RHI_CONFIG` nor `RHI_CONFIG_FILE`: the
-        # loader fails closed until issue E1-10 gives the step its own.
-        synth = pipelines.ShellStep(
-            "Synth",
-            input=source,
-            install_commands=[f"python3 -m pip install uv=={UV_VERSION}", "npm ci --ignore-scripts"],
-            commands=["node_modules/.bin/cdk synth --lookups=false"],
-        )
+        synth = synth_step(self, source)
         underlying = codepipeline.Pipeline(
             self,
             "CodePipeline",
