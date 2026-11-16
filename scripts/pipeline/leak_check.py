@@ -9,7 +9,8 @@ searched for: they would match everywhere.
 
 A hit fails the check, which is how the pipeline alerts the owner. It is reported by its file,
 its line and the name of the key, never by the value: what the check prints ends up in the
-build's logs.
+build's logs. A path the check prints is redacted too: where a private value is part of a file's
+or a folder's name, the name of its key stands in its place.
 
 The source CodeBuild receives has no `.git`, so the check cannot tell a tracked file from an
 untracked one, and searches them all. The fetched file must therefore lie outside the tree: when
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -67,12 +69,25 @@ def private_values(fetched: config.Config) -> dict[str, str]:
     return {key: str(getattr(fetched, key)).casefold() for key in sorted(config.PRIVATE_KEYS)}
 
 
+def redacted(text: str, values: Mapping[str, str]) -> str:
+    """The text with every private value, in any letter case, replaced by the name of its key.
+
+    When a value survives the replacement (a letter whose case folding changes its length), the
+    whole text is withheld rather than shown."""
+    for key, value in sorted(values.items(), key=lambda item: len(item[1]), reverse=True):
+        if value:
+            text = re.sub(re.escape(value), f"<{key}>", text, flags=re.IGNORECASE)
+    if any(value and value in text.casefold() for value in values.values()):
+        return "<a path that holds a private value>"
+    return text
+
+
 def hits(tree: Path, values: Mapping[str, str]) -> Iterator[str]:
     """Each line of the tree that holds a value, as `<file>:<line>: <key>`, the file relative to
-    the tree. A file that cannot be read is reported too: the check does not pass what it did not
-    read."""
+    the tree, redacted. A file that cannot be read is reported too: the check does not pass what
+    it did not read."""
     for path in files(tree):
-        shown = path.relative_to(tree).as_posix()
+        shown = redacted(path.relative_to(tree).as_posix(), values)
         try:
             text = path.read_bytes().decode("utf-8", errors="replace")
         except OSError:
@@ -97,16 +112,24 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
         print(f"{NAME}: RHI_CONFIG_FILE is not set: it names the fetched configuration", file=sys.stderr)
         return 1
     fetched_file = Path(named).absolute()
+    source = {"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(fetched_file)}
     for candidate in (fetched_file, fetched_file.resolve()):
         if candidate.is_relative_to(tree):
+            # The path is named, redacted with the file's own values when it can be read: a
+            # private value may be part of its name.
+            try:
+                values = private_values(config.load(source))
+            except config.ConfigError:
+                values = {}
             print(
                 f"{NAME}: RHI_CONFIG_FILE names a file inside the tree the check searches, "
-                f"{candidate.relative_to(tree).as_posix()}: the configuration must be fetched outside it",
+                f"{redacted(candidate.relative_to(tree).as_posix(), values)}: "
+                "the configuration must be fetched outside it",
                 file=sys.stderr,
             )
             return 1
     try:
-        fetched = config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(fetched_file)})
+        fetched = config.load(source)
     except config.ConfigError as error:
         print(f"{NAME}: {error}", file=sys.stderr)
         return 1
