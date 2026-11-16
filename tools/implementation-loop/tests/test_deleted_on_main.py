@@ -67,15 +67,23 @@ class DeletedOnMainTests(unittest.TestCase):
         coord = self.tmp / "coord"
         (coord / "tests").mkdir(parents=True)
         (coord / "tests/test_kept.py").write_text("class Case:\n    def test_a(self):\n        pass\n")
+        (coord / "tests/test_other.py").write_text("def test_c():\n    pass\n")
+        (coord / "tests/unit").mkdir()
+        (coord / "tests/unit/test_d.py").write_text("def test_d():\n    pass\n")
         ran, skipped = self.regressions(coord, [
             {"criterion": "D1", "command": "pytest tests/test_kept.py::Case::test_a", "cwd": ".", "author": "builder"},
             {"criterion": "D2", "command": "pytest tests/test_kept.py::Case::test_renamed", "cwd": ".",
              "author": "builder"},
-            {"criterion": "D3", "command": "pytest tests/test_kept.py::test_b", "cwd": ".", "author": "builder"}],
+            {"criterion": "D3", "command": "pytest tests/test_other.py tests/test_gone.py", "cwd": ".",
+             "author": "builder"},
+            {"criterion": "A1", "command": "pytest tests/", "cwd": ".", "author": "builder"}],
             {"*": ["tests/test_kept.py::Case::test_a", "tests/test_kept.py::Case::test_renamed[x]",
-                   "tests/test_kept.py::test_b"]})
-        self.assertEqual(ran, [(["pytest tests/test_kept.py::Case::test_a"], {"*": ["tests/test_kept.py::Case::test_a"]})])
-        self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed", "pytest tests/test_kept.py::test_b"])
+                   "tests/test_other.py::test_c", "tests/unit/test_d.py::test_d"]})
+        self.assertEqual(ran, [(["pytest tests/test_kept.py::Case::test_a", "pytest tests/"],
+                                {"*": ["tests/unit/test_d.py::test_d"]})],
+                         "the tests of the files the skipped checks name are no longer required")
+        self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed",
+                                   "pytest tests/test_other.py tests/test_gone.py"])
 
     def test_a_locked_file_main_deleted_leaves_the_lock(self):
         wt = self.tmp / "wt"
