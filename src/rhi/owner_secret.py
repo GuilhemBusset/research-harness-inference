@@ -45,8 +45,12 @@ def store(name: str, value: str, client: Any = None) -> str:
     errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
     try:
         client = boto3.client("secretsmanager") if client is None else client
-    except errors:
+    except botocore.exceptions.NoRegionError:
         raise RuntimeError("no Secrets Manager client can be made: the AWS configuration must give a region") from None
+    except errors as error:
+        # The class names the cause (a missing dependency, a profile that cannot be read); its
+        # text is the SDK's and is not repeated.
+        raise RuntimeError(f"no Secrets Manager client can be made: the AWS SDK raised {type(error).__name__}") from None
     try:
         try:
             client.create_secret(Name=name, SecretString=value)

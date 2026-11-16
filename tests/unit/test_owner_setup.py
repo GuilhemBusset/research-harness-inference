@@ -125,7 +125,9 @@ class Walkthrough:
             (self.stand_ins / "uv").unlink()
         # Nothing the caller's shell sets may keep bytecode or an environment out of the tree: the
         # script has to. The real uv finds everything it installs in its cache.
+        # Nor may the region the caller's shell sets: a run names its own.
         dropped = ("PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV")
+        dropped += ("AWS_REGION", "AWS_DEFAULT_REGION")
         added = env or {}
         env = {name: value for name, value in os.environ.items() if name not in dropped}
         env |= {
@@ -482,6 +484,46 @@ def test_the_module_stores_the_three_fields(tmp_path: Path, capsys: pytest.Captu
     printed = capsys.readouterr()
     assert SECRET in printed.out
     assert KEY_MARK not in printed.out + printed.err
+
+
+@pytest.mark.parametrize(
+    ("error", "named"),
+    [
+        (botocore.exceptions.NoRegionError(), "must give a region"),
+        (botocore.exceptions.MissingDependencyException(msg=f"no awscrt {MARK}"), "MissingDependencyException"),
+    ],
+)
+def test_a_client_the_sdk_cannot_make_is_named_by_its_cause(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, named: str
+) -> None:
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *_: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError) as raised:
+        owner_secret.store(SECRET, "{}")
+    assert named in str(raised.value)
+    assert MARK not in str(raised.value)  # the SDK's own text is not repeated
+    if not isinstance(error, botocore.exceptions.NoRegionError):
+        assert "region" not in str(raised.value)
+
+
+def test_only_aws_region_gives_the_region_to_every_command(walkthrough: Walkthrough) -> None:
+    file = walkthrough.owner_file()
+    seen = walkthrough.tmp_path / "region"
+    # The stand-in for uv records the region the SDK of a Python step would read, then goes on.
+    uv = walkthrough.stand_ins / "uv"
+    uv.write_text(
+        uv.read_text(encoding="utf-8").replace(
+            "#!/usr/bin/env bash\n", f'#!/usr/bin/env bash\necho "${{AWS_DEFAULT_REGION-unset}}" >> {seen}\n', 1
+        ),
+        encoding="utf-8",
+    )
+    region = {"AWS_REGION": "us-west-2"}
+    for only, expected in ((region, "us-west-2"), (region | {"AWS_DEFAULT_REGION": "us-east-1"}, "us-east-1")):
+        seen.write_text("", encoding="utf-8")
+        done = walkthrough.run("--step", "configuration", "--config", file, answers="y\ny\nn\n", env=only)
+        assert done.returncode == 0, done.stderr
+        assert seen.read_text(encoding="utf-8").split() == [expected, expected]  # the check and the writing
 
 
 def test_the_configuration_comes_from_outside_the_tree(walkthrough: Walkthrough) -> None:

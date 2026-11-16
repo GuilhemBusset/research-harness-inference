@@ -89,6 +89,15 @@ if [ -n "$only" ] && [[ " ${steps[*]} " != *" $only "* ]]; then
   exit 2
 fi
 
+# --- The region the AWS CLI and the AWS SDK read ---------------------------------------------
+
+# For every command a step runs. The AWS CLI reads AWS_REGION, then AWS_DEFAULT_REGION; the AWS
+# SDK of the Python steps (at the version uv.lock holds) reads AWS_DEFAULT_REGION and never
+# AWS_REGION. When only AWS_REGION is set, both read it.
+if [ -n "${AWS_REGION:-}" ] && [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+fi
+
 # --- What the tools write as they run stays out of the working tree ---------------------------
 
 export PYTHONDONTWRITEBYTECODE=1
