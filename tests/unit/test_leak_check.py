@@ -107,3 +107,22 @@ def test_the_fetched_file_is_not_a_leak(tree: Path, fetched: Path) -> None:
     assert "config.local.toml" in result.stderr
     assert result.stdout == ""
     assert shows_no_value(result)
+
+
+@pytest.mark.parametrize("key", sorted(config.PRIVATE_KEYS))
+def test_a_path_that_holds_a_private_value_is_redacted(tree: Path, fetched: Path, key: str) -> None:
+    # A hit in a file whose name holds the value: the file is reported, its name redacted.
+    (tree / "docs" / f"{PRIVATE[key].upper()}.md").write_text(f"{PRIVATE[key]}\n", encoding="utf-8")
+    hit = run(tree, fetched)
+    assert hit.returncode != 0
+    assert hit.stdout.splitlines() == [f"docs/<{key}>.md:1: the value of the private key {key!r}"]
+    assert shows_no_value(hit)
+
+    # The fetched file inside the tree, under such a name: refused, the path named and redacted.
+    (tree / "docs" / f"{PRIVATE[key].upper()}.md").unlink()
+    inside = tree / f"{PRIVATE[key].swapcase()}.toml"
+    shutil.copyfile(fetched, inside)
+    refused = run(tree, inside)
+    assert refused.returncode != 0
+    assert f"<{key}>.toml" in refused.stderr
+    assert shows_no_value(refused)
