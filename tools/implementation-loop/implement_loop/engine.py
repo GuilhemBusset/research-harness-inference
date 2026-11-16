@@ -3320,9 +3320,9 @@ class Engine:
     def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
         """Re-run the commands of the run's earlier issues on `main` after a merge. Not re-run: an
         examiner's check (a probe an earlier engine committed), and a check that names a test file
-        or a test main no longer holds, with the tests of the files it names; nor is a locked test
-        main no longer defines required to run. A reviewed merge removed or renamed them on
-        purpose."""
+        or a test main no longer holds; nor are the locked tests of the files a skipped check
+        names, or a locked test main no longer defines, required to run. A reviewed merge removed
+        or renamed them on purpose."""
         out = []
         fields = CheckSpec.__dataclass_fields__
         for key, entry in sorted(self.store.state.get("accepted_checks", {}).items()):
@@ -3336,7 +3336,7 @@ class Engine:
             if skipped:
                 self.store.event("regression_check_skipped", issue=n, of=m,
                                  checks=[(c.get("command") or "")[:160] for c in skipped])
-            gone = {f for c in skipped for f in named_tests(c) if c.get("author") == "examiner" or not (coord / f).exists()}
+            gone = {f for c in skipped for f in named_tests(c)}   # no check left runs their tests
             manifest = {k: [i for i in v if i.split("::")[0] not in gone and defines_test(coord, i)]
                         for k, v in (entry.get("manifest") or {}).items()}
             checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in commands if c not in skipped]
