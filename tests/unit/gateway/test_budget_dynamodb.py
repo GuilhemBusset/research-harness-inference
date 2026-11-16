@@ -235,6 +235,89 @@ def test_an_expired_lease_frees_its_slot_and_is_charged_its_estimate(client: Cal
     assert (record.tokens, record.leases) == (1000 + 3000 + 1050, {})
 
 
+class Paused:
+    """A client whose first call of one operation waits for the test, before it reaches the table.
+
+    With `after`, it also waits once that call has been applied, before it answers its caller.
+    """
+
+    def __init__(self, client: Calls, operation: str, *, after: bool = False) -> None:
+        self._client = client
+        self._operation = operation
+        self._after = after
+        self.reached = threading.Event()
+        self.go = threading.Event()
+        self.applied = threading.Event()
+        self.answer = threading.Event()
+
+    def __getattr__(self, operation: str) -> Any:
+        call = getattr(self._client, operation)
+
+        def paused(**arguments: Any) -> Any:
+            if operation != self._operation or self.reached.is_set():
+                return call(**arguments)
+            self.reached.set()
+            assert self.go.wait(timeout=10)
+            result = call(**arguments)
+            self.applied.set()
+            if self._after:
+                assert self.answer.wait(timeout=10)
+            return result
+
+        return paused
+
+    def release(self) -> None:
+        self.go.set()
+        self.answer.set()
+
+
+def test_the_opening_of_a_day_admits_no_more_than_the_limit_across_midnight(client: Calls) -> None:
+    midnight = NOON + 12 * 3600
+    clock = Clock(midnight - 60)
+    who = student(limit=4)
+
+    def answer(ledger: DynamoDBLedger, request: str) -> Reservation | Cause:
+        try:
+            return reserve(ledger, who, request)
+        except GatewayError as refused:
+            return refused.cause
+
+    ordinary = DynamoDBLedger(client, TABLE, clock=clock)
+    running = [answer(ordinary, f"running-{number}") for number in range(2)]
+    late = [Paused(client, "update_item") for _ in range(2)]
+    opening = Paused(client, "put_item", after=True)
+    with ThreadPoolExecutor(3) as threads:
+        try:
+            # Two reservations of the old day have reached the table but are not yet applied.
+            clock.now = midnight - 1
+            pending = [
+                threads.submit(answer, DynamoDBLedger(paused, TABLE, clock=clock), f"late-{number}")
+                for number, paused in enumerate(late)
+            ]
+            for paused in late:
+                assert paused.reached.wait(timeout=10)
+            # The first reservation of the new day has read the old day and is about to write its item.
+            clock.now = midnight + 1
+            opener = threads.submit(answer, DynamoDBLedger(opening, TABLE, clock=clock), "opener")
+            assert opening.reached.wait(timeout=10)
+            for paused in late:
+                paused.release()
+            answers = [one.result(timeout=10) for one in pending]
+            # The new day's item is written, and its opener has not yet answered: a follower comes now.
+            opening.go.set()
+            assert opening.applied.wait(timeout=10)
+            follower = answer(ordinary, "follower")
+            opening.answer.set()
+            answers += [follower, opener.result(timeout=10)]
+        finally:
+            for paused in [*late, opening]:
+                paused.release()
+
+    answers += running
+    assert sum(isinstance(one, Reservation) for one in answers) <= who.concurrency_limit, answers
+    assert answers.count(Cause.CONCURRENCY_LIMIT) >= 2, answers
+
+
 def test_a_reservation_gives_up_on_a_record_that_keeps_changing_and_raises_any_other_error(client: Calls) -> None:
     who = student()
     reserve(DynamoDBLedger(client, TABLE, clock=Clock()), who, "request-1")
