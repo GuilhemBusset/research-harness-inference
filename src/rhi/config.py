@@ -289,8 +289,12 @@ def _ssm(client: Any) -> tuple[Any, tuple[type[Exception], ...]]:
     errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
     try:
         return (boto3.client("ssm") if client is None else client), errors
-    except errors:
+    except botocore.exceptions.NoRegionError:
         raise ConfigError("no SSM client can be made: the caller's AWS configuration must give a region") from None
+    except errors as error:
+        # The class names the cause (a missing dependency, a profile that cannot be read); its
+        # text is the SDK's and is not repeated.
+        raise ConfigError(f"no SSM client can be made: the AWS SDK raised {type(error).__name__}") from None
 
 
 def read_ssm(client: Any = None) -> Config:

@@ -324,6 +324,12 @@ are recorded here as proposed and are part of what the owner approves.
    `claude-opus-5-5` (`loop.toml`, `claude_fallback_model`) and go back to Fable 30 minutes
    later. A refused call did no work and is charged to no budget. Decision 2's division of roles
    between the vendors is unchanged: the builder stays a Claude model and the examiner Codex.
+9. **Less scrutiny until the system works end to end.** The examiner owes no probe per item, and
+   no probe is ever committed: a probe only witnesses a finding, and the verifier runs it from
+   the run's state. The builder's locked tests prove the items, one command at least per item.
+   An item that ends with `(needs <capability>)` for a capability no CI job provides gets no
+   verdict demand; it is the owner's obligation. The supervisor gives a repair run only to an
+   engine exception, never to an issue that stalled (`ceiling`, `no_progress`).
 
 ## Verified and taken on trust
 
