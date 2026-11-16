@@ -21,14 +21,15 @@ setup/owner-setup.sh --dry-run                                  # print every st
 setup/owner-setup.sh                                            # the walkthrough
 setup/owner-setup.sh --step configuration --config <file>       # one step on its own
 setup/owner-setup.sh --step values --config <file>              # the scanner's list of real values
-setup/owner-setup.sh --step apps --reporter-key <file>          # the Apps, read back from GitHub
+setup/owner-setup.sh --step apps --reporter-key <file> --factory-key <file>   # the Apps, read back
 ```
 
 - It shows each command before it runs it, and runs it only after a `y`. Any other answer skips
   the command.
 - `--dry-run` reads no answer and calls neither AWS nor GitHub: `aws`, `gh` and `cdk` are never
-  started. It prints `123456789012`, `us-east-1`, `<quota code>` and `<app id>` where a real run
-  reads the value from your credentials or from GitHub. Start with it.
+  started. It prints `123456789012`, `us-east-1`, `<quota code>`, `<app id>` and
+  `<installation id>` where a real run reads the value from your credentials, from you or from
+  GitHub. Start with it.
 - `--step <name>` runs one step: `quotas`, `domain`, `apps`, `configuration`, `values`, `billing`,
   `bootstrap`, `connection`, `repository` or `roster`. A step can be repeated.
 - It writes nothing to the working tree. What it learns (the account, a quota's code, an address,
@@ -40,8 +41,25 @@ setup/owner-setup.sh --step apps --reporter-key <file>          # the Apps, read
   and leaves no `.venv` and no `cdk.out` behind.
 
 It needs, on the machine: the AWS CLI with your credentials and their region set, `gh` logged in
-as the repository's admin, `uv`, and for step 6 the CDK CLI (`npm ci --ignore-scripts`,
+as the repository's admin (for step 8), `uv`, `openssl` (for step 3), and for step 6 the CDK CLI (`npm ci --ignore-scripts`,
 [`setup/README.md`](../../setup/README.md)).
+
+**The region and the sign-in.** Two kinds of command reach AWS, and they read the region from
+different places:
+
+- the AWS CLI (the `aws` commands, and the CDK CLI of step 6) reads `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`, then the `region` of your profile;
+- the AWS SDK of the Python steps (the reporter's secret in step 3, the configuration in step 4)
+  reads `AWS_DEFAULT_REGION`, then the `region` of your profile, and never `AWS_REGION`.
+
+A region in your profile, or `AWS_DEFAULT_REGION`, reaches both. When you set only `AWS_REGION`,
+the script copies it into `AWS_DEFAULT_REGION` before any step runs a command, so every step
+works in the same region. When both are set, the script changes neither: keep them equal.
+
+Any profile the AWS CLI accepts works in every step, a profile signed in with `aws login` (your
+console credentials) included: the project installs the SDK with its crt extra, which that
+sign-in needs. When the SDK cannot make a client, the step says so by the name of the SDK's error
+(for example `NoCredentialsError`), never by its text; a missing region it reports as such.
 
 ## 1. Request the GPU quotas
 
@@ -105,21 +123,27 @@ dig +short NS example.com
 
 ## 3. Create the three GitHub Apps
 
-**Needs.** A browser: a script cannot set a GitHub App's permissions. To read the Apps back, `gh`
-logged in as the account that owns them: a private App answers an authenticated caller only. To
-store the reporter's credentials, your AWS credentials and their region, and two things GitHub
-gives you once the reporter is registered and installed:
+**Needs.** A browser: a script cannot set a GitHub App's permissions. Then, to read the Apps back
+and store the reporter's credentials:
 
-- its installation ID, the number that ends the address of the installation's page (GitHub,
-  Settings, Applications, Installed GitHub Apps, Configure):
-  `https://github.com/settings/installations/<installation id>`;
-- its private key file, as GitHub downloaded it, kept outside every checkout and readable by you
-  alone, for instance under `$HOME/.config/rhi/`.
+- the status reporter's and the factory's App's IDs, each on its App's settings page (About);
+- the login App's slug, the last part of the address of its settings page,
+  `https://github.com/settings/apps/<slug>`;
+- the reporter's and the factory's App's private key files, as GitHub downloaded them, kept
+  outside every checkout and readable by you alone: the reporter's for instance under
+  `$HOME/.config/rhi/`, the factory's where [`green-light.md`](../factory/green-light.md), step 7,
+  put it;
+- `openssl`, which signs with a key so that the step can read an App back as the App itself;
+- your AWS credentials and their region, to store the reporter's secret.
+
+Your `gh` login is not among them. Each App is installable only on your account, which makes it
+private, and GitHub answers a request for a private App only to the App's own tokens: your login
+gets 404. No command of this step uses it.
 
 **Command.**
 
 ```sh
-setup/owner-setup.sh --step apps --reporter-key <private key file>
+setup/owner-setup.sh --step apps --reporter-key <reporter's key file> --factory-key <factory's key file>
 ```
 
 The step first prints, for each App, the permissions to set, and the page where an App is
@@ -129,20 +153,44 @@ Apps, New GitHub App). For each: Webhook not active, installable only on this ac
 | App | Permissions | Installed on | What it leaves you with |
 | --- | --- | --- | --- |
 | Student login | None. Device flow on | Nobody installs it | Its client ID, which goes into the configuration as `login_client_id` (step 4). It needs no secret |
-| Status reporter | Commit statuses, read and write. Nothing else | This repository only | Its private key and its installation ID, which this step stores in the reporter's secret |
+| Status reporter | Commit statuses, read and write. Nothing else | This repository only | Its private key, which this step stores in the reporter's secret with the IDs GitHub reports |
 | The factory's identity | Contents, Pull requests and Issues, read and write; Commit statuses, Checks and Actions, read-only. No Workflows, no Administration | This repository only | Its private key, which stays on the factory's host: the factory has no AWS credentials to read a secret with. [`green-light.md`](../factory/green-light.md), step 7, creates this App |
 
-**Reading each App back.** The step then asks, for each App in turn, for its slug: the last part
-of the address of the App's settings page, `https://github.com/settings/apps/<slug>`. An empty
-answer skips an App that is not registered yet, and the step can be run again. For a slug it
-runs, after a `y`:
+**Reading each App back.** The step reads the Apps in this order, each after a `y`, through
+`src/rhi/owner_apps.py`. An empty answer to an App's ID or slug skips an App that is not
+registered yet, and the step can be run again.
 
-```sh
-gh api apps/<slug> --jq '"\(.id) \(.permissions | to_entries | map("\(.key)=\(.value)") | sort | join(" "))"'
-```
+1. The status reporter. The step asks for its App ID, and for its key file when `--reporter-key`
+   did not name it. It takes this repository's name, `<owner>/<name>`, from the clone's `origin`
+   remote, and asks for it when there is none. Then:
 
-It prints the App's ID and its permissions, under the names GitHub's API gives them, and one line
-that says whether they are those of section 8.6 of the design:
+   ```sh
+   env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_apps reporter \
+     --app-id <app id> --key-file <reporter's key file> --repository <owner>/<name>
+   ```
+
+   The module signs a JSON Web Token with the App's own key (`openssl` reads the key; its issuer
+   is the App's ID) and reads the App with it (`GET /app`), then its installations
+   (`GET /app/installations`). For each installation it mints an installation token and lists the
+   repositories the installation reaches (`GET /installation/repositories`).
+2. The student login App. It has no key, so it is read by its slug with an installation token of
+   the status reporter (`GET /apps/<slug>`), and only once the reporter was read back. The module
+   then asks GitHub for a device code with the App's client ID
+   (`POST https://github.com/login/device/code`): GitHub gives one only when the App's device flow
+   is on.
+
+   ```sh
+   env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_apps login \
+     --slug <slug> --app-id <app id> --key-file <reporter's key file>
+   ```
+
+3. The factory's identity, as the reporter, with `factory`, its App ID and the file
+   `--factory-key` names (or that the step asks for).
+
+For each App it prints the slug, the ID and the permissions, under the names GitHub's API gives
+them, and one line that says whether they are those of section 8.6 of the design. For the reporter
+and the factory's App it prints each installation: its ID, its repository selection (`selected`,
+or `all`) and the repositories it reaches. For the login App it says that its device flow is on.
 
 | App | The permissions GitHub answers with |
 | --- | --- |
@@ -156,32 +204,49 @@ App it does: that App has no permission at all. When the line says the permissio
 of section 8.6, correct them on the App's settings page (Permissions & events) and run the step
 again. An App's ID and its key do not change with its permissions.
 
-**The reporter's secret.** Once the reporter is read back, the step asks for its installation ID
-and, when `--reporter-key` did not name it, for the private key file. It refuses a key file
-inside the working tree, and a link in the tree to a file outside it. Then, after a `y`:
+**What it refuses.**
+
+- A reporter or a factory's App with an installation on anything other than this repository
+  alone: an installation on all repositories, one that reaches another repository too, or a second
+  installation, on another account. Change the installation to "Only select repositories", with
+  this repository alone (GitHub, Settings, Applications, Installed GitHub Apps, Configure), and run
+  the step again.
+- A login App whose device flow is off: turn on Enable Device Flow on its settings page.
+- A key file inside the working tree, and a link in the tree to a file outside it.
+- A key that does not sign for the App's ID: GitHub refuses the token, and the step names the HTTP
+  status.
+
+A refused App stops nothing but itself: the step goes on to the next App. Nothing the step prints
+holds a key, a token, a device code or the login App's client ID, which is a private value of the
+configuration; and it repeats no text GitHub answered.
+
+**The reporter's secret.** Once the reporter is read back and not refused, the step stores its
+credentials, after a `y`. The installation ID is the one GitHub reported for this repository: the
+step does not ask for it. When the reporter has no installation yet, nothing is stored.
 
 ```sh
 env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_secret rhi/reporter/github-app \
-  --app-id <app id> --installation-id <installation id> --private-key-file <private key file>
+  --app-id <app id> --installation-id <installation id> --private-key-file <reporter's key file>
 ```
 
 This writes the Secrets Manager secret `rhi/reporter/github-app`, in the region of your
 credentials: it creates the secret when it is absent, and replaces its value when it exists. The
-value is one JSON object with the fields `app_id` (the ID read back from GitHub),
-`installation_id` and `private_key` (the text of the file). The key is read from the file, which
-stays where it is, and is never printed. The reporter's stack refers to this secret by its name
-and does not create it: until the secret is stored, the reporter posts nothing. To replace the
-key later, generate a new one on the App's settings page and run the step again.
+value is one JSON object with the fields `app_id`, `installation_id` (both as GitHub reported
+them) and `private_key` (the text of the file). The key is read from the file, which stays where
+it is, and is never printed. The reporter's stack refers to this secret by its name and does not
+create it: until the secret is stored, the reporter posts nothing. To replace the key later,
+generate a new one on the App's settings page and run the step again.
 
-A dry run prints these commands with `<slug>`, `<app id>` and `<installation id>` in place of the
-values. It checks where the file `--reporter-key` names is, and does not open it.
+A dry run prints these commands with `<app id>`, `<slug>`, `<installation id>`, `<owner>/<name>`
+(when the clone has no `origin` on GitHub) and `<private key file>` (when no option named one) in
+place of the values. It checks where the files `--reporter-key` and `--factory-key` name are, and
+opens neither.
 
 **Check.**
 
-- The step's line for each App says that its permissions are those of section 8.6.
-- What GitHub's answer does not hold, on the App's own pages: Enable Device Flow is on for the
-  login App; the reporter and the factory's App are each installed on "Only select repositories",
-  with this repository alone.
+- The step's line for each App says that its permissions are those of section 8.6, the reporter
+  and the factory's App each show one installation, `selected`, on this repository alone, and the
+  login App's device flow is on.
 - The secret exists, which the step offers to check, and holds its three fields. The second
   command prints the names of the fields and no value:
 

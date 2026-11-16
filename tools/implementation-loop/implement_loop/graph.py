@@ -149,11 +149,9 @@ def _lint(order: list[int], specs: dict[int, IssueSpec], issues: dict[int, Issue
         spec = specs[n]
         if not spec.ledger:
             warnings.append(f"#{n} has no Deliverables or Acceptance criteria checkboxes; nothing to prove it done.")
-        if not spec.branch:
-            warnings.append(f"#{n} has no 'Suggested branch'; the engine will use loop/issue-{n}.")
-        elif spec.branch in branches:
+        if spec.branch in branches:
             warnings.append(f"#{n} and #{branches[spec.branch]} suggest the same branch {spec.branch}.")
-        else:
+        elif spec.branch:
             branches[spec.branch] = n
         for ref in spec.reference_paths:
             if not (repo_root / ref).exists():
