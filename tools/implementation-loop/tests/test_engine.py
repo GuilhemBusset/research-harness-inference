@@ -72,8 +72,7 @@ class HappyPathTests(EngineCase):
         self.assertEqual(self.repo.main_file("docs/a.txt"), "alpha")
         self.assertEqual(self.repo.main_file("docs/b.txt"), "beta")
         self.assertTrue(present(self.repo.main_file("checks/issue_2.sh")).startswith("#!/usr/bin/env bash"))
-        self.assertTrue(present(self.repo.main_file("checks/probe_2.sh")).startswith("#!/usr/bin/env bash"),
-                        "the examiner's passing probe is adopted as locked evidence")
+        self.assertIsNone(self.repo.main_file("checks/probe_2.sh"), "a passing probe of an approved item is not kept")
         self.assertEqual([e["issue"] for e in self.events("merged")], [2, 3])
         first_b = min(e["seq"] for e in self.events("phase", 3) if e["to"] == "plan")
         a_done = min(e["seq"] for e in self.events("phase", 2) if e["to"] == "done")
@@ -146,9 +145,18 @@ class RoundTests(EngineCase):
         self.assertEqual(len([c for c in self.agents.calls if c[0] == "build"]), 1, "it never blocked")
 
     def test_a_probe_that_fails_unconditionally_is_rejected(self):
-        self.add_work(2, "docs/a.txt", "alpha", probe="unconditional")
+        self.add_work(2, "docs/a.txt", "alpha", probe="unconditional", findings=1)
         self.epic(2)
-        self.run_engine()
+        agents = FakeAgents(self.scripts)
+        examine = agents.examine
+
+        def naming_its_probe(*args):   # only a probe a finding names is looked at
+            result = examine(*args)
+            for f in result.findings:
+                f.probe = agents.probe_file(2)
+            return result
+        agents.examine = naming_its_probe  # ty: ignore[invalid-assignment]  # test double
+        self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertIsNone(self.repo.main_file("checks/probe_2.sh"))
         self.assertTrue(self.events("examined", 2)[0]["rejected"])
