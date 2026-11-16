@@ -139,3 +139,20 @@ def test_every_role_of_the_pipeline_carries_the_boundary(templates: dict[str, di
     assert {logical_id: role.get("PermissionsBoundary") for logical_id, role in roles.items()} == dict.fromkeys(
         roles, boundary
     )
+
+
+def test_the_source_can_use_the_stacks_connection(templates: dict[str, dict[str, Any]]) -> None:
+    # The source action's role holds both service prefixes of the permission on the connection.
+    template = templates[PIPELINE_TEMPLATE]
+    pipeline = the_pipeline(templates)
+    (source,) = actions_of(pipeline)["Source"]
+    role = source.get("RoleArn", pipeline["RoleArn"])["Fn::GetAtt"][0]
+    allowed = set()
+    for policy in resources_of(template, "AWS::IAM::Policy").values():
+        if {"Ref": role} not in policy["Roles"]:
+            continue
+        for statement in policy["PolicyDocument"]["Statement"]:
+            if statement["Effect"] == "Allow" and statement["Resource"] == source["Configuration"]["ConnectionArn"]:
+                actions = statement["Action"]
+                allowed |= {actions} if isinstance(actions, str) else set(actions)
+    assert {"codeconnections:UseConnection", "codestar-connections:UseConnection"} <= allowed
