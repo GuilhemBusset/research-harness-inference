@@ -30,13 +30,13 @@ from typing import TYPE_CHECKING, Any
 import aws_cdk as cdk
 from aws_cdk import aws_codeconnections as codeconnections
 from aws_cdk import aws_codepipeline as codepipeline
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
 from rhi.stage import PERMISSIONS_BOUNDARY
 
 if TYPE_CHECKING:
-    from aws_cdk import aws_iam as iam
     from constructs import Construct, IConstruct
 
     from rhi.config import Config
@@ -89,6 +89,15 @@ class PipelineStack(cdk.Stack):
         check = pipelines.ConfirmPermissionsBroadening("Check", stage=stage)
         self.pipeline.add_stage(stage, pre=[check])
         self.pipeline.build_pipeline()
+
+        # CDK grants the source's role the connection's old service prefix only. The source
+        # action's documentation asks for both prefixes on the connection, so the new one is added.
+        source_scope = underlying.node.find_child("Source").node.find_child(SOURCE_ACTION)
+        source_role = source_scope.node.find_child("CodePipelineActionRole")
+        assert isinstance(source_role, iam.Role)
+        source_role.add_to_principal_policy(
+            iam.PolicyStatement(actions=["codeconnections:UseConnection"], resources=[connection.attr_connection_arn])
+        )
 
         # The trigger says what the source already does: a push to `main`, and nothing else.
         (source_action,) = underlying.stages[0].actions
