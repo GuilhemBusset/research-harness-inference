@@ -36,6 +36,7 @@ import cdk_nag
 
 from rhi import config as configuration
 from rhi import nag
+from rhi.pipeline.stack import PipelineStack
 from rhi.stage import EndpointStage
 
 if TYPE_CHECKING:
@@ -69,9 +70,14 @@ def build(config: Config, *, outdir: str | None = None, context: Mapping[str, An
     `cdk.json` through the environment; a test gives its own."""
     # No version-reporting resource: in a stack without a region, its condition lists region names.
     app = cdk.App(outdir=outdir, context=context, analytics_reporting=False)
-    EndpointStage(app, "Rhi", config=config)
-    # Last: it reaches the stages the app holds by now.
+    # The stage is deployed only by the pipeline (system design, section 8.2): the pipeline stack
+    # is the app's one stack, and the stage's stacks are deployed by its actions.
+    stage = EndpointStage(app, "Rhi", config=config)
+    # Once the app holds every stage, and before the pipeline: adding the stage to the pipeline
+    # synthesizes the stage, so cdk-nag's aspects must be on it by then. An aspect of the app
+    # reaches the pipeline stack all the same.
     add_nag(app)
+    PipelineStack(app, "RhiPipeline", config=config, stage=stage)
     return app
 
 

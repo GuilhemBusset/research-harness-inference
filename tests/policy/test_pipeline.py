@@ -32,8 +32,8 @@ Rules hold those two, and every action:
 - every role of every template carries the permissions boundary of the bounded bootstrap, by its
   fixed name, in the deploying account (`setup/bootstrap/README.md`).
 
-The app has no pipeline yet, so the list is empty. The checks are shown on pipelines built here
-with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
+The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
+pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
 """
 
 from __future__ import annotations
@@ -55,8 +55,13 @@ if TYPE_CHECKING:
     # What a test does to the pipeline's stack and to the pipeline, given the CDK library.
     Change = Callable[[ModuleType, Any, Any], None]
 
-# The reviewed list. Empty: the app has no pipeline.
-REVIEWED: Reviewed = []
+# The reviewed list: the pipeline of `src/rhi/pipeline/stack.py`.
+REVIEWED: Reviewed = [
+    ("Source", [("GitHub", "Source/AWS/CodeStarSourceConnection")]),
+    ("Build", [("Synth", "Build/AWS/CodeBuild")]),
+    ("UpdatePipeline", [("SelfMutate", "Build/AWS/CodeBuild")]),
+    ("Rhi", [("Check.Check", "Build/AWS/CodeBuild"), ("Check.Confirm", "Approval/AWS/Manual")]),
+]
 
 # The types of action the rules name, as `Category/Owner/Provider`.
 CODEBUILD = "Build/AWS/CodeBuild"
