@@ -20,6 +20,7 @@ COURSEWORK = {
     "model": "Qwen/Qwen3.8-27B-FP8",
     "revision": REVISION,
     "instance_types": ["g7e.2xlarge"],
+    "prices": {"g7e.2xlarge": 3.36},
     "max_instances": 2,
     "warm_instances": 2,
     "wake": "on-demand",
@@ -34,6 +35,7 @@ COURSEWORK = {
 MOCK = {
     "engine": "mock",
     "instance_types": ["t4g.small"],
+    "prices": {"t4g.small": 0.0168},
     "max_instances": 1,
     "warm_instances": 0,
     "wake": "scheduled-only",
@@ -115,6 +117,7 @@ def test_optional_fields() -> None:
             for field in (
                 "engine",
                 "instance_types",
+                "prices",
                 "max_instances",
                 "warm_instances",
                 "wake",
@@ -134,3 +137,78 @@ def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
     assert (refusal.value.pool, refusal.value.field) == (name, field)
     assert repr(name) in str(refusal.value)
     assert repr(field) in str(refusal.value)
+
+
+def refused(name: str, entry: Mapping[str, object], **limit: float) -> PoolConfigError:
+    with pytest.raises(PoolConfigError) as refusal:
+        parse_pools({name: entry}, **limit)
+    assert refusal.value.pool == name
+    assert repr(name) in str(refusal.value)
+    return refusal.value
+
+
+def test_prices() -> None:
+    fallback = changed(COURSEWORK, {"instance_types": ["g7e.2xlarge", "g7e.4xlarge"]})
+    (pool,) = parse_pools({"coursework": changed(fallback, {"prices": {"g7e.4xlarge": 4.5, "g7e.2xlarge": 3.36}})})
+    # The type it runs first, then its fallback, whatever order the prices were written in.
+    assert list(pool.prices.items()) == [("g7e.2xlarge", 3.36), ("g7e.4xlarge", 4.5)]
+    assert parse_pools({"coursework": changed(COURSEWORK, {"prices": {"g7e.2xlarge": 0}})})[0].prices == {
+        "g7e.2xlarge": 0
+    }
+
+    unpriced = changed(fallback, {"prices": {"g7e.2xlarge": 3.36}})
+    unlisted = changed(COURSEWORK, {"prices": {"g7e.2xlarge": 3.36, "g7e.4xlarge": 4.5}})
+    for entry in (
+        unpriced,
+        unlisted,
+        *(changed(COURSEWORK, {"prices": {"g7e.2xlarge": bad}}) for bad in (-0.01, "3", True)),
+    ):
+        refusal = refused("coursework", entry)
+        assert refusal.field == "prices"
+        assert repr("prices") in str(refusal)
+
+
+def test_price_limit() -> None:
+    def priced(price: float, wake: str, fallback: float | None = None) -> dict[str, object]:
+        prices = {"g7e.2xlarge": price} if fallback is None else {"g7e.2xlarge": price, "g7e.4xlarge": fallback}
+        return changed(COURSEWORK, {"instance_types": list(prices), "prices": prices, "wake": wake})
+
+    assert parse_pools({"coursework": priced(3.36, "on-demand")})[0].wake == "on-demand"
+    assert parse_pools({"coursework": priced(5, "on-demand")})[0].wake == "on-demand"
+    assert refused("coursework", priced(16.57, "on-demand")).field == "wake"
+    assert parse_pools({"coursework": priced(16.57, "scheduled-only")})[0].wake == "scheduled-only"
+    assert refused("coursework", priced(3.36, "on-demand", fallback=6)).field == "wake"
+    # A limit given replaces the default.
+    assert parse_pools({"coursework": priced(16.57, "on-demand")}, on_demand_price_limit=20)[0].prices
+    assert refused("coursework", priced(3.36, "on-demand"), on_demand_price_limit=3).field == "wake"
+
+
+def test_expected_values() -> None:
+    estimate = {
+        "stream_tokens_per_second": [15, 22],
+        "time_to_first_token_seconds": [0.3, 1.5],
+        "cache_tokens": [1100000, 1800000],
+    }
+    (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"expected": estimate})})
+    assert pool.expected is not None
+    assert pool.expected.stream_tokens_per_second == (15, 22)
+    assert pool.expected.time_to_first_token_seconds == (0.3, 1.5)
+    assert pool.expected.cache_tokens == (1_100_000, 1_800_000)
+
+    assert parse_pools({"coursework": COURSEWORK})[0].expected is None
+    (partial,) = parse_pools({"coursework": changed(COURSEWORK, {"expected": {"time_to_first_token_seconds": [0, 1]}})})
+    assert partial.expected is not None
+    assert partial.expected.time_to_first_token_seconds == (0, 1)
+    assert (partial.expected.stream_tokens_per_second, partial.expected.cache_tokens) == (None, None)
+
+    for bad in (
+        {"stream_tokens_per_second": [22, 15]},
+        {"stream_tokens_per_second": [-1, 15]},
+        {"cache_tokens": [0, 0]},
+        {"cache_tokens": [1, 2, 3]},
+        {"cache_tokens": ["1", 2]},
+        {"cache_hit_rate": [0.5, 0.9]},
+    ):
+        refusal = refused("coursework", changed(COURSEWORK, {"expected": bad}))
+        assert refusal.field == "expected"
+        assert repr("expected") in str(refusal)

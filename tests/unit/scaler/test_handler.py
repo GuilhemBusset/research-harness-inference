@@ -28,6 +28,7 @@ WORKSPACE = "https://aps.example.com/workspaces/ws-example/api/v1/remote_write"
 ENTRY = {
     "engine": "mock",
     "instance_types": ["t4g.small"],
+    "prices": {"t4g.small": 0.0168},
     "max_instances": 1,
     "warm_instances": 1,
     "wake": "on-demand",

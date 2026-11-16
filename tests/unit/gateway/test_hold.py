@@ -27,6 +27,7 @@ def pool(**fields: int) -> Pool:
     entry = {
         "engine": "mock",
         "instance_types": ["t4g.small"],
+        "prices": {"t4g.small": 0.0168},
         "max_instances": 1,
         "warm_instances": 0,
         "wake": "on-demand",

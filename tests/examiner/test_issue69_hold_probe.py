@@ -19,6 +19,7 @@ START = 2_000_000
 def configured_pool() -> Pool:
     return parse_pools({"probe": {
         "engine": "mock", "instance_types": ["t4g.small"], "max_instances": 1,
+        "prices": {"t4g.small": 0.0168},
         "warm_instances": 0, "wake": "on-demand", "target_concurrency": 1,
         "context_length": 1024, "largest_output": 128,
     }})[0]
