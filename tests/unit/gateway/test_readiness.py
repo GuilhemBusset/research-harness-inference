@@ -222,3 +222,71 @@ def test_an_explicit_wake_is_pending_for_10_minutes_or_until_ready() -> None:
     waker.record("coursework")  # on a ready pool, it ends at once
     assert waker.pending("coursework") == 0
     assert waker.ended_ready_at("coursework") == START + 600
+
+
+def test_each_record_keeps_its_previous_value_when_only_its_read_fails() -> None:
+    _, _, table, readiness = build()
+    mode = PoolState("coursework", Mode.ENABLED, set_by="admin", set_at=1)
+    table.put(mode)
+    table.put(ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=2))
+    readiness.refresh()
+    newer = ScalerNote("coursework", capacity_asked=0, no_capacity_at=5, written_at=6)
+    table.put(newer)
+    table.items["coursework", "mode"] = {"pool": "coursework", "record": "mode"}  # not a mode record
+    readiness.refresh()
+    assert (readiness.pool("coursework").mode, readiness.pool("coursework").note) == (mode, newer)
+
+
+def test_a_wake_ends_ready_only_at_what_a_read_observed_while_the_clock_moved(monkeypatch: Any) -> None:
+    clock, elbv2, table, readiness = build()
+    waker = Waker(readiness, lambda_client=Scaler(), function_name="scaler-function", clock=clock)
+    read_health, read_record = elbv2.describe_target_health, table.get_item
+
+    def health_answers_after(during: Any) -> None:
+        def slow(**arguments: Any) -> dict[str, Any]:
+            during()
+            return read_health(**arguments)
+
+        monkeypatch.setattr(elbv2, "describe_target_health", slow)
+
+    # A wake recorded while the read is in flight ends when the answer comes back, not before.
+    def request_arrives() -> None:
+        clock.now = START + 1
+        waker.record("coursework")
+        clock.now = START + 2
+
+    elbv2.states["group-coursework"] = ["healthy"]
+    health_answers_after(request_arrives)
+    readiness.refresh()
+    assert (waker.pending("coursework"), waker.ended_ready_at("coursework")) == (0, START + 2)
+
+    # Health first seen ready after a wake's 10 minutes: that wake expired, it did not end ready.
+    waker.record("mock")
+
+    def turns_healthy_after_expiry() -> None:
+        clock.now = START + 2 + 601
+        elbv2.states["group-mock"] = ["healthy"]
+
+    clock.now = START + 2 + 599
+    health_answers_after(turns_healthy_after_expiry)
+    readiness.refresh()
+    assert (waker.pending("mock"), waker.ended_ready_at("mock")) == (0, None)
+
+    # Seen ready before expiry, published after it: a caller asking in between erases nothing.
+    monkeypatch.setattr(elbv2, "describe_target_health", read_health)
+    clock.now = START + 1000
+    elbv2.states["group-upgrade"] = []
+    readiness.refresh()
+    waker.record("upgrade")
+    elbv2.states["group-upgrade"] = ["healthy"]
+    clock.now = START + 1000 + 599
+
+    def slow_record(**arguments: Any) -> dict[str, Any]:
+        if arguments["Key"]["pool"] == "upgrade":
+            clock.now = START + 1000 + 601
+            waker.pending("upgrade")
+        return read_record(**arguments)
+
+    monkeypatch.setattr(table, "get_item", slow_record)
+    readiness.refresh()
+    assert (waker.pending("upgrade"), waker.ended_ready_at("upgrade")) == (0, START + 1000 + 599)
