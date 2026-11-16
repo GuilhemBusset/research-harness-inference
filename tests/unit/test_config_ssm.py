@@ -244,6 +244,17 @@ def test_an_error_of_the_sdk_or_of_the_system_names_no_value(tmp_path: Path, mon
     logged(lambda: config.write_file(EXAMPLE, tmp_path / f"folder{MARK}" / "written.toml"))
 
 
+def test_a_client_the_sdk_cannot_make_is_reported_by_the_class_of_its_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    missing = botocore.exceptions.MissingDependencyException(msg=f"no awscrt {MARK}")
+    monkeypatch.setattr(boto3, "client", lambda *_: (_ for _ in ()).throw(missing))
+    for call in (lambda: config.load({"RHI_CONFIG": "ssm"}), lambda: config.write_ssm(EXAMPLE)):
+        with pytest.raises(config.ConfigError) as raised:
+            call()
+        assert "MissingDependencyException" in str(raised.value)
+        assert "region" not in str(raised.value)
+        assert MARK not in as_logged(raised.value)
+
+
 def test_the_sdk_is_pinned_and_only_the_ssm_source_and_writer_load_it() -> None:
     project = tomllib.loads((config.REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     lock = tomllib.loads((config.REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
@@ -251,7 +262,8 @@ def test_the_sdk_is_pinned_and_only_the_ssm_source_and_writer_load_it() -> None:
     locked = [package["version"] for package in lock["package"] if package["name"] == "boto3"]
     assert len(pins) == 1
     assert len(locked) == 1  # one lock holds one version
-    assert pins[0] == f"boto3=={locked[0]}"
+    # With its crt extra, which installs awscrt: the SDK needs it for a profile signed in with `aws login`.
+    assert pins[0] == f"boto3[crt]=={locked[0]}"
 
     # The loader and the file writer run without the SDK: only the ssm source and its writer import it.
     program = (
