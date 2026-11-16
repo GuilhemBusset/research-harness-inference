@@ -1085,7 +1085,7 @@ class Engine:
 
     def _verify_in(self, root: Path, st: IssueState, head: str, work_dir: Path, check_tamper: bool = True):
         return verify.verify(root, self._specs(st), head, work_dir, st.locked, sorted(set(st.tests) | set(st.probes)),
-                             st.manifest or None, self.caps.check_timeout_s,
+                             in_tree(st.manifest) or None, self.caps.check_timeout_s,
                              extra_env=self.check_env, check_tamper=check_tamper,
                              standing=standing_checks(), mounts=self._mounts(root))
 
@@ -2046,7 +2046,7 @@ class Engine:
         history = history_checks(f"{self.ws.git('rev-parse', self.ws.base_ref(), cwd=wt)}..{head}")
         with self.ws.disposable(wt) as scratch:
             ok, evidence, vproblems, ran = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n),
-                                                         st.locked, locked_tests, st.manifest or None,
+                                                         st.locked, locked_tests, in_tree(st.manifest) or None,
                                                          self.caps.check_timeout_s, extra_env=self.check_env,
                                                          check_tamper=bool(st.examined_sha),
                                                          standing=standing_checks() + history, mounts=self._mounts(scratch))
@@ -2072,7 +2072,7 @@ class Engine:
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
         self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
         st.evidence, st.base_sha = evidence, base
-        st.last_ran = {"*": sorted(ran)} if ok else st.last_ran
+        st.last_ran = in_tree({"*": sorted(ran)}) if ok else st.last_ran
         if ok and st.examined_sha:
             # the manifest only grows: a locked test that ran once must keep running
             grown = {i for i in ran if i.split("::")[0] in st.locked}
@@ -2981,7 +2981,7 @@ class Engine:
         head = self.ws.head(coord)
         with self.ws.disposable(coord) as scratch:
             ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
-                                                      sorted(set(st.tests) | set(st.probes)), st.manifest or None,
+                                                      sorted(set(st.tests) | set(st.probes)), in_tree(st.manifest) or None,
                                                       self.caps.check_timeout_s, extra_env=self.check_env,
                                                       standing=standing_checks(), mounts=self._mounts(scratch))
         self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
@@ -3482,6 +3482,13 @@ def criterion_item(criterion: str | None, items: set[str]) -> str | None:
         return criterion
     m = CRITERION_LEAD.match(criterion or "")
     return m.group(1) if m and m.group(1) in items else None
+
+
+def in_tree(manifest: dict | None) -> dict:
+    """A selection without the tests that ran outside the checked tree: the plugin keeps their ids
+    absolute (a copy of the tree a command made under `/tmp`). Their path changes on every run, so
+    they can never be required."""
+    return {k: [i for i in v if not i.startswith("/")] for k, v in (manifest or {}).items()}
 
 
 def named_tests(check: dict) -> list[str]:
