@@ -344,6 +344,19 @@ def test_a_hold_the_client_leaves_stops_counting() -> None:
     asyncio.run(scenario())
 
 
+def test_a_cancelled_hold_stops_counting() -> None:
+    async def scenario() -> None:
+        gateway = Gateway()
+        call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": []})
+        await until(lambda: gateway.row()[1] == 1)
+        call.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call.ended()
+        await until(lambda: gateway.row() == (0, 0, NOW))
+
+    asyncio.run(scenario())
+
+
 def test_an_explicit_wake_is_demand() -> None:
     gateway = Gateway()
     gateway.waker.record(POOL)
