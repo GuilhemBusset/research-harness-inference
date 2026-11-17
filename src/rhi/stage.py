@@ -13,6 +13,7 @@ import aws_cdk as cdk
 
 from rhi.access.stack import AccessStack
 from rhi.network.stack import NetworkStack
+from rhi.observability.stack import ObservabilityStack
 from rhi.pools.stack import PoolsStack
 
 if TYPE_CHECKING:
@@ -40,3 +41,6 @@ class EndpointStage(cdk.Stage):
         # logical IDs (`tests/policy/stateful_logical_ids.json`): a table that moves is replaced.
         self.access = AccessStack(self, "Access")
         self.pools = PoolsStack(self, "Pools")
+        # The metrics workspace, which the nodes, the gateway and the scaler write to. Its logical
+        # ID is recorded too.
+        self.observability = ObservabilityStack(self, "Observability")
