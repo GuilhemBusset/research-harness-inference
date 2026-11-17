@@ -1,11 +1,12 @@
-"""The routes the gateway answers itself: the models, the status and the hello (system design, sections 5.3, 6.2).
+"""The routes the gateway answers itself: the models, the status, the wake and the hello (system design, sections 5.3, 6.2).
 
-Three of the four local routes of the table are answered here; the wake is not.
+The four local routes of the table are answered here.
 
 | Route | Key | Answer |
 | --- | --- | --- |
 | `GET /v1/models` | needed | the model name of every configured pool, and which one the `claude-` names map to |
 | `GET /status` | needed | one record per configured pool: its model name, its state and, when unavailable, its cause |
+| `POST /wake` | needed | the record of the pool its body's `model` names, at once; the wake itself (below) is not waited for |
 | `HEAD /api/hello` | none | 200 with no body |
 
 Every student may use every configured pool, so both lists are the configuration's, in its order.
@@ -15,7 +16,7 @@ runs, and a key that is not well formed is refused with no lookup.
 A pool's state comes from what the gateway already keeps of it (`rhi_gateway.readiness`): whether
 it has a healthy target, its mode and the scaler's note. Answering reads nothing else, asks for no
 wake and reserves no budget: cheap calls never wake a GPU, and a status call is not demand
-(sections 5.1 and 5.3). The routes are given neither the waker nor the ledger.
+(sections 5.1 and 5.3). Only the wake is given the waker and the ledger.
 
 | State | When |
 | --- | --- |
@@ -28,6 +29,17 @@ wake and reserves no budget: cheap calls never wake a GPU, and a status call is 
 The first row is the hold itself, stepped once at the time of the call: the status cannot say a
 pool can start when a request for it would be refused. A step is pure, and the wake it may return
 is a value that is dropped here.
+
+**The wake** starts a pool without a request, under a request's rules (sections 5.1 and 5.3). Its
+body is a JSON object whose `model` names the pool as a request's does (`rhi_gateway.body.pool_named`):
+a configured pool's name, or a `claude-` name for the default pool; anything else is
+`request_refused`. A student with no tokens left of the day, by the ledger's read, is refused with
+`budget_reached` and nothing is asked. Otherwise the answer is the pool's record, as the status
+gives it. When that record is unavailable for one of the hold's immediate causes the wake asks for
+nothing; for any other pool, one unavailable for capacity included, the scaler is asked to run
+(`rhi_gateway.waker.Waker.ask`, which the scaler retries) and the wake is recorded as an explicit
+wake, demand until the pool is ready or 10 minutes have passed. The wake reads the ledger and never
+writes it: it reserves no tokens and takes no concurrency slot.
 """
 
 from __future__ import annotations
@@ -38,6 +50,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -45,13 +58,16 @@ from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode, ScalerNote
 from rhi_gateway import routes
-from rhi_gateway.app import Handler
+from rhi_gateway.app import Handler, RequestBody
 from rhi_gateway.auth import Authenticator, authenticated
-from rhi_gateway.errors import WireFormat
+from rhi_gateway.body import MODEL_FIELD, parse, pool_named, read_body
+from rhi_gateway.budget import Ledger
+from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.hold import NO_CAPACITY_SECONDS, End, Hold
 from rhi_gateway.keystore import KeyRecord
 from rhi_gateway.readiness import PoolView
 from rhi_gateway.routes import Route
+from rhi_gateway.waker import Waker
 
 # The mode a pool is in before the admin writes one, by its `wake` (section 11.3).
 _CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
@@ -118,12 +134,14 @@ def _json(body: object) -> Response:
 
 @dataclass(frozen=True)
 class LocalRoutes:
-    """What the three routes are made of: who is let in, the configured pools and the kept views.
+    """What the local routes are made of: who is let in, the configured pools and the kept views.
 
     `default_pool` is the pool of the `claude-` names, the one the body filters are given, or None
     when the deployment has none. `views` gives the kept view of every pool
     (`rhi_gateway.readiness.Readiness.views`); a pool it does not hold yet reads as not ready with
     no records. `clock` gives the seconds since the epoch, the clock of the scaler's note.
+
+    `waker` and `ledger` are the wake's, given together: without them the wake is not served here.
     """
 
     authenticator: Authenticator
@@ -131,10 +149,14 @@ class LocalRoutes:
     views: Callable[[], Mapping[str, PoolView]]
     default_pool: Pool | None = None
     clock: Callable[[], float] = time.time
+    waker: Waker | None = None
+    ledger: Ledger | None = None
 
     def __post_init__(self) -> None:
         if self.default_pool is not None and self.default_pool not in self.pools:
             raise ValueError("the default pool is not one of the configured pools")
+        if (self.waker is None) != (self.ledger is None):
+            raise ValueError("the wake needs both the waker and the ledger")
 
     def statuses(self) -> list[PoolStatus]:
         """One record per configured pool, in the configuration's order."""
@@ -157,13 +179,35 @@ class LocalRoutes:
     async def status(self, request: Request, entry: Route, student: KeyRecord) -> Response:
         return _json({"pools": [record.to_json() for record in self.statuses()]})
 
+    async def wake(self, request: Request, entry: Route, student: KeyRecord) -> Response:
+        waker, ledger = self.waker, self.ledger
+        if waker is None or ledger is None:
+            raise RuntimeError("the wake is served only with a waker and a ledger")
+        try:
+            body = parse(await read_body(RequestBody(request.receive)))
+            pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
+            # The ledger's read: it reserves nothing and holds no slot.
+            if await run_in_threadpool(ledger.tokens_left, student) <= 0:
+                raise GatewayError(Cause.BUDGET_REACHED)
+        except GatewayError as refused:
+            answer = render_json(refused, WireFormat.MESSAGES)
+            return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
+        record = pool_status(pool, self.views().get(pool.name, PoolView()), self.clock())
+        if record.cause not in _IMMEDIATE:
+            waker.record(pool.name)
+            waker.ask(pool.name)
+        return _json(record.to_json())
+
     def handlers(self) -> dict[Route, Handler]:
-        """The handlers of the models, status and hello routes: the first two behind authentication."""
-        return {
+        """The handlers of the local routes: all but the hello behind authentication, the wake when it is given its parts."""
+        served: dict[Route, Handler] = {
             routes.MODELS: authenticated(self.authenticator, self.models),
             routes.STATUS: authenticated(self.authenticator, self.status),
             routes.HELLO: hello,
         }
+        if self.waker is not None:
+            served[routes.WAKE] = authenticated(self.authenticator, self.wake)
+        return served
 
 
 async def hello(request: Request, entry: Route) -> Response:
