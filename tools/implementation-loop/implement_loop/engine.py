@@ -2980,10 +2980,12 @@ class Engine:
         coord = self.ws.coord()
         head = self.ws.head(coord)
         with self.ws.disposable(coord) as scratch:
+            # behaviour only: a later reviewed merge may change this issue's locked tests on main
             ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
                                                       sorted(set(st.tests) | set(st.probes)), in_tree(st.manifest) or None,
                                                       self.caps.check_timeout_s, extra_env=self.check_env,
-                                                      standing=standing_checks(), mounts=self._mounts(scratch))
+                                                      check_tamper=False, standing=standing_checks(),
+                                                      mounts=self._mounts(scratch))
         self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
         if not ok:
             env = environment_problem(evidence)
@@ -3318,7 +3320,8 @@ class Engine:
         self._wait(n, WAIT_OWNER_LANDING, f"a revert: {detail}", resume=Phase.MERGED)
 
     def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
-        """Re-run the commands of the run's earlier issues on `main` after a merge. Not re-run: an
+        """Re-run the commands of the run's earlier issues on `main` after a merge; an issue whose
+        checks fail is checked once more, and fails only if they fail twice. Not re-run: an
         examiner's check (a probe an earlier engine committed), and a check that names a test file
         or a test main no longer holds; nor are the locked tests of the files a skipped check
         names, or a locked test main no longer defines, required to run. A reviewed merge removed
@@ -3342,12 +3345,16 @@ class Engine:
             checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in commands if c not in skipped]
             if not checks:
                 continue
-            with self.ws.disposable(coord) as scratch:
-                ok, evidence, problems, _ = verify.verify(scratch, checks, head, self.store.issue_dir(m) / "regression",
-                                                          {}, entry.get("check_files", []), manifest or None,
-                                                          self.caps.check_timeout_s, extra_env=self.check_env,
-                                                          check_tamper=False, mounts=self._mounts(scratch))
-            self.store.event("regression_check", issue=n, of=m, head=head, ok=ok, problems=problems)
+            for attempt in (1, 2):   # a failure is checked once more: a test that fails under load
+                with self.ws.disposable(coord) as scratch:   # once is no regression (#22, 2026-11-16)
+                    ok, evidence, problems, _ = verify.verify(
+                        scratch, checks, head, self.store.issue_dir(m) / "regression", {},
+                        entry.get("check_files", []), manifest or None, self.caps.check_timeout_s,
+                        extra_env=self.check_env, check_tamper=False, mounts=self._mounts(scratch))
+                self.store.event("regression_check", issue=n, of=m, head=head, ok=ok, problems=problems,
+                                 attempt=attempt)
+                if ok or environment_problem(evidence):
+                    break
             if not ok and not environment_problem(evidence):
                 out.append(f"after #{n} merged, #{m}'s checks fail on main: " + "; ".join(problems)[:400])
         return out
