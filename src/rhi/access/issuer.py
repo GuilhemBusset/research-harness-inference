@@ -10,7 +10,8 @@ malformed input itself, and the WAF rate rule on its path is the edge's.
 `PRIORITY`, forwards the paths under `/auth/` to the function's target group. The gateway's rule
 is at 10 and Grafana's at 30. The listener exists only while the configuration's `https_listener`
 is true (`rhi.network.edge`): without it the function has no target group, no rule and no
-permission for the load balancer to invoke it, and nothing reaches it from the internet.
+permission for the load balancer to invoke it, and nothing reaches it from the internet. With it,
+that permission holds only for a load balancer of the deploying account.
 
 **Its logs** go to the log group `LOG_GROUP_NAME`, a fixed name, so that Grafana's role can name it
 without a reference to this stack.
@@ -33,8 +34,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
+import jsii
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
-from aws_cdk import aws_elasticloadbalancingv2_targets as elb_targets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
@@ -78,6 +79,26 @@ ISSUANCES_PER_DAY_VARIABLE = "RHI_ISSUANCES_PER_DAY"
 ROSTER_TABLE_VARIABLE = "RHI_ROSTER_TABLE"
 KEYS_TABLE_VARIABLE = "RHI_KEYS_TABLE"
 
+LOAD_BALANCER_PRINCIPAL = "elasticloadbalancing.amazonaws.com"
+
+
+@jsii.implements(elbv2.IApplicationLoadBalancerTarget)
+class _AccountScopedTarget:
+    """The function as the target of a group, registered once `permission` lets the load balancer
+    invoke it. The CDK's own Lambda target grants that permission with no source at all."""
+
+    def __init__(self, function: lambda_.Function, permission: cdk.CfnResource) -> None:
+        self._function = function
+        self._permission = permission
+
+    def attach_to_application_target_group(
+        self, target_group: elbv2.IApplicationTargetGroup
+    ) -> elbv2.LoadBalancerTargetProps:
+        target_group.node.add_dependency(self._permission)
+        return elbv2.LoadBalancerTargetProps(
+            target_type=elbv2.TargetType.LAMBDA, target_json={"id": self._function.function_arn}
+        )
+
 
 class Issuer(Construct):
     """The issuer's function, as `function`, and, when `listener` is given, its target group and
@@ -113,9 +134,7 @@ class Issuer(Construct):
             )
         )
         role.add_to_policy(iam.PolicyStatement(actions=READ_ACTIONS, resources=[roster.table_arn]))
-        role.add_to_policy(
-            iam.PolicyStatement(actions=READ_ACTIONS + WRITE_ACTIONS, resources=[keys.table_arn])
-        )
+        role.add_to_policy(iam.PolicyStatement(actions=READ_ACTIONS + WRITE_ACTIONS, resources=[keys.table_arn]))
         # The one index the issuer queries, a student's keys (`rhi_issuer.rules`), by its name.
         by_student = KEYS.index(BY_STUDENT).name
         role.add_to_policy(
@@ -153,10 +172,19 @@ class Issuer(Construct):
         self.rule: elbv2.ApplicationListenerRule | None = None
         if listener is None:
             return
-        # The target adds the permission for Elastic Load Balancing to invoke the function, which the
-        # target group needs before it registers the function. Multi-value headers stay off, as the
-        # handler expects.
-        target = elb_targets.LambdaTarget(self.function)  # ty: ignore[invalid-argument-type] - as above
+        # Elastic Load Balancing may invoke the function only for a load balancer of the deploying
+        # account. The target group's ARN would scope it further, but the group registers the
+        # function only once the permission exists, so the permission cannot name the group.
+        permission = lambda_.CfnPermission(
+            self,
+            "Invoke",
+            action="lambda:InvokeFunction",
+            function_name=self.function.function_arn,
+            principal=LOAD_BALANCER_PRINCIPAL,
+            source_account=cdk.Stack.of(self).account,
+        )
+        # Multi-value headers stay off, as the handler expects.
+        target = _AccountScopedTarget(self.function, permission)
         self.target_group = elbv2.ApplicationTargetGroup(self, "Target", targets=[target])
         self.rule = elbv2.ApplicationListenerRule(
             self,
