@@ -50,7 +50,18 @@ POOLS = parse_pools(
             "target_concurrency": 8,
             "context_length": 131072,
             "largest_output": 8000,
-        }
+        },
+        "evening": {
+            "engine": "mock",
+            "instance_types": ["t3.small"],
+            "prices": {"t3.small": 0.0208},
+            "max_instances": 1,
+            "warm_instances": 0,
+            "wake": "scheduled-only",
+            "target_concurrency": 8,
+            "context_length": 131072,
+            "largest_output": 8000,
+        },
     }
 )
 # One answer every forwarded route reads as whole: 5,000 tokens in and 7 out (12 for a token count).
@@ -99,7 +110,8 @@ def gateway() -> tuple[Starlette, str]:
     )
     authenticator = Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW))
     ledger = InMemoryLedger(clock=lambda: float(NOW))
-    ready = lambda: {pool.name: PoolView(ready=True) for pool in POOLS}
+    # The coursework pool is ready; the evening pool, scheduled only, is not.
+    ready = lambda: {"coursework": PoolView(ready=True)}
     engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))
     forwarding = Forwarding(
         authenticator=authenticator,
@@ -242,13 +254,29 @@ def test_an_unhandled_error_is_cause_none(capsys: pytest.CaptureFixture[str]) ->
     assert text not in json.dumps(record)
 
 
-def test_an_answer_of_500_or_above_that_names_no_cause_is_cause_none(capsys: pytest.CaptureFixture[str]) -> None:
-    async def unavailable(request: Request, entry: routes.Route) -> Response:
-        return Response(status_code=503)
+@pytest.mark.parametrize("answered", [500, 503])
+def test_an_answer_of_500_or_above_that_names_no_cause_is_a_fault(
+    answered: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = "exception-text-9a41"
 
-    call(build_app({routes.STATUS: unavailable}), "GET", "/status")
+    async def unavailable(request: Request, entry: routes.Route) -> Response:
+        return Response(text, status_code=answered)
+
+    status, headers, body = call(build_app({routes.STATUS: unavailable}), "GET", "/status")
+    assert status == 500
+    assert text.encode() not in body + b"".join(name + value for name, value in headers)
     [record] = records(capsys)
-    assert (record["status"], record["cause"]) == (503, "none")
+    assert (record["status"], record["cause"]) == (500, "none")
+
+
+def test_the_cause_a_wake_answers_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
+    app, key = gateway()
+    status, _, body = call(app, "POST", "/wake", key=key, body={"model": "evening"})
+    assert status == 200
+    assert json.loads(body)["cause"] == "pool_scheduled_only"
+    [record] = records(capsys)
+    assert (record["pool"], record["status"], record["cause"]) == ("evening", 200, "pool_scheduled_only")
 
 
 def _keys(value: object) -> set[str]:
