@@ -57,7 +57,7 @@ from starlette.responses import Response
 from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode, ScalerNote
-from rhi_gateway import routes
+from rhi_gateway import routes, telemetry
 from rhi_gateway.app import Handler, RequestBody
 from rhi_gateway.auth import Authenticator, authenticated
 from rhi_gateway.body import MODEL_FIELD, parse, pool_named, read_body
@@ -186,10 +186,12 @@ class LocalRoutes:
         try:
             body = parse(await read_body(RequestBody(request.receive)))
             pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
+            telemetry.note_pool(pool.name)
             # The ledger's read: it reserves nothing and holds no slot.
             if await run_in_threadpool(ledger.tokens_left, student) <= 0:
                 raise GatewayError(Cause.BUDGET_REACHED)
         except GatewayError as refused:
+            telemetry.note_cause(refused.cause)
             answer = render_json(refused, WireFormat.MESSAGES)
             return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
         record = pool_status(pool, self.views().get(pool.name, PoolView()), self.clock())

@@ -107,7 +107,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
 from rhi_common.causes import Cause
-from rhi_gateway import routes
+from rhi_gateway import routes, telemetry
 from rhi_gateway.body import Forwarded
 from rhi_gateway.errors import GatewayError, WireFormat, render_json, render_stream_event
 from rhi_gateway.formats.chat import ChatForwarded
@@ -552,7 +552,7 @@ class _Stream:
         # An error, ended early, broken off or out of time: the gateway's error event, and nothing after it.
         if self._gate.failed:
             cause = Cause.ENGINE_ERROR
-        yield self._gate.ending(render_stream_event(cause, self._wire_format), client_has)
+        yield self._gate.ending(_error_event(cause, self._wire_format), client_has)
 
     @property
     def observed(self) -> Observed:
@@ -569,11 +569,18 @@ class _Stream:
             await self._settle(self.observed)
 
 
+def _error_event(cause: Cause, wire_format: WireFormat) -> bytes:
+    """The event that ends a stream with `cause`, noted on the request's log record."""
+    telemetry.note_cause(cause)
+    return render_stream_event(cause, wire_format)
+
+
 def _is_stream(content_type: str) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == STREAM_TYPE
 
 
 def _error_answer(cause: Cause, wire_format: WireFormat) -> Response:
+    telemetry.note_cause(cause)
     answer = render_json(cause, wire_format)
     return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
 
@@ -781,7 +788,7 @@ class _HeldStream:
         except GatewayError as ended:
             # The hold ended the request: nothing was sent to the engine, nothing observed.
             await _to_the_end(self._settle(Observed(0, 0, ended_cleanly=False)))
-            yield render_stream_event(ended.cause, self._wire_format)
+            yield _error_event(ended.cause, self._wire_format)
             return
         ends = self.ends = _Ends(self._proxy._sleep, self._proxy._longest, None)
         cause = Cause.ENGINE_ERROR
@@ -830,7 +837,7 @@ class _HeldStream:
         except (httpx.RequestError, LookupError):
             pass  # Not reached, broken off before its first event, or a pool with no secret.
         await _to_the_end(self.end())
-        yield render_stream_event(cause, self._wire_format)
+        yield _error_event(cause, self._wire_format)
 
     async def end(self) -> None:
         """Close what is open of the engine's answer and settle the request; once, however often called."""
