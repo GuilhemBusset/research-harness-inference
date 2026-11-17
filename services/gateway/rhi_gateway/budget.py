@@ -8,7 +8,7 @@ and this module is the one place where it does:
    estimate of the input plus the request's output limit to the tokens of the student's day, and
    adds a lease under the request's ID. Its condition is the budget and the limit themselves: the
    day's tokens and this amount fit the daily budget, and the leases are fewer than the
-   concurrency limit. Both numbers are the ones the key's lookup gave (`StudentKey`). Requests
+   concurrency limit. Both numbers are the ones the key's lookup gave (`Student`). Requests
    sent at once therefore cannot be admitted beyond either. A refusal is a `GatewayError`: for the
    budget, with the cause `budget_reached`; for the limit, with `concurrency_limit`. A student
    over both is told `budget_reached`, the one no retry cures.
@@ -108,7 +108,7 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from rhi_common.causes import Cause
-from rhi_common.students import Lease, StudentKey, UsageDay, utc_day
+from rhi_common.students import Lease, UsageDay, utc_day
 from rhi_gateway.errors import GatewayError
 
 BYTES_PER_TOKEN = 4
@@ -138,6 +138,29 @@ def lease_seconds(hold_seconds: int, longest_request_seconds: int) -> int:
     return hold_seconds + longest_request_seconds + LEASE_MARGIN_SECONDS
 
 
+class Student(Protocol):
+    """What the ledger reads of a student: the fields a key item and the gateway's lookup of it share.
+
+    `rhi_common.students.StudentKey` and `rhi_gateway.keystore.KeyRecord` both have them.
+    `expires_at` is the course end, which the retention of the usage item counts from.
+    """
+
+    @property
+    def github_id(self) -> int: ...
+
+    @property
+    def alias(self) -> str: ...
+
+    @property
+    def expires_at(self) -> int: ...
+
+    @property
+    def daily_token_budget(self) -> int: ...
+
+    @property
+    def concurrency_limit(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class Reservation:
     """What a request reserved: where its lease is, and the lease. The settlement takes it back."""
@@ -153,7 +176,7 @@ class Ledger(Protocol):
 
     def reserve(
         self,
-        student: StudentKey,
+        student: Student,
         request_id: str,
         body: bytes,
         *,
@@ -181,7 +204,7 @@ class Ledger(Protocol):
         """
         ...
 
-    def tokens_left(self, student: StudentKey) -> int:
+    def tokens_left(self, student: Student) -> int:
         """The tokens of today's budget neither charged nor reserved. Writes nothing."""
         ...
 
@@ -197,7 +220,7 @@ def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
     return {} if day is None else {request: lease for request, lease in day.leases.items() if lease.expires > now}
 
 
-def _new_day(student: StudentKey, day: str, before: UsageDay | None, now: int) -> UsageDay:
+def _new_day(student: Student, day: str, before: UsageDay | None, now: int) -> UsageDay:
     """A day as its first reservation finds it: no tokens, and a stand-in for each live lease of `before`."""
     return UsageDay(
         github_id=student.github_id,
@@ -234,7 +257,7 @@ def _without(day: UsageDay, expired: Mapping[str, Lease]) -> UsageDay:
     return replace(day, tokens=day.tokens - _released(expired), leases=leases)
 
 
-def _refusal(day: UsageDay, student: StudentKey, amount: int) -> Cause | None:
+def _refusal(day: UsageDay, student: Student, amount: int) -> Cause | None:
     """Why this day cannot take `amount` more tokens and one more lease, if it cannot."""
     if day.tokens + amount > student.daily_token_budget:
         return Cause.BUDGET_REACHED
@@ -258,7 +281,7 @@ def _ended(day: UsageDay, before: Callable[[], UsageDay | None], now: int) -> di
 
 def _to_remove(
     day: UsageDay,
-    student: StudentKey,
+    student: Student,
     request_id: str,
     lease: Lease,
     now: int,
@@ -292,7 +315,7 @@ def _reserved(day: UsageDay, request_id: str, lease: Lease, expired: Mapping[str
 
 def _reserve_within_the_day(
     clock: Callable[[], float],
-    student: StudentKey,
+    student: Student,
     request_id: str,
     body: bytes,
     output_limit: int,
@@ -349,7 +372,7 @@ def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: 
     return used if ended_cleanly else max(used, lease.estimate)
 
 
-def _left(day: UsageDay | None, student: StudentKey, now: int) -> int:
+def _left(day: UsageDay | None, student: Student, now: int) -> int:
     if day is None:
         return max(0, student.daily_token_budget)
     return max(0, student.daily_token_budget - _without(day, _expired(day, now)).tokens)
@@ -373,7 +396,7 @@ class InMemoryLedger:
 
     def reserve(
         self,
-        student: StudentKey,
+        student: Student,
         request_id: str,
         body: bytes,
         *,
@@ -420,7 +443,7 @@ class InMemoryLedger:
             self._write(replace(day, tokens=day.tokens + charge - reservation.lease.tokens, leases=leases))
         return True
 
-    def tokens_left(self, student: StudentKey) -> int:
+    def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
         return _left(self.day(student.github_id, utc_day(now)), student, now)
 
@@ -489,7 +512,7 @@ class DynamoDBLedger:
 
     def reserve(
         self,
-        student: StudentKey,
+        student: Student,
         request_id: str,
         body: bytes,
         *,
@@ -515,11 +538,11 @@ class DynamoDBLedger:
         charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
         return charge if self._remove(reservation, charge) else None
 
-    def tokens_left(self, student: StudentKey) -> int:
+    def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
         return _left(self._read(student.github_id, utc_day(now)), student, now)
 
-    def _write_reservation(self, student: StudentKey, reservation: Reservation, now: int) -> None:
+    def _write_reservation(self, student: Student, reservation: Reservation, now: int) -> None:
         """Add the reservation to the item of its day, or raise the refusal."""
         request_id, lease = reservation.request_id, reservation.lease
 
@@ -586,7 +609,7 @@ class DynamoDBLedger:
 
     def _add_lease(
         self,
-        student: StudentKey,
+        student: Student,
         reservation: Reservation,
         gone: Mapping[str, Lease],
         carried: Mapping[str, Lease] | None,
@@ -629,9 +652,7 @@ class DynamoDBLedger:
             ExpressionAttributeValues=_values(values),
         )
 
-    def _open_day(
-        self, student: StudentKey, reservation: Reservation, now: int
-    ) -> tuple[bool, Mapping[str, Any] | None]:
+    def _open_day(self, student: Student, reservation: Reservation, now: int) -> tuple[bool, Mapping[str, Any] | None]:
         """The student's first reservation of a day: the item written whole, only if the day has none.
 
         It holds a stand-in for each request still running from the day before, read here, and
