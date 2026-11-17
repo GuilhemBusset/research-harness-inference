@@ -110,6 +110,15 @@ def test_one_rule_at_priority_20_forwards_auth_to_the_function(templates: dict[s
     assert rule["Actions"] == [{"Type": "forward", "TargetGroupArn": {"Ref": group_id}}]
 
 
+def test_only_a_load_balancer_of_the_account_may_invoke_the_function(templates: dict[str, dict[str, Any]]) -> None:
+    template = access_template(templates)
+    function_id, _ = issuer_function(template)
+    (permission,) = [p for p in of_type(template, "AWS::Lambda::Permission").values() if function_id in references(p)]
+    assert permission["Principal"] == "elasticloadbalancing.amazonaws.com"
+    assert permission["Action"] == "lambda:InvokeFunction"
+    assert permission["SourceAccount"] == {"Ref": "AWS::AccountId"}
+
+
 def test_the_role_is_limited_to_the_roster_and_keys_tables(templates: dict[str, dict[str, Any]]) -> None:
     template = access_template(templates)
     _, function = issuer_function(template)
