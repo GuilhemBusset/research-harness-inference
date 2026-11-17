@@ -18,8 +18,9 @@ The reservation is made once the body is read and filtered, because it needs wha
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
 long the lease lasts. It is still made before anything is sent to the engine.
 
-The models, status and hello routes are answered by `rhi_gateway.local`: `build_app` fills their
-slots from the `LocalRoutes` it is given.
+The models, status, wake and hello routes are answered by `rhi_gateway.local`: `build_app` fills
+their slots from the `LocalRoutes` it is given (the wake's only when that is given the waker and
+the ledger).
 
 Everything outside the table is answered 404 with the cause `not_found`, by this application and
 not by Starlette: no redirect to or from a trailing slash, and no 405 for another method on a
@@ -98,7 +99,7 @@ class TableRoute(BaseRoute):
 def build_app(handlers: Mapping[Route, Handler] | None = None, *, local: LocalRoutes | None = None) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
-    `local`, when given, answers the models, status and hello routes (`rhi_gateway.local`); a
+    `local`, when given, answers the models, status, wake and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
     entry of the table is refused: the table is the only way a route comes to exist.
     """
