@@ -30,7 +30,7 @@ no hold. Otherwise the reservation is made, and only then is the scaler asked to
 - a stream is answered 200 at once with the keep-alives of its format, and the engine's stream
   follows on the same connection (`rhi_gateway.proxy.Proxy.held`);
 - a call that is not a stream is held in silence, then forwarded as any other; a client that
-  leaves meanwhile ends its hold.
+  leaves meanwhile ends its hold, and so does the cancellation of the request, which is settled still.
 
 A hold that ends, at its deadline (`warming`, or `capacity_unavailable`) or for any other cause,
 settles the reservation with nothing observed, which the ledger charges the input estimate, and
@@ -38,6 +38,12 @@ ends the request with its cause: the error event of its format on a stream, the 
 with `Retry-After` for `warming`) otherwise. Token counting is a cheap call (section 5.3): it is
 never held and never asks for a wake, and on a pool that is not ready it is answered `warming` at
 once, before any reservation.
+
+**The demand** (section 5.1): with a heartbeat (`rhi_gateway.heartbeat`), a request counts as
+held while it is held and as in flight from its forwarding to its end, which the settlement marks;
+it is received once its reservation is made. Token counting is never demand, and neither is
+anything the local routes answer. `build_app` given the heartbeat starts its writes with the
+application and, at shutdown, stops them with a last row of zeros.
 
 The models, status, wake and hello routes are answered by `rhi_gateway.local`: `build_app` fills
 their slots from the `LocalRoutes` it is given (the wake's only when that is given the waker and
@@ -56,7 +62,7 @@ import math
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -76,12 +82,13 @@ from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
-from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy
+from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
 from rhi_gateway.readiness import PoolView
 from rhi_gateway.routes import TABLE, Route, match
 
 if TYPE_CHECKING:
     from rhi_gateway.auth import Authenticator
+    from rhi_gateway.heartbeat import Demand, Heartbeat
     from rhi_gateway.keystore import KeyRecord
     from rhi_gateway.local import LocalRoutes
 
@@ -124,8 +131,31 @@ class TableRoute(BaseRoute):
         raise NoMatchFound(name, path_params)
 
 
-def build_app(handlers: Mapping[Route, Handler] | None = None, *, local: LocalRoutes | None = None) -> Starlette:
+def _beating(heartbeat: Heartbeat) -> Callable[[Starlette], Any]:
+    """The application's lifespan: the heartbeat writes while it runs, and its last row is one of zeros."""
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None]:
+        writing = asyncio.ensure_future(heartbeat.run())
+        try:
+            yield
+        finally:
+            writing.cancel()
+            await asyncio.wait((writing,))
+            await heartbeat.stop()
+
+    return lifespan
+
+
+def build_app(
+    handlers: Mapping[Route, Handler] | None = None,
+    *,
+    local: LocalRoutes | None = None,
+    heartbeat: Heartbeat | None = None,
+) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
+
+    `heartbeat`, when given, writes this task's demand for as long as the application runs.
 
     `local`, when given, answers the models, status, wake and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
@@ -140,7 +170,10 @@ def build_app(handlers: Mapping[Route, Handler] | None = None, *, local: LocalRo
     if any(entry not in TABLE for entry in given):
         raise ValueError("a handler was given for a route that is not in the table")
 
-    app = Starlette(routes=[TableRoute(entry, given.get(entry)) for entry in TABLE])
+    app = Starlette(
+        routes=[TableRoute(entry, given.get(entry)) for entry in TABLE],
+        lifespan=None if heartbeat is None else _beating(heartbeat),
+    )
     router = app.router
     router.redirect_slashes = False
     close_websocket = router.default
@@ -233,7 +266,7 @@ class Forwarding:
     """What the forwarded routes are made of: who is let in, the budget, the filters, the hold and the proxy.
 
     `filters` holds the body filter of each forwarded route of the table, under its entry. The
-    longest a request may run is the proxy's.
+    longest a request may run is the proxy's. `heartbeat`, when given, counts the demand.
     """
 
     authenticator: Authenticator
@@ -241,6 +274,7 @@ class Forwarding:
     filters: Mapping[Route, Filter]
     proxy: Proxy
     holding: Holding
+    heartbeat: Heartbeat | None = None
 
 
 def output_limit(entry: Route, forwarded: Forwarded) -> int:
@@ -289,6 +323,7 @@ class _Held:
             if isinstance(action, End):
                 raise GatewayError(action.cause)
         self.ready = any(isinstance(action, Forward) for action in self._first)
+        self.demand: Demand | None = None  # Set once the request is received: it is forwarded when the hold ends.
 
     def _step(self) -> tuple[Action, ...]:
         view = self._holding.view(self._pool)
@@ -314,10 +349,15 @@ class _Held:
                 elif isinstance(action, Wake):
                     self._holding.wake(self._pool.name)
                 elif isinstance(action, Forward):
+                    if self.demand is not None:
+                        self.demand.forwarded()
                     return
                 else:
                     raise GatewayError(action.cause)
-            await self._until_next()
+            # A pool found ready since the last step is acted on at once, never after one more wait:
+            # the hold may first run, or resume from a keep-alive, well after its last step.
+            if not self._holding.view(self._pool).ready:
+                await self._until_next()
             actions = self._step()
 
     async def next_keep_alive(self) -> bytes:
@@ -400,7 +440,14 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         except GatewayError as refused:
             return _refusal(refused, entry)
 
+        demand: Demand | None = None
+        if held is not None and forwarding.heartbeat is not None:
+            # Token counting has no hold: it is never demand.
+            demand = held.demand = forwarding.heartbeat.received(forwarded.pool.name, held=not held.ready)
+
         async def settle(observed: Observed) -> None:
+            if demand is not None:
+                demand.end()
             await run_in_threadpool(
                 forwarding.ledger.settle,
                 reservation,
@@ -418,6 +465,10 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             except GatewayError as ended:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return _refusal(ended, entry)
+            except asyncio.CancelledError:
+                # The request itself is cancelled while held: it has ended, and its settlement is run to its end still.
+                await _to_the_end(settle(Observed(0, 0, ended_cleanly=False)))
+                raise
             if left:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return Response(status_code=CLIENT_LEFT_STATUS)
