@@ -15,8 +15,10 @@ in that order with `rhi_reporter.github`.
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
   events of those steps' stages post nothing: their actions say it all.
 - An execution's own events post nothing. The superseded description is not given here.
-- A pending status is not posted once the stage has ended for the same execution: events arrive
-  in no guaranteed order, and a late pending status would hide the stage's verdict.
+- A pending status is not posted once the stage has ended for the same execution, once one of
+  the execution's stages has stopped short (failed, stopped or cancelled), or once the execution
+  itself has ended: events arrive in no guaranteed order, and a late pending status, of the stage
+  or of a step before it, would hide the verdict already posted.
 
 **The commit** is the source revision of the execution, read from CodePipeline: an event does not
 carry it. An execution that names none yet posts nothing.
@@ -75,8 +77,12 @@ SYNTH_ACTION = "Synth"
 TEMPLATE_SUFFIX = ".template.json"
 # What CodePipeline names the provider of a stack's deployment.
 CLOUDFORMATION = "CloudFormation"
-# The states CodePipeline gives a stage that has ended, in its API's own spelling.
+# The states CodePipeline gives a stage that has ended, in its API's own spelling, and among them
+# those of a stage that stopped short, which ends every deployment of the execution.
 ENDED = frozenset({"Succeeded", "Failed", "Stopped", "Cancelled"})
+STOPPED_SHORT = frozenset({"Failed", "Stopped", "Cancelled"})
+# The states CodePipeline gives an execution that has ended, or is ending.
+EXECUTION_ENDED = frozenset({"Succeeded", "Failed", "Stopped", "Stopping", "Cancelled", "Superseded"})
 # At most this many pages of a stack's events are read: 100 events each.
 EVENT_PAGES = 10
 
@@ -132,21 +138,24 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
         logger.warning(NO_CREDENTIAL)
         return
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
-    commit = _commit(aws.codepipeline, pipeline, execution)
+    commit, execution_status = _execution(aws.codepipeline, pipeline, execution)
     if commit is None:
         logger.warning(NO_COMMIT)
         return
     kind_of = detail.get("type")
     category = kind_of.get("category") if isinstance(kind_of, dict) else None
-    ended: set[str] | None = None
+    ended: tuple[set[str], bool] | None = None
     try:
         for under in [stage] if stage in stages else stages:
             facts = {"stage": under, "action": action, "category": category, "state": detail.get("state")}
             facts["commit"] = commit
             status = status_for(facts)
             if status.state is State.PENDING:
+                if execution_status in EXECUTION_ENDED:
+                    continue
                 ended = _ended(aws.codepipeline, pipeline, execution) if ended is None else ended
-                if under in ended:
+                stages_ended, stopped_short = ended
+                if under in stages_ended or stopped_short:
                     continue
             _post(client, status)
             if status.state is State.FAILURE and action is not None:
@@ -160,25 +169,30 @@ def _post(client: Any, status: CommitStatus) -> None:
     client.post_status(status.commit, status.state.value, status.context, status.description)
 
 
-def _commit(codepipeline: Any, pipeline: object, execution: object) -> str | None:
-    """The full SHA of the commit the execution deploys, None when it names none."""
+def _execution(codepipeline: Any, pipeline: object, execution: object) -> tuple[str | None, object]:
+    """The full SHA of the commit the execution deploys, None when it names none, and the
+    execution's status as CodePipeline gives it now."""
     answer = codepipeline.get_pipeline_execution(pipelineName=pipeline, pipelineExecutionId=execution)
-    for revision in answer.get("pipelineExecution", {}).get("artifactRevisions", []):
+    record = answer.get("pipelineExecution", {})
+    for revision in record.get("artifactRevisions", []):
         sha = revision.get("revisionId")
         if isinstance(sha, str) and _SHA.fullmatch(sha):
-            return sha
-    return None
+            return sha, record.get("status")
+    return None, record.get("status")
 
 
-def _ended(codepipeline: Any, pipeline: object, execution: object) -> set[str]:
-    """The stages whose latest execution is this one and has ended."""
+def _ended(codepipeline: Any, pipeline: object, execution: object) -> tuple[set[str], bool]:
+    """The stages whose latest execution is this one and has ended, and whether one of them
+    stopped short: no stage of the execution runs on after that."""
     answer = codepipeline.get_pipeline_state(name=pipeline)
-    return {
-        state.get("stageName")
-        for state in answer.get("stageStates", [])
-        if state.get("latestExecution", {}).get("pipelineExecutionId") == execution
-        and state.get("latestExecution", {}).get("status") in ENDED
-    }
+    ended: set[str] = set()
+    stopped_short = False
+    for state in answer.get("stageStates", []):
+        latest = state.get("latestExecution", {})
+        if latest.get("pipelineExecutionId") == execution and latest.get("status") in ENDED:
+            ended.add(state.get("stageName"))
+            stopped_short = stopped_short or latest.get("status") in STOPPED_SHORT
+    return ended, stopped_short
 
 
 def _report(
