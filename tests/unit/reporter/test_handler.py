@@ -128,6 +128,7 @@ class Stub:
         self.commit = commit
         self.secret: dict[str, str] | None = {"app_id": "1", "installation_id": "2", "private_key": "not a key"}
         self.stage_states: dict[str, str] = {}
+        self.status = "InProgress"
         self.objects_read: list[tuple[str, str]] = []
 
     # Secrets Manager.
@@ -140,7 +141,8 @@ class Stub:
     def get_pipeline_execution(self, pipelineName: str, pipelineExecutionId: str) -> dict[str, Any]:
         assert (pipelineName, pipelineExecutionId) == (PIPELINE, self.execution)
         revisions = [{"name": "example_owner_example_repository_Source", "revisionId": self.commit}]
-        return {"pipelineExecution": {"pipelineExecutionId": self.execution, "artifactRevisions": revisions}}
+        record = {"pipelineExecutionId": self.execution, "status": self.status, "artifactRevisions": revisions}
+        return {"pipelineExecution": record}
 
     def get_pipeline_state(self, name: str) -> dict[str, Any]:
         assert name == PIPELINE
@@ -289,6 +291,26 @@ def test_a_late_pending_status_does_not_hide_the_verdict(stub: Stub) -> None:
     events[8], events[9] = events[9], events[8]
     run(events, stub, client)
     assert client.posted[-1][1:3] == ("success", DEPLOY)
+
+
+@pytest.mark.parametrize(
+    ("execution_status", "stage_failed"),
+    [("Failed", False), ("InProgress", True)],
+    ids=["the execution ended", "a stage before failed"],
+)
+def test_a_late_step_before_the_stage_does_not_hide_its_failure(
+    stub: Stub, execution_status: str, stage_failed: bool
+) -> None:
+    stub.status = execution_status
+    client = Client()
+    events = [action_event(stub.execution, "Build", "Synth", "Build", "FAILED")]
+    if stage_failed:
+        events.append(stage_event(stub.execution, "Build", "FAILED"))
+    # The source step's success arrives last; the stage `Rhi` never started in this execution.
+    events.append(action_event(stub.execution, "Source", "GitHub", "Source", "SUCCEEDED"))
+    run(events, stub, client)
+    assert client.posted[0][1:3] == ("failure", DEPLOY)
+    assert all(state == "failure" for _, state, _, _ in client.posted)
 
 
 @pytest.mark.parametrize("secret", [None, {"app_id": "1", "installation_id": "2"}], ids=["absent", "no private_key"])
