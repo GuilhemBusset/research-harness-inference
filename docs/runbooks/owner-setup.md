@@ -277,11 +277,16 @@ repository and nothing else is part of the trust boundary (section 8.4; ADR 0001
 | `login_client_id` | The client ID of the student login App of step 3 |
 | `monthly_budget_usd` | The monthly budget, in whole US dollars |
 | `time_zone`, `course_end` | The IANA time zone of the schedule, and the day the course ends |
-| `session_windows`, `pools` | Empty lists for now: `[]` |
+| `session_windows` | An empty list for now: `[]` |
+| `pools` | An empty table for now: `pools = {}` |
 
-The loader requires every one of these keys. It refuses a session window and a pool entry until
-the changes that give them their shape, so both lists stay empty. The windows and each pool, with
-its GPU-hour ceilings, are added later, by running this step again.
+The loader requires every one of these keys. It refuses a session window until the change that
+gives windows their shape, so that list stays empty. A pool is a `[pools.<name>]` table, which
+the loader checks with the pool parser; the mock pool of `config.example.toml` is the first one
+added. Three keys go with the pools and may be left out: `allowed_instance_types` (by default the
+instance types the pools list), `on_demand_price_limit` (5 dollars an hour by default) and
+`default_pool` (by default the only pool; with two pools or more it must be given). The windows
+and each pool, with its GPU-hour ceilings, are added later, by running this step again.
 
 **Command.**
 
@@ -293,8 +298,8 @@ The step refuses a file inside the working tree, and a link in the tree to a fil
 It then runs two commands, the second after a `y`:
 
 ```sh
-env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config check <file>
-env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config write <file>
+env PYTHONPATH=src:services/common uv run --locked --no-dev python -m rhi.owner_config check <file>
+env PYTHONPATH=src:services/common uv run --locked --no-dev python -m rhi.owner_config write <file>
 ```
 
 The first is the configuration loader (`src/rhi/config.py`), reading the file as the pipeline
@@ -307,7 +312,8 @@ file and calls nothing.
 runbooks and the owner's steps of later changes use this step for that.
 
 **Check.** The names of the parameters, not their values: one per key of the table, except
-`pools`, which has a parameter per entry and so none yet.
+`pools`, which has a parameter per entry, `/rhi/config/pools/<name>`, holding the entry as a JSON
+object: none while the table is empty.
 
 ```sh
 aws ssm get-parameters-by-path --path /rhi/config/ --recursive --query 'Parameters[].Name' --output text
@@ -343,7 +349,7 @@ line, ended by an empty line: anything else no file of the repository may hold, 
 for instance. Then, after a `y`:
 
 ```sh
-env PYTHONPATH=src uv run --locked --no-dev python -m rhi.owner_config values <file> --list <list>
+env PYTHONPATH=src:services/common uv run --locked --no-dev python -m rhi.owner_config values <file> --list <list>
 ```
 
 - It adds the value of each private key of the configuration (`domain`, `hosted_zone_id`,
