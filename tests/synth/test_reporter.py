@@ -81,3 +81,47 @@ def test_the_synth_step_the_handler_reads_is_the_pipeline_s(templates: dict[str,
         for action in stage["Actions"]
     }
     assert outputs[handler.SYNTH_STAGE, handler.SYNTH_ACTION]
+
+
+# What the function's role may do: each action with what it is allowed on.
+ROLE_ACTIONS = {
+    "secretsmanager:GetSecretValue",
+    "codepipeline:GetPipelineExecution",
+    "codepipeline:GetPipelineState",
+    "codepipeline:ListActionExecutions",
+    "codepipeline:ListPipelineExecutions",
+    "cloudformation:DescribeStackEvents",
+    "s3:GetObject",
+    "logs:CreateLogStream",
+    "logs:PutLogEvents",
+}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def role_statements(template: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every statement of the policies attached to the reporter's role."""
+    (function,) = reporter_functions(template).values()
+    role = function["Role"]["Fn::GetAtt"][0]
+    return [
+        statement
+        for policy in of_type(template, "AWS::IAM::Policy").values()
+        if {"Ref": role} in policy["Roles"]
+        for statement in policy["PolicyDocument"]["Statement"]
+    ]
+
+
+def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
+    statements = role_statements(template)
+    actions = [action for statement in statements for action in as_list(statement["Action"])]
+    assert sorted(actions) == sorted(ROLE_ACTIONS)
+    (listing,) = [s for s in statements if "codepipeline:ListPipelineExecutions" in as_list(s["Action"])]
+    assert listing["Effect"] == "Allow"
+    # This pipeline's ARN, and no other resource.
+    parts = listing["Resource"]["Fn::Join"][1]
+    assert parts[-1] == {"Ref": pipeline_id}
+    assert [part for part in parts if isinstance(part, str)] == ["arn:", ":codepipeline:", ":", ":"]
