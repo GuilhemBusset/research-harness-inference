@@ -21,6 +21,15 @@ in that order with `rhi_reporter.github`.
   that ended with a verdict. Under each stage, such a commit is pending, naming the covering
   commit, while the covering execution runs, and gets its final state once it has ended, with
   the state of its verification when that ran.
+- An event of a stage or an action of an execution that a self-update cancelled (the execution
+  ended `Cancelled` or `Superseded`, or the event's own state is `CANCELED`, which CodePipeline
+  gives only when an update of the pipeline cancels an execution) posts none of its own: its
+  commit's verdict is the covering execution's. It posts that commit's superseded statuses again,
+  as the execution's own end does, so that a cancellation that arrives late, after the covering
+  execution has ended, leaves its verdict as it stands.
+- When the pipeline's executions cannot be read for a superseded commit, the function fails after
+  logging `NO_EXECUTIONS`, so that the event is invoked again: returning would leave the commit
+  pending for good.
 - A pending status is not posted once the stage has ended for the same execution, once one of
   the execution's stages has stopped short (failed, stopped or cancelled), or once the execution
   itself has ended: events arrive in no guaranteed order, and a late pending status, of the stage
@@ -90,6 +99,8 @@ ENDED = frozenset({"Succeeded", "Failed", "Stopped", "Cancelled"})
 STOPPED_SHORT = frozenset({"Failed", "Stopped", "Cancelled"})
 # The states CodePipeline gives an execution that has ended, or is ending.
 EXECUTION_ENDED = frozenset({"Succeeded", "Failed", "Stopped", "Stopping", "Cancelled", "Superseded"})
+# The state of a stage's or an action's event when an update of the pipeline cancelled its execution.
+CANCELED = "CANCELED"
 # At most this many pages of a stack's events are read: 100 events each.
 EVENT_PAGES = 10
 # At most this many pages of the pipeline's executions are read: 100 executions each.
@@ -98,7 +109,7 @@ EXECUTION_PAGES = 10
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
-NO_EXECUTIONS = "No superseded commit was reported: the pipeline's executions could not be read."
+NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
 NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
 
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -153,6 +164,9 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
         return
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
     commit, execution_status = _execution(aws.codepipeline, pipeline, execution)
+    if execution_status in superseded.SUPERSEDED_STATUSES or detail.get("state") == CANCELED:
+        _reconcile(detail, aws=aws, client=client, stages=stages)
+        return
     if commit is None:
         logger.warning(NO_COMMIT)
         return
@@ -187,12 +201,19 @@ def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequ
     if not github.has_credential(aws.secrets):
         logger.warning(NO_CREDENTIAL)
         return
+    _reconcile(detail, aws=aws, client=client, stages=stages)
+
+
+def _reconcile(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
+    """Posts the statuses of the superseded commits that the execution of `detail` covers, or
+    whose execution it is, as the pipeline's executions stand now. Raises when they cannot be
+    read, so that the event is invoked again."""
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
     try:
         executions = _executions(aws.codepipeline, pipeline, execution)
     except (BotoCoreError, ClientError):
         logger.warning(NO_EXECUTIONS)
-        return
+        raise
     try:
         for cover in superseded.covers(executions):
             if execution not in (cover.superseded.execution_id, cover.covering.execution_id):
