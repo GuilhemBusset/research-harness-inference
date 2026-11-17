@@ -385,6 +385,11 @@ class Finding08TriageDependency(FixCase):
         self.assertIn("- [ ] It plays in the widget.", self.gh.issues[2]["body"])
 
 
+# #3 is still in flight when #2 asks for it: with one writer, whichever issue takes the slot
+# first decides the order, and #3 may land before #2 ever asks
+TWO_WRITERS = Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2)
+
+
 class Finding09MidBuildDependency(FixCase):
     def test_9_an_approved_mid_build_dependency_waits_and_survives_a_restart(self):
         self.gh.add_issue(3, "Prerequisite widget", issue_body("feat/issue-3", ["`docs/b.txt` contains `beta`."],
@@ -407,7 +412,7 @@ class Finding09MidBuildDependency(FixCase):
             if n == 2 and engine.store.issue(2).phase == Phase.PENDING:
                 (engine.store.dir / "STOP").write_text("stop\n")
         with mock.patch.object(Engine, "_step_build", stop_once_it_waits):
-            self.run_engine(agents=agents)
+            self.run_engine(agents=agents, caps=TWO_WRITERS)
         st = self.store.issue(2)
         self.assertEqual((st.phase, st.extra_deps), (Phase.PENDING, [3]))
         self.assertTrue(self.events("waits_for_prerequisite", 2))
@@ -415,7 +420,7 @@ class Finding09MidBuildDependency(FixCase):
         (self.store_dir() / "STOP").unlink()
 
         restart = self.last_seq()
-        self.run_engine(agents=agents)   # a fresh plan: the edge comes back from the state
+        self.run_engine(agents=agents, caps=TWO_WRITERS)   # a fresh plan: the edge comes back from the state
         self.assertIn(3, self.engine.plan.deps[2])
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
         three_done = min(e["seq"] for e in self.after("phase", restart, 3) if e["to"] == "done")
