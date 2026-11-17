@@ -15,15 +15,18 @@ function posts nothing.
 **The function's role** may read that secret, the state of this pipeline's executions and their
 list, from which it finds the commits a self-update left without an execution (section 8.4), the
 events of the stacks this pipeline deploys, the objects of the pipeline's artifact bucket (where the
-synth step's output, the templates of each execution, is kept), and write its own logs. Nothing
-else: `tests/policy/test_pipeline.py` holds it to that.
+synth step's output, the templates of each execution, is kept), publish to the owner's topic of
+`rhi.pipeline.notify` and to no other topic, and write its own logs. Nothing else:
+`tests/policy/test_pipeline.py` holds it to that. The topic is encrypted with the key AWS manages
+for SNS, whose policy admits the account's principals through SNS: the role needs no grant on it.
 
 What the function is told, as environment variables:
 
 - `RHI_REPORTER_SECRET`: the secret's name;
 - `RHI_REPORTER_REPOSITORY`: the repository, as owner/name, from the configuration;
 - `RHI_REPORTER_STAGES`: the stages the pipeline deploys, comma-separated, under which the steps
-  that run before them report.
+  that run before them report;
+- `RHI_REPORTER_TOPIC`: the ARN of the owner's topic, where the details of a failure go.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from rhi import packaging
 
 if TYPE_CHECKING:
     from aws_cdk import aws_codepipeline as codepipeline
+    from aws_cdk import aws_sns as sns
 
     from rhi.config import Config
 
@@ -51,6 +55,7 @@ SECRET_NAME = "rhi/reporter/github-app"
 SECRET_VARIABLE = "RHI_REPORTER_SECRET"
 REPOSITORY_VARIABLE = "RHI_REPORTER_REPOSITORY"
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
+TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
 
 # The three kinds of state change CodePipeline sends to EventBridge.
 DETAIL_TYPES = [
@@ -69,10 +74,17 @@ LOG_RETENTION = logs.RetentionDays.ONE_MONTH
 
 class Reporter(Construct):
     """The rule on `pipeline`'s state and the function that reports it, for `stage`, the stage the
-    pipeline deploys."""
+    pipeline deploys, and sends the details of a failure to `topic`."""
 
     def __init__(
-        self, scope: Construct, construct_id: str, *, config: Config, pipeline: codepipeline.Pipeline, stage: cdk.Stage
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        config: Config,
+        pipeline: codepipeline.Pipeline,
+        stage: cdk.Stage,
+        topic: sns.ITopic,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -119,6 +131,8 @@ class Reporter(Construct):
         role.add_to_policy(
             iam.PolicyStatement(actions=["s3:GetObject"], resources=[pipeline.artifact_bucket.arn_for_objects("*")])
         )
+        # The owner's topic, and no other.
+        role.add_to_policy(iam.PolicyStatement(actions=["sns:Publish"], resources=[topic.topic_arn]))
 
         self.function = lambda_.Function(
             self,
@@ -135,6 +149,7 @@ class Reporter(Construct):
                 SECRET_VARIABLE: SECRET_NAME,
                 REPOSITORY_VARIABLE: f"{config.github_owner}/{config.github_repo}",
                 STAGES_VARIABLE: stage.stage_name,
+                TOPIC_VARIABLE: topic.topic_arn,
             },
         )
         target = targets.LambdaFunction(self.function)  # ty: ignore[invalid-argument-type] - as above

@@ -50,6 +50,15 @@ carry it. An execution that names none yet posts nothing.
 
 What cannot be read for the report leaves it out: a resource then counts as dropped.
 
+**The owner's message.** After the statuses of an action's event are posted, an action that
+ended without success, a failure or an error, has its details sent to the owner's topic, the one
+`RHI_REPORTER_TOPIC` names (`rhi_reporter.notify`): once per event, whatever number of stages it
+reports under. They are read from the same records as the report, the action's latest run that
+failed or was abandoned and its stack's events since it started, and are read once for both.
+Sending is the last thing the function does for an event, and nothing it raises reaches the
+statuses: a failure to publish is logged, `NOT_SENT`, and the function returns normally. While the
+variable is unset, nothing is sent.
+
 **The credential.** Before anything is posted, the secret is checked as the client reads it.
 While it is absent or lacks one of its fields, nothing is posted, `NO_CREDENTIAL` is logged, and
 the function returns normally, so that EventBridge does not retry: the owner creates the secret
@@ -71,16 +80,17 @@ from typing import TYPE_CHECKING, Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from rhi_reporter import github, superseded
+from rhi_reporter import github, notify, superseded
 from rhi_reporter.report import build_report, statuses_of
 from rhi_reporter.status import VERIFY_ACTION, State, status_for
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from rhi_reporter.status import CommitStatus
 
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
+TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
 
 PIPELINE_CHANGE = "CodePipeline Pipeline Execution State Change"
 STAGE_CHANGE = "CodePipeline Stage Execution State Change"
@@ -105,12 +115,15 @@ CANCELED = "CANCELED"
 EVENT_PAGES = 10
 # At most this many pages of the pipeline's executions are read: 100 executions each.
 EXECUTION_PAGES = 10
+# The statuses CodePipeline gives a run of an action that ended without success.
+UNSUCCESSFUL_RUNS = frozenset({"Failed", "Abandoned"})
 
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
 NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
 NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
+NOT_SENT = "The details of a failure were not sent to the owner: the topic refused them or could not be reached."
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -125,6 +138,20 @@ class Aws:
     cloudformation: Any
     s3: Any
     secrets: Any
+    # The owner's topic is published to with it. None sends nothing.
+    sns: Any = None
+
+
+@dataclass
+class _Records:
+    """What the pipeline's records hold of one failed action, read once for the report and the
+    owner's message."""
+
+    executions: list[Mapping[str, Any]]
+    # The action's latest run that ended without success, None when there is none.
+    run: Mapping[str, Any] | None
+    resource_events: list[Mapping[str, object]]
+    read: bool
 
 
 @functools.cache
@@ -136,6 +163,7 @@ def _clients() -> tuple[Aws, github.StatusClient]:
         cloudformation=boto3.client("cloudformation"),
         s3=boto3.client("s3"),
         secrets=secrets,
+        sns=boto3.client("sns"),
     )
     return aws, github.StatusClient(secrets)
 
@@ -144,12 +172,13 @@ def handler(event: Mapping[str, Any], _context: object) -> None:
     """The Lambda function's entry point."""
     aws, client = _clients()
     stages = tuple(stage for stage in os.environ.get(STAGES_VARIABLE, "").split(",") if stage)
-    handle(event, aws=aws, client=client, stages=stages)
+    handle(event, aws=aws, client=client, stages=stages, topic=os.environ.get(TOPIC_VARIABLE) or None)
 
 
-def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
+def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], topic: str | None = None) -> None:
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
-    as `github.StatusClient` has it. `stages` are the stages the pipeline deploys."""
+    as `github.StatusClient` has it, then sends the details of an action that ended without
+    success to `topic`, the owner's. `stages` are the stages the pipeline deploys."""
     kind, detail = event.get("detail-type"), event.get("detail")
     if kind == PIPELINE_CHANGE and isinstance(detail, dict):
         _supersede(detail, aws=aws, client=client, stages=stages)
@@ -173,6 +202,13 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
     kind_of = detail.get("type")
     category = kind_of.get("category") if isinstance(kind_of, dict) else None
     ended: tuple[set[str], bool] | None = None
+    records: list[_Records] = []
+
+    def read() -> _Records:
+        if not records:
+            records.append(_read(aws, pipeline=pipeline, execution=execution, stage=stage, action=action))
+        return records[0]
+
     try:
         for under in [stage] if stage in stages else stages:
             facts = {"stage": under, "action": action, "category": category, "state": detail.get("state")}
@@ -187,10 +223,13 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
                     continue
             _post(client, status)
             if status.state is State.FAILURE and action is not None:
-                for fact in _report(aws, facts, pipeline=pipeline, execution=execution, stage=stage, action=action):
+                for fact in _report(aws, facts, read()):
                     _post(client, fact)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
+    if action is not None and topic is not None and aws.sns is not None:
+        own = {"stage": stage, "action": action, "category": category, "state": detail.get("state"), "commit": commit}
+        _send(aws, topic, own, execution=execution, read=read)
 
 
 def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
@@ -297,30 +336,64 @@ def _ended(codepipeline: Any, pipeline: object, execution: object) -> tuple[set[
     return ended, stopped_short
 
 
-def _report(
-    aws: Aws, facts: Mapping[str, object], *, pipeline: object, execution: object, stage: str, action: str
-) -> list[CommitStatus]:
-    """The report of the failure `facts` tell, as statuses. `stage` and `action` name the failed
-    action as the pipeline does."""
-    resource_events: list[Mapping[str, object]] = []
+def _read(aws: Aws, *, pipeline: object, execution: object, stage: object, action: object) -> _Records:
+    """The records of the action `stage` and `action` name as the pipeline does: the execution's
+    action runs, the action's latest run that ended without success, and the events since it
+    started of the stack it deploys. What cannot be read is left empty, and `NO_FACTS` logged."""
+    records = _Records(executions=[], run=None, resource_events=[], read=True)
+    try:
+        records.executions = list(_action_executions(aws.codepipeline, pipeline, execution))
+        runs = [
+            detail
+            for detail in records.executions
+            if (detail.get("stageName"), detail.get("actionName")) == (stage, action)
+            and detail.get("status") in UNSUCCESSFUL_RUNS
+        ]
+        if runs:
+            # A stage that is retried runs the action again: the latest run is the one that failed now.
+            records.run = max(runs, key=lambda detail: detail["startTime"])
+            records.resource_events = _resource_events(aws.cloudformation, records.run)
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+        logger.warning(NO_FACTS)
+        records.read = False
+    return records
+
+
+def _report(aws: Aws, facts: Mapping[str, object], records: _Records) -> list[CommitStatus]:
+    """The report of the failure `facts` tell, as statuses, from the failed action's records."""
+    failed = records.run is not None and records.run.get("status") == "Failed"
+    resource_events = records.resource_events if failed else []
     logical_ids: set[str] = set()
     try:
-        executions = list(_action_executions(aws.codepipeline, pipeline, execution))
-        failed = [
-            detail
-            for detail in executions
-            if (detail.get("stageName"), detail.get("actionName"), detail.get("status")) == (stage, action, "Failed")
-        ]
-        if failed:
-            # A stage that is retried runs the action again: the latest run is the one that failed now.
-            latest = max(failed, key=lambda detail: detail["startTime"])
-            resource_events = _resource_events(aws.cloudformation, latest)
         if resource_events:
-            logical_ids = _logical_ids(aws.s3, executions)
+            logical_ids = _logical_ids(aws.s3, records.executions)
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError, zipfile.BadZipFile):
         logger.warning(NO_FACTS)
     report = build_report(facts, resource_events, logical_ids=logical_ids, smoke_test_ids=(), lifecycle_stages=())
     return statuses_of(report)
+
+
+def _send(
+    aws: Aws, topic: str, facts: Mapping[str, object], *, execution: object, read: Callable[[], _Records]
+) -> None:
+    """Publishes to `topic` the owner's message of the action's event `facts` tell, when it ended
+    without success. Nothing raised here goes further: it is logged as `NOT_SENT`, without its
+    text."""
+    try:
+        if notify.message_for(facts) is None:
+            return
+        records = read()
+        message = notify.message_for(
+            facts,
+            execution=execution,
+            action_execution=records.run,
+            resource_events=records.resource_events,
+            read=records.read,
+        )
+        if message is not None:
+            aws.sns.publish(TopicArn=topic, Subject=message.subject, Message=message.body)
+    except Exception:  # noqa: BLE001 - whatever the topic or a record raises, the posted statuses stand.
+        logger.warning(NOT_SENT)
 
 
 def _action_executions(codepipeline: Any, pipeline: object, execution: object) -> Iterator[Mapping[str, Any]]:

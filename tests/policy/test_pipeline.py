@@ -44,7 +44,9 @@ Rules hold those two, and every action:
   list the executions of the template's own pipeline, and of no other pipeline; the events of the
   stacks that pipeline deploys, by the names its CloudFormation actions give them, and of no other
   stack; the objects of the pipeline's artifact bucket, where each execution's synthesized
-  templates are; and write to the function's own log group. Nothing else: every action it is allowed is one of `REPORTER_READS`,
+  templates are; publish to the owner's topic, the one topic of the template that the function's
+  `RHI_REPORTER_TOPIC` names, and to no other; and write to the function's own log group. Nothing
+  else: every action it is allowed is one of `REPORTER_READS`,
   each on resources of its kind only, and a wildcard action, `NotAction`, `NotResource` and a
   managed policy the template does not hold are taken as reaching more.
 
@@ -155,6 +157,7 @@ REPORTER_READS = {
     "codepipeline:ListPipelineExecutions": "pipeline",
     "cloudformation:DescribeStackEvents": "stacks",
     "s3:GetObject": "artifacts",
+    "sns:Publish": "topic",
     "logs:CreateLogStream": "logs",
     "logs:PutLogEvents": "logs",
 }
@@ -171,7 +174,12 @@ ANOTHER_TRIGGER = "a trigger other than a push to `main`"
 WEBHOOK = "a CodeBuild project with a webhook"
 NO_BOUNDARY = "a role without the permissions boundary of the bounded bootstrap"
 READS_MORE = "a synth role that may read more than the parameters under /rhi/config/"
-REPORTS_MORE = "a reporter's role that may do more than read its secret, its pipeline's records and templates"
+REPORTS_MORE = (
+    "a reporter's role that may do more than read its secret, its pipeline's records and templates,"
+    " and publish to its own topic"
+)
+# The variable that names the reporter's topic to its function.
+REPORTER_TOPIC = "RHI_REPORTER_TOPIC"
 
 
 def resources(templates: Templates, kind: str) -> list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]:
@@ -467,7 +475,8 @@ def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
 def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, list[re.Pattern[str]]]:
     """For each kind of resource of `REPORTER_READS`, what the reporter's role may name, as
     `arn_text` writes it: the secret, the template's own pipelines, the stacks they deploy, their
-    artifact buckets' objects, and the function's own log group."""
+    artifact buckets' objects, the topic of the template that the function's `REPORTER_TOPIC`
+    names, and the function's own log group."""
     pipelines = resources({"": template}, "AWS::CodePipeline::Pipeline")
     stacks = {
         action.get("Configuration", {}).get("StackName")
@@ -482,8 +491,12 @@ def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, 
         for store in [pipeline.get("ArtifactStore", {})]
         + [entry.get("ArtifactStore", {}) for entry in pipeline.get("ArtifactStores", [])]
     ]
-    log_group = template["Resources"][function].get("Properties", {}).get("LoggingConfig", {}).get("LogGroup")
+    properties = template["Resources"][function].get("Properties", {})
+    log_group = properties.get("LoggingConfig", {}).get("LogGroup")
     own_logs = log_group.get("Ref") if isinstance(log_group, dict) else None
+    named_topic = properties.get("Environment", {}).get("Variables", {}).get(REPORTER_TOPIC)
+    topics = {logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::SNS::Topic")}
+    own_topic = named_topic.get("Ref") if isinstance(named_topic, dict) else None
     return {
         "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(REPORTER_SECRET)}-\?{{6}}")],
         "pipeline": [
@@ -499,6 +512,7 @@ def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, 
             for store in stores
             if isinstance(store, dict) and isinstance(store.get("Ref"), str)
         ],
+        "topic": [re.compile(rf"\$\{{{re.escape(own_topic)}\}}")] if own_topic in topics else [],
         "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
     }
 
@@ -1020,6 +1034,15 @@ def every_resource(_cdk: ModuleType, _stack: Any, _pipeline: Any) -> str:
     return "*"
 
 
+def the_topic(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    """The reporter's own topic, the one its function names, which `a_reporter` creates first."""
+    return stack.node.find_child("ReporterTopic").topic_arn
+
+
+def another_topic(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return cdk.aws_sns.Topic(stack, "AnotherTopic").topic_arn
+
+
 # The narrow role: each action of `REPORTER_READS` on what it reads. The stage of `built` deploys
 # the stack `Rhi-Endpoint`.
 NARROW: list[tuple[list[str], Names]] = [
@@ -1035,16 +1058,18 @@ NARROW: list[tuple[list[str], Names]] = [
     ),
     (["cloudformation:DescribeStackEvents"], the_stack("Rhi-Endpoint")),
     (["s3:GetObject"], the_artifacts),
+    (["sns:Publish"], the_topic),
 ]
 
 
 def a_reporter(more: tuple[str, Names] | None = None, *, managed: bool = False) -> Change:
-    """A rule on the pipeline's state that invokes a function, whose role holds the narrow
-    statements, writes its own log group and, when asked, one more statement or the AWS managed
-    policy for a function's logs."""
+    """A rule on the pipeline's state that invokes a function, told its own topic, whose role
+    holds the narrow statements, writes its own log group and, when asked, one more statement or
+    the AWS managed policy for a function's logs."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         iam, lambda_ = cdk.aws_iam, cdk.aws_lambda
+        topic = cdk.aws_sns.Topic(stack, "ReporterTopic")
         logs = cdk.aws_logs.LogGroup(stack, "ReporterLogs")
         role = iam.Role(stack, "ReporterRole", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"))
         statements = [(["logs:CreateLogStream", "logs:PutLogEvents"], logs.log_group_arn)]
@@ -1065,6 +1090,7 @@ def a_reporter(more: tuple[str, Names] | None = None, *, managed: bool = False) 
             code=lambda_.Code.from_inline("def handler(event, context):\n    pass\n"),
             role=role,
             log_group=logs,
+            environment={REPORTER_TOPIC: topic.topic_arn},
         )
         pattern = cdk.aws_events.EventPattern(source=["aws.codepipeline"], resources=[pipeline.pipeline_arn])
         targets = [cdk.aws_events_targets.LambdaFunction(function)]
@@ -1098,6 +1124,9 @@ def test_keeps_a_reporter_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) 
         ),
         pytest.param(a_reporter(("codepipeline:StartPipelineExecution", the_pipeline)), id="another action"),
         pytest.param(a_reporter(managed=True), id="a managed policy the template does not hold"),
+        pytest.param(a_reporter(("sns:Publish", another_topic)), id="publishing to another topic"),
+        pytest.param(a_reporter(("sns:Publish", every_resource)), id="publishing to every topic"),
+        pytest.param(a_reporter(("sns:*", the_topic)), id="every action on its own topic"),
     ],
 )
 def test_refuses_a_reporter_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:

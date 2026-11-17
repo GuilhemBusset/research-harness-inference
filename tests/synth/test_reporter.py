@@ -1,6 +1,7 @@
 """The pipeline's reporter, in the app's synthesized templates (system design, section 8.2, step 7):
-a rule on this pipeline's state changes and nothing else, the function it invokes, and the secret
-the function reads, which the stack refers to and never creates.
+a rule on this pipeline's state changes and nothing else, the function it invokes, the secret
+the function reads, which the stack refers to and never creates, and the owner's topic, where the
+function sends what a public status may not carry (section 8.4).
 """
 
 from __future__ import annotations
@@ -56,13 +57,43 @@ def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str
 
 
 def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str, dict[str, Any]]) -> None:
-    (function,) = reporter_functions(templates[PIPELINE_TEMPLATE]).values()
+    template = templates[PIPELINE_TEMPLATE]
+    (function,) = reporter_functions(template).values()
+    (topic_id,) = of_type(template, "AWS::SNS::Topic")
     example = config.load({"RHI_CONFIG": "example"})
     assert function["Environment"]["Variables"] == {
         "RHI_REPORTER_SECRET": SECRET_NAME,
         "RHI_REPORTER_REPOSITORY": f"{example.github_owner}/{example.github_repo}",
         handler.STAGES_VARIABLE: "Rhi",
+        handler.TOPIC_VARIABLE: {"Ref": topic_id},
     }
+
+
+def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (topic_id, topic), *others = [
+        (logical_id, properties)
+        for template in templates.values()
+        for logical_id, properties in of_type(template, "AWS::SNS::Topic").items()
+    ]
+    assert others == [] and topic_id in template["Resources"]
+    assert topic["KmsMasterKeyId"] == "alias/aws/sns"
+    (policy,) = [p for p in of_type(template, "AWS::SNS::TopicPolicy").values() if {"Ref": topic_id} in p["Topics"]]
+    assert {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "sns:Publish",
+        "Resource": {"Ref": topic_id},
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }.items() <= next(iter(policy["PolicyDocument"]["Statement"])).items()
+
+
+def test_one_e_mail_subscription_to_the_admin_address(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    (subscription,) = of_type(template, "AWS::SNS::Subscription").values()
+    example = config.load({"RHI_CONFIG": "example"})
+    assert subscription == {"Protocol": "email", "Endpoint": example.admin_email, "TopicArn": {"Ref": topic_id}}
 
 
 def test_the_stack_creates_no_secret(templates: dict[str, dict[str, Any]]) -> None:
@@ -92,6 +123,7 @@ ROLE_ACTIONS = {
     "codepipeline:ListPipelineExecutions",
     "cloudformation:DescribeStackEvents",
     "s3:GetObject",
+    "sns:Publish",
     "logs:CreateLogStream",
     "logs:PutLogEvents",
 }
@@ -125,3 +157,10 @@ def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[
     parts = listing["Resource"]["Fn::Join"][1]
     assert parts[-1] == {"Ref": pipeline_id}
     assert [part for part in parts if isinstance(part, str)] == ["arn:", ":codepipeline:", ":", ":"]
+
+
+def test_the_role_may_publish_to_the_owner_s_topic_only(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    publishing = [s for s in role_statements(template) if any(a.startswith("sns:") for a in as_list(s["Action"]))]
+    assert publishing == [{"Action": "sns:Publish", "Effect": "Allow", "Resource": {"Ref": topic_id}}]

@@ -19,7 +19,9 @@ build hosts are x86_64, so each project that publishes an image first registers 
 arm64 and selects a builder that can target either platform, all pinned (`IMAGE_BUILDER`).
 
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
-function that posts commit statuses to GitHub (step 7). It adds no step to the pipeline.
+function that posts commit statuses to GitHub (step 7), and sends the owner, on the topic of
+`rhi.pipeline.notify`, what a public status may not carry of a failure. It adds no step to the
+pipeline.
 
 A push to `main` is the only trigger. No CodeBuild project has a webhook: on a public repository
 it would run a stranger's code with a role of the account (section 8.3). Every role of this stack
@@ -43,6 +45,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
+from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
 from rhi.pipeline.synth import synth_step
 from rhi.stage import PERMISSIONS_BOUNDARY
@@ -143,7 +146,16 @@ class PipelineStack(cdk.Stack):
             ),
         )
         # Before the rewrite below, which visits every function of the stack, the reporter's too.
-        self.reporter = Reporter(self, "Reporter", config=config, pipeline=underlying, stage=stage)
+        self.owner_topic = OwnerTopic(self, "OwnerTopic", config=config)
+        self.reporter = Reporter(
+            self,
+            "Reporter",
+            config=config,
+            pipeline=underlying,
+            stage=stage,
+            # ty reads the CDK's generated topic as unlike its protocol: jsii passes a renamed parameter by position.
+            topic=self.owner_topic.topic,  # ty: ignore[invalid-argument-type]
+        )
         self._as_cfn_lint_reads_it(underlying)
 
     def _builds_images_for_both_platforms(self) -> None:
