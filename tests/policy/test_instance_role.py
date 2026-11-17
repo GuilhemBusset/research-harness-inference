@@ -14,7 +14,7 @@ this test cannot read, and the statements it does carry are held to these rules:
   of a secret named so.
 
 The statements are those of the role's inline policies and of every policy that names the role,
-in any template of the app. An action is read as IAM reads it, wildcards included, and
+by reference or by its name, in any template of the app. An action is read as IAM reads it, wildcards included, and
 `NotAction` may be any action. A resource the test cannot resolve, `NotResource`, and a policy it
 cannot read count against the role: the rules fail closed.
 """
@@ -259,6 +259,24 @@ def instance_roles(templates: Templates) -> list[tuple[str, str]]:
     ]
 
 
+def names(name: Any, path: str, role: tuple[str, str], templates: Templates, exports: Exports) -> bool:
+    """Whether an entry of a policy's `Roles`, read in the template at `path`, may name the role:
+    by reference, or by the physical name the role is given. A name chosen at deployment, or one
+    set against a role name the test cannot read, may be any role's."""
+    found = target(name, path, templates, exports)
+    if found is not None:
+        return found == role
+    text = written(name, path, templates, exports)
+    if text is None:
+        return True
+    properties = templates[role[0]]["Resources"][role[1]].get("Properties", {})
+    if "RoleName" not in properties:
+        # CloudFormation makes the name up when the role is created: no text written before may name it.
+        return False
+    role_name = written(properties["RoleName"], role[0], templates, exports)
+    return role_name is None or overlaps(text, role_name)
+
+
 def violations(templates: Templates) -> list[Finding]:
     """Every rule an instance role of the templates breaks."""
     exports: Exports = {
@@ -298,13 +316,13 @@ def violations(templates: Templates) -> list[Finding]:
                 if resource.get("Type") not in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
                     continue
                 policy_properties = resource.get("Properties", {})
-                named = [
-                    target(name, other, templates, exports) for name in as_list(policy_properties.get("Roles", []))
-                ]
+                named = any(
+                    names(name, other, role, templates, exports) for name in as_list(policy_properties.get("Roles", []))
+                )
                 attached = [
                     target(arn, path, templates, exports) for arn in as_list(properties.get("ManagedPolicyArns", []))
                 ]
-                if role in named or (other, policy_id) in attached:
+                if named or (other, policy_id) in attached:
                     documents.append((policy_properties.get("PolicyDocument"), other))
         for document, where in documents:
             statements = as_list(document.get("Statement")) if isinstance(document, dict) else [None]
@@ -444,4 +462,32 @@ def test_detects_a_read_of_another_pools_parameter_or_secret(statement: dict[str
     }
     release = {"Type": "AWS::SSM::Parameter", "Properties": {"Name": "/rhi/pools/mock/release", "Type": "String"}}
     template = {"Parameters": {"Chosen": {"Type": "String"}}, "Resources": {"Role": role, "Release": release}}
+    assert problems_of({"built.template.json": template}) == expected
+
+
+@pytest.mark.parametrize("kind", ["AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"])
+@pytest.mark.parametrize(
+    ("named", "expected"),
+    [
+        pytest.param("mock-instance", [OTHER_PARAMETER, CONFIGURATION], id="its name"),
+        pytest.param({"Ref": "Chosen"}, [OTHER_PARAMETER, CONFIGURATION], id="a name chosen at deployment"),
+        pytest.param("another-role", [], id="another role's name"),
+    ],
+)
+def test_reads_a_policy_that_names_the_role_by_its_name(kind: str, named: Any, expected: list[str]) -> None:
+    role = {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+            "RoleName": "mock-instance",
+            "AssumeRolePolicyDocument": {
+                "Statement": [
+                    {"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"Service": "ec2.amazonaws.com"}}
+                ]
+            },
+            "Tags": [{"Key": POOL_TAG, "Value": "mock"}],
+        },
+    }
+    read = {"Effect": "Allow", "Action": "ssm:GetParameter", "Resource": parameter("/rhi/config/domain")}
+    policy = {"Type": kind, "Properties": {"Roles": [named], "PolicyDocument": {"Statement": [read]}}}
+    template = {"Parameters": {"Chosen": {"Type": "String"}}, "Resources": {"Role": role, "Policy": policy}}
     assert problems_of({"built.template.json": template}) == expected
