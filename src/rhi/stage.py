@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
 
+from rhi.access.stack import AccessStack
 from rhi.network.stack import NetworkStack
+from rhi.pools.stack import PoolsStack
 
 if TYPE_CHECKING:
     from constructs import Construct
@@ -34,3 +36,7 @@ class EndpointStage(cdk.Stage):
         super().__init__(scope, construct_id, permissions_boundary=boundary)
         self.config = config
         self.network = NetworkStack(self, "Network", config=config)
+        # The students' tables and the pools' tables. Their stacks are fixed with their tables'
+        # logical IDs (`tests/policy/stateful_logical_ids.json`): a table that moves is replaced.
+        self.access = AccessStack(self, "Access")
+        self.pools = PoolsStack(self, "Pools")
