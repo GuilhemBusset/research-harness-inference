@@ -16,6 +16,7 @@ import secrets
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 
 from rhi_reporter import handler
 from rhi_reporter.github import SECRET_VARIABLE
@@ -62,6 +63,10 @@ class Pipeline:
         self.queue: list[str] = []
         self.commits: list[str] = []
         self.stage_states: dict[str, dict[str, str]] = {}
+        # The executions an update of the pipeline cancelled, the one that updated it among them.
+        self.cancelled: list[str] = []
+        # Whether the next read of the executions fails.
+        self.unreadable = False
 
     # What happens.
     def push(self) -> str:
@@ -78,6 +83,7 @@ class Pipeline:
             self._event("Action", execution, stage="UpdatePipeline", action="SelfMutate", state="SUCCEEDED")
             self._end(execution, "Superseded", "SUPERSEDED")
             cancelled, self.queue = self.queue, []
+            self.cancelled += [execution, *cancelled]
             for other in cancelled:
                 self._end(other, "Cancelled", "CANCELED")
             self.queue.append(self._execution(self.commits[-1]))
@@ -147,6 +153,9 @@ class Pipeline:
 
     def list_pipeline_executions(self, pipelineName: str, maxResults: int, nextToken: str = "0") -> dict[str, Any]:
         assert pipelineName == PIPELINE
+        if self.unreadable:
+            self.unreadable = False
+            raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListExecutions")
         newest = sorted(self.executions.items(), key=lambda item: item[1]["started"], reverse=True)
         start = int(nextToken)
         summaries = [
@@ -264,3 +273,48 @@ def test_a_cancelled_commit_waits_for_an_execution_that_covers_it() -> None:
     execution = pipeline.queue.pop()
     pipeline._end(execution, "Cancelled", "CANCELED")
     assert client.last(queued, DEPLOY) is None
+
+
+def test_a_late_cancellation_leaves_the_covering_verdict() -> None:
+    for steps in sequences(5):
+        client = Client()
+        pipeline = Pipeline(client)
+        for step in steps:
+            if step == PUSH:
+                pipeline.push()
+            else:
+                pipeline.run(step)
+        while pipeline.queue:
+            pipeline.run(SUCCEEDS)
+        verdicts = {
+            (commit, context): client.last(commit, context)
+            for commit in pipeline.commits
+            for context in (DEPLOY, VERIFY)
+        }
+        # CodePipeline's events of the cancellation arrive after the covering execution has ended.
+        for execution in pipeline.cancelled:
+            pipeline._event("Action", execution, stage="Build", action="Synth", state="CANCELED")
+            pipeline._event("Stage", execution, stage="Build", state="CANCELED")
+            pipeline._event("Stage", execution, stage=STAGE, state="CANCELED")
+        assert {key: client.last(*key) for key in verdicts} == verdicts, steps
+
+
+def test_a_failed_read_of_the_executions_is_tried_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = Client()
+    pipeline = Pipeline(client)
+    _, second, third = pipeline.push(), pipeline.push(), pipeline.push()
+    pipeline.run(UPDATES_THE_PIPELINE)
+    end = pipeline._end
+
+    def end_unread(execution: str, status: str, state: str) -> None:
+        pipeline.unreadable = True
+        with pytest.raises(ClientError):
+            end(execution, status, state)
+        assert client.last(second, DEPLOY) == ("pending", superseded_description(third))
+        # The function failed: Lambda invokes it again with the same event.
+        pipeline._event("Pipeline", execution, state=state)
+
+    monkeypatch.setattr(pipeline, "_end", end_unread)
+    pipeline.run(SUCCEEDS)
+    assert client.last(second, DEPLOY) == ("success", Description.DEPLOYED)
+    assert client.last(second, VERIFY) == ("success", Description.VERIFIED)
