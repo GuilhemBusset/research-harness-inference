@@ -161,7 +161,10 @@ class Records:
 
 
 class Engine:
-    """The pool's engine: silent for `headers_after`, then `first_after` more seconds, then `answer`, or it breaks off."""
+    """The pool's engine: silent for `headers_after`, then `first_after` more seconds, then `answer`, or it breaks off.
+
+    With `rest_after`, only the answer's first byte comes then, and the rest that many seconds later.
+    """
 
     def __init__(
         self,
@@ -173,6 +176,7 @@ class Engine:
         first_after: float = 0,
         content_type: str = "text/event-stream",
         fails: bool = False,
+        rest_after: float | None = None,
     ) -> None:
         self._clock = clock
         self.fails = fails
@@ -181,6 +185,7 @@ class Engine:
         self.headers_after = headers_after
         self.first_after = first_after
         self.content_type = content_type
+        self.rest_after = rest_after
         self.reached_at: list[float] = []
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -192,7 +197,12 @@ class Engine:
             await self._clock.sleep(self.first_after)
             if self.fails:
                 raise httpx.ReadError(ENGINE_TEXT)
-            yield self.answer
+            if self.rest_after is None:
+                yield self.answer
+                return
+            yield self.answer[:1]
+            await self._clock.sleep(self.rest_after)
+            yield self.answer[1:]
 
         headers = {"content-type": self.content_type, "x-engine-detail": ENGINE_TEXT}
         return httpx.Response(self.status, headers=headers, content=body())
@@ -388,6 +398,24 @@ def test_a_held_stream_is_kept_alive_until_the_engine_speaks(entry: routes.Route
         assert call.responses_started == 1  # One answer: the real stream followed on the same connection.
         assert gateway.ledger.settled == [(*REPORTED[entry], True)]
         assert gateway.ledger.open_leases() == {}
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("entry", FORMATS, ids=lambda entry: entry.path)
+def test_keep_alives_last_until_the_first_event_is_whole(entry: routes.Route) -> None:
+    async def scenario() -> None:
+        # Forwarded at 30; the engine's first byte comes at once, the rest of its first event at 70.
+        gateway = Gateway(STREAMS[entry], healthy_at=30, rest_after=40)
+        call = Call(gateway, entry)
+        await held(gateway)
+        await gateway.advance_to(80)
+        await call.ended()
+        times, rest = call.split(entry)
+        assert times[:6] == [10, 20, 30, 40, 50, 60]
+        assert times[6:] in ([], [70])
+        assert rest == STREAMS[entry]  # No keep-alive inside the engine's event.
+        assert gateway.ledger.settled == [(*REPORTED[entry], True)]
 
     run(scenario)
 
