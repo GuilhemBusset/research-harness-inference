@@ -195,6 +195,9 @@ class LocalRoutes:
             answer = render_json(refused, WireFormat.MESSAGES)
             return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
         record = pool_status(pool, self.views().get(pool.name, PoolView()), self.clock())
+        if record.cause is not None:
+            # The cause the wake's answer states is the request's cause in its log record.
+            telemetry.note_cause(record.cause)
         if record.cause not in _IMMEDIATE:
             waker.record(pool.name)
             waker.ask(pool.name)

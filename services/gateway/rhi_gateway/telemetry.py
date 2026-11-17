@@ -22,8 +22,10 @@ those cannot be deleted for 15 months.
 
 **The gateway's own faults** (section 7.3). An exception that escapes the application is a fault
 of the gateway: the client is answered 500 with no body, so none of the exception's text reaches
-it, and the record carries the cause `none`. So does any answer of 500 or above that names no
-cause. The exception is not raised further: the server would log its text.
+it, and the record carries the cause `none`. So is any answer of 500 or above that names no cause
+(one that no part of the gateway noted a cause for before it started): it is replaced, before
+anything of it is sent, by the same 500 with no body. The exception is not raised further: the
+server would log its text.
 
 `Telemetry` is the middleware that `rhi_gateway.app.build_app` installs. The parts of the gateway
 that learn something of a request note it on the request's record through the `note_*`
@@ -145,8 +147,20 @@ class Telemetry:
         record = RequestRecord(time=_arrival(self._clock()), wire_format=wire_format)
         started = self._monotonic()
 
+        faulted = False
+
         async def sending(message: Message) -> None:
+            nonlocal faulted
+            if faulted:
+                return  # The rest of an answer replaced by the fault's: nothing of it reaches the client.
             if message["type"] == "http.response.start":
+                if message["status"] >= FAULT_STATUS and record.cause is None:
+                    # An answer of 500 or above that names no cause is the gateway's own fault.
+                    faulted = True
+                    record.cause = NO_CAUSE
+                    await _answer_fault(send)
+                    record.status = FAULT_STATUS
+                    return
                 record.status = message["status"]
             await send(message)
 
@@ -160,8 +174,6 @@ class Telemetry:
         finally:
             _CURRENT.reset(token)
             record.latency_ms = max(0, round((self._monotonic() - started) * 1000))
-            if record.status is not None and record.status >= FAULT_STATUS and record.cause is None:
-                record.cause = NO_CAUSE
             self._write(json.dumps(record.to_json(), separators=(",", ":")))
 
 
