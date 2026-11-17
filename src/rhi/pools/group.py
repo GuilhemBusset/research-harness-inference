@@ -26,8 +26,14 @@ setting.
 
 The mock pool's machine image is the ECS-optimized Amazon Linux 2023 image for arm64, which carries
 Docker: its ID is read from the parameter AWS publishes for it when the stack is deployed, and
-nothing is looked up at synthesis. The image of a GPU pool is read from the parameter its promotion
-job writes, which does not exist yet: such a pool is refused here until it does.
+nothing is looked up at synthesis. A GPU pool's image is AWS's base GPU image on Ubuntu, whose ID
+the promotion job writes to a parameter of the owner's account, `/rhi/images/gpu`, after a canary
+start on it passes (section 4.3): it too is read when the stack is deployed, so a merge never
+changes the image, and a stage with a GPU pool deploys once that parameter exists.
+
+The custom resource may suspend processes only of a group tagged with its pool: Auto Scaling puts an
+identifier it chooses at creation before the group's name in the group's ARN, so the ARN is named by
+pattern, and the tag the group carries from its creation narrows it to the pool's own group.
 """
 
 from __future__ import annotations
@@ -65,6 +71,11 @@ def release_parameter(pool: str) -> str:
 MOCK_IMAGE_PARAMETER = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 MOCK_ROOT_DEVICE = "/dev/xvda"
 
+# The parameter of the owner's account that the promotion job writes with the GPU image's ID, and
+# the root device of that image (an Ubuntu image).
+GPU_IMAGE_PARAMETER = "/rhi/images/gpu"
+GPU_ROOT_DEVICE = "/dev/sda1"
+
 # The process that replaces instances in service to even out the zones.
 REBALANCING = "AZRebalance"
 
@@ -73,7 +84,7 @@ def machine_image(pool: Pool) -> tuple[ec2.IMachineImage, str]:
     """The pool's machine image, resolved when the stack is deployed, and the image's root device."""
     if pool.engine == "mock":
         return ec2.MachineImage.from_ssm_parameter(MOCK_IMAGE_PARAMETER), MOCK_ROOT_DEVICE
-    raise ValueError(f"pool {pool.name}: no machine image is defined yet for the engine {pool.engine}")
+    return ec2.MachineImage.from_ssm_parameter(GPU_IMAGE_PARAMETER), GPU_ROOT_DEVICE
 
 
 class PoolGroup(Construct):
@@ -150,6 +161,13 @@ class PoolGroup(Construct):
         )
 
         stack = cdk.Stack.of(self)
+        # Every group, by the pattern of its ARN, narrowed to the pool's by the group's tag.
+        groups = stack.format_arn(
+            service="autoscaling",
+            resource="autoScalingGroup",
+            resource_name="*:autoScalingGroupName/*",
+            arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+        )
         call = cr.AwsSdkCall(
             service="AutoScaling",
             action="suspendProcesses",
@@ -166,14 +184,8 @@ class PoolGroup(Construct):
                 [
                     iam.PolicyStatement(
                         actions=["autoscaling:SuspendProcesses"],
-                        resources=[
-                            stack.format_arn(
-                                service="autoscaling",
-                                resource="autoScalingGroup",
-                                resource_name=f"*:autoScalingGroupName/{self.group.ref}",
-                                arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
-                            )
-                        ],
+                        resources=[groups],
+                        conditions={"StringEquals": {f"autoscaling:ResourceTag/{POOL_TAG}": pool.name}},
                     )
                 ]
             ),
