@@ -153,6 +153,12 @@ class Stub:
             ]
         }
 
+    def list_pipeline_executions(self, pipelineName: str, maxResults: int) -> dict[str, Any]:
+        assert pipelineName == PIPELINE
+        revisions = [{"actionName": "GitHub", "revisionId": self.commit}]
+        summary = {"pipelineExecutionId": self.execution, "status": self.status, "startTime": STARTED}
+        return {"pipelineExecutionSummaries": [summary | {"sourceRevisions": revisions}]}
+
     def list_action_executions(self, pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
         assert (pipelineName, filter) == (PIPELINE, {"pipelineExecutionId": self.execution})
         synth = {

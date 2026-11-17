@@ -12,8 +12,9 @@ private_key. A secret the stack created would hold a placeholder the function wo
 from a real value, and would be a stateful resource of this stack. While it is absent, the
 function posts nothing.
 
-**The function's role** may read that secret, the state of this pipeline's executions, the events
-of the stacks this pipeline deploys, the objects of the pipeline's artifact bucket (where the
+**The function's role** may read that secret, the state of this pipeline's executions and their
+list, from which it finds the commits a self-update left without an execution (section 8.4), the
+events of the stacks this pipeline deploys, the objects of the pipeline's artifact bucket (where the
 synth step's output, the templates of each execution, is kept), and write its own logs. Nothing
 else: `tests/policy/test_pipeline.py` holds it to that.
 
@@ -101,6 +102,7 @@ class Reporter(Construct):
                     "codepipeline:GetPipelineExecution",
                     "codepipeline:GetPipelineState",
                     "codepipeline:ListActionExecutions",
+                    "codepipeline:ListPipelineExecutions",
                 ],
                 resources=[pipeline.pipeline_arn],
             )

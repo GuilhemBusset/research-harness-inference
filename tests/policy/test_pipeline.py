@@ -40,11 +40,11 @@ Rules hold those two, and every action:
   deploying account. A statement written as `NotAction` or `NotResource`, and a managed policy the
   template does not hold, are taken as reaching everything;
 - the role of a function that an EventBridge rule of a pipeline's template invokes, the reporter
-  (section 8.2, step 7), may read the reporter's one secret, `rhi/reporter/github-app`; the
-  executions of the template's own pipeline; the events of the stacks that pipeline deploys, by
-  the names its CloudFormation actions give them, and of no other stack; the objects of the
-  pipeline's artifact bucket, where each execution's synthesized templates are; and write to the
-  function's own log group. Nothing else: every action it is allowed is one of `REPORTER_READS`,
+  (section 8.2, step 7), may read the reporter's one secret, `rhi/reporter/github-app`; read and
+  list the executions of the template's own pipeline, and of no other pipeline; the events of the
+  stacks that pipeline deploys, by the names its CloudFormation actions give them, and of no other
+  stack; the objects of the pipeline's artifact bucket, where each execution's synthesized
+  templates are; and write to the function's own log group. Nothing else: every action it is allowed is one of `REPORTER_READS`,
   each on resources of its kind only, and a wildcard action, `NotAction`, `NotResource` and a
   managed policy the template does not hold are taken as reaching more.
 
@@ -152,6 +152,7 @@ REPORTER_READS = {
     "codepipeline:GetPipelineExecution": "pipeline",
     "codepipeline:GetPipelineState": "pipeline",
     "codepipeline:ListActionExecutions": "pipeline",
+    "codepipeline:ListPipelineExecutions": "pipeline",
     "cloudformation:DescribeStackEvents": "stacks",
     "s3:GetObject": "artifacts",
     "logs:CreateLogStream": "logs",
@@ -1007,6 +1008,10 @@ def the_artifacts(_cdk: ModuleType, _stack: Any, pipeline: Any) -> str:
     return pipeline.artifact_bucket.arn_for_objects("*")
 
 
+def another_pipeline(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return stack.format_arn(service="codepipeline", resource="Another")
+
+
 def another_bucket(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
     return cdk.aws_s3.Bucket(stack, "Another").arn_for_objects("*")
 
@@ -1020,7 +1025,12 @@ def every_resource(_cdk: ModuleType, _stack: Any, _pipeline: Any) -> str:
 NARROW: list[tuple[list[str], Names]] = [
     (["secretsmanager:GetSecretValue"], the_secret(f"{REPORTER_SECRET}-??????")),
     (
-        ["codepipeline:GetPipelineExecution", "codepipeline:GetPipelineState", "codepipeline:ListActionExecutions"],
+        [
+            "codepipeline:GetPipelineExecution",
+            "codepipeline:GetPipelineState",
+            "codepipeline:ListActionExecutions",
+            "codepipeline:ListPipelineExecutions",
+        ],
         the_pipeline,
     ),
     (["cloudformation:DescribeStackEvents"], the_stack("Rhi-Endpoint")),
@@ -1077,6 +1087,10 @@ def test_keeps_a_reporter_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) 
         ),
         pytest.param(a_reporter(("secretsmanager:*", the_secret(f"{REPORTER_SECRET}-??????"))), id="a wildcard action"),
         pytest.param(a_reporter(("s3:GetObject", another_bucket)), id="another bucket"),
+        pytest.param(
+            a_reporter(("codepipeline:ListPipelineExecutions", another_pipeline)),
+            id="another pipeline's executions",
+        ),
         pytest.param(a_reporter(("cloudformation:DescribeStackEvents", every_resource)), id="every resource"),
         pytest.param(
             a_reporter(("cloudformation:DescribeStackEvents", the_stack("Unrelated"))),

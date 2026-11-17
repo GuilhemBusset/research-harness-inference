@@ -14,7 +14,13 @@ in that order with `rhi_reporter.github`.
   reports under each of them, as one of their actions, so that a failure there ends the stage's
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
   events of those steps' stages post nothing: their actions say it all.
-- An execution's own events post nothing. The superseded description is not given here.
+- An execution's own event, at its start and at its end, gives the statuses of the commits a
+  self-update left without an execution (`rhi_reporter.superseded`): those this execution covers,
+  and its own commit when this execution was cancelled and a later one covers it. They are read
+  from the pipeline's executions, newest first, down to the first execution older than this one
+  that ended with a verdict. Under each stage, such a commit is pending, naming the covering
+  commit, while the covering execution runs, and gets its final state once it has ended, with
+  the state of its verification when that ran.
 - A pending status is not posted once the stage has ended for the same execution, once one of
   the execution's stages has stopped short (failed, stopped or cancelled), or once the execution
   itself has ended: events arrive in no guaranteed order, and a late pending status, of the stage
@@ -56,9 +62,9 @@ from typing import TYPE_CHECKING, Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from rhi_reporter import github
+from rhi_reporter import github, superseded
 from rhi_reporter.report import build_report, statuses_of
-from rhi_reporter.status import State, status_for
+from rhi_reporter.status import VERIFY_ACTION, State, status_for
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -67,6 +73,7 @@ if TYPE_CHECKING:
 
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 
+PIPELINE_CHANGE = "CodePipeline Pipeline Execution State Change"
 STAGE_CHANGE = "CodePipeline Stage Execution State Change"
 ACTION_CHANGE = "CodePipeline Action Execution State Change"
 
@@ -85,10 +92,14 @@ STOPPED_SHORT = frozenset({"Failed", "Stopped", "Cancelled"})
 EXECUTION_ENDED = frozenset({"Succeeded", "Failed", "Stopped", "Stopping", "Cancelled", "Superseded"})
 # At most this many pages of a stack's events are read: 100 events each.
 EVENT_PAGES = 10
+# At most this many pages of the pipeline's executions are read: 100 executions each.
+EXECUTION_PAGES = 10
 
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
+NO_EXECUTIONS = "No superseded commit was reported: the pipeline's executions could not be read."
+NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -129,6 +140,9 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
     as `github.StatusClient` has it. `stages` are the stages the pipeline deploys."""
     kind, detail = event.get("detail-type"), event.get("detail")
+    if kind == PIPELINE_CHANGE and isinstance(detail, dict):
+        _supersede(detail, aws=aws, client=client, stages=stages)
+        return
     if kind not in (STAGE_CHANGE, ACTION_CHANGE) or not isinstance(detail, dict):
         return
     stage, action = detail.get("stage"), detail.get("action") if kind == ACTION_CHANGE else None
@@ -163,6 +177,73 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
                     _post(client, fact)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
+
+
+def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
+    """Posts the statuses of the superseded commits that the execution of `detail` covers, or
+    whose execution it is."""
+    if not stages:
+        return
+    if not github.has_credential(aws.secrets):
+        logger.warning(NO_CREDENTIAL)
+        return
+    pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
+    try:
+        executions = _executions(aws.codepipeline, pipeline, execution)
+    except (BotoCoreError, ClientError):
+        logger.warning(NO_EXECUTIONS)
+        return
+    try:
+        for cover in superseded.covers(executions):
+            if execution not in (cover.superseded.execution_id, cover.covering.execution_id):
+                continue
+            for stage in stages:
+                verification = _verification(aws.codepipeline, pipeline, cover, stage) if cover.ended else None
+                for status in superseded.statuses_for(cover, stage, verification):
+                    _post(client, status)
+    except github.CredentialError:
+        logger.warning(NO_CREDENTIAL)
+
+
+def _executions(codepipeline: Any, pipeline: object, execution: object) -> list[superseded.Execution]:
+    """The pipeline's executions, newest first, down to the first one older than `execution`
+    that did not end superseded: no older one is covered by, or covers, `execution`."""
+    found: list[superseded.Execution] = []
+    seen = False
+    token: str | None = None
+    for _ in range(EXECUTION_PAGES):
+        page = {"nextToken": token} if token else {}
+        answer = codepipeline.list_pipeline_executions(pipelineName=pipeline, maxResults=100, **page)
+        for summary in answer.get("pipelineExecutionSummaries", []):
+            record = superseded.execution_of(summary)
+            if record is None:
+                continue
+            found.append(record)
+            if record.execution_id == execution:
+                seen = True
+            elif seen and record.status not in superseded.SUPERSEDED_STATUSES:
+                return found
+        token = answer.get("nextToken")
+        if not token:
+            break
+    return found
+
+
+def _verification(codepipeline: Any, pipeline: object, cover: superseded.Cover, stage: str) -> str | None:
+    """The status of the latest run of the action named Verify of `stage` in the covering
+    execution, as CodePipeline spells it. None when it did not run, or cannot be read."""
+    try:
+        runs = [
+            detail
+            for detail in _action_executions(codepipeline, pipeline, cover.covering.execution_id)
+            if (detail.get("stageName"), detail.get("actionName")) == (stage, VERIFY_ACTION)
+        ]
+        latest = max(runs, key=lambda detail: detail["startTime"], default=None)
+    except (BotoCoreError, ClientError, KeyError, TypeError):
+        logger.warning(NO_VERIFICATION)
+        return None
+    status = latest.get("status") if latest is not None else None
+    return status if isinstance(status, str) else None
 
 
 def _post(client: Any, status: CommitStatus) -> None:
