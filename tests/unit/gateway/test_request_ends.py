@@ -445,3 +445,99 @@ def test_a_limit_already_reached_wins_over_a_waiting_chunk() -> None:
         assert [clean for _, _, clean, _ in ledger.settled] == [False]
 
     run(scenario)
+
+
+@pytest.mark.parametrize("entry", FORMATS, ids=lambda entry: entry.path)
+def test_an_error_event_whose_data_spans_lines_is_replaced(entry: routes.Route) -> None:
+    wire_format = entry.wire_format
+    assert isinstance(wire_format, WireFormat)
+    name, data = {
+        routes.MESSAGES: ("error", {"type": "error", "error": {"message": ENGINE_TEXT}}),
+        routes.CHAT_COMPLETIONS: (None, {"error": {"message": ENGINE_TEXT}}),
+        routes.RESPONSES: (
+            "response.failed",
+            {"type": "response.failed", "response": {"error": {"message": ENGINE_TEXT}}},
+        ),
+    }[entry]
+    # One data value carried by several `data:` lines, which the reader joins.
+    lines = "".join(f"data: {line}\n" for line in json.dumps(data, indent=2).splitlines())
+    error = ((f"event: {name}\n" if name else "") + lines + "\n").encode()
+
+    async def scenario() -> None:
+        app, key, ledger = gateway(Upstream([STARTS[entry], error]), Clock())
+        call = Call(app, key, entry)
+        await call.ended()
+        assert call.body == STARTS[entry] + render_stream_event(Cause.ENGINE_ERROR, wire_format)
+        assert len(ledger.settled) == 1
+
+    run(scenario)
+
+
+def test_an_answer_of_an_unexpected_shape_is_settled() -> None:
+    async def scenario() -> None:
+        answer = json.dumps({"type": [], "usage": {"input_tokens": 5000, "output_tokens": 7}}).encode()
+        app, key, ledger = gateway(Upstream([answer], content_type="application/json"), Clock())
+        call = Call(app, key, routes.MESSAGES, stream=False)
+        await call.ended()
+        assert len(ledger.settled) == 1
+        assert ledger.leases() == {}
+
+    run(scenario)
+
+
+def test_a_limit_reached_with_the_end_of_an_answer_wins() -> None:
+    async def scenario() -> None:
+        clock = Clock()
+
+        async def upstream(request: httpx.Request) -> httpx.Response:
+            async def body() -> AsyncIterator[bytes]:
+                yield WHOLE_ANSWER
+                # The limit is reached as the answer ends: both are ready together.
+                clock.now = LIMIT
+                for at, wake in clock._sleepers:
+                    if at <= LIMIT and not wake.done():
+                        wake.set_result(None)
+
+            return httpx.Response(200, headers={"content-type": "application/json"}, content=body())
+
+        app, key, ledger = gateway(upstream, clock)  # ty: ignore[invalid-argument-type] - a bare handler stands in for the Upstream
+        call = Call(app, key, routes.MESSAGES, stream=False)
+        await call.ended()
+        assert (call.status, call.body) == (504, render_json(Cause.TIME_LIMIT, WireFormat.MESSAGES).body)
+        assert [clean for _, _, clean, _ in ledger.settled] == [False]
+
+    run(scenario)
+
+
+async def settled(ledger: Ledger) -> None:
+    while not ledger.settled:
+        await asyncio.sleep(0.001)
+
+
+def test_the_limit_ends_a_request_whose_client_does_not_take_a_write() -> None:
+    async def scenario() -> None:
+        clock = Clock()
+        upstream = Upstream([MESSAGES_START], "stall")
+        app, key, ledger = gateway(upstream, clock)
+        taken = asyncio.Event()
+
+        class Stuck(Call):
+            async def _send(self, message: Message) -> None:
+                await super()._send(message)
+                if message.get("body") == MESSAGES_START:
+                    await taken.wait()  # The client does not take this write until the test lets it.
+
+        call = Stuck(app, key, routes.MESSAGES)
+        await call.got_some.wait()
+        await clock.advance_to(LIMIT)
+        # Settled at the limit, the write never taken: the client is not waited for. The ledger is
+        # called in a worker thread, hence the wait, with a guard that is not the clock under test.
+        await asyncio.wait_for(settled(ledger), timeout=10)
+        assert [clean for _, _, clean, _ in ledger.settled] == [False]
+        assert ledger.leases() == {}
+        assert not taken.is_set()
+        await call.ended()
+        assert call.body == MESSAGES_START + render_stream_event(Cause.TIME_LIMIT, WireFormat.MESSAGES)
+        assert len(ledger.settled) == 1
+
+    run(scenario)
