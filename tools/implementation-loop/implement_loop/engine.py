@@ -2980,10 +2980,12 @@ class Engine:
         coord = self.ws.coord()
         head = self.ws.head(coord)
         with self.ws.disposable(coord) as scratch:
+            # behaviour only: a later reviewed merge may change this issue's locked tests on main
             ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
                                                       sorted(set(st.tests) | set(st.probes)), in_tree(st.manifest) or None,
                                                       self.caps.check_timeout_s, extra_env=self.check_env,
-                                                      standing=standing_checks(), mounts=self._mounts(scratch))
+                                                      check_tamper=False, standing=standing_checks(),
+                                                      mounts=self._mounts(scratch))
         self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
         if not ok:
             env = environment_problem(evidence)

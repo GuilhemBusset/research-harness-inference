@@ -88,6 +88,23 @@ class DeletedOnMainTests(unittest.TestCase):
         self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed",
                                    "pytest tests/test_other.py tests/test_gone.py"])
 
+    def test_the_check_on_main_after_a_merge_is_behaviour_only(self):
+        # #69 waited, a later reviewed merge changed its locked test on main, and the tamper check
+        # read that as a broken main (2026-11-17)
+        self.engine.store.put(IssueState(number=9, locked={"tests/test_a.py": "digest"}))
+        asked = []
+        self.engine._requirements_current = lambda n: True  # ty: ignore[invalid-assignment]  # test double
+        self.engine.ws = SimpleNamespace(coord=lambda: self.tmp, head=lambda root: "abc123",  # ty: ignore[invalid-assignment]  # test double
+                                         disposable=contextlib.nullcontext)
+        self.engine._specs = lambda st: []  # ty: ignore[invalid-assignment]  # test double
+        self.engine.caps, self.engine.check_env = Caps(), {}
+        self.engine._mounts = lambda root: None  # ty: ignore[invalid-assignment]  # test double
+        self.engine._fix_forward = lambda n, feedback: asked.append(feedback)  # ty: ignore[invalid-assignment]  # test double
+        with mock.patch.object(engine_module.verify, "verify",
+                               lambda *a, **k: asked.append(k["check_tamper"]) or (False, [], ["A1 failed"], [])):
+            self.engine._accept(9)
+        self.assertEqual(asked[0], False, "a locked file main changed since is no tampering")
+
     def test_a_check_that_fails_once_is_checked_again_and_fails_only_twice(self):
         coord = self.tmp / "coord"
         (coord / "scripts").mkdir(parents=True)
