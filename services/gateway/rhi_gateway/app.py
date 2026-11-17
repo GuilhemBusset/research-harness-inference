@@ -232,7 +232,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 ended_cleanly=observed.ended_cleanly,
             )
 
-        return await forwarding.proxy.forward(entry, forwarded, settle)
+        return await forwarding.proxy.forward(entry, forwarded, settle, receive=request.receive)
 
     return handler
 
