@@ -49,7 +49,9 @@ apply or changes another file than its entry names. Then, for each defect, it:
 3. calls the examiner role through the engine's agent interface (`Agents.examine`, with the engine's
    live agents and their sandbox), with the defect's task as the issue and the patch as the change;
 4. records whether a finding names the defect: it points at the patched file and names the class's
-   invariant or one of the defect's words. It also records whether the examiner certified the change;
+   invariant or one of the defect's `match` phrases, each of which states the defect itself (the
+   permission, the open range, the lost protection, the skipped check), so a finding on something
+   else in the same file stays a miss. It also records whether the examiner certified the change;
 5. deletes the scratch worktree.
 
 It never commits, branches, tags, pushes or merges, in this repository or anywhere else.

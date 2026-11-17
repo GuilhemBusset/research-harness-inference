@@ -7,7 +7,8 @@ records. For each defect the runner builds a scratch worktree of that commit out
 repository, applies the patch there and leaves it uncommitted, and asks the examiner role for its
 findings through the engine's agent interface (`Agents.examine`), the call the implement loop makes
 before it certifies a head. A defect is caught when one finding points at the patched file and
-names the defect: the safety invariant of its class, or one of the defect's own words. The report,
+names the defect: the safety invariant of its class, or one of the defect's `match` phrases, each a
+statement of the defect itself, never an incidental word of the file or of the task. The report,
 with the catch rate per class, is written outside the repository.
 
 Nothing here commits, branches, tags or pushes. A scratch worktree is a fresh repository with no
@@ -119,10 +120,10 @@ def _points_at(finding: Finding, file: str, text: str) -> bool:
 
 def names_defect(finding: Finding, defect: Defect, invariants: Sequence[str]) -> bool:
     """Whether `finding` points at the defect's file and names the defect: one of its class's
-    safety invariants, or one of the defect's own words."""
-    text = " ".join(
-        part for part in (finding.title, finding.observed, finding.expected, finding.quote, finding.invariant) if part
-    ).lower()
+    safety invariants, or one of the defect's `match` phrases in what the finding says. The
+    finding's `quote` is left out: it quotes the task, which never names the defect."""
+    text = " ".join(part for part in (finding.title, finding.observed, finding.expected, finding.invariant) if part)
+    text = text.lower()
     if not _points_at(finding, defect.file, text):
         return False
     invariant = (finding.invariant or "").strip().lower()
