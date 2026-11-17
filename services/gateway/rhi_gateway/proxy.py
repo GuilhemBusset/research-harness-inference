@@ -22,11 +22,13 @@ chunk arrives. Each chunk is also fed to the usage parser of the request's wire 
 6.2, step 6): Messages and Responses read beside the stream; Chat Completions forwards what its
 parser returns, which hides the usage chunk the gateway asked for from a client that did not. On
 its way to the client the stream passes one more reader, which keeps the engine's own errors out
-of it: of a line not yet ended, only its field name (`event:`, `data:`) is forwarded at once, and
-its value once the line is whole; an event with a name is judged by its name line, and an event
-without one (as Chat Completions sends them) is held until it ends and judged by its data. An
-event that is an error (named `error` or `response.failed`, or whose data is a JSON object whose
-`type` is `error` or whose `error` is set) is never forwarded: the stream ends there (below).
+of it: of an event's first line, not yet ended, only its field name (`event:`, `data:`) is
+forwarded at once, and its value once the line is whole. An event with a name is judged first by its name line, which is
+forwarded once whole unless it names an error; the rest of the event, and the whole of an event
+without a name (as Chat Completions sends them), is held until the event ends and judged with its
+data, however many lines carry it. An event that is an error (named `error` or `response.failed`,
+or whose data is a JSON object whose `type` is `error` or `response.failed` or whose `error` is
+set) is never forwarded: the stream ends there (below).
 
 An answer that is not a stream is read whole before any of it is sent. It is sent only if it is a
 whole answer of its format that reports its usage, read by the format's `read_answer` (a token
@@ -48,15 +50,19 @@ ends:
   cause, and nothing follows it. None of the engine's own answer, its body, its headers or its
   error events, is sent in either case;
 - **the time limit**: a request may run `longest_request_seconds` at most, 1,800 by default
-  (section 17), counted from the moment it is forwarded. Every wait on the engine races that
-  deadline, and a deadline already past wins over an answer already waiting. A request that
-  reaches it is ended with the cause `time_limit`: 504 if nothing was sent, the error event of
-  its wire format on a stream;
+  (section 17), counted from the moment it is forwarded. Every wait on the engine, and every
+  write of a stream to the client, races that deadline, and a deadline reached wins over an
+  answer or a write that is ready with it. A request that reaches it is ended with the cause
+  `time_limit`: 504 if nothing was sent, the error event of its wire format on a stream. A write
+  to the client under way at the limit is given up, the engine's answer is closed and the request
+  settled, and the error event is then written for a client that still takes it;
 - **the client leaves**: while the gateway waits for the engine's headers or for an answer that is
   not a stream, the client's disconnect is listened for and ends the wait; once a stream has
   started, Starlette's own listener does. The engine's answer is closed and nothing more is sent.
 
-The error answers and events are those of `rhi_gateway.errors`, which reads nothing but the cause.
+A stream is settled as soon as its end is known, before its last bytes are written to the client,
+so that a client slow to read them holds no reservation. The error answers and events are those of
+`rhi_gateway.errors`, which reads nothing but the cause.
 A stream cut in the middle of an event has that event closed before the error event, so that the
 error is read as an event of its own; where what the client has of the open event is the start of
 the error event (`event: `, `data: `), the error event is completed from there instead.
@@ -83,7 +89,7 @@ from typing import Any, Protocol
 
 import httpx
 from starlette.responses import Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from rhi_common.causes import Cause
 from rhi_gateway import routes
@@ -208,8 +214,13 @@ def _json_object(body: bytes | str) -> dict[str, object]:
 
 
 def _reports_failure(answer: Mapping[str, object]) -> bool:
-    """Whether an answer, or an event's data, is the engine's report of a failure."""
-    return answer.get("error") is not None or answer.get("type") in FAILURE_EVENTS or answer.get("status") == "failed"
+    """Whether an answer, or an event's data, is the engine's report of a failure; any field may be of any type."""
+    kind = answer.get("type")
+    return (
+        answer.get("error") is not None
+        or (isinstance(kind, str) and kind in FAILURE_EVENTS)
+        or answer.get("status") == "failed"
+    )
 
 
 def read_token_count(body: bytes) -> Observed:
@@ -248,12 +259,19 @@ def _is_failure(event: SseEvent) -> bool:
     return event.name in FAILURE_EVENTS or _reports_failure(_json_object(event.data))
 
 
+def _event_name(line: bytes) -> str:
+    """The name an `event:` line gives, as the SSE reader reads it: one space after the colon is not part of it."""
+    value = line[len(b"event:") :].rstrip(b"\r\n")
+    return value.removeprefix(b" ").decode("utf-8", "replace")
+
+
 class _ErrorGate:
     """Forwards a stream's bytes in order and stops at the first event that is an engine's error.
 
-    Of a line not yet ended, the field name is forwarded at once and the value waits for the end of
-    the line. An event with a name is judged by its name line; the lines of one without a name are
-    held from its first field until it ends, and judged with its data.
+    Of the first line of an event, not yet ended, the field name is forwarded at once and the value
+    waits for the end of the line. An event's name line is judged by the name it gives, and
+    forwarded if that is not an error's; every other line of an event is held until the event ends,
+    and judged with the event's data.
     """
 
     def __init__(self) -> None:
@@ -262,7 +280,7 @@ class _ErrorGate:
         self._line_sent = 0  # How much of it the client has.
         self._open = bytearray()  # What the client has of the event not yet ended.
         self._held = bytearray()  # Whole lines of that event the client does not have yet.
-        self._named = False  # Whether that event's name was read and is not an error.
+        self._named = False  # Whether that event's name line was read, forwarded, and is not an error's.
         self.failed = False  # An error event was read: nothing more is forwarded.
         self.failed_event_ended = False  # And the stream has reached that event's end.
 
@@ -279,7 +297,7 @@ class _ErrorGate:
             if self.failed_event_ended:
                 return bytes(forward)
         self._line += rest
-        if not self.failed and not self._held:
+        if not self.failed and not self._held and not self._named:
             colon = self._line.find(b":")
             if colon >= 0:
                 field_end = colon + 1 + (self._line[colon + 1 : colon + 2] == b" ")
@@ -295,9 +313,9 @@ class _ErrorGate:
         if self.failed:
             self.failed_event_ended = blank
             return
-        if self._named and line.startswith(b"data:"):
-            # A named event is judged by its name; its data still may not be an error's.
-            failure = failure or _reports_failure(_json_object(line[5:]))
+        first_name = line.startswith(b"event:") and not self._held and not self._named
+        if first_name and _event_name(line) in FAILURE_EVENTS:
+            failure = True  # Judged by its name, before any of its data is read.
         if failure:
             self.failed = True
             self.failed_event_ended = blank
@@ -309,14 +327,14 @@ class _ErrorGate:
             self._held.clear()
             self._open.clear()
             self._named = False
-        elif line.startswith(b":") and not self._held and len(self._open) == len(line) - len(unsent):
+        elif (
+            line.startswith(b":") and not self._held and not self._named and len(self._open) == len(line) - len(unsent)
+        ):
             # A comment between events, a keep-alive: sent as soon as it is whole, and part of no event.
             self._send(unsent, forward)
             self._open.clear()
-        elif line.startswith(b"event:") and not self._held:
+        elif first_name:
             self._named = True
-            self._send(unsent, forward)
-        elif self._named and not self._held:
             self._send(unsent, forward)
         else:
             self._held += unsent
@@ -360,10 +378,11 @@ class _Ends:
     def __init__(self, sleep: Callable[[float], Awaitable[None]], seconds: float, receive: Receive | None) -> None:
         self._timer = asyncio.ensure_future(sleep(seconds))
         self._left = None if receive is None else asyncio.ensure_future(_until_disconnect(receive))
-        self._step: asyncio.Future[Any] | None = None  # The wait on the engine under way.
+        self._step: asyncio.Future[Any] | None = None  # The wait on the engine, or the client, under way.
+        self.closed = False  # The request has ended: nothing is raced any more.
 
     def _check(self) -> None:
-        if self._timer.done():
+        if self._timer.done() and not self._timer.cancelled():
             raise TimeLimitReached
         if self._left is not None and self._left.done():
             raise ClientLeft
@@ -371,7 +390,8 @@ class _Ends:
     async def race[T](self, waited: Coroutine[Any, Any, T]) -> T:
         """What `waited` gives, unless the time limit or the client's leaving comes first.
 
-        A limit already reached wins over an answer already waiting: `waited` is not started.
+        A limit already reached wins over an answer already waiting: `waited` is not started. A
+        limit reached while `waited` ran wins over what `waited` gave, should both be ready together.
         """
         try:
             self._check()
@@ -387,8 +407,12 @@ class _Ends:
             # Cancelled as well when the request is (the client left): `close` waits for it to stop.
             if not step.done():
                 step.cancel()
-        if not step.done() or step.cancelled():
+        try:
             self._check()
+        except BaseException:
+            if step.done() and not step.cancelled():
+                step.exception()  # Retrieved: what the step gave is given up for the end that came with it.
+            raise
         self._step = None
         return step.result()
 
@@ -405,6 +429,7 @@ class _Ends:
 
     async def close(self) -> None:
         """Stop the timer and the listener, and wait for a cancelled wait on the engine to stop."""
+        self.closed = True
         self._timer.cancel()
         waits = [wait for wait in (self._step, self._left) if wait is not None]
         self._step = self._left = None
@@ -434,12 +459,15 @@ class _Settlement:
 class _Stream:
     """A streamed answer, open: its chunks for the client, the error event that ends a broken one, its usage."""
 
-    def __init__(self, response: httpx.Response, meter: _Meter, ends: _Ends, wire_format: WireFormat) -> None:
+    def __init__(
+        self, response: httpx.Response, meter: _Meter, ends: _Ends, wire_format: WireFormat, settle: _Settlement
+    ) -> None:
         self._response = response
         self._meter = meter
         self._gate = _ErrorGate()
-        self._ends = ends
+        self.ends = ends
         self._wire_format = wire_format
+        self._settle = settle
         self._clean = False
 
     @property
@@ -457,7 +485,7 @@ class _Stream:
         upstream = self._response.aiter_bytes()
         cause = Cause.ENGINE_ERROR
         try:
-            while (chunk := await self._ends.race(_next_chunk(upstream))) is not None:
+            while (chunk := await self.ends.race(_next_chunk(upstream))) is not None:
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
                     yield forward
@@ -467,9 +495,11 @@ class _Stream:
             cause = Cause.TIME_LIMIT
         except httpx.RequestError:
             pass  # The upstream broke off: the answer is cut where it stands.
-        if not self._gate.failed and self._meter.observed().ended_cleanly:
-            # The format's own clean end was read: the answer is whole, whatever came after it.
-            self._clean = True
+        # The format's own clean end was read: the answer is whole, whatever came after it.
+        self._clean = not self._gate.failed and self._meter.observed().ended_cleanly
+        # Settled before the last bytes are written, which a client may be slow to take.
+        await _to_the_end(self.end())
+        if self._clean:
             return
         # An error, ended early, broken off or out of time: the gateway's error event, and nothing after it.
         if self._gate.failed:
@@ -482,9 +512,13 @@ class _Stream:
         seen = self._meter.observed()
         return Observed(seen.input_tokens, seen.output_tokens, ended_cleanly=self._clean)
 
-    async def aclose(self) -> None:
-        await self._ends.close()
-        await self._response.aclose()
+    async def end(self) -> None:
+        """Close the engine's answer and settle the request with what was observed; once, however often called."""
+        try:
+            await self.ends.close()
+            await self._response.aclose()
+        finally:
+            await self._settle(self.observed)
 
 
 def _is_stream(content_type: str) -> bool:
@@ -575,7 +609,7 @@ class Proxy:
                     await ends.stop_listening()
                     streaming = True
                     meter = _stream_meter(route, forwarded)
-                    return ProxiedResponse(_Stream(response, meter, ends, wire_format), settle)
+                    return ProxiedResponse(_Stream(response, meter, ends, wire_format, settle))
                 chunks = response.aiter_bytes()
                 while (chunk := await ends.race(_next_chunk(chunks))) is not None:
                     received += chunk
@@ -583,7 +617,9 @@ class Proxy:
                     # Cut short, or the engine's report of a failure: none of it reaches the client.
                     return _error_answer(Cause.ENGINE_ERROR, wire_format)
                 whole = True
-                return Response(content=bytes(received), status_code=response.status_code, media_type=content_type or None)
+                return Response(
+                    content=bytes(received), status_code=response.status_code, media_type=content_type or None
+                )
             except TimeLimitReached:
                 return _error_answer(Cause.TIME_LIMIT, wire_format)
             except ClientLeft:
@@ -593,8 +629,16 @@ class Proxy:
                 return _error_answer(Cause.ENGINE_ERROR, wire_format)
         finally:
             if not streaming:
-                seen = read_whole_answer(route, bytes(received))
+                seen = _observed_of(route, bytes(received))
                 await _to_the_end(_close_and_settle(ends, response, settle, seen if whole else seen.unclean()))
+
+
+def _observed_of(route: Route, body: bytes) -> Observed:
+    """What an answer that is not a stream reported; nothing, should reading it fail, so that it is settled still."""
+    try:
+        return read_whole_answer(route, body)
+    except Exception:  # noqa: BLE001 - the settlement must be made whatever the engine sent; it then charges the estimate.
+        return Observed(0, 0, ended_cleanly=False)
 
 
 async def _close_and_settle(
@@ -617,6 +661,26 @@ async def _to_the_end(work: Awaitable[None]) -> None:
     await asyncio.shield(ending)
 
 
+class _LimitedSend:
+    """The client's `send`, each write racing the request's time limit until the request has ended."""
+
+    def __init__(self, send: Send, ends: _Ends) -> None:
+        self._send = send
+        self._ends = ends
+        self.started = False  # The answer's start has reached the client.
+
+    async def _write(self, message: Message) -> None:
+        await self._send(message)
+        if message["type"] == "http.response.start":
+            self.started = True
+
+    async def __call__(self, message: Message) -> None:
+        if self._ends.closed:
+            await self._write(message)
+        else:
+            await self._ends.race(self._write(message))
+
+
 class ProxiedResponse(StreamingResponse):
     """The client's stream: the upstream's chunks, then the settlement with what was observed, exactly once.
 
@@ -624,11 +688,23 @@ class ProxiedResponse(StreamingResponse):
     the cancellation that a client's disconnect brings, so that it is not lost.
     """
 
-    def __init__(self, stream: _Stream, settle: _Settlement) -> None:
+    def __init__(self, stream: _Stream) -> None:
         self._chunks = stream.chunks()
         super().__init__(self._chunks, status_code=stream.status_code, media_type=stream.content_type)
         self._stream = stream
-        self._settle = settle
+
+    async def stream_response(self, send: Send) -> None:
+        limited = _LimitedSend(send, self._stream.ends)
+        try:
+            await super().stream_response(limited)
+        except TimeLimitReached:
+            # The limit came during a write to the client, which is given up. The stream resumes, reaches
+            # its limit, and is settled; its error event is then written, should the client still take it.
+            if not limited.started:
+                return
+            async for chunk in self._chunks:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -639,9 +715,8 @@ class ProxiedResponse(StreamingResponse):
     async def _end(self) -> None:
         try:
             await self._chunks.aclose()
-            await self._stream.aclose()
         finally:
-            await self._settle(self._stream.observed)
+            await self._stream.end()
 
 
 # The ends under way, held until each is done: a task the loop alone refers to may be collected.
