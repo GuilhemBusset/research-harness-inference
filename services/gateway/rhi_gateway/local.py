@@ -1,0 +1,171 @@
+"""The routes the gateway answers itself: the models, the status and the hello (system design, sections 5.3, 6.2).
+
+Three of the four local routes of the table are answered here; the wake is not.
+
+| Route | Key | Answer |
+| --- | --- | --- |
+| `GET /v1/models` | needed | the model name of every configured pool, and which one the `claude-` names map to |
+| `GET /status` | needed | one record per configured pool: its model name, its state and, when unavailable, its cause |
+| `HEAD /api/hello` | none | 200 with no body |
+
+Every student may use every configured pool, so both lists are the configuration's, in its order.
+A request without a valid key is refused by `rhi_gateway.auth.authenticated` before anything here
+runs, and a key that is not well formed is refused with no lookup.
+
+A pool's state comes from what the gateway already keeps of it (`rhi_gateway.readiness`): whether
+it has a healthy target, its mode and the scaler's note. Answering reads nothing else, asks for no
+wake and reserves no budget: cheap calls never wake a GPU, and a status call is not demand
+(sections 5.1 and 5.3). The routes are given neither the waker nor the ledger.
+
+| State | When |
+| --- | --- |
+| `unavailable` | the hold's rule (`rhi_gateway.hold`) would end a request for the pool at once, with its cause: `pool_disabled`, `pool_ceiling_reached` or `pool_scheduled_only` |
+| `ready` | otherwise, when the pool has a healthy target |
+| `unavailable` | otherwise, with `capacity_unavailable`, when a launch found no capacity in the past 10 minutes |
+| `warming` | otherwise, when the scaler asked for capacity |
+| `cold` | otherwise |
+
+The first row is the hold itself, stepped once at the time of the call: the status cannot say a
+pool can start when a request for it would be refused. A step is pure, and the wake it may return
+is a value that is dropped here.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+
+from starlette.requests import Request
+from starlette.responses import Response
+
+from rhi_common.causes import Cause
+from rhi_common.pool_config import Pool
+from rhi_common.records import Mode, ScalerNote
+from rhi_gateway import routes
+from rhi_gateway.app import Handler
+from rhi_gateway.auth import Authenticator, authenticated
+from rhi_gateway.errors import WireFormat
+from rhi_gateway.hold import NO_CAPACITY_SECONDS, End, Hold
+from rhi_gateway.keystore import KeyRecord
+from rhi_gateway.readiness import PoolView
+from rhi_gateway.routes import Route
+
+# The mode a pool is in before the admin writes one, by its `wake` (section 11.3).
+_CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
+# The causes the hold's rule gives at once, before any deadline.
+_IMMEDIATE = frozenset({Cause.POOL_DISABLED, Cause.POOL_CEILING_REACHED, Cause.POOL_SCHEDULED_ONLY})
+
+
+class State(StrEnum):
+    """A pool's state as the status gives it (section 5.3)."""
+
+    READY = "ready"
+    WARMING = "warming"
+    COLD = "cold"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class PoolStatus:
+    """One pool's record in the status. `cause` is set exactly when the state is `unavailable`."""
+
+    model: str
+    state: State
+    cause: Cause | None = None
+
+    def to_json(self) -> dict[str, str]:
+        record = {"model": self.model, "state": self.state.value}
+        if self.cause is not None:
+            record["cause"] = self.cause.value
+        return record
+
+
+def _recently_found_none(note: ScalerNote | None, now: float) -> bool:
+    # Compared as the hold compares it at its deadline.
+    found_none_at = None if note is None else note.no_capacity_at
+    return found_none_at is not None and now - found_none_at <= NO_CAPACITY_SECONDS
+
+
+def pool_status(pool: Pool, view: PoolView, now: float) -> PoolStatus:
+    """The state of one pool at the time `now` (seconds since the epoch), from its kept view."""
+    mode = _CONFIGURED_MODE[pool.wake] if view.mode is None else view.mode.mode
+    # One step of a hold that starts now: what a request arriving now would be told at once.
+    first = Hold(pool, WireFormat.MESSAGES, streams=True, started_at=now).step(
+        now, mode=mode, note=view.note, ready=view.ready
+    )
+    for action in first:
+        if isinstance(action, End) and action.cause in _IMMEDIATE:
+            return PoolStatus(pool.name, State.UNAVAILABLE, action.cause)
+    if view.ready:
+        return PoolStatus(pool.name, State.READY)
+    if _recently_found_none(view.note, now):
+        return PoolStatus(pool.name, State.UNAVAILABLE, Cause.CAPACITY_UNAVAILABLE)
+    if view.note is not None and view.note.capacity_asked > 0:
+        return PoolStatus(pool.name, State.WARMING)
+    return PoolStatus(pool.name, State.COLD)
+
+
+def _json(body: object) -> Response:
+    return Response(
+        content=json.dumps(body, separators=(",", ":")).encode("ascii"),
+        status_code=200,
+        media_type="application/json",
+    )
+
+
+@dataclass(frozen=True)
+class LocalRoutes:
+    """What the three routes are made of: who is let in, the configured pools and the kept views.
+
+    `default_pool` is the pool of the `claude-` names, the one the body filters are given, or None
+    when the deployment has none. `views` gives the kept view of every pool
+    (`rhi_gateway.readiness.Readiness.views`); a pool it does not hold yet reads as not ready with
+    no records. `clock` gives the seconds since the epoch, the clock of the scaler's note.
+    """
+
+    authenticator: Authenticator
+    pools: tuple[Pool, ...]
+    views: Callable[[], Mapping[str, PoolView]]
+    default_pool: Pool | None = None
+    clock: Callable[[], float] = time.time
+
+    def __post_init__(self) -> None:
+        if self.default_pool is not None and self.default_pool not in self.pools:
+            raise ValueError("the default pool is not one of the configured pools")
+
+    def statuses(self) -> list[PoolStatus]:
+        """One record per configured pool, in the configuration's order."""
+        views, now = self.views(), self.clock()
+        return [pool_status(pool, views.get(pool.name, PoolView()), now) for pool in self.pools]
+
+    async def models(self, request: Request, entry: Route, student: KeyRecord) -> Response:
+        default = None if self.default_pool is None else self.default_pool.name
+        return _json(
+            {
+                "object": "list",
+                "data": [
+                    {"id": pool.name, "object": "model", "type": "model", "default": pool.name == default}
+                    for pool in self.pools
+                ],
+                "default": default,
+            }
+        )
+
+    async def status(self, request: Request, entry: Route, student: KeyRecord) -> Response:
+        return _json({"pools": [record.to_json() for record in self.statuses()]})
+
+    def handlers(self) -> dict[Route, Handler]:
+        """The handlers of the models, status and hello routes: the first two behind authentication."""
+        return {
+            routes.MODELS: authenticated(self.authenticator, self.models),
+            routes.STATUS: authenticated(self.authenticator, self.status),
+            routes.HELLO: hello,
+        }
+
+
+async def hello(request: Request, entry: Route) -> Response:
+    """The hello: 200 and no body, for anyone. It reads nothing."""
+    return Response(status_code=200)
