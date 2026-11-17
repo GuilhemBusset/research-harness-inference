@@ -118,4 +118,4 @@ def test_on_every_resource_only_the_five_session_actions(statements: list[dict[s
     assert on_every_resource == SESSION_ACTIONS
     # And no other statement than those above.
     services = {action.split(":")[0] for statement in statements for action in as_list(statement["Action"])}
-    assert services == {"dynamodb", "logs", "aps", "autoscaling", "ssm", "ssmmessages"}
+    assert services == {"dynamodb", "logs", "aps", "autoscaling", "secretsmanager", "ssm", "ssmmessages"}
