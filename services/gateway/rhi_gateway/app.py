@@ -354,7 +354,10 @@ class _Held:
                     return
                 else:
                     raise GatewayError(action.cause)
-            await self._until_next()
+            # A pool found ready since the last step is acted on at once, never after one more wait:
+            # the hold may first run, or resume from a keep-alive, well after its last step.
+            if not self._holding.view(self._pool).ready:
+                await self._until_next()
             actions = self._step()
 
     async def next_keep_alive(self) -> bytes:
