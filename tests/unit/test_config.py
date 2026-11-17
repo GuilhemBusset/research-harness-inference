@@ -185,6 +185,11 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("https_listener", f'"{MARK}"'),
         ("https_listener", '"true"'),
         ("https_listener", "1"),
+        *(
+            (key, value)
+            for key in ("issuer_reserved_concurrency", "key_issuances_per_day")
+            for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")
+        ),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -219,6 +224,17 @@ def test_https_listener_reads_false_when_left_out(tmp_path: Path) -> None:
     # The example turns the listener on, so that synthesis sees it.
     assert config.load({"RHI_CONFIG": "example"}).https_listener is True
     assert load_text(tmp_path, example_with(https_listener="false")).https_listener is False
+
+
+def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
+    # Section 17: the issuer's reserved concurrency and a student's issuances a day are both 5.
+    left_out = load_text(tmp_path, example_with(issuer_reserved_concurrency=None, key_issuances_per_day=None))
+    assert (left_out.issuer_reserved_concurrency, left_out.key_issuances_per_day) == (5, 5)
+    # The example gives each, at its default; a source that gives another value keeps it.
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert (example["issuer_reserved_concurrency"], example["key_issuances_per_day"]) == (5, 5)
+    given = load_text(tmp_path, example_with(issuer_reserved_concurrency="2", key_issuances_per_day="3"))
+    assert (given.issuer_reserved_concurrency, given.key_issuances_per_day) == (2, 3)
 
 
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

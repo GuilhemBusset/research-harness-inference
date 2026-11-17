@@ -51,6 +51,11 @@ on_demand_price_limit = 5
 # only pool when there is one; with two pools or more it must be given.
 default_pool = "mock"
 
+# The key issuer's reserved concurrency, and the most keys a student may be issued over one UTC
+# day (sections 6.4 and 17). Left out, each is 5.
+issuer_reserved_concurrency = 5
+key_issuances_per_day = 5
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
 #
