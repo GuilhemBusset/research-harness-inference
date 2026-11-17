@@ -1,0 +1,16 @@
+# What the role of `src/rhi/pools/group.py` may do, each action on each resource, with its reason.
+# The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The policy of each pool's custom resource that suspends zone rebalancing, attached to the role
+# of the function the CDK shares among the stack's custom resources (`pools_stack.toml`):
+# - autoscaling:SuspendProcesses on the pool's own group only, a group ARN whose condition is the
+#   group's tag rhi-pool with the pool's name: the custom resource suspends the group's process
+#   AZRebalance when the group is created or replaced.
+#
+# The launch template gives its instances no role: what an instance reads is another module's.
+
+[nag]
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
+"AwsSolutions-EC26" = "The rule cannot read the volumes of a group that names its launch template by reference; that launch template encrypts the one volume it gives an instance, which tests/synth/test_pool_group.py asserts."
+"AwsSolutions-AS3" = "A pool's group changes size only when the scaler sets its desired capacity, and the scaler records every change it makes; a topic of scaling events would add a resource that nothing in the design reads."
