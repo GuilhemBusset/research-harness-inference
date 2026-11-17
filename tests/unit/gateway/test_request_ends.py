@@ -541,3 +541,38 @@ def test_the_limit_ends_a_request_whose_client_does_not_take_a_write() -> None:
         assert len(ledger.settled) == 1
 
     run(scenario)
+
+
+@pytest.mark.parametrize("blocked", ["start", "clean end"])
+def test_the_limit_is_told_after_a_write_given_up(blocked: str) -> None:
+    async def scenario() -> None:
+        clock = Clock()
+        app, key, ledger = gateway(Upstream([MESSAGES_START, MESSAGES_END]), clock)
+        writing = asyncio.Event()
+
+        class Blocked(Call):
+            async def _send(self, message: Message) -> None:
+                at = (
+                    message["type"] == "http.response.start"
+                    if blocked == "start"
+                    else message.get("body") == MESSAGES_END
+                )
+                if at and not writing.is_set():
+                    writing.set()
+                    await _forever()  # This write is never taken; the client takes the ones after it.
+                await super()._send(message)
+
+        call = Blocked(app, key, routes.MESSAGES)
+        await asyncio.wait_for(writing.wait(), timeout=10)
+        await clock.advance_to(LIMIT)
+        await call.ended()
+        if blocked == "start":
+            assert (call.status, call.body) == (504, render_json(Cause.TIME_LIMIT, WireFormat.MESSAGES).body)
+        else:
+            # The clean end never reached the client: the answer did not end cleanly.
+            assert call.body == MESSAGES_START + render_stream_event(Cause.TIME_LIMIT, WireFormat.MESSAGES)
+        assert len(ledger.settled) == 1
+        assert ledger.settled[0][2] is False
+        assert ledger.settled[0][3] is not None and ledger.settled[0][3] >= ledger.estimate
+
+    run(scenario)
