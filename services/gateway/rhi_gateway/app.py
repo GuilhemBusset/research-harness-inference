@@ -12,7 +12,10 @@ ends. A clean end is charged the usage the engine reported; any other end, the t
 never less than the input estimate (`rhi_gateway.budget`). The reservation is made once the body is
 read and filtered, because it needs what only the body gives: the estimate of the input, the
 request's output limit, and the pool, whose hold sets how long the lease lasts. It is still made
-before anything is sent to the engine. The local answers are not written here.
+before anything is sent to the engine.
+
+The models, status and hello routes are answered by `rhi_gateway.local`: `build_app` fills their
+slots from the `LocalRoutes` it is given.
 
 Everything outside the table is answered 404 with the cause `not_found`, by this application and
 not by Starlette: no redirect to or from a trailing slash, and no 405 for another method on a
@@ -47,6 +50,7 @@ from rhi_gateway.routes import TABLE, Route, match
 if TYPE_CHECKING:
     from rhi_gateway.auth import Authenticator
     from rhi_gateway.keystore import KeyRecord
+    from rhi_gateway.local import LocalRoutes
 
 # What fills a slot: it gets the request and the table entry it was registered for.
 Handler = Callable[[Request, Route], Awaitable[Response]]
@@ -87,13 +91,19 @@ class TableRoute(BaseRoute):
         raise NoMatchFound(name, path_params)
 
 
-def build_app(handlers: Mapping[Route, Handler] | None = None) -> Starlette:
+def build_app(handlers: Mapping[Route, Handler] | None = None, *, local: LocalRoutes | None = None) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
-    A handler given for anything that is not an entry of the table is refused: the table is the
-    only way a route comes to exist.
+    `local`, when given, answers the models, status and hello routes (`rhi_gateway.local`); a
+    handler given for one of them as well is refused. A handler given for anything that is not an
+    entry of the table is refused: the table is the only way a route comes to exist.
     """
     given = dict(handlers or {})
+    if local is not None:
+        served = local.handlers()
+        if given.keys() & served.keys():
+            raise ValueError("a handler was given for a route that the local routes answer")
+        given.update(served)
     if any(entry not in TABLE for entry in given):
         raise ValueError("a handler was given for a route that is not in the table")
 
