@@ -1,5 +1,5 @@
-"""The pools stack: the pools' state and heartbeats, and later the internal load balancer, the
-groups and the scaler that use them (system design, sections 2, 4.2 and 5).
+"""The pools stack: the pools' state and heartbeats, the internal load balancer, the groups and the
+scaler that sizes them (system design, sections 2, 4.2 and 5).
 
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
 reference it back. The stack and the logical IDs of its tables are recorded in
@@ -15,6 +15,7 @@ from aws_cdk import custom_resources as cr
 
 from rhi.pools.group import PoolGroup
 from rhi.pools.routing import Routing
+from rhi.pools.scaler import Scaler
 from rhi.pools.tables import PoolTables
 
 if TYPE_CHECKING:
@@ -22,15 +23,25 @@ if TYPE_CHECKING:
 
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
+    from rhi.observability.stack import ObservabilityStack
 
 
 class PoolsStack(cdk.Stack):
     """Holds the pool-state and heartbeat tables, which the stack's later constructs take from
     `tables` (`tables.pool_state`, `tables.heartbeats`), the internal load balancer with one
     target group per pool, which they take from `routing` (`routing.target_groups[name]`), and each
-    pool's launch template and Auto Scaling group, from `groups[name]`."""
+    pool's launch template and Auto Scaling group, from `groups[name]`, and the scaler, from
+    `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke."""
 
-    def __init__(self, scope: Construct, construct_id: str, *, config: Config, network: NetworkStack) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        config: Config,
+        network: NetworkStack,
+        observability: ObservabilityStack,
+    ) -> None:
         super().__init__(scope, construct_id)
         # The VPC, its subnets and the internal load balancer's group are the network stack's: this
         # stack imports them through exports, the CDK's default, stated here. Network cannot drop an
@@ -59,6 +70,17 @@ class PoolsStack(cdk.Stack):
             )
             for pool in config.pools
         }
+        # The one writer of the groups' desired capacity, which writes its metrics to the workspace.
+        self.scaler = Scaler(
+            self,
+            "Scaler",
+            pools=config.pools,
+            groups=self.groups,
+            target_groups=self.routing.target_groups,
+            heartbeats=self.tables.heartbeats,
+            pool_state=self.tables.pool_state,
+            workspace=observability.prometheus,
+        )
         # The groups' custom resources run on one function the CDK puts at the stack's root. That
         # function names its role's ARN, which orders the two already; its `DependsOn` on the role
         # repeats it, and cfn-lint warns (W3005).
