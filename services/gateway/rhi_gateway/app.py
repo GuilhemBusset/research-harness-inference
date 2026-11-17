@@ -30,7 +30,7 @@ no hold. Otherwise the reservation is made, and only then is the scaler asked to
 - a stream is answered 200 at once with the keep-alives of its format, and the engine's stream
   follows on the same connection (`rhi_gateway.proxy.Proxy.held`);
 - a call that is not a stream is held in silence, then forwarded as any other; a client that
-  leaves meanwhile ends its hold.
+  leaves meanwhile ends its hold, and so does the cancellation of the request, which is settled still.
 
 A hold that ends, at its deadline (`warming`, or `capacity_unavailable`) or for any other cause,
 settles the reservation with nothing observed, which the ledger charges the input estimate, and
@@ -82,7 +82,7 @@ from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
-from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy
+from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
 from rhi_gateway.readiness import PoolView
 from rhi_gateway.routes import TABLE, Route, match
 
@@ -462,6 +462,10 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             except GatewayError as ended:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return _refusal(ended, entry)
+            except asyncio.CancelledError:
+                # The request itself is cancelled while held: it has ended, and its settlement is run to its end still.
+                await _to_the_end(settle(Observed(0, 0, ended_cleanly=False)))
+                raise
             if left:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return Response(status_code=CLIENT_LEFT_STATUS)
