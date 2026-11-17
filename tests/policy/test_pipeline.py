@@ -36,7 +36,15 @@ Rules hold those two, and every action:
   statement it is allowed whose actions reach a read of a parameter or a secret, or assume another
   role, which could read them in its place, names only parameters under that path, in the
   deploying account. A statement written as `NotAction` or `NotResource`, and a managed policy the
-  template does not hold, are taken as reaching everything.
+  template does not hold, are taken as reaching everything;
+- the role of a function that an EventBridge rule of a pipeline's template invokes, the reporter
+  (section 8.2, step 7), may read the reporter's one secret, `rhi/reporter/github-app`; the
+  executions of the template's own pipeline; the events of the stacks that pipeline deploys, by
+  the names its CloudFormation actions give them, and of no other stack; the objects of the
+  pipeline's artifact bucket, where each execution's synthesized templates are; and write to the
+  function's own log group. Nothing else: every action it is allowed is one of `REPORTER_READS`,
+  each on resources of its kind only, and a wildcard action, `NotAction`, `NotResource` and a
+  managed policy the template does not hold are taken as reaching more.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -61,6 +69,8 @@ if TYPE_CHECKING:
     Reviewed = list[tuple[str, list[tuple[str, str]]]]
     # What a test does to the pipeline's stack and to the pipeline, given the CDK library.
     Change = Callable[[ModuleType, Any, Any], None]
+    # What a statement of a reporter's role names, given the same.
+    Names = Callable[[ModuleType, Any, Any], str]
 
 # The reviewed list: the pipeline of `src/rhi/pipeline/stack.py`.
 REVIEWED: Reviewed = [
@@ -114,6 +124,22 @@ READS = (
     "sts:AssumeRole",
 )
 
+# The reporter's one secret, which the owner creates (section 8.6, step 3), and the actions its role
+# may be allowed, each with the kind of resource it may be allowed on.
+REPORTER_SECRET = "rhi/reporter/github-app"
+REPORTER_READS = {
+    "secretsmanager:GetSecretValue": "secret",
+    "codepipeline:GetPipelineExecution": "pipeline",
+    "codepipeline:GetPipelineState": "pipeline",
+    "codepipeline:ListActionExecutions": "pipeline",
+    "cloudformation:DescribeStackEvents": "stacks",
+    "s3:GetObject": "artifacts",
+    "logs:CreateLogStream": "logs",
+    "logs:PutLogEvents": "logs",
+}
+PARTITION = r"arn:(aws[a-z-]*|\$\{AWS::Partition\})"
+HERE = r"\$\{AWS::Region\}:\$\{AWS::AccountId\}"
+
 UNLISTED = "the pipeline has it and the reviewed list does not"
 MISSING = "the reviewed list has it and the pipeline does not"
 ANOTHER_ORDER = "the pipeline's stages and actions are not in the order of the reviewed list"
@@ -124,6 +150,7 @@ ANOTHER_TRIGGER = "a trigger other than a push to `main`"
 WEBHOOK = "a CodeBuild project with a webhook"
 NO_BOUNDARY = "a role without the permissions boundary of the bounded bootstrap"
 READS_MORE = "a synth role that may read more than the parameters under /rhi/config/"
+REPORTS_MORE = "a reporter's role that may do more than read its secret, its pipeline's records and templates"
 
 
 def resources(templates: Templates, kind: str) -> list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]:
@@ -374,6 +401,101 @@ def reads_more(statement: Mapping[str, Any]) -> bool:
     return not named or not all(arn is not None and CONFIGURATION.fullmatch(arn) for arn in named)
 
 
+def arn_text(value: Any) -> str | None:
+    """A resource of a statement as `Fn::Sub` would write it: a reference as `${Name}`, an
+    attribute as `${Name.Attribute}`. None when it is built any other way."""
+    if isinstance(value, str):
+        return None if "$" in value else value
+    if not isinstance(value, dict) or len(value) != 1:
+        return None
+    ((function, argument),) = value.items()
+    if function == "Ref" and isinstance(argument, str):
+        return "${" + argument + "}"
+    if function == "Fn::GetAtt" and isinstance(argument, list) and all(isinstance(part, str) for part in argument):
+        return "${" + ".".join(argument) + "}"
+    if function == "Fn::Sub" and isinstance(argument, str):
+        return argument
+    if function == "Fn::Join" and isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list):
+        parts = [arn_text(part) for part in argument[1]]
+        if isinstance(argument[0], str) and all(isinstance(part, str) for part in parts):
+            return argument[0].join(part for part in parts if part is not None)
+    return None
+
+
+def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
+    """The functions of a template that its EventBridge rules invoke, as `(function, its role)`,
+    the role None when the template does not hold it."""
+    functions = {
+        logical_id: properties for _, logical_id, properties, _ in resources({"": template}, "AWS::Lambda::Function")
+    }
+    found = []
+    for _, _, rule, _ in resources({"": template}, "AWS::Events::Rule"):
+        for target in as_list(rule.get("Targets", [])):
+            arn = target.get("Arn") if isinstance(target, dict) else None
+            function = arn["Fn::GetAtt"][0] if isinstance(arn, dict) and "Fn::GetAtt" in arn else None
+            if function not in functions:
+                continue
+            role = functions[function].get("Role")
+            held = isinstance(role, dict) and "Fn::GetAtt" in role and role["Fn::GetAtt"][0] in template["Resources"]
+            found.append((function, role["Fn::GetAtt"][0] if held else None))
+    return found
+
+
+def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, list[re.Pattern[str]]]:
+    """For each kind of resource of `REPORTER_READS`, what the reporter's role may name, as
+    `arn_text` writes it: the secret, the template's own pipelines, the stacks they deploy, their
+    artifact buckets' objects, and the function's own log group."""
+    pipelines = resources({"": template}, "AWS::CodePipeline::Pipeline")
+    stacks = {
+        action.get("Configuration", {}).get("StackName")
+        for _, _, pipeline, _ in pipelines
+        for _, actions in stages_of(pipeline)
+        for action in actions
+        if type_of(action) == CLOUDFORMATION
+    }
+    stores = [
+        store.get("Location")
+        for _, _, pipeline, _ in pipelines
+        for store in [pipeline.get("ArtifactStore", {})]
+        + [entry.get("ArtifactStore", {}) for entry in pipeline.get("ArtifactStores", [])]
+    ]
+    log_group = template["Resources"][function].get("Properties", {}).get("LoggingConfig", {}).get("LogGroup")
+    own_logs = log_group.get("Ref") if isinstance(log_group, dict) else None
+    return {
+        "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(REPORTER_SECRET)}-\?{{6}}")],
+        "pipeline": [
+            re.compile(rf"{PARTITION}:codepipeline:{HERE}:\$\{{{re.escape(pipeline_id)}\}}")
+            for _, pipeline_id, _, _ in pipelines
+        ],
+        "stacks": [
+            re.compile(rf"{PARTITION}:cloudformation:{HERE}:stack/{re.escape(name)}/\*")
+            for name in sorted(name for name in stacks if isinstance(name, str))
+        ],
+        "artifacts": [
+            re.compile(rf"\$\{{{re.escape(store['Ref'])}\.Arn\}}/\S*")
+            for store in stores
+            if isinstance(store, dict) and isinstance(store.get("Ref"), str)
+        ],
+        "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
+    }
+
+
+def reports_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]]) -> bool:
+    """Whether an allowed statement of the reporter's role reaches an action it is not given, or
+    a resource beyond those of the action's kind."""
+    if "NotAction" in statement or "NotResource" in statement:
+        return True
+    reads = {action.lower(): kind for action, kind in REPORTER_READS.items()}
+    named = [arn_text(resource) for resource in as_list(statement.get("Resource", []))]
+    for action in as_list(statement.get("Action", [])):
+        kind = reads.get(action.lower()) if isinstance(action, str) else None
+        if kind is None or not named:
+            return True
+        if not all(arn is not None and any(shape.fullmatch(arn) for shape in allowed[kind]) for arn in named):
+            return True
+    return False
+
+
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """Everything of the templates that a rule refuses, as `(template path, what it is named,
     what is refused)`: an action by its stage and name, a resource by its logical ID."""
@@ -427,6 +549,14 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
             statements = statements_of(template, role)
             if statements is None or any(reads_more(statement) for statement in statements):
                 found.append((path, role, READS_MORE))
+    for path, template in sorted(templates.items()):
+        if not resources({"": template}, "AWS::CodePipeline::Pipeline"):
+            continue
+        for function, role in reporter_roles(template):
+            allowed = reporter_resources(template, function)
+            statements = statements_of(template, role) if role is not None else None
+            if statements is None or any(reports_more(statement, allowed) for statement in statements):
+                found.append((path, role or function, REPORTS_MORE))
     return found
 
 
@@ -770,3 +900,121 @@ def test_keeps_a_synth_role_that_reads_the_configuration(cdk: ModuleType, tmp_pa
 def test_each_rule_refuses_its_breach(cdk: ModuleType, tmp_path: Path, changes: dict[str, Any], expected: str) -> None:
     assert refused(built(cdk, tmp_path / "kept")) == set()
     assert refused(built(cdk, tmp_path / "breached", **changes)) == {expected}
+
+
+def test_the_reporter_s_role_is_the_one_held(templates: dict[str, dict[str, Any]]) -> None:
+    # The rule above holds a role only once it finds it: the app's reporter is found.
+    found = [
+        role
+        for template in templates.values()
+        if resources({"": template}, "AWS::CodePipeline::Pipeline")
+        for _, role in reporter_roles(template)
+    ]
+    assert len(found) == 1 and found[0] is not None
+
+
+def the_secret(name: str) -> Names:
+    def arn(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        colon = cdk.ArnFormat.COLON_RESOURCE_NAME
+        return stack.format_arn(service="secretsmanager", resource="secret", resource_name=name, arn_format=colon)
+
+    return arn
+
+
+def the_stack(name: str) -> Names:
+    def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        return stack.format_arn(service="cloudformation", resource="stack", resource_name=f"{name}/*")
+
+    return arn
+
+
+def the_pipeline(_cdk: ModuleType, _stack: Any, pipeline: Any) -> str:
+    return pipeline.pipeline_arn
+
+
+def the_artifacts(_cdk: ModuleType, _stack: Any, pipeline: Any) -> str:
+    return pipeline.artifact_bucket.arn_for_objects("*")
+
+
+def another_bucket(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return cdk.aws_s3.Bucket(stack, "Another").arn_for_objects("*")
+
+
+def every_resource(_cdk: ModuleType, _stack: Any, _pipeline: Any) -> str:
+    return "*"
+
+
+# The narrow role: each action of `REPORTER_READS` on what it reads. The stage of `built` deploys
+# the stack `Rhi-Endpoint`.
+NARROW: list[tuple[list[str], Names]] = [
+    (["secretsmanager:GetSecretValue"], the_secret(f"{REPORTER_SECRET}-??????")),
+    (
+        ["codepipeline:GetPipelineExecution", "codepipeline:GetPipelineState", "codepipeline:ListActionExecutions"],
+        the_pipeline,
+    ),
+    (["cloudformation:DescribeStackEvents"], the_stack("Rhi-Endpoint")),
+    (["s3:GetObject"], the_artifacts),
+]
+
+
+def a_reporter(more: tuple[str, Names] | None = None, *, managed: bool = False) -> Change:
+    """A rule on the pipeline's state that invokes a function, whose role holds the narrow
+    statements, writes its own log group and, when asked, one more statement or the AWS managed
+    policy for a function's logs."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        iam, lambda_ = cdk.aws_iam, cdk.aws_lambda
+        logs = cdk.aws_logs.LogGroup(stack, "ReporterLogs")
+        role = iam.Role(stack, "ReporterRole", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"))
+        statements = [(["logs:CreateLogStream", "logs:PutLogEvents"], logs.log_group_arn)]
+        statements += [(actions, arn(cdk, stack, pipeline)) for actions, arn in NARROW]
+        if more is not None:
+            statements.append(([more[0]], more[1](cdk, stack, pipeline)))
+        for actions, resource in statements:
+            role.add_to_policy(iam.PolicyStatement(actions=actions, resources=[resource]))
+        if managed:
+            role.add_managed_policy(
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
+            )
+        function = lambda_.Function(
+            stack,
+            "Reporter",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            handler="index.handler",
+            code=lambda_.Code.from_inline("def handler(event, context):\n    pass\n"),
+            role=role,
+            log_group=logs,
+        )
+        pattern = cdk.aws_events.EventPattern(source=["aws.codepipeline"], resources=[pipeline.pipeline_arn])
+        targets = [cdk.aws_events_targets.LambdaFunction(function)]
+        cdk.aws_events.Rule(stack, "OnTheState", event_pattern=pattern, targets=targets)
+
+    return change
+
+
+def test_keeps_a_reporter_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path, change=a_reporter())
+    assert [role for template in templates.values() for _, role in reporter_roles(template)] != []
+    assert breaches(templates) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(
+            a_reporter(("secretsmanager:GetSecretValue", the_secret("rhi/other-??????"))), id="another secret"
+        ),
+        pytest.param(a_reporter(("secretsmanager:*", the_secret(f"{REPORTER_SECRET}-??????"))), id="a wildcard action"),
+        pytest.param(a_reporter(("s3:GetObject", another_bucket)), id="another bucket"),
+        pytest.param(a_reporter(("cloudformation:DescribeStackEvents", every_resource)), id="every resource"),
+        pytest.param(
+            a_reporter(("cloudformation:DescribeStackEvents", the_stack("Unrelated"))),
+            id="a stack the pipeline does not deploy",
+        ),
+        pytest.param(a_reporter(("codepipeline:StartPipelineExecution", the_pipeline)), id="another action"),
+        pytest.param(a_reporter(managed=True), id="a managed policy the template does not hold"),
+    ],
+)
+def test_refuses_a_reporter_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
+    assert refused(built(cdk, tmp_path / "kept", change=a_reporter())) == set()
+    assert refused(built(cdk, tmp_path / "breached", change=change)) == {REPORTS_MORE}
