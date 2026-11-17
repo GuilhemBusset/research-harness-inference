@@ -476,7 +476,7 @@ def read_ssm(client: Any = None) -> Config:
     return parse(data, "ssm")
 
 
-def _entry(pool: Pool) -> dict[str, object]:
+def pool_entry(pool: Pool) -> dict[str, object]:
     """A pool's entry, as the pool parser reads it: every field the pool holds, but its name."""
     entry: dict[str, object] = {}
     for field in dataclasses.fields(Pool):
@@ -493,7 +493,7 @@ def _pool_entries(value: object) -> dict[str, dict[str, object]] | None:
     """The table of a tuple of pools, or None when the value is not one."""
     if not isinstance(value, tuple) or not value or not all(isinstance(pool, Pool) for pool in value):
         return None
-    return {pool.name: _entry(pool) for pool in value}
+    return {pool.name: pool_entry(pool) for pool in value}
 
 
 def _json(value: object) -> str:
@@ -572,7 +572,7 @@ def write_ssm(config: Config, client: Any = None) -> None:
     texts = _written(config, _ssm_text, lambda key, text: key.from_text(text), "SSM")
     # The pools table has no parameter of its own: each entry is one, under the pool's name.
     del texts["pools"]
-    texts |= {f"pools/{pool.name}": _json(_entry(pool)) for pool in config.pools}
+    texts |= {f"pools/{pool.name}": _json(pool_entry(pool)) for pool in config.pools}
     client, errors = _ssm(client)
     for key, text in texts.items():
         name = SSM_PREFIX + key

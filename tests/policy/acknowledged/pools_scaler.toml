@@ -1,0 +1,28 @@
+# What the role of `src/rhi/pools/scaler.py` may do, each action on each resource, with its reason.
+# The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The scaler function's own role, which holds no AWS managed policy:
+# - autoscaling:SetDesiredCapacity, autoscaling:SetInstanceProtection, autoscaling:SuspendProcesses
+#   and autoscaling:ResumeProcesses on a group ARN by pattern, with the conditions that the group's
+#   tag aws:cloudformation:stack-id is the pools stack's ID and its tag rhi-pool names a pool of the
+#   stage: the scaler sets each pool's desired capacity, protects its instances from scale-in or
+#   lifts that protection, and suspends or resumes the group's Launch process.
+# - autoscaling:DescribeAutoScalingGroups, autoscaling:DescribeWarmPool,
+#   autoscaling:DescribeScalingActivities and elasticloadbalancing:DescribeTargetHealth on every
+#   resource: what a run reads of each group, its warm pool, its launches and its target group.
+# - the item reads and writes of DynamoDB on the heartbeat and pool-state tables, by their ARNs:
+#   a run reads the heartbeats and the pool's state, and writes its note and its memory.
+# - logs:CreateLogStream and logs:PutLogEvents on its own log group, /rhi/scaler.
+# - aps:RemoteWrite on the metrics workspace only, by its ARN: a run pushes the fleet's metrics.
+
+[nag]
+"AwsSolutions-L1" = "The scaler runs on the Lambda runtime of the Python that .python-version names, the one its tests and its bundle's libraries are built for, which packaging.RUNTIME holds for every function of the app."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its conditions on the tags aws:cloudformation:stack-id and rhi-pool narrow it to the pool groups of this stack."
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeAutoScalingGroups, DescribeWarmPool, DescribeScalingActivities and DescribeTargetHealth only on every resource, and the statement holds those four actions alone."
+
+[wildcard_actions]
+"autoscaling:DescribeAutoScalingGroups" = "AWS grants this action only on every resource, and the scaler reads with it each pool group's capacity, instances, protection and suspended processes."
+"autoscaling:DescribeWarmPool" = "AWS grants this action only on every resource, and the scaler reads with it the stopped instances of each pool's warm pool."
+"autoscaling:DescribeScalingActivities" = "AWS grants this action only on every resource, and the scaler reads with it the launches of each pool group that were abandoned or found no capacity."
+"elasticloadbalancing:DescribeTargetHealth" = "AWS grants this action only on every resource, and the scaler reads with it which instances of each pool's target group serve."

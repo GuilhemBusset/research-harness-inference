@@ -39,12 +39,13 @@ def reporter_functions(template: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
-    # The one rule on the default bus: the other is on the measurement bus.
+    # The one rule on the default bus that matches events: the other is on the measurement bus, and
+    # a schedule matches none.
     (rule,) = [
         rule
         for template in templates.values()
         for rule in of_type(template, "AWS::Events::Rule").values()
-        if "EventBusName" not in rule
+        if "EventBusName" not in rule and "EventPattern" in rule
     ]
     pattern = rule["EventPattern"]
     assert pattern["source"] == ["aws.codepipeline"]
