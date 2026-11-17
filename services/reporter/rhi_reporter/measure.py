@@ -22,10 +22,28 @@ address, an ARN or a sentence passes as a name. No error message repeats what wa
 enumeration, so it checks shapes only. A job that posts one run label twice on one commit, the
 second time in fewer parts, leaves a part of the first behind: the parts then repeat a name, or
 disagree on the state, and `decode` refuses them.
+
+**The measurement event.** A job cannot post a status: it holds no GitHub credential. It hands one
+run to the reporter as one EventBridge event on the measurement bus, the one its environment
+variable `BUS_VARIABLE` names (`src/rhi/pipeline/reporter.py`). `measurement_event` builds the
+entry the job gives PutEvents, of source `SOURCE`, and `read_event` gives the statuses of an event
+as EventBridge delivers it to the reporter. The event's detail holds, and nothing else of the event
+is read:
+
+- `commit`: the commit the job ran from, CodeBuild's `CODEBUILD_RESOLVED_SOURCE_VERSION`;
+- `measurement`: the id, one of `IDS`;
+- `label`: the run label;
+- `verdict`: `pass`, `fail` or `error`;
+- `names`: the enumeration of names the job declares, as a list;
+- `numbers`: the named numbers, as an object.
+
+`read_event` checks the shape of each, then hands them to `encode`, which checks them again as it
+checks a job's own call: whatever either refuses raises ValueError, and no status is built.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -38,6 +56,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 MEASURE_CONTEXT = "measure/"
+
+# The measurement event: its source, which the reporter's rule on the measurement bus matches, its
+# detail type, and the variable that names the bus to a job.
+SOURCE = "rhi.measurement"
+DETAIL_TYPE = "Measurement"
+BUS_VARIABLE = "RHI_MEASUREMENT_BUS"
+_DETAIL_KEYS = ("commit", "measurement", "label", "verdict", "names", "numbers")
 
 # The validation spikes of the design's section 12, the weekly GPU canary of section 8.2 and the
 # dry-run class of section 14. A record is named after its id in lower case
@@ -58,6 +83,10 @@ class Verdict(StrEnum):
     PASS = State.SUCCESS
     FAIL = State.FAILURE
     NOT_MEASURED = State.ERROR
+
+
+# The verdict as the event's detail writes it.
+_EVENT_VERDICTS = {Verdict.PASS: "pass", Verdict.FAIL: "fail", Verdict.NOT_MEASURED: "error"}
 
 
 @dataclass(frozen=True)
@@ -85,7 +114,7 @@ def encode(
     commit: str,
 ) -> list[CommitStatus]:
     """The statuses of one run, in the order of their parts. `names` is the enumeration the job
-    declares: every key of `numbers` is one of its members. ValueError, before any status is built,
+    declares: every member has the shape of a name, and every key of `numbers` is one of them. ValueError, before any status is built,
     for anything the module's rules do not allow."""
     if measurement not in IDS:
         raise ValueError("the id is not a measurement's")
@@ -96,10 +125,11 @@ def encode(
     if not isinstance(commit, str) or not _SHA.fullmatch(commit):
         raise ValueError("the commit is not a full commit SHA")
     declared = frozenset(names)
-    pairs = []
-    for name, number in numbers.items():
+    for name in (*declared, *numbers):
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise ValueError("a name is not lower-case letters, digits and underscores after a letter")
+    pairs = []
+    for name, number in numbers.items():
         if name not in declared:
             raise ValueError("a name is not in the enumeration the job declares")
         if isinstance(number, bool) or not isinstance(number, int | float) or not math.isfinite(number):
@@ -125,6 +155,53 @@ def encode(
         )
         for part, description in enumerate(descriptions, start=1)
     ]
+
+
+def measurement_event(
+    measurement: str,
+    label: str,
+    verdict: Verdict,
+    numbers: Mapping[str, int | float],
+    *,
+    names: Iterable[str],
+    commit: str,
+    bus: str,
+) -> dict[str, str]:
+    """The entry of PutEvents that hands one run to the reporter on the measurement bus `bus`, from
+    the commit the job ran from. ValueError for anything `encode` refuses: a job learns of it
+    before it sends."""
+    declared = list(names)
+    encode(measurement, label, verdict, numbers, names=declared, commit=commit)
+    detail = {
+        "commit": commit,
+        "measurement": measurement,
+        "label": label,
+        "verdict": _EVENT_VERDICTS[verdict],
+        "names": declared,
+        "numbers": dict(numbers),
+    }
+    return {"Source": SOURCE, "DetailType": DETAIL_TYPE, "Detail": json.dumps(detail), "EventBusName": bus}
+
+
+def read_event(event: Mapping[str, object]) -> list[CommitStatus]:
+    """The statuses of the measurement event `event`, as EventBridge delivers it, in the order of
+    their parts, on the commit it names. Only its detail is read. ValueError, before any status is
+    built, for a detail of another shape or anything `encode` refuses."""
+    detail = event.get("detail") if isinstance(event, dict) else None
+    if not isinstance(detail, dict) or not all(key in detail for key in _DETAIL_KEYS):
+        raise ValueError("the event's detail is not a measurement's")
+    commit, measurement, label, verdict, names, numbers = (detail[key] for key in _DETAIL_KEYS)
+    verdicts = {written: verdict for verdict, written in _EVENT_VERDICTS.items()}
+    if not isinstance(verdict, str) or verdict not in verdicts:
+        raise ValueError("the verdict is not pass, fail or error")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise ValueError("the declared names are not a list of names")
+    if not isinstance(numbers, dict):
+        raise ValueError("the numbers are not named")  # noqa: TRY004 - one error type for every refusal
+    if not isinstance(commit, str) or not isinstance(measurement, str) or not isinstance(label, str):
+        raise ValueError("the commit, the id or the run label is not text")  # noqa: TRY004 - as above
+    # A SHA is posted in lower case, the way GitHub writes it.
+    return encode(measurement, label, verdicts[verdict], numbers, names=names, commit=commit.lower())
 
 
 def context_parts(context: str) -> tuple[str, str, int]:

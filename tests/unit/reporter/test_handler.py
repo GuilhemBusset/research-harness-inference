@@ -1,5 +1,5 @@
-"""The reporter's function, on recorded sequences of CodePipeline's events, with stubs of the AWS
-services it reads and of the GitHub client it posts with.
+"""The reporter's function, on recorded sequences of CodePipeline's events and on the measurement
+events of a job, with stubs of the AWS services it reads and of the GitHub client it posts with.
 
 The events are shaped as EventBridge delivers them for the pipeline of `src/rhi/pipeline/stack.py`:
 the steps `Build/Synth` before the stage `Rhi`, whose actions check widened permissions, wait for
@@ -21,8 +21,9 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
-from rhi_reporter import handler
-from rhi_reporter.github import SECRET_VARIABLE
+from rhi_reporter import handler, measure
+from rhi_reporter.github import SECRET_VARIABLE, RefusedError
+from rhi_reporter.status import CommitStatus, State
 
 ACCOUNT = "123456789012"
 REGION = "us-east-1"
@@ -328,3 +329,65 @@ def test_no_secret_no_status(stub: Stub, secret: dict[str, str] | None, caplog: 
     assert client.posted == []
     assert [record.getMessage() for record in caplog.records] == [handler.NO_CREDENTIAL]
     assert MARKER not in caplog.text
+
+
+# A matrix of S5's kind: more numbers than one description holds.
+SPEEDS = {f"output_speed_s{streams}_p50": streams * 10.25 for streams in (1, 2, 4, 8, 16, 32, 64)}
+
+
+def measurement(commit: str, label: str) -> dict[str, Any]:
+    """The event EventBridge delivers for one run that a job sent from `commit`."""
+    entry = measure.measurement_event(
+        "S5", label, measure.Verdict.PASS, SPEEDS, names=list(SPEEDS), commit=commit, bus="rhi-measurements"
+    )
+    return wrapped(entry["DetailType"], json.loads(entry["Detail"])) | {"source": entry["Source"], "resources": []}
+
+
+def test_a_measurement_posts_its_statuses_on_the_job_s_commit(stub: Stub) -> None:
+    # Not the commit of the pipeline's execution: the one the event names.
+    job_commit = secrets.token_hex(20)
+    for label in ("8bit", "4bit"):
+        client = Client()
+        run([measurement(job_commit, label)], stub, client)
+        assert [context for _, _, context, _ in client.posted] == [f"measure/S5/{label}/1", f"measure/S5/{label}/2"]
+        assert {posted_on for posted_on, _, _, _ in client.posted} == {job_commit}
+        statuses = [CommitStatus(c, State(state), context, text) for c, state, context, text in client.posted]
+        (run_read,) = measure.decode(statuses)
+        assert (run_read.label, run_read.verdict, dict(run_read.numbers)) == (label, measure.Verdict.PASS, SPEEDS)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param({"numbers": SPEEDS | {"undeclared": 1}}, id="a name outside the declared enumeration"),
+        pytest.param({"measurement": "S99"}, id="an unknown id"),
+        pytest.param({"label": "8/bit"}, id="a run label with a slash"),
+        pytest.param({"commit": "not-a-sha"}, id="a commit that is not a SHA"),
+        pytest.param({"numbers": SPEEDS | {"output_speed_s1_p50": "12"}}, id="text where a number belongs"),
+    ],
+)
+def test_a_bad_measurement_posts_nothing(
+    stub: Stub, commit: str, change: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    event = measurement(commit, "8bit")
+    event["detail"] |= change
+    client = Client()
+    with caplog.at_level(logging.DEBUG):
+        run([event], stub, client)
+    assert client.posted == []
+    assert [record.getMessage() for record in caplog.records] == [handler.NOT_A_MEASUREMENT]
+
+
+def test_a_refused_measurement_is_logged_and_not_retried(stub: Stub, caplog: pytest.LogCaptureFixture) -> None:
+    class Refusing(Client):
+        def post_status(self, commit: str, state: str, context: str, description: str) -> None:
+            super().post_status(commit, state, context, description)
+            raise RefusedError(422, "unprocessable")
+
+    client = Refusing()
+    with caplog.at_level(logging.DEBUG):
+        run([measurement(secrets.token_hex(20), "8bit")], stub, client)
+    assert len(client.posted) == 1
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{handler.REFUSED} GitHub refused the call: HTTP 422, code unprocessable"
+    ]

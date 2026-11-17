@@ -48,7 +48,18 @@ Rules hold those two, and every action:
   `RHI_REPORTER_TOPIC` names, and to no other; and write to the function's own log group. Nothing
   else: every action it is allowed is one of `REPORTER_READS`,
   each on resources of its kind only, and a wildcard action, `NotAction`, `NotResource` and a
-  managed policy the template does not hold are taken as reaching more.
+  managed policy the template does not hold are taken as reaching more;
+- no role of any template but the reporter's may read the reporter's secret (section 8.4): the
+  App's key is the only GitHub credential in the account. A statement reaches the secret when one
+  of its actions matches a read of a secret (`SECRET_READS`) and one of its resources may name the
+  secret, in any partition, region and account and whatever six characters Secrets Manager adds
+  to its name, a wildcard and a value of the template read as matching anything; `NotAction` and
+  `NotResource` reach everything. A managed policy the template does not hold is taken as
+  reaching it too;
+- no role may both put events on the measurement bus, `rhi-measurements`, and read that secret: a
+  job sends the reporter its numbers because it must not hold the credential (section 12). A
+  statement reaches the bus when one of its actions matches `events:PutEvents` and one of its
+  resources may name the bus, in any partition, region and account, read as above.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -57,6 +68,7 @@ pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeli
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import re
 from pathlib import Path
@@ -161,8 +173,25 @@ REPORTER_READS = {
     "logs:CreateLogStream": "logs",
     "logs:PutLogEvents": "logs",
 }
+# What reads a secret, and every ARN of the reporter's secret and of the measurement bus, as patterns
+# that a resource of a statement must overlap to reach them (`overlaps`): any partition, region and
+# account, and the six characters Secrets Manager chooses and adds to a secret's name. `FIELD` stands
+# for one field of an ARN, any run of characters without a colon.
+FIELD = "\x00"
+SECRET_READS = ("secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue")
+SECRET_ARN = f"arn:{FIELD}:secretsmanager:{FIELD}:{FIELD}:secret:{REPORTER_SECRET}-??????"
+MEASUREMENT_BUS = "rhi-measurements"
+# The AWS managed policy CDK gives the functions it adds itself, CDK Pipelines' approval among them:
+# it allows creating a log group and writing logs, and nothing else.
+WRITES_LOGS_ONLY = re.compile(
+    r"arn:(aws[a-z-]*|\$\{AWS::Partition\}):iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+)
+PUTS_EVENTS = ("events:PutEvents",)
+BUS_ARN = f"arn:{FIELD}:events:{FIELD}:{FIELD}:event-bus/{MEASUREMENT_BUS}"
 PARTITION = r"arn:(aws[a-z-]*|\$\{AWS::Partition\})"
 HERE = r"\$\{AWS::Region\}:\$\{AWS::AccountId\}"
+# The pseudo parameters that fill one field of an ARN.
+PSEUDO_FIELD = re.compile(r"\$\{AWS::(Partition|Region|AccountId|URLSuffix)\}")
 
 UNLISTED = "the pipeline has it and the reviewed list does not"
 MISSING = "the reviewed list has it and the pipeline does not"
@@ -178,6 +207,8 @@ REPORTS_MORE = (
     "a reporter's role that may do more than read its secret, its pipeline's records and templates,"
     " and publish to its own topic"
 )
+SECRET_ELSEWHERE = "a role other than the reporter function's that may read the reporter's secret"
+MEASURES_AND_READS = "a role that may put events on the measurement bus and read the reporter's secret"
 # The variable that names the reporter's topic to its function.
 REPORTER_TOPIC = "RHI_REPORTER_TOPIC"
 
@@ -392,13 +423,18 @@ def synth_roles(template: Mapping[str, Any]) -> set[str]:
     return found
 
 
-def statements_of(template: Mapping[str, Any], role: str) -> list[Mapping[str, Any]] | None:
+def statements_of(
+    template: Mapping[str, Any], role: str, *, known: re.Pattern[str] | None = None
+) -> list[Mapping[str, Any]] | None:
     """Every statement a role of the template is allowed: those of the policies attached to it and
-    of its own. None when it holds a managed policy the template does not."""
+    of its own. None when it holds a managed policy the template does not, other than those whose
+    ARN `known` matches, whose statements the caller knows."""
     properties = template["Resources"][role].get("Properties", {})
     held = {logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::IAM::ManagedPolicy")}
     documents = [policy["PolicyDocument"] for policy in properties.get("Policies", [])]
     for arn in properties.get("ManagedPolicyArns", []):
+        if known is not None and known.fullmatch(written(arn) or ""):
+            continue
         if not (isinstance(arn, dict) and arn.get("Ref") in held):
             return None
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
@@ -453,9 +489,57 @@ def arn_text(value: Any) -> str | None:
     return None
 
 
+def overlaps(one: str, other: str) -> bool:
+    """Whether some text matches both patterns, where `*` stands for any run of characters, `FIELD`
+    for any run without a colon and `?` for any one character, as IAM reads a resource."""
+    runs = {"*", FIELD}
+
+    def absorbs(run: str, char: str) -> bool:
+        return run == "*" or char != ":"
+
+    @functools.cache
+    def rest(i: int, j: int) -> bool:
+        if i == len(one) or j == len(other):
+            return set(one[i:] + other[j:]) <= runs
+        a, b = one[i], other[j]
+        if a in runs:
+            return rest(i + 1, j) or ((b in runs or absorbs(a, b)) and rest(i, j + 1))
+        if b in runs:
+            return rest(i, j + 1) or (absorbs(b, a) and rest(i + 1, j))
+        return (a == b or "?" in (a, b)) and rest(i + 1, j + 1)
+
+    return rest(0, 0)
+
+
+def reaches(statement: Mapping[str, Any], actions: tuple[str, ...], arn: str) -> bool:
+    """Whether an allowed statement reaches one of `actions` on a resource of an ARN the pattern
+    `arn` matches. A value of the template in a resource, a reference or a pseudo parameter,
+    matches anything there, and a resource that cannot be read as text matches everything."""
+    if "NotAction" in statement or "NotResource" in statement:
+        return True
+    if not any(
+        isinstance(action, str) and fnmatch.fnmatchcase(wanted.lower(), action.lower())
+        for action in as_list(statement.get("Action", []))
+        for wanted in actions
+    ):
+        return False
+    for resource in as_list(statement.get("Resource", [])):
+        text = arn_text(resource)
+        if text is None or overlaps(arn, re.sub(r"\$\{[^}]*\}", "*", PSEUDO_FIELD.sub(FIELD, text))):
+            return True
+    return False
+
+
+def may(template: Mapping[str, Any], role: str, actions: tuple[str, ...], arn: str) -> bool:
+    """Whether a role of the template may do one of `actions` on `arn`: a managed policy the
+    template does not hold, but the one that only writes a function's logs, is taken as allowing it."""
+    statements = statements_of(template, role, known=WRITES_LOGS_ONLY)
+    return statements is None or any(reaches(statement, actions, arn) for statement in statements)
+
+
 def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
     """The functions of a template that its EventBridge rules invoke, as `(function, its role)`,
-    the role None when the template does not hold it."""
+    the role None when the template does not hold it. A function two rules invoke is named once."""
     functions = {
         logical_id: properties for _, logical_id, properties, _ in resources({"": template}, "AWS::Lambda::Function")
     }
@@ -468,7 +552,8 @@ def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
                 continue
             role = functions[function].get("Role")
             held = isinstance(role, dict) and "Fn::GetAtt" in role and role["Fn::GetAtt"][0] in template["Resources"]
-            found.append((function, role["Fn::GetAtt"][0] if held else None))
+            if (function, role["Fn::GetAtt"][0] if held else None) not in found:
+                found.append((function, role["Fn::GetAtt"][0] if held else None))
     return found
 
 
@@ -594,6 +679,21 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
             statements = statements_of(template, role) if role is not None else None
             if statements is None or any(reports_more(statement, allowed) for statement in statements):
                 found.append((path, role or function, REPORTS_MORE))
+    # The reporter's secret, read by its function's role and by no other; never by a role that may
+    # also put events on the measurement bus.
+    for path, template in sorted(templates.items()):
+        reporters = (
+            {role for _, role in reporter_roles(template)}
+            if resources({"": template}, "AWS::CodePipeline::Pipeline")
+            else set()
+        )
+        for _, role, _, _ in resources({"": template}, "AWS::IAM::Role"):
+            if not may(template, role, SECRET_READS, SECRET_ARN):
+                continue
+            if role not in reporters:
+                found.append((path, role, SECRET_ELSEWHERE))
+            if may(template, role, PUTS_EVENTS, BUS_ARN):
+                found.append((path, role, MEASURES_AND_READS))
     return found
 
 
@@ -1132,3 +1232,69 @@ def test_keeps_a_reporter_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) 
 def test_refuses_a_reporter_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
     assert refused(built(cdk, tmp_path / "kept", change=a_reporter())) == set()
     assert refused(built(cdk, tmp_path / "breached", change=change)) == {REPORTS_MORE}
+
+
+def a_role(
+    *, measures: bool = False, reads: Names | None = None, action: str = "secretsmanager:GetSecretValue"
+) -> Change:
+    """A job's role in the pipeline's stack, given the grant of `rhi.pipeline.reporter` when it
+    measures, and allowed `action` on what `reads` names when asked."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        from rhi.pipeline import reporter
+
+        role = cdk.aws_iam.Role(stack, "Job", assumed_by=cdk.aws_iam.ServicePrincipal("codebuild.amazonaws.com"))
+        if measures:
+            reporter.measuring_job(role, {})
+        if reads is not None:
+            statement = cdk.aws_iam.PolicyStatement(actions=[action], resources=[reads(cdk, stack, pipeline)])
+            role.add_to_policy(statement)
+
+    return change
+
+
+def test_keeps_a_job_given_the_measurement_grant(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path, change=a_role(measures=True))
+    _, role, _, template = next(found for found in resources(templates, "AWS::IAM::Role") if found[1].startswith("Job"))
+    statements = statements_of(template, role)
+    assert statements is not None and any(reaches(s, PUTS_EVENTS, BUS_ARN) for s in statements)
+    assert not may(template, role, SECRET_READS, SECRET_ARN)
+    assert breaches(templates) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(a_role(reads=the_secret(f"{REPORTER_SECRET}-??????")), {SECRET_ELSEWHERE}, id="by its name"),
+        pytest.param(
+            a_role(reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")), {SECRET_ELSEWHERE}, id="by its full name"
+        ),
+        pytest.param(a_role(reads=every_resource), {SECRET_ELSEWHERE}, id="on every resource"),
+        pytest.param(
+            a_role(reads=the_secret("rhi/*"), action="secretsmanager:*"), {SECRET_ELSEWHERE}, id="by wildcards"
+        ),
+        pytest.param(
+            a_role(measures=True, reads=the_secret(f"{REPORTER_SECRET}-??????")),
+            {SECRET_ELSEWHERE, MEASURES_AND_READS},
+            id="by a job given the measurement grant",
+        ),
+        pytest.param(
+            a_role(measures=True, reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")),
+            {SECRET_ELSEWHERE, MEASURES_AND_READS},
+            id="by its full name, by a job given the measurement grant",
+        ),
+    ],
+)
+def test_refuses_another_role_that_reads_the_reporter_s_secret(
+    cdk: ModuleType, tmp_path: Path, change: Change, expected: set[str]
+) -> None:
+    assert refused(built(cdk, tmp_path / "kept", change=a_role(reads=the_secret("rhi/other-??????")))) == set()
+    assert refused(built(cdk, tmp_path / "breached", change=change)) == expected
+
+
+def test_refuses_a_reporter_that_also_puts_measurements(cdk: ModuleType, tmp_path: Path) -> None:
+    def the_bus(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        return stack.format_arn(service="events", resource="event-bus", resource_name=MEASUREMENT_BUS)
+
+    templates = built(cdk, tmp_path, change=a_reporter(("events:PutEvents", the_bus)))
+    assert refused(templates) == {REPORTS_MORE, MEASURES_AND_READS}

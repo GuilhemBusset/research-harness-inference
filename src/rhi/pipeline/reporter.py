@@ -1,9 +1,18 @@
-"""The pipeline's reporter: an EventBridge rule on this pipeline's state and the function it invokes
-(system design, section 8.2, step 7, and section 8.4).
+"""The pipeline's reporter: an EventBridge rule on this pipeline's state, the measurement bus with a
+rule on it, and the function both rules invoke (system design, sections 8.2, step 7, 8.4 and 12).
 
 The rule matches CodePipeline's state changes of executions, stages and actions, of this pipeline
 and no other. Its one target is the function of `services/reporter/` (`rhi_reporter.handler`),
 which turns each event into commit statuses on the commit the execution deploys.
+
+**The measurement bus.** A spike, the weekly GPU canary or the dry run runs as a job that cannot
+post a status itself: the App's key is in the reporter's secret, which only the function may
+read, and a job holds no other GitHub credential. It hands each run of a measurement to the
+reporter as one event of source `rhi.measurement` on an EventBridge bus of its own,
+`MEASUREMENT_BUS_NAME`, which keeps a job's grant to one resource and its events apart from the
+pipeline's. A second rule, on that bus only, invokes the function for those events. A job's
+construct calls `measuring_job`: it lets the job's role put events on that bus and do nothing else,
+and gives the job the bus's name in `RHI_MEASUREMENT_BUS`. It grants nothing on the secret.
 
 **The secret is referred to, never created.** The function's GitHub credential is the status
 reporter App of section 8.6, step 3, whose private key only the owner holds. It is read from the
@@ -44,6 +53,8 @@ from constructs import Construct
 from rhi import packaging
 
 if TYPE_CHECKING:
+    from collections.abc import MutableMapping
+
     from aws_cdk import aws_codepipeline as codepipeline
     from aws_cdk import aws_sns as sns
 
@@ -63,6 +74,12 @@ DETAIL_TYPES = [
     "CodePipeline Stage Execution State Change",
     "CodePipeline Action Execution State Change",
 ]
+
+# The measurement bus: its fixed name, the source of a job's events, and the variable that names the
+# bus to a job (`rhi_reporter.measure`).
+MEASUREMENT_BUS_NAME = "rhi-measurements"
+MEASUREMENT_SOURCE = "rhi.measurement"
+MEASUREMENT_BUS_VARIABLE = "RHI_MEASUREMENT_BUS"
 
 HANDLER = "rhi_reporter.handler.handler"
 ARCHITECTURE = lambda_.Architecture.ARM_64
@@ -161,3 +178,27 @@ class Reporter(Construct):
             ),
             targets=[target],  # ty: ignore[invalid-argument-type] - as above
         )
+        # The measurement bus, and a rule on it for a job's events, which invokes the same function.
+        self.measurement_bus = events.EventBus(self, "MeasurementBus", event_bus_name=MEASUREMENT_BUS_NAME)
+        self.measurement_rule = events.Rule(
+            self,
+            "MeasurementRule",
+            event_bus=self.measurement_bus,
+            event_pattern=events.EventPattern(source=[MEASUREMENT_SOURCE]),
+            targets=[target],  # ty: ignore[invalid-argument-type] - as above
+        )
+
+
+def measuring_job(role: iam.Role | iam.IRole, environment: MutableMapping[str, str]) -> None:
+    """Lets a job post measurements: `role`, the job's, may put events on the measurement bus and
+    on nothing else, and `environment`, the variables the job's construct gives the job, names the
+    bus in `RHI_MEASUREMENT_BUS`. A CodeBuild step of the pipeline, for one, is given the role as its
+    `role` and the variables as its `env`. Nothing is granted on the reporter's secret.
+
+    The bus is named by its fixed name, in the account and region of the role's stack, so a job of
+    any stack of the app can be given it."""
+    bus = cdk.Stack.of(role).format_arn(service="events", resource="event-bus", resource_name=MEASUREMENT_BUS_NAME)
+    added = role.add_to_principal_policy(iam.PolicyStatement(actions=["events:PutEvents"], resources=[bus]))
+    if not added.statement_added:
+        raise ValueError("the job's role takes no statement: the role is not one of the app's")
+    environment[MEASUREMENT_BUS_VARIABLE] = MEASUREMENT_BUS_NAME
