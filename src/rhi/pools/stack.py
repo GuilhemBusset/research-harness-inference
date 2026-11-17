@@ -17,6 +17,7 @@ from rhi.pools.group import PoolGroup
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
 from rhi.pools.scaler import Scaler
+from rhi.pools.secret import PoolSecret
 from rhi.pools.tables import PoolTables
 
 if TYPE_CHECKING:
@@ -32,7 +33,9 @@ class PoolsStack(cdk.Stack):
     `tables` (`tables.pool_state`, `tables.heartbeats`), the internal load balancer with one
     target group per pool, which they take from `routing` (`routing.target_groups[name]`), each
     pool's instance role and log group, from `roles[name]` (`roles[name].role`, which later issues
-    grant what their resources need), each pool's launch template and Auto Scaling group, from
+    grant what their resources need), each pool's bearer secret, from `secrets[name]`
+    (`secrets[name].secret`, whose `secrets[name].grant_read(grantee)` lets another construct of the
+    stage, the gateway's, allow its role to read it), each pool's launch template and Auto Scaling group, from
     `groups[name]`, and the scaler, from
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke."""
 
@@ -68,6 +71,11 @@ class PoolsStack(cdk.Stack):
                 heartbeats=self.tables.heartbeats,
                 workspace=observability.prometheus,
             )
+            for pool in config.pools
+        }
+        # One bearer secret per pool, by the pool's name, readable by that pool's instance role.
+        self.secrets = {
+            pool.name: PoolSecret(self, f"Secret-{pool.name}", pool=pool.name, role=self.roles[pool.name].role)
             for pool in config.pools
         }
         # One launch template and group per pool, by the pool's name; none with the table empty.

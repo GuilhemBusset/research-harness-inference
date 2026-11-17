@@ -151,7 +151,11 @@ def test_the_stack_creates_no_secret(templates: dict[str, dict[str, Any]]) -> No
     from rhi.pipeline import reporter
 
     assert reporter.SECRET_NAME == SECRET_NAME
-    assert all(not of_type(template, "AWS::SecretsManager::Secret") for template in templates.values())
+    assert all(
+        secret.get("Name") != SECRET_NAME
+        for template in templates.values()
+        for secret in of_type(template, "AWS::SecretsManager::Secret").values()
+    )
 
 
 def test_the_synth_step_the_handler_reads_is_the_pipeline_s(templates: dict[str, dict[str, Any]]) -> None:
