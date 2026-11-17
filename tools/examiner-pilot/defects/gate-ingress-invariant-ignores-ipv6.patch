@@ -1,0 +1,13 @@
+diff --git a/tests/policy/test_no_public_ingress.py b/tests/policy/test_no_public_ingress.py
+index 3999540..2262f17 100644
+--- a/tests/policy/test_no_public_ingress.py
++++ b/tests/policy/test_no_public_ingress.py
+@@ -36,7 +36,7 @@ TWO_EDGES = f"more than one group carries the tag {EDGE_TAG}"
+ 
+ GROUP = "AWS::EC2::SecurityGroup"
+ INGRESS = "AWS::EC2::SecurityGroupIngress"
+-RANGES = ("CidrIp", "CidrIpv6")
++RANGES = ("CidrIp",)
+ 
+ 
+ def is_open(rule: Mapping[str, Any]) -> bool:

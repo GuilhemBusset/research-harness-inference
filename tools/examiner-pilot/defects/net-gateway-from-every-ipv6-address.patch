@@ -1,0 +1,12 @@
+diff --git a/src/rhi/network/security.py b/src/rhi/network/security.py
+index 24d2e6c..752a56d 100644
+--- a/src/rhi/network/security.py
++++ b/src/rhi/network/security.py
+@@ -53,6 +53,7 @@ class SecurityGroups(Construct):
+         self.gateway.add_ingress_rule(
+             self.public_load_balancer, ec2.Port.tcp(GATEWAY_PORT), "The gateway, from the public load balancer"
+         )
++        self.gateway.add_ingress_rule(ec2.Peer.any_ipv6(), ec2.Port.tcp(GATEWAY_PORT), "The gateway, for IPv6 clients")
+         self.grafana.add_ingress_rule(
+             self.public_load_balancer, ec2.Port.tcp(GRAFANA_PORT), "Grafana, from the public load balancer"
+         )

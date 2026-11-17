@@ -105,7 +105,9 @@ package = false
 # scripts/check.sh container-tests does, still collects it. The other entries are pytest's own
 # defaults, which a value here replaces.
 [tool.pytest.ini_options]
-testpaths = ["tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests", "tests"]
+testpaths = [
+    "tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests", "tools/examiner-pilot/tests", "tests",
+]
 norecursedirs = [
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
     "tests/container",
