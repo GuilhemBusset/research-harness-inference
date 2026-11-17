@@ -7,12 +7,16 @@ has no handler answers as a route outside the table does.
 
 `forwarding_handlers` fills the four forwarded slots with the warm path of a request (section 3):
 authentication from the headers, the body filter of the route's wire format, the reservation, and
-the proxy (`rhi_gateway.proxy`), whose answer streams back to the client and is settled when it
-ends. A clean end is charged the usage the engine reported; any other end, the tokens observed and
-never less than the input estimate (`rhi_gateway.budget`). The reservation is made once the body is
-read and filtered, because it needs what only the body gives: the estimate of the input, the
-request's output limit, and the pool, whose hold sets how long the lease lasts. It is still made
-before anything is sent to the engine.
+the proxy (`rhi_gateway.proxy`), whose answer goes back to the client. The proxy settles every end
+of the request exactly once: a clean end is charged the usage the engine reported; any other end (a
+client that leaves, an engine that fails, the time limit), the tokens observed and never less than
+the input estimate (`rhi_gateway.budget`). An engine that fails is told to the client with the
+cause `engine_error`, and the time limit with `time_limit`, in the request's wire format. The lease
+is reserved for the proxy's own time limit, so that the two cannot differ.
+
+The reservation is made once the body is read and filtered, because it needs what only the body
+gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
+long the lease lasts. It is still made before anything is sent to the engine.
 
 The models, status and hello routes are answered by `rhi_gateway.local`: `build_app` fills their
 slots from the `LocalRoutes` it is given.
@@ -44,7 +48,7 @@ from rhi_gateway import routes
 from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
-from rhi_gateway.proxy import Observed, ProxiedResponse, Proxy
+from rhi_gateway.proxy import Observed, Proxy
 from rhi_gateway.routes import TABLE, Route, match
 
 if TYPE_CHECKING:
@@ -123,9 +127,6 @@ def build_app(handlers: Mapping[Route, Handler] | None = None, *, local: LocalRo
     return app
 
 
-# The longest a request may run, in seconds (sections 6.2, step 7, and 17). A lease outlasts it.
-LONGEST_REQUEST_SECONDS = 1800
-
 # Where each format's body carries its output limit, the first of them that holds a number counting.
 _OUTPUT_LIMIT_FIELDS = {
     WireFormat.MESSAGES: ("max_tokens",),
@@ -172,14 +173,14 @@ class Filter(Protocol):
 class Forwarding:
     """What the forwarded routes are made of: who is let in, the budget, the filters and the proxy.
 
-    `filters` holds the body filter of each forwarded route of the table, under its entry.
+    `filters` holds the body filter of each forwarded route of the table, under its entry. The
+    longest a request may run is the proxy's.
     """
 
     authenticator: Authenticator
     ledger: Ledger
     filters: Mapping[Route, Filter]
     proxy: Proxy
-    longest_request_seconds: int = LONGEST_REQUEST_SECONDS
 
 
 def output_limit(entry: Route, forwarded: Forwarded) -> int:
@@ -217,7 +218,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 forwarded.body,
                 output_limit=output_limit(entry, forwarded),
                 hold_seconds=forwarded.pool.hold_seconds,
-                longest_request_seconds=forwarding.longest_request_seconds,
+                longest_request_seconds=forwarding.proxy.longest_request_seconds,
             )
         except GatewayError as refused:
             return _refusal(refused, entry)
@@ -231,13 +232,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 ended_cleanly=observed.ended_cleanly,
             )
 
-        try:
-            exchange = await forwarding.proxy.open(entry, forwarded)
-        except BaseException:
-            # No answer came: the slot is freed and the input estimate charged.
-            await settle(Observed(0, 0, ended_cleanly=False))
-            raise
-        return ProxiedResponse(exchange, settle)
+        return await forwarding.proxy.forward(entry, forwarded, settle)
 
     return handler
 

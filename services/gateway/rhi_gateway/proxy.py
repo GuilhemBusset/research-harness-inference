@@ -17,43 +17,63 @@ never reaches the engine and an `X-Rhi-Pool` the client sent is dropped:
 - `Content-Type: application/json`, and `Accept-Encoding: identity`, so that the bytes that come
   back are the stream itself and not a compression of it, for the usage parser and for the client.
 
-**What comes back** goes to the client chunk by chunk, as each arrives, and nothing is buffered on
-the way. Each chunk is also fed to the usage parser of the request's wire format (section 6.2,
-step 6): Messages and Responses read beside the stream and forward the chunk as it came; Chat
-Completions forwards what its parser returns, which hides the usage chunk the gateway asked for
-from a client that did not. An answer that is not a stream (its type is not `text/event-stream`)
-is forwarded the same way and read whole once it has ended, by the format's `read_answer`; a token
-count is read from its own shape, `{"input_tokens": n}`, with no output. What the caller is given
-at the end is one `Observed`: the tokens observed and whether the answer ended cleanly.
+**What comes back.** A stream (an answer of type `text/event-stream`) goes to the client chunk by
+chunk, as each arrives, and nothing is buffered on the way. Each chunk is also fed to the usage
+parser of the request's wire format (section 6.2, step 6): Messages and Responses read beside the
+stream and forward the chunk as it came; Chat Completions forwards what its parser returns, which
+hides the usage chunk the gateway asked for from a client that did not. An answer that is not a
+stream is read whole before any of it is sent, and its usage read by the format's `read_answer`; a
+token count's usage is read from its own shape, `{"input_tokens": n}`, with no output.
+
+**How a request ends** (section 6.2, steps 3, 7 and 8). Each forwarded request is settled exactly
+once, by the `on_end` it was given, with one `Observed`: the tokens observed and whether the answer
+ended cleanly. A clean end is one whose answer was read whole and reported its usage (a stream: the
+format's own clean end). The ledger charges a clean end the usage reported, and any other end the
+tokens observed, never less than the input estimate (`rhi_gateway.budget`). The other ends:
+
+- **the engine fails**: it cannot be reached, answers with a status that is not a success, breaks
+  off, or ends a stream without the format's clean end. Before anything was sent, the client is
+  answered 502 with the cause `engine_error`; on a stream that has started, the stream ends with the
+  error event of its wire format for that cause, and nothing follows it. None of the engine's own
+  answer, its body or its headers, is sent in either case;
+- **the time limit**: a request may run `longest_request_seconds` at most, 1,800 by default
+  (section 17), counted from the moment it is forwarded. Every wait on the engine races that
+  deadline. A request that reaches it is ended with the cause `time_limit`: 504 if nothing was sent,
+  the error event of its wire format on a stream;
+- **the client leaves**: the stream is stopped and the engine's answer closed.
+
+The error answers and events are those of `rhi_gateway.errors`, which reads nothing but the cause.
+A stream cut in the middle of an event has that event closed by a blank line before the error event,
+so that the error is read as an event of its own.
 
 **Time** (section 6.2, step 7). Every timeout of the upstream client is set here, because
 httpx's default, 5 seconds for each, would cut a stream that is quiet while the engine computes:
 10 seconds to connect, 60 to write a request, 10 to obtain a pooled connection, and 1,200 to read,
 the idle timeout both load balancers run (section 5.3), so that only the request's own time limit
 ends a quiet stream. An idle upstream connection is closed after 5 seconds, one of the guards that
-let a pool's instance leave service quickly (section 5.1).
+let a pool's instance leave service quickly (section 5.1). The time limit is waited for with the
+`sleep` the proxy is given, `asyncio.sleep` unless a test gives its own clock.
 
-This module is the path of an answer that ends well. A cut stream, an upstream error, a timeout
-and the 30-minute limit each end the request otherwise; how each is told to the client is not
-written here. Nothing here reads configuration or the environment: the address and the secrets
-are given.
+Nothing here reads configuration or the environment: the address, the secrets and the limit are
+given.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from rhi_common.causes import Cause
 from rhi_gateway import routes
 from rhi_gateway.body import Forwarded
-from rhi_gateway.errors import WireFormat
+from rhi_gateway.errors import WireFormat, render_json, render_stream_event
 from rhi_gateway.formats.chat import ChatForwarded
 from rhi_gateway.routes import Route
 from rhi_gateway.usage import chat, messages, responses
@@ -64,6 +84,9 @@ WRITE_SECONDS = 60.0
 READ_SECONDS = 1200.0
 POOL_SECONDS = 10.0
 KEEPALIVE_EXPIRY_SECONDS = 5.0
+
+# The longest a request may run, in seconds (sections 6.2, step 7, and 17). A lease outlasts it.
+LONGEST_REQUEST_SECONDS = 1800
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=CONNECT_SECONDS, read=READ_SECONDS, write=WRITE_SECONDS, pool=POOL_SECONDS)
 UPSTREAM_LIMITS = httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS)
@@ -187,27 +210,8 @@ def read_whole_answer(route: Route, body: bytes) -> Observed:
     return Observed(usage.input_tokens, usage.output_tokens, usage.ended_cleanly)
 
 
-class _AnswerMeter:
-    """An answer that is not a stream: forwarded as it comes, read once it is whole."""
-
-    def __init__(self, route: Route) -> None:
-        self._route = route
-        self._parts: list[bytes] = []
-
-    def feed(self, chunk: bytes) -> bytes:
-        self._parts.append(chunk)
-        return chunk
-
-    def finish(self) -> bytes:
-        return b""
-
-    def observed(self) -> Observed:
-        return read_whole_answer(self._route, b"".join(self._parts))
-
-
-def _meter(route: Route, forwarded: Forwarded, content_type: str) -> _Meter:
-    if content_type.split(";", 1)[0].strip().lower() != STREAM_TYPE:
-        return _AnswerMeter(route)
+def _stream_meter(route: Route, forwarded: Forwarded) -> _Meter:
+    """The usage parser of a stream in the route's wire format."""
     if route.wire_format is WireFormat.MESSAGES:
         return _MessagesMeter()
     if route.wire_format is WireFormat.RESPONSES:
@@ -216,13 +220,75 @@ def _meter(route: Route, forwarded: Forwarded, content_type: str) -> _Meter:
     return _ChatMeter(client_asked_for_usage=asked)
 
 
-class Exchange:
-    """One upstream answer, open: its status and type, its chunks for the client, and its usage."""
+class TimeLimitReached(Exception):
+    """The request has reached the longest duration it was given."""
 
-    def __init__(self, response: httpx.Response, meter: _Meter) -> None:
+
+async def _next_chunk(chunks: AsyncIterator[bytes]) -> bytes | None:
+    """The next chunk, or `None` once there is none: a task may not end in `StopAsyncIteration`."""
+    try:
+        return await anext(chunks)
+    except StopAsyncIteration:
+        return None
+
+
+class _Deadline:
+    """The time limit of one request: each wait on the engine is raced against it."""
+
+    def __init__(self, sleep: Callable[[float], Awaitable[None]], seconds: float) -> None:
+        self._timer = asyncio.ensure_future(sleep(seconds))
+        self._step: asyncio.Future[Any] | None = None  # The wait on the engine under way.
+
+    async def race[T](self, waited: Awaitable[T]) -> T:
+        """What `waited` gives, or `TimeLimitReached` if the deadline comes first."""
+        step = asyncio.ensure_future(waited)
+        self._step = step
+        try:
+            done, _ = await asyncio.wait((step, self._timer), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Cancelled as well when the request is (the client left): `close` waits for it to stop.
+            if not step.done():
+                step.cancel()
+        if step not in done:
+            raise TimeLimitReached
+        self._step = None
+        return step.result()
+
+    async def close(self) -> None:
+        """Stop the timer, and wait for a cancelled wait on the engine to stop before it is closed."""
+        self._timer.cancel()
+        step, self._step = self._step, None
+        if step is not None:
+            step.cancel()
+            await asyncio.wait((step,))
+            if not step.cancelled():
+                step.exception()  # Retrieved: what a wait gave after it was given up on is dropped.
+
+
+class _Settlement:
+    """The `on_end` of one request, called once at most however many of its ends race to call it."""
+
+    def __init__(self, on_end: Callable[[Observed], Awaitable[None]]) -> None:
+        self._on_end = on_end
+        self._settled = False
+
+    async def __call__(self, observed: Observed) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        await self._on_end(observed)
+
+
+class _Stream:
+    """A streamed answer, open: its chunks for the client, the error event that ends a broken one, its usage."""
+
+    def __init__(self, response: httpx.Response, meter: _Meter, deadline: _Deadline, wire_format: WireFormat) -> None:
         self._response = response
         self._meter = meter
-        self._complete = False
+        self._deadline = deadline
+        self._wire_format = wire_format
+        self._clean = False
+        self._tail = b""  # The last bytes sent, to tell whether the client is at the start of an event.
 
     @property
     def status_code(self) -> int:
@@ -234,30 +300,59 @@ class Exchange:
 
     async def chunks(self) -> AsyncGenerator[bytes]:
         """The bytes for the client, each as soon as the upstream chunk that carries it has arrived."""
+        # Decoded, should the engine compress what it was asked to send as it is: the client is
+        # given no `Content-Encoding`, and the parser reads text.
+        upstream = self._response.aiter_bytes()
+        cause: Cause | None = None
         try:
-            # Decoded, should the engine compress what it was asked to send as it is: the client is
-            # given no `Content-Encoding`, and the parser reads text.
-            async for chunk in self._response.aiter_bytes():
+            while (chunk := await self._deadline.race(_next_chunk(upstream))) is not None:
                 forward = self._meter.feed(chunk)
                 if forward:
-                    yield forward
-        except (httpx.TransportError, httpx.DecodingError):
-            # The upstream broke off: the answer is cut where it stands, and did not end cleanly.
+                    yield self._sending(forward)
+        except TimeLimitReached:
+            cause = Cause.TIME_LIMIT
+        except httpx.RequestError:
+            # The upstream broke off: the answer is cut where it stands.
+            cause = Cause.ENGINE_ERROR
+        if cause is None:
+            rest = self._meter.finish()
+            if rest:
+                yield self._sending(rest)
+        if self._meter.observed().ended_cleanly:
+            # The format's own clean end was read: the answer is whole, whatever came after it.
+            self._clean = True
             return
-        self._complete = True
-        rest = self._meter.finish()
-        if rest:
-            yield rest
+        # Ended early, broken off or out of time: the error event, and nothing after it.
+        yield self._separator() + render_stream_event(cause or Cause.ENGINE_ERROR, self._wire_format)
+
+    def _sending(self, chunk: bytes) -> bytes:
+        self._tail = (self._tail + chunk)[-2:]
+        return chunk
+
+    def _separator(self) -> bytes:
+        """What closes the line and the event a cut stream left unfinished, so that the error is its own event."""
+        if not self._tail or self._tail.endswith(b"\n\n"):
+            return b""
+        return b"\n" if self._tail.endswith(b"\n") else b"\n\n"
 
     @property
     def observed(self) -> Observed:
-        """The tokens observed so far; clean only for a whole, successful answer that reported its usage."""
+        """The tokens observed so far; clean only for a stream that reached its format's clean end."""
         seen = self._meter.observed()
-        clean = seen.ended_cleanly and self._complete and self._response.is_success
-        return Observed(seen.input_tokens, seen.output_tokens, ended_cleanly=clean)
+        return Observed(seen.input_tokens, seen.output_tokens, ended_cleanly=self._clean)
 
     async def aclose(self) -> None:
+        await self._deadline.close()
         await self._response.aclose()
+
+
+def _is_stream(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() == STREAM_TYPE
+
+
+def _error_answer(cause: Cause, wire_format: WireFormat) -> Response:
+    answer = render_json(cause, wire_format)
+    return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
 
 
 class Proxy:
@@ -265,14 +360,31 @@ class Proxy:
 
     `base_url` is the internal load balancer's address and `secrets` the bearer secret of each
     pool, by the pool's name: both are configuration, never anything a client sent.
+    `longest_request_seconds` is the longest a request may run, and `sleep` what waits for it.
     """
 
-    def __init__(self, client: httpx.AsyncClient, base_url: str, secrets: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        secrets: Mapping[str, str],
+        *,
+        longest_request_seconds: int = LONGEST_REQUEST_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if longest_request_seconds <= 0:
+            raise ValueError("the longest a request may run must be a positive number of seconds")
         self._client = client
         self._base_url = base_url
         self._secrets = dict(secrets)
+        self._longest = longest_request_seconds
+        self._sleep = sleep
 
-    async def open(self, route: Route, forwarded: Forwarded) -> Exchange:
+    @property
+    def longest_request_seconds(self) -> int:
+        return self._longest
+
+    async def _send(self, route: Route, forwarded: Forwarded) -> httpx.Response:
         """Send the request and return the answer as soon as its headers have arrived."""
         secret = self._secrets.get(forwarded.pool.name)
         if not secret:
@@ -288,38 +400,88 @@ class Proxy:
                 "Accept-Encoding": "identity",
             },
         )
-        response = await self._client.send(request, stream=True)
-        return Exchange(response, _meter(route, forwarded, response.headers.get("content-type", "")))
+        return await self._client.send(request, stream=True)
+
+    async def forward(
+        self, route: Route, forwarded: Forwarded, on_end: Callable[[Observed], Awaitable[None]]
+    ) -> Response:
+        """Forward the request and return the client's answer; `on_end` is called exactly once, at its end.
+
+        A stream's end comes once the client's answer has been sent or abandoned; every other end
+        comes before this returns.
+        """
+        settle = _Settlement(on_end)
+        wire_format = route.wire_format or WireFormat.MESSAGES
+        deadline = _Deadline(self._sleep, self._longest)
+        response: httpx.Response | None = None
+        streaming = False
+        try:
+            try:
+                response = await deadline.race(self._send(route, forwarded))
+                if not response.is_success:
+                    # The engine failed: none of its answer reaches the client.
+                    return _error_answer(Cause.ENGINE_ERROR, wire_format)
+                content_type = response.headers.get("content-type", "")
+                if not _is_stream(content_type):
+                    body = await deadline.race(response.aread())
+                    await settle(read_whole_answer(route, body))
+                    return Response(content=body, status_code=response.status_code, media_type=content_type or None)
+                streaming = True
+                meter = _stream_meter(route, forwarded)
+                return ProxiedResponse(_Stream(response, meter, deadline, wire_format), settle)
+            except TimeLimitReached:
+                return _error_answer(Cause.TIME_LIMIT, wire_format)
+            except httpx.RequestError:
+                # Not reached, or broken off before its answer was whole.
+                return _error_answer(Cause.ENGINE_ERROR, wire_format)
+        finally:
+            if not streaming:
+                await _to_the_end(_close_and_settle(deadline, response, settle))
+
+
+async def _close_and_settle(deadline: _Deadline, response: httpx.Response | None, settle: _Settlement) -> None:
+    """End a request whose answer was not a stream: nothing observed, unless it was settled already."""
+    try:
+        await deadline.close()
+        if response is not None:
+            await response.aclose()
+    finally:
+        await settle(Observed(0, 0, ended_cleanly=False))
+
+
+async def _to_the_end(work: Awaitable[None]) -> None:
+    """Run `work` to its end even if the caller is cancelled meanwhile, so that no settlement is lost."""
+    ending = asyncio.ensure_future(work)
+    _ENDING.add(ending)
+    ending.add_done_callback(_ENDING.discard)
+    await asyncio.shield(ending)
 
 
 class ProxiedResponse(StreamingResponse):
-    """The client's answer: the exchange's chunks, then `on_end` with what was observed, exactly once.
+    """The client's stream: the upstream's chunks, then the settlement with what was observed, exactly once.
 
-    `on_end` runs however the answer ends, the client gone included, and is shielded from the
-    cancellation that a client's disconnect brings, so that the settlement it makes is not lost.
+    The settlement is made however the stream ends, the client gone included, and is shielded from
+    the cancellation that a client's disconnect brings, so that it is not lost.
     """
 
-    def __init__(self, exchange: Exchange, on_end: Callable[[Observed], Awaitable[None]]) -> None:
-        self._chunks = exchange.chunks()
-        super().__init__(self._chunks, status_code=exchange.status_code, media_type=exchange.content_type)
-        self._exchange = exchange
-        self._on_end = on_end
+    def __init__(self, stream: _Stream, settle: _Settlement) -> None:
+        self._chunks = stream.chunks()
+        super().__init__(self._chunks, status_code=stream.status_code, media_type=stream.content_type)
+        self._stream = stream
+        self._settle = settle
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            ending = asyncio.ensure_future(self._end())
-            _ENDING.add(ending)
-            ending.add_done_callback(_ENDING.discard)
-            await asyncio.shield(ending)
+            await _to_the_end(self._end())
 
     async def _end(self) -> None:
         try:
             await self._chunks.aclose()
-            await self._exchange.aclose()
+            await self._stream.aclose()
         finally:
-            await self._on_end(self._exchange.observed)
+            await self._settle(self._stream.observed)
 
 
 # The ends under way, held until each is done: a task the loop alone refers to may be collected.
