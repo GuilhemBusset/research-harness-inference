@@ -54,8 +54,10 @@ ends:
   write of a stream to the client, races that deadline, and a deadline reached wins over an
   answer or a write that is ready with it. A request that reaches it is ended with the cause
   `time_limit`: 504 if nothing was sent, the error event of its wire format on a stream. A write
-  to the client under way at the limit is given up, the engine's answer is closed and the request
-  settled, and the error event is then written for a client that still takes it;
+  to the client under way at the limit is given up and counted as not sent: the engine's answer is
+  closed and the request settled, and the client's answer is then written for a client that still
+  takes it, 504 if the stream's start was given up, else the error event after what was sent. An
+  answer whose clean end is in a write given up did not end cleanly;
 - **the client leaves**: while the gateway waits for the engine's headers or for an answer that is
   not a stream, the client's disconnect is listened for and ends the wait; once a stream has
   started, Starlette's own listener does. The engine's answer is closed and nothing more is sent.
@@ -343,11 +345,17 @@ class _ErrorGate:
         forward += data
         self._open += data
 
-    def ending(self, event: bytes) -> bytes:
-        """What ends the stream with `event`, after what the client already has of the open event."""
-        if event.startswith(self._open):
-            return event[len(self._open) :]
-        return (b"\n" if self._open.endswith(b"\n") else b"\n\n") + event
+    @property
+    def client_has(self) -> bytes:
+        """What the client has of the event not yet ended."""
+        return bytes(self._open)
+
+    def ending(self, event: bytes, client_has: bytes | None = None) -> bytes:
+        """What ends the stream with `event`, after what the client has of the open event (as forwarded, by default)."""
+        open_event = self.client_has if client_has is None else client_has
+        if event.startswith(open_event):
+            return event[len(open_event) :]
+        return (b"\n" if open_event.endswith(b"\n") else b"\n\n") + event
 
 
 class TimeLimitReached(Exception):
@@ -469,10 +477,19 @@ class _Stream:
         self._wire_format = wire_format
         self._settle = settle
         self._clean = False
+        self._abandoned = False  # The last write of a chunk to the client was given up at the time limit.
+
+    def abandon_write(self) -> None:
+        """The write of the chunk last given was given up: the client does not have it."""
+        self._abandoned = True
 
     @property
     def status_code(self) -> int:
         return self._response.status_code
+
+    @property
+    def wire_format(self) -> WireFormat:
+        return self._wire_format
 
     @property
     def content_type(self) -> str | None:
@@ -484,19 +501,24 @@ class _Stream:
         # given no `Content-Encoding`, and the parser reads text.
         upstream = self._response.aiter_bytes()
         cause = Cause.ENGINE_ERROR
+        client_has: bytes | None = None  # What the client has of the open event, if not all that was forwarded.
         try:
             while (chunk := await self.ends.race(_next_chunk(upstream))) is not None:
+                before = self._gate.client_has
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
                     yield forward
+                    if self._abandoned:
+                        client_has = before
+                        raise TimeLimitReached
                 if self._gate.failed_event_ended:
                     break
         except TimeLimitReached:
             cause = Cause.TIME_LIMIT
         except httpx.RequestError:
             pass  # The upstream broke off: the answer is cut where it stands.
-        # The format's own clean end was read: the answer is whole, whatever came after it.
-        self._clean = not self._gate.failed and self._meter.observed().ended_cleanly
+        # The format's own clean end was read, and sent: the answer is whole, whatever came after it.
+        self._clean = not self._abandoned and not self._gate.failed and self._meter.observed().ended_cleanly
         # Settled before the last bytes are written, which a client may be slow to take.
         await _to_the_end(self.end())
         if self._clean:
@@ -504,7 +526,7 @@ class _Stream:
         # An error, ended early, broken off or out of time: the gateway's error event, and nothing after it.
         if self._gate.failed:
             cause = Cause.ENGINE_ERROR
-        yield self._gate.ending(render_stream_event(cause, self._wire_format))
+        yield self._gate.ending(render_stream_event(cause, self._wire_format), client_has)
 
     @property
     def observed(self) -> Observed:
@@ -698,10 +720,16 @@ class ProxiedResponse(StreamingResponse):
         try:
             await super().stream_response(limited)
         except TimeLimitReached:
-            # The limit came during a write to the client, which is given up. The stream resumes, reaches
-            # its limit, and is settled; its error event is then written, should the client still take it.
+            # The limit came during a write to the client, which is given up: the client does not have it.
             if not limited.started:
+                # Nothing was sent: the request is settled, then answered 504, should the client still take it.
+                await _to_the_end(self._end())
+                answer = _error_answer(Cause.TIME_LIMIT, self._stream.wire_format)
+                await send({"type": "http.response.start", "status": answer.status_code, "headers": answer.raw_headers})
+                await send({"type": "http.response.body", "body": answer.body, "more_body": False})
                 return
+            # The stream resumes, reaches its limit, and is settled; its error event is then written.
+            self._stream.abandon_write()
             async for chunk in self._chunks:
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
             await send({"type": "http.response.body", "body": b"", "more_body": False})
