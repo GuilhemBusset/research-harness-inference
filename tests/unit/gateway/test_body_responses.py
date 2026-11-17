@@ -229,9 +229,14 @@ def test_the_client_tools_and_their_calls_keep_their_fields() -> None:
         "status": "completed",
         "action": {"type": "exec", "command": ["cat", "notes.txt"], "env": {}},
     }
-    body = forwarded({"model": "coursework", "input": [call], "tools": tools})
+    calls = [
+        call,
+        {"type": "function_call", "call_id": "c2", "name": "read", "arguments": "{}", "async": True},
+        {"type": "custom_tool_call", "call_id": "c3", "name": "run", "input": "ls", "async": True},
+    ]
+    body = forwarded({"model": "coursework", "input": calls, "tools": tools})
     assert body["tools"] == tools
-    assert body["input"] == [call]
+    assert body["input"] == calls
 
 
 def test_the_output_limit_is_clamped_to_the_pool() -> None:
