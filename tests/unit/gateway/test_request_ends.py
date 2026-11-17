@@ -350,3 +350,98 @@ def test_time_limit(entry: routes.Route) -> None:
         assert len(ledger.settled) == 1
 
     run(scenario)
+
+
+@pytest.mark.parametrize("entry", FORMATS, ids=lambda entry: entry.path)
+def test_an_error_event_of_the_engine_is_replaced(entry: routes.Route) -> None:
+    wire_format = entry.wire_format
+    assert isinstance(wire_format, WireFormat)
+    error = {
+        routes.MESSAGES: sse(("error", {"type": "error", "error": {"type": "overloaded", "message": ENGINE_TEXT}})),
+        routes.CHAT_COMPLETIONS: sse((None, {"error": {"message": ENGINE_TEXT}})),
+        routes.RESPONSES: sse(
+            (
+                "response.failed",
+                {"type": "response.failed", "response": {"error": {"message": ENGINE_TEXT}, "usage": None}},
+            )
+        ),
+    }[entry]
+
+    async def scenario() -> None:
+        # The engine's error event is cut across chunks, as a connection can cut it.
+        parts = [STARTS[entry], *(error[at : at + 7] for at in range(0, len(error), 7))]
+        app, key, ledger = gateway(Upstream(parts, "stall"), Clock())
+        call = Call(app, key, entry)
+        await call.ended()
+        assert call.body == STARTS[entry] + render_stream_event(Cause.ENGINE_ERROR, wire_format)
+        assert ENGINE_TEXT.encode() not in call.body
+        assert [clean for _, _, clean, _ in ledger.settled] == [False]
+
+    run(scenario)
+
+
+@pytest.mark.parametrize(
+    ("entry", "answer"),
+    [
+        (routes.MESSAGES, WHOLE_ANSWER[:-1]),
+        (routes.RESPONSES, json.dumps({"status": "failed", "error": {"message": ENGINE_TEXT}}).encode()),
+    ],
+    ids=["cut short", "failed"],
+)
+def test_an_answer_that_is_not_whole_is_an_engine_error(entry: routes.Route, answer: bytes) -> None:
+    wire_format = entry.wire_format
+    assert isinstance(wire_format, WireFormat)
+
+    async def scenario() -> None:
+        app, key, ledger = gateway(Upstream([answer], content_type="application/json"), Clock())
+        call = Call(app, key, entry, stream=False)
+        await call.ended()
+        assert (call.status, call.body) == (502, render_json(Cause.ENGINE_ERROR, wire_format).body)
+        assert [(clean, charge) for _, _, clean, charge in ledger.settled] == [(False, ledger.estimate)]
+
+    run(scenario)
+
+
+def test_an_answer_that_breaks_off_is_charged_what_it_reported() -> None:
+    async def scenario() -> None:
+        app, key, ledger = gateway(Upstream([WHOLE_ANSWER], "fail", content_type="application/json"), Clock())
+        call = Call(app, key, routes.MESSAGES, stream=False)
+        await call.ended()
+        assert call.status == 502
+        assert ledger.settled == [(5000, 7, False, max(5007, ledger.estimate))]
+
+    run(scenario)
+
+
+def test_a_client_that_leaves_before_its_answer_is_settled_at_once() -> None:
+    async def scenario() -> None:
+        upstream = Upstream([], "never")
+        app, key, ledger = gateway(upstream, Clock())
+        call = Call(app, key, routes.MESSAGES, stream=False)
+        await upstream.reached.wait()
+        call.leave()
+        await call.ended()  # The clock never moves: only the client's leaving can end it.
+        assert [charge for *_, charge in ledger.settled] == [ledger.estimate]
+        assert ledger.leases() == {}
+
+    run(scenario)
+
+
+def test_a_limit_already_reached_wins_over_a_waiting_chunk() -> None:
+    async def scenario() -> None:
+        clock = Clock()
+        app, key, ledger = gateway(Upstream([MESSAGES_START, MESSAGES_END]), clock)
+
+        class Slow(Call):
+            async def _send(self, message: Message) -> None:
+                await super()._send(message)
+                if message.get("body") == MESSAGES_START:
+                    # Sending the first chunk takes the request past its limit; the clean end is ready.
+                    await clock.advance_to(LIMIT)
+
+        call = Slow(app, key, routes.MESSAGES)
+        await call.ended()
+        assert call.body == MESSAGES_START + render_stream_event(Cause.TIME_LIMIT, WireFormat.MESSAGES)
+        assert [clean for _, _, clean, _ in ledger.settled] == [False]
+
+    run(scenario)
