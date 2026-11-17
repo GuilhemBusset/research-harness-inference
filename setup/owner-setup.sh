@@ -696,9 +696,20 @@ step_roster() {
   heading 9 "Enter the roster"
   cat <<'EOF'
 The students who may log in, by their numeric GitHub ID, entered through the admin CLI with your
-own AWS credentials. The admin CLI is not in the repository yet: its command arrives with it.
-The roster is never written to the repository.
+own AWS credentials, once the pipeline has deployed the access stack. Each student gets an alias,
+which their metrics carry instead of the ID, a daily budget of 100 million tokens and 4 concurrent
+requests unless you give others (--budget, --limit). Add each student with the first command; the
+roster is never written to the repository.
+
+The canary command puts the pipeline's verification on the roster and writes its key into the
+secret rhi/canary-key, creating it: run it once before the verification is merged. Running it
+again replaces the key, which it never prints.
 EOF
+  local tool=(env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main)
+  say ""
+  show "${tool[@]}" roster add "<github-id>" "<alias>"
+  run "${tool[@]}" canary || true
+  run "${tool[@]}" roster list || true
 }
 
 if [ "$dry_run" = 1 ]; then
