@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,7 +105,8 @@ class Pipeline(L.github.FakeGitHub):
 
 class Agents(L.agents.FakeAgents):
     """The fake agents, with two additions. The build of an issue in `after` starts once the issue
-    it names has merged, so the order of two landings is the test's and not a race. And a round
+    it names has merged, or once the condition it gives holds, so the order of two landings is the
+    test's and not a race. And a round
     whose feedback speaks of the deployment changes a file of its own, unless `repairs` is off: a
     fix-forward then has something to land."""
 
@@ -120,7 +122,8 @@ class Agents(L.agents.FakeAgents):
     def build(self, vendor, req, plan, worktree, feedback):
         n = req.issue.number
         if n in self.after:
-            wait_until(lambda: self.merged(self.after[n]))
+            after = self.after[n]
+            wait_until(after if callable(after) else lambda: self.merged(after))
         result = super().build(vendor, req, plan, worktree, feedback)
         if self.repairs and any("deployment" in f for f in feedback):
             (worktree / f"docs/repair_{n}.txt").write_text("repaired\n")
@@ -135,7 +138,7 @@ class Loop:
         self.deploy = L.config.Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
         self.fake = Pipeline(self.repo, self.deploy.contexts)
         self.scripts = {}
-        self.after: dict[int, int] = {}
+        self.after: dict[int, int | Callable[[], bool]] = {}
         self.repairs = True
         self.stores = {}
         self.root = L.state.runs_root(self.repo.work)
@@ -361,10 +364,12 @@ def test_a_run_for_another_root_does_not_land_before_the_verdict():
 
 def test_an_approval_releases_the_claim():
     with loop(2, 3, approval=APPROVAL) as run:
-        run.after[3] = 2
+        # #3 builds once #2 waits for the owner and has let go of the claim: built as soon as #2
+        # merged, #3 could reach its landing first and find the claim still held
+        run.after[3] = lambda: run.waits(2)[1] == "owner_approval" and not run.queue_claimed()
         run.fake.posts[2] = [("pending", APPROVAL)]
         run.fake.posts[3] = ["success"]
-        run.run()
+        run.run(max_parallel_writers=2)   # with one writer, #3 could take the slot first and wait on #2 forever
 
         [commit] = run.fake.commits[2]
         assert run.waits(2) == (Phase.WAITING, "owner_approval", "deploying")
