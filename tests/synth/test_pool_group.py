@@ -131,3 +131,50 @@ def test_types_in_order(app_module: ModuleType) -> None:
         "OnDemandBaseCapacity": 0,
         "OnDemandPercentageAboveBaseCapacity": 100,
     }
+
+
+def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(
+    app_module: ModuleType, tmp_path: Path
+) -> None:
+    """A pool of any name, and a GPU pool, each get a group: the app passes cdk-nag, the GPU image
+    is read at deployment from the parameter the promotion job writes, and each custom resource
+    suspends processes only of its own pool's group."""
+    gpu = dataclasses.replace(
+        MOCK,
+        name="coursework",
+        engine="vllm",
+        model="example/model",
+        revision="a" * 40,
+        instance_types=("g7e.2xlarge",),
+        prices={"g7e.2xlarge": 3.36},
+    )
+    pools = (dataclasses.replace(MOCK, name="second"), gpu)
+    configured = dataclasses.replace(
+        EXAMPLE,
+        pools=pools,
+        default_pool=gpu.name,
+        allowed_instance_types=tuple(t for pool in pools for t in pool.instance_types),
+    )
+    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
+    context = json.loads(cdk_json.read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app = app_module.build(configured, outdir=str(tmp_path), context=context)
+    app.synth()  # Fails on a finding no file acknowledges.
+    stage = app.node.find_child("Rhi")
+    template = json.loads((Path(stage.outdir) / stage.pools.template_file).read_text(encoding="utf-8"))
+    groups = of_type(template, "AWS::AutoScaling::AutoScalingGroup").values()
+    assert sorted(tag["Value"] for group in groups for tag in group["Tags"] if tag["Key"] == "rhi-pool") == [
+        "coursework",
+        "second",
+    ]
+    images = [
+        template["Parameters"][launch["LaunchTemplateData"]["ImageId"]["Ref"]]
+        for launch in of_type(template, "AWS::EC2::LaunchTemplate").values()
+    ]
+    assert sorted(image["Default"] for image in images) == sorted([IMAGE_PARAMETER, "/rhi/images/gpu"])
+    conditions = [
+        statement["Condition"]
+        for policy in of_type(template, "AWS::IAM::Policy").values()
+        for statement in policy["PolicyDocument"]["Statement"]
+        if statement["Action"] == "autoscaling:SuspendProcesses"
+    ]
+    assert sorted(c["StringEquals"]["autoscaling:ResourceTag/rhi-pool"] for c in conditions) == ["coursework", "second"]
