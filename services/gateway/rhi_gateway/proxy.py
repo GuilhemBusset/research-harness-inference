@@ -73,7 +73,8 @@ the error event (`event: `, `data: `), the error event is completed from there i
 answered 200 at once (`Proxy.held`), and its hold (`rhi_gateway.app`) writes its keep-alives
 until the request may be forwarded. The engine is silent while it computes a long transcript, so
 the keep-alives go on after the request is forwarded, while the gateway waits for the engine's
-headers and then its first bytes; from those on, none is sent, and the stream is the engine's, as
+headers and then its first event; the engine's bytes are kept back until that event is whole, so
+that no keep-alive lands inside it. From then on none is sent, and the stream is the engine's, as
 above. Since the client has its 200 already, every other end is an error event of its wire
 format: the hold's own cause when the hold ends the request, settled with nothing observed;
 `engine_error` for an engine that cannot be reached, answers with a status that is not a success
@@ -702,7 +703,7 @@ class HeldRequest(Protocol):
         ...
 
     def first_event(self) -> None:
-        """The engine has sent its first bytes: no keep-alive is due after them."""
+        """The engine's first event is whole: no keep-alive is due after it."""
         ...
 
 
@@ -794,15 +795,32 @@ class _HeldStream:
             # An error status, or an answer that is not a stream: none of it reaches the client.
             if response.is_success and _is_stream(response.headers.get("content-type", "")):
                 upstream = response.aiter_bytes()
-                first: list[bytes | None] = []
-                reading = _keeping_alive(ends, _next_chunk(upstream), self._held, first)
-                async with aclosing(reading):
-                    async for keep_alive in reading:
-                        yield keep_alive
+                # The network cuts an event anywhere: the engine's bytes are kept back, and the
+                # keep-alives go on, until its first event is whole (or its answer ends). A
+                # keep-alive is then never written into the middle of one of its events.
+                before_first = bytearray()
+                reader = SseReader()
+                while True:
+                    read: list[bytes | None] = []
+                    reading = _keeping_alive(ends, _next_chunk(upstream), self._held, read)
+                    async with aclosing(reading):
+                        async for keep_alive in reading:
+                            yield keep_alive
+                    if read[0] is None:
+                        break
+                    before_first += read[0]
+                    if any(not event.comment for event in reader.feed(read[0])):
+                        break
                 self._held.first_event()
                 meter = _stream_meter(self._route, self._forwarded)
                 stream = self._stream = _Stream(
-                    response, meter, ends, self._wire_format, self._settle, upstream=upstream, first=first[0]
+                    response,
+                    meter,
+                    ends,
+                    self._wire_format,
+                    self._settle,
+                    upstream=upstream,
+                    first=bytes(before_first) or None,
                 )
                 async for chunk in stream.chunks():
                     yield chunk
