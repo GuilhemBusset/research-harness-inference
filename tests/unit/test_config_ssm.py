@@ -180,11 +180,12 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         ("'https_listener'", {"/rhi/config/https_listener": f"{MARK}"}),
         # A pool entry is its own parameter, a JSON object the pool parser reads.
         ("'pools'", {"/rhi/config/pools/mock": f"entry{MARK}"}),
+        # A parameter that is not a String.
+        ("'/rhi/config/domain'", {"/rhi/config/domain": ("SecureString", f"cipher{MARK}")}),
+        # Later cases go last, so that the generated ids of the earlier ones never move.
         ("'pools'", {"/rhi/config/pools/mock": f'{{"engine": "mock{MARK}"}}'}),
         ("'allowed_instance_types'", {"/rhi/config/allowed_instance_types": f"t{MARK}.small"}),
         ("'default_pool'", {"/rhi/config/default_pool": f"pool{MARK}"}),
-        # A parameter that is not a String.
-        ("'/rhi/config/domain'", {"/rhi/config/domain": ("SecureString", f"cipher{MARK}")}),
     ],
 )
 def test_a_missing_an_unknown_or_a_wrongly_typed_parameter_raises(
