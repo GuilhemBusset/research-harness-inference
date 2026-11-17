@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import subprocess
 import sys
 import tomllib
@@ -64,11 +65,15 @@ def sdk_error(text: str, operation: str) -> botocore.exceptions.ClientError:
 def example_parameters() -> dict[str, str]:
     """The example's values as the owner types them into SSM, one parameter per key."""
     values = tomllib.loads((config.REPO_ROOT / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
-    assert values.pop("pools") == []  # an empty table: no parameter
-    assert values.pop("session_windows") == []
-    # A boolean as the owner types it: `true` or `false`.
-    typed = {f"/rhi/config/{key}": str(value).lower() if type(value) is bool else str(value) for key, value in values.items()}
-    return typed | {"/rhi/config/session_windows": "[]"}
+    # One parameter per pool, its entry as a JSON object; the table has none.
+    entries = {f"/rhi/config/pools/{name}": json.dumps(entry) for name, entry in values.pop("pools").items()}
+    # A boolean as the owner types it, `true` or `false`, and a list as a JSON array.
+    def typed(value: object) -> str:
+        if type(value) is bool:
+            return str(value).lower()
+        return json.dumps(value) if type(value) is list else str(value)
+
+    return {f"/rhi/config/{key}": typed(value) for key, value in values.items()} | entries
 
 
 def as_logged(error: BaseException) -> str:
@@ -105,11 +110,17 @@ def test_the_layout() -> None:
 
     written = StandIn()
     config.write_ssm(EXAMPLE, written)
-    assert set(written.parameters) == {f"/rhi/config/{key}" for key in config.KEYS if key != "pools"}
+    assert set(written.parameters) == {f"/rhi/config/{key}" for key in config.KEYS if key != "pools"} | {
+        "/rhi/config/pools/mock"
+    }
     assert {kind for kind, _ in written.parameters.values()} == {"String"}
-    assert not [name for name in written.parameters if name.startswith("/rhi/config/pools/")]
     assert all(request["Name"].startswith("/rhi/config/") for _, request in written.calls)
-    assert {name: value for name, (_, value) in written.parameters.items()} == example_parameters()
+    values = {name: value for name, (_, value) in written.parameters.items()}
+    typed = example_parameters()
+    # The written entry holds every field the owner typed, and the defaults of section 17 too.
+    written_entry, typed_entry = (json.loads(each.pop("/rhi/config/pools/mock")) for each in (values, typed))
+    assert written_entry.items() >= typed_entry.items()
+    assert values == typed
 
     # A parameter beside the prefix is never met: only the prefix is read, by path, to its last page.
     beside = StandIn(example_parameters() | {"/rhi/pools/mock/release": f"release{MARK}"})
@@ -167,8 +178,11 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         ("'session_windows'", {"/rhi/config/session_windows": f'["{MARK}"]'}),
         ("'https_listener'", {"/rhi/config/https_listener": "TRUE"}),
         ("'https_listener'", {"/rhi/config/https_listener": f"{MARK}"}),
-        # A pool entry is its own parameter, and the loader refuses one until entries have a shape.
+        # A pool entry is its own parameter, a JSON object the pool parser reads.
         ("'pools'", {"/rhi/config/pools/mock": f"entry{MARK}"}),
+        ("'pools'", {"/rhi/config/pools/mock": f'{{"engine": "mock{MARK}"}}'}),
+        ("'allowed_instance_types'", {"/rhi/config/allowed_instance_types": f"t{MARK}.small"}),
+        ("'default_pool'", {"/rhi/config/default_pool": f"pool{MARK}"}),
         # A parameter that is not a String.
         ("'/rhi/config/domain'", {"/rhi/config/domain": ("SecureString", f"cipher{MARK}")}),
     ],
@@ -271,5 +285,5 @@ def test_the_sdk_is_pinned_and_only_the_ssm_source_and_writer_load_it() -> None:
         "config.write_file(config.load({'RHI_CONFIG': 'example'}), pathlib.Path(sys.argv[1]));"
         "sys.exit('boto3' in sys.modules or 'botocore' in sys.modules)"
     )
-    environment = {"PYTHONPATH": str(config.REPO_ROOT / "src")}
+    environment = {"PYTHONPATH": f"{config.REPO_ROOT / 'src'}:{config.REPO_ROOT / 'services/common'}"}
     assert subprocess.run([sys.executable, "-c", program, "/dev/null"], env=environment, check=False).returncode == 0

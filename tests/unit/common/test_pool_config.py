@@ -212,3 +212,28 @@ def test_expected_values() -> None:
         refusal = refused("coursework", changed(COURSEWORK, {"expected": bad}))
         assert refusal.field == "expected"
         assert repr("expected") in str(refusal)
+
+
+# The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A
+# copy, never read from the example: the deployed entry does not change when the example does.
+FIRST_DEPLOYED_MOCK = {
+    "engine": "mock",
+    "instance_types": ["t4g.small"],
+    "prices": {"t4g.small": 0.02},
+    "wake": "on-demand",
+    "max_instances": 2,
+    "warm_instances": 1,
+    "target_concurrency": 8,
+    "context_length": 262144,
+    "largest_output": 32000,
+}
+
+
+def test_the_first_deployed_pool_still_parses() -> None:
+    # A field added later without a default is missing from this entry, and the parser refuses it.
+    (mock,) = parse_pools({"mock": FIRST_DEPLOYED_MOCK})
+    assert (mock.engine, mock.instance_types, mock.wake) == ("mock", ("t4g.small",), "on-demand")
+    assert mock.prices == {"t4g.small": 0.02}
+    assert (mock.max_instances, mock.warm_instances, mock.target_concurrency) == (2, 1, 8)
+    assert (mock.context_length, mock.largest_output) == (262144, 32000)
+    assert (mock.expected, mock.measured_start_seconds) == (None, None)

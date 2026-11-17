@@ -36,6 +36,9 @@ REPO = Path(__file__).resolve().parents[2]
 # Not files of the repository: git's own folder, and what the tools leave behind as they run.
 LEFT_OUT = shutil.ignore_patterns(".git", ".venv", "node_modules", "cdk.out", "__pycache__", ".*_cache")
 EXAMPLE = (REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8")
+# The example with its mock pool broken: a file the loader refuses.
+REFUSED = EXAMPLE.replace("max_instances = 2\n", "max_instances = 0\n")
+assert REFUSED != EXAMPLE
 # Part of every bad value below, so a test can tell that a refusal does not repeat the value.
 MARK = "7701"
 SECRET = "rhi/reporter/github-app"
@@ -576,7 +579,7 @@ def test_the_configuration_step_asks_before_it_writes(walkthrough: Walkthrough) 
     assert walkthrough.called("aws") == []
 
     # A file the loader refuses stops the step before the writing is offered.
-    refused = walkthrough.owner_file(EXAMPLE.replace("pools = []", "pools = [1]"), "refused.toml")
+    refused = walkthrough.owner_file(REFUSED, "refused.toml")
     done = walkthrough.run("--step", "configuration", "--config", refused, answers="y\ny\ny\n")
     assert done.returncode != 0
     assert [call.split()[7] for call in walkthrough.called("uv")] == ["check"]
@@ -605,7 +608,7 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
 
     # A check writes nothing, and a file the loader refuses is refused before anything is written.
     assert owner_config.main(["check", str(file)], untouched) == 0
-    file.write_text(EXAMPLE.replace("pools = []", "pools = [1]"), encoding="utf-8")
+    file.write_text(REFUSED, encoding="utf-8")
     assert owner_config.main(["write", str(file)], untouched) == 1
     assert untouched.put == []
 

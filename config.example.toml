@@ -33,11 +33,38 @@ course_end = 2099-12-31
 # Entries have no shape yet: the loader refuses any.
 session_windows = []
 
-# One entry per pool. Entries have no shape yet: the loader refuses any.
-pools = []
-
 # Whether the public load balancer has its certificate, its HTTPS listener on 443 and the domain's
 # alias record. Left out, it reads false: the owner turns it on once the domain resolves through
 # the hosted zone above. The example turns it on, so that synthesis and the policy tests see the
 # listener and the rules on it.
 https_listener = true
+
+# The instance types a pool may list, a hard cap (system design, section 11.3). Left out, it is the
+# types the pools below list.
+allowed_instance_types = ["t4g.small"]
+
+# Dollars an hour: a pool with an instance type priced above it may only wake on schedule
+# (section 17). Left out, it is 5.
+on_demand_price_limit = 5
+
+# The pool the gateway maps `claude-*` model names to (sections 5.4 and 6.2). Left out, it is the
+# only pool when there is one; with two pools or more it must be given.
+default_pool = "mock"
+
+# One entry per pool, under the model name students choose it by (section 4.2). An empty table,
+# `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
+#
+# The mock pool, phase 1's only pool: the mock engine on t4g.small, woken on demand. Its context
+# length is the coursework pool's, so that the mock exercises the same limits; its largest output
+# is the 32,000 tokens Claude Code asks for on its main turns (evidence E15), which the body filter
+# then leaves as they are sent. It gives no expected values and has no measured start.
+[pools.mock]
+engine = "mock"
+instance_types = ["t4g.small"]
+prices = { "t4g.small" = 0.02 }
+wake = "on-demand"
+max_instances = 2
+warm_instances = 1
+target_concurrency = 8
+context_length = 262144
+largest_output = 32000
