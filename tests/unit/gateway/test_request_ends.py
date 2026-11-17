@@ -23,7 +23,7 @@ from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
-from rhi_gateway.app import Forwarding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -31,6 +31,7 @@ from rhi_gateway.errors import WireFormat, render_json, render_stream_event
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.keystore import InMemoryKeyStore
+from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
 STUDENT = 4242
@@ -194,6 +195,8 @@ def gateway(upstream: Upstream, clock: Clock) -> tuple[Starlette, str, Ledger]:
         ledger=ledger,
         filters=filters,
         proxy=proxy.Proxy(client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=clock.sleep),
+        # Every pool is ready: these requests are forwarded at once, with no hold.
+        holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
     )
     return build_app(forwarding_handlers(forwarding)), key, ledger
 
