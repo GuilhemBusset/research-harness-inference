@@ -13,6 +13,11 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
   when a change widens permissions. That approval is a tripwire for honest mistakes. It does not
   cover this stack, which updates earlier in the same run (section 8.4, control 6).
 
+The asset step builds every image asset of the stage for its pool's processor architecture
+(sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
+build hosts are x86_64, so each project that publishes an image first registers an emulator for
+arm64 and selects a builder that can target either platform, all pinned (`IMAGE_BUILDER`).
+
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
 function that posts commit statuses to GitHub (step 7). It adds no step to the pipeline.
 
@@ -27,9 +32,11 @@ credentials that deploy it (section 10).
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 import aws_cdk as cdk
+from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_codeconnections as codeconnections
 from aws_cdk import aws_codepipeline as codepipeline
 from aws_cdk import aws_iam as iam
@@ -51,6 +58,37 @@ BRANCH = "main"
 CONNECTION_NAME = "rhi-github"
 # The name of the source's action in the pipeline.
 SOURCE_ACTION = "GitHub"
+
+# What a project that publishes an image installs, so that one run builds an image for linux/arm64
+# as well as one for linux/amd64. Each is pinned, by digest or by version and checksum, and each
+# release had been out a week when it was pinned (the cooling-off of sections 9 and 17).
+# The emulator: QEMU's arm64 handler, registered with the host's kernel by this image.
+EMULATOR_IMAGE = (
+    "tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+)
+# The builder: Docker's buildx plugin, for the x86_64 build host, checked against its release's checksum.
+BUILDX_VERSION = "0.38.2"
+BUILDX_SHA256 = "7992ec09413b80ff57ba4e081f56fc833d7bac1d5e71143c6c809e7e6065f6d6"
+BUILDX_URL = (
+    f"https://github.com/docker/buildx/releases/download/v{BUILDX_VERSION}/buildx-v{BUILDX_VERSION}.linux-amd64"
+)
+BUILDX_PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
+# The BuildKit the builder runs in a container. It builds for any platform the emulator adds, and
+# loads what it builds into Docker, from where `cdk-assets` tags and pushes it.
+BUILDKIT_IMAGE = "moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
+BUILDER = "rhi-assets"
+IMAGE_BUILDER = [
+    f"docker run --privileged --rm {EMULATOR_IMAGE} --install arm64",
+    f'curl -fsSL --create-dirs -o "{BUILDX_PLUGIN}" {BUILDX_URL}',
+    f'echo "{BUILDX_SHA256}  {BUILDX_PLUGIN}" | sha256sum -c -',
+    f'chmod +x "{BUILDX_PLUGIN}"',
+    (
+        f"docker buildx create --name {BUILDER} --driver docker-container --driver-opt image={BUILDKIT_IMAGE}"
+        " --driver-opt default-load=true --bootstrap --use"
+    ),
+]
+# `docker build`, as `cdk-assets` runs it, is the builder's: BuildKit, on the builder created above.
+IMAGE_BUILDER_ENVIRONMENT = {"DOCKER_BUILDKIT": "1", "BUILDX_BUILDER": BUILDER}
 
 
 class PipelineStack(cdk.Stack):
@@ -84,6 +122,7 @@ class PipelineStack(cdk.Stack):
         check = pipelines.ConfirmPermissionsBroadening("Check", stage=stage)
         self.pipeline.add_stage(stage, pre=[check])
         self.pipeline.build_pipeline()
+        self._builds_images_for_both_platforms()
 
         # CDK grants the source's role the connection's old service prefix only. The source
         # action's documentation asks for both prefixes on the connection, so the new one is added.
@@ -106,6 +145,29 @@ class PipelineStack(cdk.Stack):
         # Before the rewrite below, which visits every function of the stack, the reporter's too.
         self.reporter = Reporter(self, "Reporter", config=config, pipeline=underlying, stage=stage)
         self._as_cfn_lint_reads_it(underlying)
+
+    def _builds_images_for_both_platforms(self) -> None:
+        """Gives every project of the asset step that publishes an image `IMAGE_BUILDER`, after
+        what CDK Pipelines installs and before it publishes.
+
+        CDK Pipelines gives every asset project the same build settings, and runs Docker only in
+        a project that publishes an image, which it makes privileged for that: a privileged
+        project of the asset step is one that publishes an image. A project that publishes files
+        is left as it is.
+        """
+        assets = self.pipeline.node.try_find_child("Assets")
+        projects = [] if assets is None else assets.node.find_all()
+        for project in projects:
+            if not isinstance(project, codebuild.CfnProject):
+                continue
+            if not self.resolve(project.environment).get("privilegedMode"):
+                continue
+            build_spec = json.loads(self.resolve(project.source)["buildSpec"])
+            install = build_spec["phases"].setdefault("install", {})
+            install["commands"] = [*install.get("commands", []), *IMAGE_BUILDER]
+            variables = build_spec.setdefault("env", {}).setdefault("variables", {})
+            variables.update(IMAGE_BUILDER_ENVIRONMENT)
+            project.add_property_override("Source.BuildSpec", json.dumps(build_spec, indent=2))
 
     def _as_cfn_lint_reads_it(self, underlying: codepipeline.Pipeline) -> None:
         """Rewrites what CDK Pipelines writes and cfn-lint warns about, with the same meaning.
