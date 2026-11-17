@@ -111,6 +111,10 @@ class Config:
     # alias record. Off until the owner's domain resolves through the hosted zone: before that,
     # the certificate's DNS validation never completes and the deployment fails.
     https_listener: bool
+    # The issuer's reserved concurrency, and the most keys a student may be issued over one UTC
+    # day, which reaches the issuer as RHI_ISSUANCES_PER_DAY (sections 6.4 and 17).
+    issuer_reserved_concurrency: int
+    key_issuances_per_day: int
 
 
 def _as_stored(text: str) -> object:
@@ -137,6 +141,13 @@ def _string(value: object) -> str:
 
 def _whole_dollars(value: object) -> int:
     # A TOML boolean is a Python int: it is not a number of dollars.
+    if type(value) is not int or value <= 0:
+        raise ValueError
+    return value
+
+
+def _whole_number(value: object) -> int:
+    # A TOML boolean is a Python int: it is not a count.
     if type(value) is not int or value <= 0:
         raise ValueError
     return value
@@ -255,6 +266,8 @@ KEYS: dict[str, Key] = {
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
     "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
     "default_pool": _STRING,
+    "issuer_reserved_concurrency": Key("a whole number above zero", _whole_number, _number_from_text),
+    "key_issuances_per_day": Key("a whole number above zero", _whole_number, _number_from_text),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -267,6 +280,9 @@ DEFAULTS: dict[str, object] = {
     "https_listener": False,
     # Section 17: 5 dollars an hour.
     "on_demand_price_limit": DEFAULT_ON_DEMAND_PRICE_LIMIT,
+    # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
+    "issuer_reserved_concurrency": 5,
+    "key_issuances_per_day": 5,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two

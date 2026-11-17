@@ -39,7 +39,8 @@ class EndpointStage(cdk.Stage):
         self.network = NetworkStack(self, "Network", config=config)
         # The students' tables and the pools' tables. Their stacks are fixed with their tables'
         # logical IDs (`tests/policy/stateful_logical_ids.json`): a table that moves is replaced.
-        self.access = AccessStack(self, "Access")
+        # The key issuer beside the students' tables, behind the public listener when there is one.
+        self.access = AccessStack(self, "Access", config=config, listener=self.network.https_listener)
         self.pools = PoolsStack(self, "Pools")
         # The metrics workspace, which the nodes, the gateway and the scaler write to. Its logical
         # ID is recorded too.
