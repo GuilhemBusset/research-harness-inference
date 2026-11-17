@@ -114,7 +114,7 @@ def encode(
     commit: str,
 ) -> list[CommitStatus]:
     """The statuses of one run, in the order of their parts. `names` is the enumeration the job
-    declares: every key of `numbers` is one of its members. ValueError, before any status is built,
+    declares: every member has the shape of a name, and every key of `numbers` is one of them. ValueError, before any status is built,
     for anything the module's rules do not allow."""
     if measurement not in IDS:
         raise ValueError("the id is not a measurement's")
@@ -125,10 +125,11 @@ def encode(
     if not isinstance(commit, str) or not _SHA.fullmatch(commit):
         raise ValueError("the commit is not a full commit SHA")
     declared = frozenset(names)
-    pairs = []
-    for name, number in numbers.items():
+    for name in (*declared, *numbers):
         if not isinstance(name, str) or not _NAME.fullmatch(name):
             raise ValueError("a name is not lower-case letters, digits and underscores after a letter")
+    pairs = []
+    for name, number in numbers.items():
         if name not in declared:
             raise ValueError("a name is not in the enumeration the job declares")
         if isinstance(number, bool) or not isinstance(number, int | float) or not math.isfinite(number):
