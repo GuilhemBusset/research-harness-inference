@@ -79,6 +79,7 @@ def test_only_the_detail_is_read(commit: str) -> None:
         pytest.param({"numbers": {"preemptions": True}}, id="a truth value for a number"),
         pytest.param({"numbers": {"preemptions": "0"}}, id="text for a number"),
         pytest.param({"names": "preemptions"}, id="names that are not a list"),
+        pytest.param({"names": [*NAMES, "invalid/name"]}, id="a declared name of another shape"),
         pytest.param({"verdict": "success"}, id="a verdict that is not pass, fail or error"),
         pytest.param({"label": 8}, id="a run label that is not text"),
         pytest.param({"commit": "0" * 39}, id="a commit that is not a full SHA"),
