@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """The examiner pilot (ADR 0001, decision 2): how often the examiner's findings name a defect seeded
 in a change to the CDK app, per class of defect.
 
