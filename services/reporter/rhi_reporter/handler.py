@@ -63,6 +63,15 @@ variable is unset, nothing is sent.
 While it is absent or lacks one of its fields, nothing is posted, `NO_CREDENTIAL` is logged, and
 the function returns normally, so that EventBridge does not retry: the owner creates the secret
 after the first deployment.
+
+**A measurement.** The rule on the measurement bus invokes `handler` with the events of source
+`measure.SOURCE`, each one run of a spike, the canary or the dry run, which a job sent because it
+cannot post a status itself (sections 8.4 and 12). Such an event takes no other path. Its statuses
+are the ones `measure.read_event` gives, posted in the order of their parts on the commit the event
+names, the one the job ran from. When the measure module refuses any part of it, nothing is posted
+and `NOT_A_MEASUREMENT` is logged, without the event's content. When GitHub refuses a status, a
+commit not in the repository among other reasons, `REFUSED` is logged with the HTTP status and
+GitHub's error code, and the rest is not posted.
 """
 
 from __future__ import annotations
@@ -80,7 +89,7 @@ from typing import TYPE_CHECKING, Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from rhi_reporter import github, notify, superseded
+from rhi_reporter import github, measure, notify, superseded
 from rhi_reporter.report import build_report, statuses_of
 from rhi_reporter.status import VERIFY_ACTION, State, status_for
 
@@ -124,6 +133,8 @@ NO_FACTS = "The report of a failure leaves out its resources: the pipeline's rec
 NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
 NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
 NOT_SENT = "The details of a failure were not sent to the owner: the topic refused them or could not be reached."
+NOT_A_MEASUREMENT = "No commit status was posted: the measurement event is not one the measure module accepts."
+REFUSED = "A measurement's commit status was not posted:"
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -178,7 +189,11 @@ def handler(event: Mapping[str, Any], _context: object) -> None:
 def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], topic: str | None = None) -> None:
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
     as `github.StatusClient` has it, then sends the details of an action that ended without
-    success to `topic`, the owner's. `stages` are the stages the pipeline deploys."""
+    success to `topic`, the owner's. `stages` are the stages the pipeline deploys. An event of a
+    measurement posts its statuses and nothing else."""
+    if event.get("source") == measure.SOURCE:
+        _measurement(event, aws=aws, client=client)
+        return
     kind, detail = event.get("detail-type"), event.get("detail")
     if kind == PIPELINE_CHANGE and isinstance(detail, dict):
         _supersede(detail, aws=aws, client=client, stages=stages)
@@ -230,6 +245,27 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
     if action is not None and topic is not None and aws.sns is not None:
         own = {"stage": stage, "action": action, "category": category, "state": detail.get("state"), "commit": commit}
         _send(aws, topic, own, execution=execution, read=read)
+
+
+def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any) -> None:
+    """Posts the statuses of one run that a job sent, on the commit the event names, or nothing
+    when the measure module refuses any part of the event."""
+    try:
+        statuses = measure.read_event(event)
+    except ValueError:
+        logger.warning(NOT_A_MEASUREMENT)
+        return
+    if not github.has_credential(aws.secrets):
+        logger.warning(NO_CREDENTIAL)
+        return
+    try:
+        for status in statuses:
+            _post(client, status)
+    except github.CredentialError:
+        logger.warning(NO_CREDENTIAL)
+    except github.RefusedError as error:
+        # The error's text is fixed: the HTTP status and one of GitHub's error codes.
+        logger.warning("%s %s", REFUSED, error)
 
 
 def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:

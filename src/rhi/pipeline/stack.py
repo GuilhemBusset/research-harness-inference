@@ -20,8 +20,10 @@ arm64 and selects a builder that can target either platform, all pinned (`IMAGE_
 
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
 function that posts commit statuses to GitHub (step 7), and sends the owner, on the topic of
-`rhi.pipeline.notify`, what a public status may not carry of a failure. It adds no step to the
-pipeline.
+`rhi.pipeline.notify`, what a public status may not carry of a failure. With it come the
+measurement bus and a rule on it that invokes the same function, through which a spike's or the
+canary's job hands its numbers to the reporter as events (sections 8.4 and 12). It adds no step to
+the pipeline.
 
 A push to `main` is the only trigger. No CodeBuild project has a webhook: on a public repository
 it would run a stranger's code with a role of the account (section 8.3). Every role of this stack

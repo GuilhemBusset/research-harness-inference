@@ -1,3 +1,30 @@
+# What the roles of `src/rhi/pipeline/reporter.py` may do, each action on each resource, with its
+# reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments. `tests/synth/test_reporter.py` and `tests/policy/test_pipeline.py` hold
+# the roles to it.
+#
+# The reporter function's role:
+# - secretsmanager:GetSecretValue on the secret rhi/reporter/github-app-?????? only: the status
+#   reporter App's credential, the one GitHub credential in the account, which no other role reads.
+# - codepipeline:GetPipelineExecution, GetPipelineState, ListActionExecutions and
+#   ListPipelineExecutions on this pipeline only: the commit an execution deploys, the state of its
+#   stages, its failed action and the commits a self-update left without an execution.
+# - cloudformation:DescribeStackEvents on stack/<name>/* of each stack the pipeline deploys: the
+#   resources that failed, for the report of a failure.
+# - s3:GetObject on the objects of the pipeline's artifact bucket: the templates the execution's
+#   synth step wrote, whose logical IDs bound what the report names.
+# - sns:Publish on the owner's topic only: the details of a failure a public status may not carry.
+# - logs:CreateLogStream and logs:PutLogEvents on the function's own log group: its logs.
+# It is given nothing on the measurement bus: it reads the bus's events, it does not send them.
+#
+# A job's role, through `measuring_job`:
+# - events:PutEvents on event-bus/rhi-measurements only: the job hands each run of a measurement to
+#   the reporter, since it may not hold the GitHub credential. Nothing on the secret.
+#
+# The two rules invoke the function through its resource policy, which lets events.amazonaws.com
+# call lambda:InvokeFunction from each rule's ARN only. The measurement bus has no policy of its
+# own: a role of the account puts events on it by its IAM grant.
+
 [nag]
 "AwsSolutions-L1" = "The reporter runs on the Lambda runtime of the Python that .python-version names, the one its tests and its bundle's libraries are built for, which packaging.RUNTIME holds for every function of the app."
 "AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/*]" = "The reporter reads the templates that an execution's synth step wrote to the pipeline's own artifact bucket, under an object key CodePipeline only chooses when the execution runs."

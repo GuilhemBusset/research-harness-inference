@@ -1,7 +1,9 @@
 """The pipeline's reporter, in the app's synthesized templates (system design, section 8.2, step 7):
 a rule on this pipeline's state changes and nothing else, the function it invokes, the secret
 the function reads, which the stack refers to and never creates, and the owner's topic, where the
-function sends what a public status may not carry (section 8.4).
+function sends what a public status may not carry (section 8.4). Beside them, the measurement bus,
+a rule on it for a job's measurements that invokes the same function, and the grant a job's role
+is given to put events on that bus (sections 8.4 and 12).
 """
 
 from __future__ import annotations
@@ -9,11 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 from rhi import config
-from rhi_reporter import handler
+from rhi_reporter import handler, measure
 
 PIPELINE_TEMPLATE = "RhiPipeline.template.json"
 # The secret's fixed name, which the owner creates (section 8.6, step 3).
 SECRET_NAME = "rhi/reporter/github-app"
+MEASUREMENT_BUS = "rhi-measurements"
 
 
 def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
@@ -36,7 +39,13 @@ def reporter_functions(template: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
-    (rule,) = [rule for template in templates.values() for rule in of_type(template, "AWS::Events::Rule").values()]
+    # The one rule on the default bus: the other is on the measurement bus.
+    (rule,) = [
+        rule
+        for template in templates.values()
+        for rule in of_type(template, "AWS::Events::Rule").values()
+        if "EventBusName" not in rule
+    ]
     pattern = rule["EventPattern"]
     assert pattern["source"] == ["aws.codepipeline"]
     assert sorted(pattern["detail-type"]) == [
@@ -54,6 +63,46 @@ def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str
     (target,) = rule["Targets"]
     (function_id,) = reporter_functions(template)
     assert target["Arn"] == {"Fn::GetAtt": [function_id, "Arn"]}
+
+
+def test_the_measurement_rule_matches_the_measurement_bus_only(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    buses = [(path, bus) for path, t in templates.items() for bus in of_type(t, "AWS::Events::EventBus").items()]
+    ((path, (bus_id, bus)),) = buses
+    assert path == PIPELINE_TEMPLATE and bus["Name"] == MEASUREMENT_BUS
+    rules = [rule for t in templates.values() for rule in of_type(t, "AWS::Events::Rule").values()]
+    (rule,) = [rule for rule in rules if "EventBusName" in rule]
+    assert rule["EventBusName"] == {"Ref": bus_id}
+    # A job's events, whatever they are, and the job and the reporter agree on their source.
+    assert rule["EventPattern"] == {"source": [measure.SOURCE]} == {"source": ["rhi.measurement"]}
+    (target,) = rule["Targets"]
+    (function_id,) = reporter_functions(template)
+    assert target["Arn"] == {"Fn::GetAtt": [function_id, "Arn"]}
+
+
+def test_a_job_given_the_grant_may_put_events_on_the_bus_and_read_no_secret(app: Any) -> None:
+    # Imported once the fixtures have started the CDK as the sandbox needs it (`conftest.py`).
+    import aws_cdk as cdk
+    from aws_cdk import assertions
+
+    from rhi.pipeline import reporter
+
+    stack = cdk.Stack(cdk.App(), "Job")
+    codebuild = cdk.aws_iam.ServicePrincipal("codebuild.amazonaws.com")
+    # ty reads the CDK's generated classes as unlike the protocols they implement (`src/rhi/pipeline/reporter.py`).
+    role = cdk.aws_iam.Role(stack, "Role", assumed_by=codebuild)  # ty: ignore[invalid-argument-type]
+    environment = {"OTHER": "kept"}
+    reporter.measuring_job(role, environment)
+
+    assert environment == {"OTHER": "kept", measure.BUS_VARIABLE: MEASUREMENT_BUS}
+    template = dict(assertions.Template.from_stack(stack).to_json())
+    (policy,) = of_type(template, "AWS::IAM::Policy").values()
+    (statement,) = policy["PolicyDocument"]["Statement"]
+    assert {key: statement[key] for key in ("Effect", "Action")} == {"Effect": "Allow", "Action": "events:PutEvents"}
+    parts = statement["Resource"]["Fn::Join"][1]
+    texts = [part for part in parts if isinstance(part, str)]
+    assert texts == ["arn:", ":events:", ":", f":event-bus/{MEASUREMENT_BUS}"]
+    assert "secretsmanager" not in str(template)
 
 
 def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str, dict[str, Any]]) -> None:
