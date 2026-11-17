@@ -29,8 +29,8 @@ of the group suspends a process for good, so a custom resource calls `SuspendPro
 name, which changes the custom resource's call, and CloudFormation then updates it. The scaler
 resumes only the process `Launch`, so rebalancing stays suspended.
 
-The launch template gives an instance no public address and no key pair, requires IMDSv2, lets the
-instance read its own tags through the instance metadata and encrypts its volume. It tags the
+The launch template gives an instance the pool's role (`rhi.pools.role`), no public address and no
+key pair, requires IMDSv2, lets the instance read its own tags through the instance metadata and encrypts its volume. It tags the
 instance with its pool, `rhi-pool`, and with the name of its pool's release parameter,
 `rhi-release-parameter`: the boot program installed by the user data
 (`services/engine/boot/user-data.sh`) reads that tag to find its release, so the user data holds no
@@ -111,6 +111,7 @@ class PoolGroup(Construct):
         vpc: ec2.IVpc,
         security_group: ec2.ISecurityGroup,
         target_group: elbv2.IApplicationTargetGroup,
+        role: iam.Role,
         nightly_stop: str,
         time_zone: str,
     ) -> None:
@@ -122,6 +123,8 @@ class PoolGroup(Construct):
             machine_image=image,
             user_data=ec2.UserData.custom(USER_DATA.read_text(encoding="utf-8")),
             security_group=security_group,
+            # Through an instance profile the launch template makes for it.
+            role=role,  # ty: ignore[invalid-argument-type] - jsii passes `grantee` by position (rhi.pools.role)
             associate_public_ip_address=False,
             require_imdsv2=True,
             http_tokens=ec2.LaunchTemplateHttpTokens.REQUIRED,

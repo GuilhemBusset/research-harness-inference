@@ -1,0 +1,31 @@
+# What the roles of `src/rhi/pools/role.py` may do, each action on each resource, with its reason.
+# The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# Each pool's instance role, trusted by EC2, tagged rhi-pool with the pool's name, and holding no
+# AWS managed policy (tests/policy/test_instance_role.py):
+# - dynamodb:PutItem and dynamodb:UpdateItem on the heartbeat table, by its ARN, with the condition
+#   that dynamodb:LeadingKeys is the pool's name: an instance writes its own pool's heartbeat rows
+#   and no other.
+# - aps:RemoteWrite on the metrics workspace only, by its ARN: an instance pushes its metrics.
+# - logs:CreateLogStream and logs:PutLogEvents on the pool's own log group, /rhi/pools/<pool>.
+# - autoscaling:CompleteLifecycleAction and autoscaling:RecordLifecycleActionHeartbeat on a group
+#   ARN by pattern, with the condition that the group's tag rhi-pool is the pool's name: an
+#   instance completes, or keeps waiting, the lifecycle actions of its own group.
+# - in the session policy, the five actions of Session Manager on every resource, which is the
+#   only way AWS grants them: ssm:UpdateInstanceInformation, ssmmessages:CreateControlChannel,
+#   ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel and
+#   ssmmessages:OpenDataChannel.
+# Each later issue that creates a resource the instances read grants it to this role, and lists
+# it here.
+
+[nag]
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants the five actions of Session Manager only on every resource, and the session policy holds those five actions alone."
+
+[wildcard_actions]
+"ssm:UpdateInstanceInformation" = "AWS grants this action only on every resource, and the Session Manager agent of an instance reports its status with it."
+"ssmmessages:CreateControlChannel" = "AWS grants this action only on every resource, and the Session Manager agent of an instance opens with it the channel that receives sessions."
+"ssmmessages:CreateDataChannel" = "AWS grants this action only on every resource, and the Session Manager agent of an instance opens with it the channel that carries a session."
+"ssmmessages:OpenControlChannel" = "AWS grants this action only on every resource, and the Session Manager agent of an instance connects with it to its control channel."
+"ssmmessages:OpenDataChannel" = "AWS grants this action only on every resource, and the Session Manager agent of an instance connects with it to a session's data channel."

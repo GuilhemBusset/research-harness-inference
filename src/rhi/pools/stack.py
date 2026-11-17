@@ -14,6 +14,7 @@ import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 
 from rhi.pools.group import PoolGroup
+from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
 from rhi.pools.scaler import Scaler
 from rhi.pools.tables import PoolTables
@@ -29,8 +30,10 @@ if TYPE_CHECKING:
 class PoolsStack(cdk.Stack):
     """Holds the pool-state and heartbeat tables, which the stack's later constructs take from
     `tables` (`tables.pool_state`, `tables.heartbeats`), the internal load balancer with one
-    target group per pool, which they take from `routing` (`routing.target_groups[name]`), and each
-    pool's launch template and Auto Scaling group, from `groups[name]`, and the scaler, from
+    target group per pool, which they take from `routing` (`routing.target_groups[name]`), each
+    pool's instance role and log group, from `roles[name]` (`roles[name].role`, which later issues
+    grant what their resources need), each pool's launch template and Auto Scaling group, from
+    `groups[name]`, and the scaler, from
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke."""
 
     def __init__(
@@ -56,6 +59,17 @@ class PoolsStack(cdk.Stack):
             security_group=network.security_groups.internal_load_balancer,
             pools=config.pools,
         )
+        # One instance role per pool, with its log group, by the pool's name.
+        self.roles = {
+            pool.name: PoolRole(
+                self,
+                f"Role-{pool.name}",
+                pool=pool.name,
+                heartbeats=self.tables.heartbeats,
+                workspace=observability.prometheus,
+            )
+            for pool in config.pools
+        }
         # One launch template and group per pool, by the pool's name; none with the table empty.
         self.groups = {
             pool.name: PoolGroup(
@@ -65,6 +79,7 @@ class PoolsStack(cdk.Stack):
                 vpc=network.vpc,
                 security_group=network.security_groups.instances,
                 target_group=self.routing.target_groups[pool.name],
+                role=self.roles[pool.name].role,
                 nightly_stop=config.nightly_stop,
                 time_zone=config.time_zone,
             )

@@ -132,6 +132,7 @@ def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00
     from aws_cdk import assertions
     from aws_cdk import aws_ec2 as ec2
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+    from aws_cdk import aws_iam as iam
 
     from rhi.pools.group import PoolGroup
 
@@ -139,6 +140,8 @@ def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00
     stack = cdk.Stack(cdk.App(analytics_reporting=False), "Group")
     vpc = ec2.Vpc(stack, "Vpc", max_azs=2, nat_gateways=1)
     target_group = elbv2.ApplicationTargetGroup(stack, "Targets", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE)
+    ec2_service = iam.ServicePrincipal("ec2.amazonaws.com")
+    role = iam.Role(stack, "Role", assumed_by=ec2_service)  # ty: ignore[invalid-argument-type] - jsii, as in role.py
     PoolGroup(
         stack,
         "Pool",
@@ -146,6 +149,7 @@ def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00
         vpc=vpc,
         security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
         target_group=target_group,
+        role=role,
         nightly_stop=nightly_stop,
         time_zone="Europe/Paris",
     )

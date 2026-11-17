@@ -8,7 +8,8 @@
 #   group's tag rhi-pool with the pool's name: the custom resource suspends the group's process
 #   AZRebalance when the group is created or replaced.
 #
-# The launch template gives its instances no role: what an instance reads is another module's.
+# The launch template gives its instances the pool's role through an instance profile it makes,
+# which holds no action of its own: what that role may do is listed in `pools_role.toml`.
 #
 # The warm pool and the nightly scheduled action that sets the desired capacity to zero are
 # resources Auto Scaling acts on with its own service-linked role: they bring no role of this
