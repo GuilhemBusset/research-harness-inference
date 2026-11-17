@@ -51,14 +51,15 @@ Rules hold those two, and every action:
   managed policy the template does not hold are taken as reaching more;
 - no role of any template but the reporter's may read the reporter's secret (section 8.4): the
   App's key is the only GitHub credential in the account. A statement reaches the secret when one
-  of its actions matches a read of a secret (`SECRET_READS`) and one of its resources matches the
-  secret's ARN, a wildcard and a value of the template read as matching anything; `NotAction` and
+  of its actions matches a read of a secret (`SECRET_READS`) and one of its resources may name the
+  secret, in any partition, region and account and whatever six characters Secrets Manager adds
+  to its name, a wildcard and a value of the template read as matching anything; `NotAction` and
   `NotResource` reach everything. A managed policy the template does not hold is taken as
   reaching it too;
 - no role may both put events on the measurement bus, `rhi-measurements`, and read that secret: a
   job sends the reporter its numbers because it must not hold the credential (section 12). A
   statement reaches the bus when one of its actions matches `events:PutEvents` and one of its
-  resources matches the bus's ARN, read as above.
+  resources may name the bus, in any partition, region and account, read as above.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -67,6 +68,7 @@ pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeli
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import re
 from pathlib import Path
@@ -171,11 +173,13 @@ REPORTER_READS = {
     "logs:CreateLogStream": "logs",
     "logs:PutLogEvents": "logs",
 }
-# What reads a secret, and the ARN of the reporter's secret and of the measurement bus as a resource of
-# a statement must match to reach them: Secrets Manager adds six characters it chooses to a secret's
-# name, here a sample of them.
+# What reads a secret, and every ARN of the reporter's secret and of the measurement bus, as patterns
+# that a resource of a statement must overlap to reach them (`overlaps`): any partition, region and
+# account, and the six characters Secrets Manager chooses and adds to a secret's name. `FIELD` stands
+# for one field of an ARN, any run of characters without a colon.
+FIELD = "\x00"
 SECRET_READS = ("secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue")
-SECRET_ARN = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{REPORTER_SECRET}-AbCdEf"
+SECRET_ARN = f"arn:{FIELD}:secretsmanager:{FIELD}:{FIELD}:secret:{REPORTER_SECRET}-??????"
 MEASUREMENT_BUS = "rhi-measurements"
 # The AWS managed policy CDK gives the functions it adds itself, CDK Pipelines' approval among them:
 # it allows creating a log group and writing logs, and nothing else.
@@ -183,9 +187,11 @@ WRITES_LOGS_ONLY = re.compile(
     r"arn:(aws[a-z-]*|\$\{AWS::Partition\}):iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 )
 PUTS_EVENTS = ("events:PutEvents",)
-BUS_ARN = f"arn:aws:events:us-east-1:123456789012:event-bus/{MEASUREMENT_BUS}"
+BUS_ARN = f"arn:{FIELD}:events:{FIELD}:{FIELD}:event-bus/{MEASUREMENT_BUS}"
 PARTITION = r"arn:(aws[a-z-]*|\$\{AWS::Partition\})"
 HERE = r"\$\{AWS::Region\}:\$\{AWS::AccountId\}"
+# The pseudo parameters that fill one field of an ARN.
+PSEUDO_FIELD = re.compile(r"\$\{AWS::(Partition|Region|AccountId|URLSuffix)\}")
 
 UNLISTED = "the pipeline has it and the reviewed list does not"
 MISSING = "the reviewed list has it and the pipeline does not"
@@ -483,10 +489,32 @@ def arn_text(value: Any) -> str | None:
     return None
 
 
+def overlaps(one: str, other: str) -> bool:
+    """Whether some text matches both patterns, where `*` stands for any run of characters, `FIELD`
+    for any run without a colon and `?` for any one character, as IAM reads a resource."""
+    runs = {"*", FIELD}
+
+    def absorbs(run: str, char: str) -> bool:
+        return run == "*" or char != ":"
+
+    @functools.cache
+    def rest(i: int, j: int) -> bool:
+        if i == len(one) or j == len(other):
+            return set(one[i:] + other[j:]) <= runs
+        a, b = one[i], other[j]
+        if a in runs:
+            return rest(i + 1, j) or ((b in runs or absorbs(a, b)) and rest(i, j + 1))
+        if b in runs:
+            return rest(i, j + 1) or (absorbs(b, a) and rest(i + 1, j))
+        return (a == b or "?" in (a, b)) and rest(i + 1, j + 1)
+
+    return rest(0, 0)
+
+
 def reaches(statement: Mapping[str, Any], actions: tuple[str, ...], arn: str) -> bool:
-    """Whether an allowed statement reaches one of `actions` on the resource of ARN `arn`. A value
-    of the template in a resource, a reference or a pseudo parameter, matches anything there, and a
-    resource that cannot be read as text matches everything."""
+    """Whether an allowed statement reaches one of `actions` on a resource of an ARN the pattern
+    `arn` matches. A value of the template in a resource, a reference or a pseudo parameter,
+    matches anything there, and a resource that cannot be read as text matches everything."""
     if "NotAction" in statement or "NotResource" in statement:
         return True
     if not any(
@@ -497,7 +525,7 @@ def reaches(statement: Mapping[str, Any], actions: tuple[str, ...], arn: str) ->
         return False
     for resource in as_list(statement.get("Resource", [])):
         text = arn_text(resource)
-        if text is None or fnmatch.fnmatchcase(arn, re.sub(r"\$\{[^}]*\}", "*", text)):
+        if text is None or overlaps(arn, re.sub(r"\$\{[^}]*\}", "*", PSEUDO_FIELD.sub(FIELD, text))):
             return True
     return False
 
@@ -1238,6 +1266,9 @@ def test_keeps_a_job_given_the_measurement_grant(cdk: ModuleType, tmp_path: Path
     ("change", "expected"),
     [
         pytest.param(a_role(reads=the_secret(f"{REPORTER_SECRET}-??????")), {SECRET_ELSEWHERE}, id="by its name"),
+        pytest.param(
+            a_role(reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")), {SECRET_ELSEWHERE}, id="by its full name"
+        ),
         pytest.param(a_role(reads=every_resource), {SECRET_ELSEWHERE}, id="on every resource"),
         pytest.param(
             a_role(reads=the_secret("rhi/*"), action="secretsmanager:*"), {SECRET_ELSEWHERE}, id="by wildcards"
@@ -1246,6 +1277,11 @@ def test_keeps_a_job_given_the_measurement_grant(cdk: ModuleType, tmp_path: Path
             a_role(measures=True, reads=the_secret(f"{REPORTER_SECRET}-??????")),
             {SECRET_ELSEWHERE, MEASURES_AND_READS},
             id="by a job given the measurement grant",
+        ),
+        pytest.param(
+            a_role(measures=True, reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")),
+            {SECRET_ELSEWHERE, MEASURES_AND_READS},
+            id="by its full name, by a job given the measurement grant",
         ),
     ],
 )
