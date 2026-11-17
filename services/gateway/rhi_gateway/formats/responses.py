@@ -173,6 +173,7 @@ _ITEM: Final = Fields(
         "caller": _CALLER,
         "arguments": KEEP,  # `FunctionCall`: a string of JSON
         "input": KEEP,  # `CustomToolCall`: the text the model wrote for the tool
+        "async": KEEP,  # `FunctionCall`, `CustomToolCall`: whether its result may come in a later request
         # `FunctionCallOutput`, `CustomToolCallOutput`: a string or an array of parts;
         # `ShellCallOutput`: an array of what each command printed; `LocalShellCallOutput`,
         # `ApplyPatchCallOutput`: a string; `ComputerCallOutput`: one
