@@ -69,6 +69,17 @@ A stream cut in the middle of an event has that event closed before the error ev
 error is read as an event of its own; where what the client has of the open event is the start of
 the error event (`event: `, `data: `), the error event is completed from there instead.
 
+**A held stream** (sections 5.3 and 6.2, steps 5 and 8). A stream whose pool was not ready is
+answered 200 at once (`Proxy.held`), and its hold (`rhi_gateway.app`) writes its keep-alives
+until the request may be forwarded. The engine is silent while it computes a long transcript, so
+the keep-alives go on after the request is forwarded, while the gateway waits for the engine's
+headers and then its first bytes; from those on, none is sent, and the stream is the engine's, as
+above. Since the client has its 200 already, every other end is an error event of its wire
+format: the hold's own cause when the hold ends the request, settled with nothing observed;
+`engine_error` for an engine that cannot be reached, answers with a status that is not a success
+or with an answer that is not a stream, or breaks off before its first event, none of whose own
+answer is sent; `time_limit` for the request's time limit, counted from the moment it is forwarded.
+
 **Time** (section 6.2, step 7). Every timeout of the upstream client is set here, because
 httpx's default, 5 seconds for each, would cut a stream that is quiet while the engine computes:
 10 seconds to connect, 60 to write a request, 10 to obtain a pooled connection, and 1,200 to read,
@@ -86,6 +97,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -96,7 +108,7 @@ from starlette.types import Message, Receive, Scope, Send
 from rhi_common.causes import Cause
 from rhi_gateway import routes
 from rhi_gateway.body import Forwarded
-from rhi_gateway.errors import WireFormat, render_json, render_stream_event
+from rhi_gateway.errors import GatewayError, WireFormat, render_json, render_stream_event
 from rhi_gateway.formats.chat import ChatForwarded
 from rhi_gateway.routes import Route
 from rhi_gateway.sse import SseEvent, SseReader
@@ -468,9 +480,22 @@ class _Stream:
     """A streamed answer, open: its chunks for the client, the error event that ends a broken one, its usage."""
 
     def __init__(
-        self, response: httpx.Response, meter: _Meter, ends: _Ends, wire_format: WireFormat, settle: _Settlement
+        self,
+        response: httpx.Response,
+        meter: _Meter,
+        ends: _Ends,
+        wire_format: WireFormat,
+        settle: _Settlement,
+        *,
+        upstream: AsyncIterator[bytes] | None = None,
+        first: bytes | None = None,
     ) -> None:
         self._response = response
+        # Decoded, should the engine compress what it was asked to send as it is: the client is
+        # given no `Content-Encoding`, and the parser reads text. A held stream has read the first
+        # chunk already, from this same iterator.
+        self._upstream = response.aiter_bytes() if upstream is None else upstream
+        self._first = first
         self._meter = meter
         self._gate = _ErrorGate()
         self.ends = ends
@@ -497,13 +522,13 @@ class _Stream:
 
     async def chunks(self) -> AsyncGenerator[bytes]:
         """The bytes for the client, each as soon as the upstream chunk that carries it has arrived."""
-        # Decoded, should the engine compress what it was asked to send as it is: the client is
-        # given no `Content-Encoding`, and the parser reads text.
-        upstream = self._response.aiter_bytes()
+        upstream = self._upstream
+        first, self._first = self._first, None
         cause = Cause.ENGINE_ERROR
         client_has: bytes | None = None  # What the client has of the open event, if not all that was forwarded.
         try:
-            while (chunk := await self.ends.race(_next_chunk(upstream))) is not None:
+            while (chunk := first if first is not None else await self.ends.race(_next_chunk(upstream))) is not None:
+                first = None
                 before = self._gate.client_has
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
@@ -654,6 +679,154 @@ class Proxy:
                 seen = _observed_of(route, bytes(received))
                 await _to_the_end(_close_and_settle(ends, response, settle, seen if whole else seen.unclean()))
 
+    def held(
+        self, route: Route, forwarded: Forwarded, on_end: Callable[[Observed], Awaitable[None]], held: HeldRequest
+    ) -> Response:
+        """A held stream's answer: 200 at once, the hold's keep-alives, then the engine's stream on the same connection.
+
+        `on_end` is called exactly once: with nothing observed when the hold ends the request,
+        else as `forward` calls it. The request is forwarded when `held.waiting()` ends.
+        """
+        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held))
+
+
+class HeldRequest(Protocol):
+    """A stream held while its pool starts (`rhi_gateway.app`), as the proxy drives it."""
+
+    def waiting(self) -> AsyncGenerator[bytes]:
+        """The keep-alives while the pool starts. Ends when the request may be forwarded; raises `GatewayError` with the cause that ends it."""
+        ...
+
+    async def next_keep_alive(self) -> bytes:
+        """Wait for the next keep-alive due after the request was forwarded, and return its bytes."""
+        ...
+
+    def first_event(self) -> None:
+        """The engine has sent its first bytes: no keep-alive is due after them."""
+        ...
+
+
+def _drop(step: asyncio.Future[Any]) -> None:
+    """Give up a wait on the engine: cancel it, and close an answer it may still bring."""
+    if not step.done():
+        step.cancel()
+    step.add_done_callback(_dropped)
+
+
+def _dropped(step: asyncio.Future[Any]) -> None:
+    if step.cancelled() or step.exception() is not None:
+        return
+    answer = step.result()
+    if isinstance(answer, httpx.Response):
+        closing = asyncio.ensure_future(answer.aclose())
+        _ENDING.add(closing)
+        closing.add_done_callback(_ENDING.discard)
+
+
+async def _keeping_alive[T](
+    ends: _Ends, waited: Coroutine[Any, Any, T], held: HeldRequest, into: list[T]
+) -> AsyncGenerator[bytes]:
+    """The held stream's keep-alives while `waited` runs; what it gave is then put in `into`.
+
+    `waited` races the request's time limit as every wait on the engine does; a keep-alive due
+    with its answer is still sent.
+    """
+    step = asyncio.ensure_future(waited)
+    taken = False
+    try:
+        while not step.done():
+            beat = asyncio.ensure_future(held.next_keep_alive())
+            try:
+                await ends.race(asyncio.wait((step, beat), return_when=asyncio.FIRST_COMPLETED))
+            finally:
+                if not beat.done():
+                    beat.cancel()
+            if beat.done() and not beat.cancelled():
+                yield beat.result()
+        into.append(step.result())
+        taken = True
+    finally:
+        if not taken:
+            _drop(step)
+
+
+class _HeldStream:
+    """A held stream: the hold's keep-alives, then the request forwarded, with keep-alives until the engine's first event."""
+
+    def __init__(
+        self, proxy: Proxy, route: Route, forwarded: Forwarded, settle: _Settlement, held: HeldRequest
+    ) -> None:
+        self._proxy = proxy
+        self._route = route
+        self._forwarded = forwarded
+        self._settle = settle
+        self._held = held
+        self._wire_format = route.wire_format or WireFormat.MESSAGES
+        self.ends: _Ends | None = None  # Once forwarded: the request's time limit.
+        self._response: httpx.Response | None = None
+        self._stream: _Stream | None = None
+
+    def abandon_write(self) -> None:
+        """The last write was given up at the time limit: the client does not have it."""
+        if self._stream is not None:
+            self._stream.abandon_write()
+
+    async def chunks(self) -> AsyncGenerator[bytes]:
+        try:
+            waiting = self._held.waiting()
+            async with aclosing(waiting):
+                async for keep_alive in waiting:
+                    yield keep_alive
+        except GatewayError as ended:
+            # The hold ended the request: nothing was sent to the engine, nothing observed.
+            await _to_the_end(self._settle(Observed(0, 0, ended_cleanly=False)))
+            yield render_stream_event(ended.cause, self._wire_format)
+            return
+        ends = self.ends = _Ends(self._proxy._sleep, self._proxy._longest, None)
+        cause = Cause.ENGINE_ERROR
+        try:
+            answer: list[httpx.Response] = []
+            sending = _keeping_alive(ends, self._proxy._send(self._route, self._forwarded), self._held, answer)
+            async with aclosing(sending):
+                async for keep_alive in sending:
+                    yield keep_alive
+            response = self._response = answer[0]
+            # An error status, or an answer that is not a stream: none of it reaches the client.
+            if response.is_success and _is_stream(response.headers.get("content-type", "")):
+                upstream = response.aiter_bytes()
+                first: list[bytes | None] = []
+                reading = _keeping_alive(ends, _next_chunk(upstream), self._held, first)
+                async with aclosing(reading):
+                    async for keep_alive in reading:
+                        yield keep_alive
+                self._held.first_event()
+                meter = _stream_meter(self._route, self._forwarded)
+                stream = self._stream = _Stream(
+                    response, meter, ends, self._wire_format, self._settle, upstream=upstream, first=first[0]
+                )
+                async for chunk in stream.chunks():
+                    yield chunk
+                return
+        except TimeLimitReached:
+            cause = Cause.TIME_LIMIT
+        except (httpx.RequestError, LookupError):
+            pass  # Not reached, broken off before its first event, or a pool with no secret.
+        await _to_the_end(self.end())
+        yield render_stream_event(cause, self._wire_format)
+
+    async def end(self) -> None:
+        """Close what is open of the engine's answer and settle the request; once, however often called."""
+        if self._stream is not None:
+            await self._stream.end()
+            return
+        try:
+            if self.ends is not None:
+                await self.ends.close()
+            if self._response is not None:
+                await self._response.aclose()
+        finally:
+            await self._settle(Observed(0, 0, ended_cleanly=False))
+
 
 def _observed_of(route: Route, body: bytes) -> Observed:
     """What an answer that is not a stream reported; nothing, should reading it fail, so that it is settled still."""
@@ -745,6 +918,58 @@ class ProxiedResponse(StreamingResponse):
             await self._chunks.aclose()
         finally:
             await self._stream.end()
+
+
+class _HeldSend:
+    """The client's `send` for a held stream: plain while the request is held, racing its time limit once forwarded."""
+
+    def __init__(self, send: Send, held: _HeldStream) -> None:
+        self._send = send
+        self._held = held
+
+    async def _write(self, message: Message) -> None:
+        await self._send(message)
+
+    async def __call__(self, message: Message) -> None:
+        ends = self._held.ends
+        if ends is None or ends.closed:
+            await self._write(message)
+        else:
+            await ends.race(self._write(message))
+
+
+class HeldResponse(StreamingResponse):
+    """A held stream's answer: 200 at once, and the request settled exactly once however it ends.
+
+    As for `ProxiedResponse`, the settlement is shielded from a client's disconnect.
+    """
+
+    def __init__(self, held: _HeldStream) -> None:
+        self._held = held
+        self._chunks = held.chunks()
+        super().__init__(self._chunks, status_code=200, media_type=STREAM_TYPE)
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(_HeldSend(send, self._held))
+        except TimeLimitReached:
+            # A write given up at the limit, after the 200: the stream resumes, is settled, and its error event follows.
+            self._held.abandon_write()
+            async for chunk in self._chunks:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _to_the_end(self._end())
+
+    async def _end(self) -> None:
+        try:
+            await self._chunks.aclose()
+        finally:
+            await self._held.end()
 
 
 # The ends under way, held until each is done: a task the loop alone refers to may be collected.
