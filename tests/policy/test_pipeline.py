@@ -8,8 +8,10 @@ the order they run. An action is listed by its name and its type. Two kinds of a
 listed, because every stack and every asset a later change adds to the stage brings its own:
 
 - an asset-publishing action: a CodeBuild action whose project does nothing but publish assets
-  with `cdk-assets`. It is left out in the asset stage, and so is that stage while it holds
-  nothing else: CDK Pipelines creates it with the first asset;
+  with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
+  an arm64 emulator and a multi-platform builder, each pinned by its digest or by its version and
+  checksum (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
+  while it holds nothing else: CDK Pipelines creates it with the first asset;
 - a stack's deployment action: a CloudFormation action that prepares or executes a change set, or
   creates and updates a stack.
 
@@ -91,6 +93,24 @@ ASSET_STAGE = "Assets"
 # What a project that only publishes assets runs, as CDK Pipelines writes it.
 PUBLISHES_ASSETS = re.compile(r'cdk-assets --path "[\w./-]+" --verbose publish "[\w:.-]+"')
 INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
+# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: an
+# arm64 emulator and a builder for either platform, each image by its digest and the builder's
+# download by its version, checked against its checksum (sections 4.2 and 8.2, step 4).
+DIGEST = r"(:[\w.-]+)?@sha256:[0-9a-f]{64}"
+BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
+INSTALLS_THE_IMAGE_BUILDER = [
+    re.compile(rf"docker run --privileged --rm tonistiigi/binfmt{DIGEST} --install arm64"),
+    re.compile(
+        rf'curl -fsSL --create-dirs -o "{BUILDX}" '
+        r"https://github\.com/docker/buildx/releases/download/v(\d+\.\d+\.\d+)/buildx-v\1\.linux-amd64"
+    ),
+    re.compile(rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -'),
+    re.compile(rf'chmod \+x "{BUILDX}"'),
+    re.compile(
+        rf"docker buildx create --name [\w-]+ --driver docker-container --driver-opt image=moby/buildkit{DIGEST}"
+        r" --driver-opt default-load=true --bootstrap --use"
+    ),
+]
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
 # one that failed.
 DEPLOYS = ("CHANGE_SET_REPLACE", "CHANGE_SET_EXECUTE", "CREATE_UPDATE")
@@ -216,13 +236,15 @@ def commands_of(build_spec: Any) -> list[str] | None:
 
 def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
     """Whether an action is a CodeBuild action whose project does nothing but publish assets:
-    every command of its build specification installs `cdk-assets` or publishes with it."""
+    every command of its build specification installs `cdk-assets`, publishes with it, or
+    installs the pinned emulator and builder an image is built with."""
     commands = commands_of(build_spec_of(action, template))
     if commands is None:
         return False
     publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
+    installs = [INSTALLS_THE_PUBLISHER, *INSTALLS_THE_IMAGE_BUILDER]
     return bool(publishing) and all(
-        INSTALLS_THE_PUBLISHER.fullmatch(command) for command in commands if command not in publishing
+        any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
     )
 
 
@@ -716,6 +738,45 @@ def more_than_publishing(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
     pipeline.stage(ASSET_STAGE).add_action(action)
 
 
+# The emulator and the builder as a project that publishes images installs them, pinned.
+PINNED = "@sha256:" + "0" * 64
+PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
+IMAGE_BUILDER = [
+    f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64",
+    (
+        f'curl -fsSL --create-dirs -o "{PLUGIN}" '
+        "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64"
+    ),
+    f'echo "{"0" * 64}  {PLUGIN}" | sha256sum -c -',
+    f'chmod +x "{PLUGIN}"',
+    (
+        f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image=moby/buildkit{PINNED}"
+        " --driver-opt default-load=true --bootstrap --use"
+    ),
+]
+
+
+def a_publisher_that_installs(installs: list[str]) -> Change:
+    """Adds to the asset stage a project that installs the publisher and `installs`, then publishes."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        codebuild = cdk.aws_codebuild
+        phases = {"install": {"commands": ["npm install -g cdk-assets@latest", *installs]}, "build": {"commands": [PUBLISH]}}
+        spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
+        project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
+        synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
+        action = cdk.aws_codepipeline_actions.CodeBuildAction(action_name="Image", project=project, input=synthesized)
+        pipeline.stage(ASSET_STAGE).add_action(action)
+
+    return change
+
+
+def test_a_publisher_that_installs_the_pinned_image_builder_is_left_out(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path, stack_with_an_asset=BOUNDARY, change=a_publisher_that_installs(IMAGE_BUILDER))
+    assert differences(templates, BUILT) == []
+    assert breaches(templates) == []
+
+
 def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
     delete = cdk.aws_codepipeline_actions.CloudFormationDeleteStackAction
     action = delete(action_name="Delete", stack_name="Rhi-Other", admin_permissions=False, run_order=9)
@@ -729,6 +790,16 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             more_than_publishing,
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Extra: {CODEBUILD}"],
             id="a project of the asset stage that does more than publish assets",
+        ),
+        pytest.param(
+            a_publisher_that_installs([IMAGE_BUILDER[0].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that installs an emulator without its digest",
+        ),
+        pytest.param(
+            a_publisher_that_installs([IMAGE_BUILDER[1].replace("download/v0.38.2", "latest/download")]),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that downloads the builder without its version",
         ),
         pytest.param(a_deletion, [f"Rhi/Delete: {CLOUDFORMATION}"], id="a CloudFormation action that deletes a stack"),
     ],
