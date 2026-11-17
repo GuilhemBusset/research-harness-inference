@@ -52,6 +52,13 @@ the ledger).
 Everything outside the table is answered 404 with the cause `not_found`, by this application and
 not by Starlette: no redirect to or from a trailing slash, and no 405 for another method on a
 path of the table, which would tell a client that the path exists.
+
+**The log** (sections 6.2, 6.6 and 7.3): every request the application answers, a local route, a
+refusal and a path outside the table included, gives one log record of metadata
+(`rhi_gateway.telemetry`), written by the middleware `build_app` installs. Each part that decides
+something of a request notes it there: the alias once the key is accepted, the pool once the body
+names it, the tokens at the settlement, and the cause wherever an error is rendered. An exception
+that escapes a handler is answered 500 with no body and logged with the cause `none`.
 """
 
 from __future__ import annotations
@@ -69,6 +76,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import URLPath
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import BaseRoute, Match, NoMatchFound
@@ -77,7 +85,7 @@ from starlette.types import Receive, Scope, Send
 from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
-from rhi_gateway import routes
+from rhi_gateway import routes, telemetry
 from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
@@ -102,6 +110,7 @@ _NOT_FOUND = render_json(Cause.NOT_FOUND, WireFormat.MESSAGES)
 
 async def not_found(scope: Scope, receive: Receive, send: Send) -> None:
     """Answer 404 with the cause `not_found`."""
+    telemetry.note_cause(Cause.NOT_FOUND)
     response = Response(content=_NOT_FOUND.body, status_code=_NOT_FOUND.status, headers=_NOT_FOUND.headers)
     await response(scope, receive, send)
 
@@ -173,6 +182,8 @@ def build_app(
     app = Starlette(
         routes=[TableRoute(entry, given.get(entry)) for entry in TABLE],
         lifespan=None if heartbeat is None else _beating(heartbeat),
+        # One log record per request, and the gateway's own faults answered 500 with no text.
+        middleware=[Middleware(telemetry.Telemetry)],
     )
     router = app.router
     router.redirect_slashes = False
@@ -407,6 +418,7 @@ async def _hold_silently(held: _Held, receive: Receive) -> bool:
 
 
 def _refusal(error: GatewayError, entry: Route) -> Response:
+    telemetry.note_cause(error.cause)
     answer = render_json(error, entry.wire_format or WireFormat.MESSAGES)
     return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
 
@@ -420,6 +432,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             forwarded = await body_filter.read(
                 RequestBody(request.receive), student=str(student.github_id), request_id=request_id
             )
+            telemetry.note_pool(forwarded.pool.name)
             if entry == routes.COUNT_TOKENS:
                 # A cheap call: never held, never a wake, never demand (section 5.3).
                 if not holding.view(forwarded.pool).ready:
@@ -446,6 +459,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             demand = held.demand = forwarding.heartbeat.received(forwarded.pool.name, held=not held.ready)
 
         async def settle(observed: Observed) -> None:
+            telemetry.note_tokens(observed.input_tokens, observed.output_tokens)
             if demand is not None:
                 demand.end()
             await run_in_threadpool(
