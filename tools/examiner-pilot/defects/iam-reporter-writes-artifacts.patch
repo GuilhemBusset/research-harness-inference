@@ -1,0 +1,15 @@
+diff --git a/src/rhi/pipeline/reporter.py b/src/rhi/pipeline/reporter.py
+index f6bb569..212f328 100644
+--- a/src/rhi/pipeline/reporter.py
++++ b/src/rhi/pipeline/reporter.py
+@@ -115,7 +115,9 @@ class Reporter(Construct):
+         role.add_to_policy(iam.PolicyStatement(actions=["cloudformation:DescribeStackEvents"], resources=stack_arns))
+         # The synth step's output of every execution, in the pipeline's own artifact bucket.
+         role.add_to_policy(
+-            iam.PolicyStatement(actions=["s3:GetObject"], resources=[pipeline.artifact_bucket.arn_for_objects("*")])
++            iam.PolicyStatement(
++                actions=["s3:GetObject", "s3:PutObject"], resources=[pipeline.artifact_bucket.arn_for_objects("*")]
++            )
+         )
+ 
+         self.function = lambda_.Function(

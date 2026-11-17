@@ -23,6 +23,7 @@ src = [
   "tools/hygiene",
   "tools/backlog", "tools/backlog/tests",
   "tools/measurements",
+  "tools/examiner-pilot",
   "tests/examiner",
   "src",
   "services/common",

@@ -1,0 +1,19 @@
+diff --git a/src/rhi/network/edge.py b/src/rhi/network/edge.py
+index 88a3d83..8dbeca0 100644
+--- a/src/rhi/network/edge.py
++++ b/src/rhi/network/edge.py
+@@ -59,6 +59,14 @@ class Edge(Construct):
+             security_group=security_group,
+             idle_timeout=cdk.Duration.seconds(IDLE_TIMEOUT_SECONDS),
+         )
++        # A request on plain HTTP gets an answer rather than a timeout.
++        self.load_balancer.add_listener(
++            "Http",
++            port=80,
++            protocol=elbv2.ApplicationProtocol.HTTP,
++            open=True,
++            default_action=elbv2.ListenerAction.fixed_response(NOT_FOUND),
++        )
+         self.https_listener: elbv2.ApplicationListener | None = None
+         if not config.https_listener:
+             return

@@ -1,0 +1,18 @@
+diff --git a/src/rhi/pipeline/reporter.py b/src/rhi/pipeline/reporter.py
+index f6bb569..88f776e 100644
+--- a/src/rhi/pipeline/reporter.py
++++ b/src/rhi/pipeline/reporter.py
+@@ -97,11 +97,8 @@ class Reporter(Construct):
+         role.add_to_policy(iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]))
+         role.add_to_policy(
+             iam.PolicyStatement(
+-                actions=[
+-                    "codepipeline:GetPipelineExecution",
+-                    "codepipeline:GetPipelineState",
+-                    "codepipeline:ListActionExecutions",
+-                ],
++                # Every read of the pipeline the reporter may come to need, in one line.
++                actions=["codepipeline:*"],
+                 resources=[pipeline.pipeline_arn],
+             )
+         )
