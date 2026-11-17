@@ -190,6 +190,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
             for key in ("issuer_reserved_concurrency", "key_issuances_per_day")
             for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")
         ),
+        *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -235,6 +236,13 @@ def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
     assert (example["issuer_reserved_concurrency"], example["key_issuances_per_day"]) == (5, 5)
     given = load_text(tmp_path, example_with(issuer_reserved_concurrency="2", key_issuances_per_day="3"))
     assert (given.issuer_reserved_concurrency, given.key_issuances_per_day) == (2, 3)
+
+
+def test_nightly_stop_reads_02_00_when_left_out(tmp_path: Path) -> None:
+    # Section 17: the nightly stop is at 02:00; the example gives that, and a given time is kept.
+    assert load_text(tmp_path, example_with(nightly_stop=None)).nightly_stop == "02:00"
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["nightly_stop"] == "02:00"
+    assert load_text(tmp_path, example_with(nightly_stop='"23:30"')).nightly_stop == "23:30"
 
 
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

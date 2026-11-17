@@ -115,6 +115,9 @@ class Config:
     # day, which reaches the issuer as RHI_ISSUANCES_PER_DAY (sections 6.4 and 17).
     issuer_reserved_concurrency: int
     key_issuances_per_day: int
+    # The time of day, HH:MM in `time_zone`, at which each pool's group is set to no instance
+    # (sections 5.1 and 17). Only synthesis reads it: it reaches no service.
+    nightly_stop: str
 
 
 def _as_stored(text: str) -> object:
@@ -167,6 +170,13 @@ def _time_zone(value: object) -> str:
         zoneinfo.ZoneInfo(value)
     except (LookupError, ValueError, OSError):
         raise ValueError from None  # zoneinfo's own error repeats the name it was given
+    return value
+
+
+def _time_of_day(value: object) -> str:
+    # Hours and minutes, each of two digits, on a 24-hour clock.
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError
     return value
 
 
@@ -268,6 +278,7 @@ KEYS: dict[str, Key] = {
     "default_pool": _STRING,
     "issuer_reserved_concurrency": Key("a whole number above zero", _whole_number, _number_from_text),
     "key_issuances_per_day": Key("a whole number above zero", _whole_number, _number_from_text),
+    "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -283,6 +294,8 @@ DEFAULTS: dict[str, object] = {
     # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
     "issuer_reserved_concurrency": 5,
     "key_issuances_per_day": 5,
+    # Section 17: the nightly stop is at 02:00 in the configured time zone.
+    "nightly_stop": "02:00",
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two

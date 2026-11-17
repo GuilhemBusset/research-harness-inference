@@ -1,4 +1,5 @@
-"""A pool's Auto Scaling group and its launch template (system design, sections 4.2, 4.3 and 5.4).
+"""A pool's Auto Scaling group, its launch template, its warm pool and its nightly stop (system design,
+sections 4.2, 4.3, 5.1 and 5.4).
 
 A pool becomes one group, whose instances register with the pool's target group (`rhi.pools.routing`).
 The group holds to the fleet cap (`tests/policy/test_fleet_cap.py`): a minimum of zero, the pool's
@@ -10,6 +11,17 @@ The group spans the private subnets of the VPC's three zones, and launches the p
 in the order the configuration lists them: the first, then each fallback when a zone has none of
 the one before. They are On-Demand only and carry no weights, which a warm pool requires of a group
 with several types (evidence E10).
+
+A pool whose `warm_instances` is above zero has a warm pool of stopped instances, which cost only
+their disk and keep the pulled image: its prepared capacity, the instances running or stopped that
+the group keeps, is `warm_instances`, and its minimum is zero, since a minimum above zero would
+launch a fresh instance to refill the pool on every wake (section 4.2; evidence E10). Instances
+return to it on scale-in. A pool whose `warm_instances` is zero has no warm pool.
+
+What stays outside the scaler, so that a broken scaler cannot cost money, includes a scheduled
+action that sets the group's desired capacity to zero every night, at the configuration's
+`nightly_stop` in its `time_zone` (sections 5.1 and 17). It sets neither the minimum nor the
+maximum, which the fleet cap checks, and leaves the warm pool as it is.
 
 Zone rebalancing is suspended, because it replaces instances in service (section 4.3). No property
 of the group suspends a process for good, so a custom resource calls `SuspendProcesses` for
@@ -99,6 +111,8 @@ class PoolGroup(Construct):
         vpc: ec2.IVpc,
         security_group: ec2.ISecurityGroup,
         target_group: elbv2.IApplicationTargetGroup,
+        nightly_stop: str,
+        time_zone: str,
     ) -> None:
         super().__init__(scope, construct_id)
         image, root_device = machine_image(pool)
@@ -158,6 +172,30 @@ class PoolGroup(Construct):
                     key=POOL_TAG, value=pool.name, propagate_at_launch=False
                 )
             ],
+        )
+
+        if pool.warm_instances > 0:
+            self.warm_pool: autoscaling.CfnWarmPool | None = autoscaling.CfnWarmPool(
+                self,
+                "WarmPool",
+                auto_scaling_group_name=self.group.ref,
+                pool_state="Stopped",
+                max_group_prepared_capacity=pool.warm_instances,
+                min_size=0,
+                instance_reuse_policy=autoscaling.CfnWarmPool.InstanceReusePolicyProperty(reuse_on_scale_in=True),
+            )
+        else:
+            self.warm_pool = None
+
+        # The desired capacity alone: "HH:MM" becomes the cron "MM HH * * *" in the time zone.
+        hours, minutes = nightly_stop.split(":")
+        self.nightly_stop = autoscaling.CfnScheduledAction(
+            self,
+            "NightlyStop",
+            auto_scaling_group_name=self.group.ref,
+            desired_capacity=0,
+            recurrence=f"{int(minutes)} {int(hours)} * * *",
+            time_zone=time_zone,
         )
 
         stack = cdk.Stack.of(self)

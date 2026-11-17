@@ -1,5 +1,6 @@
-"""A pool's launch template and Auto Scaling group (system design, sections 4.2, 4.3 and 5.4): the
-mock pool of the example configuration, and a pool with a fallback instance type.
+"""A pool's launch template, Auto Scaling group, warm pool and nightly stop (system design, sections
+4.2, 4.3, 5.1 and 5.4): the mock pool of the example configuration, a pool with a fallback instance
+type, and a pool with no warm instance.
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
 """
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     import aws_cdk as cdk
+
+    from rhi_common.pool_config import Pool
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
 (MOCK,) = EXAMPLE.pools
@@ -102,7 +105,30 @@ def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
         assert call["parameters"] == {"AutoScalingGroupName": "NAME", "ScalingProcesses": ["AZRebalance"]}
 
 
-def test_types_in_order(app_module: ModuleType) -> None:
+def test_the_mock_pool_warm_pool(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
+    name, _ = group
+    (warm_pool,) = of_type(pools, "AWS::AutoScaling::WarmPool").values()
+    assert warm_pool["AutoScalingGroupName"] == {"Ref": name}
+    assert warm_pool["PoolState"] == "Stopped"
+    assert warm_pool["MaxGroupPreparedCapacity"] == MOCK.warm_instances == 1
+    assert warm_pool["MinSize"] == 0
+    assert warm_pool["InstanceReusePolicy"] == {"ReuseOnScaleIn": True}
+
+
+def test_the_mock_pool_nightly_stop(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
+    name, _ = group
+    (action,) = of_type(pools, "AWS::AutoScaling::ScheduledAction").values()
+    assert action["AutoScalingGroupName"] == {"Ref": name}
+    assert EXAMPLE.nightly_stop == "02:00"
+    assert action["Recurrence"] == "0 2 * * *"
+    assert action["TimeZone"] == EXAMPLE.time_zone
+    assert action["DesiredCapacity"] == 0
+    assert "MinSize" not in action
+    assert "MaxSize" not in action
+
+
+def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00") -> Mapping[str, Any]:
+    """The template of a stack that holds only this pool's group, in a VPC of its own."""
     from aws_cdk import assertions
     from aws_cdk import aws_ec2 as ec2
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
@@ -112,17 +138,24 @@ def test_types_in_order(app_module: ModuleType) -> None:
     cdk = app_module.cdk
     stack = cdk.Stack(cdk.App(analytics_reporting=False), "Group")
     vpc = ec2.Vpc(stack, "Vpc", max_azs=2, nat_gateways=1)
-    target_group = elbv2.ApplicationTargetGroup(stack, "Pool", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE)
-    pool = dataclasses.replace(MOCK, name="two", instance_types=("t4g.medium", "t4g.small"))
+    target_group = elbv2.ApplicationTargetGroup(stack, "Targets", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE)
     PoolGroup(
         stack,
-        "Two",
+        "Pool",
         pool=pool,
         vpc=vpc,
         security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
         target_group=target_group,
+        nightly_stop=nightly_stop,
+        time_zone="Europe/Paris",
     )
-    (properties,) = of_type(assertions.Template.from_stack(stack).to_json(), "AWS::AutoScaling::AutoScalingGroup").values()
+    return assertions.Template.from_stack(stack).to_json()
+
+
+def test_types_in_order(app_module: ModuleType) -> None:
+    pool = dataclasses.replace(MOCK, name="two", instance_types=("t4g.medium", "t4g.small"))
+    template = standalone(app_module, pool)
+    (properties,) = of_type(template, "AWS::AutoScaling::AutoScalingGroup").values()
     policy = properties["MixedInstancesPolicy"]
     # In the configuration's order, with no WeightedCapacity, and On-Demand only.
     assert policy["LaunchTemplate"]["Overrides"] == [{"InstanceType": "t4g.medium"}, {"InstanceType": "t4g.small"}]
@@ -131,6 +164,15 @@ def test_types_in_order(app_module: ModuleType) -> None:
         "OnDemandBaseCapacity": 0,
         "OnDemandPercentageAboveBaseCapacity": 100,
     }
+
+
+def test_no_warm_pool_at_zero(app_module: ModuleType) -> None:
+    template = standalone(app_module, dataclasses.replace(MOCK, warm_instances=0), nightly_stop="23:05")
+    assert len(of_type(template, "AWS::AutoScaling::AutoScalingGroup")) == 1
+    assert of_type(template, "AWS::AutoScaling::WarmPool") == {}
+    # The nightly stop does not depend on a warm pool, and follows the configured time.
+    (action,) = of_type(template, "AWS::AutoScaling::ScheduledAction").values()
+    assert (action["Recurrence"], action["TimeZone"], action["DesiredCapacity"]) == ("5 23 * * *", "Europe/Paris", 0)
 
 
 def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(

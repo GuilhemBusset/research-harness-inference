@@ -54,6 +54,8 @@ class PoolsStack(cdk.Stack):
                 vpc=network.vpc,
                 security_group=network.security_groups.instances,
                 target_group=self.routing.target_groups[pool.name],
+                nightly_stop=config.nightly_stop,
+                time_zone=config.time_zone,
             )
             for pool in config.pools
         }

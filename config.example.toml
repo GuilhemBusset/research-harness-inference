@@ -56,6 +56,10 @@ default_pool = "mock"
 issuer_reserved_concurrency = 5
 key_issuances_per_day = 5
 
+# The time of day, in the time zone above, at which a scheduled action sets every pool's desired
+# capacity to zero (sections 5.1 and 17). Left out, it is 02:00.
+nightly_stop = "02:00"
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
 #
