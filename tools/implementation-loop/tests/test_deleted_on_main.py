@@ -88,6 +88,27 @@ class DeletedOnMainTests(unittest.TestCase):
         self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed",
                                    "pytest tests/test_other.py tests/test_gone.py"])
 
+    def test_a_check_that_fails_once_is_checked_again_and_fails_only_twice(self):
+        coord = self.tmp / "coord"
+        (coord / "scripts").mkdir(parents=True)
+        (coord / "scripts/check.sh").write_text("#!/usr/bin/env bash\n")
+        self.engine.store.put_section("accepted_checks", "5", {"checks": [
+            {"criterion": "A1", "command": "scripts/check.sh engine-tests", "cwd": ".", "author": "builder"}],
+            "check_files": [], "manifest": {}})
+        self.engine.ws = SimpleNamespace(disposable=contextlib.nullcontext)  # ty: ignore[invalid-assignment]  # test double
+        self.engine.caps, self.engine.check_env = Caps(), {}
+        self.engine._mounts = lambda scratch: None  # ty: ignore[invalid-assignment]  # test double
+        for outcomes, failed in (([False, True], False), ([False, False], True), ([True], False)):
+            results = iter(outcomes)
+
+            def verified(*args, results=results, **kwargs):
+                ok = next(results)
+                return ok, [], [] if ok else ["A1 failed: failed tests: ['test_x']"], []
+            with mock.patch.object(engine_module.verify, "verify", verified):
+                found = self.engine._regressions(6, coord, "abc123")
+            self.assertEqual(bool(found), failed, outcomes)
+            self.assertEqual(next(results, None), None, "each outcome was asked for, and no more")
+
     def test_tests_that_ran_in_a_copy_outside_the_tree_are_never_required(self):
         # a command that copies the tree to a fresh `mktemp -d` and runs pytest there: the plugin
         # keeps those ids absolute, and the copy's path changes on every run
