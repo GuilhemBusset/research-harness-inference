@@ -489,12 +489,36 @@ address.
 
 ## 9. Enter the roster
 
-**Needs.** The students' numeric GitHub IDs, and the admin CLI, which is not in the repository
-yet.
+**Needs.** The students' numeric GitHub IDs, an alias for each (their metrics carry the alias,
+never the ID), your AWS credentials and their region, and the access stack deployed by the
+pipeline: the admin CLI finds the tables in it by their logical IDs, and reads the course end from
+the configuration of step 4.
 
-**Command.** It arrives with the admin CLI. `setup/owner-setup.sh --step roster` says so. The
-roster is never written to the repository.
+**Command.** The admin CLI, `admin/rhi_admin/main.py`. `setup/owner-setup.sh --step roster` prints
+the commands and offers the last two. The roster is never written to the repository.
 
-**Check.** With the admin CLI, when it exists.
+```sh
+admin=(env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main)
+"${admin[@]}" roster add <github-id> <alias>          # 100 million tokens a day and 4 requests; or --budget N --limit N
+"${admin[@]}" canary                                   # once, before the pipeline's verification is merged
+"${admin[@]}" roster list
+```
+
+`roster set <github-id> --budget N --limit N` changes a student's numbers on the entry and on each
+of their active keys; the gateway applies them within a minute. `roster remove <github-id>`
+removes a student and revokes their keys. `key issue <github-id>` issues a key without a login,
+when GitHub's 50 confirmations an hour run out, and prints it once; `key revoke <github-id>`
+revokes every key of a student.
+
+The canary command puts the pipeline's verification on the roster, under the alias `canary`, and
+writes its key into the Secrets Manager secret `rhi/canary-key`, creating the secret if it does not
+exist. It never prints the key. Running it again replaces the key.
+
+**Check.** `roster list` shows each student, and `canary`, with their budget and limit. The
+secret exists:
+
+```sh
+aws secretsmanager describe-secret --secret-id rhi/canary-key --query Name --output text
+```
 
 **Decision.** None of section 15.
