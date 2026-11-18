@@ -27,8 +27,10 @@ completed leaves the instance in service, and the next reading hands it over aga
 **One transition at a time, beside the readings.** A transition can take minutes, and the readings
 go on every `TICK_SECONDS` while it runs. A reading that finds a transition under way calls for
 nothing: the transition ends first, and the reading after it decides what comes next. That reading
-is made at once when the transition has lasted beyond a reading, and at its own time otherwise, so
-a transition that fails at once is not run again before the next one.
+is made at once when the transition has lasted beyond a reading, or has ended while one was made,
+and at its own time otherwise, so a transition that fails at once is not run again before the next
+one. The wait for a reading's moment starts in the turn of the event loop that read the clock for
+it: the 5 seconds are counted from that moment.
 
 **The duties at rest before the engine stops.** A duty does its work in a worker thread, and
 cancelling the duty does not end a call that is under way there: a check of the engine that was
@@ -308,6 +310,7 @@ class Agent:
         if self._duties is not None and self._duties.done():
             # Raises what ended the duties: the program ends, and its unit restarts it.
             self._duties.result()
+        under_way = self._transition is not None and not self._transition.done()
         reading = await asyncio.to_thread(self._read)
         if self._transition is not None:
             if not self._transition.done():
@@ -316,6 +319,10 @@ class Agent:
                 return
             transition, self._transition = self._transition, None
             transition.result()  # raises what ended it, as for the duties
+            if under_way:
+                # The transition ended while this reading was made, and the reading may be from
+                # before its end: the one that decides what comes next is made after it.
+                reading = await asyncio.to_thread(self._read)
         if reading is None:
             return
         target, instance = reading
@@ -336,7 +343,13 @@ class Agent:
     async def _pause(self, until: float) -> bool:
         """Wait for the moment `until` of the next reading. The end of a transition that a reading
         found under way ends the wait before: says whether it did."""
-        sleep = asyncio.ensure_future(self._sleep(until - self._clock()))
+
+        async def asleep() -> None:
+            await self._sleep(until - self._clock())
+
+        # Started here, not at the event loop's next turn: the wait is counted from the moment
+        # the clock was read, whatever moves the clock in between.
+        sleep = asyncio.Task(asleep(), loop=asyncio.get_running_loop(), eager_start=True)
         waited: set[asyncio.Future[Any]] = {sleep}
         if self._transition is not None and self._outlasted:
             waited.add(self._transition)
