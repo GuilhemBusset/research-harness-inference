@@ -119,6 +119,8 @@ except (ImportError, AttributeError):   # pragma: no cover - older config.py and
         contexts: tuple[str, ...] = ()
         timeout_s: int = 3600
         approval_description: str = ""
+        verified_description: str = ""
+        unverified_tests: tuple[str, ...] | None = None
 
 try:   # the wait for the owner's push and merge arrives with its kind, and with its record, in model.py
     from .model import WAIT_OWNER_LANDING
@@ -211,6 +213,16 @@ CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
 # leading `./`. The folder alone names no test, and neither does the same folder under another one.
 CONTAINER_TEST = re.compile(r"(?<![\w./-])(?:\./)?tests/container/(?:[\w.-]+/)*[\w.-]+\.py\b")
 CHECK_RUN_EVIDENCE = "check_run"   # the kind of the evidence record of an item a CI job's check run proved
+# What a verified deployment discharges (ADR 0001, decision 6, Consequences): an item that needs this
+# capability and names a smoke test, which the pipeline's verification runs against the deployed
+# endpoint. A smoke test, as a ledger item names it: a test file (`test_*.py`) under the repository's
+# `tests/smoke/`, written from the repository's root, with or without a leading `./`. The folder
+# alone names no test, and neither does the same folder under another one, nor a path that leaves it.
+DEPLOYED_ENVIRONMENT = "aws:deployed-environment"
+SMOKE_TEST = re.compile(r"(?<![\w./-])(?:\./)?(tests/smoke/(?:(?!\.\.?/)[\w.-]+/)*test_[\w.-]*\.py)\b")
+# The context of a stage's verification, as the pipeline's reporter posts it: `verify/<stage>`.
+VERIFY_CONTEXT = re.compile(r"verify/[^/\s]+")
+COMMIT_STATUS_EVIDENCE = "commit_status"   # the kind of the evidence record of an item a verified deployment proved
 # A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
@@ -2795,7 +2807,8 @@ class Engine:
             if failed:
                 return self._deployment_failed(n, sha, failed)
             if all(state == "success" for state in states.values()):
-                return self._deployed(n, sha, dict.fromkeys(states, "success"))
+                return self._deployed(n, sha, dict.fromkeys(states, "success"),
+                                      {c: str(s.get("description") or "") for c, s in statuses.items()})
             approval = [c for c, s in statuses.items() if s.get("state") == "pending" and self.deploy.approval_description
                         and s.get("description") == self.deploy.approval_description]
             if approval:
@@ -2812,9 +2825,12 @@ class Engine:
             self.sleep(self.caps.ci_poll_s)
             waited += max(self.caps.ci_poll_s, 1)
 
-    def _deployed(self, n: int, sha: str, states: dict[str, str]) -> None:
+    def _deployed(self, n: int, sha: str, states: dict[str, str], descriptions: dict[str, str]) -> None:
+        """Every context succeeded on `sha`. The verdict is recorded with the description each
+        success carried when it was read: the evidence step compares that one, and reads no status
+        again (`_verified_discharged`)."""
         st = self.store.issue(n)
-        st.deploy = {"sha": sha, "states": states}
+        st.deploy = {"sha": sha, "states": states, "descriptions": descriptions}
         self.store.put(st)
         self.store.event("deployed", issue=n, sha=sha, contexts=states)
         self._release_hold(n)
@@ -2998,7 +3014,9 @@ class Engine:
             return self._fix_forward(n, regressions)
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
-        discharged = self._ci_discharged(n, st)    # owner items a CI job proved on the head that was merged
+        checked = self._ci_discharged(n, st)       # owner items a CI job proved on the head that was merged
+        verified = self._verified_discharged(n, st)   # owner items the deployment's verification proved on the merge commit
+        discharged = checked | verified
         records = evidence + deployed + list(discharged.values())
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
                                                  report.render_evidence(n, records, head, verdicts))
@@ -3013,7 +3031,7 @@ class Engine:
         unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
         if unproven:
             return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
-        links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in discharged.items()}
+        links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in checked.items()}
         ticked = issue_parser.tick(issue.get("body") or "", links)
         if ticked != (issue.get("body") or ""):
             self._safe(self.gh.edit_issue, n, body=ticked)
@@ -3031,9 +3049,12 @@ class Engine:
         self._publish_deferred(n, st)
         self._file_followup(n, st)
         self.store.put(st)
-        if discharged:
-            self.store.event("obligations_discharged", issue=n, head=next(iter(discharged.values()))["head_sha"],
-                             items={i: e["address"] for i, e in discharged.items()})
+        if checked:
+            self.store.event("obligations_discharged", issue=n, head=next(iter(checked.values()))["head_sha"],
+                             items={i: e["address"] for i, e in checked.items()})
+        if verified:
+            self.store.event("obligations_discharged", issue=n, head=next(iter(verified.values()))["head_sha"],
+                             items={i: e["context"] for i, e in verified.items()})
         self.store.put_section("accepted_checks", str(n), {
             "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
             "manifest": st.manifest})
@@ -3090,6 +3111,54 @@ class Engine:
                               note=f"the check run `{job}` succeeded on the merged head `{head[:12]}`: {address}",
                               verifier="check run")
             out[item] = asdict(record) | {"address": address, "check": job}
+        return out
+
+    def _verified_discharged(self, n: int, st: IssueState) -> dict[str, dict]:
+        """The owner items a verified deployment proves (ADR 0001, decision 6, Consequences), each
+        with its evidence record. The pipeline's verification runs the smoke tests of the commit it
+        deployed against the deployed endpoint, all but those `[deploy] unverified_tests` names, so
+        its success proves an item when all of this holds: `[deploy] verified_description` is set,
+        and `unverified_tests` says which test files the verification leaves a test out of; a
+        configured context of the form `verify/<stage>` succeeded on the issue's merge commit with
+        exactly that description, as the deploying phase read it (`_deployed`); the plan gives the
+        item to the owner for `aws:deployed-environment`, and its text ends with no other
+        capability; and its text names a smoke test (`SMOKE_TEST`), every one of which is a file of
+        that commit and none of which is among `unverified_tests`. The record names the commit, the
+        context and the description; the item's box is ticked with the evidence comment, which
+        carries that row. Anything less discharges nothing and the obligation stays the owner's:
+        no description configured, a table that does not say what the verification leaves out, no
+        verification context, a success with another description (a verification that ran no
+        test, a parked system), a verdict recorded without descriptions, another capability, no
+        smoke test named, one the commit does not hold, or one the verification leaves a test out
+        of. No status is read here, and this step gives the same answer when it runs again."""
+        # An older config.py reads neither key into its table (this engine.py beside the `implement_loop` of
+        # the engine that runs the loop, as the verifier loads it): nothing is said, so nothing is discharged.
+        said = getattr(self.deploy, "verified_description", "")
+        left_out = getattr(self.deploy, "unverified_tests", None)
+        if left_out is None:
+            return {}
+        d = (st.deploy or {}) if self.deploy.contexts and said else {}
+        states, descriptions = d.get("states") or {}, d.get("descriptions") or {}
+        context = next((c for c in self.deploy.contexts if VERIFY_CONTEXT.fullmatch(c) and states.get(c) == "success"
+                        and descriptions.get(c) == said), None)
+        if not context:
+            return {}
+        sha, texts, out = d["sha"], self._item_text(n), {}
+        unverified = {SMOKE_TEST.sub(r"\1", t) for t in left_out}   # as an item's text is read: no leading `./`
+        for i in self._items(st):
+            text = texts.get(i["id"], "")
+            needs = NEEDS_END.search(text)
+            tests = sorted({m.group(1) for m in SMOKE_TEST.finditer(text)})
+            if (i["proof"] != "owner" or i.get("capability") != DEPLOYED_ENVIRONMENT or not tests
+                    or (needs and needs.group(1) != DEPLOYED_ENVIRONMENT) or unverified & set(tests)
+                    or not all(self.ws.git("ls-tree", "--name-only", sha, "--", t, check=False) == t for t in tests)):
+                continue
+            record = Evidence(criterion=i["id"], kind=COMMIT_STATUS_EVIDENCE, command=None, cwd=".", head_sha=sha,
+                              exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
+                              note=(f"the commit status `{context}` succeeded on the merge commit `{sha[:12]}` with the "
+                                    f"description `{said}`: the verification ran {', '.join(f'`{t}`' for t in tests)}"),
+                              verifier="commit status")
+            out[i["id"]] = asdict(record) | {"context": context, "description": said}
         return out
 
     def _obligation_text(self, o: dict) -> str:

@@ -12,7 +12,17 @@ For **every** ledger item ({{ledger_ids}}) return one entry:
   - `owner`: only when it needs a capability this host lacks ({{lacks}}). Give that `capability`
     exactly, and the `agent_part`: what agents still build and prove (or `none`, with why). An
     item only a deployed environment, a real account or GPU capacity can show is such an item:
-    its `agent_part` is the template and the assertions that can be proven here;
+    its `agent_part` is the template and the assertions that can be proven here.
+    An item about the deployed system should name the smoke test that decides it: a test under
+    `tests/smoke/`, which the pipeline's verification runs against the deployed endpoint after
+    each merge. An item that needs `aws:deployed-environment` and names such a test is still
+    planned as `owner` with that capability, and its `agent_part` is that smoke test. The engine
+    then proves it from the deployment verdict, not the owner: once the merge commit's
+    `verify/<stage>` status succeeds with the description that says its tests ran and passed,
+    the item is recorded as proven with that status as its evidence. Until the owner configures
+    that verdict, for an item that names no smoke test, and for one that names a test file of
+    which the verification leaves a test out (`scripts/pipeline/verify.py` says which tests it
+    deselects), it stays the owner's;
   - `deferred`: only when it needs another **open** issue's deliverable. Give `depends_on` and
     `depends_quote`, words from that issue's title or body that show it delivers what you need.
 - `zones`: every path you expect to change, registrations and test files included. A protected
