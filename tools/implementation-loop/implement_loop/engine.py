@@ -3127,7 +3127,9 @@ class Engine:
         description (a verification that ran no test, a parked system), a verdict recorded
         without descriptions, another capability, no smoke test named, or one the commit does not
         hold. No status is read here, and this step gives the same answer when it runs again."""
-        said = self.deploy.verified_description
+        # An older config.py reads no such key into its table (this engine.py beside the `implement_loop` of
+        # the engine that runs the loop, as the verifier loads it): no description, so nothing is discharged.
+        said = getattr(self.deploy, "verified_description", "")
         d = (st.deploy or {}) if self.deploy.contexts and said else {}
         states, descriptions = d.get("states") or {}, d.get("descriptions") or {}
         context = next((c for c in self.deploy.contexts if VERIFY_CONTEXT.fullmatch(c) and states.get(c) == "success"

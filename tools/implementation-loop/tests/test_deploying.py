@@ -576,3 +576,16 @@ def test_only_a_verified_smoke_test_item_is_discharged(case):
         assert run.summary["owner_obligations"] == {2: st.human_tasks}
         assert f"D2: needs {capability}" in run.fake.prs[present(st.pr)]["body"]
         assert not [e for e in st.evidence if e["criterion"] == "D2"] and not run.events("obligations_discharged", 2)
+
+
+def test_a_table_without_the_key_discharges_nothing():
+    """`engine.py` also runs beside an older `config.py`, whose table has no `verified_description`:
+    the verifier's pytest loads the tests' engine into the package of the engine that runs the loop."""
+    with loop(contexts=(DEPLOY, VERIFY), lacks=(DEPLOYED,)) as run:
+        older = SimpleNamespace(contexts=run.deploy.contexts, timeout_s=2, approval_description="")
+        run.deploy = older   # a test double: the table as an older config.py reads it
+        run.add_work(2, owner=((SIGNS_IN, DEPLOYED),), files=(SMOKE,))
+        run.fake.posts[2] = [("success", VERIFIED)]
+        run.run()
+        assert not run.events("step_crashed"), "the evidence step reads a key the table may not have"
+        assert run.issue(2).phase == Phase.DELIVERED and len(run.issue(2).human_tasks) == 1, "the item stays the owner's"
