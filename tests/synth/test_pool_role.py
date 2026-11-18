@@ -115,7 +115,10 @@ def test_on_every_resource_only_the_five_session_actions(statements: list[dict[s
         if "*" in as_list(statement["Resource"])
         for action in as_list(statement["Action"])
     }
-    assert on_every_resource == SESSION_ACTIONS
-    # And no other statement than those above.
+    # And the registry's authorization token, which the pool's release grants with the pull of its
+    # engine image (`rhi.pools.release`): AWS grants it on every resource only.
+    assert on_every_resource == SESSION_ACTIONS | {"ecr:GetAuthorizationToken"}
+    # And no other statement than those above and those of the pool's release, which reads its
+    # parameter, its files' object and its engine image (`tests/synth/test_pool_release.py`).
     services = {action.split(":")[0] for statement in statements for action in as_list(statement["Action"])}
-    assert services == {"dynamodb", "logs", "aps", "autoscaling", "secretsmanager", "ssm", "ssmmessages"}
+    assert services == {"dynamodb", "logs", "aps", "autoscaling", "secretsmanager", "ssm", "ssmmessages", "s3", "ecr"}

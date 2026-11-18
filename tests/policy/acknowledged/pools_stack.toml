@@ -3,7 +3,8 @@
 # written here as comments.
 #
 # The role of the function the CDK puts at the stack's root for its AWS SDK custom resources (the
-# one that suspends each pool group's zone rebalancing, `pools_group.toml`):
+# one that suspends each pool group's zone rebalancing, `pools_group.toml`, and the one that reads
+# the digest of each pool's engine image, `pools_release.toml`):
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on every resource, through the
 #   AWS managed policy AWSLambdaBasicExecutionRole: the function writes its own logs.
 # Each custom resource attaches its own policy to that role, in the module that created it.
