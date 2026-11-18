@@ -19,6 +19,9 @@ one. What a reading calls for:
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
 | in service | any other | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
 
+Any other reading calls for nothing. An instance that was never in service and whose target state
+is a terminated one is among them: no engine runs there to drain, and the program leaves it alone.
+
 The instance is in service once a launch into service, a promotion or a launch straight there, has
 completed its hook: the serving duties start then. They run until the target state leaves service,
 and on while the termination handling waits for the engine to drain. A hook that could not be
