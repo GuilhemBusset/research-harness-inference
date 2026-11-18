@@ -59,6 +59,10 @@ refusal and a path outside the table included, gives one log record of metadata
 something of a request notes it there: the alias once the key is accepted, the pool once the body
 names it, the tokens at the settlement, and the cause wherever an error is rendered. An exception
 that escapes a handler is answered 500 with no body and logged with the cause `none`.
+
+**The metrics** (sections 6.6 and 7.2): `build_app` given the gateway's metrics
+(`rhi_gateway.metrics.Metrics`) counts each of these requests once, from its finished record: per
+student by alias and per pool, the requests, the tokens settled and the errors by cause.
 """
 
 from __future__ import annotations
@@ -99,6 +103,7 @@ if TYPE_CHECKING:
     from rhi_gateway.heartbeat import Demand, Heartbeat
     from rhi_gateway.keystore import KeyRecord
     from rhi_gateway.local import LocalRoutes
+    from rhi_gateway.metrics import Metrics
 
 # What fills a slot: it gets the request and the table entry it was registered for.
 Handler = Callable[[Request, Route], Awaitable[Response]]
@@ -161,10 +166,14 @@ def build_app(
     *,
     local: LocalRoutes | None = None,
     heartbeat: Heartbeat | None = None,
+    metrics: Metrics | None = None,
 ) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
     `heartbeat`, when given, writes this task's demand for as long as the application runs.
+
+    `metrics`, when given, counts every request the application answers, the local routes, the
+    refusals and the paths outside the table included (`rhi_gateway.metrics`).
 
     `local`, when given, answers the models, status, wake and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
@@ -182,8 +191,9 @@ def build_app(
     app = Starlette(
         routes=[TableRoute(entry, given.get(entry)) for entry in TABLE],
         lifespan=None if heartbeat is None else _beating(heartbeat),
-        # One log record per request, and the gateway's own faults answered 500 with no text.
-        middleware=[Middleware(telemetry.Telemetry)],
+        # One log record per request, counted as it is logged, and the gateway's own faults answered
+        # 500 with no text.
+        middleware=[Middleware(telemetry.Telemetry, ended=None if metrics is None else metrics.count)],
     )
     router = app.router
     router.redirect_slashes = False

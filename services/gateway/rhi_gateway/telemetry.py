@@ -30,6 +30,10 @@ server would log its text.
 `Telemetry` is the middleware that `rhi_gateway.app.build_app` installs. The parts of the gateway
 that learn something of a request note it on the request's record through the `note_*`
 functions, which do nothing outside a request.
+
+**The count.** A record that is finished is also given to `ended`, when the middleware has one,
+before it is written: `rhi_gateway.metrics` counts the request from it, so the metrics and the log
+are of the same requests and say the same of each.
 """
 
 from __future__ import annotations
@@ -39,13 +43,17 @@ import sys
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rhi_common.causes import Cause
 from rhi_gateway.routes import match
+
+if TYPE_CHECKING:
+    from rhi_gateway.budget import Student
 
 # The cause of an answer that names none of `rhi_common.causes`: a fault of the gateway itself.
 NO_CAUSE = "none"
@@ -55,7 +63,11 @@ FAULT_STATUS = 500
 
 @dataclass
 class RequestRecord:
-    """What is logged of one request. Every field is metadata: none comes from a body or a header's value."""
+    """What is logged of one request. Every field is metadata: none comes from a body or a header's value.
+
+    `student` is not logged: it is the record of the accepted key, by which the metrics read the
+    student's budget from the ledger (`rhi_gateway.metrics`).
+    """
 
     time: str
     wire_format: str | None
@@ -66,6 +78,7 @@ class RequestRecord:
     latency_ms: int = 0
     status: int | None = None
     cause: str | None = None
+    student: Student | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -84,11 +97,12 @@ class RequestRecord:
 _CURRENT: ContextVar[RequestRecord | None] = ContextVar("rhi_gateway_request_record", default=None)
 
 
-def note_student(alias: str) -> None:
-    """The request's student, by alias: never the GitHub ID."""
+def note_student(student: Student) -> None:
+    """The request's student, once the key is accepted. The log names the alias: never the GitHub ID."""
     record = _CURRENT.get()
     if record is not None:
-        record.alias = alias
+        record.alias = student.alias
+        record.student = student
 
 
 def note_pool(name: str) -> None:
@@ -123,7 +137,10 @@ def _arrival(seconds: float) -> str:
 
 
 class Telemetry:
-    """The ASGI middleware that writes one record per HTTP request, and answers the gateway's own faults."""
+    """The ASGI middleware that writes one record per HTTP request, and answers the gateway's own faults.
+
+    `ended`, when given, is called with each finished record, once, before the record is written.
+    """
 
     def __init__(
         self,
@@ -132,9 +149,11 @@ class Telemetry:
         write: Callable[[str], None] = write_line,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        ended: Callable[[RequestRecord], None] | None = None,
     ) -> None:
         self._app = app
         self._write = write
+        self._ended = ended
         self._clock = clock
         self._monotonic = monotonic
 
@@ -174,6 +193,8 @@ class Telemetry:
         finally:
             _CURRENT.reset(token)
             record.latency_ms = max(0, round((self._monotonic() - started) * 1000))
+            if self._ended is not None:
+                self._ended(record)
             self._write(json.dumps(record.to_json(), separators=(",", ":")))
 
 

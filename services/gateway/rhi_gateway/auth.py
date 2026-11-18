@@ -139,7 +139,7 @@ def authenticated(authenticator: Authenticator, handler: AuthenticatedHandler) -
             # A route the gateway answers itself has no wire format: it answers as `not_found` does.
             answer = render_json(refused, entry.wire_format or WireFormat.MESSAGES)
             return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
-        telemetry.note_student(student.alias)
+        telemetry.note_student(student)
         return await handler(request, entry, student)
 
     return slot
