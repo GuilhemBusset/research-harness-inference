@@ -35,6 +35,7 @@ VERIFIED, PARKED = "the verification's tests ran and passed", "the system is par
 DEPLOYED, GPU = "aws:deployed-environment", "gpu:capacity"
 SMOKE = "tests/smoke/deployed/test_sign_in.py"
 SIGNS_IN = f"`{SMOKE}::test_a_student_signs_in` passes on the deployed endpoint (needs aws:deployed-environment)."
+LEFT_OUT = "tests/smoke/deployed/test_internal_routes.py"   # a file of which the verification leaves a test out
 
 
 def loop_beside_these_tests() -> SimpleNamespace:
@@ -144,10 +145,10 @@ class Agents(L.agents.FakeAgents):
 class Loop:
     """A throwaway repository, the fake GitHub with its pipeline, and engine runs with `[deploy]` set."""
 
-    def __init__(self, contexts=(DEPLOY,), timeout_s=2, approval="", verified="", lacks=()):
+    def __init__(self, contexts=(DEPLOY,), timeout_s=2, approval="", verified="", lacks=(), unverified=None):
         self.repo = TempRepo()
         self.deploy = L.config.Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval,
-                                      verified_description=verified)
+                                      verified_description=verified, unverified_tests=unverified)
         self.lacks = list(lacks)
         self.fake = Pipeline(self.repo, self.deploy.contexts)
         self.scripts = {}
@@ -274,6 +275,20 @@ def test_loop_toml_has_an_empty_verified_description_and_a_set_one_is_read():
         path.write_text("[deploy]\nverified_description = true\n")
         with pytest.raises(TypeError, match="verified_description"):
             L.config.load_policy(path)
+
+
+def test_the_tests_a_verification_leaves_out_are_read_from_the_table():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "loop.toml"
+
+        def read(value):
+            path.write_text(f"[deploy]\nunverified_tests = {value}\n")
+            return L.config.load_policy(path)["deploy"].unverified_tests
+        assert L.config.Deploy().unverified_tests is None, "a table that does not say is not one that says none"
+        assert (read("[]"), read(f'["{LEFT_OUT}"]')) == ((), (LEFT_OUT,))
+        for not_a_list_of_files in (f'"{LEFT_OUT}"', "[1]"):
+            with pytest.raises(TypeError, match="unverified_tests"):
+                read(not_a_list_of_files)
 
 
 # ---------------------------------------------------------------------- the phase
@@ -517,11 +532,12 @@ def test_a_run_stopped_while_it_polls_is_reported_and_resumes_in_deploying():
 # ---------------------------------------------------------------------- what a verified deployment discharges
 @contextmanager
 def deployed(item=SIGNS_IN, capability=DEPLOYED, configured=VERIFIED, contexts=(DEPLOY, VERIFY), said=VERIFIED,
-             in_the_commit=(SMOKE,)):
-    """Issue #2 after one engine run, on a deploy table built here. Its second deliverable, D2, is
-    `item`, which the plan gives to the owner for `capability`; its change holds the files
-    `in_the_commit`. Every context succeeds on the merge commit, each with the description `said`."""
-    with loop(contexts=contexts, verified=configured, lacks=(DEPLOYED, GPU)) as run:
+             in_the_commit=(SMOKE,), left_out=(LEFT_OUT,)):
+    """Issue #2 after one engine run, on a deploy table built here, which says that the verification
+    leaves out a test of each file of `left_out`. Its second deliverable, D2, is `item`, which the
+    plan gives to the owner for `capability`; its change holds the files `in_the_commit`. Every
+    context succeeds on the merge commit, each with the description `said`."""
+    with loop(contexts=contexts, verified=configured, lacks=(DEPLOYED, GPU), unverified=left_out) as run:
         run.add_work(2, owner=((item, capability),), files=in_the_commit)
         run.fake.posts[2] = [("success", said)]
         run.summary = run.run()
@@ -550,6 +566,8 @@ def test_a_verified_deployment_discharges_a_smoke_test_item():
 
 NO_TEST_NAMED = "The smoke tests of `tests/smoke/` pass on the deployed endpoint (needs aws:deployed-environment)."
 NEEDS_GPU = f"`{SMOKE}::test_a_pool_starts` passes on the deployed endpoint (needs gpu:capacity)."
+# Two tests decide this one, and the verification runs only the first.
+PARTLY_RUN = f"`{SMOKE}` and `{LEFT_OUT}` pass on the deployed endpoint (needs aws:deployed-environment)."
 
 
 @pytest.mark.parametrize("case", [
@@ -558,6 +576,10 @@ NEEDS_GPU = f"`{SMOKE}::test_a_pool_starts` passes on the deployed endpoint (nee
     pytest.param({"contexts": (DEPLOY,)}, id="no-verification-context"),
     pytest.param({"item": NO_TEST_NAMED}, id="no-smoke-test-named"),
     pytest.param({"in_the_commit": ()}, id="a-smoke-test-the-commit-does-not-hold"),
+    pytest.param({"item": SIGNS_IN.replace(SMOKE, LEFT_OUT), "in_the_commit": (LEFT_OUT,)},
+                 id="a-smoke-test-the-verification-leaves-out"),
+    pytest.param({"item": PARTLY_RUN, "in_the_commit": (SMOKE, LEFT_OUT)}, id="one-of-its-smoke-tests-left-out"),
+    pytest.param({"left_out": None}, id="a-table-that-does-not-say-what-is-left-out"),
     pytest.param({"item": NEEDS_GPU, "capability": GPU}, id="gpu-capacity"),
     pytest.param({"item": NEEDS_GPU}, id="gpu-capacity-whatever-the-plan-says"),
     pytest.param({"item": NEEDS_GPU.replace(" (needs gpu:capacity)", ""), "capability": GPU}, id="gpu-capacity-by-the-plan-alone"),
