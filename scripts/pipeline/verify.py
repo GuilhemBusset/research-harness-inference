@@ -8,6 +8,12 @@ process of their own. The key reaches that process in its environment and nowher
 never on a command line, and nothing here prints it. A failed test is a non-zero exit, which fails
 the step and the execution.
 
+**What the tests print reaches the build's log without the key.** A failing test prints what it
+held, and a smoke test holds the key. So that process writes to this one, not to the log, and
+each line goes on with `REDACTED` in place of the key and of any piece of it `PIECE` characters
+long or longer: pytest shortens a long value by cutting its middle out, which can leave part of a
+key.
+
 **The tests it leaves out.** The step runs outside the private network, and only the gateway may
 reach the internal load balancer (section 6.5), so the tests that call the forbidden routes
 through it cannot run from here. They are deselected by their IDs, `DESELECTED`, and no other
@@ -92,6 +98,10 @@ DESELECTED: tuple[str, ...] = (
 # The marker a smoke test carries its ID in.
 ID_MARKER = "smoke_id"
 
+# What the build's log reads in place of the key, and the shortest piece of the key it replaces.
+REDACTED = "[canary key]"
+PIECE = 8
+
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of `DESELECTED`."""
@@ -123,15 +133,48 @@ def release_parameters(text: str) -> dict[str, str]:
     return dict(pair.split("=", 1) for pair in text.split(","))
 
 
+def without(secret: str) -> Callable[[str], str]:
+    """What rewrites a line of text with `REDACTED` in place of `secret` and of every piece of it
+    `PIECE` characters long or longer."""
+    width = min(PIECE, len(secret))
+    pieces = {secret[at : at + width] for at in range(len(secret) - width + 1)} if secret else set()
+
+    def redacted(line: str) -> str:
+        # Each stretch of the line that pieces of the secret cover, end to end.
+        covered: list[list[int]] = []
+        for at in range(len(line) - width + 1):
+            if line[at : at + width] not in pieces:
+                continue
+            if covered and at <= covered[-1][1]:
+                covered[-1][1] = at + width
+            else:
+                covered.append([at, at + width])
+        for start, end in reversed(covered):
+            line = line[:start] + REDACTED + line[end:]
+        return line
+
+    return redacted
+
+
 def run_tests(environ: Mapping[str, str], tests: Sequence[str] = (SMOKE_TESTS,)) -> int:
     """Runs the tests with pytest in a process of its own, whose environment is `environ`, with
-    this file as a plugin; pytest's exit code. It collects from the repository's root."""
+    this file as a plugin; pytest's exit code. It collects from the repository's root. What the
+    process and its children print is printed here, line by line, without the key `environ` holds."""
     # pytest loads a plugin named on its command line before it reads the import path of
     # `pyproject.toml`: the plugin's folder goes on the process's own.
     folders = [str(Path(__file__).resolve().parent), *filter(None, [environ.get("PYTHONPATH")])]
     command = [sys.executable, "-m", "pytest", "-p", NAME, *tests]
-    done = subprocess.run(command, cwd=REPO, env={**environ, "PYTHONPATH": os.pathsep.join(folders)}, check=False)
-    return done.returncode
+    redacted = without(environ.get(KEY_VARIABLE, ""))
+    # Unbuffered, so that the log follows the tests as they run.
+    env = {**environ, "PYTHONPATH": os.pathsep.join(folders), "PYTHONUNBUFFERED": "1"}
+    with subprocess.Popen(
+        command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace"
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(redacted(line))
+            sys.stdout.flush()
+    return process.returncode
 
 
 def not_run(reason: str, env: Mapping[str, str]) -> int:

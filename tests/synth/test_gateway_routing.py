@@ -4,10 +4,9 @@ service's target group, which keeps a deregistering task for 1800 seconds and ch
 with a keyless `GET /v1/models` that answers 401. All of it only while the listener exists: without
 it the service has no load balancer.
 
-The tests synthesize the stage themselves, with its gateway stack and with cdk-nag, which fails the
-synthesis on a finding that the file of the resource's module does not acknowledge: the app does
-not ask the stage for that stack yet (`rhi.stage.EndpointStage`). The CDK is imported inside
-`synthesize`, after `app_module` has started jsii (see conftest.py).
+The tests synthesize the stage themselves, with the listener on and off, and with cdk-nag, which
+fails the synthesis on a finding that the file of the resource's module does not acknowledge. The
+CDK is imported inside `synthesize`, after `app_module` has started jsii (see conftest.py).
 """
 
 from __future__ import annotations
@@ -91,15 +90,15 @@ class Stage:
 
 
 def synthesize(app_module: ModuleType, outdir: Path, *, https_listener: bool) -> Stage:
-    """The stage, with its gateway stack, under the example configuration with the listener on or
-    off: with the context of `cdk.json`, nothing bundled, and cdk-nag as the app runs it."""
+    """The stage under the example configuration with the listener on or off: with the context of
+    `cdk.json`, nothing bundled, and cdk-nag as the app runs it."""
     import aws_cdk as cdk
 
     from rhi.stage import EndpointStage
 
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
     app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    EndpointStage(app, "Rhi", config=dataclasses.replace(EXAMPLE, https_listener=https_listener), gateway=True)
+    EndpointStage(app, "Rhi", config=dataclasses.replace(EXAMPLE, https_listener=https_listener))
     app_module.add_nag(app)
     app.synth()
     return Stage(

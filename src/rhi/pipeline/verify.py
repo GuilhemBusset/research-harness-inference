@@ -13,8 +13,7 @@ Pipelines' outputs of a deployed stack. Nothing is looked up, and the pipeline's
 reference to each output, never its value:
 
 - `RHI_SMOKE_ENDPOINT`: the endpoint's address, the gateway stack's output, which reads `none`
-  while the endpoint has no HTTPS listener. While the stage deploys no gateway stack
-  (`rhi.stage`), the step is given `none` itself: there is no endpoint to verify.
+  while the endpoint has no HTTPS listener.
 - `RHI_SMOKE_WORKSPACE_URL`: the Prometheus workspace's query address, the observability stack's.
 - `RHI_VERIFY_RELEASE_PARAMETERS`: each pool's name and the name of its release parameter, the
   pools stack's. The script hands it to the smoke tests as the JSON they read.
@@ -112,13 +111,8 @@ def verify_step(
         iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]),
         iam.PolicyStatement(actions=["s3:PutObject"], resources=[artifacts.arn_for_objects(f"{PREFIX}/*")]),
     ]
-    # A stage that is not the endpoint's has nothing to verify: the step says so, as not run.
-    gateway = stage.gateway if isinstance(stage, EndpointStage) else None
-    if gateway is None:
-        environment[ENDPOINT_VARIABLE] = NO_ENDPOINT
-    else:
-        outputs[ENDPOINT_VARIABLE] = gateway.endpoint
     if isinstance(stage, EndpointStage):
+        outputs[ENDPOINT_VARIABLE] = stage.gateway.endpoint
         outputs[WORKSPACE_URL_VARIABLE] = stage.observability.workspace_url
         outputs[RELEASE_PARAMETERS_VARIABLE] = stage.pools.release_parameters_output
         # The stage's workspace, by its tag: every workspace of the account and region, narrowed
@@ -133,6 +127,9 @@ def verify_step(
         ]
         if parameters:
             statements.append(iam.PolicyStatement(actions=["ssm:GetParameter"], resources=parameters))
+    else:
+        # A stage that is not the endpoint's has no endpoint to verify: the step says so, as not run.
+        environment[ENDPOINT_VARIABLE] = NO_ENDPOINT
     return pipelines.CodeBuildStep(
         ACTION,
         input=source,
