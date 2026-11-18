@@ -21,9 +21,21 @@ one. What a reading calls for:
 
 The instance is in service once a launch into service, a promotion or a launch straight there, has
 completed its hook: the serving duties start then. They run until the target state leaves service,
-and on while the termination handling waits for the engine to drain: the program stops them once
-the termination hook is completed. A hook that could not be completed leaves the instance in
-service, and the next reading hands it over again.
+and on while the termination handling waits for the engine to drain. A hook that could not be
+completed leaves the instance in service, and the next reading hands it over again.
+
+**One transition at a time, beside the readings.** A transition can take minutes, and the readings
+go on every `TICK_SECONDS` while it runs. A reading that finds a transition under way calls for
+nothing: the transition ends first, and the reading after it decides what comes next. That reading
+is made at once when the transition has lasted beyond a reading, and at its own time otherwise, so
+a transition that fails at once is not run again before the next one.
+
+**The duties at rest before the engine stops.** A duty does its work in a worker thread, and
+cancelling the duty does not end a call that is under way there: a check of the engine that was
+waiting for the pool's secret would go on, find the engine stopped, and restart it. So the
+termination handling stops the engine's unit through a host that first brings the duties to rest
+(`_Host`): once the termination hook is completed they are cancelled, and what they have in a
+worker thread is waited for. Only then is the unit stopped, and nothing of the duties runs after.
 
 After an entry to the warm pool the program runs no serving duty: the group stops the instance. An
 instance that has left service is not taken for one that enters the pool: the state it left for
@@ -36,16 +48,19 @@ takes the instance as in service. The serving duties end only by failing, and th
 ends with them, so that its unit restarts it and they resume.
 
 Every call that waits (the instance metadata, a transition) runs in a worker thread, so the
-serving duties keep their own cadence beside it.
+readings and the serving duties keep their own cadence beside it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Self
 
@@ -59,7 +74,7 @@ from rhi_lifecycle.serving import Serving
 from rhi_lifecycle.termination import Termination
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Coroutine, Mapping
     from pathlib import Path
     from wsgiref.simple_server import WSGIServer
 
@@ -71,6 +86,9 @@ TICK_SECONDS = 5.0
 PARAMETER_VARIABLE = "RHI_RELEASE_PARAMETER"
 REGION_VARIABLE = "RHI_REGION"
 ENGINE_VARIABLE = "RHI_ENGINE"
+
+# Set in the tasks of the serving duties, and so wherever one of them hands a call to a worker thread.
+_SERVING: contextvars.ContextVar[bool] = contextvars.ContextVar("serving", default=False)
 
 _LOG = logging.getLogger(__name__)
 
@@ -108,6 +126,61 @@ class Environment:
         return cls(environ[PARAMETER_VARIABLE], environ[REGION_VARIABLE], engine, settings)
 
 
+class _Workers(ThreadPoolExecutor):
+    """The event loop's worker threads, where `asyncio.to_thread` runs a call. They keep the calls
+    of the serving duties that have not returned: cancelling a duty does not end the call it waits
+    for, and the program waits for it before the engine is stopped."""
+
+    def __init__(self) -> None:
+        super().__init__(thread_name_prefix="rhi-lifecycle")
+        self._lock = threading.Lock()
+        self._serving: set[Future[Any]] = set()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        # Called in the event loop, by the task that hands the call over: the context is its own.
+        call = super().submit(fn, *args, **kwargs)
+        if _SERVING.get():
+            with self._lock:
+                self._serving.add(call)
+            call.add_done_callback(self._returned)
+        return call
+
+    def _returned(self, call: Future[Any]) -> None:
+        with self._lock:
+            self._serving.discard(call)
+
+    def serving(self) -> list[Future[Any]]:
+        """The calls of the serving duties that are under way."""
+        with self._lock:
+            return list(self._serving)
+
+
+class _Host(Host):
+    """The host as the termination handling acts on it. Before the engine's unit is stopped, `rest`
+    is called: it returns once the serving duties are at rest. Every other action is `host`'s."""
+
+    def __init__(self, host: Host, rest: Callable[[], object]) -> None:
+        super().__init__()
+        self._host = host
+        self._rest = rest
+
+    def holds(self, image: str, timeout: float | None = None) -> bool:
+        return self._host.holds(image, timeout=timeout)
+
+    def pull(self, image: str, timeout: float | None = None) -> None:
+        self._host.pull(image, timeout=timeout)
+
+    def start_engine(self, timeout: float | None = None) -> None:
+        self._host.start_engine(timeout=timeout)
+
+    def restart_engine(self) -> None:
+        self._host.restart_engine()
+
+    def stop_engine(self) -> None:
+        self._rest()
+        self._host.stop_engine()
+
+
 class Agent:
     """The agent of one instance. `autoscaling`, `ssm` and `secrets` are the AWS SDK's clients for
     Auto Scaling, Systems Manager and Secrets Manager, and `dynamodb` is boto3's DynamoDB resource.
@@ -142,7 +215,7 @@ class Agent:
             self._metadata,
             autoscaling=autoscaling,
             ssm=ssm,
-            host=host,
+            host=_Host(host, self._rest),
             engine=environment.engine,
             fetch=fetch,
             sleep=wait,
@@ -197,10 +270,18 @@ class Agent:
         # as `_duties` while the instance is in service.
         self._serving: Serving | None = None
         self._duties: asyncio.Task[None] | None = None
+        # The transition under way, or the last one until a reading has taken what ended it, and
+        # whether a reading found it under way.
+        self._transition: asyncio.Task[None] | None = None
+        self._outlasted = False
+        self._workers = _Workers()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
         """Serve the metrics, then read the target state every `TICK_SECONDS` and do what each
-        reading calls for, until cancelled or until the serving duties fail."""
+        reading calls for, until cancelled or until a transition or the serving duties fail."""
+        self._loop = asyncio.get_running_loop()
+        self._loop.set_default_executor(self._workers)
         self.server = server = metrics.serve(self._registry, port=self._port)
         # A unit restarted on an instance that serves: no launch transition is run on it.
         self._in_service = self._served.exists()
@@ -208,12 +289,15 @@ class Agent:
             next_at = self._clock()
             while True:
                 await self.tick()
-                # A fixed cadence: the time a reading takes is not added to the interval, and a
-                # transition that outlasted it is followed by a reading at once.
+                # A fixed cadence: the time a reading takes is not added to the interval.
                 next_at = max(next_at + TICK_SECONDS, self._clock())
-                await self._sleep(next_at - self._clock())
+                if await self._pause(next_at):
+                    next_at = self._clock()
         finally:
             try:
+                if self._transition is not None:
+                    self._transition.cancel()
+                    await asyncio.wait({self._transition})
                 await self._stop_duties()
             finally:
                 server.shutdown()
@@ -225,6 +309,13 @@ class Agent:
             # Raises what ended the duties: the program ends, and its unit restarts it.
             self._duties.result()
         reading = await asyncio.to_thread(self._read)
+        if self._transition is not None:
+            if not self._transition.done():
+                # One transition at a time: this reading calls for nothing.
+                self._outlasted = True
+                return
+            transition, self._transition = self._transition, None
+            transition.result()  # raises what ended it, as for the duties
         if reading is None:
             return
         target, instance = reading
@@ -233,9 +324,27 @@ class Agent:
                 if self._duties is None:
                     self._serve(instance)
             else:
-                await self._leave(target, instance)
+                self._begin(self._leave(target, instance))
         elif target != self._acted and (target == launch.IN_SERVICE or target in launch.WARM_STATES):
-            await self._enter(target, instance)
+            self._begin(self._enter(target, instance))
+
+    def _begin(self, transition: Coroutine[Any, Any, None]) -> None:
+        """Run `transition` beside the readings."""
+        self._outlasted = False
+        self._transition = asyncio.create_task(transition, name="transition")
+
+    async def _pause(self, until: float) -> bool:
+        """Wait for the moment `until` of the next reading. The end of a transition that a reading
+        found under way ends the wait before: says whether it did."""
+        sleep = asyncio.ensure_future(self._sleep(until - self._clock()))
+        waited: set[asyncio.Future[Any]] = {sleep}
+        if self._transition is not None and self._outlasted:
+            waited.add(self._transition)
+        try:
+            await asyncio.wait(waited, return_when=asyncio.FIRST_COMPLETED)
+            return not sleep.done()
+        finally:
+            sleep.cancel()
 
     def _read(self) -> tuple[str, str] | None:
         """The target state and the instance, or None when the instance metadata gives neither."""
@@ -261,7 +370,7 @@ class Agent:
         outcome = await asyncio.to_thread(self._termination.drain, instance)
         _LOG.info("the termination handling ended: %s", outcome.value)
         if outcome is Outcome.DRAINED:
-            await self._stop_duties()
+            # The duties are at rest: the engine's unit was stopped only once they were.
             self._in_service = False
             # A return to the warm pool is not an entry to it.
             self._acted = target
@@ -274,15 +383,30 @@ class Agent:
                 _LOG.error("the record of the release on disk cannot be read: no serving duty runs")
                 return
             self._serving = self._make_serving(held, instance)
-        self._duties = asyncio.create_task(self._serving.run(), name="serving")
+        # The duties' tasks carry the mark by which `_Workers` knows their calls.
+        context = contextvars.copy_context()
+        context.run(_SERVING.set, True)
+        self._duties = asyncio.create_task(self._serving.run(), name="serving", context=context)
         _LOG.info("the serving duties run")
 
     async def _stop_duties(self) -> None:
+        """Bring the serving duties to rest: they are cancelled, and what one of them has in a
+        worker thread is waited for, because cancelling the duty does not end it."""
         duties, self._duties = self._duties, None
         if duties is not None:
             duties.cancel()
             await asyncio.wait({duties})
+        calls = self._workers.serving()
+        if calls:
+            await asyncio.wait([asyncio.wrap_future(call) for call in calls])
+        if duties is not None:
             _LOG.info("the serving duties are stopped")
+
+    def _rest(self) -> None:
+        """Bring the serving duties to rest, for a transition: called in its worker thread, and
+        returns once they are."""
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._stop_duties(), self._loop).result()
 
 
 def main() -> None:
