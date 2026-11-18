@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
-from rhi_reporter import handler, measure
+from rhi_reporter import handler, measure, report
 from rhi_reporter.github import SECRET_VARIABLE, RefusedError
 from rhi_reporter.status import CommitStatus, State
 
@@ -276,6 +276,27 @@ def test_a_failed_execution_reports_only_resources_of_its_templates(stub: Stub, 
     known = {logical_id for template in TEMPLATES.values() for logical_id in template["Resources"]}
     named = [description.split()[0] for _, _, context, description in client.posted if "/resource/" in context]
     assert named and set(named) <= known
+
+
+def test_a_failure_s_report_is_built_with_the_allow_list_of_smoke_tests_the_function_is_given(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The variable as the function's construct writes it; the handler reads it for every event.
+    monkeypatch.setenv(handler.SMOKE_TESTS_VARIABLE, "hello,no-key")
+    assert handler.smoke_test_ids({}) == ()
+    allow_lists: list[tuple[str, ...]] = []
+
+    def build_report(*arguments: Any, **lists: Any) -> Any:
+        allow_lists.append(tuple(lists["smoke_test_ids"]))
+        return report.build_report(*arguments, **lists)
+
+    aws = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub)
+    monkeypatch.setattr(handler, "build_report", build_report)
+    monkeypatch.setattr(handler, "_clients", lambda: (aws, Client()))
+    monkeypatch.setenv(handler.STAGES_VARIABLE, STAGE)
+    for event in failed(stub.execution):
+        handler.handler(event, None)
+    assert allow_lists == [("hello", "no-key")]
 
 
 def test_a_failed_step_before_the_stage_fails_its_deployment(stub: Stub, commit: str) -> None:
