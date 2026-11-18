@@ -18,10 +18,12 @@ An instance launched straight into service never entered the warm pool: the pool
 keeps no warm instance. Its start is not the one that was measured, so only the hook's own timeout
 bounds it. The same holds for a promotion while the parameter gives no measured start.
 
-An instance that returns from service to the warm pool has a warm-pool target state too. It is
-draining, not entering, and is not handled here: `Launch.run` does nothing for an instance that
-has served since its start. It knows one by a file it writes before it completes a hook into
-service, in a folder the host empties at every start (`SERVED_FILE`).
+An instance that returns from service to the warm pool has a warm-pool target state too, and meets
+the same wait state. It is leaving service, not entering the pool: `Launch.run` hands an instance
+that has served since its start to `rhi_lifecycle.termination`, which waits for the engine to drain
+and completes the termination hook, and does none of an entry's steps. It knows one by a file it
+writes before it completes a hook into service, in a folder the host empties at every start
+(`SERVED_FILE`).
 
 **Abandon.** A release that differs, a step that fails and the transition's deadline all end the
 same way. Every step takes what is left of the deadline as its time limit, so a pull that hangs, or
@@ -50,12 +52,15 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_lifecycle import release
 from rhi_lifecycle.host import Host, HostError
+
+if TYPE_CHECKING:
+    from rhi_lifecycle.termination import Termination
 
 # The deadline of an entry to the warm pool (section 4.3; section 17 gives the same 15 minutes to
 # the hook itself until a start is measured).
@@ -179,16 +184,20 @@ class Engine:
 
 
 class Outcome(enum.Enum):
-    """How `Launch.run` ended."""
+    """How `Launch.run`, or `Termination.run`, ended."""
 
-    # The hook was completed with `CONTINUE`.
+    # The launch hook was completed with `CONTINUE`.
     CONTINUED = "continued"
-    # The hook was completed with `ABANDON`.
+    # The launch hook was completed with `ABANDON`.
     ABANDONED = "abandoned"
-    # The instance is in no launch transition, or is draining back to the warm pool: nothing was done.
+    # The engine was idle, and the termination hook was completed: the instance may leave service.
+    DRAINED = "drained"
+    # The instance is in no launch transition: nothing was done.
     NOT_A_LAUNCH = "not-a-launch"
+    # The instance is not being terminated: nothing was done.
+    NOT_A_TERMINATION = "not-a-termination"
     # No completion reached Auto Scaling: the transition, the instance or the hook is unknown, or
-    # the call failed. The hook's own timeout abandons the instance.
+    # the call failed. The hook's own timeout ends the wait.
     NOT_COMPLETED = "not-completed"
 
 
@@ -200,9 +209,9 @@ class _Abandon(Exception):
 class Launch:
     """One instance's launch. `parameter` is the name of its pool's release parameter;
     `autoscaling`, `ssm` and `secrets` are the AWS SDK's clients for Auto Scaling, Systems Manager
-    and Secrets Manager. `held` is the record of the release on disk, `served` the file that says
-    the instance has served since its start. `clock` and `sleep` are arguments so that a test
-    waits for nothing."""
+    and Secrets Manager. `termination` is what an instance that leaves service is handed to.
+    `held` is the record of the release on disk, `served` the file that says the instance has
+    served since its start. `clock` and `sleep` are arguments so that a test waits for nothing."""
 
     parameter: str
     metadata: Metadata
@@ -211,13 +220,15 @@ class Launch:
     secrets: Any
     host: Host
     engine: Engine
+    termination: Termination
     held: Path = release.HELD_RELEASE_FILE
     served: Path = SERVED_FILE
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = time.sleep
 
     def run(self) -> Outcome:
-        """Do the steps of the transition the instance is in, and complete its launch hook."""
+        """Do the steps of the transition the instance is in, and complete its hook: the launch
+        hook, or the termination hook for an instance that returns to the warm pool."""
         started = self.clock()
         try:
             target = self.metadata.target_state()
@@ -225,8 +236,11 @@ class Launch:
         except MetadataError:
             return Outcome.NOT_COMPLETED
         into_service = target == IN_SERVICE
-        if not into_service and (target not in WARM_STATES or self.served.exists()):
+        if not into_service and target not in WARM_STATES:
             return Outcome.NOT_A_LAUNCH
+        if not into_service and self.served.exists():
+            # The instance has served: it is leaving service for the warm pool, not entering it.
+            return self.termination.drain(instance)
         current = release.read_current(self.ssm, self.parameter)
         if current is None:
             return Outcome.NOT_COMPLETED
