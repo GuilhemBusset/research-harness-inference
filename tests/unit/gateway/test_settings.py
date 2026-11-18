@@ -141,8 +141,11 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
     loaded = parse_pools({"mock": MOCK, "coursework": vllm}, on_demand_price_limit=10)
     written = json.dumps({pool.name: config.pool_entry(pool) for pool in loaded})
 
-    arns = json.dumps(dict.fromkeys((pool.name for pool in loaded), TARGET_GROUPS["mock"]))
-    by_pool = {"RHI_TARGET_GROUPS": arns, "RHI_POOL_SECRETS": arns}
+    names = [pool.name for pool in loaded]
+    by_pool = {
+        "RHI_TARGET_GROUPS": json.dumps(dict.fromkeys(names, TARGET_GROUPS["mock"])),
+        "RHI_POOL_SECRETS": json.dumps(dict.fromkeys(names, POOL_SECRETS["mock"])),
+    }
     settings = read_settings({**FULL, "RHI_POOLS": written, "RHI_DEFAULT_POOL": "coursework", **by_pool})
 
     assert settings.pools == loaded
@@ -217,10 +220,33 @@ def test_a_required_variable_left_out_raises_an_error_that_names_it(variable: st
             )
         ),
         *(
+            pytest.param(variable, json.dumps({**arns, "mock": value}), id=f"{variable}-{case}")
+            for variable, arns, others in (
+                ("RHI_TARGET_GROUPS", TARGET_GROUPS, POOL_SECRETS),
+                ("RHI_POOL_SECRETS", POOL_SECRETS, TARGET_GROUPS),
+            )
+            for case, value in (
+                ("a-name", SECRET),
+                ("a-path", f"{SECRET}/resource-name"),
+                ("an-arn-of-the-other-kind", others["mock"]),
+                ("an-arn-of-no-account", arns["mock"].replace(ACCOUNT, SECRET)),
+                ("an-arn-then-text", f"{arns['mock']} {SECRET}"),
+            )
+        ),
+        *(
             pytest.param(variable, value, id=f"{variable}-{case}")
             for variable in REQUIRED[4:]
-            for case, value in (("empty", ""), ("a-space", f"{SECRET} {SECRET}"), ("a-line", f"{SECRET}\n"))
+            for case, value in (
+                ("empty", ""),
+                ("a-space", f"{SECRET} {SECRET}"),
+                ("a-line", f"{SECRET}\n"),
+                ("a-path", f"{SECRET}/resource-name"),
+                ("an-arn", POOL_SECRETS["mock"] + SECRET),
+            )
         ),
+        *(pytest.param(variable, "ab", id=f"{variable}-too-short") for variable in REQUIRED[4:8]),
+        pytest.param("RHI_SCALER_FUNCTION", SECRET * 2, id="RHI_SCALER_FUNCTION-too-long"),
+        pytest.param("RHI_SCALER_FUNCTION", f"{SECRET}.name", id="RHI_SCALER_FUNCTION-a-dot"),
         *(
             pytest.param(variable, value, id=f"{variable}-{case}")
             for variable in NUMERIC
@@ -245,6 +271,30 @@ def test_a_malformed_variable_raises_an_error_that_names_it_and_never_its_value(
     assert str(error).startswith(variable + " ")
     # Neither the message nor an error chained to it repeats the value.
     assert SECRET not in as_logged(error)
+
+
+def test_the_names_and_arns_a_deployment_can_give_are_accepted() -> None:
+    # Refusing a value AWS itself gives would keep the gateway from starting: the forms are AWS's, no narrower.
+    partition = f"arn:aws-us-gov:{{}}:us-gov-west-1:{ACCOUNT}:"
+    target_group = partition.format("elasticloadbalancing") + "targetgroup/Stage-Pools-MOCK1/0123456789abcdef"
+    secret = partition.format("secretsmanager") + "secret:stage/pools/Mock_secret+=.@-AbCdEf"
+    given = {
+        "RHI_TARGET_GROUPS": json.dumps(dict.fromkeys(POOLS, target_group)),
+        "RHI_POOL_SECRETS": json.dumps(dict.fromkeys(POOLS, secret)),
+        "RHI_KEYS_TABLE": "Stage-Tables.Keys_1A2B3C",
+        "RHI_USAGE_TABLE": "abc",
+        "RHI_HEARTBEAT_TABLE": "t" * 255,
+        "RHI_POOL_STATE_TABLE": "Stage_pool-state",
+        "RHI_SCALER_FUNCTION": "Stage-Scaler_Function1A2B3C",
+    }
+
+    settings = read_settings({**FULL, **given})
+
+    assert settings.target_groups == dict.fromkeys(POOLS, target_group)
+    assert settings.pool_secrets == dict.fromkeys(POOLS, secret)
+    tables = (settings.keys_table, settings.usage_table, settings.heartbeat_table, settings.pool_state_table)
+    assert (*tables, settings.scaler_function) == tuple(list(given.values())[2:])
+    assert read_settings({**FULL, "RHI_SCALER_FUNCTION": "f" * 64}).scaler_function == "f" * 64
 
 
 def test_a_refused_pool_field_is_named_from_the_fixed_list_only() -> None:
