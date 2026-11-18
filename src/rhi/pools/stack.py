@@ -5,6 +5,11 @@ complete (system design, sections 2, 4.2, 4.3 and 5).
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
 reference it back. The stack and the logical IDs of its tables are recorded in
 `tests/policy/stateful_logical_ids.json`: moving a table to another stack replaces it.
+
+The stack declares one output, `ReleaseParameters`: each pool's name with the name of its release
+parameter, which the pipeline's verification takes as an input (`rhi.pipeline.verify`). It is
+written as `release_parameters_text` writes it, without a quote: CodePipeline puts an output's
+value into the JSON of an action's configuration as it is.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from typing import TYPE_CHECKING
 import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 
-from rhi.pools.group import PoolGroup
+from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
 from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
@@ -24,11 +29,26 @@ from rhi.pools.secret import PoolSecret
 from rhi.pools.tables import PoolTables
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from constructs import Construct
 
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
     from rhi.observability.stack import ObservabilityStack
+
+# What separates two pools in the output of the release parameters, and a pool's name from its
+# parameter's. Neither is a character of a pool's name or of a parameter's.
+POOL_SEPARATOR = ","
+NAME_SEPARATOR = "="
+# What the output reads for no pool: an output has a value.
+NO_POOL = "none"
+
+
+def release_parameters_text(parameters: Mapping[str, str]) -> str:
+    """Each pool's name and the name of its release parameter, as one text:
+    `mock=/rhi/pools/mock/release` for one pool, a comma between two, and `NO_POOL` for no pool."""
+    return POOL_SEPARATOR.join(f"{pool}{NAME_SEPARATOR}{name}" for pool, name in parameters.items()) or NO_POOL
 
 
 class PoolsStack(cdk.Stack):
@@ -42,8 +62,10 @@ class PoolsStack(cdk.Stack):
     `groups[name]`, the scaler, from
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke,
     each pool's release, from `releases[name]`: its engine image, its release parameter and the
-    instance refresh that a change to the release starts, and each pool's lifecycle hooks, from
-    `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`)."""
+    instance refresh that a change to the release starts, each pool's lifecycle hooks, from
+    `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`), and the name of each pool's
+    release parameter, from `release_parameters[name]` and, all of them, as the output
+    `release_parameters_output`."""
 
     def __init__(
         self,
@@ -131,6 +153,15 @@ class PoolsStack(cdk.Stack):
                 )
                 for pool in config.pools
             }
+        # The name of each pool's release parameter, by the pool's name, as text: a stack that does
+        # not hold the parameter, the pipeline's, names it so. The output holds the same names.
+        self.release_parameters = {name: release_parameter(name) for name in self.releases}
+        self.release_parameters_output = cdk.CfnOutput(
+            self,
+            "ReleaseParameters",
+            description="Each pool's name and the name of its release parameter.",
+            value=release_parameters_text(self.release_parameters),
+        )
         # One launch hook and one termination hook per pool, by the pool's name. They come last among
         # a pool's pieces: with them, an instance enters service only when its agent completes the
         # launch hook, which takes the role, the secret and the release above.
