@@ -56,7 +56,12 @@ Rules hold those two, and every action:
   the action is in: the workspaces of the deploying account and region, under the condition that
   names the tag `rhi-stage` and a value that a workspace of a stack that stage deploys carries,
   and no workspace of any other template; read the release parameters, `/rhi/pools/<pool>/release`,
-  that the stacks that stage deploys hold, each by its name; and write objects under
+  that the stacks that stage deploys hold, each by its name; read by pool, with `dynamodb:Query`
+  and no other action, the items of the stage's heartbeats table and of no other table: the table
+  of a stack that stage deploys whose name the action is given in `RHI_VERIFY_HEARTBEATS_TABLE`,
+  as an output of that stack, named as CloudFormation names a table that has no name of its own,
+  the stack's name, a hyphen, the table's logical ID, a hyphen and a wildcard for the suffix it
+  generates, in the deploying account and region (section 8.4); and write objects under
   `verification/` of the pipeline's artifact bucket. Beside those it holds what CDK Pipelines gives
   every project: a read of the artifact bucket, and its own log group and report groups. Nothing
   else: every action it is allowed is one of `VERIFICATION_MAY`, each on resources of its kind
@@ -199,18 +204,22 @@ REPORTER_READS = {
 MARKS = "marks"
 LISTS_THE_MARKS = {"StringLike": {"s3:prefix": "verification/*"}}
 # The verification: the name of its action, the canary's secret, the prefix it writes under, the tag
-# its stage's workspace is named by, the name of a pool's release parameter, and the actions its
-# role may be allowed, each with the kind of resource it may be allowed on. The last three groups
-# are what CDK Pipelines gives every project of the pipeline.
+# its stage's workspace is named by, the name of a pool's release parameter, the variable that names
+# its stage's heartbeats table to it, as an output of a deployed stack, and the actions its role
+# may be allowed, each with the kind of resource it may be allowed on. The last three groups are
+# what CDK Pipelines gives every project of the pipeline.
 VERIFY_ACTION = "Verify"
 CANARY_SECRET = "rhi/canary-key"
 VERIFICATION_PREFIX = "verification"
 STAGE_TAG = "rhi-stage"
 RELEASE_PARAMETER = re.compile(r"/rhi/pools/[a-z0-9-]+/release")
+HEARTBEATS_TABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
+STACK_OUTPUT = re.compile(r"#\{(\w+)\.(\w+)\}")
 VERIFICATION_MAY = {
     "secretsmanager:GetSecretValue": "secret",
     "aps:QueryMetrics": "workspaces",
     "ssm:GetParameter": "parameters",
+    "dynamodb:Query": "heartbeats",
     "s3:PutObject": "verification",
     "s3:GetBucket*": "artifacts",
     "s3:GetObject*": "artifacts",
@@ -260,7 +269,7 @@ REPORTS_MORE = (
 )
 VERIFIES_MORE = (
     "a verification's role that may do more than read the canary's secret, query its stage's workspace,"
-    " read its stage's release parameters and write under verification/"
+    " read its stage's release parameters, query its stage's heartbeats table and write under verification/"
 )
 SECRET_ELSEWHERE = "a role other than the reporter function's that may read the reporter's secret"
 MEASURES_AND_READS = "a role that may put events on the measurement bus and read the reporter's secret"
@@ -731,6 +740,38 @@ def workspace_tags(template: Mapping[str, Any]) -> set[str]:
     }
 
 
+def heartbeat_tables(templates: Templates, actions: list[dict[str, Any]]) -> list[str]:
+    """The heartbeats tables that the verifications of a stage are told of, each as the pattern of
+    the name CloudFormation gives it: the stack's name, a hyphen, the table's logical ID, a hyphen
+    and a wildcard for the generated suffix. A table is one when an action named `Verify` of the
+    stage is given, in `HEARTBEATS_TABLE`, an output of a stack that the stage deploys, and that
+    output is a reference to a DynamoDB table of the stack's template that has no name of its own."""
+    found = []
+    deployments = [action for action in actions if type_of(action) == CLOUDFORMATION]
+    for action in actions:
+        if action["Name"] != VERIFY_ACTION or type_of(action) != CODEBUILD:
+            continue
+        variables = action.get("Configuration", {}).get("EnvironmentVariables")
+        for variable in json.loads(variables) if isinstance(variables, str) else []:
+            output = STACK_OUTPUT.fullmatch(str(variable.get("value")))
+            if variable.get("name") != HEARTBEATS_TABLE or output is None:
+                continue
+            # The action that executes a stack's change set carries the namespace of its outputs, and
+            # the one that prepares the change set names the stack's template.
+            for stack in sorted(
+                {d["Configuration"]["StackName"] for d in deployments if d.get("Namespace") == output[1]}, key=str
+            ):
+                of_the_stack = [d for d in deployments if d["Configuration"]["StackName"] == stack]
+                for template in deployed_by(of_the_stack, templates):
+                    value = template.get("Outputs", {}).get(output[2], {}).get("Value")
+                    table = value.get("Ref") if isinstance(value, dict) and list(value) == ["Ref"] else None
+                    held = template.get("Resources", {}).get(table, {}) if isinstance(table, str) else {}
+                    unnamed = "TableName" not in held.get("Properties", {})
+                    if isinstance(stack, str) and held.get("Type") == "AWS::DynamoDB::Table" and unnamed:
+                        found.append(f"{stack}-{table}-*")
+    return found
+
+
 def verification_resources(
     templates: Templates,
     actions: list[dict[str, Any]],
@@ -739,7 +780,8 @@ def verification_resources(
 ) -> tuple[dict[str, list[re.Pattern[str]]], set[str]]:
     """For each kind of resource of `VERIFICATION_MAY`, what the role of the verification of a
     stage may name, as `arn_text` writes it: the canary's secret, every workspace of the deploying
-    account and region, the release parameters the stage's stacks hold, the objects under
+    account and region, the release parameters the stage's stacks hold, the heartbeats table the
+    stage's verification is told of (`heartbeat_tables`), the objects under
     `verification/` of the pipeline's artifact bucket, that bucket and its objects, and the
     project's own log group and report groups. With them, the values of the tag `rhi-stage` that
     name the stage's workspace: those a workspace of a stack the stage deploys carries, and no
@@ -766,6 +808,10 @@ def verification_resources(
         "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(CANARY_SECRET)}-\?{{6}}")],
         "workspaces": [re.compile(rf"{PARTITION}:aps:{HERE}:workspace/\*")],
         "parameters": [re.compile(rf"{PARTITION}:ssm:{HERE}:parameter{re.escape(name)}") for name in parameters],
+        "heartbeats": [
+            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}")
+            for name in heartbeat_tables(templates, actions)
+        ],
         "verification": [re.compile(rf"\$\{{{store}\.Arn\}}/{VERIFICATION_PREFIX}/\*") for store in stores],
         "artifacts": [re.compile(rf"\$\{{{store}\.Arn\}}(/\*)?") for store in stores],
         "logs": [re.compile(rf"{PARTITION}:logs:{HERE}:log-group:/aws/codebuild/{own}(:\*)?")],
@@ -925,8 +971,9 @@ def built(
     - one more stack in the stage, with a file asset and a role under the boundary of the name
       given or, when the name is empty, under none;
     - a verification: a CodeBuild step named `Verify` after the stage's deployment, and in the
-      stage's stack what it reads, a workspace tagged with the stage's name and the release
-      parameter of the pool `mock`. Its role holds what CDK Pipelines gives it, until `change`;
+      stage's stack what it reads, a workspace tagged with the stage's name, the release
+      parameter of the pool `mock` and the table `Heartbeats`, whose name the stack declares as
+      an output that the step is given. Its role holds what CDK Pipelines gives it, until `change`;
     - anything `change` does to the pipeline's stack and to the pipeline once it is built.
     """
     pipelines, iam = cdk.pipelines, cdk.aws_iam
@@ -955,9 +1002,21 @@ def built(
     endpoint = cdk.Stack(stage, "Endpoint")
     bounded(endpoint, boundary)
     iam.Role(endpoint, "Role", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"))
+    told: dict[str, Any] = {}
     if verification:
         cdk.aws_aps.CfnWorkspace(endpoint, "Workspace", tags=[cdk.CfnTag(key=STAGE_TAG, value="Rhi")])
         cdk.aws_ssm.StringParameter(endpoint, "Release", parameter_name="/rhi/pools/mock/release", string_value="{}")
+        dynamodb = cdk.aws_dynamodb
+        table = dynamodb.CfnTable(
+            endpoint,
+            "Heartbeats",
+            key_schema=[dynamodb.CfnTable.KeySchemaProperty(attribute_name="pool", key_type="HASH")],
+            attribute_definitions=[
+                dynamodb.CfnTable.AttributeDefinitionProperty(attribute_name="pool", attribute_type="S")
+            ],
+            billing_mode="PAY_PER_REQUEST",
+        )
+        told = {HEARTBEATS_TABLE: cdk.CfnOutput(endpoint, "HeartbeatsTable", value=table.ref)}
     if stack_with_an_asset is not None:
         other = cdk.Stack(stage, "Other")
         (folder / "asset.txt").write_text("An asset.\n", encoding="utf-8")
@@ -973,7 +1032,9 @@ def built(
         gate = [pipelines.ConfirmPermissionsBroadening("Check", stage=stage)]
     more = [pipelines.ShellStep(step[0], commands=step[1])] if step is not None else []
     last = approval == "last"
-    verify = [pipelines.CodeBuildStep(VERIFY_ACTION, commands=["true"])] if verification else []
+    verify = (
+        [pipelines.CodeBuildStep(VERIFY_ACTION, commands=["true"], env_from_cfn_outputs=told)] if verification else []
+    )
     pipeline.add_stage(stage, pre=more if last else gate + more, post=(gate if last else []) + verify)
     pipeline.build_pipeline()
     if change is not None:
@@ -1468,6 +1529,21 @@ def test_the_verification_s_role_is_the_one_held(templates: dict[str, dict[str, 
     assert role is not None
     allowed, tags = verification_resources(templates, actions, pipeline, project)
     assert tags == {"Rhi"} and allowed["parameters"] and allowed["verification"]
+    # And so is the heartbeats table it is told of, the one table its role may query: the pools
+    # stack's, by the logical ID recorded for it, and no other action of DynamoDB.
+    recorded = json.loads((Path(__file__).resolve().parent / "stateful_logical_ids.json").read_text(encoding="utf-8"))
+    (table,) = heartbeat_tables(templates, actions)
+    assert table in {f"{stack}-{logical_id}-*" for stack, ids in recorded.items() for logical_id in ids}
+    (template,) = [template for template in templates.values() if role in template["Resources"]]
+    queries = [
+        statement
+        for statement in statements_of(template, role) or []
+        if any(str(action).lower().startswith("dynamodb:") for action in as_list(statement.get("Action")))
+    ]
+    (heartbeats,) = allowed["heartbeats"]
+    assert [(s["Action"], heartbeats.fullmatch(arn_text(s["Resource"]) or "") is not None) for s in queries] == [
+        ("dynamodb:Query", True)
+    ]
 
 
 def the_workspaces(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
@@ -1477,6 +1553,13 @@ def the_workspaces(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
 def the_parameter(name: str) -> Names:
     def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
         return stack.format_arn(service="ssm", resource="parameter", resource_name=name)
+
+    return arn
+
+
+def the_table(name: str) -> Names:
+    def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        return stack.format_arn(service="dynamodb", resource="table", resource_name=name)
 
     return arn
 
@@ -1499,11 +1582,15 @@ def tagged(stage: str) -> dict[str, Any]:
 
 # One more statement of a verification's role: its action, what it names and its condition.
 More = tuple[str, "Names", "dict[str, Any] | None"]
+# The heartbeats table of the stage of `built`, as CloudFormation names it: the stage deploys the
+# stack `Rhi-Endpoint`, which holds the table under the logical ID `Heartbeats`.
+HEARTBEATS = "Rhi-Endpoint-Heartbeats-*"
 # The narrow role: what the verification of the stage of `built` reads and writes.
 VERIFIES: list[More] = [
     ("secretsmanager:GetSecretValue", the_secret(f"{CANARY_SECRET}-??????"), None),
     ("aps:QueryMetrics", the_workspaces, tagged("Rhi")),
     ("ssm:GetParameter", the_parameter("rhi/pools/mock/release"), None),
+    ("dynamodb:Query", the_table(HEARTBEATS), None),
     ("s3:PutObject", under(VERIFICATION_PREFIX), None),
 ]
 
@@ -1578,6 +1665,25 @@ def test_keeps_a_verification_with_the_narrow_role(cdk: ModuleType, tmp_path: Pa
         ),
         pytest.param(
             a_verification(("ssm:GetParameter", the_parameter("rhi/config/domain"), None)), id="another parameter"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table("Rhi-Endpoint-Other-*"), None)),
+            id="another table of the stage",
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table("Rhi-Endpoint-Heartbeats*"), None)),
+            id="every table whose logical ID starts as the heartbeats table's",
+        ),
+        pytest.param(a_verification(("dynamodb:Query", the_table("*"), None)), id="every table"),
+        pytest.param(
+            a_verification(("dynamodb:Scan", the_table(HEARTBEATS), None)), id="a scan of the heartbeats table"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:PutItem", the_table(HEARTBEATS), None)), id="a write to the heartbeats table"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table(f"{HEARTBEATS}/index/*"), None)),
+            id="the indexes of the heartbeats table",
         ),
         pytest.param(a_verification(("s3:PutObject", the_artifacts, None)), id="a write outside verification/"),
         pytest.param(

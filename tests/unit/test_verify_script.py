@@ -1,10 +1,12 @@
 """The verification script (scripts/pipeline/verify.py): with no listener or no canary key it runs
 no test, exits 0 and leaves its reason; with a key it runs the smoke tests, all but those that
 must reach the internal load balancer, a failed test is a non-zero exit and leaves its ID, and
-what the tests print reaches the log without the key.
+what the tests print reaches the log without the key. After a failed run it leaves the last
+lifecycle stage each instance of the tested pools reached, and nothing else of a heartbeat's row.
 
-A stand-in for the Secrets Manager client replaces AWS. The tests that pytest really collects and
-runs do so in a process of their own, as the script starts one, and reach no stack.
+A stand-in for the Secrets Manager client replaces AWS, and moto holds the heartbeats table in
+process: no account, no credentials, no network. The tests that pytest really collects and runs do
+so in a process of their own, as the script starts one, and reach no stack.
 """
 
 from __future__ import annotations
@@ -12,18 +14,23 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
+from moto import mock_aws
 
 import verify
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat
+from rhi_common.tables import HEARTBEATS
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 REPO = Path(__file__).resolve().parents[2]
 SMOKE_TEST_IDS: tuple[str, ...] = runpy.run_path(str(REPO / "tests/smoke/ids.py"))["SMOKE_TEST_IDS"]
@@ -134,6 +141,103 @@ def test_with_a_key_the_tests_run_with_it_and_their_exit_is_the_script_s(
 
 def test_no_pool_is_no_release_parameter() -> None:
     assert verify.release_parameters("none") == {}
+
+
+TABLE = "heartbeats-under-test"
+
+
+@pytest.fixture
+def heartbeats() -> Iterator[Any]:
+    """A DynamoDB client, in moto, of a region that holds the heartbeats table with the key schema
+    of `rhi_common.tables.HEARTBEATS`, and no row."""
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name="us-east-1")
+        keys = [(HEARTBEATS.partition_key, "HASH"), (HEARTBEATS.sort_key, "RANGE")]
+        client.create_table(
+            TableName=TABLE,
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[
+                {"AttributeName": key.name, "AttributeType": key.type.value} for key, _ in keys if key is not None
+            ],
+            KeySchema=[{"AttributeName": key.name, "KeyType": kind} for key, kind in keys if key is not None],
+        )
+        yield client
+
+
+def instance_row(pool: str, stage: str) -> tuple[str, dict[str, Any]]:
+    """An instance's heartbeat as its lifecycle agent writes it, with the stage it has reached: the
+    instance's ID, drawn now, and the row's item."""
+    instance = f"instance-{secrets.token_hex(8)}"
+    release = {"image_digest": f"sha256:{secrets.token_hex(32)}", "model_revision": secrets.token_hex(20)}
+    row = InstanceHeartbeat(instance=instance, pool=pool, running=0, waiting=0, stage=stage, written_at=1, **release)
+    return instance, row.to_item()
+
+
+def failed_run(tmp_path: Path, dynamodb: Any, exit_code: int = 1) -> tuple[int, str | None]:
+    """The script's exit after a run of the tests of the pools `mock` and `gpu` that ends in
+    `exit_code`, and what it left as the instances' last stages, None for no file."""
+    left = tmp_path / "build" / "last-stages"
+    environ = {
+        verify.ENDPOINT_VARIABLE: ENDPOINT,
+        verify.RELEASE_PARAMETERS_VARIABLE: "mock=/rhi/pools/mock/release,gpu=/rhi/pools/gpu/release",
+        verify.HEARTBEATS_TABLE_VARIABLE: TABLE,
+        verify.LAST_STAGES_FILE_VARIABLE: str(left),
+    }
+    exited = verify.main(environ, client=Secrets(a_key()), run=Run(exit_code), dynamodb=dynamodb)
+    return exited, left.read_text(encoding="utf-8") if left.exists() else None
+
+
+def test_a_failed_run_leaves_the_last_stage_of_each_instance_of_the_tested_pools_and_nothing_else(
+    tmp_path: Path, heartbeats: Any
+) -> None:
+    table = boto3.resource("dynamodb", region_name="us-east-1").Table(TABLE)
+    # Two pools the step tested, with an instance that never served, one that serves and a gateway
+    # task's own heartbeat, and a pool it did not test.
+    rows = [instance_row("mock", "weights"), instance_row("mock", "serving"), instance_row("gpu", "release-check")]
+    untested = instance_row("other", "boot")
+    for _, item in [*rows, untested]:
+        table.put_item(Item=item)
+    task = GatewayHeartbeat(task="task-1", pool="mock", in_flight=1, held=0, last_request_at=None, written_at=1)
+    table.put_item(Item=task.to_item())
+
+    exit_code, left = failed_run(tmp_path, heartbeats)
+
+    # The tests' exit is the script's, and each line is a stage: no instance, no release, no pool.
+    assert exit_code == 1 and left is not None and left.endswith("\n")
+    assert sorted(left.splitlines()) == ["release-check", "serving", "weights"]
+    # A table read a page at a time gives the same lines.
+    assert sorted((failed_run(tmp_path, OneRowAPage(heartbeats))[1] or "").splitlines()) == sorted(left.splitlines())
+
+
+class OneRowAPage:
+    """A DynamoDB client that answers a query one row at a time, as DynamoDB pages a long answer."""
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def query(self, **request: Any) -> dict[str, Any]:
+        return self.client.query(**request, Limit=1)
+
+
+def test_a_run_that_passed_or_a_pool_with_no_instance_leaves_no_last_stage(tmp_path: Path, heartbeats: Any) -> None:
+    # No instance's row: a failed run has no stage to leave.
+    assert failed_run(tmp_path, heartbeats) == (1, None)
+    boto3.resource("dynamodb", region_name="us-east-1").Table(TABLE).put_item(Item=instance_row("mock", "weights")[1])
+    # A run whose tests passed does not read the table.
+    assert failed_run(tmp_path, None, exit_code=0) == (0, None)
+    assert failed_run(tmp_path, heartbeats) == (1, "weights\n")
+
+
+def test_a_table_that_cannot_be_read_leaves_the_tests_exit_as_it_is(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Refuses:
+        def query(self, **_request: Any) -> dict[str, Any]:
+            raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "said by AWS"}}, "Query")
+
+    assert failed_run(tmp_path, Refuses(), exit_code=2) == (2, None)
+    printed = capsys.readouterr().err
+    assert "last stages were not read" in printed and "said by AWS" not in printed
 
 
 # A plugin of the collection below: it writes, as JSON, the IDs of the tests that were deselected

@@ -34,6 +34,16 @@ cut short still leaves those it had. No failed test leaves no file. The step's p
 which runs after a failed build too, copies the file to where the reporter reads which tests
 failed.
 
+**Where the instances stopped.** When the run of the tests fails, the script reads the heartbeat
+rows of the instances of each pool it tested, the pools `RHI_VERIFY_RELEASE_PARAMETERS` names, from
+the table `RHI_VERIFY_HEARTBEATS_TABLE` names, and leaves the last lifecycle stage each instance
+reached as one line of the file `RHI_VERIFY_LAST_STAGES_FILE` names: the row's `stage`, and nothing
+else of a row, neither the instance's ID nor its release. It asks DynamoDB for that one attribute.
+A launch names a stage of `rhi_lifecycle.stages` there, and an instance in service the serving
+module's own name. No row, or no table named, leaves no file, and so does a table that cannot be
+read, after a line in the log: the exit stays the tests'. The post-build phase copies the file to
+where the reporter reads it, and the reporter names only the stages of its own list.
+
 What the step gives, in the environment:
 
 | Variable | Holds |
@@ -43,6 +53,8 @@ What the step gives, in the environment:
 | `RHI_VERIFY_RELEASE_PARAMETERS` | Each pool and its release parameter: `pool=name`, comma-separated, or `none` |
 | `RHI_VERIFY_REASON_FILE` | The file the reason is left in |
 | `RHI_VERIFY_FAILED_TESTS_FILE` | The file the IDs of the failed tests are left in |
+| `RHI_VERIFY_HEARTBEATS_TABLE` | The name of the heartbeats table of the stage |
+| `RHI_VERIFY_LAST_STAGES_FILE` | The file the instances' last stages are left in |
 
 The pools' parameters come from a stack's output through the pipeline, which puts the value into
 JSON as it is, so they arrive without a quote; the smoke tests read them as JSON, in
@@ -65,10 +77,10 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     import pytest
 
@@ -85,6 +97,18 @@ SMOKE_RELEASE_PARAMETERS_VARIABLE = "RHI_SMOKE_RELEASE_PARAMETERS"
 RELEASE_PARAMETERS_VARIABLE = "RHI_VERIFY_RELEASE_PARAMETERS"
 REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
 FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
+HEARTBEATS_TABLE_VARIABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
+LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
+
+# The heartbeats table as far as the script reads it: its partition key, its sort key, what comes
+# before an instance's ID in the sort key, and the attribute that holds the last stage the
+# instance reached (`rhi_common.tables`, `rhi_common.records`; the script imports neither).
+POOL_ATTRIBUTE = "pool"
+SOURCE_ATTRIBUTE = "source"
+INSTANCE_SOURCE = "instance#"
+STAGE_ATTRIBUTE = "stage"
+# At most this many pages of a pool's rows are read.
+ROW_PAGES = 10
 
 # What the endpoint's output reads while there is no HTTPS listener (`rhi.gateway.stack`), and the
 # pools' output while there is no pool (`rhi.pools.stack`).
@@ -167,6 +191,58 @@ def release_parameters(text: str) -> dict[str, str]:
     return dict(pair.split("=", 1) for pair in text.split(","))
 
 
+def last_stages(client: Any, table: str, pools: Iterable[str]) -> list[str]:
+    """The last lifecycle stage each instance of `pools` reached: the `stage` of each instance's row
+    of the heartbeats table `table`, read by pool with `client`, a DynamoDB client of the AWS SDK.
+    Only that attribute is asked for, and a row whose stage is not one line of text gives none."""
+    found: list[str] = []
+    for pool in pools:
+        request: dict[str, Any] = {
+            "TableName": table,
+            "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
+            "ProjectionExpression": "#stage",
+            "ExpressionAttributeNames": {
+                "#pool": POOL_ATTRIBUTE,
+                "#source": SOURCE_ATTRIBUTE,
+                "#stage": STAGE_ATTRIBUTE,
+            },
+            "ExpressionAttributeValues": {":pool": {"S": pool}, ":instance": {"S": INSTANCE_SOURCE}},
+        }
+        for _ in range(ROW_PAGES):
+            answer = client.query(**request)
+            stages = [item.get(STAGE_ATTRIBUTE, {}).get("S") for item in answer.get("Items", [])]
+            found += [stage for stage in stages if isinstance(stage, str) and stage.splitlines() == [stage]]
+            if "LastEvaluatedKey" not in answer:
+                break
+            request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
+    return found
+
+
+def leave_last_stages(env: Mapping[str, str], pools: Iterable[str], client: Any = None) -> None:
+    """After a run of the tests that failed: leaves the last stage each instance of `pools` reached,
+    one per line and nothing else, in the file `RHI_VERIFY_LAST_STAGES_FILE` names, for the step's
+    post-build phase. Without the table's name, the file's or a row, it leaves no file. A table
+    that cannot be read is a line in the log and no file: the tests' exit is the script's."""
+    table, named = env.get(HEARTBEATS_TABLE_VARIABLE), env.get(LAST_STAGES_FILE_VARIABLE)
+    pools = list(pools)
+    if not table or not named or not pools:
+        return
+    try:
+        if client is None:
+            import boto3
+
+            client = boto3.client("dynamodb")
+        stages = last_stages(client, table, pools)
+    except (BotoCoreError, ClientError) as error:
+        print(f"{NAME}: the instances' last stages were not read ({type(error).__name__})", file=sys.stderr)
+        return
+    if not stages:
+        return
+    path = Path(named)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{stage}\n" for stage in stages), encoding="utf-8")
+
+
 def without(secret: str) -> Callable[[str], str]:
     """What rewrites a line of text with `REDACTED` in place of `secret` and of every piece of it
     `PIECE` characters long or longer."""
@@ -228,10 +304,13 @@ def main(
     environ: Mapping[str, str] | None = None,
     client: Any = None,
     run: Callable[[Mapping[str, str]], int] = run_tests,
+    dynamodb: Any = None,
 ) -> int:
     """Verifies the deployment the environment names; 0 when every test passed or none could run.
-    `client` is a Secrets Manager client of the AWS SDK; without one, the build's own credentials
-    and region make it. `run` runs the smoke tests in the environment it is given."""
+    `client` is a Secrets Manager client of the AWS SDK and `dynamodb` a DynamoDB one; without one,
+    the build's own credentials and region make it. `run` runs the smoke tests in the environment
+    it is given. When that run fails, the last stage each instance of the tested pools reached is
+    left for the step's post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
     if not endpoint:
@@ -247,8 +326,11 @@ def main(
     key = canary_key(client)
     if key is None:
         return not_run(CANARY_MISSING, env)
-    parameters = json.dumps(release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, "")))
-    return run({**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: parameters})
+    pools = release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, ""))
+    exit_code = run({**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)})
+    if exit_code != 0:
+        leave_last_stages(env, pools, dynamodb)
+    return exit_code
 
 
 if __name__ == "__main__":

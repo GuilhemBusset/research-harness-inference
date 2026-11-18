@@ -1,10 +1,12 @@
 """The pipeline's verification step (src/rhi/pipeline/verify.py; system design, section 8.2, step
 6): the action named Verify, after the stage's deployment, which runs the verification script and
 builds no image; a post-build phase that copies the script's reason, when there is one, to the
-key verification/<execution ID>/not-run of the artifact bucket, and the IDs of the smoke tests
-that failed to failed-smoke-tests beside it; inputs that are outputs of the
-stage's stacks and the execution's ID; and a role that reads the canary's secret, queries the
-stage's workspace, reads the stage's pools' release parameters and writes under verification/.
+key verification/<execution ID>/not-run of the artifact bucket, the IDs of the smoke tests
+that failed to failed-smoke-tests beside it, and the last lifecycle stage each instance reached to
+last-stages; inputs that are outputs of the stage's stacks and the execution's ID; and a role that
+reads the canary's secret, queries the stage's workspace, reads the stage's pools' release
+parameters, queries the stage's heartbeats table, and that one table, and writes under
+verification/.
 
 The tests read the app's own pipeline, the one that is deployed. Two of them also build the app
 from a changed configuration, with no listener and with no pool.
@@ -12,6 +14,7 @@ from a changed configuration, with no listener and with no pool.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 import shutil
@@ -99,6 +102,14 @@ class Verification:
     def given_by_the_project(self) -> dict[str, Any]:
         return {entry["Name"]: entry["Value"] for entry in self.project["Environment"]["EnvironmentVariables"]}
 
+    def stacks(self) -> dict[str, dict[str, Any]]:
+        """The template of each stack the stage's actions deploy, by the name they deploy it under."""
+        return {
+            a["Configuration"]["StackName"]: self.templates[a["Configuration"]["TemplatePath"].partition("::")[2]]
+            for a in self.deployments()
+            if "TemplatePath" in a["Configuration"]
+        }
+
     def output(self, variable: str) -> tuple[str, Any, dict[str, Any]]:
         """The stack output a variable of the action reads: the stack's name as the pipeline
         deploys it, the output's value and the template that declares it."""
@@ -157,9 +168,10 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
     (store,) = [verification.pipeline["ArtifactStore"]["Location"]]
     (bucket,) = [name for name, value in by_project.items() if value == store]
     reason_file, failed_file = script.REASON_FILE_VARIABLE, script.FAILED_TESTS_FILE_VARIABLE
-    # The files the step names are two, outside the checkout, which CodeBuild places under its own folder.
-    assert by_project[reason_file] != by_project[failed_file]
-    for file in (reason_file, failed_file):
+    stages_file = script.LAST_STAGES_FILE_VARIABLE
+    # The files the step names are three, outside the checkout, which CodeBuild places under its own folder.
+    assert len({by_project[reason_file], by_project[failed_file], by_project[stages_file]}) == 3
+    for file in (reason_file, failed_file, stages_file):
         assert Path(by_project[file]).is_absolute() and not by_project[file].startswith("/codebuild")
 
     # The AWS CLI, as far as the phase uses it: `aws s3 cp <file> s3://<bucket>/<key>`, into a folder.
@@ -173,14 +185,15 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
     (tools / "aws").chmod(0o755)
 
     def post_build(
-        reason: str | None, *, failed: str | None = None, refuses: bool = False
+        reason: str | None, *, failed: str | None = None, stages: str | None = None, refuses: bool = False
     ) -> tuple[int, dict[str, str]]:
-        """Runs the phase for the execution `an-execution`, after a script that left `reason`
-        and the failed tests `failed`: its exit, and the objects of the buckets."""
+        """Runs the phase for the execution `an-execution`, after a script that left `reason`,
+        the failed tests `failed` and the instances' last stages `stages`: its exit, and the
+        objects of the buckets."""
         shutil.rmtree(buckets, ignore_errors=True)
         folder = tmp_path / "left"
         folder.mkdir(exist_ok=True)
-        for name, held in (("reason", reason), ("failed", failed)):
+        for name, held in (("reason", reason), ("failed", failed), ("stages", stages)):
             (folder / name).unlink(missing_ok=True)
             if held is not None:
                 (folder / name).write_text(held, encoding="utf-8")
@@ -190,6 +203,7 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
             "REFUSES": "yes" if refuses else "",
             reason_file: str(folder / "reason"),
             failed_file: str(folder / "failed"),
+            stages_file: str(folder / "stages"),
             bucket: "artifacts",
             execution: "an-execution",
         }
@@ -215,6 +229,14 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
         0,
         {"artifacts/verification/an-execution/failed-smoke-tests": "hello\nno-key\n"},
     )
+    # And, after tests that failed, the last stage each instance reached, as the script left them.
+    assert post_build(None, failed="hello\n", stages="weights\nboot\n") == (
+        0,
+        {
+            "artifacts/verification/an-execution/failed-smoke-tests": "hello\n",
+            "artifacts/verification/an-execution/last-stages": "weights\nboot\n",
+        },
+    )
 
 
 def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(verification: Verification) -> None:
@@ -225,6 +247,7 @@ def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(ver
         script.ENDPOINT_VARIABLE,
         "RHI_SMOKE_WORKSPACE_URL",
         script.RELEASE_PARAMETERS_VARIABLE,
+        script.HEARTBEATS_TABLE_VARIABLE,
     }
 
     # The endpoint is the output of the stack that holds the gateway's service, which the pipeline
@@ -256,6 +279,17 @@ def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(ver
     # CodePipeline writes an output's value into the JSON of the action's configuration as it is.
     assert '"' not in value and "\\" not in value
 
+    # The heartbeats table's name, which the deployment generates: the pools stack's output of the
+    # table whose rows are kept by pool and by source, as the script reads them.
+    stack, value, template = verification.output(script.HEARTBEATS_TABLE_VARIABLE)
+    assert stack == f"{STAGE}-Pools"
+    table = template["Resources"][value["Ref"]]
+    assert table["Type"] == "AWS::DynamoDB::Table"
+    assert [key["AttributeName"] for key in table["Properties"]["KeySchema"]] == [
+        script.POOL_ATTRIBUTE,
+        script.SOURCE_ATTRIBUTE,
+    ]
+
 
 def test_the_role_reads_one_secret_and_writes_under_verification_only(verification: Verification) -> None:
     (secret,) = verification.allowed("secretsmanager")
@@ -272,9 +306,9 @@ def test_the_role_reads_one_secret_and_writes_under_verification_only(verificati
     assert write["Action"] == "s3:PutObject"
     assert text(write["Resource"]) == f"<{store}.Arn>/verification/*"
 
-    # Beside the four grants, only CodeBuild's own: the project's logs and test reports.
+    # Beside the five grants, only CodeBuild's own: the project's logs and test reports.
     services = {action.partition(":")[0] for s in verification.statements for action in as_list(s["Action"])}
-    assert services == {"secretsmanager", "s3", "aps", "ssm", "logs", "codebuild"}
+    assert services == {"secretsmanager", "s3", "aps", "ssm", "dynamodb", "logs", "codebuild"}
     assert all(statement["Effect"] == "Allow" for statement in verification.statements)
 
 
@@ -306,6 +340,45 @@ def test_the_role_queries_the_stage_s_workspace_and_reads_the_stage_s_release_pa
     assert sorted(text(r) for r in as_list(read["Resource"])) == sorted(
         f"arn:<>:ssm:<>:<>:parameter{name}" for name in given.values()
     )
+
+
+def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None:
+    # One statement on DynamoDB: a query, which reads a table's items by their partition key, the pool.
+    (query,) = verification.allowed("dynamodb")
+    assert query["Action"] == "dynamodb:Query"
+    (resource,) = as_list(query["Resource"])
+
+    # The table the step is given the name of, under its logical ID in the synthesized pools
+    # template: the role names it as CloudFormation names a table that has no name of its own, the
+    # stack's name, a hyphen, the logical ID, a hyphen and, for the generated suffix, a wildcard,
+    # in the partition, region and account of the pipeline's own stack.
+    stack, value, template = verification.output(script.HEARTBEATS_TABLE_VARIABLE)
+    heartbeats = value["Ref"]
+    assert stack == f"{STAGE}-Pools" and template is verification.stacks()[stack]
+    assert "TableName" not in template["Resources"][heartbeats]["Properties"]
+    assert text(resource) == f"arn:<>:dynamodb:<>:<>:table/{stack}-{heartbeats}-*"
+    assert resource["Fn::Join"][1][1::2] == [
+        {"Ref": "AWS::Partition"},
+        {"Ref": "AWS::Region"},
+        {"Ref": "AWS::AccountId"},
+    ]
+
+    def matches(stack: str, logical_id: str) -> bool:
+        """Whether the role's pattern matches the name CloudFormation would give that table."""
+        name, pattern = f"{stack}-{logical_id}-1A2B3C4D5E6F7", text(resource).partition(":table/")[2]
+        return fnmatch.fnmatchcase(name, pattern)
+
+    # A logical ID holds no hyphen, so the pattern ends where the table's own name does: it matches
+    # the heartbeats table, and no other table of any template the stage deploys.
+    tables = [
+        (name, logical_id)
+        for name, deployed in verification.stacks().items()
+        for logical_id, held in deployed["Resources"].items()
+        if held["Type"].startswith("AWS::DynamoDB::")
+    ]
+    assert all("-" not in logical_id for _, logical_id in tables)
+    assert [table for table in tables if matches(*table)] == [(stack, heartbeats)]
+    assert {name for name, _ in tables} > {stack} and len([name for name, _ in tables if name == stack]) > 1
 
 
 def build(app_module: ModuleType, outdir: Path, change: Callable[[dict[str, Any]], None]) -> Verification:

@@ -258,15 +258,29 @@ def stub(commit: str, monkeypatch: pytest.MonkeyPatch) -> Stub:
     return Stub(str(uuid.uuid4()), commit)
 
 
-def run(events: list[dict[str, Any]], stub: Stub, client: Client, smoke_tests: tuple[str, ...] = ()) -> None:
+def run(
+    events: list[dict[str, Any]],
+    stub: Stub,
+    client: Client,
+    smoke_tests: tuple[str, ...] = (),
+    lifecycle_stages: tuple[str, ...] = (),
+) -> None:
     """Hands each event to the function, as CodePipeline's state stands when it is sent, with
-    `smoke_tests` as the allow-list of smoke test IDs."""
+    `smoke_tests` as the allow-list of smoke test IDs and `lifecycle_stages` as that of stages."""
     aws = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub)
     for event in events:
         detail = event["detail"]
         if event["detail-type"] == handler.STAGE_CHANGE:
             stub.stage_states[detail["stage"]] = STAGE_STATES[detail["state"]]
-        told = handler.handle(event, aws=aws, client=client, stages=[STAGE], smoke_tests=smoke_tests, artifacts=BUCKET)
+        told = handler.handle(
+            event,
+            aws=aws,
+            client=client,
+            stages=[STAGE],
+            smoke_tests=smoke_tests,
+            artifacts=BUCKET,
+            lifecycle_stages=lifecycle_stages,
+        )
         assert told is None
 
 
@@ -329,27 +343,54 @@ def test_a_failed_verification_names_its_failed_smoke_tests_by_their_listed_ids(
     assert stub.objects_read == [(BUCKET, f"verification/{stub.execution}/failed-smoke-tests")]
 
 
-@pytest.mark.parametrize("left", ["nothing", "another execution's", "marks that cannot be listed"])
-def test_a_failed_verification_with_no_failed_tests_to_read_names_none(
-    stub: Stub, commit: str, left: str, caplog: pytest.LogCaptureFixture
+def test_a_failed_verification_names_the_last_stage_an_instance_reached(
+    stub: Stub, commit: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    if left == "another execution's":
-        stub.mark("failed-smoke-tests", "hello\n", execution=str(uuid.uuid4()))
-    # A mark of this execution that S3 does not let the function list.
-    stub.refuses_to_list = left == "marks that cannot be listed"
-    if stub.refuses_to_list:
-        stub.mark("failed-smoke-tests", "hello\n")
+    # What the step left: the stage of two instances that never served, and a line that is no
+    # stage of the allow-list, as anything else of a heartbeat's row would be.
+    unlisted = f"instance {MARKER}"
+    stub.mark("last-stages", f"weights\n{unlisted}\nweights\n")
     client = Client()
     with caplog.at_level(logging.DEBUG):
-        run(verification(stub.execution, "FAILED")[1:], stub, client, ("hello", "no-key"))
-    # The failure and its action, and no status of a smoke test, not even a count.
+        run(verification(stub.execution, "FAILED"), stub, client, lifecycle_stages=("boot", "weights", "warm-up"))
+    assert client.posted == [
+        (commit, "pending", VERIFY, "The verification is running."),
+        (commit, "failure", VERIFY, "The verification failed."),
+        (commit, "failure", f"{VERIFY}/action", f"{STAGE} Verify"),
+        (commit, "failure", f"{VERIFY}/lifecycle/1", "weights"),
+        # The unlisted line, as a count and nothing else.
+        (commit, "failure", f"{VERIFY}/dropped", "1"),
+    ]
+    assert MARKER not in str(client.posted) and MARKER not in caplog.text
+    # The mark was read from the folder of the event's own execution.
+    assert stub.objects_read == [(BUCKET, f"verification/{stub.execution}/last-stages")]
+
+
+@pytest.mark.parametrize("left", ["nothing", "another execution's", "marks that cannot be listed"])
+def test_a_failed_verification_with_no_marks_to_read_names_no_test_and_no_stage(
+    stub: Stub, commit: str, left: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    marks = {"failed-smoke-tests": "hello\n", "last-stages": "weights\n"}
+    if left == "another execution's":
+        other = str(uuid.uuid4())
+        for name, held in marks.items():
+            stub.mark(name, held, execution=other)
+    # Marks of this execution that S3 does not let the function list.
+    stub.refuses_to_list = left == "marks that cannot be listed"
+    if stub.refuses_to_list:
+        for name, held in marks.items():
+            stub.mark(name, held)
+    client = Client()
+    with caplog.at_level(logging.DEBUG):
+        run(verification(stub.execution, "FAILED")[1:], stub, client, ("hello", "no-key"), ("weights",))
+    # The failure and its action, and no status of a smoke test or of a stage, not even a count.
     assert client.posted == [
         (commit, "failure", VERIFY, "The verification failed."),
         (commit, "failure", f"{VERIFY}/action", f"{STAGE} Verify"),
     ]
     assert stub.objects_read == []
     assert [record.getMessage() for record in caplog.records] == (
-        [handler.NO_FAILED_TESTS] if stub.refuses_to_list else []
+        [handler.NO_FAILED_TESTS, handler.NO_LAST_STAGES] if stub.refuses_to_list else []
     )
     assert MARKER not in caplog.text
 
@@ -383,6 +424,35 @@ def test_the_function_reads_its_allow_list_and_its_bucket_from_its_environment(
     ]
     monkeypatch.delenv("RHI_REPORTER_ARTIFACTS")
     assert reported() == [(f"{VERIFY}/action", f"{STAGE} Verify")]
+
+
+def test_the_function_reads_its_lifecycle_stages_from_its_environment(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub.mark("last-stages", "weights\nnot-a-stage\nboot\n")
+    aws, client = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub), Client()
+    monkeypatch.setattr(handler, "_clients", lambda: (aws, client))
+    monkeypatch.setenv(handler.STAGES_VARIABLE, STAGE)
+    monkeypatch.setenv("RHI_REPORTER_ARTIFACTS", BUCKET)
+    (event,) = verification(stub.execution, "FAILED")[1:]
+
+    def reported() -> list[tuple[str, str]]:
+        """The contexts and descriptions of the report the function posts for the event."""
+        client.posted.clear()
+        handler.handler(event, None)
+        return [(context, description) for _, _, context, description in client.posted[1:]]
+
+    # The variable as the function's construct writes it. Without it the allow-list is empty, and
+    # no stage is named.
+    monkeypatch.delenv("RHI_LIFECYCLE_STAGES", raising=False)
+    assert reported() == [(f"{VERIFY}/action", f"{STAGE} Verify"), (f"{VERIFY}/dropped", "3")]
+    monkeypatch.setenv("RHI_LIFECYCLE_STAGES", "boot,release-check,weights")
+    assert reported() == [
+        (f"{VERIFY}/action", f"{STAGE} Verify"),
+        (f"{VERIFY}/lifecycle/1", "boot"),
+        (f"{VERIFY}/lifecycle/2", "weights"),
+        (f"{VERIFY}/dropped", "1"),
+    ]
 
 
 def test_a_verification_that_ran_nothing_is_not_verified(stub: Stub, commit: str) -> None:
