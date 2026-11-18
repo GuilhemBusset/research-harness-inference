@@ -1,6 +1,7 @@
 """The verification script (scripts/pipeline/verify.py): with no listener or no canary key it runs
 no test, exits 0 and leaves its reason; with a key it runs the smoke tests, all but those that
-must reach the internal load balancer, and a failed test is a non-zero exit.
+must reach the internal load balancer, a failed test is a non-zero exit, and what the tests print
+reaches the log without the key.
 
 A stand-in for the Secrets Manager client replaces AWS. The tests that pytest really collects and
 runs do so in a process of their own, as the script starts one, and reach no stack.
@@ -137,7 +138,7 @@ def test_no_pool_is_no_release_parameter() -> None:
 
 # A plugin of the collection below: it writes, as JSON, the IDs of the tests that were deselected
 # and of those that were kept, to the file its variable names.
-RECORDER = '''
+RECORDER = """
 import json, os
 
 deselected = []
@@ -154,7 +155,7 @@ def pytest_deselected(items):
 def pytest_collection_finish(session):
     with open(os.environ["RECORDED"], "w", encoding="utf-8") as file:
         json.dump({"deselected": deselected, "kept": ids(session.items)}, file)
-'''
+"""
 
 
 def run_tests_in(tmp_path: Path, tests: list[str], *, more: Mapping[str, str] | None = None) -> int:
@@ -204,6 +205,32 @@ def test_a_failed_test_makes_the_script_exit_non_zero(tmp_path: Path) -> None:
 
     assert run_these(passing) == 0
     assert run_these(failing) != 0
+
+
+def test_what_the_tests_print_reaches_the_log_without_the_key(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # A test that fails holding the key, and prints it whole, then cut as pytest cuts a long value.
+    key = a_key()
+    (tmp_path / "test_it.py").write_text(
+        "import os, sys\n\n\n"
+        "def test_it() -> None:\n"
+        "    key = os.environ['RHI_SMOKE_KEY']\n"
+        "    print('whole:', key)\n"
+        "    print('cut:', key[:20] + '...' + key[-12:], file=sys.stderr)\n"
+        "    print('nothing of a key')\n"
+        "    assert key == 'another'\n",
+        encoding="utf-8",
+    )
+    more = {verify.KEY_VARIABLE: key, "PYTEST_ADDOPTS": "-p no:cacheprovider"}
+
+    assert run_tests_in(tmp_path, [str(tmp_path)], more=more) != 0
+
+    printed = "".join(capfd.readouterr())
+    # The failure is told, with the lines that hold no key as they were.
+    assert "AssertionError" in printed and "nothing of a key" in printed
+    assert verify.REDACTED in printed
+    assert not [at for at in range(len(key) - verify.PIECE + 1) if key[at : at + verify.PIECE] in printed]
 
 
 def test_the_script_runs_as_the_step_runs_it(tmp_path: Path) -> None:
