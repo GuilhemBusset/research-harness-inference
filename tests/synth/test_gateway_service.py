@@ -1,8 +1,8 @@
 """The gateway's service in the gateway stack (system design, sections 2, 5.3, 6.2 and 11.2): as
-many Fargate tasks as `gateway_tasks`, in private subnets, with no load balancer; an environment the
-gateway's settings reader accepts, with a pool or with none; a task role that may do what the
-gateway and its collector do and no more; and a collector beside the gateway, both logging to
-/rhi/gateway.
+many Fargate tasks as `gateway_tasks`, in private subnets; an environment the gateway's settings
+reader accepts, with a pool or with none; a task role that may do what the gateway and its
+collector do and no more; and a collector beside the gateway, both logging to /rhi/gateway. How
+the public load balancer reaches the service is `test_gateway_routing.py`'s.
 
 Some values of the environment are references that CloudFormation resolves at deployment.
 `Deployment` gives each a placeholder of the form the deployment would give, and remembers which
@@ -198,14 +198,12 @@ def one_task(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -
     )
 
 
-def test_the_service_runs_on_fargate_in_private_subnets_with_no_load_balancer(gateway: Gateway) -> None:
+def test_the_service_runs_on_fargate_in_private_subnets(gateway: Gateway) -> None:
     assert gateway.service["LaunchType"] == "FARGATE"
     assert gateway.task["RequiresCompatibilities"] == ["FARGATE"]
     # 0.5 vCPU, in ECS's units, and 1 GB.
     assert (gateway.task["Cpu"], gateway.task["Memory"]) == ("512", "1024")
     assert [port["ContainerPort"] for port in gateway.container["PortMappings"]] == [8080]
-    assert not gateway.service.get("LoadBalancers")
-    assert not [r["Type"] for r in gateway.template["Resources"].values() if "ElasticLoadBalancing" in r["Type"]]
 
     network = gateway.service["NetworkConfiguration"]["AwsvpcConfiguration"]
     assert network["AssignPublicIp"] == "DISABLED"

@@ -27,6 +27,10 @@
 # - ecr:GetAuthorizationToken on every resource: ECS signs in to the registry before it pulls.
 # - logs:CreateLogStream and logs:PutLogEvents on the log group /rhi/gateway, by its ARN: ECS
 #   writes the two containers' logs.
+#
+# The service's target group and its rule on the public load balancer's listener bring no role, no
+# action and no finding: ECS registers each task with the target group, and deregisters it, with
+# its service-linked role, which no stack of the app creates (`setup/bootstrap/README.md`).
 
 [nag]
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeTargetHealth, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds that one action alone."
