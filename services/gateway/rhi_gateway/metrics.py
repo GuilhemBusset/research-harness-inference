@@ -151,13 +151,14 @@ class Metrics:
         if record.student is not None and self._budget_left is not None:
             self._budget_left.seen(record.student)
 
-    def serve(self, *, host: str = HOST, port: int = PORT) -> WSGIServer:
+    def serve(self, *, port: int = PORT) -> WSGIServer:
         """Start serving the endpoint, in a thread that ends with the gateway, and return its server.
 
-        `shutdown` then `server_close` stop it. `host` and `port` are arguments for the tests,
-        which take a free port: the gateway gives neither.
+        `shutdown` then `server_close` stop it. The address is `HOST` and is not an argument: no
+        caller can open the endpoint on another one. `port` is an argument for the tests, which
+        take a free port: the gateway gives none.
         """
-        server = make_server(host, port, application(self.registry), ThreadingWSGIServer, handler_class=_Quiet)
+        server = make_server(HOST, port, application(self.registry), ThreadingWSGIServer, handler_class=_Quiet)
         threading.Thread(target=server.serve_forever, name="metrics", daemon=True).start()
         return server
 
