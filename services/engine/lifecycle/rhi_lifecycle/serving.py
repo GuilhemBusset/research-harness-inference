@@ -66,8 +66,8 @@ PROBE_SECONDS = 30.0
 
 # The stage an instance in service has reached, as its heartbeat names it.
 STAGE = "serving"
-# The model revision of a pool that serves no model: the heartbeat's row takes no empty value.
-NO_MODEL = "none"
+# The model revision of a pool that serves no model, as the row of a launch names it too.
+NO_MODEL = launch.NO_MODEL
 
 RELEASE_METRIC = "rhi_lifecycle_release_info"
 RESTARTS_METRIC = "rhi_lifecycle_engine_restarts"
@@ -122,9 +122,7 @@ class Serving:
         self._settings = settings
         self._instance = instance
         self._engine_name = engine
-        # The digest is what follows the repository in the image's reference.
-        self._image_digest = served.engine_image.rpartition("@")[2]
-        self._model_revision = NO_MODEL if served.model_revision is None else served.model_revision
+        self._image_digest, self._model_revision = launch.identity(served)
         self._table = dynamodb.Table(settings.heartbeat_table)
         self._secrets = secrets
         self._host = host
