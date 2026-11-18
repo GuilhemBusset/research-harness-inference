@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import aws_cdk as cdk
 
 from rhi.access.stack import AccessStack
+from rhi.gateway.stack import GatewayStack
 from rhi.network.stack import NetworkStack
 from rhi.observability.stack import ObservabilityStack
 from rhi.pools.stack import PoolsStack
@@ -27,9 +28,18 @@ PERMISSIONS_BOUNDARY = "rhi-permissions-boundary"
 
 class EndpointStage(cdk.Stage):
     """The endpoint, as one stage of stacks. Each construct arrives with its own issue and reads
-    what it needs from `config`; a stack that needs the VPC takes it from `network.vpc`."""
+    what it needs from `config`; a stack that needs the VPC takes it from `network.vpc`.
 
-    def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
+    **The gateway stack is added only when `gateway` is true, and the app does not ask for it
+    yet.** The pipeline's reporter may read the events of every stack of the stage it deploys
+    (`rhi.pipeline.reporter`), each named with the identifier CloudFormation adds to a stack's ARN,
+    and cdk-nag fails synthesis on each such grant that the reporter's own file,
+    `tests/policy/acknowledged/pipeline_reporter.toml`, does not acknowledge. That file is a
+    protected path, and adding the gateway stack's entry to it is the owner's decision. Once that
+    entry is there, the default below becomes true (or the parameter goes) and the pipeline deploys
+    the gateway; `tests/synth/test_gateway_service.py` synthesizes the stage with it meanwhile."""
+
+    def __init__(self, scope: Construct, construct_id: str, *, config: Config, gateway: bool = False) -> None:
         # Every role of the stage, those the CDK makes for its own functions included, carries the
         # permissions boundary of the bounded bootstrap, by its fixed name, in the deploying account
         # (`setup/bootstrap/README.md`).
@@ -47,3 +57,17 @@ class EndpointStage(cdk.Stage):
         # The internal load balancer beside them, in the network's VPC, the groups and the scaler,
         # which writes to the workspace.
         self.pools = PoolsStack(self, "Pools", config=config, network=self.network, observability=self.observability)
+        # The gateway's service, which reads of every stack above: it is deployed after them.
+        self.gateway = (
+            GatewayStack(
+                self,
+                "Gateway",
+                config=config,
+                network=self.network,
+                access=self.access,
+                observability=self.observability,
+                pools=self.pools,
+            )
+            if gateway
+            else None
+        )

@@ -1,0 +1,38 @@
+# What the roles of `src/rhi/gateway/service.py` may do, each action on each resource, with its
+# reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments. `tests/synth/test_gateway_service.py` holds the task's role to it.
+#
+# The role of the gateway's tasks, trusted by ECS tasks, which holds no AWS managed policy and
+# which the gateway and the collector beside it both run with:
+# - dynamodb:BatchGetItem, ConditionCheckItem, GetItem, Query and Scan on the keys table and on
+#   the pool-state table, by their ARNs: the gateway reads the key of each request, and each pool's
+#   state record and the scaler's note.
+# - the same reads, and dynamodb:BatchWriteItem, DeleteItem, PutItem and UpdateItem, on the usage
+#   table and on the heartbeat table, by their ARNs: the gateway counts each student's tokens
+#   against the budget, and writes its own heartbeat rows.
+# - secretsmanager:GetSecretValue and secretsmanager:DescribeSecret on each pool's bearer secret,
+#   /rhi/pools/<pool>/bearer-??????, by its fixed name: the gateway reads it at start and sends it
+#   to the pool's engines.
+# - elasticloadbalancing:DescribeTargetHealth on every resource: the gateway reads the health of
+#   each pool's target group to know when the pool is ready.
+# - lambda:InvokeFunction on the scaler function only, by its ARN: a request for a pool that
+#   sleeps asks the scaler to wake it.
+# - aps:RemoteWrite on the metrics workspace only, by its ARN: the collector pushes the gateway's
+#   metrics.
+#
+# The task's execution role, trusted by ECS tasks, which ECS uses to start a task and which no
+# container holds, with no AWS managed policy:
+# - ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer and ecr:BatchGetImage on the
+#   bootstrap's image repository, by its ARN: ECS pulls the gateway's image.
+# - ecr:GetAuthorizationToken on every resource: ECS signs in to the registry before it pulls.
+# - logs:CreateLogStream and logs:PutLogEvents on the log group /rhi/gateway, by its ARN: ECS
+#   writes the two containers' logs.
+
+[nag]
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeTargetHealth, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds that one action alone."
+"AwsSolutions-ECS2" = "The task definition gives the gateway its settings as environment variables, which is the only way its settings reader takes them, and none holds a secret: they are names, ARNs, addresses and numbers, and the gateway reads each pool's secret from Secrets Manager at start."
+"AwsSolutions-ECS4" = "The gateway's metrics go to the Managed Prometheus workspace through the collector of its task, and its logs to its log group, so Container Insights would be a second, paid store of metrics that no dashboard of the design reads."
+
+[wildcard_actions]
+"elasticloadbalancing:DescribeTargetHealth" = "AWS grants this action only on every resource, and the gateway reads with it which instances of each pool's target group serve, to know when a pool is ready."
+"ecr:GetAuthorizationToken" = "AWS grants this action only on every resource, and ECS signs in with it to the registry that holds the gateway's image before it pulls the image."
