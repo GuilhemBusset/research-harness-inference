@@ -67,6 +67,12 @@ receivers:
       - rhi-lifecycle.service
       - rhi-collector.service
       - rhi-dcgm.service
+    # Every line of these units, whatever its priority: the receiver's own default stops at info.
+    priority: debug
+    # A line in full, however long: the journal otherwise gives no text for one over 4096 bytes.
+    all: true
+    # A line with a character that does not print, a colour among them, comes as bytes: as text.
+    convert_message_bytes: true
     # The boot unit has written its lines before the collector starts.
     start_at: beginning
     storage: file_storage
