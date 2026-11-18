@@ -20,6 +20,12 @@ The defaults are section 17's, and the configuration's (`src/rhi/config.py`) for
 deployment writes into the six numeric variables. A numeric variable is a whole number above
 zero, in digits.
 
+A table's name is one DynamoDB can hold (3 to 255 letters, digits, `_`, `-` and `.`), and the
+function's name one Lambda can (1 to 64 letters, digits, `_` and `-`). A target group's ARN is an
+ARN of a load balancing target group, and a secret's ARN an ARN of a Secrets Manager secret: one
+given for the other is refused, like any text that is no ARN. A value of another form would only
+fail later, at the first call that used it.
+
 **No pool is a valid gateway.** The owner's configuration has an empty pools table until its first
 pool is added, and a gateway that refused to start would keep its service, and every later
 deployment, from a steady state. So `RHI_POOLS`, `RHI_TARGET_GROUPS` and `RHI_POOL_SECRETS` may
@@ -103,6 +109,15 @@ VARIABLES = (*REQUIRED, DEFAULT_POOL, *NUMERIC_DEFAULTS)
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
 # The fields a refusal of the pools table may name: a pool's own, never anything a value held.
 _POOL_FIELDS = FIELDS | {"name"}
+# The names DynamoDB and Lambda accept, as their APIs document them.
+_TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
+_FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+# An ARN's partition, service, region and account, then the resource of the one kind a variable holds.
+_ARN = r"arn:aws(?:-[a-z]+)*:{service}:[a-z0-9-]+:[0-9]{{12}}:{resource}"
+_TARGET_GROUP_ARN = re.compile(
+    _ARN.format(service="elasticloadbalancing", resource=r"targetgroup/[A-Za-z0-9-]+/[0-9a-f]+"), re.ASCII
+)
+_SECRET_ARN = re.compile(_ARN.format(service="secretsmanager", resource=r"secret:[A-Za-z0-9/_+=.@-]+"), re.ASCII)
 
 
 class SettingsError(ValueError):
@@ -155,11 +170,17 @@ def _required(environ: Mapping[str, str], variable: str) -> str:
     return value
 
 
-def _name(environ: Mapping[str, str], variable: str) -> str:
-    """A table's or a function's name: text with no space in it."""
+def _table(environ: Mapping[str, str], variable: str) -> str:
     value = _required(environ, variable)
-    if not value or any(character.isspace() for character in value) or not value.isprintable():
-        raise SettingsError(variable, "must be a name that is not empty and holds no space")
+    if _TABLE_NAME.fullmatch(value) is None:
+        raise SettingsError(variable, "must be a table's name: 3 to 255 letters, digits, '_', '-' and '.'")
+    return value
+
+
+def _function(environ: Mapping[str, str], variable: str) -> str:
+    value = _required(environ, variable)
+    if _FUNCTION_NAME.fullmatch(value) is None:
+        raise SettingsError(variable, "must be a function's name: 1 to 64 letters, digits, '_' and '-'")
     return value
 
 
@@ -206,7 +227,9 @@ def _pools(environ: Mapping[str, str]) -> tuple[Pool, ...]:
         raise SettingsError(POOLS, f"must be {expected}{field}") from None
 
 
-def _by_pool(environ: Mapping[str, str], variable: str, pools: tuple[Pool, ...], what: str) -> Mapping[str, str]:
+def _by_pool(
+    environ: Mapping[str, str], variable: str, pools: tuple[Pool, ...], what: str, arn: re.Pattern[str]
+) -> Mapping[str, str]:
     expected = f"a JSON object from each pool's name to its {what}, for the pools of {POOLS} and no other"
     table = _json_object(environ, variable, expected)
     if set(table) != {pool.name for pool in pools}:
@@ -214,7 +237,7 @@ def _by_pool(environ: Mapping[str, str], variable: str, pools: tuple[Pool, ...],
     given: dict[str, str] = {}
     for pool in pools:
         value = table[pool.name]
-        if not isinstance(value, str) or not value or not value.isprintable() or " " in value:
+        if not isinstance(value, str) or arn.fullmatch(value) is None:
             raise SettingsError(variable, f"must be {expected}")
         given[pool.name] = value
     return MappingProxyType(given)
@@ -250,13 +273,13 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         pools=pools,
         default_pool=_default_pool(environ, pools),
         upstream_url=_url(environ, UPSTREAM_URL),
-        target_groups=_by_pool(environ, TARGET_GROUPS, pools, "target group's ARN"),
-        pool_secrets=_by_pool(environ, POOL_SECRETS, pools, "secret's ARN"),
-        keys_table=_name(environ, KEYS_TABLE),
-        usage_table=_name(environ, USAGE_TABLE),
-        heartbeat_table=_name(environ, HEARTBEAT_TABLE),
-        pool_state_table=_name(environ, POOL_STATE_TABLE),
-        scaler_function=_name(environ, SCALER_FUNCTION),
+        target_groups=_by_pool(environ, TARGET_GROUPS, pools, "target group's ARN", _TARGET_GROUP_ARN),
+        pool_secrets=_by_pool(environ, POOL_SECRETS, pools, "secret's ARN", _SECRET_ARN),
+        keys_table=_table(environ, KEYS_TABLE),
+        usage_table=_table(environ, USAGE_TABLE),
+        heartbeat_table=_table(environ, HEARTBEAT_TABLE),
+        pool_state_table=_table(environ, POOL_STATE_TABLE),
+        scaler_function=_function(environ, SCALER_FUNCTION),
         body_limit_bytes=_number(environ, BODY_LIMIT_BYTES),
         longest_request_seconds=_number(environ, LONGEST_REQUEST_SECONDS),
         keepalive_seconds=_number(environ, KEEPALIVE_SECONDS),
