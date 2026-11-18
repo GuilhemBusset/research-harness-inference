@@ -25,5 +25,24 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## A verified deployment discharges a smoke-test item (2026-11-18)
+
+A local patch, not in upstream. ADR 0001 (decision 6, Consequences) asks to move AWS-only items
+from the owner to the pipeline's commit statuses as smoke tests appear. The engine's version stays
+1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `loop.toml` | `[deploy]` gains `verified_description`, an empty string: the description of a `verify/<stage>` success whose smoke tests ran and passed. The owner sets it with the contexts; the loop never fills it. |
+| `implement_loop/config.py` | `Deploy` gains the field, and `load_deploy` reads it and refuses a value that is not a string. |
+| `implement_loop/engine.py` | The deploying phase records, with its verdict, the description each success carried (`_deployed`). The evidence step calls the new `_verified_discharged`: an owner item whose capability is `aws:deployed-environment`, whose text ends with no other capability and names a test file under `tests/smoke/` (`SMOKE_TEST`) that the merge commit holds, is proven when a configured context of the form `verify/<stage>` succeeded on that commit with a description equal to a non-empty `verified_description`. It gets an evidence record (kind `commit_status`: the commit, the context, the description), a row in the evidence comment and a ticked box; its obligation is removed, as for an item a CI check run discharged, and the event `obligations_discharged` journals it. Anything less discharges nothing, and no status is read again in that step. |
+| `prompts/plan.md` | The `owner` bullet says that such an item is proven by the deployment verdict, and that an item about the deployed system should name the smoke test that decides it. |
+| `tests/test_deploying.py` | Three tests added, none removed or changed: the key in `loop.toml` and its reading; an issue whose only obligation is such an item ends `done`; and the cases that stay the owner's (another description, none configured, no verification context, no smoke test named, one the commit does not hold, another capability). The helper `Loop` gains optional arguments. |
+
+Behaviour an upstream reader would not expect: once the owner has set the contexts and the
+description, an issue with an item that needs `aws:deployed-environment` can end `done` with no
+action of the owner. The engine does not import the reporter: `tests/unit/test_deploy_settings.py`,
+a product test, holds the descriptions of `loop.toml` equal to the reporter's constants.
+
 `tests/fixtures/epic10.json` is a recording of GitHub's answers for epic #10 of the upstream
 repository, test input for the graph and the parser, and is not edited.

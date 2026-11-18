@@ -174,6 +174,7 @@ class Deploy:
     contexts: tuple[str, ...] = ()    # commit statuses the pipeline posts on a merge commit (`deploy/<stage>`, ...)
     timeout_s: int = 3600             # polling for a verdict, per run; after it the issue waits for the supervisor
     approval_description: str = ""    # the description of a pending status while the pipeline waits for the owner
+    verified_description: str = ""    # the description of a `verify/<stage>` success whose smoke tests ran and passed
 
 
 def load_deploy(table) -> Deploy:
@@ -201,7 +202,11 @@ def load_deploy(table) -> Deploy:
     approval = table.get("approval_description", "")
     if not isinstance(approval, str):
         raise TypeError("loop.toml: [deploy] approval_description must be a string")
-    return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
+    verified = table.get("verified_description", "")
+    if not isinstance(verified, str):
+        raise TypeError("loop.toml: [deploy] verified_description must be a string")
+    return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval,
+                  verified_description=verified)
 
 
 def load_ci_jobs(host) -> dict[str, str]:
