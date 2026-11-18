@@ -1,7 +1,7 @@
 """The pipeline stack: CDK Pipelines on CodePipeline V2, in queued execution, from `main` (system
 design, section 8.2).
 
-The only thing that deploys the endpoint is this pipeline (requirement R6). It has four steps:
+The only thing that deploys the endpoint is this pipeline (requirement R6). It has five steps:
 
 - its source is this repository, on `main`, through a CodeConnections connection the stack
   creates. The connection starts pending until the owner authorizes it once (section 8.6).
@@ -12,6 +12,8 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
 - the stage, `EndpointStage`, whose deployment waits for the approval CDK Pipelines asks for
   when a change widens permissions. That approval is a tripwire for honest mistakes. It does not
   cover this stack, which updates earlier in the same run (section 8.4, control 6).
+- the verification of `rhi.pipeline.verify`, after the stage's deployment: the smoke tests against
+  the deployed endpoint, with the canary's key. A failed test fails the execution.
 
 The asset step builds every image asset of the stage for its pool's processor architecture
 (sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
@@ -50,6 +52,7 @@ from aws_cdk import pipelines
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
 from rhi.pipeline.synth import synth_step
+from rhi.pipeline.verify import verify_step
 from rhi.stage import PERMISSIONS_BOUNDARY
 
 if TYPE_CHECKING:
@@ -125,7 +128,9 @@ class PipelineStack(cdk.Stack):
         )
         self.pipeline = pipelines.CodePipeline(self, "Pipeline", code_pipeline=underlying, synth=synth)
         check = pipelines.ConfirmPermissionsBroadening("Check", stage=stage)
-        self.pipeline.add_stage(stage, pre=[check])
+        # After every deployment action of the stage: the smoke tests, against what was deployed.
+        verify = verify_step(self, source, stage=stage, artifacts=underlying.artifact_bucket)
+        self.pipeline.add_stage(stage, pre=[check], post=[verify])
         self.pipeline.build_pipeline()
         self._builds_images_for_both_platforms()
 

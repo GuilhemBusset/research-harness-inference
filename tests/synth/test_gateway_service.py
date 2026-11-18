@@ -8,9 +8,9 @@ Some values of the environment are references that CloudFormation resolves at de
 `Deployment` gives each a placeholder of the form the deployment would give, and remembers which
 resource of which template the placeholder stands for.
 
-The tests synthesize the stage themselves, with its gateway stack and with cdk-nag: the app does
-not ask the stage for that stack yet (`rhi.stage.EndpointStage`). The CDK is imported inside
-`synthesize`, after `app_module` has started jsii (see conftest.py).
+The tests synthesize the stage themselves, with cdk-nag, from the example configuration and from
+changes of it. The CDK is imported inside `synthesize`, after `app_module` has started jsii (see
+conftest.py).
 """
 
 from __future__ import annotations
@@ -154,10 +154,10 @@ class Gateway:
 
 
 def synthesize(app_module: ModuleType, outdir: Path, change: Any = None) -> Gateway:
-    """The gateway of the stage built, with its gateway stack, from the example configuration's
-    data once `change` has changed it: with the context of `cdk.json`, nothing bundled, and
-    cdk-nag as the app runs it, which fails the synthesis on a finding that the file of the
-    resource's module does not acknowledge."""
+    """The gateway of the stage built from the example configuration's data once `change` has
+    changed it: with the context of `cdk.json`, nothing bundled, and cdk-nag as the app runs it,
+    which fails the synthesis on a finding that the file of the resource's module does not
+    acknowledge."""
     import aws_cdk as cdk
 
     from rhi.stage import EndpointStage
@@ -167,7 +167,7 @@ def synthesize(app_module: ModuleType, outdir: Path, change: Any = None) -> Gate
         change(data)
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
     app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    EndpointStage(app, "Rhi", config=config.parse(data, "test"), gateway=True)
+    EndpointStage(app, "Rhi", config=config.parse(data, "test"))
     app_module.add_nag(app)
     app.synth()
     return Gateway(outdir)
@@ -341,7 +341,8 @@ def test_the_task_role_may_do_what_the_gateway_does_and_nothing_else(gateway: Ga
     ]
     # Everything the role holds is in the policies of this template that name it: it attaches no
     # managed policy, and no other stack can name it, since this stack exports nothing.
-    assert not role.get("ManagedPolicyArns") and not role.get("Policies") and "Outputs" not in gateway.template
+    assert not role.get("ManagedPolicyArns") and not role.get("Policies")
+    assert not any("Export" in output for output in gateway.template.get("Outputs", {}).values())
     statements = [
         statement
         for policy in of_type(gateway.template, "AWS::IAM::Policy").values()
@@ -413,6 +414,17 @@ def test_both_containers_log_to_rhi_gateway_which_keeps_90_days(gateway: Gateway
     for container in (gateway.container, gateway.collector):
         logging = container["LogConfiguration"]
         assert (logging["LogDriver"], logging["Options"]["awslogs-group"]) == ("awslogs", {"Ref": log_group})
+
+
+def test_the_endpoint_s_output_is_the_domain_or_none_while_there_is_no_listener(
+    app_module: ModuleType, gateway: Gateway, tmp_path: Path
+) -> None:
+    assert EXAMPLE.https_listener
+    assert gateway.template["Outputs"]["Endpoint"]["Value"] == EXAMPLE.domain
+    # With no listener the output is still declared: what reads it never changes shape.
+    without = synthesize(app_module, tmp_path, lambda data: data.update(https_listener=False))
+    assert list(without.template["Outputs"]) == list(gateway.template["Outputs"]) == ["Endpoint"]
+    assert without.template["Outputs"]["Endpoint"]["Value"] == "none"
 
 
 def test_a_configuration_with_no_pool(app_module: ModuleType, tmp_path: Path) -> None:
