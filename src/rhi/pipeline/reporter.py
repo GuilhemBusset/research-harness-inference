@@ -49,6 +49,12 @@ What the function is told, as environment variables:
   `tests/smoke/ids.py`, read at synthesis (`smoke_test_ids`). The function's bundle holds nothing
   of the tests, and a report names a failed smoke test only by an ID of this list (section 8.4).
   A change to the list changes the function's configuration, so the same deployment carries it;
+- `RHI_LIFECYCLE_STAGES`: the allow-list of lifecycle stages, comma-separated: the members of the
+  lifecycle agent's enumeration, `rhi_lifecycle.stages.Stage`, each by its value, the name a
+  heartbeat's row holds, read at synthesis (`lifecycle_stages`). The app can import that module
+  because it puts every package root on its import path; the function's bundle holds the
+  reporter's package and `rhi_common` only, so the enumeration reaches it as data. A report names
+  the last stage an instance reached only by a name of this list;
 - `RHI_REPORTER_ARTIFACTS`: the name of the pipeline's artifact bucket, where the verification
   leaves its marks.
 """
@@ -67,6 +73,7 @@ from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from rhi import packaging
+from rhi_lifecycle.stages import Stage
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -85,6 +92,7 @@ REPOSITORY_VARIABLE = "RHI_REPORTER_REPOSITORY"
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
 SMOKE_TESTS_VARIABLE = "RHI_SMOKE_TEST_IDS"
+LIFECYCLE_STAGES_VARIABLE = "RHI_LIFECYCLE_STAGES"
 ARTIFACTS_VARIABLE = "RHI_REPORTER_ARTIFACTS"
 # The prefix of the verification's marks in the artifact bucket (`rhi.pipeline.verify`).
 MARKS_PREFIX = "verification"
@@ -92,7 +100,7 @@ MARKS_PREFIX = "verification"
 # Where the smoke tests list their IDs, and the name the list has there.
 SMOKE_TEST_IDS_FILE = packaging.REPO / "tests/smoke/ids.py"
 SMOKE_TEST_IDS_NAME = "SMOKE_TEST_IDS"
-# What separates two IDs in the variable.
+# What separates two IDs, and two stages, in their variable.
 SEPARATOR = ","
 
 # The three kinds of state change CodePipeline sends to EventBridge.
@@ -123,6 +131,16 @@ def smoke_test_ids(path: Path = SMOKE_TEST_IDS_FILE) -> tuple[str, ...]:
     if not all(isinstance(test_id, str) and test_id and SEPARATOR not in test_id for test_id in ids):
         raise ValueError(f"a smoke test's ID is text with no {SEPARATOR!r} in it")
     return ids
+
+
+def lifecycle_stages() -> tuple[str, ...]:
+    """The name of every stage of a start, as the lifecycle agent's enumeration lists them and as
+    a heartbeat's row holds them: the reporter's allow-list. ValueError for a name the variable
+    cannot carry."""
+    names = tuple(stage.value for stage in Stage)
+    if not all(isinstance(name, str) and name and SEPARATOR not in name for name in names):
+        raise ValueError(f"a lifecycle stage's name is text with no {SEPARATOR!r} in it")
+    return names
 
 
 class Reporter(Construct):
@@ -212,6 +230,7 @@ class Reporter(Construct):
                 STAGES_VARIABLE: stage.stage_name,
                 TOPIC_VARIABLE: topic.topic_arn,
                 SMOKE_TESTS_VARIABLE: SEPARATOR.join(smoke_test_ids()),
+                LIFECYCLE_STAGES_VARIABLE: SEPARATOR.join(lifecycle_stages()),
                 ARTIFACTS_VARIABLE: artifacts.bucket_name,
             },
         )

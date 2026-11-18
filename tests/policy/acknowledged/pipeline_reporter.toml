@@ -13,7 +13,8 @@
 #   resources that failed, for the report of a failure.
 # - s3:GetObject on the objects of the pipeline's artifact bucket: the templates the execution's
 #   synth step wrote, whose logical IDs bound what the report names, and, under verification/, the
-#   marks the execution's verification left: the smoke tests that failed, and the reason no test ran.
+#   marks the execution's verification left: the smoke tests that failed, the last lifecycle stage
+#   each instance reached, and the reason no test ran.
 # - s3:ListBucket on the pipeline's artifact bucket, under the condition that the listed prefix is
 #   under verification/: the function lists a mark's key before it reads it, because S3 answers a
 #   read of an object that is not there as a read that is not allowed unless the caller may list,

@@ -1,9 +1,9 @@
 """The pipeline's reporter, in the app's synthesized templates (system design, section 8.2, step 7):
 a rule on this pipeline's state changes and nothing else, the function it invokes, the secret
 the function reads, which the stack refers to and never creates, and the owner's topic, where the
-function sends what a public status may not carry (section 8.4); the allow-list of smoke test IDs
-and the artifact bucket the function is told, and its role's read of the verification's marks in
-that bucket. Beside them, the measurement bus,
+function sends what a public status may not carry (section 8.4); the allow-list of smoke test IDs,
+the allow-list of lifecycle stages and the artifact bucket the function is told, and its role's
+read of the verification's marks in that bucket. Beside them, the measurement bus,
 a rule on it for a job's measurements that invokes the same function, and the grant a job's role
 is given to put events on that bus (sections 8.4 and 12).
 """
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from rhi import config
+from rhi_lifecycle.stages import Stage
 from rhi_reporter import handler, measure
 
 PIPELINE_TEMPLATE = "RhiPipeline.template.json"
@@ -126,12 +127,25 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
         handler.STAGES_VARIABLE: "Rhi",
         handler.TOPIC_VARIABLE: {"Ref": topic_id},
         "RHI_SMOKE_TEST_IDS": ",".join(SMOKE_TEST_IDS),
+        "RHI_LIFECYCLE_STAGES": ",".join(stage.value for stage in Stage),
         # The bucket the verification step writes its marks to: the pipeline's artifact bucket.
         handler.ARTIFACTS_VARIABLE: pipeline["ArtifactStore"]["Location"],
     }
     # The allow-list as the function reads it: every ID the smoke tests list, and nothing else.
     assert handler.SMOKE_TESTS_VARIABLE == "RHI_SMOKE_TEST_IDS"
     assert handler.smoke_test_ids(function["Environment"]["Variables"]) == SMOKE_TEST_IDS != ()
+
+
+def test_the_function_s_lifecycle_stages_are_the_members_of_the_stages_enumeration(
+    templates: dict[str, dict[str, Any]],
+) -> None:
+    (function,) = reporter_functions(templates[PIPELINE_TEMPLATE]).values()
+    # Each member by its value, the name a launch writes into its instance's heartbeat row: what
+    # the function reads back from the variable is the enumeration, whole and nothing else.
+    members = tuple(stage.value for stage in Stage)
+    assert handler.LIFECYCLE_STAGES_VARIABLE == "RHI_LIFECYCLE_STAGES"
+    assert handler.lifecycle_stages(function["Environment"]["Variables"]) == members
+    assert "weights" in members and len(set(members)) == len(members)
 
 
 def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:
@@ -219,6 +233,8 @@ def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
     statements = role_statements(template)
+    # As narrow as before the function read the instances' last stages: that mark is one more
+    # object under verification/, which the role already reads and lists.
     actions = [action for statement in statements for action in as_list(statement["Action"])]
     assert sorted(actions) == sorted(ROLE_ACTIONS)
     (listing,) = [s for s in statements if "codepipeline:ListPipelineExecutions" in as_list(s["Action"])]

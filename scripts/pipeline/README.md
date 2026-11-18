@@ -27,5 +27,9 @@ deployment and needs no import path:
   or `canary-missing`, to the file `RHI_VERIFY_REASON_FILE` names, which the step's post-build
   phase copies to the artifact bucket. When a test fails, it adds the test's ID
   (`tests/smoke/ids.py`) as a line of the file `RHI_VERIFY_FAILED_TESTS_FILE` names, which that
-  phase copies too. It never prints the key, and what the tests print reaches the build's log with
-  `[canary key]` in place of the key and of any piece of it.
+  phase copies too. When the run of the tests fails, it reads the heartbeat rows of the instances of
+  the pools it tested from the table `RHI_VERIFY_HEARTBEATS_TABLE` names, and leaves the last
+  lifecycle stage each instance reached, one per line and nothing else of a row, in the file
+  `RHI_VERIFY_LAST_STAGES_FILE` names, which that phase copies as well. It never prints the key,
+  and what the tests print reaches the build's log with `[canary key]` in place of the key and of
+  any piece of it.

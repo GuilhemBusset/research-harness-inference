@@ -6,10 +6,14 @@ The stack may reference other stacks of the stage (the network, the workspace); 
 reference it back. The stack and the logical IDs of its tables are recorded in
 `tests/policy/stateful_logical_ids.json`: moving a table to another stack replaces it.
 
-The stack declares one output, `ReleaseParameters`: each pool's name with the name of its release
-parameter, which the pipeline's verification takes as an input (`rhi.pipeline.verify`). It is
-written as `release_parameters_text` writes it, without a quote: CodePipeline puts an output's
-value into the JSON of an action's configuration as it is.
+The stack declares two outputs, which the pipeline's verification takes as inputs
+(`rhi.pipeline.verify`):
+
+- `ReleaseParameters`: each pool's name with the name of its release parameter. It is written as
+  `release_parameters_text` writes it, without a quote: CodePipeline puts an output's value into
+  the JSON of an action's configuration as it is.
+- `HeartbeatsTable`: the name of the heartbeats table, which CloudFormation generates. The
+  verification reads there the last lifecycle stage each instance reached.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ class PoolsStack(cdk.Stack):
     instance refresh that a change to the release starts, each pool's lifecycle hooks, from
     `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`), and the name of each pool's
     release parameter, from `release_parameters[name]` and, all of them, as the output
-    `release_parameters_output`."""
+    `release_parameters_output`. The heartbeat table's name is the output `heartbeats_table_output`."""
 
     def __init__(
         self,
@@ -82,6 +86,13 @@ class PoolsStack(cdk.Stack):
         # export while this stack imports it.
         cdk.CrossStackReferences.of(self).consume(cdk.ReferenceStrength.STRONG)
         self.tables = PoolTables(self, "Tables")
+        # The heartbeat table's name, which the deployment generates, for the pipeline's verification.
+        self.heartbeats_table_output = cdk.CfnOutput(
+            self,
+            "HeartbeatsTable",
+            description="The name of the heartbeats table.",
+            value=self.tables.heartbeats.table_name,
+        )
         # With the pools table empty, the listener and its default 404, and no target group.
         self.routing = Routing(
             self,
