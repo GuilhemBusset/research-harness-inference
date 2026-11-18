@@ -175,6 +175,9 @@ class Deploy:
     timeout_s: int = 3600             # polling for a verdict, per run; after it the issue waits for the supervisor
     approval_description: str = ""    # the description of a pending status while the pipeline waits for the owner
     verified_description: str = ""    # the description of a `verify/<stage>` success whose smoke tests ran and passed
+    # The smoke test files of which the verification leaves a test out, from the repository's root. None:
+    # the table does not say, and a verified deployment then discharges nothing.
+    unverified_tests: tuple[str, ...] | None = None
 
 
 def load_deploy(table) -> Deploy:
@@ -205,8 +208,11 @@ def load_deploy(table) -> Deploy:
     verified = table.get("verified_description", "")
     if not isinstance(verified, str):
         raise TypeError("loop.toml: [deploy] verified_description must be a string")
+    unverified = table.get("unverified_tests")
+    if unverified is not None and not (isinstance(unverified, list) and all(isinstance(t, str) for t in unverified)):
+        raise TypeError("loop.toml: [deploy] unverified_tests must be a list of test files")
     return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval,
-                  verified_description=verified)
+                  verified_description=verified, unverified_tests=None if unverified is None else tuple(unverified))
 
 
 def load_ci_jobs(host) -> dict[str, str]:

@@ -120,6 +120,7 @@ except (ImportError, AttributeError):   # pragma: no cover - older config.py and
         timeout_s: int = 3600
         approval_description: str = ""
         verified_description: str = ""
+        unverified_tests: tuple[str, ...] | None = None
 
 try:   # the wait for the owner's push and merge arrives with its kind, and with its record, in model.py
     from .model import WAIT_OWNER_LANDING
@@ -3114,22 +3115,28 @@ class Engine:
 
     def _verified_discharged(self, n: int, st: IssueState) -> dict[str, dict]:
         """The owner items a verified deployment proves (ADR 0001, decision 6, Consequences), each
-        with its evidence record. The pipeline's verification runs every smoke test of the commit it
-        deployed against the deployed endpoint, so its success proves an item when all of this
-        holds: `[deploy] verified_description` is set; a configured context of the form
-        `verify/<stage>` succeeded on the issue's merge commit with exactly that description, as
-        the deploying phase read it (`_deployed`); the plan gives the item to the owner for
-        `aws:deployed-environment`, and its text ends with no other capability; and its text names
-        a smoke test (`SMOKE_TEST`), every one of which is a file of that commit. The record names
-        the commit, the context and the description; the item's box is ticked with the evidence
-        comment, which carries that row. Anything less discharges nothing and the obligation stays
-        the owner's: no description configured, no verification context, a success with another
-        description (a verification that ran no test, a parked system), a verdict recorded
-        without descriptions, another capability, no smoke test named, or one the commit does not
-        hold. No status is read here, and this step gives the same answer when it runs again."""
-        # An older config.py reads no such key into its table (this engine.py beside the `implement_loop` of
-        # the engine that runs the loop, as the verifier loads it): no description, so nothing is discharged.
+        with its evidence record. The pipeline's verification runs the smoke tests of the commit it
+        deployed against the deployed endpoint, all but those `[deploy] unverified_tests` names, so
+        its success proves an item when all of this holds: `[deploy] verified_description` is set,
+        and `unverified_tests` says which test files the verification leaves a test out of; a
+        configured context of the form `verify/<stage>` succeeded on the issue's merge commit with
+        exactly that description, as the deploying phase read it (`_deployed`); the plan gives the
+        item to the owner for `aws:deployed-environment`, and its text ends with no other
+        capability; and its text names a smoke test (`SMOKE_TEST`), every one of which is a file of
+        that commit and none of which is among `unverified_tests`. The record names the commit, the
+        context and the description; the item's box is ticked with the evidence comment, which
+        carries that row. Anything less discharges nothing and the obligation stays the owner's:
+        no description configured, a table that does not say what the verification leaves out, no
+        verification context, a success with another description (a verification that ran no
+        test, a parked system), a verdict recorded without descriptions, another capability, no
+        smoke test named, one the commit does not hold, or one the verification leaves a test out
+        of. No status is read here, and this step gives the same answer when it runs again."""
+        # An older config.py reads neither key into its table (this engine.py beside the `implement_loop` of
+        # the engine that runs the loop, as the verifier loads it): nothing is said, so nothing is discharged.
         said = getattr(self.deploy, "verified_description", "")
+        left_out = getattr(self.deploy, "unverified_tests", None)
+        if left_out is None:
+            return {}
         d = (st.deploy or {}) if self.deploy.contexts and said else {}
         states, descriptions = d.get("states") or {}, d.get("descriptions") or {}
         context = next((c for c in self.deploy.contexts if VERIFY_CONTEXT.fullmatch(c) and states.get(c) == "success"
@@ -3137,12 +3144,13 @@ class Engine:
         if not context:
             return {}
         sha, texts, out = d["sha"], self._item_text(n), {}
+        unverified = {SMOKE_TEST.sub(r"\1", t) for t in left_out}   # as an item's text is read: no leading `./`
         for i in self._items(st):
             text = texts.get(i["id"], "")
             needs = NEEDS_END.search(text)
             tests = sorted({m.group(1) for m in SMOKE_TEST.finditer(text)})
             if (i["proof"] != "owner" or i.get("capability") != DEPLOYED_ENVIRONMENT or not tests
-                    or (needs and needs.group(1) != DEPLOYED_ENVIRONMENT)
+                    or (needs and needs.group(1) != DEPLOYED_ENVIRONMENT) or unverified & set(tests)
                     or not all(self.ws.git("ls-tree", "--name-only", sha, "--", t, check=False) == t for t in tests)):
                 continue
             record = Evidence(criterion=i["id"], kind=COMMIT_STATUS_EVIDENCE, command=None, cwd=".", head_sha=sha,

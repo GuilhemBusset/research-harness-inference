@@ -128,6 +128,14 @@ approval_description = ""
 # not left to the owner. Empty: never. The owner sets it with the contexts, and
 # `tests/unit/test_deploy_settings.py` holds both descriptions equal to the reporter's constants.
 verified_description = ""
+# The smoke test files of which the verification leaves a test out (`scripts/pipeline/verify.py`
+# deselects the tests that must reach the internal load balancer): an item that names one of them
+# stays the owner's, whatever the verification's status says. Absent, as here: the table does not
+# say what the verification leaves out, and a verified deployment discharges nothing. The owner
+# sets it with `verified_description`, and `tests/unit/test_deploy_settings.py` then holds it
+# equal to the files of the tests the verification's own run deselects, and names them when it
+# fails. An empty list says that every smoke test is run.
+# unverified_tests = ["tests/smoke/deployed/<file>.py"]
 
 # The sandbox every agent call and every check command runs in (ADR 0001, decision 3;
 # docs/factory/isolation.md). The root filesystem is read-only, `/tmp` and the home directory

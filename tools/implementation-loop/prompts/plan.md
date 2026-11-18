@@ -20,7 +20,9 @@ For **every** ledger item ({{ledger_ids}}) return one entry:
     then proves it from the deployment verdict, not the owner: once the merge commit's
     `verify/<stage>` status succeeds with the description that says its tests ran and passed,
     the item is recorded as proven with that status as its evidence. Until the owner configures
-    that verdict, and for an item that names no smoke test, it stays the owner's;
+    that verdict, for an item that names no smoke test, and for one that names a test file of
+    which the verification leaves a test out (`scripts/pipeline/verify.py` says which tests it
+    deselects), it stays the owner's;
   - `deferred`: only when it needs another **open** issue's deliverable. Give `depends_on` and
     `depends_quote`, words from that issue's title or body that show it delivers what you need.
 - `zones`: every path you expect to change, registrations and test files included. A protected
