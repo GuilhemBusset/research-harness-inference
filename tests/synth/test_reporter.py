@@ -8,6 +8,8 @@ is given to put events on that bus (sections 8.4 and 12).
 
 from __future__ import annotations
 
+import runpy
+from pathlib import Path
 from typing import Any
 
 from rhi import config
@@ -17,6 +19,10 @@ PIPELINE_TEMPLATE = "RhiPipeline.template.json"
 # The secret's fixed name, which the owner creates (section 8.6, step 3).
 SECRET_NAME = "rhi/reporter/github-app"
 MEASUREMENT_BUS = "rhi-measurements"
+# The ID of every smoke test, where the smoke tests list them: the reporter's allow-list.
+SMOKE_TEST_IDS: tuple[str, ...] = runpy.run_path(str(Path(__file__).resolve().parents[1] / "smoke/ids.py"))[
+    "SMOKE_TEST_IDS"
+]
 
 
 def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
@@ -116,7 +122,10 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
         "RHI_REPORTER_REPOSITORY": f"{example.github_owner}/{example.github_repo}",
         handler.STAGES_VARIABLE: "Rhi",
         handler.TOPIC_VARIABLE: {"Ref": topic_id},
+        handler.SMOKE_TESTS_VARIABLE: ",".join(SMOKE_TEST_IDS),
     }
+    # The allow-list as the function reads it: every ID the smoke tests list, and nothing else.
+    assert handler.smoke_test_ids(function["Environment"]["Variables"]) == SMOKE_TEST_IDS != ()
 
 
 def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:

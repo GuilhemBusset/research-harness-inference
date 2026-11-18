@@ -45,8 +45,12 @@ carry it. An execution that names none yet posts nothing.
 - `logical_ids`: the names of the resources of every template that the same execution's synth
   step wrote, read from its output in the pipeline's artifact store. A resource is named only
   when one of them holds it;
-- empty allow-lists of smoke test IDs and lifecycle stages: the steps that report them come later
-  (issues E0-21 and E0-26).
+- `smoke_tests`: the allow-list of smoke test IDs, the list of `tests/smoke/ids.py`, which the
+  function's construct reads at synthesis and gives in `RHI_REPORTER_SMOKE_TESTS`, comma-separated
+  (`smoke_test_ids`). No event carries a failed test yet;
+- an empty allow-list of lifecycle stages.
+
+The steps that report failed tests and lifecycle stages come later (issues E0-21 and E0-26).
 
 What cannot be read for the report leaves it out: a resource then counts as dropped.
 
@@ -100,6 +104,7 @@ if TYPE_CHECKING:
 
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
+SMOKE_TESTS_VARIABLE = "RHI_REPORTER_SMOKE_TESTS"
 
 PIPELINE_CHANGE = "CodePipeline Pipeline Execution State Change"
 STAGE_CHANGE = "CodePipeline Stage Execution State Change"
@@ -183,13 +188,35 @@ def handler(event: Mapping[str, Any], _context: object) -> None:
     """The Lambda function's entry point."""
     aws, client = _clients()
     stages = tuple(stage for stage in os.environ.get(STAGES_VARIABLE, "").split(",") if stage)
-    handle(event, aws=aws, client=client, stages=stages, topic=os.environ.get(TOPIC_VARIABLE) or None)
+    handle(
+        event,
+        aws=aws,
+        client=client,
+        stages=stages,
+        topic=os.environ.get(TOPIC_VARIABLE) or None,
+        smoke_tests=smoke_test_ids(os.environ),
+    )
 
 
-def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], topic: str | None = None) -> None:
+def smoke_test_ids(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """The allow-list of smoke test IDs that `environ` gives the function: the IDs of
+    `tests/smoke/ids.py`, as the function's construct wrote them into `RHI_REPORTER_SMOKE_TESTS`."""
+    return tuple(test_id for test_id in environ.get(SMOKE_TESTS_VARIABLE, "").split(",") if test_id)
+
+
+def handle(
+    event: Mapping[str, Any],
+    *,
+    aws: Aws,
+    client: Any,
+    stages: Sequence[str],
+    topic: str | None = None,
+    smoke_tests: Sequence[str] = (),
+) -> None:
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
     as `github.StatusClient` has it, then sends the details of an action that ended without
-    success to `topic`, the owner's. `stages` are the stages the pipeline deploys. An event of a
+    success to `topic`, the owner's. `stages` are the stages the pipeline deploys, and
+    `smoke_tests` the IDs a report of a failure may name a smoke test by. An event of a
     measurement posts its statuses and nothing else."""
     if event.get("source") == measure.SOURCE:
         _measurement(event, aws=aws, client=client)
@@ -238,7 +265,7 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
                     continue
             _post(client, status)
             if status.state is State.FAILURE and action is not None:
-                for fact in _report(aws, facts, read()):
+                for fact in _report(aws, facts, read(), smoke_tests):
                     _post(client, fact)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
@@ -395,8 +422,9 @@ def _read(aws: Aws, *, pipeline: object, execution: object, stage: object, actio
     return records
 
 
-def _report(aws: Aws, facts: Mapping[str, object], records: _Records) -> list[CommitStatus]:
-    """The report of the failure `facts` tell, as statuses, from the failed action's records."""
+def _report(aws: Aws, facts: Mapping[str, object], records: _Records, smoke_tests: Sequence[str]) -> list[CommitStatus]:
+    """The report of the failure `facts` tell, as statuses, from the failed action's records.
+    `smoke_tests` is the allow-list of smoke test IDs."""
     failed = records.run is not None and records.run.get("status") == "Failed"
     resource_events = records.resource_events if failed else []
     logical_ids: set[str] = set()
@@ -405,7 +433,9 @@ def _report(aws: Aws, facts: Mapping[str, object], records: _Records) -> list[Co
             logical_ids = _logical_ids(aws.s3, records.executions)
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError, zipfile.BadZipFile):
         logger.warning(NO_FACTS)
-    report = build_report(facts, resource_events, logical_ids=logical_ids, smoke_test_ids=(), lifecycle_stages=())
+    report = build_report(
+        facts, resource_events, logical_ids=logical_ids, smoke_test_ids=smoke_tests, lifecycle_stages=()
+    )
     return statuses_of(report)
 
 

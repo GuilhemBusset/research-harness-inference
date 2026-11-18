@@ -35,11 +35,15 @@ What the function is told, as environment variables:
 - `RHI_REPORTER_REPOSITORY`: the repository, as owner/name, from the configuration;
 - `RHI_REPORTER_STAGES`: the stages the pipeline deploys, comma-separated, under which the steps
   that run before them report;
-- `RHI_REPORTER_TOPIC`: the ARN of the owner's topic, where the details of a failure go.
+- `RHI_REPORTER_TOPIC`: the ARN of the owner's topic, where the details of a failure go;
+- `RHI_REPORTER_SMOKE_TESTS`: the allow-list of smoke test IDs, comma-separated: the list of
+  `tests/smoke/ids.py`, read at synthesis (`smoke_test_ids`). The function's bundle holds nothing
+  of the tests, and a report names a failed smoke test only by an ID of this list (section 8.4).
 """
 
 from __future__ import annotations
 
+import runpy
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
@@ -54,6 +58,7 @@ from rhi import packaging
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
+    from pathlib import Path
 
     from aws_cdk import aws_codepipeline as codepipeline
     from aws_cdk import aws_sns as sns
@@ -67,6 +72,13 @@ SECRET_VARIABLE = "RHI_REPORTER_SECRET"
 REPOSITORY_VARIABLE = "RHI_REPORTER_REPOSITORY"
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
+SMOKE_TESTS_VARIABLE = "RHI_REPORTER_SMOKE_TESTS"
+
+# Where the smoke tests list their IDs, and the name the list has there.
+SMOKE_TEST_IDS_FILE = packaging.REPO / "tests/smoke/ids.py"
+SMOKE_TEST_IDS_NAME = "SMOKE_TEST_IDS"
+# What separates two IDs in the variable.
+SEPARATOR = ","
 
 # The three kinds of state change CodePipeline sends to EventBridge.
 DETAIL_TYPES = [
@@ -87,6 +99,15 @@ ARCHITECTURE = lambda_.Architecture.ARM_64
 MEMORY_MB = 512
 TIMEOUT = cdk.Duration.minutes(1)
 LOG_RETENTION = logs.RetentionDays.ONE_MONTH
+
+
+def smoke_test_ids(path: Path = SMOKE_TEST_IDS_FILE) -> tuple[str, ...]:
+    """The ID of every smoke test, as `tests/smoke/ids.py` lists them: the reporter's allow-list.
+    The file is data and imports nothing. ValueError for an ID the variable cannot carry."""
+    ids = tuple(runpy.run_path(str(path))[SMOKE_TEST_IDS_NAME])
+    if not all(isinstance(test_id, str) and test_id and SEPARATOR not in test_id for test_id in ids):
+        raise ValueError(f"a smoke test's ID is text with no {SEPARATOR!r} in it")
+    return ids
 
 
 class Reporter(Construct):
@@ -167,6 +188,7 @@ class Reporter(Construct):
                 REPOSITORY_VARIABLE: f"{config.github_owner}/{config.github_repo}",
                 STAGES_VARIABLE: stage.stage_name,
                 TOPIC_VARIABLE: topic.topic_arn,
+                SMOKE_TESTS_VARIABLE: SEPARATOR.join(smoke_test_ids()),
             },
         )
         target = targets.LambdaFunction(self.function)  # ty: ignore[invalid-argument-type] - as above
