@@ -12,7 +12,13 @@
 # - cloudformation:DescribeStackEvents on stack/<name>/* of each stack the pipeline deploys: the
 #   resources that failed, for the report of a failure.
 # - s3:GetObject on the objects of the pipeline's artifact bucket: the templates the execution's
-#   synth step wrote, whose logical IDs bound what the report names.
+#   synth step wrote, whose logical IDs bound what the report names, and, under verification/, the
+#   marks the execution's verification left: the smoke tests that failed, and the reason no test ran.
+# - s3:ListBucket on the pipeline's artifact bucket, under the condition that the listed prefix is
+#   under verification/: the function lists a mark's key before it reads it, because S3 answers a
+#   read of an object that is not there as a read that is not allowed unless the caller may list,
+#   and a verification with no not-run mark is one whose tests ran. The condition shows it no key
+#   outside that prefix.
 # - sns:Publish on the owner's topic only: the details of a failure a public status may not carry.
 # - logs:CreateLogStream and logs:PutLogEvents on the function's own log group: its logs.
 # It is given nothing on the measurement bus: it reads the bus's events, it does not send them.
@@ -27,7 +33,7 @@
 
 [nag]
 "AwsSolutions-L1" = "The reporter runs on the Lambda runtime of the Python that .python-version names, the one its tests and its bundle's libraries are built for, which packaging.RUNTIME holds for every function of the app."
-"AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/*]" = "The reporter reads the templates that an execution's synth step wrote to the pipeline's own artifact bucket, under an object key CodePipeline only chooses when the execution runs."
+"AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/*]" = "The reporter reads the templates that an execution's synth step wrote and the marks that its verification left in the pipeline's own artifact bucket, under object keys that are only known when the execution runs."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Network/*]" = "The reporter reads the events of a stack the pipeline deploys, by its fixed name, and CloudFormation adds an identifier it chooses at creation to every stack's ARN."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Access/*]" = "The reporter reads the events of a stack the pipeline deploys, by its fixed name, and CloudFormation adds an identifier it chooses at creation to every stack's ARN."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Pools/*]" = "The reporter reads the events of a stack the pipeline deploys, by its fixed name, and CloudFormation adds an identifier it chooses at creation to every stack's ARN."

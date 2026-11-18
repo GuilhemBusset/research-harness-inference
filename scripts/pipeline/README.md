@@ -25,5 +25,7 @@ deployment and needs no import path:
   balancer, and exits non-zero when a test fails. While the endpoint has no HTTPS listener, or the
   secret is missing or holds no key, it runs no test, exits 0 and writes its reason, `listener-off`
   or `canary-missing`, to the file `RHI_VERIFY_REASON_FILE` names, which the step's post-build
-  phase copies to the artifact bucket. It never prints the key, and what the tests print reaches
-  the build's log with `[canary key]` in place of the key and of any piece of it.
+  phase copies to the artifact bucket. When a test fails, it adds the test's ID
+  (`tests/smoke/ids.py`) as a line of the file `RHI_VERIFY_FAILED_TESTS_FILE` names, which that
+  phase copies too. It never prints the key, and what the tests print reaches the build's log with
+  `[canary key]` in place of the key and of any piece of it.

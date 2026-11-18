@@ -1,7 +1,7 @@
 """The verification script (scripts/pipeline/verify.py): with no listener or no canary key it runs
 no test, exits 0 and leaves its reason; with a key it runs the smoke tests, all but those that
-must reach the internal load balancer, a failed test is a non-zero exit, and what the tests print
-reaches the log without the key.
+must reach the internal load balancer, a failed test is a non-zero exit and leaves its ID, and
+what the tests print reaches the log without the key.
 
 A stand-in for the Secrets Manager client replaces AWS. The tests that pytest really collects and
 runs do so in a process of their own, as the script starts one, and reach no stack.
@@ -205,6 +205,37 @@ def test_a_failed_test_makes_the_script_exit_non_zero(tmp_path: Path) -> None:
 
     assert run_these(passing) == 0
     assert run_these(failing) != 0
+
+
+def test_the_ids_of_the_tests_that_failed_are_left_one_per_line_and_nothing_else(tmp_path: Path) -> None:
+    # Tests that carry their IDs as the smoke tests do: one passes, one fails, one fails before it
+    # starts, and one is among those the verification leaves out.
+    tests = tmp_path / "tests" / "test_it.py"
+    tests.parent.mkdir()
+    tests.write_text(
+        "import pytest\n\n\n"
+        "@pytest.fixture\ndef broken() -> None:\n    raise RuntimeError('what a test says is not an ID')\n\n\n"
+        "@pytest.mark.smoke_id('hello')\ndef test_passes() -> None:\n    pass\n\n\n"
+        "@pytest.mark.smoke_id('no-key')\ndef test_fails() -> None:\n    assert False, 'nor is this'\n\n\n"
+        "@pytest.mark.smoke_id('environment')\ndef test_fails_before_it_starts(broken: None) -> None:\n    pass\n\n\n"
+        "@pytest.mark.smoke_id('internal-health')\ndef test_is_left_out() -> None:\n    assert False\n",
+        encoding="utf-8",
+    )
+    quiet = "-q -p no:cacheprovider -W ignore::pytest.PytestUnknownMarkWarning"
+
+    def left_by(*selection: str) -> tuple[int, str | None]:
+        """The exit of a run of those tests, and what it left as its failed tests, None for no file."""
+        left = tmp_path / "build" / "failed"
+        left.unlink(missing_ok=True)
+        more = {verify.FAILED_TESTS_FILE_VARIABLE: str(left), "PYTEST_ADDOPTS": quiet}
+        exit_code = run_tests_in(tmp_path, [str(tests), *selection], more=more)
+        return exit_code, left.read_text(encoding="utf-8") if left.exists() else None
+
+    exit_code, left = left_by()
+    assert exit_code != 0 and left is not None
+    assert sorted(left.splitlines()) == ["environment", "no-key"] and left.endswith("\n")
+    # A run in which no test fails leaves no file: there is nothing for the step to copy.
+    assert left_by("-k", "passes") == (0, None)
 
 
 def test_what_the_tests_print_reaches_the_log_without_the_key(

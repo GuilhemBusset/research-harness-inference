@@ -13,8 +13,10 @@
 #   instances report.
 # - ssm:GetParameter on the release parameter of each pool the stage deploys, each by its name,
 #   /rhi/pools/<pool>/release: the release the pipeline deployed, which the served one must equal.
-# - s3:PutObject on verification/* of the pipeline's artifact bucket: the object
-#   verification/<execution ID>/not-run, when no test could run.
+# - s3:PutObject on verification/* of the pipeline's artifact bucket: the step's marks, which its
+#   post-build phase writes itself because a failed action may leave no output artifact. They are
+#   the objects verification/<execution ID>/not-run, when no test could run, and
+#   verification/<execution ID>/failed-smoke-tests, the IDs of the smoke tests that failed.
 # - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
 #   CDK Pipelines' grant to a project that takes an input, here the source the step runs.
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,

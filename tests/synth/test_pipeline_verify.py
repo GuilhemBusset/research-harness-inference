@@ -1,7 +1,8 @@
 """The pipeline's verification step (src/rhi/pipeline/verify.py; system design, section 8.2, step
 6): the action named Verify, after the stage's deployment, which runs the verification script and
 builds no image; a post-build phase that copies the script's reason, when there is one, to the
-key verification/<execution ID>/not-run of the artifact bucket; inputs that are outputs of the
+key verification/<execution ID>/not-run of the artifact bucket, and the IDs of the smoke tests
+that failed to failed-smoke-tests beside it; inputs that are outputs of the
 stage's stacks and the execution's ID; and a role that reads the canary's secret, queries the
 stage's workspace, reads the stage's pools' release parameters and writes under verification/.
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -149,14 +151,16 @@ def test_the_step_runs_the_script_outside_the_network_and_builds_no_image(verifi
     assert not any("docker" in command for command in commands)
 
 
-def test_the_post_build_phase_copies_the_reason_when_there_is_one(verification: Verification, tmp_path: Path) -> None:
+def test_the_post_build_phase_copies_what_the_script_left(verification: Verification, tmp_path: Path) -> None:
     by_action, by_project = verification.given_by_the_action(), verification.given_by_the_project()
     (execution,) = [name for name, value in by_action.items() if value == EXECUTION_ID]
     (store,) = [verification.pipeline["ArtifactStore"]["Location"]]
     (bucket,) = [name for name, value in by_project.items() if value == store]
-    reason_file = script.REASON_FILE_VARIABLE
-    # The file the step names is outside the checkout, which CodeBuild places under its own folder.
-    assert Path(by_project[reason_file]).is_absolute() and not by_project[reason_file].startswith("/codebuild")
+    reason_file, failed_file = script.REASON_FILE_VARIABLE, script.FAILED_TESTS_FILE_VARIABLE
+    # The files the step names are two, outside the checkout, which CodeBuild places under its own folder.
+    assert by_project[reason_file] != by_project[failed_file]
+    for file in (reason_file, failed_file):
+        assert Path(by_project[file]).is_absolute() and not by_project[file].startswith("/codebuild")
 
     # The AWS CLI, as far as the phase uses it: `aws s3 cp <file> s3://<bucket>/<key>`, into a folder.
     tools, buckets = tmp_path / "tools", tmp_path / "buckets"
@@ -168,19 +172,24 @@ def test_the_post_build_phase_copies_the_reason_when_there_is_one(verification: 
     )
     (tools / "aws").chmod(0o755)
 
-    def post_build(reason: str | None, *, refuses: bool = False) -> tuple[int, dict[str, str]]:
-        """Runs the phase for the execution `an-execution`, after a script that left `reason`:
-        its exit, and the objects of the buckets."""
-        left = tmp_path / "left" / "reason"
-        left.parent.mkdir(exist_ok=True)
-        left.unlink(missing_ok=True)
-        if reason is not None:
-            left.write_text(reason, encoding="utf-8")
+    def post_build(
+        reason: str | None, *, failed: str | None = None, refuses: bool = False
+    ) -> tuple[int, dict[str, str]]:
+        """Runs the phase for the execution `an-execution`, after a script that left `reason`
+        and the failed tests `failed`: its exit, and the objects of the buckets."""
+        shutil.rmtree(buckets, ignore_errors=True)
+        folder = tmp_path / "left"
+        folder.mkdir(exist_ok=True)
+        for name, held in (("reason", reason), ("failed", failed)):
+            (folder / name).unlink(missing_ok=True)
+            if held is not None:
+                (folder / name).write_text(held, encoding="utf-8")
         environ = {
             "PATH": f"{tools}:/usr/bin:/bin",
             "BUCKETS": str(buckets),
             "REFUSES": "yes" if refuses else "",
-            reason_file: str(left),
+            reason_file: str(folder / "reason"),
+            failed_file: str(folder / "failed"),
             bucket: "artifacts",
             execution: "an-execution",
         }
@@ -195,11 +204,17 @@ def test_the_post_build_phase_copies_the_reason_when_there_is_one(verification: 
         }
         return max(exits), objects
 
-    # No reason: every test ran, and nothing is written.
+    # Neither file: every test ran and passed, and nothing is written.
     assert post_build(None) == (0, {})
     # A copy that fails fails the build: a verification that was not run is not taken for one that passed.
     assert post_build("canary-missing\n", refuses=True)[0] != 0
     assert post_build("listener-off\n") == (0, {"artifacts/verification/an-execution/not-run": "listener-off\n"})
+    # The IDs of the tests that failed, as the script left them, beside where the reason goes. The
+    # phase is the build's post-build phase, which CodeBuild runs after a build phase that failed.
+    assert post_build(None, failed="hello\nno-key\n") == (
+        0,
+        {"artifacts/verification/an-execution/failed-smoke-tests": "hello\nno-key\n"},
+    )
 
 
 def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(verification: Verification) -> None:

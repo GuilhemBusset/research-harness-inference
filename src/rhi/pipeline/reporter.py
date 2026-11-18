@@ -24,10 +24,19 @@ function posts nothing.
 **The function's role** may read that secret, the state of this pipeline's executions and their
 list, from which it finds the commits a self-update left without an execution (section 8.4), the
 events of the stacks this pipeline deploys, the objects of the pipeline's artifact bucket (where the
-synth step's output, the templates of each execution, is kept), publish to the owner's topic of
-`rhi.pipeline.notify` and to no other topic, and write its own logs. Nothing else:
-`tests/policy/test_pipeline.py` holds it to that. The topic is encrypted with the key AWS manages
-for SNS, whose policy admits the account's principals through SNS: the role needs no grant on it.
+synth step's output, the templates of each execution, is kept, and, under `verification/`, the marks
+of each execution's verification), list that bucket under the prefix `verification/` and no other,
+publish to the owner's topic of `rhi.pipeline.notify` and to no other topic, and write its own logs.
+Nothing else: `tests/policy/test_pipeline.py` holds it to that. The topic is encrypted with the key
+AWS manages for SNS, whose policy admits the account's principals through SNS: the role needs no
+grant on it.
+
+**Why the role lists.** The verification step leaves a mark only when it has something to say
+(`rhi.pipeline.verify`), and a verification with no `not-run` mark is one whose tests ran. S3
+answers a read of an object that is not there as it answers a read that is not allowed, unless the
+caller may list the bucket. So the function lists a mark's key before it reads it, and the role's
+listing carries the condition that the listed prefix is under `verification/`: it shows no other
+key of the bucket.
 
 What the function is told, as environment variables:
 
@@ -36,9 +45,12 @@ What the function is told, as environment variables:
 - `RHI_REPORTER_STAGES`: the stages the pipeline deploys, comma-separated, under which the steps
   that run before them report;
 - `RHI_REPORTER_TOPIC`: the ARN of the owner's topic, where the details of a failure go;
-- `RHI_REPORTER_SMOKE_TESTS`: the allow-list of smoke test IDs, comma-separated: the list of
+- `RHI_SMOKE_TEST_IDS`: the allow-list of smoke test IDs, comma-separated: the list of
   `tests/smoke/ids.py`, read at synthesis (`smoke_test_ids`). The function's bundle holds nothing
   of the tests, and a report names a failed smoke test only by an ID of this list (section 8.4).
+  A change to the list changes the function's configuration, so the same deployment carries it;
+- `RHI_REPORTER_ARTIFACTS`: the name of the pipeline's artifact bucket, where the verification
+  leaves its marks.
 """
 
 from __future__ import annotations
@@ -72,7 +84,10 @@ SECRET_VARIABLE = "RHI_REPORTER_SECRET"
 REPOSITORY_VARIABLE = "RHI_REPORTER_REPOSITORY"
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
-SMOKE_TESTS_VARIABLE = "RHI_REPORTER_SMOKE_TESTS"
+SMOKE_TESTS_VARIABLE = "RHI_SMOKE_TEST_IDS"
+ARTIFACTS_VARIABLE = "RHI_REPORTER_ARTIFACTS"
+# The prefix of the verification's marks in the artifact bucket (`rhi.pipeline.verify`).
+MARKS_PREFIX = "verification"
 
 # Where the smoke tests list their IDs, and the name the list has there.
 SMOKE_TEST_IDS_FILE = packaging.REPO / "tests/smoke/ids.py"
@@ -165,9 +180,17 @@ class Reporter(Construct):
             stack.format_arn(service="cloudformation", resource="stack", resource_name=f"{name}/*") for name in deployed
         ]
         role.add_to_policy(iam.PolicyStatement(actions=["cloudformation:DescribeStackEvents"], resources=stack_arns))
-        # The synth step's output of every execution, in the pipeline's own artifact bucket.
+        # The synth step's output of every execution and the marks of its verification, in the
+        # pipeline's own artifact bucket.
+        artifacts = pipeline.artifact_bucket
+        role.add_to_policy(iam.PolicyStatement(actions=["s3:GetObject"], resources=[artifacts.arn_for_objects("*")]))
+        # A listing of the marks, and of nothing else of the bucket.
         role.add_to_policy(
-            iam.PolicyStatement(actions=["s3:GetObject"], resources=[pipeline.artifact_bucket.arn_for_objects("*")])
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[artifacts.bucket_arn],
+                conditions={"StringLike": {"s3:prefix": f"{MARKS_PREFIX}/*"}},
+            )
         )
         # The owner's topic, and no other.
         role.add_to_policy(iam.PolicyStatement(actions=["sns:Publish"], resources=[topic.topic_arn]))
@@ -189,6 +212,7 @@ class Reporter(Construct):
                 STAGES_VARIABLE: stage.stage_name,
                 TOPIC_VARIABLE: topic.topic_arn,
                 SMOKE_TESTS_VARIABLE: SEPARATOR.join(smoke_test_ids()),
+                ARTIFACTS_VARIABLE: artifacts.bucket_name,
             },
         )
         target = targets.LambdaFunction(self.function)  # ty: ignore[invalid-argument-type] - as above

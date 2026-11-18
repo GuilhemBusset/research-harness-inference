@@ -1,7 +1,9 @@
 """The pipeline's reporter, in the app's synthesized templates (system design, section 8.2, step 7):
 a rule on this pipeline's state changes and nothing else, the function it invokes, the secret
 the function reads, which the stack refers to and never creates, and the owner's topic, where the
-function sends what a public status may not carry (section 8.4). Beside them, the measurement bus,
+function sends what a public status may not carry (section 8.4); the allow-list of smoke test IDs
+and the artifact bucket the function is told, and its role's read of the verification's marks in
+that bucket. Beside them, the measurement bus,
 a rule on it for a job's measurements that invokes the same function, and the grant a job's role
 is given to put events on that bus (sections 8.4 and 12).
 """
@@ -116,15 +118,19 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
     template = templates[PIPELINE_TEMPLATE]
     (function,) = reporter_functions(template).values()
     (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    (pipeline,) = of_type(template, "AWS::CodePipeline::Pipeline").values()
     example = config.load({"RHI_CONFIG": "example"})
     assert function["Environment"]["Variables"] == {
         "RHI_REPORTER_SECRET": SECRET_NAME,
         "RHI_REPORTER_REPOSITORY": f"{example.github_owner}/{example.github_repo}",
         handler.STAGES_VARIABLE: "Rhi",
         handler.TOPIC_VARIABLE: {"Ref": topic_id},
-        handler.SMOKE_TESTS_VARIABLE: ",".join(SMOKE_TEST_IDS),
+        "RHI_SMOKE_TEST_IDS": ",".join(SMOKE_TEST_IDS),
+        # The bucket the verification step writes its marks to: the pipeline's artifact bucket.
+        handler.ARTIFACTS_VARIABLE: pipeline["ArtifactStore"]["Location"],
     }
     # The allow-list as the function reads it: every ID the smoke tests list, and nothing else.
+    assert handler.SMOKE_TESTS_VARIABLE == "RHI_SMOKE_TEST_IDS"
     assert handler.smoke_test_ids(function["Environment"]["Variables"]) == SMOKE_TEST_IDS != ()
 
 
@@ -186,6 +192,7 @@ ROLE_ACTIONS = {
     "codepipeline:ListPipelineExecutions",
     "cloudformation:DescribeStackEvents",
     "s3:GetObject",
+    "s3:ListBucket",
     "sns:Publish",
     "logs:CreateLogStream",
     "logs:PutLogEvents",
@@ -220,6 +227,27 @@ def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[
     parts = listing["Resource"]["Fn::Join"][1]
     assert parts[-1] == {"Ref": pipeline_id}
     assert [part for part in parts if isinstance(part, str)] == ["arn:", ":codepipeline:", ":", ":"]
+
+
+def test_the_role_reads_the_verification_s_marks_and_lists_no_other_key(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (pipeline,) = of_type(template, "AWS::CodePipeline::Pipeline").values()
+    bucket = {"Fn::GetAtt": [pipeline["ArtifactStore"]["Location"]["Ref"], "Arn"]}
+    on_s3 = [s for s in role_statements(template) if any(a.startswith("s3:") for a in as_list(s["Action"]))]
+    # The objects of the artifact bucket, the marks under verification/ among them, as before; and
+    # a listing of that bucket that is shown the keys under the marks' prefix and no other, which
+    # is the prefix the function lists and the one the verification step writes under.
+    marks = f"{handler.MARKS_PREFIX}/*"
+    assert marks == "verification/*"
+    assert sorted(on_s3, key=lambda statement: statement["Action"]) == [
+        {"Action": "s3:GetObject", "Effect": "Allow", "Resource": {"Fn::Join": ["", [bucket, "/*"]]}},
+        {
+            "Action": "s3:ListBucket",
+            "Effect": "Allow",
+            "Resource": bucket,
+            "Condition": {"StringLike": {"s3:prefix": marks}},
+        },
+    ]
 
 
 def test_the_role_may_publish_to_the_owner_s_topic_only(templates: dict[str, dict[str, Any]]) -> None:

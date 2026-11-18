@@ -22,7 +22,8 @@ and of the execution:
 
 - `RHI_VERIFY_EXECUTION`: the execution's ID, from the pipeline's variable for it;
 - `RHI_VERIFY_BUCKET`: the pipeline's artifact bucket;
-- `RHI_VERIFY_REASON_FILE`: where the script leaves its reason when it runs no test.
+- `RHI_VERIFY_REASON_FILE`: where the script leaves its reason when it runs no test;
+- `RHI_VERIFY_FAILED_TESTS_FILE`: where the script leaves the IDs of the tests that fail.
 
 **When no test runs.** While the endpoint has no listener, or the canary's secret is missing or
 holds no key, the script runs no test, writes its reason to that file, `listener-off` or
@@ -30,6 +31,13 @@ holds no key, the script runs no test, writes its reason to that file, `listener
 the object `verification/<execution ID>/not-run` of the artifact bucket, where the reporter reads
 that the verification was not run. A copy that fails fails the step: a verification that was not
 run is never taken for one that passed.
+
+**When a test fails.** A CodeBuild action that fails may leave no output artifact, so the step
+does not rely on one. The script leaves the ID of each smoke test that fails, one per line and
+nothing else, in the file of the second variable, and the post-build phase, which CodeBuild runs
+whether the build phase passed or failed, copies it, when there is one, to the object
+`verification/<execution ID>/failed-smoke-tests`, beside `not-run`. The reporter names those
+tests in its report of the failure (`rhi_reporter.handler`).
 
 **The role** may read the canary's secret, `rhi/canary-key`; query the workspace of the stage it
 verifies, which it names by the workspace's tag, since the workspace has no ID when the role is
@@ -68,8 +76,10 @@ CANARY_SECRET = "rhi/canary-key"
 # in the folder of the execution's ID.
 PREFIX = "verification"
 NOT_RUN = "not-run"
-# The file the script leaves its reason in, outside the checkout.
+FAILED_TESTS = "failed-smoke-tests"
+# The files the script leaves its reason and the IDs of the failed tests in, outside the checkout.
 REASON_FILE = "/tmp/rhi-verification-not-run"
+FAILED_TESTS_FILE = "/tmp/rhi-verification-failed-smoke-tests"
 
 ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
@@ -77,16 +87,23 @@ RELEASE_PARAMETERS_VARIABLE = "RHI_VERIFY_RELEASE_PARAMETERS"
 EXECUTION_VARIABLE = "RHI_VERIFY_EXECUTION"
 BUCKET_VARIABLE = "RHI_VERIFY_BUCKET"
 REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
+FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 # CodePipeline's variable for the ID of the execution an action runs in.
 EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
 
 INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
 COMMANDS = ["uv sync --locked", f"uv run --locked python {SCRIPT}"]
-# The reason, when the script left one, as the object the reporter reads.
-NOT_RUN_OBJECT = f"s3://${BUCKET_VARIABLE}/{PREFIX}/${EXECUTION_VARIABLE}/{NOT_RUN}"
-POST_BUILD_COMMANDS = [
-    f'if [ -f "${REASON_FILE_VARIABLE}" ]; then aws s3 cp "${REASON_FILE_VARIABLE}" "{NOT_RUN_OBJECT}"; fi'
-]
+
+
+def _copy(file_variable: str, key: str) -> str:
+    """The command that copies the file a variable names, when there is one, to the object `key`
+    of the execution's folder, where the reporter reads it."""
+    to = f"s3://${BUCKET_VARIABLE}/{PREFIX}/${EXECUTION_VARIABLE}/{key}"
+    return f'if [ -f "${file_variable}" ]; then aws s3 cp "${file_variable}" "{to}"; fi'
+
+
+# What the script left, as the objects the reporter reads: its reason, and the tests that failed.
+POST_BUILD_COMMANDS = [_copy(REASON_FILE_VARIABLE, NOT_RUN), _copy(FAILED_TESTS_FILE_VARIABLE, FAILED_TESTS)]
 
 
 def verify_step(
@@ -98,6 +115,7 @@ def verify_step(
         EXECUTION_VARIABLE: EXECUTION_ID,
         BUCKET_VARIABLE: artifacts.bucket_name,
         REASON_FILE_VARIABLE: REASON_FILE,
+        FAILED_TESTS_FILE_VARIABLE: FAILED_TESTS_FILE,
     }
     outputs: dict[str, cdk.CfnOutput] = {}
     # Secrets Manager adds six random characters to a secret's name in its ARN.
