@@ -1,0 +1,74 @@
+# The engine: the container of the release's engine image (system design, "The engine contract"
+# and "What happens on an instance"). The same file runs on every pool: the image is the
+# release's, by its digest, and the docker of the host takes its own platform from it.
+#
+# It has no [Install] section and no unit asks for it: the lifecycle agent starts it, after the
+# release check, and stops it once the engine has drained.
+#
+# The network is the host's, so the engine's own port, 8000, is the instance's, and the collector
+# scrapes the engine on the loopback address, which is the only one its metrics route answers.
+#
+# The pool's secret. The start command reads it from Secrets Manager, by RHI_SECRET_ID, and holds
+# it in the memory of one shell. Docker is given neither its value nor its name: what docker is
+# given of a container (the command, the variables of --env) it writes to the container's record
+# under its data directory, which is on the EBS volume. So the value goes to the container's
+# standard input, and the container's first process is a shell that reads it into RHI_POOL_SECRET
+# and then becomes the image's own command, which finds the variable in its environment. The
+# value is in no argument, in no file, and in no environment but the engine's.
+# - The image's command is its entry point and its command, read from the image the host holds
+#   (the agent pulls it before it starts this unit), a word on each line: an argument of it holds
+#   no line break. Docker ends what it prints with a line break of its own, which is no word.
+# - An engine image carries /bin/sh.
+#
+# Storage. An instance has one EBS volume, its root volume, and an instance store is another
+# filesystem, wiped when the instance stops. A stopped warm instance keeps its pulled image and
+# its compile cache only if they are on the volume. So before each start the unit checks that
+# docker keeps its data in /var/lib/docker and that this directory and the cache's are on the
+# filesystem of /, and it does not start the engine otherwise. The cache's directory is the
+# container's /var/cache/rhi-engine, which XDG_CACHE_HOME names to the engine. The engine writes
+# there under its image's user, whichever it is.
+#
+# A value of systemd's own syntax: $$ is a dollar sign and %% a percent sign, for the shell.
+
+[Unit]
+Description=The engine container of the pool's release, on port 8000
+Requires=docker.service
+After=docker.service
+
+[Service]
+EnvironmentFile=/run/rhi/release.env
+ExecStartPre=-/usr/bin/docker rm --force rhi-engine
+ExecStartPre=/bin/bash -c ' \
+    set -eu; \
+    [ "$$(docker info --format "{{.DockerRootDir}}")" = "$$1" ] \
+        || { echo "rhi-engine: docker does not keep its data in $$1" >&2; exit 1; }; \
+    install -d -m 1777 "$$2"; \
+    for directory in "$$1" "$$2"; do \
+        [ "$$(stat --dereference --format %%d "$$directory")" = "$$(stat --dereference --format %%d "$$3")" ] \
+            || { echo "rhi-engine: $$directory is not on the volume of $$3" >&2; exit 1; }; \
+    done' \
+    rhi-engine /var/lib/docker /var/lib/rhi/engine-cache /
+ExecStart=/bin/bash -c ' \
+    set -euo pipefail; \
+    secret="$$(aws secretsmanager get-secret-value --region "$$RHI_REGION" --secret-id "$$RHI_SECRET_ID" \
+        --query SecretString --output text)"; \
+    [ -n "$$secret" ] || { echo "rhi-engine: the secret is empty" >&2; exit 1; }; \
+    mapfile -t command < <(docker image inspect --format \
+        "{{range .Config.Entrypoint}}{{println .}}{{end}}{{range .Config.Cmd}}{{println .}}{{end}}" \
+        "$$RHI_ENGINE_IMAGE"); \
+    [ "$${#command[@]}" -eq 0 ] || [ -n "$${command[-1]}" ] || unset "command[-1]"; \
+    [ "$${#command[@]}" -gt 0 ] \
+        || { echo "rhi-engine: the engine image is not held, or it names no command" >&2; exit 1; }; \
+    exec docker run --rm --name rhi-engine --interactive --network host \
+        --volume /var/lib/rhi/engine-cache:/var/cache/rhi-engine \
+        --env XDG_CACHE_HOME=/var/cache/rhi-engine \
+        --entrypoint /bin/sh "$$RHI_ENGINE_IMAGE" -c "$$1" rhi-engine "$${command[@]}" \
+        < <(printf %%s "$$secret")' \
+    rhi-engine \
+    'IFS= read -r RHI_POOL_SECRET; \
+    [ -n "$$RHI_POOL_SECRET" ] || { echo "rhi-engine: no secret on the standard input" >&2; exit 1; }; \
+    export RHI_POOL_SECRET; \
+    exec "$$@"'
+ExecStop=/usr/bin/docker stop rhi-engine
+Restart=on-failure
+RestartSec=5
