@@ -7,6 +7,10 @@ gateway and its collector do and no more; and a collector beside the gateway, bo
 Some values of the environment are references that CloudFormation resolves at deployment.
 `Deployment` gives each a placeholder of the form the deployment would give, and remembers which
 resource of which template the placeholder stands for.
+
+The tests synthesize the stage themselves, with its gateway stack and with cdk-nag: the app does
+not ask the stage for that stack yet (`rhi.stage.EndpointStage`). The CDK is imported inside
+`synthesize`, after `app_module` has started jsii (see conftest.py).
 """
 
 from __future__ import annotations
@@ -128,7 +132,12 @@ class Deployment:
 class Gateway:
     """The gateway stack's template among the stage's, and what the tests read of it."""
 
-    def __init__(self, templates: Templates) -> None:
+    def __init__(self, outdir: Path) -> None:
+        self.outdir = outdir
+        templates = {
+            path.relative_to(outdir).as_posix(): json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(outdir.rglob("*.template.json"))
+        }
         self.deployment = Deployment(templates)
         self.path, self.template = find(templates, "RhiGateway")
         ((_, self.service),) = of_type(self.template, "AWS::ECS::Service").items()
@@ -144,22 +153,30 @@ class Gateway:
         return self.deployment.origin(value, self.path)
 
 
-def synthesize(app_module: ModuleType, outdir: Path, change: Any) -> Gateway:
-    """The gateway of the app built from the example configuration's data, once `change` has
-    changed it, with the context of `cdk.json` and cdk-nag, and nothing bundled."""
+def synthesize(app_module: ModuleType, outdir: Path, change: Any = None) -> Gateway:
+    """The gateway of the stage built, with its gateway stack, from the example configuration's
+    data once `change` has changed it: with the context of `cdk.json`, nothing bundled, and
+    cdk-nag as the app runs it, which fails the synthesis on a finding that the file of the
+    resource's module does not acknowledge."""
+    import aws_cdk as cdk
+
+    from rhi.stage import EndpointStage
+
     data = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
-    change(data)
+    if change is not None:
+        change(data)
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    app_module.build(config.parse(data, "test"), outdir=str(outdir), context=context).synth()
-    return Gateway(
-        {p.relative_to(outdir).as_posix(): json.loads(p.read_text()) for p in outdir.rglob("*.template.json")}
-    )
+    app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
+    EndpointStage(app, "Rhi", config=config.parse(data, "test"), gateway=True)
+    app_module.add_nag(app)
+    app.synth()
+    return Gateway(outdir)
 
 
 @pytest.fixture(scope="module")
-def gateway(templates: Templates) -> Gateway:
+def gateway(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> Gateway:
     """The gateway under the example configuration."""
-    return Gateway(templates)
+    return synthesize(app_module, tmp_path_factory.mktemp("example"))
 
 
 # Six numbers that are neither the configuration's defaults nor the settings reader's.
@@ -220,10 +237,8 @@ def test_the_service_runs_on_fargate_in_private_subnets_with_no_load_balancer(ga
     assert admitted == [{"Fn::GetAtt": [group, "GroupId"]}]
 
 
-def test_the_image_is_built_from_the_gateway_s_context_for_the_tasks_architecture(
-    gateway: Gateway, cloud_assembly: Path
-) -> None:
-    (assets,) = (cloud_assembly / gateway.path).parent.glob("RhiGateway*.assets.json")
+def test_the_image_is_built_from_the_gateway_s_context_for_the_tasks_architecture(gateway: Gateway) -> None:
+    (assets,) = (gateway.outdir / gateway.path).parent.glob("RhiGateway*.assets.json")
     ((tag, image),) = json.loads(assets.read_text(encoding="utf-8"))["dockerImages"].items()
     assert gateway.container["Image"]["Fn::Sub"].endswith(f":{tag}")
     assert gateway.task["RuntimePlatform"] == {"CpuArchitecture": "ARM64", "OperatingSystemFamily": "LINUX"}
@@ -362,6 +377,19 @@ def test_the_task_role_may_do_what_the_gateway_does_and_nothing_else(gateway: Ga
         ("aps:RemoteWrite", stands_for[endpoint]),
     }
     assert allowed == expected
+
+
+def test_an_action_on_every_resource_is_one_the_module_s_file_lists(gateway: Gateway) -> None:
+    file = REPO / "tests" / "policy" / "acknowledged" / "gateway_service.toml"
+    listed = tomllib.loads(file.read_text(encoding="utf-8"))["wildcard_actions"]
+    on_every_resource = {
+        action
+        for policy in of_type(gateway.template, "AWS::IAM::Policy").values()
+        for statement in as_list(policy["PolicyDocument"]["Statement"])
+        if "*" in as_list(statement["Resource"])
+        for action in as_list(statement["Action"])
+    }
+    assert on_every_resource == set(listed)
 
 
 def test_a_collector_pinned_by_digest_runs_beside_the_gateway_with_its_configuration(gateway: Gateway) -> None:
