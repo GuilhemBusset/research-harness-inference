@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import aws_cdk as cdk
 
 from rhi.access.stack import AccessStack
+from rhi.gateway.stack import GatewayStack
 from rhi.network.stack import NetworkStack
 from rhi.observability.stack import ObservabilityStack
 from rhi.pools.stack import PoolsStack
@@ -47,3 +48,13 @@ class EndpointStage(cdk.Stage):
         # The internal load balancer beside them, in the network's VPC, the groups and the scaler,
         # which writes to the workspace.
         self.pools = PoolsStack(self, "Pools", config=config, network=self.network, observability=self.observability)
+        # The gateway's service, which reads of every stack above: it is deployed after them.
+        self.gateway = GatewayStack(
+            self,
+            "Gateway",
+            config=config,
+            network=self.network,
+            access=self.access,
+            observability=self.observability,
+            pools=self.pools,
+        )
