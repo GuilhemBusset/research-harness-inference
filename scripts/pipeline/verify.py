@@ -27,6 +27,13 @@ no test, writes its reason, `listener-off` or `canary-missing`, as the one line 
 `RHI_VERIFY_REASON_FILE` names, and exits 0. The step's post-build phase copies that file to where
 the reporter reads that the verification was not run: neither passed nor failed.
 
+**The tests that failed.** A smoke test is known by its ID (`tests/smoke/ids.py`). As the run's
+plugin, this file adds the ID of each test that fails, when it fails, as one more line of the file
+`RHI_VERIFY_FAILED_TESTS_FILE` names: the IDs, one per line, and nothing else, so a run that is
+cut short still leaves those it had. No failed test leaves no file. The step's post-build phase,
+which runs after a failed build too, copies the file to where the reporter reads which tests
+failed.
+
 What the step gives, in the environment:
 
 | Variable | Holds |
@@ -35,6 +42,7 @@ What the step gives, in the environment:
 | `RHI_SMOKE_WORKSPACE_URL` | The Prometheus workspace's query address, which the smoke tests read as it is |
 | `RHI_VERIFY_RELEASE_PARAMETERS` | Each pool and its release parameter: `pool=name`, comma-separated, or `none` |
 | `RHI_VERIFY_REASON_FILE` | The file the reason is left in |
+| `RHI_VERIFY_FAILED_TESTS_FILE` | The file the IDs of the failed tests are left in |
 
 The pools' parameters come from a stack's output through the pipeline, which puts the value into
 JSON as it is, so they arrive without a quote; the smoke tests read them as JSON, in
@@ -45,7 +53,7 @@ Run by the verification step, from the checkout:
     uv run --locked python scripts/pipeline/verify.py
 
 The file is also the pytest plugin of the run it starts (`-p verify`): `pytest_collection_modifyitems`,
-below, is what deselects.
+below, is what deselects, and `pytest_runtest_logreport` what leaves the IDs of the failed tests.
 """
 
 from __future__ import annotations
@@ -76,6 +84,7 @@ KEY_VARIABLE = "RHI_SMOKE_KEY"
 SMOKE_RELEASE_PARAMETERS_VARIABLE = "RHI_SMOKE_RELEASE_PARAMETERS"
 RELEASE_PARAMETERS_VARIABLE = "RHI_VERIFY_RELEASE_PARAMETERS"
 REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
+FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 
 # What the endpoint's output reads while there is no HTTPS listener (`rhi.gateway.stack`), and the
 # pools' output while there is no pool (`rhi.pools.stack`).
@@ -102,15 +111,40 @@ ID_MARKER = "smoke_id"
 REDACTED = "[canary key]"
 PIECE = 8
 
+# As a plugin, in the process that runs the tests: the IDs of each test that is run, by the name
+# pytest reports the test under, and the IDs already left as failed.
+_ids: dict[str, tuple[str, ...]] = {}
+_left: set[str] = set()
+
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of `DESELECTED`."""
+    """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of `DESELECTED`,
+    and keeps the IDs of the others for `pytest_runtest_logreport`."""
     left_out = [
         item for item in items if any(set(marker.args) & set(DESELECTED) for marker in item.iter_markers(ID_MARKER))
     ]
     if left_out:
         config.hook.pytest_deselected(items=left_out)
         items[:] = [item for item in items if item not in left_out]
+    for item in items:
+        _ids[item.nodeid] = tuple(
+            test_id for marker in item.iter_markers(ID_MARKER) for test_id in marker.args if isinstance(test_id, str)
+        )
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """As a plugin of the run of the smoke tests: when a test fails, in its set-up, its call or its
+    teardown, adds its ID as a line of the file `RHI_VERIFY_FAILED_TESTS_FILE` names, once. Only
+    the ID is written: nothing of what the test held or printed. Without the variable, nothing is."""
+    named = os.environ.get(FAILED_TESTS_FILE_VARIABLE)
+    failed = [test_id for test_id in _ids.get(report.nodeid, ()) if test_id not in _left] if report.failed else []
+    if not named or not failed:
+        return
+    path = Path(named)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.writelines(f"{test_id}\n" for test_id in failed)
+    _left.update(failed)
 
 
 def canary_key(client: Any) -> str | None:

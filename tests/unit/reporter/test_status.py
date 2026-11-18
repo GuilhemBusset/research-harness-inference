@@ -1,8 +1,9 @@
 """A pipeline event becomes one commit status, from a fixed vocabulary (system design, section 8.4).
 
 The status is the factory's only view of a deployment and it is public: these tests hold the
-contexts and states the implement loop waits on, the two descriptions it reads by value, and that
-nothing of an event but five fields can reach GitHub.
+contexts and states the implement loop waits on, the two descriptions it reads by value, that
+nothing of an event but five fields can reach GitHub, and that a verification that ran no test is
+described as one, never as verified.
 """
 
 import dataclasses
@@ -19,6 +20,8 @@ from rhi_reporter.status import (
     CommitStatus,
     Description,
     State,
+    as_it_ran,
+    not_run_description,
     status_for,
     superseded_description,
 )
@@ -140,6 +143,29 @@ def test_nothing_from_aws_is_copied() -> None:
             assert recorded.read == set(EVENT_FIELDS) == {"stage", "action", "category", "state", "commit"}
             written = " ".join(str(value) for value in dataclasses.astuple(status))
             assert not [value for value in (account, arn, bucket) if value in written], (kind, state)
+
+
+def test_a_verification_that_ran_no_test_is_described_by_its_reason_and_never_as_verified() -> None:
+    canary, listener = not_run_description("canary-missing"), not_run_description("listener-off")
+    other = not_run_description("parked")
+    # Three members of the vocabulary, which no event gives and the loop does not read as verified.
+    assert len({canary, listener, other}) == 3 and {canary, listener, other} <= set(Description)
+    assert VERIFIED_DESCRIPTION not in (canary, listener, other)
+    assert [given_by(description) for description in (canary, listener, other)] == [[], [], []]
+    # A reason is compared and never written: whatever else it is, it gets the one other member.
+    arn = ":".join(("arn", "aws", "s3", "", "", "pipeline-artifacts"))
+    for reason in ("", "Canary-Missing", "canary-missing\n", f"listener-off {arn}", arn, 7, None):
+        assert not_run_description(reason) is other
+
+    verified = status_for(event("verify", "SUCCEEDED"))
+    told = as_it_ran(verified, "listener-off")
+    assert told == CommitStatus(SHA, State.SUCCESS, "verify/Prod", listener)
+    assert as_it_ran(verified, arn) == CommitStatus(SHA, State.SUCCESS, "verify/Prod", other)
+    # With no reason the tests ran, and only a verification's success is told otherwise.
+    assert as_it_ran(verified, None) == verified
+    for kind, state in SWEEP:
+        status = status_for(event(kind, state))
+        assert status == verified or as_it_ran(status, "canary-missing") == status, (kind, state)
 
 
 def test_an_approval_has_descriptions_of_its_own() -> None:
