@@ -35,15 +35,17 @@ no hold. Otherwise the reservation is made, and only then is the scaler asked to
 A hold that ends, at its deadline (`warming`, or `capacity_unavailable`) or for any other cause,
 settles the reservation with nothing observed, which the ledger charges the input estimate, and
 ends the request with its cause: the error event of its format on a stream, the JSON answer (503
-with `Retry-After` for `warming`) otherwise. Token counting is a cheap call (section 5.3): it is
-never held and never asks for a wake, and on a pool that is not ready it is answered `warming` at
-once, before any reservation.
+with `Retry-After` for `warming`) otherwise. The seconds of `Retry-After` are the design's for each
+cause that carries the header, or those `Forwarding.retry_after` gives. Token counting is a cheap
+call (section 5.3): it is never held and never asks for a wake, and on a pool that is not ready it
+is answered `warming` at once, before any reservation.
 
 **The demand** (section 5.1): with a heartbeat (`rhi_gateway.heartbeat`), a request counts as
 held while it is held and as in flight from its forwarding to its end, which the settlement marks;
 it is received once its reservation is made. Token counting is never demand, and neither is
 anything the local routes answer. `build_app` given the heartbeat starts its writes with the
-application and, at shutdown, stops them with a last row of zeros.
+application and, at shutdown, stops them with a last row of zeros. Given the readiness reader, it
+runs its cycle for as long as the application does.
 
 The models, status, wake and hello routes are answered by `rhi_gateway.local`: `build_app` fills
 their slots from the `LocalRoutes` it is given (the wake's only when that is given the waker and
@@ -74,7 +76,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from starlette.applications import Starlette
@@ -95,7 +97,7 @@ from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
 from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
-from rhi_gateway.readiness import PoolView
+from rhi_gateway.readiness import PoolView, Readiness
 from rhi_gateway.routes import TABLE, Route, match
 
 if TYPE_CHECKING:
@@ -145,18 +147,24 @@ class TableRoute(BaseRoute):
         raise NoMatchFound(name, path_params)
 
 
-def _beating(heartbeat: Heartbeat) -> Callable[[Starlette], Any]:
-    """The application's lifespan: the heartbeat writes while it runs, and its last row is one of zeros."""
+def _running(heartbeat: Heartbeat | None, readiness: Readiness | None) -> Callable[[Starlette], Any]:
+    """The application's lifespan: the pools are read and the heartbeat writes while it runs.
+
+    The heartbeat's last row is one of zeros, written once both have stopped.
+    """
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncGenerator[None]:
-        writing = asyncio.ensure_future(heartbeat.run())
+        loops = [part.run() for part in (readiness, heartbeat) if part is not None]
+        running = [asyncio.ensure_future(loop) for loop in loops]
         try:
             yield
         finally:
-            writing.cancel()
-            await asyncio.wait((writing,))
-            await heartbeat.stop()
+            for task in running:
+                task.cancel()
+            await asyncio.wait(running)
+            if heartbeat is not None:
+                await heartbeat.stop()
 
     return lifespan
 
@@ -167,10 +175,13 @@ def build_app(
     local: LocalRoutes | None = None,
     heartbeat: Heartbeat | None = None,
     metrics: Metrics | None = None,
+    readiness: Readiness | None = None,
 ) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
     `heartbeat`, when given, writes this task's demand for as long as the application runs.
+    `readiness`, when given, reads every pool on its cycle for as long (`rhi_gateway.readiness`):
+    without it, whoever builds the application runs the cycle.
 
     `metrics`, when given, counts every request the application answers, the local routes, the
     refusals and the paths outside the table included (`rhi_gateway.metrics`).
@@ -190,7 +201,7 @@ def build_app(
 
     app = Starlette(
         routes=[TableRoute(entry, given.get(entry)) for entry in TABLE],
-        lifespan=None if heartbeat is None else _beating(heartbeat),
+        lifespan=None if heartbeat is None and readiness is None else _running(heartbeat, readiness),
         # One log record per request, counted as it is logged, and the gateway's own faults answered
         # 500 with no text.
         middleware=[Middleware(telemetry.Telemetry, ended=None if metrics is None else metrics.count)],
@@ -288,6 +299,8 @@ class Forwarding:
 
     `filters` holds the body filter of each forwarded route of the table, under its entry. The
     longest a request may run is the proxy's. `heartbeat`, when given, counts the demand.
+    `retry_after` gives the seconds of `Retry-After` for the causes it names, in place of the
+    design's (`rhi_gateway.errors.render_json`): only a cause that carries the header may be named.
     """
 
     authenticator: Authenticator
@@ -296,6 +309,11 @@ class Forwarding:
     proxy: Proxy
     holding: Holding
     heartbeat: Heartbeat | None = None
+    retry_after: Mapping[Cause, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Refused when the gateway is built, not at the first refusal it would render.
+        render_json(Cause.WARMING, WireFormat.MESSAGES, self.retry_after)
 
 
 def output_limit(entry: Route, forwarded: Forwarded) -> int:
@@ -427,9 +445,9 @@ async def _hold_silently(held: _Held, receive: Receive) -> bool:
     return True
 
 
-def _refusal(error: GatewayError, entry: Route) -> Response:
+def _refusal(error: GatewayError, entry: Route, retry_after: Mapping[Cause, int]) -> Response:
     telemetry.note_cause(error.cause)
-    answer = render_json(error, entry.wire_format or WireFormat.MESSAGES)
+    answer = render_json(error, entry.wire_format or WireFormat.MESSAGES, retry_after)
     return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
 
 
@@ -461,7 +479,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 longest_request_seconds=forwarding.proxy.longest_request_seconds,
             )
         except GatewayError as refused:
-            return _refusal(refused, entry)
+            return _refusal(refused, entry, forwarding.retry_after)
 
         demand: Demand | None = None
         if held is not None and forwarding.heartbeat is not None:
@@ -488,7 +506,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 left = await _hold_silently(held, request.receive)
             except GatewayError as ended:
                 await settle(Observed(0, 0, ended_cleanly=False))
-                return _refusal(ended, entry)
+                return _refusal(ended, entry, forwarding.retry_after)
             except asyncio.CancelledError:
                 # The request itself is cancelled while held: it has ended, and its settlement is run to its end still.
                 await _to_the_end(settle(Observed(0, 0, ended_cleanly=False)))

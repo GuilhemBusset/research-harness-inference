@@ -60,6 +60,20 @@ key_issuances_per_day = 5
 # capacity to zero (sections 5.1 and 17). Left out, it is 02:00.
 nightly_stop = "02:00"
 
+# How many gateway tasks the service runs (sections 2 and 11.2). Left out, it is 2.
+gateway_tasks = 2
+
+# The gateway's numeric settings (section 17), which the deployment writes into the gateway's
+# environment. Left out, each is the value below: the largest request body, in bytes (8 MB); the
+# longest a request may run and the interval between the keep-alives of a held request, in
+# seconds; and the seconds of Retry-After for the three causes that carry one.
+request_body_limit_bytes = 8388608
+longest_request_seconds = 1800
+keepalive_seconds = 10
+retry_after_warming_seconds = 30
+retry_after_capacity_unavailable_seconds = 60
+retry_after_concurrency_limit_seconds = 5
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
 #

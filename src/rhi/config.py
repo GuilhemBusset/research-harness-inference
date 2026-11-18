@@ -118,6 +118,18 @@ class Config:
     # The time of day, HH:MM in `time_zone`, at which each pool's group is set to no instance
     # (sections 5.1 and 17). Only synthesis reads it: it reaches no service.
     nightly_stop: str
+    # How many gateway tasks the service runs (sections 2 and 11.2). Only the deployment reads it.
+    gateway_tasks: int
+    # The gateway's numeric settings (section 17), each of which the deployment writes into the
+    # variable `services/gateway/rhi_gateway/settings.py` reads it from: the largest request body
+    # in bytes, the longest request and the keep-alive interval of a hold in seconds, and the
+    # seconds of `Retry-After` for the three causes that carry one.
+    request_body_limit_bytes: int
+    longest_request_seconds: int
+    keepalive_seconds: int
+    retry_after_warming_seconds: int
+    retry_after_capacity_unavailable_seconds: int
+    retry_after_concurrency_limit_seconds: int
 
 
 def _as_stored(text: str) -> object:
@@ -257,6 +269,7 @@ def _json_from_text(text: str) -> object:
 
 _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
+_WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -276,9 +289,16 @@ KEYS: dict[str, Key] = {
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
     "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
     "default_pool": _STRING,
-    "issuer_reserved_concurrency": Key("a whole number above zero", _whole_number, _number_from_text),
-    "key_issuances_per_day": Key("a whole number above zero", _whole_number, _number_from_text),
+    "issuer_reserved_concurrency": _WHOLE_NUMBER,
+    "key_issuances_per_day": _WHOLE_NUMBER,
     "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
+    "gateway_tasks": _WHOLE_NUMBER,
+    "request_body_limit_bytes": _WHOLE_NUMBER,
+    "longest_request_seconds": _WHOLE_NUMBER,
+    "keepalive_seconds": _WHOLE_NUMBER,
+    "retry_after_warming_seconds": _WHOLE_NUMBER,
+    "retry_after_capacity_unavailable_seconds": _WHOLE_NUMBER,
+    "retry_after_concurrency_limit_seconds": _WHOLE_NUMBER,
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -296,6 +316,18 @@ DEFAULTS: dict[str, object] = {
     "key_issuances_per_day": 5,
     # Section 17: the nightly stop is at 02:00 in the configured time zone.
     "nightly_stop": "02:00",
+    # Sections 2 and 11.2: the gateway runs two tasks.
+    "gateway_tasks": 2,
+    # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, a keep-alive
+    # every 10 seconds of a hold, and a `Retry-After` of 30 seconds for `warming`, 60 for
+    # `capacity_unavailable` and 5 for `concurrency_limit`. The gateway's reader of its environment
+    # (`rhi_gateway.settings`) has the same defaults.
+    "request_body_limit_bytes": 8_388_608,
+    "longest_request_seconds": 1800,
+    "keepalive_seconds": 10,
+    "retry_after_warming_seconds": 30,
+    "retry_after_capacity_unavailable_seconds": 60,
+    "retry_after_concurrency_limit_seconds": 5,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
