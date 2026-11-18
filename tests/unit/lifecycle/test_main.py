@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import urllib.request
 from typing import TYPE_CHECKING, Any
 
@@ -474,6 +475,75 @@ def test_an_instance_that_returns_to_the_warm_pool_drains_and_is_not_taken_for_a
 
         assert world.calls[launched:] == ["termination hook", "stop"]
         assert world.completions == [completion("launch"), completion("termination")]
+
+    run(scenario)
+
+
+class SlowPull(World):
+    """An instance whose pull of the engine image takes ten minutes."""
+
+    def pull(self, image: str, timeout: float | None = None) -> None:
+        super().pull(image, timeout)
+        self.wait(600)
+
+
+def test_the_target_state_is_read_every_5_seconds_while_a_launch_runs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = SlowPull(tmp_path, IN_SERVICE)
+        async with world.running():
+            await until(lambda: world.waits == 1)  # the launch is in its pull
+            await world.ticks(3)
+            # The first two readings are the program's and the launch's own. The readings went on
+            # beside the launch, and none of them started it again.
+            assert world.readings[2:] == [NOW + 5, NOW + 10, NOW + 15]
+            assert world.calls == ["pull"]
+
+            # The pull ends: the launch goes on from where it was, into service.
+            await world.clock.advance(585)
+            await until(lambda: len(world.beats) == 1)
+
+        assert world.calls.count("pull") == 1
+        assert world.completions == [completion("launch")]
+
+    run(scenario)
+
+
+class SlowSecret(World):
+    """Secrets Manager takes its time: the pool's secret is `given` when the test says so."""
+
+    def __init__(self, folder: Path, target: str | None) -> None:
+        super().__init__(folder, target)
+        self.asked_secret = threading.Event()
+        self.given = threading.Event()
+
+    def get_secret_value(self, **request: Any) -> dict[str, Any]:
+        self.asked_secret.set()
+        self.given.wait(timeout=10)  # a guard, not the clock under test
+        return super().get_secret_value(**request)
+
+
+def test_a_duty_at_work_is_waited_for_before_the_engine_is_stopped(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = SlowSecret(tmp_path, IN_SERVICE)
+        world.serves_already()
+        async with world.running():
+            try:
+                # The check of the engine is at work, waiting for the pool's secret, when the
+                # group terminates the instance. The engine is idle: the hook is completed.
+                await until(world.asked_secret.is_set)
+                world.target = TERMINATED
+                await world.clock.advance(5)
+                await until(lambda: world.calls == ["termination hook"])
+
+                world.given.set()
+                await until(lambda: world.calls[-1] == "stop")
+                await world.ticks(2)
+            finally:
+                world.given.set()
+
+        # The check found the engine still running, so it restarted nothing, and the engine was
+        # stopped only after it: a check left behind would have restarted a stopped engine.
+        assert world.calls == ["termination hook", "completion", "stop"]
 
     run(scenario)
 
