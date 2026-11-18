@@ -118,6 +118,10 @@ def test_the_units_logs_reach_the_pool_log_group() -> None:
     journal = node["receivers"]["journald"]
     assert set(journal["units"]) == UNITS
     assert not WIDER & set(journal)
+    # Their lines whatever the priority, and in full: the receiver otherwise stops at info, and
+    # the journal gives no text for a line over 4096 bytes.
+    assert journal["priority"] == "debug"
+    assert journal["all"] is True
     # No other receiver of the file reads a log: the others are the two of the metrics pipelines.
     assert set(node["receivers"]) == {"journald", "prometheus", "host_metrics"}
 
