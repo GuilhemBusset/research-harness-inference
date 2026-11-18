@@ -1,0 +1,897 @@
+"""A pool's release (`rhi.pools.release`; system design, sections 4.3 and 8.2): the parameter its
+instances read, the archive and the engine image it names, what the instance role may fetch, and
+what starts an instance refresh.
+
+The mock pool of the example configuration is read from the app the session synthesizes. What
+needs two syntheses to compare, or another pool, builds a stack that holds one pool and its
+release, from a copy of the sources when a source file changes. The CDK is imported inside the
+tests, after `app_module` has started jsii (see conftest.py). Every digest and name that stands
+for a value of a deployment is made at run time.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import tarfile
+import threading
+import tomllib
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from botocore.exceptions import ClientError
+
+from rhi import config
+from rhi_common import pool_config
+from rhi_lifecycle import release as agent_release
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from types import ModuleType
+
+    import aws_cdk as cdk
+
+    from rhi_common.pool_config import Pool
+
+REPO = Path(__file__).resolve().parents[2]
+BOOT = REPO / "services/engine/boot/rhi-boot.sh"
+EXAMPLE = config.load({"RHI_CONFIG": "example"})
+(MOCK,) = EXAMPLE.pools
+GPU = dataclasses.replace(
+    MOCK,
+    name="coursework",
+    engine="vllm",
+    model="example/model",
+    revision="a" * 40,
+    instance_types=("g7e.2xlarge",),
+    prices={"g7e.2xlarge": 3.36},
+)
+
+PARAMETER = "/rhi/pools/mock/release"
+REFRESH = "Custom::RhiInstanceRefresh"
+UNITS = {"rhi-collector.service", "rhi-engine.service", "rhi-lifecycle.service"}
+# What the sources of a release are, for a copy of them: the lock, the services and their images.
+SOURCES = ("pyproject.toml", "uv.lock", "services/common", "services/engine")
+
+REGION = "eu-west-3"
+PSEUDO = {
+    "AWS::AccountId": "123456789012",
+    "AWS::Region": REGION,
+    "AWS::Partition": "aws",
+    "AWS::URLSuffix": "amazonaws.com",
+}
+WORKSPACE = "https://aps-workspaces.example.com/workspaces/ws-sample/"
+IMAGE_DIGEST = "sha256:" + hashlib.sha256(secrets.token_bytes(16)).hexdigest()
+
+
+def of_type(template: Mapping[str, Any], kind: str) -> dict[str, dict[str, Any]]:
+    return {name: r["Properties"] for name, r in template["Resources"].items() if r["Type"] == kind}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def sample(value: Any) -> str:
+    """A value of a template with each reference replaced by a sample value: a resource's `Ref`
+    by `sample-<logical ID>`, the image's digest by a digest, the workspace's endpoint by an
+    address of example.com."""
+    if isinstance(value, str):
+        return value
+    ((function, argument),) = value.items()
+    if function == "Fn::Join":
+        return argument[0].join(sample(part) for part in argument[1])
+    if function == "Ref":
+        return PSEUDO.get(argument, f"sample-{argument}")
+    if function == "Fn::Sub":
+        return re.sub(r"\$\{([^}]+)\}", lambda match: PSEUDO[match[1]], argument)
+    if function == "Fn::GetAtt" and argument[1] == "imageDetails.0.imageDigest":
+        return IMAGE_DIGEST
+    if (function, argument[1:]) == ("Fn::GetAtt", ["PrometheusEndpoint"]) or (
+        function == "Fn::ImportValue" and "PrometheusEndpoint" in argument
+    ):
+        return WORKSPACE
+    raise AssertionError(f"no sample value for {function}")
+
+
+def references(value: Any) -> list[Any]:
+    """Every `Ref` in a value of a template."""
+    if isinstance(value, dict):
+        return [value["Ref"]] if list(value) == ["Ref"] else [r for part in value.values() for r in references(part)]
+    return [r for part in value for r in references(part)] if isinstance(value, list) else []
+
+
+@dataclasses.dataclass(frozen=True)
+class Release:
+    """One pool's release, as synthesis wrote it."""
+
+    template: Mapping[str, Any]
+    outdir: Path
+    # The asset manifest of the pool's stack.
+    assets: Mapping[str, Any]
+    pool: str
+
+    @property
+    def parameter(self) -> dict[str, Any]:
+        (found,) = [
+            p
+            for p in of_type(self.template, "AWS::SSM::Parameter").values()
+            if p["Name"] == f"/rhi/pools/{self.pool}/release"
+        ]
+        return found
+
+    @property
+    def value(self) -> dict[str, Any]:
+        """The parameter's value, with each reference replaced by a sample value."""
+        return json.loads(sample(self.parameter["Value"]))
+
+    @property
+    def refresh(self) -> dict[str, Any]:
+        """The custom resource that refreshes the pool's group, whole."""
+        (found,) = [
+            resource
+            for resource in self.template["Resources"].values()
+            if resource["Type"] == REFRESH and self.parameter_of(resource) == [f"/rhi/pools/{self.pool}/release"]
+        ]
+        return found
+
+    def parameter_of(self, refresh: Mapping[str, Any]) -> list[str]:
+        """The names of the release parameters a refresh waits for."""
+        return [
+            self.template["Resources"][name]["Properties"]["Name"]
+            for name in as_list(refresh["DependsOn"])
+            if self.template["Resources"][name]["Type"] == "AWS::SSM::Parameter"
+        ]
+
+    @property
+    def trigger(self) -> Any:
+        return self.refresh["Properties"]["Trigger"]
+
+    @property
+    def archive(self) -> Path:
+        """The file of the release's archive in the cloud assembly."""
+        (source,) = [
+            file["source"] for file in self.assets["files"].values() if file["source"]["path"].endswith(".tar")
+        ]
+        assert source["packaging"] == "file"
+        return (self.outdir / source["path"]).resolve()
+
+    @property
+    def digest_lookup(self) -> tuple[str, str]:
+        """The custom resource that reads the engine image's digest from the registry when the stack
+        is deployed: its logical ID, and the call it makes."""
+        (found,) = [
+            (name, sample(properties["Update"]))
+            for name, properties in of_type(self.template, "Custom::RhiImageDigest").items()
+            if f"rhi-{self.pool}-engine-image" in sample(properties["Update"])
+        ]
+        return found
+
+    @property
+    def image(self) -> dict[str, Any]:
+        """The source of the pool's engine image asset: the one pushed under the tag the release
+        reads the digest of."""
+        call = json.loads(self.digest_lookup[1])
+        assert (call["service"], call["action"]) == ("ECR", "describeImages")
+        ((tag, asset),) = [(tag, a) for tag, a in self.assets["dockerImages"].items() if tag in self.digest_lookup[1]]
+        (destination,) = asset["destinations"].values()
+        assert call["parameters"] == {
+            "repositoryName": sample({"Fn::Sub": destination["repositoryName"]}),
+            "imageIds": [{"imageTag": tag}],
+        }
+        return asset["source"]
+
+
+@pytest.fixture(scope="module")
+def mock(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> Release:
+    """The mock pool's release in the app."""
+    stage = app.node.find_child("Rhi")
+    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    outdir = Path(stage.outdir)  # ty: ignore[unresolved-attribute]
+    assets = json.loads((outdir / f"{stack.artifact_id}.assets.json").read_text(encoding="utf-8"))
+    return Release(
+        templates[(outdir / stack.template_file).relative_to(cloud_assembly).as_posix()], outdir, assets, "mock"
+    )
+
+
+def copy_of_the_sources(into: Path) -> Path:
+    for source in SOURCES:
+        if (REPO / source).is_dir():
+            shutil.copytree(REPO / source, into / source, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            into.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / source, into / source)
+    return into
+
+
+def standalone(
+    app_module: ModuleType,
+    outdir: Path,
+    pool: Pool = MOCK,
+    *,
+    repo: Path = REPO,
+    heartbeats: str = "Heartbeats",
+    unrelated: bool = False,
+    bundled: bool = False,
+) -> Release:
+    """A stack that holds only this pool's group and its release, synthesized into `outdir`."""
+    from aws_cdk import aws_dynamodb as dynamodb
+    from aws_cdk import aws_ec2 as ec2
+    from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+    from aws_cdk import aws_iam as iam
+    from aws_cdk import aws_sns as sns
+
+    from rhi.observability.prometheus import PrometheusWorkspace
+    from rhi.pools.group import PoolGroup
+    from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
+
+    cdk = app_module.cdk
+    context = {"aws:cdk:bundling-stacks": ["**"] if bundled else []}
+    app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
+    stack = cdk.Stack(app, "Pools")
+    vpc = ec2.Vpc(stack, "Vpc", max_azs=2, nat_gateways=1)
+    ec2_service = iam.ServicePrincipal("ec2.amazonaws.com")
+    role = iam.Role(stack, "Role", assumed_by=ec2_service)  # ty: ignore[invalid-argument-type] - jsii, as in role.py
+    group = PoolGroup(
+        stack,
+        "Pool",
+        pool=pool,
+        vpc=vpc,
+        security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
+        target_group=elbv2.ApplicationTargetGroup(
+            stack, "Targets", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE
+        ),
+        role=role,
+        nightly_stop="02:00",
+        time_zone="Etc/UTC",
+    )
+    key = dynamodb.Attribute(name="pool", type=dynamodb.AttributeType.STRING)
+    if unrelated:
+        sns.Topic(stack, "Unrelated")
+    PoolRelease(
+        stack,
+        "Release",
+        pool=pool,
+        files=ReleaseFiles(stack, "ReleaseFiles", repo=repo),
+        refresher=InstanceRefresher(stack, "InstanceRefresher", pools=[pool]),
+        group=group,
+        role=role,
+        heartbeats=dynamodb.Table(stack, heartbeats, partition_key=key),
+        workspace=PrometheusWorkspace(stack, "Prometheus"),
+        repo=repo,
+    )
+    app.synth()
+    template = json.loads((outdir / "Pools.template.json").read_text(encoding="utf-8"))
+    assets = json.loads((outdir / "Pools.assets.json").read_text(encoding="utf-8"))
+    return Release(template, outdir, assets, pool.name)
+
+
+@pytest.fixture(scope="module")
+def alone(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> Release:
+    """The mock pool's release in a stack of its own, which the syntheses that change one thing are compared with."""
+    return standalone(app_module, tmp_path_factory.mktemp("alone"))
+
+
+# The parameter.
+
+
+def test_the_agent_reads_the_parameter(app: cdk.App, mock: Release) -> None:
+    assert mock.parameter["Name"] == PARAMETER
+    assert mock.parameter["Type"] == "String"
+    assert not PARAMETER.startswith(config.SSM_PREFIX)
+    assert config.SSM_PREFIX == "/rhi/config/"
+
+    current = agent_release.parse_current(sample(mock.parameter["Value"]))
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    (group,) = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")
+    heartbeats = stack.resolve(stack.get_logical_id(stack.tables.heartbeats.node.default_child))
+    assert current.settings == agent_release.Settings(
+        pool="mock",
+        group=f"sample-{group}",
+        launch_hook="rhi-launch",
+        termination_hook="rhi-termination",
+        log_group="/rhi/pools/mock",
+        workspace_url=WORKSPACE + "api/v1/remote_write",
+        heartbeat_table=f"sample-{heartbeats}",
+        secret_id="/rhi/pools/mock/bearer",
+    )
+    # The log group and the secret the settings name are the pool's own, by their fixed names.
+    assert "/rhi/pools/mock" in [g.get("LogGroupName") for g in of_type(mock.template, "AWS::Logs::LogGroup").values()]
+    assert "/rhi/pools/mock/bearer" in [
+        s["Name"] for s in of_type(mock.template, "AWS::SecretsManager::Secret").values()
+    ]
+
+    # The compared release: the image by the registry's digest, in the repository the asset is
+    # pushed to; no model and no flag for the mock; the files by the digest of the archive.
+    (destination,) = next(iter(mock.assets["dockerImages"].values()))["destinations"].values()
+    repository = sample({"Fn::Sub": destination["repositoryName"]})
+    assert current.release == agent_release.Release(
+        engine_image=f"123456789012.dkr.ecr.{REGION}.amazonaws.com/{repository}@{IMAGE_DIGEST}",
+        model_revision=None,
+        engine_flags=(),
+        files_sha256=hashlib.sha256(mock.archive.read_bytes()).hexdigest(),
+    )
+    # The example gives the mock pool no measured start.
+    assert current.measured_start_seconds is None
+    assert "measured_start_seconds" not in mock.value
+
+
+def test_the_files_are_the_archive_published_as_it_is(mock: Release) -> None:
+    (file,) = [f for f in mock.assets["files"].values() if f["source"]["path"].endswith(".tar")]
+    (destination,) = file["destinations"].values()
+    files = mock.value["files"]
+    assert file["source"]["packaging"] == "file"
+    assert files["bucket"] == sample({"Fn::Sub": destination["bucketName"]})
+    assert files["key"] == destination["objectKey"]
+    assert files["sha256"] == hashlib.sha256(mock.archive.read_bytes()).hexdigest()
+
+
+def test_a_gpu_pool_names_its_model_revision_and_its_measured_start(app_module: ModuleType, tmp_path: Path) -> None:
+    measured = standalone(app_module, tmp_path, dataclasses.replace(GPU, measured_start_seconds=200))
+    current = agent_release.parse_current(sample(measured.parameter["Value"]))
+    assert measured.parameter["Name"] == "/rhi/pools/coursework/release"
+    assert current.release.model_revision == GPU.revision
+    assert current.measured_start_seconds == 200
+    assert current.settings.pool == "coursework"
+
+
+# The archive.
+
+
+def members(archive: Path) -> dict[str, tarfile.TarInfo]:
+    with tarfile.open(archive) as tar:
+        return {member.name: member for member in tar.getmembers()}
+
+
+def test_the_archive_holds_the_units_the_collector_configuration_and_the_agent(mock: Release) -> None:
+    found = members(mock.archive)
+    files = {name for name, member in found.items() if member.isfile()}
+    assert {name for name in files if name.startswith("units/")} == {f"units/{unit}" for unit in UNITS}
+    assert {name for name in files if name.startswith("collector/")} == {"collector/config.yaml"}
+    # The agent: the two packages, as `python -m rhi_lifecycle` finds them in its working directory.
+    for package in (REPO / "services/common/rhi_common", REPO / "services/engine/lifecycle/rhi_lifecycle"):
+        sources = {p.relative_to(package.parent).as_posix() for p in package.rglob("*.py")}
+        assert sources and {f"agent/{source}" for source in sources} <= files
+    assert "agent/rhi_lifecycle/__main__.py" in files
+    assert {name.split("/")[0] for name in found} == {"units", "collector", "agent"}
+    assert not [name for name in found if "__pycache__" in name]
+    # A file of the archive is the repository's, byte for byte.
+    with tarfile.open(mock.archive) as tar:
+        unit = tar.extractfile("units/rhi-lifecycle.service")
+        assert unit is not None
+        assert unit.read() == (REPO / "services/engine/units/rhi-lifecycle.service").read_bytes()
+
+
+def test_the_archive_is_reproducible(app_module: ModuleType, mock: Release, tmp_path: Path) -> None:
+    from rhi.pools.release import ARCHIVE_TIME, build_archive
+
+    found = members(mock.archive)
+    assert list(found) == sorted(found)
+    assert {member.mtime for member in found.values()} == {ARCHIVE_TIME}
+    assert {(m.uid, m.gid, m.uname, m.gname) for m in found.values()} == {(0, 0, "", "")}
+    assert {(member.type, member.mode) for member in found.values()} == {
+        (tarfile.DIRTYPE, 0o755),
+        (tarfile.REGTYPE, 0o644),
+    }
+    # The same files, copied elsewhere at another time and with other modes, give the same bytes.
+    copy = copy_of_the_sources(tmp_path / "copy")
+    for path in copy.rglob("*"):
+        os.utime(path, (1, 1))
+        path.chmod(0o700)
+    digest = build_archive(tmp_path / "again.tar", repo=copy, libraries=False)
+    assert (tmp_path / "again.tar").read_bytes() == mock.archive.read_bytes()
+    assert digest == mock.value["files"]["sha256"]
+
+
+def test_a_bundled_stack_carries_the_agents_libraries(
+    app_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where CDK bundles the stack, the libraries of the lifecycle group are installed beside the
+    agent, as for a function's bundle. The step that installs them is replaced by a stand-in."""
+    from rhi import packaging
+
+    asked = []
+
+    def install(command: Sequence[str]) -> None:
+        requirements = Path(command[command.index("--requirements") + 1]).read_text(encoding="utf-8")
+        target = Path(command[command.index("--target") + 1])
+        asked.append((list(command), requirements))
+        # What an installer leaves: the library, its metadata, the record of its own run, a script.
+        for file in ("lib/__init__.py", "lib-1.0.dist-info/METADATA", "lib-1.0.dist-info/RECORD", "bin/lib", ".lock"):
+            (target / file).parent.mkdir(parents=True, exist_ok=True)
+            (target / file).write_text(str(target), encoding="utf-8")
+
+    monkeypatch.setattr(packaging, "install", install)
+    bundled = standalone(app_module, tmp_path, bundled=True)
+    ((command, requirements),) = asked
+    assert command[command.index("--python-version") + 1] == packaging.PYTHON == "3.13"
+    lifecycle = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["dependency-groups"]["lifecycle"]
+    assert lifecycle and all(pin in requirements for pin in lifecycle)
+
+    files = {name for name, member in members(bundled.archive).items() if member.isfile()}
+    assert {"agent/lib/__init__.py", "agent/lib-1.0.dist-info/METADATA", "agent/rhi_lifecycle/__main__.py"} <= files
+    assert not files & {"agent/lib-1.0.dist-info/RECORD", "agent/bin/lib", "agent/.lock"}
+    # Sorted as text, a library's metadata folder before the files of the library itself.
+    assert list(members(bundled.archive)) == sorted(members(bundled.archive))
+    assert bundled.value["files"]["sha256"] == hashlib.sha256(bundled.archive.read_bytes()).hexdigest()
+
+
+def without_a_pure_wheel(lock: Mapping[str, Any], group: str) -> list[str]:
+    """The libraries of a dependency group, with what they need, that `uv.lock` holds no pure-Python wheel for."""
+    packages = {package["name"]: package for package in lock["package"]}
+    (project,) = [package for package in lock["package"] if group in package.get("dev-dependencies", {})]
+    pending = list(project["dev-dependencies"][group])
+    seen: set[str] = set()
+    while pending:
+        dependency = pending.pop()
+        package = packages[dependency["name"]]
+        for extra in dependency.get("extra", []):
+            pending += package["optional-dependencies"][extra]
+        if package["name"] not in seen:
+            seen.add(package["name"])
+            pending += package.get("dependencies", [])
+    return sorted(
+        name
+        for name in seen
+        if not any(
+            re.fullmatch(r".*-(py3|py2\.py3)-none-any\.whl", wheel["url"]) for wheel in packages[name].get("wheels", [])
+        )
+    )
+
+
+def test_every_library_of_the_lifecycle_group_has_a_pure_python_wheel() -> None:
+    lock = tomllib.loads((REPO / "uv.lock").read_text(encoding="utf-8"))
+    assert without_a_pure_wheel(lock, "lifecycle") == []
+    # A library that is compiled for a platform, or that has no wheel at all, is found.
+    made_up = {
+        "package": [
+            {"name": "project", "dev-dependencies": {"lifecycle": [{"name": "pure"}, {"name": "compiled"}]}},
+            {
+                "name": "pure",
+                "dependencies": [{"name": "source-only"}],
+                "wheels": [{"url": "https://files.example.com/pure-1.0-py3-none-any.whl"}],
+            },
+            {
+                "name": "compiled",
+                "wheels": [{"url": "https://files.example.com/compiled-1.0-cp313-cp313-manylinux_2_28_aarch64.whl"}],
+            },
+            {"name": "source-only", "sdist": {"url": "https://files.example.com/source-only-1.0.tar.gz"}},
+        ]
+    }
+    assert without_a_pure_wheel(made_up, "lifecycle") == ["compiled", "source-only"]
+
+
+# The engine image.
+
+
+def test_the_mock_image_is_arm64(app_module: ModuleType, mock: Release, tmp_path: Path) -> None:
+    from rhi.pools.release import ReleaseError
+
+    assert mock.image["platform"] == "linux/arm64"
+    # A GPU pool, on the type the design gives the coursework pool.
+    assert standalone(app_module, tmp_path / "gpu", GPU).image["platform"] == "linux/amd64"
+    # The mock engine on that type is built for it all the same: the types decide, not the engine.
+    on_gpu_type = dataclasses.replace(MOCK, instance_types=GPU.instance_types, prices=GPU.prices)
+    assert standalone(app_module, tmp_path / "mock", on_gpu_type).image["platform"] == "linux/amd64"
+
+    mixed = dataclasses.replace(
+        MOCK, name="mixed", instance_types=("t4g.small", "g7e.2xlarge"), prices={"t4g.small": 0.02, "g7e.2xlarge": 3.36}
+    )
+    with pytest.raises(ReleaseError, match="'mixed'.*mix"):
+        standalone(app_module, tmp_path / "mixed", mixed)
+
+
+@pytest.mark.parametrize(
+    ("instance_type", "expected"),
+    [("t4g.small", "arm64"), ("m7gd.large", "arm64"), ("g5g.xlarge", "arm64"), ("g7e.2xlarge", "amd64")]
+    + [("g6.xlarge", "amd64"), ("p5en.48xlarge", "amd64"), ("m7i.large", "amd64")],
+)
+def test_the_architecture_is_read_from_the_letters_after_the_generation(
+    app_module: ModuleType, instance_type: str, expected: str
+) -> None:
+    from rhi.pools.release import architecture
+
+    assert architecture(dataclasses.replace(MOCK, instance_types=(instance_type,))) == expected
+
+
+def test_each_engine_is_built_from_its_dockerfile_in_the_context_of_its_packaging(
+    app_module: ModuleType, mock: Release, tmp_path: Path
+) -> None:
+    from rhi.pools.release import ENGINES
+
+    # Every engine a pool may name has a Dockerfile, so every configured pool gets its image.
+    assert set(ENGINES) == set(pool_config.ENGINES)
+    assert all((REPO / engine.dockerfile).is_file() for engine in ENGINES.values())
+
+    context = (mock.outdir / mock.image["directory"]).resolve()
+    assert (context / "Dockerfile").read_bytes() == (REPO / "services/engine/mock/Dockerfile").read_bytes()
+    assert {path.name for path in context.iterdir()} == {
+        "Dockerfile",
+        "requirements.txt",
+        "rhi_common",
+        "rhi_mock_engine",
+    }
+
+    gpu = standalone(app_module, tmp_path, GPU)
+    context = (gpu.outdir / gpu.image["directory"]).resolve()
+    assert [path.name for path in context.iterdir()] == ["Dockerfile"]
+    assert (context / "Dockerfile").read_bytes() == (REPO / "services/engine/vllm/Dockerfile").read_bytes()
+
+
+# The grants.
+
+
+def test_the_instance_role_may_fetch_its_release_and_nothing_else(mock: Release) -> None:
+    (role,) = [
+        name
+        for name, properties in of_type(mock.template, "AWS::IAM::Role").items()
+        if "ec2.amazonaws.com" in json.dumps(properties["AssumeRolePolicyDocument"])
+    ]
+    statements = [
+        statement
+        for policy in of_type(mock.template, "AWS::IAM::Policy").values()
+        if {"Ref": role} in policy["Roles"]
+        for statement in policy["PolicyDocument"]["Statement"]
+    ]
+    assert all(statement["Effect"] == "Allow" for statement in statements)
+
+    def granting(service: str) -> list[dict[str, Any]]:
+        return [s for s in statements if any(a.startswith(f"{service}:") for a in as_list(s["Action"]))]
+
+    # That parameter, by the reference whose value is its name, and no other.
+    (parameter_id,) = [
+        name for name, p in of_type(mock.template, "AWS::SSM::Parameter").items() if p["Name"] == PARAMETER
+    ]
+    (parameter,) = [s for s in granting("ssm") if "Parameter" in json.dumps(s["Action"])]
+    assert parameter["Action"] == "ssm:GetParameter"
+    assert references(parameter["Resource"]) == ["AWS::Partition", "AWS::Region", "AWS::AccountId", parameter_id]
+    assert sample(parameter["Resource"]) == f"arn:aws:ssm:{REGION}:123456789012:parametersample-{parameter_id}"
+
+    # That object of the bucket, and no other: no pattern, and no action on the bucket.
+    (archive,) = granting("s3")
+    files = mock.value["files"]
+    assert archive["Action"] == "s3:GetObject"
+    assert sample(archive["Resource"]) == f"arn:aws:s3:::{files['bucket']}/{files['key']}"
+    assert "*" not in sample(archive["Resource"]) and "?" not in sample(archive["Resource"])
+
+    # The pull, on the repository the image is pushed to; the token, as AWS grants it.
+    pull, token = sorted(granting("ecr"), key=lambda s: s["Resource"] == "*")
+    repository = mock.value["engine_image"].split("@")[0].split("/", 1)[1]
+    assert sorted(pull["Action"]) == [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+    ]
+    assert sample(pull["Resource"]) == f"arn:aws:ecr:{REGION}:123456789012:repository/{repository}"
+    assert (token["Action"], token["Resource"]) == ("ecr:GetAuthorizationToken", "*")
+
+
+# The refresh.
+
+
+def changed(tmp_path: Path, file: str) -> Path:
+    """A copy of the sources that differs from them in one file."""
+    copy = copy_of_the_sources(tmp_path / "sources")
+    with (copy / file).open("a", encoding="utf-8") as stream:
+        stream.write("\n# A change.\n")
+    return copy
+
+
+@pytest.mark.parametrize("file", ["services/engine/mock/Dockerfile", "services/engine/units/rhi-collector.service"])
+def test_a_change_to_what_an_instance_holds_changes_the_release_and_the_trigger(
+    app_module: ModuleType, alone: Release, tmp_path: Path, file: str
+) -> None:
+    other = standalone(app_module, tmp_path / "out", repo=changed(tmp_path, file))
+    assert other.trigger != alone.trigger
+    # The image the release names is the one whose digest the lookup reads, in each.
+    for release in (other, alone):
+        parts = release.parameter["Value"]["Fn::Join"][1]
+        assert {"Fn::GetAtt": [release.digest_lookup[0], "imageDetails.0.imageDigest"]} in parts
+    if file.endswith("Dockerfile"):
+        # Another image, pushed under another tag, whose digest the deployment reads for the release.
+        assert other.image["directory"] != alone.image["directory"]
+        assert other.digest_lookup != alone.digest_lookup
+        assert other.value["files"] == alone.value["files"]
+    else:
+        # Other files, by their digest, in the parameter's value itself.
+        assert other.value["files"]["sha256"] != alone.value["files"]["sha256"]
+        assert other.parameter["Value"] != alone.parameter["Value"]
+        assert other.digest_lookup == alone.digest_lookup
+
+
+def test_what_is_outside_the_comparison_starts_no_refresh(
+    app_module: ModuleType, alone: Release, tmp_path: Path
+) -> None:
+    """CloudFormation calls the refresh's resource only when one of its properties changes."""
+    unrelated = standalone(app_module, tmp_path / "unrelated", unrelated=True)
+    assert "AWS::SNS::Topic" in {r["Type"] for r in unrelated.template["Resources"].values()}
+    assert "AWS::SNS::Topic" not in {r["Type"] for r in alone.template["Resources"].values()}
+
+    measured = standalone(app_module, tmp_path / "measured", dataclasses.replace(MOCK, measured_start_seconds=120))
+    assert measured.value["measured_start_seconds"] == 120
+
+    setting = standalone(app_module, tmp_path / "setting", heartbeats="OtherHeartbeats")
+    assert setting.value["settings"]["heartbeat_table"] != alone.value["settings"]["heartbeat_table"]
+
+    for other in (unrelated, measured, setting):
+        assert other.refresh["Properties"] == alone.refresh["Properties"]
+    for other in (measured, setting):
+        assert other.parameter["Value"] != alone.parameter["Value"]
+
+
+def test_the_trigger_holds_the_compared_release_and_the_machine_image_resolved_at_deployment(mock: Release) -> None:
+    trigger = json.loads(sample(mock.trigger))
+    value = mock.value
+    assert {key: trigger[key] for key in ("engine_image", "model_revision", "engine_flags")} == {
+        key: value[key] for key in ("engine_image", "model_revision", "engine_flags")
+    }
+    assert trigger["files_sha256"] == value["files"]["sha256"]
+    # The digest is read for the tag the asset step pushed the image under.
+    assert trigger["image_tag"] in mock.assets["dockerImages"]
+
+    # The machine image: the launch template's own reference, a parameter of the stack that
+    # CloudFormation resolves from the pool's image parameter when the stack is deployed.
+    (launch_template,) = of_type(mock.template, "AWS::EC2::LaunchTemplate").values()
+    image = launch_template["LaunchTemplateData"]["ImageId"]["Ref"]
+    assert image in references(mock.trigger)
+    assert trigger["machine_image"] == f"sample-{image}"
+    assert mock.template["Parameters"][image]["Type"] == "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    assert mock.template["Parameters"][image]["Default"].startswith("/aws/service/ecs/optimized-ami/")
+
+
+def test_the_stacks_deployment_waits_on_the_refresh(mock: Release) -> None:
+    resources = mock.template["Resources"]
+    refresh = mock.refresh
+    (group,) = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")
+    assert refresh["Properties"]["Group"] == {"Ref": group}
+    # The release is written, and the instances may fetch it, before any instance is replaced.
+    depends_on = {resources[name]["Type"] for name in refresh["DependsOn"]}
+    assert mock.parameter_of(refresh) == [PARAMETER]
+    assert depends_on == {"AWS::SSM::Parameter", "AWS::IAM::Policy"}
+
+    # CloudFormation calls the provider's function, which starts the refresh with `on_event` and
+    # then runs a state machine that asks `is_complete` until the refresh has ended.
+    function = resources[refresh["Properties"]["ServiceToken"]["Fn::GetAtt"][0]]["Properties"]
+    variables = function["Environment"]["Variables"]
+    start = resources[variables["USER_ON_EVENT_FUNCTION_ARN"]["Fn::GetAtt"][0]]["Properties"]
+    query = resources[variables["USER_IS_COMPLETE_FUNCTION_ARN"]["Fn::GetAtt"][0]]["Properties"]
+    assert (start["Handler"], query["Handler"]) == ("index.on_event", "index.is_complete")
+    assert start["Code"] == query["Code"]
+    machine = resources[variables["WAITER_STATE_MACHINE_ARN"]["Ref"]]
+    assert machine["Type"] == "AWS::StepFunctions::StateMachine"
+    # It asks for as long as CloudFormation waits for a custom resource: an hour.
+    (retry,) = json.loads(sample_definition(machine))["States"]["framework-isComplete-task"]["Retry"]
+    assert retry["IntervalSeconds"] * retry["MaxAttempts"] == 3600
+
+
+def sample_definition(machine: Mapping[str, Any]) -> str:
+    definition = machine["Properties"]["DefinitionString"]
+    return "".join(part if isinstance(part, str) else "arn" for part in definition["Fn::Join"][1])
+
+
+class AutoScaling:
+    """Auto Scaling, for the three calls of the refresh's handlers: one group and its refreshes."""
+
+    def __init__(self, *, running: int = 0) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        # How many more starts find a refresh still running.
+        self.running = running
+        self.status = "Pending"
+
+    def start_instance_refresh(self, **arguments: Any) -> dict[str, Any]:
+        self.calls.append(("start", arguments))
+        if self.running:
+            self.running -= 1
+            raise ClientError({"Error": {"Code": "InstanceRefreshInProgress"}}, "StartInstanceRefresh")
+        return {"InstanceRefreshId": "refresh-1"}
+
+    def cancel_instance_refresh(self, **arguments: Any) -> dict[str, Any]:
+        self.calls.append(("cancel", arguments))
+        return {}
+
+    def describe_instance_refreshes(self, **arguments: Any) -> dict[str, Any]:
+        self.calls.append(("describe", arguments))
+        return {"InstanceRefreshes": [{"InstanceRefreshId": "refresh-1", "Status": self.status}]}
+
+
+@pytest.fixture
+def handlers(mock: Release) -> ModuleType:
+    """The code of the refresh's functions, as the template carries it."""
+    code = {
+        properties["Code"]["ZipFile"]
+        for properties in of_type(mock.template, "AWS::Lambda::Function").values()
+        if properties["Handler"] in ("index.on_event", "index.is_complete")
+    }
+    (source,) = code
+    module = types.ModuleType("index")
+    exec(compile(source, "index.py", "exec"), module.__dict__)  # noqa: S102 - the repository's own handler, read from its template
+    return module
+
+
+def test_the_refresh_replaces_instances_protected_from_scale_in(handlers: ModuleType) -> None:
+    autoscaling = AutoScaling()
+    event = {"RequestType": "Update", "ResourceProperties": {"Group": "the-group", "Trigger": "{}"}}
+    started = handlers.on_event(event, None, autoscaling=autoscaling)
+    assert autoscaling.calls == [
+        ("start", {"AutoScalingGroupName": "the-group", "Preferences": {"ScaleInProtectedInstances": "Refresh"}})
+    ]
+
+    # The deployment does not finish before the refresh does, and fails when the refresh does.
+    asked = event | started
+    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": False}
+    assert autoscaling.calls[-1] == (
+        "describe",
+        {"AutoScalingGroupName": "the-group", "InstanceRefreshIds": ["refresh-1"]},
+    )
+    autoscaling.status = "InProgress"
+    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": False}
+    autoscaling.status = "Successful"
+    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": True}
+    for status in ("Failed", "Cancelled", "RollbackSuccessful"):
+        autoscaling.status = status
+        with pytest.raises(RuntimeError):
+            handlers.is_complete(asked, None, autoscaling=autoscaling)
+
+
+def test_a_new_stack_refreshes_too_and_a_removed_one_does_nothing(handlers: ModuleType) -> None:
+    autoscaling = AutoScaling()
+    created = handlers.on_event(
+        {"RequestType": "Create", "ResourceProperties": {"Group": "the-group"}}, None, autoscaling=autoscaling
+    )
+    assert created == {"Data": {"RefreshId": "refresh-1"}}
+    deleted = {"RequestType": "Delete", "ResourceProperties": {"Group": "the-group"}}
+    handlers.on_event(deleted, None, autoscaling=autoscaling)
+    assert handlers.is_complete(deleted, None, autoscaling=autoscaling) == {"IsComplete": True}
+    assert [call for call, _ in autoscaling.calls] == ["start"]
+
+
+def test_a_refresh_still_running_is_cancelled_for_one_that_starts_after_the_release_is_written(
+    handlers: ModuleType,
+) -> None:
+    autoscaling = AutoScaling(running=2)
+    pauses: list[int] = []
+    event = {"RequestType": "Update", "ResourceProperties": {"Group": "the-group"}}
+    started = handlers.on_event(event, None, autoscaling=autoscaling, sleep=pauses.append)
+    assert started == {"Data": {"RefreshId": "refresh-1"}}
+    assert [call for call, _ in autoscaling.calls] == ["start", "cancel", "start", "cancel", "start"]
+    assert len(pauses) == 2
+    # A group that never lets go of its refresh fails the deployment: the wait has an end.
+    stuck = AutoScaling(running=10**6)
+    with pytest.raises(ClientError):
+        handlers.on_event(event, None, autoscaling=stuck, sleep=pauses.append)
+
+
+# The boot program.
+
+AWS = '''#!/usr/bin/env python3
+"""The AWS CLI, for the two calls of the boot program: one region, one parameter and one object."""
+import argparse
+import json
+import os
+import shutil
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("call", nargs=2)
+parser.add_argument("--region", required=True)
+parser.add_argument("--name")
+parser.add_argument("--output", choices=["json"])
+parser.add_argument("--only-show-errors", action="store_true")
+parser.add_argument("paths", nargs="*")
+arguments = parser.parse_intermixed_args()
+with open(os.path.join(os.environ["RHI_TEST_STATE"], "cloud.json"), encoding="utf-8") as stream:
+    cloud = json.load(stream)
+if arguments.region != cloud["region"]:
+    sys.exit(254)
+if arguments.call == ["ssm", "get-parameter"] and arguments.output and arguments.name in cloud["parameters"]:
+    value = cloud["parameters"][arguments.name]
+    print(json.dumps({"Parameter": {"Name": arguments.name, "Type": "String", "Value": value}}))
+elif arguments.call == ["s3", "cp"] and len(arguments.paths) == 2 and arguments.paths[0] in cloud["objects"]:
+    shutil.copyfile(cloud["objects"][arguments.paths[0]], arguments.paths[1])
+else:
+    sys.exit(254)
+'''
+SYSTEMCTL = """#!/bin/bash
+# systemctl: it records each call.
+printf '%s\\n' "$*" >>"$RHI_TEST_STATE/systemctl.log"
+"""
+
+
+class Metadata(ThreadingHTTPServer):
+    """The instance metadata, as IMDSv2 serves it: a session token first, then reads that carry it."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        super().__init__(("127.0.0.1", 0), MetadataRequest)
+        self.token = secrets.token_urlsafe(24)
+        self.values = values
+
+
+class MetadataRequest(BaseHTTPRequestHandler):
+    def answer(self, status: int, body: str = "") -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body.encode())))
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def metadata(self) -> Metadata:
+        assert isinstance(self.server, Metadata)
+        return self.server
+
+    def do_PUT(self) -> None:
+        self.answer(200, self.metadata().token) if self.path == "/latest/api/token" else self.answer(404)
+
+    def do_GET(self) -> None:
+        value = self.metadata().values.get(self.path.removeprefix("/latest/meta-data/"))
+        if self.headers.get("X-aws-ec2-metadata-token") != self.metadata().token:
+            self.answer(401)
+        elif value is None:
+            self.answer(404)
+        else:
+            self.answer(200, value)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Nothing is written to the test's output."""
+
+
+def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> None:
+    root, state, programs = tmp_path / "root", tmp_path / "state", tmp_path / "bin"
+    for folder in (root, state, programs):
+        folder.mkdir()
+    for name, text in (("aws", AWS), ("systemctl", SYSTEMCTL)):
+        (programs / name).write_text(text, encoding="utf-8")
+        (programs / name).chmod(0o755)
+    value = sample(mock.parameter["Value"])
+    files = json.loads(value)["files"]
+    cloud = {
+        "region": REGION,
+        "parameters": {PARAMETER: value},
+        "objects": {f"s3://{files['bucket']}/{files['key']}": str(mock.archive)},
+    }
+    (state / "cloud.json").write_text(json.dumps(cloud), encoding="utf-8")
+
+    metadata = Metadata({"tags/instance/rhi-release-parameter": PARAMETER, "placement/region": REGION})
+    threading.Thread(target=metadata.serve_forever, daemon=True).start()
+    try:
+        ran = subprocess.run(
+            ["bash", str(BOOT)],
+            env={
+                "PATH": f"{programs}{os.pathsep}{os.environ['PATH']}",
+                "RHI_BOOT_ROOT": str(root),
+                "RHI_BOOT_METADATA": f"http://127.0.0.1:{metadata.server_address[1]}",
+                "RHI_TEST_STATE": str(state),
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        metadata.shutdown()
+        metadata.server_close()
+
+    # The digest the parameter names is the archive's: the program went on to unpack and start it.
+    assert (ran.returncode, ran.stderr) == (0, "")
+    assert {path.name for path in (root / "run/systemd/system").iterdir()} == UNITS
+    collector = root / "opt/rhi/release/collector/config.yaml"
+    assert collector.read_bytes() == (REPO / "services/engine/collector/config.yaml").read_bytes()
+    assert (root / "opt/rhi/release/agent/rhi_lifecycle/__main__.py").is_file()
+    assert (root / "opt/rhi/release/agent/rhi_common/__init__.py").is_file()
+    assert (state / "systemctl.log").read_text(encoding="utf-8").splitlines() == [
+        "daemon-reload",
+        "start --no-block rhi-collector.service rhi-lifecycle.service",
+    ]
+    # The settings the units read are the parameter's.
+    settings = dict(
+        line.split("=", 1) for line in (root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    )
+    assert settings["RHI_ENGINE_IMAGE"] == json.loads(value)["engine_image"]
+    assert (settings["RHI_LAUNCH_HOOK"], settings["RHI_TERMINATION_HOOK"]) == ("rhi-launch", "rhi-termination")

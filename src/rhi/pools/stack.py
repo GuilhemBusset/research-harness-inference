@@ -1,5 +1,6 @@
-"""The pools stack: the pools' state and heartbeats, the internal load balancer, the groups and the
-scaler that sizes them (system design, sections 2, 4.2 and 5).
+"""The pools stack: the pools' state and heartbeats, the internal load balancer, the groups, the
+scaler that sizes them and the releases their instances run (system design, sections 2, 4.2, 4.3
+and 5).
 
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
 reference it back. The stack and the logical IDs of its tables are recorded in
@@ -14,6 +15,7 @@ import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 
 from rhi.pools.group import PoolGroup
+from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
 from rhi.pools.scaler import Scaler
@@ -36,8 +38,10 @@ class PoolsStack(cdk.Stack):
     grant what their resources need), each pool's bearer secret, from `secrets[name]`
     (`secrets[name].secret`, whose `secrets[name].grant_read(grantee)` lets another construct of the
     stage, the gateway's, allow its role to read it), each pool's launch template and Auto Scaling group, from
-    `groups[name]`, and the scaler, from
-    `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke."""
+    `groups[name]`, the scaler, from
+    `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke,
+    and each pool's release, from `releases[name]`: its engine image, its release parameter and the
+    instance refresh that a change to the release starts."""
 
     def __init__(
         self,
@@ -104,7 +108,28 @@ class PoolsStack(cdk.Stack):
             pool_state=self.tables.pool_state,
             workspace=observability.prometheus,
         )
-        # The groups' custom resources run on one function the CDK puts at the stack's root. That
+        # One release per pool, by the pool's name: its engine image, the parameter its instances
+        # read at every start, and the refresh of its group when the release changes. The pools
+        # share the release's files and what runs the refreshes; with the table empty there is none.
+        self.releases: dict[str, PoolRelease] = {}
+        if config.pools:
+            files = ReleaseFiles(self, "ReleaseFiles")
+            refresher = InstanceRefresher(self, "InstanceRefresher", pools=config.pools)
+            self.releases = {
+                pool.name: PoolRelease(
+                    self,
+                    f"Release-{pool.name}",
+                    pool=pool,
+                    files=files,
+                    refresher=refresher,
+                    group=self.groups[pool.name],
+                    role=self.roles[pool.name].role,
+                    heartbeats=self.tables.heartbeats,
+                    workspace=observability.prometheus,
+                )
+                for pool in config.pools
+            }
+        # The groups' and the releases' AWS SDK custom resources run on one function the CDK puts at the stack's root. That
         # function names its role's ARN, which orders the two already; its `DependsOn` on the role
         # repeats it, and cfn-lint warns (W3005).
         provider = self.node.try_find_child("AWS" + cr.AwsCustomResource.PROVIDER_FUNCTION_UUID.replace("-", ""))
