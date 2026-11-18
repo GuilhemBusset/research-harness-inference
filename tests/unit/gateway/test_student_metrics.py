@@ -331,7 +331,7 @@ def test_the_endpoint_serves_on_the_loopback_address_only() -> None:
     server = made.metrics.serve(port=0)  # A free port: another gateway may be running on this host.
     try:
         host, port = server.server_address[:2]
-        # The address given by default, and the one address the socket listens on.
+        # The one address the socket listens on.
         assert host == metrics.HOST
         with urllib.request.urlopen(f"http://{metrics.HOST}:{port}{metrics.ROUTE}", timeout=10) as answer:
             assert answer.headers["Content-Type"].startswith("text/plain")
@@ -348,6 +348,13 @@ def test_the_endpoint_serves_on_the_loopback_address_only() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_the_endpoint_takes_no_other_address() -> None:
+    # Nothing a caller gives opens the endpoint outside the task: the address is not an argument.
+    serve: Any = metrics.Metrics().serve
+    with pytest.raises(TypeError):
+        serve(host="0.0.0.0", port=0).server_close()
 
 
 def test_a_budget_that_cannot_be_read_leaves_the_counters_served() -> None:
