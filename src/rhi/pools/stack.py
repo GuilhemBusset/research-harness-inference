@@ -1,6 +1,6 @@
 """The pools stack: the pools' state and heartbeats, the internal load balancer, the groups, the
-scaler that sizes them and the releases their instances run (system design, sections 2, 4.2, 4.3
-and 5).
+scaler that sizes them, the releases their instances run and the lifecycle hooks their instances
+complete (system design, sections 2, 4.2, 4.3 and 5).
 
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
 reference it back. The stack and the logical IDs of its tables are recorded in
@@ -15,6 +15,7 @@ import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 
 from rhi.pools.group import PoolGroup
+from rhi.pools.hooks import PoolHooks
 from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
@@ -40,8 +41,9 @@ class PoolsStack(cdk.Stack):
     stage, the gateway's, allow its role to read it), each pool's launch template and Auto Scaling group, from
     `groups[name]`, the scaler, from
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke,
-    and each pool's release, from `releases[name]`: its engine image, its release parameter and the
-    instance refresh that a change to the release starts."""
+    each pool's release, from `releases[name]`: its engine image, its release parameter and the
+    instance refresh that a change to the release starts, and each pool's lifecycle hooks, from
+    `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`)."""
 
     def __init__(
         self,
@@ -129,6 +131,13 @@ class PoolsStack(cdk.Stack):
                 )
                 for pool in config.pools
             }
+        # One launch hook and one termination hook per pool, by the pool's name. They come last among
+        # a pool's pieces: with them, an instance enters service only when its agent completes the
+        # launch hook, which takes the role, the secret and the release above.
+        self.hooks = {
+            pool.name: PoolHooks(self, f"Hooks-{pool.name}", pool=pool, group=self.groups[pool.name].group)
+            for pool in config.pools
+        }
         # The groups' and the releases' AWS SDK custom resources run on one function the CDK puts at the stack's root. That
         # function names its role's ARN, which orders the two already; its `DependsOn` on the role
         # repeats it, and cfn-lint warns (W3005).
