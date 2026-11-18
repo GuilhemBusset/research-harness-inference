@@ -1,8 +1,9 @@
 """The gateway stack: the gateway's Fargate service (system design, sections 2 and 6.2).
 
-The stack references the other stacks of the stage: the network's VPC and the gateway's security
-group, the students' tables, the workspace, and the pools' internal load balancer, target groups,
-secrets, tables and scaler. None of them references it back.
+The stack references the other stacks of the stage: the network's VPC, the gateway's security
+group and the public load balancer's HTTPS listener, when it has one, the students' tables, the
+workspace, and the pools' internal load balancer, target groups, secrets, tables and scaler. None
+of them references it back.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ if TYPE_CHECKING:
 
 class GatewayStack(cdk.Stack):
     """Holds the gateway's service, which a later construct takes from `service`
-    (`service.service`, `service.task_role`, `service.log_group`)."""
+    (`service.service`, `service.task_role`, `service.log_group`), reached through the network's
+    HTTPS listener, or from nowhere while there is none."""
 
     def __init__(
         self,
@@ -59,4 +61,5 @@ class GatewayStack(cdk.Stack):
             pool_state=pools.tables.pool_state,
             scaler=pools.scaler.function,
             workspace=observability.prometheus,
+            listener=network.https_listener,
         )

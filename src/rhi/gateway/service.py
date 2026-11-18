@@ -4,9 +4,28 @@ collector beside the gateway (system design, sections 2, 5.3, 6.2, 6.6 and 11.2)
 **The tasks.** As many as the configuration's `gateway_tasks`, each of 0.5 vCPU and 1 GB on arm64,
 the architecture the idle cost of section 11.2 is priced for, in the VPC's private subnets with no
 public address, in the gateway's security group of `rhi.network.security`. The gateway listens on
-port 8080. The service has no load balancer: the public load balancer's target group, its health
-check and its deregistration delay arrive with the rule that reaches the gateway, and until then
-nothing reaches it from the internet. A deployment starts new tasks before it stops old ones.
+port 8080. A deployment starts new tasks before it stops old ones.
+
+**How it is reached.** One rule of the public load balancer's HTTPS listener, at priority
+`PRIORITY`, forwards the paths of the gateway's route table (`PATH_PATTERNS`: everything under
+`/v1/`, and `/status`, `/wake` and `/api/hello`) to the service's target group, on port 8080. The
+issuer's rule is at 20 and Grafana's at 30; the load balancer answers every other path with its
+fixed 404, and the gateway's own table is still the control. The listener exists only while the
+configuration's `https_listener` is true (`rhi.network.edge`), and ECS refuses a service whose
+target group belongs to no load balancer: without the listener the service has no target group,
+no rule and no load balancer, and nothing reaches it from the internet. The security group of
+`rhi.network.security` already admits the load balancer on port 8080, so the attachment adds no
+rule of its own.
+
+**A deployment never cuts a request.** ECS waits for an old task's target to finish deregistering
+before it stops the task, and the target group's deregistration delay is `DEREGISTRATION_SECONDS`,
+1800: a held request or a stream up to 30 minutes long finishes, and a gateway deployment takes
+that long to complete (section 8.5; the number is a default of section 17).
+
+**The health check** sends `GET /v1/models`, as a load balancer does, with no key, and counts the
+status 401 as healthy. The route table is closed, and its one route answered without a key,
+`HEAD /api/hello`, is not a GET; the gateway answers a request that has no key from its headers
+alone, with no lookup, so the check costs nothing and adds no route.
 
 **The image** is built from the context `rhi.packaging.image_context` gives the gateway:
 `rhi_common`, `rhi_gateway`, the gateway's Dockerfile and the gateway group's requirements with
@@ -80,6 +99,7 @@ import aws_cdk as cdk
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_ecs as ecs
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from constructs import Construct
@@ -95,7 +115,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from aws_cdk import aws_dynamodb as dynamodb
-    from aws_cdk import aws_elasticloadbalancingv2 as elbv2
     from aws_cdk import aws_lambda as lambda_
 
     from rhi.config import Config
@@ -146,6 +165,19 @@ NUMERIC = {
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "retry_after_concurrency_limit_seconds",
 }
 
+# The container that listens, by the name the task definition gives it.
+GATEWAY_CONTAINER = "Gateway"
+# The listener's rules need distinct priorities; the design gives none (issuer 20, Grafana 30).
+PRIORITY = 10
+# The paths of the gateway's route table (`rhi_gateway.routes`): the forwarded and local routes
+# under /v1/, and the three others.
+PATH_PATTERNS = ["/v1/*", "/status", "/wake", "/api/hello"]
+# How long a deregistering task keeps its requests: the longest request, 30 minutes.
+DEREGISTRATION_SECONDS = 1800
+# What the health check asks, with no key, and the status the gateway answers it with.
+HEALTH_CHECK_PATH = "/v1/models"
+HEALTH_CHECK_STATUS = "401"
+
 TARGET_HEALTH_ACTIONS = ["elasticloadbalancing:DescribeTargetHealth"]
 INVOKE_ACTIONS = ["lambda:InvokeFunction"]
 
@@ -153,8 +185,8 @@ INVOKE_ACTIONS = ["lambda:InvokeFunction"]
 class GatewayService(Construct):
     """The gateway's cluster, as `cluster`, its task definition, as `task_definition`, the task's
     role, as `task_role`, the two containers' log group, as `log_group`, and the service, as
-    `service`. The construct that adds the public load balancer's rule registers `service` with its
-    target group."""
+    `service`. When `listener` is given, the service's target group and its rule on that listener,
+    as `target_group` and `rule`; both are None without one."""
 
     def __init__(
         self,
@@ -173,6 +205,7 @@ class GatewayService(Construct):
         pool_state: dynamodb.ITable,
         scaler: lambda_.Function,
         workspace: PrometheusWorkspace,
+        listener: elbv2.IApplicationListener | None,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -246,7 +279,7 @@ class GatewayService(Construct):
             environment[DEFAULT_POOL_VARIABLE] = config.default_pool
 
         self.task_definition.add_container(
-            "Gateway",
+            GATEWAY_CONTAINER,
             image=ecs.ContainerImage.from_asset(
                 packaging.image_context("gateway", DOCKERFILE),
                 platform=IMAGE_PLATFORM,
@@ -287,6 +320,35 @@ class GatewayService(Construct):
             # A deployment whose tasks do not start fails, and the service goes back to the tasks
             # it had: without this CloudFormation waits three hours for a steady state.
             circuit_breaker=ecs.DeploymentCircuitBreaker(enable=True, rollback=True),
+        )
+
+        self.target_group: elbv2.ApplicationTargetGroup | None = None
+        self.rule: elbv2.ApplicationListenerRule | None = None
+        if listener is None:
+            return
+        self.target_group = elbv2.ApplicationTargetGroup(
+            self,
+            "Target",
+            vpc=vpc,
+            port=GATEWAY_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            # Each task by its address: ECS registers it, and deregisters it before it stops it.
+            targets=[self.service.load_balancer_target(container_name=GATEWAY_CONTAINER, container_port=GATEWAY_PORT)],
+            deregistration_delay=cdk.Duration.seconds(DEREGISTRATION_SECONDS),
+            # A load balancer's HTTP check is a GET that carries no header, so no key.
+            health_check=elbv2.HealthCheck(
+                path=HEALTH_CHECK_PATH,
+                protocol=elbv2.Protocol.HTTP,
+                healthy_http_codes=HEALTH_CHECK_STATUS,
+            ),
+        )
+        self.rule = elbv2.ApplicationListenerRule(
+            self,
+            "Rule",
+            listener=listener,
+            priority=PRIORITY,
+            conditions=[elbv2.ListenerCondition.path_patterns(PATH_PATTERNS)],
+            action=elbv2.ListenerAction.forward([self.target_group]),
         )
 
 
