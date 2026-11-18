@@ -8,9 +8,9 @@ Some values of the environment are references that CloudFormation resolves at de
 `Deployment` gives each a placeholder of the form the deployment would give, and remembers which
 resource of which template the placeholder stands for.
 
-The tests synthesize the stage themselves, with its gateway stack and with cdk-nag: the app does
-not ask the stage for that stack yet (`rhi.stage.EndpointStage`). The CDK is imported inside
-`synthesize`, after `app_module` has started jsii (see conftest.py).
+The tests synthesize the stage themselves, with cdk-nag, from the example configuration and from
+changes of it. The CDK is imported inside `synthesize`, after `app_module` has started jsii (see
+conftest.py).
 """
 
 from __future__ import annotations
@@ -154,10 +154,10 @@ class Gateway:
 
 
 def synthesize(app_module: ModuleType, outdir: Path, change: Any = None) -> Gateway:
-    """The gateway of the stage built, with its gateway stack, from the example configuration's
-    data once `change` has changed it: with the context of `cdk.json`, nothing bundled, and
-    cdk-nag as the app runs it, which fails the synthesis on a finding that the file of the
-    resource's module does not acknowledge."""
+    """The gateway of the stage built from the example configuration's data once `change` has
+    changed it: with the context of `cdk.json`, nothing bundled, and cdk-nag as the app runs it,
+    which fails the synthesis on a finding that the file of the resource's module does not
+    acknowledge."""
     import aws_cdk as cdk
 
     from rhi.stage import EndpointStage
@@ -167,7 +167,7 @@ def synthesize(app_module: ModuleType, outdir: Path, change: Any = None) -> Gate
         change(data)
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
     app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    EndpointStage(app, "Rhi", config=config.parse(data, "test"), gateway=True)
+    EndpointStage(app, "Rhi", config=config.parse(data, "test"))
     app_module.add_nag(app)
     app.synth()
     return Gateway(outdir)

@@ -5,10 +5,8 @@ key verification/<execution ID>/not-run of the artifact bucket; inputs that are 
 stage's stacks and the execution's ID; and a role that reads the canary's secret, queries the
 stage's workspace, reads the stage's pools' release parameters and writes under verification/.
 
-The app does not ask the stage for its gateway stack yet (`rhi.stage.EndpointStage`), so the
-tests of the endpoint's input build the pipeline over a stage that has it, without cdk-nag: the
-reporter's file does not acknowledge that stack yet. The CDK is imported inside that build, after
-`app_module` has started jsii (see conftest.py).
+The tests read the app's own pipeline, the one that is deployed. Two of them also build the app
+from a changed configuration, with no listener and with no pool.
 """
 
 from __future__ import annotations
@@ -207,7 +205,21 @@ def test_the_post_build_phase_copies_the_reason_when_there_is_one(verification: 
 def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(verification: Verification) -> None:
     by_action = verification.given_by_the_action()
     (execution,) = [name for name, value in by_action.items() if value == EXECUTION_ID]
-    assert set(by_action) == {execution, "RHI_SMOKE_WORKSPACE_URL", script.RELEASE_PARAMETERS_VARIABLE}
+    assert set(by_action) == {
+        execution,
+        script.ENDPOINT_VARIABLE,
+        "RHI_SMOKE_WORKSPACE_URL",
+        script.RELEASE_PARAMETERS_VARIABLE,
+    }
+
+    # The endpoint is the output of the stack that holds the gateway's service, which the pipeline
+    # deploys: the example configuration has a listener, so the output is its domain.
+    stack, value, template = verification.output(script.ENDPOINT_VARIABLE)
+    assert stack == f"{STAGE}-Gateway"
+    assert [r for r in template["Resources"].values() if r["Type"] == "AWS::ECS::Service"]
+    example = config.load({"RHI_CONFIG": "example"})
+    assert example.https_listener and value == example.domain
+    assert script.ENDPOINT_VARIABLE not in verification.given_by_the_project()
 
     stack, value, template = verification.output("RHI_SMOKE_WORKSPACE_URL")
     assert stack == f"{STAGE}-Observability"
@@ -224,14 +236,10 @@ def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(ver
         for r in template["Resources"].values()
         if r["Type"] == "AWS::SSM::Parameter" and RELEASE_PARAMETER.fullmatch(str(r["Properties"].get("Name")))
     }
-    example = config.load({"RHI_CONFIG": "example"})
     assert set(named) == {pool.name for pool in example.pools} and named
     assert set(named.values()) == declared
     # CodePipeline writes an output's value into the JSON of the action's configuration as it is.
     assert '"' not in value and "\\" not in value
-
-    # The app's stage has no gateway stack yet: the step is told there is no endpoint.
-    assert verification.given_by_the_project()[script.ENDPOINT_VARIABLE] == script.NO_ENDPOINT
 
 
 def test_the_role_reads_one_secret_and_writes_under_verification_only(verification: Verification) -> None:
@@ -286,21 +294,12 @@ def test_the_role_queries_the_stage_s_workspace_and_reads_the_stage_s_release_pa
 
 
 def build(app_module: ModuleType, outdir: Path, change: Callable[[dict[str, Any]], None]) -> Verification:
-    """The verification of the pipeline over a stage with its gateway stack, from the example
-    configuration's data once `change` has changed it."""
-    import aws_cdk as cdk
-
-    from rhi.pipeline.stack import PipelineStack
-    from rhi.stage import EndpointStage
-
+    """The verification of the app's pipeline under the example configuration's data once `change`
+    has changed it: the app as `app.py` builds it, cdk-nag included, with nothing bundled."""
     data = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
     change(data)
-    parsed = config.parse(data, "test")
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    stage = EndpointStage(app, STAGE, config=parsed, gateway=True)
-    PipelineStack(app, "RhiPipeline", config=parsed, stage=stage)
-    app.synth()
+    app_module.build(config.parse(data, "test"), outdir=str(outdir), context=context).synth()
     return Verification(
         {
             path.relative_to(outdir).as_posix(): json.loads(path.read_text(encoding="utf-8"))
@@ -310,10 +309,11 @@ def build(app_module: ModuleType, outdir: Path, change: Callable[[dict[str, Any]
 
 
 def test_the_endpoint_is_the_gateway_stack_s_output_whatever_the_listener(
-    app_module: ModuleType, tmp_path: Path
+    verification: Verification, app_module: ModuleType, tmp_path: Path
 ) -> None:
-    listening = build(app_module, tmp_path / "on", lambda data: data.update(https_listener=True))
-    silent = build(app_module, tmp_path / "off", lambda data: data.update(https_listener=False))
+    # The app's pipeline, whose configuration has a listener, and the same app with none.
+    listening = verification
+    silent = build(app_module, tmp_path, lambda data: data.update(https_listener=False))
 
     stack, value, _ = listening.output(script.ENDPOINT_VARIABLE)
     assert (stack, value) == (f"{STAGE}-Gateway", config.load({"RHI_CONFIG": "example"}).domain)
@@ -323,13 +323,8 @@ def test_the_endpoint_is_the_gateway_stack_s_output_whatever_the_listener(
     # The step's inputs do not change shape with the listener, and the pipeline's template holds
     # no value of either stage: only the names of the outputs.
     assert listening.given_by_the_action() == silent.given_by_the_action()
-    assert set(listening.given_by_the_action()) > {
-        script.ENDPOINT_VARIABLE,
-        "RHI_SMOKE_WORKSPACE_URL",
-        script.RELEASE_PARAMETERS_VARIABLE,
-    }
-    assert script.ENDPOINT_VARIABLE not in listening.given_by_the_project()
-    assert listening.action["RunOrder"] > max(action["RunOrder"] for action in listening.deployments())
+    assert script.ENDPOINT_VARIABLE not in silent.given_by_the_project()
+    assert silent.action["RunOrder"] > max(action["RunOrder"] for action in silent.deployments())
 
 
 def test_a_stage_with_no_pool_gives_no_parameter_to_read(app_module: ModuleType, tmp_path: Path) -> None:
