@@ -103,6 +103,7 @@ class World(Host):
             autoscaling=self,
             ssm=self,
             secrets=self,
+            dynamodb=self,
             host=self,
             engine=Engine(self.fetch),
             # An instance that leaves service is handed over: tests/unit/lifecycle/test_termination.py.
@@ -158,6 +159,14 @@ class World(Host):
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         self.calls.append("complete")
         self.completions.append(request)
+        return {}
+
+    # The heartbeats table, where a launch names the stage it has reached: tests/unit/lifecycle/test_stages.py.
+
+    def Table(self, name: str) -> World:
+        return self
+
+    def put_item(self, **request: Any) -> dict[str, Any]:
         return {}
 
     # The instance metadata and the engine: what answers when the agent opens a URL.

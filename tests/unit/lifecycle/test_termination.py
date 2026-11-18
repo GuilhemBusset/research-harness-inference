@@ -114,6 +114,7 @@ class World(Host):
             autoscaling=self,
             ssm=self,
             secrets=self,
+            dynamodb=self,
             host=self,
             engine=Engine(self.fetch),
             termination=self.termination(),
@@ -199,6 +200,14 @@ class World(Host):
 
     def get_secret_value(self, **request: Any) -> dict[str, Any]:
         return {"SecretString": SECRET}
+
+    # The heartbeats table, where a launch names the stage it has reached: tests/unit/lifecycle/test_stages.py.
+
+    def Table(self, name: str) -> World:
+        return self
+
+    def put_item(self, **request: Any) -> dict[str, Any]:
+        return {}
 
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         if self.completion_fails:
