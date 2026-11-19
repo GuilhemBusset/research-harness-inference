@@ -18,7 +18,6 @@ import dataclasses
 import json
 import re
 import tomllib
-from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -43,7 +42,6 @@ QUERY_ACTIONS = {"aps:QueryMetrics", "aps:GetSeries", "aps:GetLabels", "aps:GetM
 LOG_ACTIONS = {"logs:StartQuery", "logs:GetLogGroupFields", "logs:GetLogEvents"}
 CLOUDWATCH_READS = {"cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "logs:GetQueryResults"}
 SERVICE_LOG_GROUPS = {"/rhi/gateway", "/rhi/scaler", "/rhi/issuer"}
-POOLS_LOG_GROUPS = "/rhi/pools/*"
 
 # What the pseudo parameters of an ARN are read as, and the ARN of a log group so read: its name,
 # then `:*` for the log group and its streams.
@@ -126,6 +124,23 @@ def task_role_statements(template: Template) -> list[dict[str, Any]]:
             if {"Ref": role_id} in policy.get("Roles", [])
         ]
     return [statement for document in documents for statement in as_list(document["Statement"])]
+
+
+def log_groups_named(template: Template) -> set[str]:
+    """The names of the log groups that the role of Grafana's task may query: each resource of
+    its one statement on log groups is the ARN of a log group and its streams, written out by
+    name, as text, in the stack's own partition, region and account."""
+    (logs,) = [
+        statement for statement in task_role_statements(template) if set(as_list(statement["Action"])) == LOG_ACTIONS
+    ]
+    named = set()
+    for resource in as_list(logs["Resource"]):
+        # No reference to the stack that creates the log group.
+        assert imports(resource) == set()
+        matched = LOG_GROUP_ARN.fullmatch(written(resource) or "")
+        assert matched, resource
+        named.add(matched["name"])
+    return named
 
 
 def written(resource: Any) -> str | None:
@@ -367,35 +382,36 @@ def test_the_role_names_the_workspace_and_the_stage_s_log_groups_only(templates:
     (logs,) = by_resource.values()
     assert set(logs["Action"]) == LOG_ACTIONS
 
-    # Each log group by its name, as text, in the stack's own partition, region and account: no
-    # reference to the stack that creates it.
-    named = set()
-    for resource in logs["Resource"]:
-        assert imports(resource) == set()
-        matched = LOG_GROUP_ARN.fullmatch(written(resource) or "")
-        assert matched, resource
-        named.add(matched["name"])
-    assert named == SERVICE_LOG_GROUPS | {POOLS_LOG_GROUPS}
-
-    # What that reaches of the log groups the stage creates: the gateway's, the scaler's, the
-    # issuer's and each configured pool's, and no other, Grafana's own included.
+    # The log groups, each by its own name and none by a pattern: the gateway's, the scaler's, the
+    # issuer's and that of the example's one pool.
+    assert [pool.name for pool in EXAMPLE.pools] == ["mock"]
+    named = log_groups_named(template)
+    assert named == SERVICE_LOG_GROUPS | {"/rhi/pools/mock"}
+    # Each is the name of a log group the stage creates. Grafana's own is not among them.
     created = {
         group["LogGroupName"]
         for path, _, group in everywhere(templates, "AWS::Logs::LogGroup")
         if "/" in path and isinstance(group.get("LogGroupName"), str)
     }
-    assert "/rhi/grafana" in created
-    assert [pool.name for pool in EXAMPLE.pools] == ["mock"]
-    assert {name for name in created if any(fnmatchcase(name, pattern) for pattern in named)} == {
-        "/rhi/gateway",
-        "/rhi/scaler",
-        "/rhi/issuer",
-        "/rhi/pools/mock",
-    }
-    # Each name the role writes is one the stage creates, and the pattern takes nothing but the
-    # pools' log groups.
-    assert SERVICE_LOG_GROUPS <= created
-    assert {name for name in created if fnmatchcase(name, POOLS_LOG_GROUPS)} == {"/rhi/pools/mock"}
+    assert named <= created
+    assert "/rhi/grafana" in created - named
+
+
+def test_the_role_names_the_log_group_of_each_configured_pool(tmp_path: Path) -> None:
+    """Two pools, neither the example's: the role names the log group of each, and no other
+    pool's, the example's included."""
+    import aws_cdk as cdk
+
+    from rhi.stage import EndpointStage
+
+    (mock,) = EXAMPLE.pools
+    pools = (dataclasses.replace(mock, name="first"), dataclasses.replace(mock, name="second"))
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app = cdk.App(outdir=str(tmp_path), context=context, analytics_reporting=False)
+    stage = EndpointStage(app, "Rhi", config=dataclasses.replace(EXAMPLE, pools=pools, default_pool="first"))
+    app.synth()
+    template = json.loads((Path(stage.outdir) / stage.observability.template_file).read_text(encoding="utf-8"))
+    assert log_groups_named(template) == SERVICE_LOG_GROUPS | {"/rhi/pools/first", "/rhi/pools/second"}
 
 
 def test_the_stack_depends_on_no_stack_that_depends_on_it(templates: Templates) -> None:
