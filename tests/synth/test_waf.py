@@ -191,6 +191,14 @@ def test_the_acl_takes_its_limits_from_the_configuration_with_the_listener_off(
     app = app_module.build(settings, outdir=str(tmp_path), context=context)
     app.synth()
     templates = {str(path): json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.rglob("*.template.json")}
-    assert resources(templates, "AWS::ElasticLoadBalancingV2::Listener") == []
+    # The public load balancer has no listener; the internal one, which routes to the pools, keeps its own.
+    (public,) = [
+        name
+        for template in templates.values()
+        for name, r in template["Resources"].items()
+        if r["Type"] == "AWS::ElasticLoadBalancingV2::LoadBalancer" and r["Properties"]["Scheme"] == "internet-facing"
+    ]
+    listeners = resources(templates, "AWS::ElasticLoadBalancingV2::Listener")
+    assert [listener for listener in listeners if listener["Properties"]["LoadBalancerArn"] == {"Ref": public}] == []
     assert rate_rules(acl_of(templates)) == {None: 5000, "/auth/": 20, "/grafana/": 150}
     assert len(resources(templates, "AWS::WAFv2::WebACLAssociation")) == 1
