@@ -269,7 +269,9 @@ def test_students_are_aliases() -> None:
     assert {sample.labels["alias"] for sample in of_a_student} == {alias}
     assert {sample.name for sample in of_a_student} >= {REQUESTS, INPUT, OUTPUT, ERRORS, metrics.BUDGET_LEFT}
     # A student has no other name in any series: no label but these three, and nowhere the ID or the key.
-    assert {name for sample in exposed for name in sample.labels} == {"alias", "pool", "cause"}
+    # The two others are those of what students experience (`rhi_gateway.experience`), which names no student.
+    labels = {name for sample in exposed for name in sample.labels}
+    assert labels == {"alias", "pool", "cause", "wire_format", "le"}
     for sample in exposed:
         written = " ".join([sample.name, *sample.labels, *sample.labels.values()])
         assert str(github_id) not in written

@@ -89,6 +89,18 @@ ends a quiet stream. An idle upstream connection is closed after 5 seconds, one 
 let a pool's instance leave service quickly (section 5.1). The time limit is waited for with the
 `sleep` the proxy is given, `asyncio.sleep` unless a test gives its own clock.
 
+**Token times** (section 7.2). The speed a student got is counted from the first token sent to the
+last, so `forward` and `held` take a `token_sent`, which the proxy calls each time a write to the
+client that completed an event carrying output has returned (`carries_output`). Output is text,
+reasoning or a tool call's arguments, as in the engine's output tokens, and an event carries some
+when the piece it adds is not empty: a `content_block_delta` of Messages with text, thinking or a
+tool's input, a `.delta` event of Responses, a Chat Completions chunk whose delta holds text or a
+tool call's arguments. An empty piece is no token, and neither is what an engine sends beside its
+output: a thinking block's signature, a tool call's name, the role. It is not called for a write
+given up at the time limit, for a keep-alive, or for an answer that is not a stream. The first and
+the last call of a request are its two times; whoever is called reads the clock
+(`rhi_gateway.experience`).
+
 Nothing here reads configuration or the environment: the address, the secrets and the limit are
 given.
 """
@@ -272,6 +284,65 @@ def _is_failure(event: SseEvent) -> bool:
     if event.comment:
         return False
     return event.name in FAILURE_EVENTS or _reports_failure(_json_object(event.data))
+
+
+# The events that carry output. Messages names one kind of event, and the field of each kind of piece: a
+# thinking block's signature is a `signature_delta`, which is not output. Responses ends the name of
+# each of its kinds alike, and the piece is the event's `delta`.
+MESSAGES_OUTPUT_EVENT = "content_block_delta"
+MESSAGES_OUTPUT_FIELDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}
+RESPONSES_OUTPUT_SUFFIX = ".delta"
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _chat_delta_carries_output(delta: Mapping[str, object]) -> bool:
+    """Whether a chunk's delta adds text (the answer's, the reasoning's) or a piece of a tool call's arguments."""
+    for name, value in delta.items():
+        if name == "tool_calls":
+            # A call's first chunk names it, with no arguments yet: that is not a token.
+            calls = value if isinstance(value, list) else []
+            if any(
+                isinstance(call, dict)
+                and isinstance(function := call.get("function"), dict)
+                and _is_text(function.get("arguments"))
+                for call in calls
+            ):
+                return True
+        elif name != "role" and _is_text(value):
+            return True
+    return False
+
+
+def carries_output(wire_format: WireFormat, event: SseEvent) -> bool:
+    """Whether an event of a stream carries output: a piece, not empty, of text, reasoning or a tool call's arguments."""
+    if event.comment:
+        return False
+    data = _json_object(event.data)
+    if wire_format is WireFormat.CHAT_COMPLETIONS:
+        choices = data.get("choices")
+        return isinstance(choices, list) and any(
+            isinstance(choice, dict)
+            and isinstance(delta := choice.get("delta"), dict)
+            and _chat_delta_carries_output(delta)
+            for choice in choices
+        )
+    kind = event.name or data.get("type")
+    if not isinstance(kind, str):
+        return False
+    if wire_format is WireFormat.RESPONSES:
+        return kind.endswith(RESPONSES_OUTPUT_SUFFIX) and _is_text(data.get("delta"))
+    delta = data.get("delta")
+    if kind != MESSAGES_OUTPUT_EVENT or not isinstance(delta, dict):
+        return False
+    piece = delta.get("type")
+    return (
+        isinstance(piece, str)
+        and piece in MESSAGES_OUTPUT_FIELDS
+        and _is_text(delta.get(MESSAGES_OUTPUT_FIELDS[piece]))
+    )
 
 
 def _event_name(line: bytes) -> str:
@@ -490,6 +561,7 @@ class _Stream:
         *,
         upstream: AsyncIterator[bytes] | None = None,
         first: bytes | None = None,
+        token_sent: Callable[[], None] | None = None,
     ) -> None:
         self._response = response
         # Decoded, should the engine compress what it was asked to send as it is: the client is
@@ -504,6 +576,8 @@ class _Stream:
         self._settle = settle
         self._clean = False
         self._abandoned = False  # The last write of a chunk to the client was given up at the time limit.
+        self._token_sent = token_sent
+        self._sent = SseReader()  # Reads what is written to the client, for the events that carry output.
 
     def abandon_write(self) -> None:
         """The write of the chunk last given was given up: the client does not have it."""
@@ -533,10 +607,15 @@ class _Stream:
                 before = self._gate.client_has
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
+                    carried = self._token_sent is not None and any(
+                        carries_output(self._wire_format, event) for event in self._sent.feed(forward)
+                    )
                     yield forward
                     if self._abandoned:
                         client_has = before
                         raise TimeLimitReached
+                    if carried and self._token_sent is not None:
+                        self._token_sent()  # The write has returned: the client has the token.
                 if self._gate.failed_event_ended:
                     break
         except TimeLimitReached:
@@ -639,12 +718,14 @@ class Proxy:
         on_end: Callable[[Observed], Awaitable[None]],
         *,
         receive: Receive | None = None,
+        token_sent: Callable[[], None] | None = None,
     ) -> Response:
         """Forward the request and return the client's answer; `on_end` is called exactly once, at its end.
 
         `receive` is the client's, whose body has been read: it is listened to for the client's
         disconnect until a stream starts. A stream's end comes once the client's answer has been
-        sent or abandoned; every other end comes before this returns.
+        sent or abandoned; every other end comes before this returns. `token_sent` is called each
+        time an event of a stream that carries output has been written to the client.
         """
         settle = _Settlement(on_end)
         wire_format = route.wire_format or WireFormat.MESSAGES
@@ -664,7 +745,7 @@ class Proxy:
                     await ends.stop_listening()
                     streaming = True
                     meter = _stream_meter(route, forwarded)
-                    return ProxiedResponse(_Stream(response, meter, ends, wire_format, settle))
+                    return ProxiedResponse(_Stream(response, meter, ends, wire_format, settle, token_sent=token_sent))
                 chunks = response.aiter_bytes()
                 while (chunk := await ends.race(_next_chunk(chunks))) is not None:
                     received += chunk
@@ -688,14 +769,21 @@ class Proxy:
                 await _to_the_end(_close_and_settle(ends, response, settle, seen if whole else seen.unclean()))
 
     def held(
-        self, route: Route, forwarded: Forwarded, on_end: Callable[[Observed], Awaitable[None]], held: HeldRequest
+        self,
+        route: Route,
+        forwarded: Forwarded,
+        on_end: Callable[[Observed], Awaitable[None]],
+        held: HeldRequest,
+        *,
+        token_sent: Callable[[], None] | None = None,
     ) -> Response:
         """A held stream's answer: 200 at once, the hold's keep-alives, then the engine's stream on the same connection.
 
         `on_end` is called exactly once: with nothing observed when the hold ends the request,
         else as `forward` calls it. The request is forwarded when `held.waiting()` ends.
+        `token_sent` is called as `forward` calls it, for the engine's stream.
         """
-        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held))
+        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held, token_sent))
 
 
 class HeldRequest(Protocol):
@@ -762,9 +850,16 @@ class _HeldStream:
     """A held stream: the hold's keep-alives, then the request forwarded, with keep-alives until the engine's first event."""
 
     def __init__(
-        self, proxy: Proxy, route: Route, forwarded: Forwarded, settle: _Settlement, held: HeldRequest
+        self,
+        proxy: Proxy,
+        route: Route,
+        forwarded: Forwarded,
+        settle: _Settlement,
+        held: HeldRequest,
+        token_sent: Callable[[], None] | None = None,
     ) -> None:
         self._proxy = proxy
+        self._token_sent = token_sent
         self._route = route
         self._forwarded = forwarded
         self._settle = settle
@@ -828,6 +923,7 @@ class _HeldStream:
                     self._settle,
                     upstream=upstream,
                     first=bytes(before_first) or None,
+                    token_sent=self._token_sent,
                 )
                 async for chunk in stream.chunks():
                     yield chunk
