@@ -254,6 +254,14 @@ def test_every_dashboard_follows_the_rules(
     found = check.violations(without_state, engines.metrics, pools)
     assert rules_broken(found) == {"asleep"}
     assert len(found) == len([panel for panel in without_state["panels"] if panel["type"] != "row"])
+    # A state query that is disabled is on no panel: nothing reads asleep.
+    state_disabled = engines.document()
+    for panel in state_disabled["panels"]:
+        for target in panel.get("targets", []):
+            target["hide"] = target["refId"] == rules.ASLEEP_REF
+    found = check.violations(state_disabled, engines.metrics, pools)
+    assert rules_broken(found) == {"asleep"}
+    assert len(found) == len([panel for panel in state_disabled["panels"] if panel["type"] != "row"])
     # The other pool's count is not this pool's.
     other = graph(rules.awake("second", tokens), rules.asleep("second"))
     assert rules_broken(check.violations(document(other), engine, pools)) == {"asleep"}
@@ -271,11 +279,34 @@ def test_every_dashboard_follows_the_rules(
     assert rules_broken(check.violations(document(alone), [seconds], pools)) == {"percentile"}
     assert rules_broken(check.violations(document(another_window), [seconds], pools)) == {"percentile"}
     assert check.violations(document(same_window), [seconds], pools) == []
+    # The count is shown, as a query of its own: a disabled one is on no panel, and a mean that
+    # holds the same increase shows a duration.
+    latency = document(rules.percentile_timeseries("Latency", "sample_request_seconds"))
+    assert check.violations(latency, [seconds], pools) == []
+    count = latency["panels"][0]["targets"][-1]
+    assert count["expr"] == rules.request_count("sample_request_seconds")
+    count["hide"] = True
+    assert rules_broken(check.violations(latency, [seconds], pools)) == {"percentile"}
+    mean = f"{rules.increase('sample_request_seconds_sum')} / {rules.increase('sample_request_seconds_count')}"
+    count.update(hide=False, expr=mean)
+    assert rules_broken(check.violations(latency, [seconds], pools)) == {"percentile"}
+    # An engine's percentile is held to the same: its count is kept to the pool in service, and shown.
+    count_disabled = engines.document()
+    for panel in count_disabled["panels"]:
+        for target in panel.get("targets", []):
+            target["hide"] = (panel["title"], target["legendFormat"]) == ("First token", "requests")
+    found = check.violations(count_disabled, engines.metrics, pools)
+    assert rules_broken(found) == {"percentile"}
+    assert len(found) == 2 * len(pools)
 
     # A metric name the module does not declare: the gateway's, and an engine's.
     assert rules_broken(check.violations(students.document(), students.metrics[1:], pools)) == {"undeclared"}
     assert rules_broken(check.violations(engines.document(), engines.metrics[1:], pools)) == {"undeclared"}
     assert rules_broken(check.violations(document(graph("up")), [], pools)) == {"undeclared"}
+    # A sample's suffix is covered after the name of a declared family, and not on its own.
+    assert check.violations(document(graph("sample_request_seconds_sum")), [seconds], pools) == []
+    assert rules_broken(check.violations(document(graph("_count")), [seconds], pools)) == {"undeclared"}
+    assert rules_broken(check.violations(document(graph("request_seconds_sum")), [seconds], pools)) == {"undeclared"}
 
     # A name declared from a file that does not contain it, or from no file of the repository.
     for path in ("services/scaler/rhi_scaler/metrics.py", "services/gateway/no_such_file.py", "../metrics.py"):
