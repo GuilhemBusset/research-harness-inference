@@ -68,8 +68,10 @@ work done: the running and waiting requests; the time from a request's arrival t
 token; the gap between two output tokens of a stream (a whole answer is not paced, so it has no
 gap); the input tokens of each request when it starts to run, cached or not, and the cached part
 of them; each output token when it is sent; the cache use, which is the tokens the cache keeps
-over its capacity. The route answers only a client on a loopback address, where the node's
-collector scrapes it; any other gets the 404 of a route that does not exist.
+over its capacity. The capacity itself, `cache_tokens`, is served the way vLLM gives its own: as a
+label of an information metric whose value is 1, named in the mock's row beside the other names.
+The lifecycle agent reads it there. The route answers only a client on a loopback address, where
+the node's collector scrapes it; any other gets the 404 of a route that does not exist.
 
 **Shutdown.** `main` serves the application on port 8000 through `serve`. On SIGTERM the server
 accepts nothing new, lets every request already accepted run to its end, with no deadline that
@@ -99,7 +101,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response, Strea
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from rhi_common.engine_metrics import MOCK, Quantity, metric_names
+from rhi_common.engine_metrics import MOCK, Quantity, cache_capacity, metric_names
 from rhi_mock_engine.cache import PrefixCache
 
 # Every engine listens here (system design, section 4.1).
@@ -588,9 +590,10 @@ _TOKEN_GAP_BUCKETS = (0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2
 
 
 class _Metrics:
-    """The quantities of the contract's metrics row, under the mock's names, in a registry of one application."""
+    """The quantities of the contract's metrics row, under the mock's names, in a registry of one
+    application, and the capacity of the cache in tokens where the mock's row says."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_tokens: int) -> None:
         names = metric_names(MOCK)
         self.registry = CollectorRegistry(auto_describe=True)
         registry = self.registry
@@ -614,6 +617,11 @@ class _Metrics:
         )
         self.output_tokens = Counter(names[Quantity.OUTPUT_TOKENS], "Output tokens sent.", registry=registry)
         self.cache_usage = Gauge(names[Quantity.CACHE_USAGE], "Share of the cache in use.", registry=registry)
+        capacity = cache_capacity(MOCK)
+        if capacity is not None:
+            Gauge(capacity.metric, "The cache: its capacity in tokens.", (capacity.label,), registry=registry).labels(
+                str(cache_tokens)
+            ).set(1)
 
 
 class _Holding:
@@ -650,7 +658,7 @@ def create_app(
     started = clock()
     secret = settings.secret.encode()
     slots = _Slots(settings.max_running)
-    metrics = _Metrics()
+    metrics = _Metrics(settings.cache_tokens)
     cache = PrefixCache(settings.cache_tokens)
 
     def authorized(request: Request) -> bool:
