@@ -27,9 +27,16 @@ from rhi_common.engine_metrics import (
 DESIGN = Path(__file__).resolve().parents[3] / "docs" / "design" / "system-design.md"
 
 
-def every_name(engine: str) -> list[Name]:
-    """Every name of the engine's row: the contract's quantities, then the further ones it has."""
+def quantity_names(engine: str) -> list[Name]:
+    """The names of the row's quantities: the contract's, then the further ones the engine has."""
     return [*metric_names(engine).values(), *further_names(engine).values()]
+
+
+def every_name(engine: str) -> list[Name]:
+    """Every name of the engine's row: those of its quantities, then the information metric that
+    carries its cache capacity."""
+    place = cache_capacity(engine)
+    return [*quantity_names(engine), *([] if place is None else [place.metric])]
 
 
 def test_the_contract_row_has_its_eight_quantities() -> None:
@@ -80,8 +87,10 @@ def test_each_row_says_where_the_cache_capacity_is_a_metric_of_its_own_and_a_lab
     assert place is not None
     assert NAME.fullmatch(place.metric)
     assert LABEL.fullmatch(place.label)
-    # An information metric beside the row's quantities, not one of them.
-    assert place.metric not in every_name(engine)
+    # An information metric is a gauge whose value is always 1, and the label to read selects no part of it.
+    assert (place.metric.kind, place.metric.labels) == (Kind.GAUGE, {})
+    # It stands beside the row's quantities, and is not one of them.
+    assert place.metric not in quantity_names(engine)
 
 
 def test_the_vllm_row_names_the_further_quantities_and_the_mock_leaves_them_out() -> None:
@@ -98,10 +107,10 @@ def test_every_vllm_name_is_one_section_7_2_gives() -> None:
     section = DESIGN.read_text(encoding="utf-8").split("\n### 7.2 ")[1].split("\n### ")[0]
     given = set(re.findall(r"`(vllm:[a-z_]+)`", section))
 
-    names = every_name(VLLM)
-    assert all(name.startswith("vllm:") for name in names)
-    assert set(names) <= given
-    # The information metric is vLLM's too: section 7.2 says a label of it carries the capacity.
+    assert all(name.startswith("vllm:") for name in every_name(VLLM))
+    assert set(quantity_names(VLLM)) <= given
+    # The information metric is vLLM's too: section 7.2 says a label of it carries the capacity,
+    # without its name, which the issue gives.
     place = cache_capacity(VLLM)
     assert place is not None
     assert place.metric == "vllm:cache_config_info"
