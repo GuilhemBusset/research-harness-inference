@@ -91,12 +91,15 @@ let a pool's instance leave service quickly (section 5.1). The time limit is wai
 
 **Token times** (section 7.2). The speed a student got is counted from the first token sent to the
 last, so `forward` and `held` take a `token_sent`, which the proxy calls each time a write to the
-client that completed an event carrying output has returned: a `content_block_delta` of Messages,
-a `.delta` event of Responses, a Chat Completions chunk whose delta holds anything but the role
-(`carries_output`). Text, reasoning and a tool call's arguments all count, as they do in the
-engine's output tokens. It is not called for a write given up at the time limit, for a keep-alive,
-or for an answer that is not a stream. The first and the last call of a request are its two times;
-whoever is called reads the clock (`rhi_gateway.experience`).
+client that completed an event carrying output has returned (`carries_output`). Output is text,
+reasoning or a tool call's arguments, as in the engine's output tokens, and an event carries some
+when the piece it adds is not empty: a `content_block_delta` of Messages with text, thinking or a
+tool's input, a `.delta` event of Responses, a Chat Completions chunk whose delta holds text or a
+tool call's arguments. An empty piece is no token, and neither is what an engine sends beside its
+output: a thinking block's signature, a tool call's name, the role. It is not called for a write
+given up at the time limit, for a keep-alive, or for an answer that is not a stream. The first and
+the last call of a request are its two times; whoever is called reads the clock
+(`rhi_gateway.experience`).
 
 Nothing here reads configuration or the environment: the address, the secrets and the limit are
 given.
@@ -283,30 +286,63 @@ def _is_failure(event: SseEvent) -> bool:
     return event.name in FAILURE_EVENTS or _reports_failure(_json_object(event.data))
 
 
-# The events that carry output: Messages names one kind, and Responses ends the name of each of its kinds alike.
+# The events that carry output. Messages names one kind of event, and the field of each kind of piece: a
+# thinking block's signature is a `signature_delta`, which is not output. Responses ends the name of
+# each of its kinds alike, and the piece is the event's `delta`.
 MESSAGES_OUTPUT_EVENT = "content_block_delta"
+MESSAGES_OUTPUT_FIELDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}
 RESPONSES_OUTPUT_SUFFIX = ".delta"
 
 
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _chat_delta_carries_output(delta: Mapping[str, object]) -> bool:
+    """Whether a chunk's delta adds text (the answer's, the reasoning's) or a piece of a tool call's arguments."""
+    for name, value in delta.items():
+        if name == "tool_calls":
+            # A call's first chunk names it, with no arguments yet: that is not a token.
+            calls = value if isinstance(value, list) else []
+            if any(
+                isinstance(call, dict)
+                and isinstance(function := call.get("function"), dict)
+                and _is_text(function.get("arguments"))
+                for call in calls
+            ):
+                return True
+        elif name != "role" and _is_text(value):
+            return True
+    return False
+
+
 def carries_output(wire_format: WireFormat, event: SseEvent) -> bool:
-    """Whether an event of a stream carries output tokens: text, reasoning, or a tool call's arguments."""
+    """Whether an event of a stream carries output: a piece, not empty, of text, reasoning or a tool call's arguments."""
     if event.comment:
         return False
+    data = _json_object(event.data)
     if wire_format is WireFormat.CHAT_COMPLETIONS:
-        # A chunk's delta that holds only the role, or nothing, opens or closes the answer.
-        choices = _json_object(event.data).get("choices")
+        choices = data.get("choices")
         return isinstance(choices, list) and any(
             isinstance(choice, dict)
             and isinstance(delta := choice.get("delta"), dict)
-            and any(value for name, value in delta.items() if name != "role")
+            and _chat_delta_carries_output(delta)
             for choice in choices
         )
-    kind = event.name or _json_object(event.data).get("type")
+    kind = event.name or data.get("type")
     if not isinstance(kind, str):
         return False
-    if wire_format is WireFormat.MESSAGES:
-        return kind == MESSAGES_OUTPUT_EVENT
-    return kind.endswith(RESPONSES_OUTPUT_SUFFIX)
+    if wire_format is WireFormat.RESPONSES:
+        return kind.endswith(RESPONSES_OUTPUT_SUFFIX) and _is_text(data.get("delta"))
+    delta = data.get("delta")
+    if kind != MESSAGES_OUTPUT_EVENT or not isinstance(delta, dict):
+        return False
+    piece = delta.get("type")
+    return (
+        isinstance(piece, str)
+        and piece in MESSAGES_OUTPUT_FIELDS
+        and _is_text(delta.get(MESSAGES_OUTPUT_FIELDS[piece]))
+    )
 
 
 def _event_name(line: bytes) -> str:
