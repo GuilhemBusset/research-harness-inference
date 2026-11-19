@@ -97,7 +97,17 @@ def test_a_key_is_refused_wherever_it_stands(place: Callable[[str], dict[str, An
 
 @pytest.mark.parametrize(
     "host",
-    ["example.org", "gateway.example.net:8443", "example.com.attacker.test", "notexample.com", "localhost", ""],
+    [
+        "example.org",
+        "gateway.example.net:8443",
+        "example.com.attacker.test",
+        "notexample.com",
+        "localhost",
+        "",
+        # A name that only ends, or only begins, as the example domain does.
+        "example.com\u00e9.test",
+        "attacker.test/.example.com",
+    ],
 )
 def test_a_host_header_outside_the_example_domain_is_refused(host: str) -> None:
     found = capture()
@@ -114,6 +124,10 @@ def test_a_host_header_outside_the_example_domain_is_refused(host: str) -> None:
         "https://example.com@attacker.test/",
         "wss://[2001:db8::1]:8443/stream",
         "http://192.0.2.7:8000/v1/models",
+        # The name goes on after `example.com`, with a character that is no ASCII letter: a client reads the whole of it.
+        "https://example.com\u00e9.test/path",
+        "https://example.com\u00ad.attacker.test/",
+        'https://example.com"attacker.test/',
     ],
 )
 @pytest.mark.parametrize("place", PLACES, ids=lambda place: place.__name__)
@@ -124,7 +138,20 @@ def test_a_url_outside_the_example_domain_is_refused(place: Callable[[str], dict
     assert url not in str(refusal)
 
 
-@pytest.mark.parametrize("address", ["192.0.2.7", "198.51.100.255", "2001:db8::1", "::1", "::ffff:192.0.2.7"])
+@pytest.mark.parametrize(
+    "address",
+    [
+        "192.0.2.7",
+        "198.51.100.255",
+        "2001:db8::1",
+        "::1",
+        "::ffff:192.0.2.7",
+        # After a label and its colon, and with a port after the last group.
+        "peer:192.0.2.7",
+        "peer:2001:db8::1",
+        "peer:2001:db8:0:0:0:0:0:1:8443",
+    ],
+)
 @pytest.mark.parametrize("place", PLACES, ids=lambda place: place.__name__)
 def test_an_address_is_refused_wherever_it_stands(place: Callable[[str], dict[str, Any]], address: str) -> None:
     refusal = refused(place(address))
@@ -140,14 +167,18 @@ def test_an_address_is_refused_wherever_it_stands(place: Callable[[str], dict[st
         "https://example.com/docs",
         "https://Gateway.Example.COM:8443/v1/messages?beta=true",
         "(see https://docs.example.com.)",
+        'say "https://example.com", then',
         "file:///work/README.md",
         # What is written like an address and is none: a version, a time, a scope of a language, a number.
         "version 2.1.0",
         "3.14.15",
         "999.1.1.1",
         "at 12:30:45",
+        "time:12:30:45",
+        "peer:unavailable",
         "std::vector<int>",
         "Vec::new()",
+        "Decimal::add(1)",
         "0.25",
         # What is written like a key and is none: one character short, and a package of this repository.
         "rhi_" + "a" * 45,
@@ -159,6 +190,17 @@ def test_what_is_no_key_no_foreign_host_and_no_address_passes(
     place: Callable[[str], dict[str, Any]], text: str
 ) -> None:
     scrub.check(place(text))
+
+
+def test_the_json_of_a_body_is_read_string_by_string() -> None:
+    found = capture()
+    # Two URLs of the example domain with only JSON between them: the quote ends the first.
+    found["request"]["body"] = '{"base":"https://example.com","docs":"https://docs.example.com","model":"mock"}'
+    scrub.check(found)
+
+    # A name written twice: a JSON reader keeps the last value, and the file holds both.
+    found["request"]["body"] = '{"base":"https://attacker.test","base":"https://example.com","model":"mock"}'
+    assert refused(found).rule == scrub.HOST
 
 
 def test_a_host_header_of_the_example_domain_passes() -> None:
