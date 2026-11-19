@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-COG8" = "The user pool stays on Cognito's default plan: nobody signs up, and its one user, whom the deployment creates, must pass MFA with an authenticator app at every sign-in. The design asks for no more, and the Plus plan is paid for threat protection that would judge that one user's sign-ins."
