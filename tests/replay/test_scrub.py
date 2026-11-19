@@ -128,6 +128,14 @@ def test_a_host_header_outside_the_example_domain_is_refused(host: str) -> None:
         "https://example.com\u00e9.test/path",
         "https://example.com\u00ad.attacker.test/",
         'https://example.com"attacker.test/',
+        "https://example.com<attacker.test/",
+        # An accent that joins the last letter is of the name, before a path and at the very end; so is a dot of another alphabet.
+        "https://example.com\u0300/path",
+        "https://example.com\u0300",
+        "https://example.com\u3002attacker.test/",
+        # A backslash: one client ends the host there, another reads what stands before it as whoever signs in.
+        "https://example.com\\@attacker.test/",
+        "https://attacker.test\\@example.com/",
     ],
 )
 @pytest.mark.parametrize("place", PLACES, ids=lambda place: place.__name__)
@@ -168,6 +176,8 @@ def test_an_address_is_refused_wherever_it_stands(place: Callable[[str], dict[st
         "https://Gateway.Example.COM:8443/v1/messages?beta=true",
         "(see https://docs.example.com.)",
         'say "https://example.com", then',
+        "<https://example.com>, or `https://docs.example.com`!",
+        'url.startswith("https://")',
         "file:///work/README.md",
         # What is written like an address and is none: a version, a time, a scope of a language, a number.
         "version 2.1.0",
