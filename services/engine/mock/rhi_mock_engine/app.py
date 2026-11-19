@@ -31,7 +31,7 @@ is their number, which the usage of an answer and the token-counting route both 
 counting (`rhi_mock_engine.cache`; section 5.5). A request to a generation route carries the cache
 salt the gateway derived from its student, in `cache_salt`, the field vLLM's API reference names.
 Its cached tokens are those its input shares, from its start, with the last input this engine
-served under the same salt, short of its own last token, which an engine always computes. The
+served under the same salt: all of them, when it repeats that input whole. The
 cache holds `cache_tokens` tokens and forgets the salt whose last request is the oldest first. A
 request with no salt is not one the gateway forwarded: nothing of it is kept, and none of its
 tokens is cached. Each format's usage reports the cached tokens where its reference puts them:

@@ -10,9 +10,8 @@ shows: the cached share of the input, and what a student loses by reaching anoth
   with that salt that this engine served, as its tokens. A new request with the same salt has, as
   cached, the tokens it shares with that input from its start, and its own input then takes the
   place of the one kept. An input under another salt is never compared.
-- **The last token is computed.** An engine computes at least the last token of a prompt, which
-  the first token of its answer comes from, so a request that repeats the last one whole has all
-  its tokens cached but that one. No answer reports an input read entirely from the cache.
+- **The whole shared prefix counts.** A request that repeats the last one whole, or stops short of
+  its end, has all its tokens cached: the count has no exception for the last token.
 - **A capacity, in tokens.** When the inputs kept hold more tokens than the capacity, the cache
   forgets whole inputs, first the salt whose last request is the oldest, until they fit: the
   engine forgets the prefixes of idle sessions first. An input larger than the capacity is
@@ -51,8 +50,7 @@ class PrefixCache:
         """The cached tokens of a request this engine serves; its input is then the one kept for its salt."""
         last = self._inputs.pop(salt, ())
         self._kept -= len(last)
-        # All but the last token of the request can be cached.
-        shared = min(len(last), max(len(tokens) - 1, 0))
+        shared = min(len(last), len(tokens))
         cached = next((at for at in range(shared) if last[at] != tokens[at]), shared)
 
         self._inputs[salt] = tokens
