@@ -187,6 +187,20 @@ class GhCliRetryTests(unittest.TestCase):
         self.assertEqual((len(fake.calls), slept), (2, [1]))
 
 
+class FailedLogTests(unittest.TestCase):
+    def test_the_tail_is_the_failed_jobs_own_and_not_the_required_checks(self):
+        """The required check only names the jobs that failed; its lines come last in the log and
+        pushed the failed job's own out of the tail (#102, 2026-11-19)."""
+        failed_job = "".join(f"engine-tests\tPrepare bubblewrap\tline {i}\n" for i in range(40))
+        failed_job += "engine-tests\tPrepare bubblewrap\tE: 503  Service Unavailable\n"
+        summary = "".join(f"required\tEvery check passed\tengine-tests: failure {i}\n" for i in range(400))
+        runs = {"workflow_runs": [{"id": 7, "name": "CI", "conclusion": "failure"}]}
+        fake = FakeGh(ok(runs), (0, failed_job + summary, ""))
+        log = GhCli("o/r", runner=fake, sleep=lambda _: None).failed_log("0" * 40, skip="required")
+        self.assertIn("E: 503  Service Unavailable", log)
+        self.assertNotIn("Every check passed", log)
+        self.assertEqual(fake.calls[1][0][:4], ["gh", "run", "view", "7"])
+
 class TransientTests(unittest.TestCase):
     def test_classification(self):
         self.assertEqual(transient(BAD_GATEWAY), "unknown")

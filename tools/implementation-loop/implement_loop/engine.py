@@ -2974,7 +2974,7 @@ class Engine:
             self.store.put(st)
             return self._wait(n, WAIT_CI, f"the required check gave no verdict on {head[:7]} ({conclusion})",
                               resume=Phase.LAND)
-        log = self._safe(self.gh.failed_log, head) or "(no log available)"
+        log = self._safe(self.gh.failed_log, head, skip=self.cfg.required_check) or "(no log available)"
         self.store.event("ci_failed", issue=n, head=head, conclusion=conclusion)
         self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}, also after one re-run. Find and "
                                 f"fix the cause; never weaken or skip a check to get green. Tail of the failed log:\n"
