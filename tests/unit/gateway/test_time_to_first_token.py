@@ -104,6 +104,9 @@ EVENTS: dict[WireFormat, dict[str, bytes]] = {
         "text": chunk({"content": "Hi"}),
         "named": chunk({"tool_calls": [{"index": 0, "function": {"name": "read", "arguments": ""}}]}),
         "arguments": chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"path"'}}]}),
+        # The deprecated function call of the reference, which the gateway still accepts in a request.
+        "function named": chunk({"function_call": {"name": "read", "arguments": ""}}),
+        "function arguments": chunk({"function_call": {"arguments": '{"path"'}}),
         "closing": chunk({}, finish_reason="stop")
         + sse(None, {"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 40}})
         + sse(None, "[DONE]"),
@@ -303,6 +306,19 @@ def test_first_answer_is_the_first_text_or_tool_call_after_the_reasoning(wire_fo
 
     assert waits(made, FIRST_TOKEN) == {(wire_format.value, "warm", "first"): [1, 4]}
     assert waits(made, FIRST_ANSWER) == {(wire_format.value, "warm", "first"): [1, 7]}
+
+
+def test_chat_function_call_arguments_are_the_answer() -> None:
+    made = gateway()
+    # Its name, sent at 6 before any of its arguments, is no token: the answer begins at 9.
+    turn(made, CHAT, (3, "reasoning"), (6, "function named"), (9, "function arguments"), (10, "function arguments"))
+    assert waits(made, FIRST_TOKEN) == {("chat_completions", "warm", "first"): [1, 3]}
+    assert waits(made, FIRST_ANSWER) == {("chat_completions", "warm", "first"): [1, 9]}
+
+    # With no reasoning before them, the arguments are the first token as well.
+    made = gateway()
+    turn(made, CHAT, (6, "function named"), (9, "function arguments"))
+    assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {("chat_completions", "warm", "first"): [1, 9]}
 
 
 @pytest.mark.parametrize("wire_format", list(WireFormat))
