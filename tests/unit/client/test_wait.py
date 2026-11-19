@@ -23,6 +23,7 @@ from typing import Any
 
 import keyring
 import keyring.backend
+import keyring.errors
 import pytest
 from keyring.backends import fail
 from starlette.types import Message
@@ -301,6 +302,22 @@ def test_a_wait_gives_up_at_its_timeout(capsys: pytest.CaptureFixture[str]) -> N
     assert unhurried.clock.now == 20 * 60
 
 
+def test_an_answer_that_arrives_after_the_timeout_is_not_a_success(capsys: pytest.CaptureFixture[str]) -> None:
+    gateway = Gateway(ready_at={"mock": 55})
+    logged_in(gateway.key)
+
+    def slow(call: login.Call) -> tuple[int, Any]:
+        # The status asked for at second 50 takes 15 seconds: it reads ready, past the timeout of one minute.
+        if call.url.endswith("/status") and gateway.clock.now >= 50:
+            gateway.clock.now += 15
+        return gateway(call)
+
+    result = wait.wait("mock", 1, transport=slow, sleep=gateway.clock.sleep, clock=lambda: gateway.clock.now)
+    assert result != 0
+    assert gateway.calls[-1] == ("GET", "/status", 65)
+    assert "not ready after 1 minutes" in capsys.readouterr().err
+
+
 def test_an_unavailable_pool_stops_the_wait(
     gateway: Gateway, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -376,6 +393,46 @@ def test_revoking_every_key_removes_the_stored_one_and_a_refusal_keeps_it(capsys
 
     revoke.revoke_all(transport=Stubs((200, {"revoked": 1})), sleep=clock.sleep, clock=lambda: clock.now)
     assert store.load_key() is None
+    assert key not in "".join(capsys.readouterr())
+
+
+def test_a_keychain_that_locks_after_the_revocation_is_reported_not_taken_for_a_removal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class LockableKeychain(MemoryKeychain):
+        locked = False
+
+        def get_password(self, service: str, username: str) -> str | None:
+            if self.locked:
+                raise keyring.errors.KeyringError("locked")
+            return super().get_password(service, username)
+
+        def delete_password(self, service: str, username: str) -> None:
+            if self.locked:
+                raise keyring.errors.KeyringError("locked")
+            super().delete_password(service, username)
+
+    key, keychain, clock = generate_key(), LockableKeychain(), Clock()
+    keyring.set_keyring(keychain)
+    logged_in(key)
+
+    def locking(stubs: Stubs) -> login.Transport:
+        def transport(call: login.Call) -> tuple[int, Any]:
+            keychain.locked = True
+            return stubs(call)
+
+        return transport
+
+    monkeypatch.setattr(login, "http_transport", locking(Stubs()))
+    assert main.main(["revoke"]) == 1
+    told = capsys.readouterr()
+    assert told.out == ""
+    assert "revoked" in told.err and "could not be removed" in told.err
+
+    with pytest.raises(store.StoreError, match="could not be removed"):
+        revoke.revoke_all(ENDPOINT, transport=locking(Stubs((200, {"revoked": 1}))), sleep=clock.sleep)
+    keychain.locked = False
+    assert store.load_key() == key
     assert key not in "".join(capsys.readouterr())
 
 
