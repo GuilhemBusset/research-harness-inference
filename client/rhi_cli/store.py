@@ -153,18 +153,28 @@ def load_key() -> str | None:
 def delete_key() -> None:
     """Remove the stored key, from the file and from the keychain; nothing when there is none.
 
-    `StoreError` when the keychain still holds a key afterwards.
+    `StoreError` unless the key is known to be gone: when the file cannot be removed, when the
+    keychain still holds a key, and when a keychain that refused the removal cannot be read either
+    (a locked one, say), since it may still hold the key.
     """
-    (config_dir() / KEY_FILE).unlink(missing_ok=True)
+    path = config_dir() / KEY_FILE
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise StoreError(f"{path} cannot be removed: delete it yourself.") from error
     if not has_keychain():
         return
     try:
         keyring.delete_password(SERVICE, USERNAME)
-    except keyring.errors.KeyringError:  # no entry, which is the aim, or a keychain that refuses
-        pass
+    except keyring.errors.KeyringError:
+        pass  # no entry, which is the aim, or a keychain that refuses: what it holds now says which
+    else:
+        return
     try:
         kept = keyring.get_password(SERVICE, USERNAME)
-    except keyring.errors.KeyringError:
-        kept = None
+    except keyring.errors.KeyringError as error:
+        raise StoreError(
+            f"The keychain cannot be opened, and may still hold the key: unlock it and remove its entry `{SERVICE}`."
+        ) from error
     if kept:
         raise StoreError(f"The keychain still holds the key: remove its entry `{SERVICE}` yourself.")

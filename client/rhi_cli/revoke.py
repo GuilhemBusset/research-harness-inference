@@ -5,6 +5,10 @@ and with nothing else: the key is what authenticates its own revocation. Once th
 answered, the key is removed from the store. It goes to the stored endpoint only, the one that
 issued it.
 
+A key the issuer has revoked may still fail to leave the machine: a keychain that locked, a file
+that cannot be deleted. The command then says both, that the key is revoked and that it is still
+stored, and exits 1; it never reports a removal it could not confirm. `--all` does the same.
+
 `rhi revoke --all` must work when a key is lost, so it uses none. It runs a fresh device flow, as
 `rhi login` does (`rhi_cli.login.start_device_flow`): the student confirms a code with GitHub, and
 the device code goes to the issuer's `POST /auth/revoke-all`, which revokes every key of that
@@ -34,6 +38,17 @@ NO_ENDPOINT = (
 )
 
 
+def _remove_stored_key(done: str) -> None:
+    """Remove the key from the store, once the issuer has revoked; `StoreError` says both when it cannot be removed."""
+    try:
+        store.delete_key()
+    except store.StoreError as error:
+        raise store.StoreError(
+            f"{done} at the endpoint, and stops working within a minute, "
+            f"but the key could not be removed from this machine. {error}"
+        ) from error
+
+
 def revoke(*, transport: login.Transport = login.http_transport, out: TextIO | None = None) -> None:
     """Revoke the stored key and remove it from the store; `LoginError` when it fails."""
     out = out or sys.stdout
@@ -41,7 +56,7 @@ def revoke(*, transport: login.Transport = login.http_transport, out: TextIO | N
     status, body = transport(login.Call("POST", address + REVOKE_PATH, headers={"Authorization": f"Bearer {key}"}))
     if status != 200:
         raise login.LoginError(f"the endpoint did not revoke the key: {login.refusal(status, body)}")
-    store.delete_key()
+    _remove_stored_key("Your key is revoked")
     print("Your key is revoked and removed from this machine. It stops working within a minute.", file=out)
 
 
@@ -61,9 +76,9 @@ def revoke_all(
     flow = login.start_device_flow(address, transport, out)
     request = login.Call("POST", address + REVOKE_ALL_PATH, {"device_code": flow.device_code})
     answer = login.redeem(flow, request, "rhi revoke --all", transport=transport, sleep=sleep, clock=clock)
-    store.delete_key()
     count = answer.get("revoked") if isinstance(answer, dict) else None
     revoked = f"{count} of your keys" if isinstance(count, int) else "Every key of yours"
+    _remove_stored_key(f"{revoked} revoked")
     print(f"{revoked} revoked. They stop working within a minute. Run rhi login for a new one.", file=out)
 
 

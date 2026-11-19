@@ -18,7 +18,8 @@ client that misbehaves while the gateway holds its request:
    time it changes.
 3. It exits 0 when the state is `ready`. It stops, prints the cause and exits 1 when a record
    reads `unavailable`, when the gateway refuses a call with an error (`budget_reached`, say), and
-   after the minutes of `--timeout`.
+   after the minutes of `--timeout`: an answer that arrives after them is too late, even one that
+   reads `ready`.
 
 The default timeout is 20 minutes, above the 15 minutes a launch on the coursework pool is given
 (section 17): a start that succeeds is never abandoned by the CLI first. Ten seconds between two
@@ -131,12 +132,16 @@ def _wait(
     next_wake = clock()
     # The pool's own model name, which the status lists: known once the first wake has answered.
     name, printed = model, None
+
+    def late() -> login.LoginError:
+        return login.LoginError(
+            f"{name} is not ready after {timeout_minutes:g} minutes. Run rhi wait again, or tell the instructor."
+        )
+
     while True:
         now = clock()
         if now >= deadline:
-            raise login.LoginError(
-                f"{name} is not ready after {timeout_minutes:g} minutes. Run rhi wait again, or tell the instructor."
-            )
+            raise late()
         if now >= next_wake:
             record = gateway.wake(model)
             next_wake = now + WAKE_SECONDS
@@ -146,6 +151,8 @@ def _wait(
             if not listed:
                 raise login.LoginError(f"the endpoint's status no longer lists {name}.")
             record = listed[0]
+        if clock() >= deadline:  # the answer took the wait past its timeout: whatever it says, it came too late
+            raise late()
         if record.state != printed:
             print(f"{name}: {record.state}", file=out, flush=True)
             printed = record.state
