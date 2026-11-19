@@ -109,9 +109,11 @@ text or a tool call (`output_of`), as each format's reference marks its events:
 - Responses: the reference names its reasoning events `response.reasoning_text.delta` and
   `response.reasoning_summary_text.delta`. A `.delta` event whose name begins `response.reasoning`
   is reasoning, and any other the answer: its text, a refusal, a tool call's arguments or input;
-- Chat Completions: the reference gives a delta `content`, `refusal` and `tool_calls` and no
-  reasoning field, so a delta with one of the first two, or with a tool call's arguments, is the
-  answer, and a delta that carries output in any other field, the engine's own, is reasoning.
+- Chat Completions: the reference gives a delta `content`, `refusal`, `tool_calls` and the
+  deprecated `function_call`, which the gateway still accepts in a request, and no reasoning
+  field. So a delta with one of the first two, or with the arguments of a tool call or of a
+  function call, is the answer, and a delta that carries output in any other field, the engine's
+  own, is reasoning.
 
 Nothing here reads configuration or the environment: the address, the secrets and the limit are
 given.
@@ -316,29 +318,35 @@ MESSAGES_OUTPUT_EVENT = "content_block_delta"
 MESSAGES_OUTPUT_FIELDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}
 RESPONSES_OUTPUT_SUFFIX = ".delta"
 # Which of them carry reasoning: one kind of piece of Messages, the events of Responses named so. Chat
-# Completions has no reasoning field: its answer is in these fields of a delta and in its tool calls.
+# Completions has no reasoning field: its answer is in these fields of a delta, in its tool calls and
+# in the deprecated function call, the one call a delta carried before it carried a list of them.
 MESSAGES_REASONING_PIECE = "thinking_delta"
 RESPONSES_REASONING_PREFIX = "response.reasoning"
 CHAT_ANSWER_FIELDS = frozenset({"content", "refusal"})
+CHAT_TOOL_CALLS = "tool_calls"
+CHAT_FUNCTION_CALL = "function_call"
 
 
 def _is_text(value: object) -> bool:
     return isinstance(value, str) and value != ""
 
 
+def _has_arguments(function: object) -> bool:
+    """Whether a function, as a delta gives it, adds a piece of its arguments: its name alone is not a token."""
+    return isinstance(function, dict) and _is_text(function.get("arguments"))
+
+
 def _chat_delta_output(delta: Mapping[str, object]) -> Output | None:
-    """What a chunk's delta adds: answer text or a piece of a tool call's arguments, else any other text, as reasoning."""
+    """What a chunk's delta adds: answer text or a piece of a call's arguments, else any other text, as reasoning."""
     found = None
     for name, value in delta.items():
-        if name == "tool_calls":
+        if name == CHAT_TOOL_CALLS:
             # A call's first chunk names it, with no arguments yet: that is not a token.
             calls = value if isinstance(value, list) else []
-            if any(
-                isinstance(call, dict)
-                and isinstance(function := call.get("function"), dict)
-                and _is_text(function.get("arguments"))
-                for call in calls
-            ):
+            if any(isinstance(call, dict) and _has_arguments(call.get("function")) for call in calls):
+                return Output.ANSWER
+        elif name == CHAT_FUNCTION_CALL:
+            if _has_arguments(value):
                 return Output.ANSWER
         elif name != "role" and _is_text(value):
             if name in CHAT_ANSWER_FIELDS:
