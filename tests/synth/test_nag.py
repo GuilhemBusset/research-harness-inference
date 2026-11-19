@@ -8,6 +8,7 @@ gives it to the app.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import sys
@@ -180,3 +181,44 @@ def test_a_resource_carries_what_the_file_of_its_module_lists_and_nothing_else(
         module: sorted(nag.items()) for module, nag in files.items()
     }
     assert written(of_no_module) == []
+
+
+def test_an_entry_for_a_pool_lists_the_finding_of_each_configured_pool_and_of_no_other_name(
+    app_module: ModuleType, tmp_path: Path
+) -> None:
+    """An entry whose key holds `<pool>` in place of a pool's name. Grafana's role names each
+    pool's log group, which brings a finding of each pool's name: with two pools, neither the
+    example's, the stage synthesizes, and the same statement for a name that is no pool's fails it."""
+    import aws_cdk as cdk
+
+    from rhi.stage import EndpointStage
+
+    example = config.load({"RHI_CONFIG": "example"})
+    (mock,) = example.pools
+    pools = tuple(dataclasses.replace(mock, name=name) for name in ("first", "second"))
+    configured = dataclasses.replace(example, pools=pools, default_pool="first")
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+
+    def synthesize(outdir: Path, also_named: str | None) -> None:
+        app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
+        role = EndpointStage(app, "Rhi", config=configured).observability.grafana.task_role
+        if also_named is not None:
+            log_group = cdk.Stack.of(role).format_arn(
+                service="logs",
+                resource="log-group",
+                resource_name=f"/rhi/pools/{also_named}:*",
+                arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+            )
+            role.add_to_policy(cdk.aws_iam.PolicyStatement(actions=["logs:StartQuery"], resources=[log_group]))
+        app_module.add_nag(app)
+        app.synth()
+
+    synthesize(tmp_path / "pools", None)
+    assert reported(tmp_path / "pools") == []
+    with pytest.raises(RuntimeError):
+        synthesize(tmp_path / "another", "third")
+    # The one finding: those of the two pools are acknowledged here too.
+    third = "arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/third:*"
+    assert reported(tmp_path / "another") == [
+        (f"AwsSolutions-IAM5[Resource::{third}]", "Rhi/Observability/Grafana/TaskRole/DefaultPolicy/Resource")
+    ]

@@ -1,0 +1,49 @@
+# What the roles of `src/rhi/observability/grafana.py` may do, each action on each resource, with
+# its reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory
+# is written here as comments. `tests/synth/test_grafana.py` holds the task's role to it.
+#
+# The role of Grafana's task, trusted by ECS tasks, which holds no AWS managed policy:
+# - aps:QueryMetrics, aps:GetSeries, aps:GetLabels and aps:GetMetricMetadata on the metrics
+#   workspace only, by its ARN: the dashboards' queries.
+# - logs:StartQuery, logs:GetLogGroupFields and logs:GetLogEvents on the log groups /rhi/gateway,
+#   /rhi/scaler and /rhi/issuer, and on the log group of each pool of the configuration,
+#   /rhi/pools/<pool>, each by its fixed name; each ARN ends `:*`, the log group and its streams:
+#   the dashboards' log queries. No other log group is named, none by a pattern, and no build
+#   project's.
+# - cloudwatch:GetMetricData, cloudwatch:ListMetrics and logs:GetQueryResults on every resource:
+#   the metrics of the load balancers, of Auto Scaling and of the pipeline, the account's
+#   month-to-date charge, and the results of the log queries.
+#
+# The task's execution role, trusted by ECS tasks, which ECS uses to start a task and which no
+# container holds, with no AWS managed policy:
+# - ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer and ecr:BatchGetImage on the
+#   bootstrap's image repository, by its ARN: ECS pulls Grafana's image.
+# - ecr:GetAuthorizationToken on every resource: ECS signs in to the registry before it pulls.
+# - logs:CreateLogStream and logs:PutLogEvents on the log group /rhi/grafana, by its ARN: ECS
+#   writes the container's logs.
+#
+# The service's target group and its rule on the public load balancer's listener bring no role, no
+# action and no finding.
+#
+# cdk-nag's finding for a log group's ARN holds the log group's name, so each pool brings a finding
+# of its own, and no file of the repository names the pools of a deployed configuration. The entry
+# whose key holds `<pool>` lists that finding for each pool of the configuration, and for no other
+# name (`src/rhi/nag.py`). The example's pool, mock, keeps its own entry as well, with the same
+# reason: `tests/policy/test_nag_acknowledgements.py` holds the example's templates to the ids as
+# cdk-nag writes them.
+
+[nag]
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants GetMetricData, ListMetrics and GetQueryResults, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds those actions alone."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/gateway:*]" = "Grafana queries the gateway's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/scaler:*]" = "Grafana queries the scaler's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/issuer:*]" = "Grafana queries the issuer's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/mock:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/<pool>:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-ECS2" = "The task definition gives Grafana the workspace's query address, the region and the domain as environment variables, which is how the image's settings and data sources read them, and none holds a secret: both data sources sign their requests with the task's role."
+"AwsSolutions-ECS4" = "Grafana shows the metrics of the Managed Prometheus workspace and of CloudWatch, and its own logs go to its log group, so Container Insights would be a paid store of metrics that no dashboard of the design reads."
+
+[wildcard_actions]
+"cloudwatch:GetMetricData" = "AWS grants this action only on every resource, and Grafana reads with it the metrics of the load balancers, of Auto Scaling and of the pipeline, and the account's month-to-date charge."
+"cloudwatch:ListMetrics" = "AWS grants this action only on every resource, and Grafana lists with it the metrics and the dimensions that a dashboard's panels and variables choose from."
+"logs:GetQueryResults" = "AWS grants this action only on every resource, and Grafana fetches with it the results of the log queries it starts, which its role lets it start on the named log groups alone."
+"ecr:GetAuthorizationToken" = "AWS grants this action only on every resource, and ECS signs in with it to the registry that holds Grafana's image before it pulls the image."
