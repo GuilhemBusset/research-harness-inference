@@ -139,4 +139,7 @@ pythonpath = [
     # probes of the engine, in tests/examiner, import each other the same way.
     "tools/implementation-loop/tests",
     "tests/examiner",
+    # The replay harness and the capture scrubber, which the replay tests import by name
+    # (tests/captures/README.md).
+    "tests/replay",
 ]

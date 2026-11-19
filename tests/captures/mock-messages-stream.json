@@ -1,0 +1,142 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/messages?beta=true",
+    "headers": {
+      "host": "gateway.example.com",
+      "content-type": "application/json",
+      "user-agent": "rhi-capture-recorder",
+      "anthropic-version": "2023-06-01"
+    },
+    "body": "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":32000,\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"You are a coding assistant. Answer briefly.\"}],\"tools\":[{\"name\":\"read_file\",\"description\":\"Read a file of the working directory.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What does the README say?\"}]}]}"
+  },
+  "forward": {
+    "model": "mock",
+    "max_tokens": 32000,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a coding assistant. Answer briefly."
+      }
+    ],
+    "tools": [
+      {
+        "name": "read_file",
+        "description": "Read a file of the working directory.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What does the README say?"
+          }
+        ]
+      }
+    ]
+  },
+  "answer": {
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "body": [
+      "event: message_start\n",
+      "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_53a89a77e96625c7b9ebfe36\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"mock\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"output_tokens\":0}}}\n",
+      "\n",
+      "event: content_block_start\n",
+      "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"The\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" request\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" is\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" a\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" test\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\",\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" so\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" a\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" canned\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" answer\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" will\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" do\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"53a89a77e96625c7b9ebfe36\"}}\n",
+      "\n",
+      "event: content_block_stop\n",
+      "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+      "\n",
+      "event: content_block_start\n",
+      "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_53a89a77e96625c7b9ebfe36\",\"name\":\"read_file\",\"input\":{}}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"canned\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\":\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" true\"}}\n",
+      "\n",
+      "event: content_block_delta\n",
+      "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n",
+      "\n",
+      "event: content_block_stop\n",
+      "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+      "\n",
+      "event: message_delta\n",
+      "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":18}}\n",
+      "\n",
+      "event: message_stop\n",
+      "data: {\"type\":\"message_stop\"}\n",
+      "\n"
+    ]
+  },
+  "usage": {
+    "input_tokens": 88,
+    "output_tokens": 18
+  }
+}

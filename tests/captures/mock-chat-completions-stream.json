@@ -1,0 +1,94 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "headers": {
+      "host": "gateway.example.com",
+      "content-type": "application/json",
+      "user-agent": "rhi-capture-recorder"
+    },
+    "body": "{\"model\":\"mock\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_completion_tokens\":512,\"messages\":[{\"role\":\"system\",\"content\":\"You are a coding assistant. Answer briefly.\"},{\"role\":\"user\",\"content\":\"Say hello.\"}]}"
+  },
+  "forward": {
+    "model": "mock",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "max_completion_tokens": 512,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a coding assistant. Answer briefly."
+      },
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "answer": {
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream; charset=utf-8"
+    },
+    "body": [
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"The\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" request\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" is\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" a\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" test\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\",\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" so\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" a\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" canned\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" answer\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" will\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" do\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"This\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" is\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" the\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" mock\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" engine\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"'s\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" canned\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" answer\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+      "\n",
+      "data: {\"id\":\"chatcmpl-c2988e3c90f3051e8e16d21e\",\"object\":\"chat.completion.chunk\",\"created\":1800000000,\"model\":\"mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":32,\"completion_tokens\":22,\"total_tokens\":54}}\n",
+      "\n",
+      "data: [DONE]\n",
+      "\n"
+    ]
+  },
+  "usage": {
+    "input_tokens": 32,
+    "output_tokens": 22
+  }
+}

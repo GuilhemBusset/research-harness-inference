@@ -1,0 +1,30 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "headers": {
+      "host": "gateway.example.com",
+      "content-type": "application/json",
+      "user-agent": "rhi-capture-recorder"
+    },
+    "body": "{\"model\":\"mock\",\"instructions\":\"You are a coding assistant. Answer briefly.\",\"input\":\"Say hello.\",\"max_output_tokens\":512}"
+  },
+  "forward": {
+    "model": "mock",
+    "instructions": "You are a coding assistant. Answer briefly.",
+    "input": "Say hello.",
+    "max_output_tokens": 512
+  },
+  "answer": {
+    "status": 200,
+    "headers": {
+      "content-length": "558",
+      "content-type": "application/json"
+    },
+    "body": "{\"id\":\"resp_d7dbc14dffd5b8d7ef93737f\",\"object\":\"response\",\"created_at\":1800000000,\"status\":\"completed\",\"model\":\"mock\",\"output\":[{\"id\":\"rs_d7dbc14dffd5b8d7ef93737f\",\"type\":\"reasoning\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"The request is a test, so a canned answer will do.\"}]},{\"id\":\"msg_d7dbc14dffd5b8d7ef93737f\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"This is the mock engine's canned answer.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":21,\"output_tokens\":22,\"total_tokens\":43}}"
+  },
+  "usage": {
+    "input_tokens": 21,
+    "output_tokens": 22
+  }
+}
