@@ -41,8 +41,10 @@ A row may leave any of them out, and the mock's leaves out all of them.
 of the rows above. An engine fixes it at start and gives it where it chooses: vLLM, as a label of an
 information metric, whose value is always 1 and which a dashboard cannot plot. So an engine's row
 also has a place for where the engine gives it, `cache_capacity`: the information metric and the
-label whose value is the number of tokens. The lifecycle agent reads it there and exports it as a
-number (section 7.2). A row that does not say where gives none, and the agent then exports none.
+label whose value is the number of tokens. The information metric's name is a name of the row like
+the others and says its type: a gauge, in both rows. The lifecycle agent reads the capacity there
+and exports it as a number (section 7.2). A row that does not say where gives none, and the agent
+then exports none.
 """
 
 from __future__ import annotations
@@ -125,9 +127,11 @@ class Name(str):
 @dataclass(frozen=True)
 class CacheCapacity:
     """Where an engine gives its cache capacity in tokens: the information metric, whose value is
-    always 1, and the label of it whose value is the number of tokens."""
+    always 1, and the label of it whose value is the number of tokens. The metric's name says its
+    type like every name of a row. The label is the one to read, not one that selects part of the
+    family, so it is not among the name's `labels`."""
 
-    metric: str
+    metric: Name
     label: str
 
 
@@ -158,7 +162,9 @@ _TABLE: dict[str, _Row] = {
                 Quantity.CACHE_USAGE: Name("rhi_mock:kv_cache_usage_perc", Kind.GAUGE),
             }
         ),
-        cache_capacity=CacheCapacity(metric="rhi_mock:cache_config_info", label="capacity_tokens"),
+        cache_capacity=CacheCapacity(
+            metric=Name("rhi_mock:cache_config_info", Kind.GAUGE), label="capacity_tokens"
+        ),
     ),
     # vLLM's names at version 0.33, the version `services/engine/vllm/Dockerfile` pins: those of
     # the system design, section 7.2 (evidence E3). vLLM hides a metric one minor version after
@@ -199,8 +205,11 @@ _TABLE: dict[str, _Row] = {
                 Further.BLOCK_IDLE_BEFORE_EVICTION: Name("vllm:kv_block_idle_before_evict_seconds", Kind.HISTOGRAM),
             }
         ),
-        # The labels of `vllm:cache_config_info` are the attributes of the engine's cache
-        # configuration, each written as text (`vllm/config/cache.py`, `CacheConfig.metrics_info`).
+        # `vllm:cache_config_info` is a gauge set to 1: vLLM declares its information metric as
+        # one, since Prometheus' own information type does not work across its processes
+        # (`vllm/v1/metrics/loggers.py`, `log_metrics_info`). Its labels are the attributes of the
+        # engine's cache configuration, each written as text (`vllm/config/cache.py`,
+        # `CacheConfig.metrics_info`).
         # `kv_cache_size_tokens` is the capacity in tokens: the number the engine logs at start as
         # "KV cache size: ... tokens" (`vllm/v1/core/kv_cache_utils.py`,
         # `update_kv_cache_capacity`, which stores it and logs it), handed to the process that
@@ -209,7 +218,9 @@ _TABLE: dict[str, _Row] = {
         # reads `None` where the engine set none. The number of blocks times the block size is not
         # it: vLLM's source says that product can be wrong for a model whose requests take blocks
         # in several groups, and the number of blocks is summed over the engine indexes.
-        cache_capacity=CacheCapacity(metric="vllm:cache_config_info", label="kv_cache_size_tokens"),
+        cache_capacity=CacheCapacity(
+            metric=Name("vllm:cache_config_info", Kind.GAUGE), label="kv_cache_size_tokens"
+        ),
     ),
 }
 
