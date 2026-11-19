@@ -48,8 +48,11 @@ class EndpointStage(cdk.Stage):
         # The key issuer beside the students' tables, behind the public listener when there is one.
         self.access = AccessStack(self, "Access", config=config, listener=self.network.https_listener)
         # The metrics workspace, which the nodes, the gateway and the scaler write to. Its logical
-        # ID is recorded too.
-        self.observability = ObservabilityStack(self, "Observability")
+        # ID is recorded too. Grafana beside it, behind the public listener and the admin's sign-in
+        # when there is a listener.
+        self.observability = ObservabilityStack(
+            self, "Observability", config=config, network=self.network, access=self.access
+        )
         # The internal load balancer beside them, in the network's VPC, the groups and the scaler,
         # which writes to the workspace.
         self.pools = PoolsStack(self, "Pools", config=config, network=self.network, observability=self.observability)
