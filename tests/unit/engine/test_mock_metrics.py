@@ -204,7 +204,7 @@ def test_running_and_waiting() -> None:
         assert value(samples, Quantity.OUTPUT_TOKENS) == sum(usage["completion_tokens"] for usage in answers)
         assert value(samples, Quantity.TIME_TO_FIRST_TOKEN) == 3
         assert value(samples, Quantity.RUNNING_REQUESTS) == value(samples, Quantity.WAITING_REQUESTS) == 0
-        # The mock has no cache.
+        # No request carried a cache salt, so the cache kept nothing and held nothing.
         assert value(samples, Quantity.CACHED_INPUT_TOKENS) == 0
         assert value(samples, Quantity.CACHE_USAGE) == 0
 
