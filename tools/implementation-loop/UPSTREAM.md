@@ -25,6 +25,20 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## A root takes over the deliveries of another root's run (2026-11-19)
+
+A local patch, not in upstream. A delivered issue stays open on GitHub while it still has owner
+items, so a later epic whose work it is planned and built it again from its own, empty record. It
+usually found its branch already merged. #122 did not: it was built again on `loop/issue-122`,
+whose history still held the first run's lock commit, so CI's loop guard refused every head and
+the issue failed. That blocked #126 and #130. The engine's version stays 1.2.21: nothing here
+repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/engine.py` | At the start of a run, `_adopt_deliveries` gives each work item not yet merged here the record of another root's run that delivered or completed it (that run's latest round, and this run's own worktree), journaled as `delivery_adopted`, and publishes its phase. It does this once per issue, kept in the run's `adopted` section, so a round this run starts later, after an edit, is its own. |
+| `tests/test_adopted_delivery.py` | New: such an issue, failed here, is taken over as delivered once, and nothing is planned or built again; without a delivery elsewhere, it is built here. |
+
 ## A failed CI run's feedback is the failed job's log (2026-11-19)
 
 A local patch, not in upstream. When the required check fails, the builder gets the tail of the

@@ -409,8 +409,48 @@ class Engine:
                 self.store.put(st)
                 self.store.event("closed_elsewhere", issue=n, state_reason=data.get("state_reason"))
 
+    def _adopt_deliveries(self) -> None:
+        """A work item another root's run already delivered (its issue stays open for the owner's
+        items) is delivered here too, with that run's record, instead of being built again on the
+        branch that run merged, whose history CI's loop guard then refuses (#122, 2026-11-19).
+        Once per issue: a round this run starts after that, after an edit, is its own."""
+        adopted = self.store.state.get("adopted", {})
+        for n in self.plan.work:
+            mine = self.store.issue(n)
+            if str(n) in adopted or mine.phase in (Phase.MERGED, DEPLOYING, Phase.DELIVERED, Phase.DONE):
+                continue
+            found = self._delivered_elsewhere(n)
+            if found is None:
+                continue
+            root, st = found
+            st.worktree = mine.worktree   # this run's own worktree, never the other run's
+            self.store.put(st)
+            self.store.put_section("adopted", str(n), root)
+            self.store.event("delivery_adopted", issue=n, root=root, phase=st.phase.value,
+                             previous=mine.phase.value, pr=st.pr)
+            self._sync(n)
+
+    def _delivered_elsewhere(self, n: int) -> tuple[int, IssueState] | None:
+        """The record of issue `n` that another root's run delivered or completed, its latest round."""
+        found = []
+        for d in runs_root(self.repo_root).glob("issue-*"):
+            m = re.fullmatch(r"issue-(\d+)", d.name)
+            if not m or d.resolve() == self.store.dir.resolve():
+                continue
+            try:
+                raw = json.loads((d / "state.json").read_text())["issues"].get(str(n))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+            if raw and raw.get("phase") in (Phase.DELIVERED.value, Phase.DONE.value):
+                found.append((raw.get("round", 1), int(m.group(1)), raw))
+        if not found:
+            return None
+        _, root, raw = max(found, key=lambda f: (f[0], f[1]))
+        return root, IssueState.from_dict(raw)
+
     def _reconcile(self) -> None:
         self._settle_closed_elsewhere()
+        self._adopt_deliveries()
         for n in list(self.plan.work):
             self._settle_interrupted(n)
             st = self.store.issue(n)
