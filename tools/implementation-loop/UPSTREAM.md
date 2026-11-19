@@ -25,6 +25,19 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## An issue closed by another run no longer keeps a root running (2026-11-19)
+
+A local patch, not in upstream. A root's state keeps every issue it ever recorded, prerequisites
+pulled in from another epic included. When another run closed one of them, its stale phase
+(`waiting`, `pending`, `build`) stayed in this root's state: the supervisor never found the root
+settled and ran it to its bound, and the watcher relaunched it, so the next epic never started.
+The engine's version stays 1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/engine.py` | At the start of a run, `_settle_closed_elsewhere` marks `done` (no wait left) every recorded issue that is not this run's work, has not ended (`done`, `delivered`, `failed`), and is closed on GitHub; the event `closed_elsewhere` journals it. An issue still open is left as it was. |
+| `tests/test_closed_elsewhere.py` | New: such an issue ends `done` and the root settles; one still open is left alone. |
+
 ## A verified deployment discharges a smoke-test item (2026-11-18)
 
 A local patch, not in upstream. ADR 0001 (decision 6, Consequences) asks to move AWS-only items
