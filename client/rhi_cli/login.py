@@ -11,6 +11,10 @@
    (RFC 8628, section 3.5), until the issuer answers with a key or a refusal, or the code expires.
 5. The key goes to the store and is never printed. The command prints when the student's previous
    key was issued, so a login the student did not start shows.
+6. Claude Code and Codex are pointed at the endpoint, each with `rhi token` as the helper that gives
+   it the key (`rhi_cli.harness`). Codex's profile `rhi` names the default pool's model, which the
+   CLI reads from the gateway's `GET /v1/models` with the new key. The key is written to neither file,
+   and the command prints each file it changed: a second login changes none.
 
 Every call goes through a `Transport`, and the waiting through `sleep` and `clock`: the tests give
 stubs of all three.
@@ -32,11 +36,12 @@ from dataclasses import dataclass
 from http.client import HTTPMessage
 from typing import IO, Any, TextIO
 
-from rhi_cli import store
+from rhi_cli import harness, store
 
 GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 CONFIG_PATH = "/auth/config"
 LOGIN_PATH = "/auth/login"
+MODELS_PATH = "/v1/models"
 
 # RFC 8628, section 3.5: the interval when GitHub names none, and the step a `slow_down` adds.
 DEFAULT_INTERVAL = 5
@@ -55,12 +60,16 @@ class LoginError(Exception):
 
 @dataclass(frozen=True)
 class Call:
-    """One HTTP call. GitHub's device endpoint takes a form; the issuer takes JSON."""
+    """One HTTP call. GitHub's device endpoint takes a form; the issuer takes JSON.
+
+    `headers` are sent with it: the gateway is given the key in one.
+    """
 
     method: str
     url: str
     fields: Mapping[str, str] | None = None
     form: bool = False
+    headers: Mapping[str, str] | None = None
 
 
 # The status of the answer and its body as JSON, or None when the body is not JSON.
@@ -79,7 +88,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def http_transport(call: Call) -> tuple[int, Any]:
     """The transport of a real login: the standard library's HTTP client."""
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "rhi-cli"}
+    headers = {"Accept": "application/json", "User-Agent": "rhi-cli", **(call.headers or {})}
     if call.fields is not None:
         if call.form:
             data = urllib.parse.urlencode(call.fields).encode()
@@ -186,6 +195,36 @@ def login(
             f"Your previous key was issued at {_when(previous)}. If you did not log in then, tell the instructor.",
             file=out,
         )
+    _configure_harnesses(address, key, transport, out)
+
+
+def _default_model(address: str, key: str, transport: Transport) -> str:
+    """The default pool's model name, read from the gateway with the key just issued."""
+    status, models = transport(Call("GET", address + MODELS_PATH, headers={"Authorization": f"Bearer {key}"}))
+    model = harness.default_model(models) if status == 200 else None
+    if model is None:
+        raise LoginError(f"The endpoint named no default model (HTTP {status}), so Codex is not configured.")
+    return model
+
+
+def _configure_harnesses(address: str, key: str, transport: Transport, out: TextIO) -> None:
+    """Point each harness at the endpoint and print each file changed; one that fails does not stop the other."""
+    steps = (
+        lambda: harness.configure_claude_code(address),
+        lambda: harness.configure_codex(address, _default_model(address, key, transport)),
+    )
+    failures = []
+    for step in steps:
+        try:
+            changed = step()
+        except (LoginError, harness.HarnessError) as error:
+            failures.append(str(error))
+            continue
+        if changed is not None:
+            print(f"Wrote {changed}", file=out)
+    if failures:
+        raise LoginError("Your key is stored, but the harnesses are not all configured. " + " ".join(failures))
+    print(f"Claude Code now uses the endpoint. Codex uses it with `codex --profile {harness.NAME}`.", file=out)
 
 
 def _run(arguments: argparse.Namespace) -> int:

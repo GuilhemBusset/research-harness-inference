@@ -69,6 +69,8 @@ class Stubs:
             }
         if (call.method, call.url) == ("POST", ENDPOINT + "/auth/login"):
             return self.logins.pop(0)
+        if (call.method, call.url) == ("GET", ENDPOINT + "/v1/models"):
+            return 200, {"data": [{"id": "coursework", "default": True}], "default": "coursework"}
         return 404, {"error": {"code": "not_found", "message": "The issuer has no such route."}}
 
     def sent(self, url: str) -> list[login.Call]:
@@ -96,6 +98,10 @@ class Clock:
 @pytest.fixture(autouse=True)
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # A login also writes the harnesses' settings, under the home folder: a scratch one.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     before = keyring.get_keyring()
     keyring.set_keyring(MemoryKeychain())
     yield tmp_path / "rhi"
