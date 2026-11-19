@@ -111,7 +111,7 @@ class GitHub(Protocol):
     def update_pr(self, n: int, body: str) -> dict: ...
     def merge_pr(self, n: int, sha: str, method: str = "squash") -> dict: ...
     def rerun_failed(self, sha: str) -> bool: ...
-    def failed_log(self, sha: str) -> str: ...
+    def failed_log(self, sha: str, skip: str | None = None) -> str: ...
     def create_issue(self, title: str, body: str, labels: list[str]) -> dict: ...
 
 
@@ -315,8 +315,10 @@ class GhCli:
             started = True
         return started
 
-    def failed_log(self, sha):
-        """The tail of the failed jobs' logs on `sha`, for the implementer to read."""
+    def failed_log(self, sha, skip=None):
+        """The tail of the failed jobs' logs on `sha`, for the implementer to read. The lines of job
+        `skip` are left out: the required check only names the jobs that failed, and its lines,
+        last in the log, would push theirs out of the tail (#102, 2026-11-19)."""
         parts = []
         for run in self._failed_runs(sha)[:3]:
             try:
@@ -325,7 +327,10 @@ class GhCli:
                 raise (GitHubUnavailable if e.transient else GitHubError)(f"gh run view was not started: {e}") from None
             proc = self._run(["gh", "run", "view", str(run["id"]), "--log-failed", "-R", self.repo],
                              capture_output=True, text=True, **identity)
-            parts.append(f"## {run.get('name', 'workflow')} (run {run['id']})\n{(proc.stdout or proc.stderr)[-6000:]}")
+            out = proc.stdout or proc.stderr
+            if skip:
+                out = "\n".join(line for line in out.splitlines() if not line.startswith(f"{skip}\t"))
+            parts.append(f"## {run.get('name', 'workflow')} (run {run['id']})\n{out[-6000:]}")
         return "\n\n".join(parts)
 
     def create_issue(self, title, body, labels):
@@ -597,7 +602,7 @@ class FakeGitHub:
         self._check_seen.pop(sha, None)   # the re-run is a new check run, with its own id and verdict
         return True
 
-    def failed_log(self, sha):
+    def failed_log(self, sha, skip=None):
         return f"FAILED tests/test_fake.py::test_platform - fake CI failure on {sha[:7]}"
 
     def create_issue(self, title, body, labels):

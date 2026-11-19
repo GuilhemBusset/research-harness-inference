@@ -120,6 +120,22 @@ timeout_s = 3600
 # the owner's approval. A pending status that carries it makes the issue wait with the kind
 # `owner_approval`, with no timeout, and lets other issues land meanwhile. Empty: never.
 approval_description = ""
+# The description the reporter gives the success of a "verify/<stage>" status when the
+# verification's smoke tests ran and passed. A verification also succeeds without running a test
+# (no canary key, no listener, a parked system), with another description. When a configured
+# "verify/<stage>" succeeded on the merge commit with exactly this description, an item that needs
+# aws:deployed-environment and names a test under `tests/smoke/` is proven by that status and is
+# not left to the owner. Empty: never. The owner sets it with the contexts, and
+# `tests/unit/test_deploy_settings.py` holds both descriptions equal to the reporter's constants.
+verified_description = ""
+# The smoke test files of which the verification leaves a test out (`scripts/pipeline/verify.py`
+# deselects the tests that must reach the internal load balancer): an item that names one of them
+# stays the owner's, whatever the verification's status says. Absent, as here: the table does not
+# say what the verification leaves out, and a verified deployment discharges nothing. The owner
+# sets it with `verified_description`, and `tests/unit/test_deploy_settings.py` then holds it
+# equal to the files of the tests the verification's own run deselects, and names them when it
+# fails. An empty list says that every smoke test is run.
+# unverified_tests = ["tests/smoke/deployed/<file>.py"]
 
 # The sandbox every agent call and every check command runs in (ADR 0001, decision 3;
 # docs/factory/isolation.md). The root filesystem is read-only, `/tmp` and the home directory

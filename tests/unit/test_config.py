@@ -36,6 +36,18 @@ OWNERS_KEYS = {
 # Part of every bad value below, so a test can tell that an error does not repeat the value.
 MARK = "7701"
 
+# The gateway's task count and its numeric settings, each at the default of section 17 (the task
+# count: sections 2 and 11.2).
+GATEWAY_KEYS = {
+    "gateway_tasks": 2,
+    "request_body_limit_bytes": 8388608,
+    "longest_request_seconds": 1800,
+    "keepalive_seconds": 10,
+    "retry_after_warming_seconds": 30,
+    "retry_after_capacity_unavailable_seconds": 60,
+    "retry_after_concurrency_limit_seconds": 5,
+}
+
 
 # A pool's table in the example: its header and its lines up to the next header or the end.
 POOL_TABLE = re.compile(r"^\[pools\.[^\]\n]+\]\n(?:[^\[\n].*\n|\n)*", re.MULTILINE)
@@ -187,9 +199,10 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("https_listener", "1"),
         *(
             (key, value)
-            for key in ("issuer_reserved_concurrency", "key_issuances_per_day")
+            for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
             for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")
         ),
+        *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -235,6 +248,25 @@ def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
     assert (example["issuer_reserved_concurrency"], example["key_issuances_per_day"]) == (5, 5)
     given = load_text(tmp_path, example_with(issuer_reserved_concurrency="2", key_issuances_per_day="3"))
     assert (given.issuer_reserved_concurrency, given.key_issuances_per_day) == (2, 3)
+
+
+def test_nightly_stop_reads_02_00_when_left_out(tmp_path: Path) -> None:
+    # Section 17: the nightly stop is at 02:00; the example gives that, and a given time is kept.
+    assert load_text(tmp_path, example_with(nightly_stop=None)).nightly_stop == "02:00"
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["nightly_stop"] == "02:00"
+    assert load_text(tmp_path, example_with(nightly_stop='"23:30"')).nightly_stop == "23:30"
+
+
+def test_the_gateway_s_seven_keys_read_their_defaults_when_left_out(tmp_path: Path) -> None:
+    # The owner's deployed configuration has none of them: a source that leaves them out loads.
+    left_out = load_text(tmp_path, example_with(**dict.fromkeys(GATEWAY_KEYS)))
+    assert {key: getattr(left_out, key) for key in GATEWAY_KEYS} == GATEWAY_KEYS
+    assert GATEWAY_KEYS.keys() & config.required_keys() == set()
+    # The example gives each, at its default; a source that gives another value keeps it.
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert {key: example.get(key) for key in GATEWAY_KEYS} == GATEWAY_KEYS
+    given = load_text(tmp_path, example_with(**{key: str(value + 1) for key, value in GATEWAY_KEYS.items()}))
+    assert {key: getattr(given, key) for key in GATEWAY_KEYS} == {key: value + 1 for key, value in GATEWAY_KEYS.items()}
 
 
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -314,6 +346,27 @@ def test_only_the_owners_keys_are_required(tmp_path: Path, monkeypatch: pytest.M
 def test_the_module_names_the_private_keys() -> None:
     assert config.PRIVATE_KEYS == {"domain", "hosted_zone_id", "admin_email", "instructor_phone", "login_client_id"}
     assert set(config.KEYS) >= config.PRIVATE_KEYS
+
+
+def test_rate_limits_read_the_defaults_of_section_17_when_left_out(tmp_path: Path) -> None:
+    defaults = config.RateLimits(per_address=2000, issuer=100, grafana=300)
+    assert load_text(tmp_path, example_with(rate_limits=None)).rate_limits == defaults
+    assert config.load({"RHI_CONFIG": "example"}).rate_limits == defaults
+    # Each entry is optional on its own.
+    partial = load_text(tmp_path, example_with(rate_limits="{ issuer = 50 }")).rate_limits
+    assert partial == config.RateLimits(per_address=2000, issuer=50, grafana=300)
+    assert load_text(tmp_path, example_with(rate_limits="{}")).rate_limits == defaults
+
+
+@pytest.mark.parametrize(
+    "value",
+    [f'"{MARK}"', MARK, f"{{ issuer = {MARK}.5 }}", "{ grafana = true }", "{ issuer = 9 }",
+     f"{{ per_address = 2{MARK}000000 }}", f"{{ surprise{MARK} = 100 }}", f'{{ issuer = "{MARK}" }}'],
+)
+def test_rate_limits_refuse_what_waf_would_not_take(tmp_path: Path, value: str) -> None:
+    message = refusal(tmp_path, example_with(rate_limits=value))
+    assert "'rate_limits'" in message
+    assert MARK not in message
 
 
 # The mock pool's lines, as the example gives them (sections 4.2 and 17, evidence E15).

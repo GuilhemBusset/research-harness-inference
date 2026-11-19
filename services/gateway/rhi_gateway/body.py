@@ -317,6 +317,17 @@ def _serialize(body: Mapping[str, Any]) -> bytes:
     return json.dumps(body, separators=(",", ":"), allow_nan=False).encode("ascii")
 
 
+def pool_named(model: Any, pools: tuple[Pool, ...], default_pool: Pool | None) -> Pool:
+    """The pool a `model` value names (step 3), or a refusal: the wake finds its pool the same way."""
+    if isinstance(model, str):
+        for pool in pools:
+            if pool.name == model:
+                return pool
+        if default_pool is not None and model.startswith(CLAUDE_PREFIX):
+            return default_pool
+    raise _refused("the model names no pool")
+
+
 @dataclass(frozen=True)
 class BodyFilter:
     """The filter of one wire format: its allow-list, the pools, and what each pool's requests go through.
@@ -347,7 +358,7 @@ class BodyFilter:
         if len(raw) > self.maximum:
             raise _refused("the body is above the maximum size")
         body = parse(raw)
-        pool = self._pool_named(body.get(MODEL_FIELD))
+        pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
         try:
             kept = _keep(body, self.allow_list, pool)
             _refuse_references(kept, self.allow_list)
@@ -360,12 +371,3 @@ class BodyFilter:
             # The parser takes deeper nesting than a walk in Python can follow.
             pass
         raise _refused("the body is nested too deep")
-
-    def _pool_named(self, model: Any) -> Pool:
-        if isinstance(model, str):
-            for pool in self.pools:
-                if pool.name == model:
-                    return pool
-            if self.default_pool is not None and model.startswith(CLAUDE_PREFIX):
-                return self.default_pool
-        raise _refused("the model names no pool")

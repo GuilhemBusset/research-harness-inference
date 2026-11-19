@@ -31,11 +31,18 @@ One description is more than a member: `superseded_description` gives the supers
 space and the full SHA of the commit whose execution covers the superseded one. A SHA is a name
 from this repository, not text from AWS, and the function checks that it is one. No event gives
 that description: the execution-level state it answers has no stage, and names no covering commit.
+
+**A verification that ran no test is not a verification that passed.** The verification step ends
+in success without running a test while there is nothing to test, and leaves its reason
+(`scripts/pipeline/verify.py`). No event carries that reason, so `status_for` cannot tell: whoever
+holds it passes the status through `as_it_ran`, which gives a verification's success the
+description of `not_run_description` in place of `VERIFIED_DESCRIPTION`: one member per known
+reason, `NOT_RUN_REASONS`, and one for any other. The reason is only compared, never written.
 """
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 EVENT_FIELDS = ("stage", "action", "category", "state", "commit")
@@ -77,6 +84,9 @@ class Description(StrEnum):
     VERIFYING = "The verification is running."
     VERIFIED = "The verification's tests ran and passed."
     VERIFICATION_FAILED = "The verification failed."
+    NOT_RUN_CANARY_MISSING = "No test ran: the canary's key is missing. The deployment is not verified."
+    NOT_RUN_LISTENER_OFF = "No test ran: the endpoint has no HTTPS listener. The deployment is not verified."
+    NOT_RUN_OTHER = "No test ran, for a reason the reporter does not know. The deployment is not verified."
     STOPPING = "The pipeline's execution is being stopped."
     STOPPED = "The pipeline's execution was stopped before this step finished."
     CANCELED = "The pipeline's execution was canceled before this step finished."
@@ -89,6 +99,13 @@ class Description(StrEnum):
 VERIFIED_DESCRIPTION = Description.VERIFIED
 # A manual approval that waits for a person: no other event gives it.
 APPROVAL_DESCRIPTION = Description.APPROVAL_WAITING
+
+# The reasons the verification step leaves when it runs no test (`scripts/pipeline/verify.py`),
+# each with the description of a verification that ended in success so.
+NOT_RUN_REASONS = {
+    "canary-missing": Description.NOT_RUN_CANARY_MISSING,
+    "listener-off": Description.NOT_RUN_LISTENER_OFF,
+}
 
 
 @dataclass(frozen=True)
@@ -151,6 +168,23 @@ def status_for(event: Mapping[str, object]) -> CommitStatus:
     unknown = (State.ERROR, Description.UNKNOWN_STATE)
     status, description = statuses.get(state, unknown) if isinstance(state, str) else unknown
     return CommitStatus(commit=commit, state=status, context=context, description=description)
+
+
+def not_run_description(reason: object) -> Description:
+    """The description of a verification that ended in success without running a test, for the
+    reason its step left: the member of `NOT_RUN_REASONS` for a reason it lists, and one member for
+    anything else. None of them is `VERIFIED_DESCRIPTION`."""
+    known = NOT_RUN_REASONS.get(reason) if isinstance(reason, str) else None
+    return Description.NOT_RUN_OTHER if known is None else known
+
+
+def as_it_ran(status: CommitStatus, reason: object) -> CommitStatus:
+    """`status` as its verification ran: when it says the verification's tests ran and passed,
+    while the step left `reason` for running none, the same status with the description of that
+    reason. Any other status, and any status while `reason` is None, is returned as it is."""
+    if reason is None or status.description != VERIFIED_DESCRIPTION:
+        return status
+    return replace(status, description=not_run_description(reason))
 
 
 def superseded_description(covering_commit: str) -> str:

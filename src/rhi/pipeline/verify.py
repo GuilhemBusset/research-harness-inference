@@ -1,0 +1,213 @@
+"""The pipeline's verification step (system design, section 8.2, step 6).
+
+After the stage is deployed, the step runs the smoke tests against the deployed endpoint with the
+canary's key: `scripts/pipeline/verify.py`, on the source, in a locked environment. It builds no
+image and runs outside the private network. A failed test fails the step, and with it the
+execution (section 8.5).
+
+**The action is named `ACTION`.** The reporter maps an action of that name to the context
+`verify/<stage>`, so the step's name is its contract: `tests/policy/test_pipeline.py` lists it.
+
+**What the step is told of the stage** comes from outputs of the stage's stacks, through CDK
+Pipelines' outputs of a deployed stack. Nothing is looked up, and the pipeline's template holds a
+reference to each output, never its value:
+
+- `RHI_SMOKE_ENDPOINT`: the endpoint's address, the gateway stack's output, which reads `none`
+  while the endpoint has no HTTPS listener.
+- `RHI_SMOKE_WORKSPACE_URL`: the Prometheus workspace's query address, the observability stack's.
+- `RHI_VERIFY_RELEASE_PARAMETERS`: each pool's name and the name of its release parameter, the
+  pools stack's. The script hands it to the smoke tests as the JSON they read.
+- `RHI_VERIFY_HEARTBEATS_TABLE`: the name of the stage's heartbeats table, the pools stack's too.
+
+and of the execution:
+
+- `RHI_VERIFY_EXECUTION`: the execution's ID, from the pipeline's variable for it;
+- `RHI_VERIFY_BUCKET`: the pipeline's artifact bucket;
+- `RHI_VERIFY_REASON_FILE`: where the script leaves its reason when it runs no test;
+- `RHI_VERIFY_FAILED_TESTS_FILE`: where the script leaves the IDs of the tests that fail;
+- `RHI_VERIFY_LAST_STAGES_FILE`: where the script leaves the last stage each instance reached.
+
+**When no test runs.** While the endpoint has no listener, or the canary's secret is missing or
+holds no key, the script runs no test, writes its reason to that file, `listener-off` or
+`canary-missing`, and exits 0. The step's post-build phase copies the file, when there is one, to
+the object `verification/<execution ID>/not-run` of the artifact bucket, where the reporter reads
+that the verification was not run. A copy that fails fails the step: a verification that was not
+run is never taken for one that passed.
+
+**When a test fails.** A CodeBuild action that fails may leave no output artifact, so the step
+does not rely on one. The script leaves the ID of each smoke test that fails, one per line and
+nothing else, in the file of the second variable, and the post-build phase, which CodeBuild runs
+whether the build phase passed or failed, copies it, when there is one, to the object
+`verification/<execution ID>/failed-smoke-tests`, beside `not-run`. The reporter names those
+tests in its report of the failure (`rhi_reporter.handler`).
+
+**Where a start stopped.** A failed run of the tests also has the script read the heartbeat rows
+of the instances of the pools it tested, and leave the last lifecycle stage each one reached, one
+stage per line and nothing else of a row, in the file of the last variable. The post-build phase
+copies it, when there is one, to the object `verification/<execution ID>/last-stages`. The
+reporter names those stages in its report, the ones its own list holds (section 8.4): it is what
+tells the factory, which holds no AWS credentials, where a start that never served stopped.
+
+**How the step addresses the heartbeats table.** The table is the pools stack's, in the stage's
+assembly, and the pipeline stack can hold no reference to it: CDK refuses a reference between two
+assemblies. An export read with an import would not do either: the pipeline updates itself before
+the stage deploys, and its first update would wait for an export that does not exist yet. So the
+table's name reaches the step when it runs, as an output of the pools stack, and the role's grant
+names the table by an ARN built here, at synthesis: the pipeline stack's own partition, region and
+account, which are the stage's, since the stage names no environment, and the name CloudFormation
+gives a table that has none of its own: the stack's name, a hyphen, the table's logical ID, a
+hyphen and a suffix it generates. The stack's name and the logical ID are read from the stage as
+text. A logical ID holds no hyphen, so the pattern matches that one table
+(`tests/synth/test_pipeline_verify.py`).
+
+**The role** may read the canary's secret, `rhi/canary-key`; query the workspace of the stage it
+verifies, which it names by the workspace's tag, since the workspace has no ID when the role is
+written (`rhi.observability.stack`); read the release parameter of each pool the stage deploys, by
+its name; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
+action on it; and write under `verification/` of the artifact bucket. Beside that it holds what CDK
+Pipelines gives every project of the pipeline: its own logs, its own test reports and a read of
+its input in the artifact bucket. Nothing else: `tests/policy/test_pipeline.py` holds it to that.
+
+The step is a step, not a construct: CDK Pipelines creates its project and role inside the
+pipeline construct of `rhi.pipeline.stack`, whose acknowledgement file covers them.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import aws_cdk as cdk
+from aws_cdk import aws_codebuild as codebuild
+from aws_cdk import aws_iam as iam
+from aws_cdk import pipelines
+
+from rhi.gateway.stack import NO_ENDPOINT
+from rhi.observability.stack import STAGE_TAG
+from rhi.pipeline.synth import UV_VERSION
+from rhi.stage import EndpointStage
+
+if TYPE_CHECKING:
+    from aws_cdk import aws_s3 as s3
+
+# The name of the step's action, which the reporter reads.
+ACTION = "Verify"
+SCRIPT = "scripts/pipeline/verify.py"
+# The secret the admin CLI's canary command writes the canary's key into (`rhi_admin.canary`).
+CANARY_SECRET = "rhi/canary-key"
+# Where, in the artifact bucket, the reporter reads what a verification left: under this prefix,
+# in the folder of the execution's ID.
+PREFIX = "verification"
+NOT_RUN = "not-run"
+FAILED_TESTS = "failed-smoke-tests"
+LAST_STAGES = "last-stages"
+# The files the script leaves its reason, the IDs of the failed tests and the instances' last
+# stages in, outside the checkout.
+REASON_FILE = "/tmp/rhi-verification-not-run"
+FAILED_TESTS_FILE = "/tmp/rhi-verification-failed-smoke-tests"
+LAST_STAGES_FILE = "/tmp/rhi-verification-last-stages"
+
+ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
+WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
+RELEASE_PARAMETERS_VARIABLE = "RHI_VERIFY_RELEASE_PARAMETERS"
+HEARTBEATS_TABLE_VARIABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
+EXECUTION_VARIABLE = "RHI_VERIFY_EXECUTION"
+BUCKET_VARIABLE = "RHI_VERIFY_BUCKET"
+REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
+FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
+LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
+# CodePipeline's variable for the ID of the execution an action runs in.
+EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
+
+INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
+COMMANDS = ["uv sync --locked", f"uv run --locked python {SCRIPT}"]
+
+
+def _copy(file_variable: str, key: str) -> str:
+    """The command that copies the file a variable names, when there is one, to the object `key`
+    of the execution's folder, where the reporter reads it."""
+    to = f"s3://${BUCKET_VARIABLE}/{PREFIX}/${EXECUTION_VARIABLE}/{key}"
+    return f'if [ -f "${file_variable}" ]; then aws s3 cp "${file_variable}" "{to}"; fi'
+
+
+# What the script left, as the objects the reporter reads: its reason, the tests that failed, and
+# the last stage each instance reached.
+POST_BUILD_COMMANDS = [
+    _copy(REASON_FILE_VARIABLE, NOT_RUN),
+    _copy(FAILED_TESTS_FILE_VARIABLE, FAILED_TESTS),
+    _copy(LAST_STAGES_FILE_VARIABLE, LAST_STAGES),
+]
+
+
+def heartbeats_table_arn(scope: cdk.Stack, stage: EndpointStage) -> str:
+    """The ARN pattern of the heartbeats table of `stage`, in the partition, region and account of
+    `scope`, the pipeline's stack: the table by the name CloudFormation gives it, the pools stack's
+    name, a hyphen, the table's logical ID, a hyphen and the suffix CloudFormation generates."""
+    pools = stage.pools
+    table = pools.tables.heartbeats.node.default_child
+    assert isinstance(table, cdk.CfnElement)
+    # The logical ID as text: a reference to it would be one between two assemblies.
+    logical_id = pools.resolve(table.logical_id)
+    assert isinstance(logical_id, str)
+    return scope.format_arn(service="dynamodb", resource="table", resource_name=f"{pools.stack_name}-{logical_id}-*")
+
+
+def verify_step(
+    scope: cdk.Stack, source: pipelines.IFileSetProducer, *, stage: cdk.Stage, artifacts: s3.IBucket
+) -> pipelines.CodeBuildStep:
+    """The verification step of the pipeline of `scope`, on `source`, for `stage`, the stage it
+    runs after, in a pipeline whose artifact bucket is `artifacts`."""
+    environment = {
+        EXECUTION_VARIABLE: EXECUTION_ID,
+        BUCKET_VARIABLE: artifacts.bucket_name,
+        REASON_FILE_VARIABLE: REASON_FILE,
+        FAILED_TESTS_FILE_VARIABLE: FAILED_TESTS_FILE,
+        LAST_STAGES_FILE_VARIABLE: LAST_STAGES_FILE,
+    }
+    outputs: dict[str, cdk.CfnOutput] = {}
+    # Secrets Manager adds six random characters to a secret's name in its ARN.
+    secret = scope.format_arn(
+        service="secretsmanager",
+        resource="secret",
+        resource_name=f"{CANARY_SECRET}-??????",
+        arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+    )
+    statements = [
+        iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]),
+        iam.PolicyStatement(actions=["s3:PutObject"], resources=[artifacts.arn_for_objects(f"{PREFIX}/*")]),
+    ]
+    if isinstance(stage, EndpointStage):
+        outputs[ENDPOINT_VARIABLE] = stage.gateway.endpoint
+        outputs[WORKSPACE_URL_VARIABLE] = stage.observability.workspace_url
+        outputs[RELEASE_PARAMETERS_VARIABLE] = stage.pools.release_parameters_output
+        outputs[HEARTBEATS_TABLE_VARIABLE] = stage.pools.heartbeats_table_output
+        # The stage's workspace, by its tag: every workspace of the account and region, narrowed
+        # to the one that carries the stage's name.
+        workspaces = scope.format_arn(service="aps", resource="workspace", resource_name="*")
+        tagged = {"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": stage.observability.stage_name}}
+        statements.append(iam.PolicyStatement(actions=["aps:QueryMetrics"], resources=[workspaces], conditions=tagged))
+        # The release parameter of each pool the stage deploys, by its name, and no other.
+        parameters = [
+            scope.format_arn(service="ssm", resource="parameter", resource_name=name.lstrip("/"))
+            for name in stage.pools.release_parameters.values()
+        ]
+        if parameters:
+            statements.append(iam.PolicyStatement(actions=["ssm:GetParameter"], resources=parameters))
+        # The stage's heartbeat rows, by pool: a query of that one table, and nothing else of it.
+        statements.append(
+            iam.PolicyStatement(actions=["dynamodb:Query"], resources=[heartbeats_table_arn(scope, stage)])
+        )
+    else:
+        # A stage that is not the endpoint's has no endpoint to verify: the step says so, as not run.
+        environment[ENDPOINT_VARIABLE] = NO_ENDPOINT
+    return pipelines.CodeBuildStep(
+        ACTION,
+        input=source,
+        install_commands=INSTALL_COMMANDS,
+        commands=COMMANDS,
+        partial_build_spec=codebuild.BuildSpec.from_object(
+            {"version": "0.2", "phases": {"post_build": {"commands": POST_BUILD_COMMANDS}}}
+        ),
+        env=environment,
+        env_from_cfn_outputs=outputs,
+        role_policy_statements=statements,
+    )

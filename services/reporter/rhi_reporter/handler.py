@@ -10,6 +10,13 @@ in that order with `rhi_reporter.github`.
 
 - An event of a stage the pipeline deploys (`RHI_REPORTER_STAGES`), the stage's own or one of its
   actions', is the status `status_for` gives it.
+- A verification that ended in success is first asked whether it ran its tests: the step leaves
+  the mark `not-run`, with its reason, when it ran none (below). With the mark, the status is a
+  success whose description says that no test ran and why (`status.as_it_ran`), never
+  `VERIFIED_DESCRIPTION`. The same holds for the verification of a covering execution, whose
+  state a superseded commit takes. When the marks cannot be read, the function fails after
+  logging `NO_NOT_RUN` and posts no such success, so that the event is invoked again: a
+  verification that may have run nothing is not reported as one that passed.
 - An action of a step that runs before those stages (source, synthesis, self-update, assets)
   reports under each of them, as one of their actions, so that a failure there ends the stage's
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
@@ -45,10 +52,39 @@ carry it. An execution that names none yet posts nothing.
 - `logical_ids`: the names of the resources of every template that the same execution's synth
   step wrote, read from its output in the pipeline's artifact store. A resource is named only
   when one of them holds it;
-- empty allow-lists of smoke test IDs and lifecycle stages: the steps that report them come later
-  (issues E0-21 and E0-26).
+- for a failed verification, the action named `Verify`, the smoke tests that failed: the lines of
+  the mark `failed-smoke-tests` of the execution (below). The report keeps a line only when it is
+  in `smoke_tests`, the allow-list of smoke test IDs, and counts every other line as dropped, so
+  nothing a test printed or held can reach a status. The allow-list is the list of
+  `tests/smoke/ids.py`, which the function's construct reads at synthesis and gives in
+  `RHI_SMOKE_TEST_IDS`, comma-separated (`smoke_test_ids`). No mark, or no variable, names no test;
+- for a failed verification too, the last lifecycle stage each instance reached: the lines of the
+  mark `last-stages` of the execution. The report keeps a line only when it is in
+  `lifecycle_stages`, the allow-list of stages, and counts every other line as dropped: nothing
+  else of an instance's row, and no text that is not a stage's name, reaches a status. The
+  allow-list is the stages of the lifecycle agent's enumeration (`rhi_lifecycle.stages`), which
+  the function's construct reads at synthesis and gives in `RHI_LIFECYCLE_STAGES`, comma-separated
+  (`lifecycle_stages`). No mark names no stage, and no variable is an empty allow-list. An
+  instance in service writes its row under the serving module's own name, which is no member of
+  the enumeration: its line counts as dropped.
 
-What cannot be read for the report leaves it out: a resource then counts as dropped.
+What cannot be read for the report leaves it out: a resource then counts as dropped, and marks
+that cannot be read name no test, after logging `NO_FAILED_TESTS`, and no stage, after logging
+`NO_LAST_STAGES`.
+
+**The verification's marks.** A CodeBuild action that fails may leave no output artifact, so the
+verification step writes what it has to say itself, in its post-build phase, to the pipeline's
+artifact bucket (`src/rhi/pipeline/verify.py`), which `RHI_REPORTER_ARTIFACTS` names. The marks of
+an execution are the objects under `verification/<execution ID>/`, and the event carries that ID:
+
+- `failed-smoke-tests`: the IDs of the smoke tests that failed, one per line;
+- `last-stages`: the last lifecycle stage each instance of the tested pools reached, one per line,
+  left when the tests failed;
+- `not-run`: one line, the reason no test ran.
+
+A mark is first looked for by listing its key, then read: the function's role may list that
+prefix, so a mark that is not there is told from one that cannot be read. At most `MARK_BYTES` of
+one are read, and nothing of a mark is logged. While no bucket is named, no mark is read.
 
 **The owner's message.** After the statuses of an action's event are posted, an action that
 ended without success, a failure or an error, has its details sent to the owner's topic, the one
@@ -91,7 +127,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_reporter import github, measure, notify, superseded
 from rhi_reporter.report import build_report, statuses_of
-from rhi_reporter.status import VERIFY_ACTION, State, status_for
+from rhi_reporter.status import VERIFIED_DESCRIPTION, VERIFY_ACTION, State, as_it_ran, status_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -100,6 +136,9 @@ if TYPE_CHECKING:
 
 STAGES_VARIABLE = "RHI_REPORTER_STAGES"
 TOPIC_VARIABLE = "RHI_REPORTER_TOPIC"
+SMOKE_TESTS_VARIABLE = "RHI_SMOKE_TEST_IDS"
+LIFECYCLE_STAGES_VARIABLE = "RHI_LIFECYCLE_STAGES"
+ARTIFACTS_VARIABLE = "RHI_REPORTER_ARTIFACTS"
 
 PIPELINE_CHANGE = "CodePipeline Pipeline Execution State Change"
 STAGE_CHANGE = "CodePipeline Stage Execution State Change"
@@ -126,11 +165,25 @@ EVENT_PAGES = 10
 EXECUTION_PAGES = 10
 # The statuses CodePipeline gives a run of an action that ended without success.
 UNSUCCESSFUL_RUNS = frozenset({"Failed", "Abandoned"})
+# The verification's marks (`src/rhi/pipeline/verify.py`): the prefix of their keys in the artifact
+# bucket, before the execution's ID, and the name of each.
+MARKS_PREFIX = "verification"
+FAILED_TESTS_MARK = "failed-smoke-tests"
+LAST_STAGES_MARK = "last-stages"
+NOT_RUN_MARK = "not-run"
+# At most this much of a mark is read: every smoke test's ID fits in it many times over, and so
+# does a stage for each instance of a fleet at its cap.
+MARK_BYTES = 65536
 
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
 NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
+NO_FAILED_TESTS = "The report of a failed verification names no smoke test: the verification's marks could not be read."
+NO_LAST_STAGES = (
+    "The report of a failed verification names no lifecycle stage: the verification's marks could not be read."
+)
+NO_NOT_RUN = "A verification's success was not posted: whether it ran its tests could not be read from its marks."
 NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
 NOT_SENT = "The details of a failure were not sent to the owner: the topic refused them or could not be reached."
 NOT_A_MEASUREMENT = "No commit status was posted: the measurement event is not one the measure module accepts."
@@ -165,6 +218,17 @@ class _Records:
     read: bool
 
 
+@dataclass
+class _Marks:
+    """What a failed verification left in its marks, each beside the allow-list the report names
+    it by: the failed smoke tests, and the last lifecycle stage each instance reached."""
+
+    smoke_tests: Sequence[str]
+    lifecycle_stages: Sequence[str]
+    failed_tests: Sequence[str] = ()
+    last_stages: Sequence[str] = ()
+
+
 @functools.cache
 def _clients() -> tuple[Aws, github.StatusClient]:
     """The clients of one execution environment, made by its first event."""
@@ -183,20 +247,56 @@ def handler(event: Mapping[str, Any], _context: object) -> None:
     """The Lambda function's entry point."""
     aws, client = _clients()
     stages = tuple(stage for stage in os.environ.get(STAGES_VARIABLE, "").split(",") if stage)
-    handle(event, aws=aws, client=client, stages=stages, topic=os.environ.get(TOPIC_VARIABLE) or None)
+    handle(
+        event,
+        aws=aws,
+        client=client,
+        stages=stages,
+        topic=os.environ.get(TOPIC_VARIABLE) or None,
+        smoke_tests=smoke_test_ids(os.environ),
+        lifecycle_stages=lifecycle_stages(os.environ),
+        artifacts=os.environ.get(ARTIFACTS_VARIABLE) or None,
+    )
 
 
-def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], topic: str | None = None) -> None:
+def smoke_test_ids(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """The allow-list of smoke test IDs that `environ` gives the function: the IDs of
+    `tests/smoke/ids.py`, as the function's construct wrote them into `RHI_SMOKE_TEST_IDS`. Empty
+    without the variable."""
+    return tuple(test_id for test_id in environ.get(SMOKE_TESTS_VARIABLE, "").split(",") if test_id)
+
+
+def lifecycle_stages(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """The allow-list of lifecycle stages that `environ` gives the function: the stages of the
+    lifecycle agent's enumeration, as the function's construct wrote them into
+    `RHI_LIFECYCLE_STAGES`. Empty without the variable."""
+    return tuple(stage for stage in environ.get(LIFECYCLE_STAGES_VARIABLE, "").split(",") if stage)
+
+
+def handle(
+    event: Mapping[str, Any],
+    *,
+    aws: Aws,
+    client: Any,
+    stages: Sequence[str],
+    topic: str | None = None,
+    smoke_tests: Sequence[str] = (),
+    artifacts: str | None = None,
+    lifecycle_stages: Sequence[str] = (),
+) -> None:
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
     as `github.StatusClient` has it, then sends the details of an action that ended without
-    success to `topic`, the owner's. `stages` are the stages the pipeline deploys. An event of a
-    measurement posts its statuses and nothing else."""
+    success to `topic`, the owner's. `stages` are the stages the pipeline deploys,
+    `smoke_tests` the IDs a report of a failure may name a smoke test by, `lifecycle_stages` the
+    names it may name a lifecycle stage by, and `artifacts` the pipeline's artifact bucket, where
+    a verification leaves its marks. An event of a measurement
+    posts its statuses and nothing else."""
     if event.get("source") == measure.SOURCE:
         _measurement(event, aws=aws, client=client)
         return
     kind, detail = event.get("detail-type"), event.get("detail")
     if kind == PIPELINE_CHANGE and isinstance(detail, dict):
-        _supersede(detail, aws=aws, client=client, stages=stages)
+        _supersede(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
         return
     if kind not in (STAGE_CHANGE, ACTION_CHANGE) or not isinstance(detail, dict):
         return
@@ -209,7 +309,7 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
     commit, execution_status = _execution(aws.codepipeline, pipeline, execution)
     if execution_status in superseded.SUPERSEDED_STATUSES or detail.get("state") == CANCELED:
-        _reconcile(detail, aws=aws, client=client, stages=stages)
+        _reconcile(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
         return
     if commit is None:
         logger.warning(NO_COMMIT)
@@ -228,7 +328,7 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
         for under in [stage] if stage in stages else stages:
             facts = {"stage": under, "action": action, "category": category, "state": detail.get("state")}
             facts["commit"] = commit
-            status = status_for(facts)
+            (status,) = _as_they_ran(aws, artifacts, execution, [status_for(facts)])
             if status.state is State.PENDING:
                 if execution_status in EXECUTION_ENDED:
                     continue
@@ -238,7 +338,11 @@ def handle(event: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[
                     continue
             _post(client, status)
             if status.state is State.FAILURE and action is not None:
-                for fact in _report(aws, facts, read()):
+                marks = _Marks(smoke_tests=smoke_tests, lifecycle_stages=lifecycle_stages)
+                if action == VERIFY_ACTION:
+                    marks.failed_tests = _failed_tests(aws, artifacts, execution)
+                    marks.last_stages = _last_stages(aws, artifacts, execution)
+                for fact in _report(aws, facts, read(), marks):
                     _post(client, fact)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
@@ -268,7 +372,9 @@ def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any) -> None:
         logger.warning("%s %s", REFUSED, error)
 
 
-def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
+def _supersede(
+    detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], artifacts: str | None
+) -> None:
     """Posts the statuses of the superseded commits that the execution of `detail` covers, or
     whose execution it is."""
     if not stages:
@@ -276,13 +382,15 @@ def _supersede(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequ
     if not github.has_credential(aws.secrets):
         logger.warning(NO_CREDENTIAL)
         return
-    _reconcile(detail, aws=aws, client=client, stages=stages)
+    _reconcile(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
 
 
-def _reconcile(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str]) -> None:
+def _reconcile(
+    detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], artifacts: str | None
+) -> None:
     """Posts the statuses of the superseded commits that the execution of `detail` covers, or
-    whose execution it is, as the pipeline's executions stand now. Raises when they cannot be
-    read, so that the event is invoked again."""
+    whose execution it is, as the pipeline's executions stand now. Raises when they, or the marks
+    of a covering execution's verification, cannot be read, so that the event is invoked again."""
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
     try:
         executions = _executions(aws.codepipeline, pipeline, execution)
@@ -295,7 +403,8 @@ def _reconcile(detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequ
                 continue
             for stage in stages:
                 verification = _verification(aws.codepipeline, pipeline, cover, stage) if cover.ended else None
-                for status in superseded.statuses_for(cover, stage, verification):
+                statuses = superseded.statuses_for(cover, stage, verification)
+                for status in _as_they_ran(aws, artifacts, cover.covering.execution_id, statuses):
                     _post(client, status)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
@@ -344,6 +453,61 @@ def _verification(codepipeline: Any, pipeline: object, cover: superseded.Cover, 
 
 def _post(client: Any, status: CommitStatus) -> None:
     client.post_status(status.commit, status.state.value, status.context, status.description)
+
+
+def _mark(s3: Any, bucket: str | None, execution: object, name: str) -> list[str] | None:
+    """The lines of the mark `name` that the verification of `execution` left in `bucket`, without
+    the blank ones. None when it left no such mark, or when no bucket or no execution is named.
+    What S3 raises is raised: a mark that cannot be read is not a mark that is not there."""
+    if bucket is None or not isinstance(execution, str) or not execution:
+        return None
+    key = f"{MARKS_PREFIX}/{execution}/{name}"
+    listed = s3.list_objects_v2(Bucket=bucket, Prefix=key)
+    if not any(entry.get("Key") == key for entry in listed.get("Contents", [])):
+        return None
+    text = s3.get_object(Bucket=bucket, Key=key)["Body"].read(MARK_BYTES).decode("utf-8", errors="replace")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _failed_tests(aws: Aws, artifacts: str | None, execution: object) -> list[str]:
+    """What the failed verification of `execution` left as its failed smoke tests, one per line:
+    the report keeps those that are IDs. Empty when it left none, and, after logging
+    `NO_FAILED_TESTS`, when its marks cannot be read."""
+    try:
+        return _mark(aws.s3, artifacts, execution, FAILED_TESTS_MARK) or []
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+        logger.warning(NO_FAILED_TESTS)
+        return []
+
+
+def _last_stages(aws: Aws, artifacts: str | None, execution: object) -> list[str]:
+    """What the failed verification of `execution` left as the last lifecycle stage each instance
+    reached, one per line: the report keeps those that are stages. Empty when it left none, and,
+    after logging `NO_LAST_STAGES`, when its marks cannot be read."""
+    try:
+        return _mark(aws.s3, artifacts, execution, LAST_STAGES_MARK) or []
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+        logger.warning(NO_LAST_STAGES)
+        return []
+
+
+def _as_they_ran(
+    aws: Aws, artifacts: str | None, execution: object, statuses: Sequence[CommitStatus]
+) -> list[CommitStatus]:
+    """`statuses` as the verification of `execution` ran. When one of them says that the
+    verification's tests ran and passed, the mark `not-run` of that execution is read first, and
+    with it that status says instead that no test ran, and why. Raises, after logging `NO_NOT_RUN`,
+    when the marks cannot be read: no status then claims a verification that may have run nothing."""
+    if not any(status.description == VERIFIED_DESCRIPTION for status in statuses):
+        return list(statuses)
+    try:
+        lines = _mark(aws.s3, artifacts, execution, NOT_RUN_MARK)
+    except Exception:
+        logger.warning(NO_NOT_RUN)
+        raise
+    # The mark alone says that no test ran, whatever it holds: an empty one is a reason not known.
+    reason = None if lines is None else next(iter(lines), "")
+    return [as_it_ran(status, reason) for status in statuses]
 
 
 def _execution(codepipeline: Any, pipeline: object, execution: object) -> tuple[str | None, object]:
@@ -395,8 +559,10 @@ def _read(aws: Aws, *, pipeline: object, execution: object, stage: object, actio
     return records
 
 
-def _report(aws: Aws, facts: Mapping[str, object], records: _Records) -> list[CommitStatus]:
-    """The report of the failure `facts` tell, as statuses, from the failed action's records."""
+def _report(aws: Aws, facts: Mapping[str, object], records: _Records, marks: _Marks) -> list[CommitStatus]:
+    """The report of the failure `facts` tell, as statuses, from the failed action's records and
+    from what a failed verification left, `marks`: the report names its failed smoke tests and
+    its instances' last stages only by their allow-lists."""
     failed = records.run is not None and records.run.get("status") == "Failed"
     resource_events = records.resource_events if failed else []
     logical_ids: set[str] = set()
@@ -405,7 +571,15 @@ def _report(aws: Aws, facts: Mapping[str, object], records: _Records) -> list[Co
             logical_ids = _logical_ids(aws.s3, records.executions)
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError, zipfile.BadZipFile):
         logger.warning(NO_FACTS)
-    report = build_report(facts, resource_events, logical_ids=logical_ids, smoke_test_ids=(), lifecycle_stages=())
+    report = build_report(
+        facts,
+        resource_events,
+        marks.failed_tests,
+        marks.last_stages,
+        logical_ids=logical_ids,
+        smoke_test_ids=marks.smoke_tests,
+        lifecycle_stages=marks.lifecycle_stages,
+    )
     return statuses_of(report)
 
 

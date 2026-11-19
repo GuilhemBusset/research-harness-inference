@@ -1,3 +1,33 @@
+# What the role of the verification step (`src/rhi/pipeline/verify.py`) may do, each action on each
+# resource, with its reason. The step is a step, not a construct: CDK Pipelines creates its project
+# and its role inside the pipeline construct of `src/rhi/pipeline/stack.py`, so they are this
+# file's. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory
+# is written here as comments. `tests/synth/test_pipeline_verify.py` and
+# `tests/policy/test_pipeline.py` hold the role to it.
+#
+# - secretsmanager:GetSecretValue on the secret rhi/canary-key-?????? only: the canary's key, which
+#   the smoke tests call the deployed endpoint with.
+# - aps:QueryMetrics on the workspaces of the deploying account and region that carry the tag
+#   rhi-stage with the name of the stage the step verifies, which is that stage's one workspace:
+#   the smoke tests read the gateway's and the pool's metrics, and the release the pool's
+#   instances report.
+# - ssm:GetParameter on the release parameter of each pool the stage deploys, each by its name,
+#   /rhi/pools/<pool>/release: the release the pipeline deployed, which the served one must equal.
+# - dynamodb:Query on the heartbeats table of the stage the step verifies, and on no other table:
+#   when its tests failed, the step reads the heartbeat rows of the pools it tested, by pool, for
+#   the last lifecycle stage each instance reached. The table is named by the pattern
+#   table/<pools stack's name>-<the table's logical ID>-*, the name CloudFormation gives it.
+# - s3:PutObject on verification/* of the pipeline's artifact bucket: the step's marks, which its
+#   post-build phase writes itself because a failed action may leave no output artifact. They are
+#   the objects verification/<execution ID>/not-run, when no test could run,
+#   verification/<execution ID>/failed-smoke-tests, the IDs of the smoke tests that failed, and
+#   verification/<execution ID>/last-stages, the last lifecycle stage each instance reached.
+# - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
+#   CDK Pipelines' grant to a project that takes an input, here the source the step runs.
+# - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
+#   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
+#   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
+
 [nag]
 "AwsSolutions-S1" = "The pipeline's artifact bucket keeps no server access logs: only the pipeline's own roles reach it, CloudTrail records who changes it, and a bucket of access logs would add storage and its cost that nothing in the design reads."
 "AwsSolutions-CB4" = "The pipeline's CodeBuild projects encrypt their artifacts with the key AWS manages for S3, the default; a customer managed key would add a monthly cost and a key policy to keep, and the artifacts hold nothing but this public repository and what is synthesized from it."
@@ -11,6 +41,11 @@
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineBuildSynthCdkBuildProjectEDF0E7B6>:*]" = "The synth project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineBuildSynthCdkBuildProjectEDF0E7B6>-*]" = "The synth project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/config/*]" = "The synth step reads the configuration by its path, every parameter under the configuration prefix, whose keys the configuration loader adds to, and no other parameter."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineRhiVerifyB6860032>:*]" = "The verification project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineRhiVerifyB6860032>-*]" = "The verification project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
+"AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/verification/*]" = "The verification step writes, under the prefix verification/ of the pipeline's own artifact bucket and nowhere else, an object whose key holds the execution's ID, which is only known when the execution runs."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The verification step queries the workspace of the stage it verifies, whose ID is only chosen when the stage is first deployed, after this stack; the statement's condition admits only a workspace tagged with that stage's name."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesHeartbeats613D6AB3-*]" = "The verification step queries the heartbeats table of the stage it verifies, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<PipelineUpdatePipelineSelfMutationDAA41400>:*]" = "The self-update project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<PipelineUpdatePipelineSelfMutationDAA41400>-*]" = "The self-update project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<PipelinePipelinesSecurityCheckCDKSecurityCheck1D09275A>:*]" = "The project that checks for widened permissions writes to the streams of its own log group, whose names CodeBuild chooses for each build."

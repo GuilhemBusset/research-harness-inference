@@ -44,11 +44,28 @@ Rules hold those two, and every action:
   list the executions of the template's own pipeline, and of no other pipeline; the events of the
   stacks that pipeline deploys, by the names its CloudFormation actions give them, and of no other
   stack; the objects of the pipeline's artifact bucket, where each execution's synthesized
-  templates are; publish to the owner's topic, the one topic of the template that the function's
-  `RHI_REPORTER_TOPIC` names, and to no other; and write to the function's own log group. Nothing
-  else: every action it is allowed is one of `REPORTER_READS`,
+  templates are, and the marks of its verification under `verification/`; list that bucket, under
+  the condition that the listed prefix is under `verification/` (`LISTS_THE_MARKS`), alone, so it
+  is shown the marks' keys and no other; publish to the owner's topic, the one topic of the
+  template that the function's `RHI_REPORTER_TOPIC` names, and to no other; and write to the
+  function's own log group. Nothing else: every action it is allowed is one of `REPORTER_READS`,
   each on resources of its kind only, and a wildcard action, `NotAction`, `NotResource` and a
   managed policy the template does not hold are taken as reaching more;
+- the role of the verification, the project of a CodeBuild action named `Verify` (section 8.2,
+  step 6), may read the canary's one secret, `rhi/canary-key`; query the workspace of the stage
+  the action is in: the workspaces of the deploying account and region, under the condition that
+  names the tag `rhi-stage` and a value that a workspace of a stack that stage deploys carries,
+  and no workspace of any other template; read the release parameters, `/rhi/pools/<pool>/release`,
+  that the stacks that stage deploys hold, each by its name; read by pool, with `dynamodb:Query`
+  and no other action, the items of the stage's heartbeats table and of no other table: the table
+  of a stack that stage deploys whose name the action is given in `RHI_VERIFY_HEARTBEATS_TABLE`,
+  as an output of that stack, named as CloudFormation names a table that has no name of its own,
+  the stack's name, a hyphen, the table's logical ID, a hyphen and a wildcard for the suffix it
+  generates, in the deploying account and region (section 8.4); and write objects under
+  `verification/` of the pipeline's artifact bucket. Beside those it holds what CDK Pipelines gives
+  every project: a read of the artifact bucket, and its own log group and report groups. Nothing
+  else: every action it is allowed is one of `VERIFICATION_MAY`, each on resources of its kind
+  only, read as the reporter's are;
 - no role of any template but the reporter's may read the reporter's secret (section 8.4): the
   App's key is the only GitHub credential in the account. A statement reaches the secret when one
   of its actions matches a read of a secret (`SECRET_READS`) and one of its resources may name the
@@ -93,7 +110,15 @@ REVIEWED: Reviewed = [
     ("Source", [("GitHub", "Source/AWS/CodeStarSourceConnection")]),
     ("Build", [("Synth", "Build/AWS/CodeBuild")]),
     ("UpdatePipeline", [("SelfMutate", "Build/AWS/CodeBuild")]),
-    ("Rhi", [("Check.Check", "Build/AWS/CodeBuild"), ("Check.Confirm", "Approval/AWS/Manual")]),
+    (
+        "Rhi",
+        [
+            ("Check.Check", "Build/AWS/CodeBuild"),
+            ("Check.Confirm", "Approval/AWS/Manual"),
+            # After the stage's deployment actions, which the list leaves out.
+            ("Verify", "Build/AWS/CodeBuild"),
+        ],
+    ),
 ]
 
 # The types of action the rules name, as `Category/Owner/Provider`.
@@ -169,9 +194,44 @@ REPORTER_READS = {
     "codepipeline:ListPipelineExecutions": "pipeline",
     "cloudformation:DescribeStackEvents": "stacks",
     "s3:GetObject": "artifacts",
+    "s3:ListBucket": "marks",
     "sns:Publish": "topic",
     "logs:CreateLogStream": "logs",
     "logs:PutLogEvents": "logs",
+}
+# The kind of resource a listing is allowed on, the artifact bucket itself, and the one condition
+# such a statement carries: the listed prefix is under the verification's.
+MARKS = "marks"
+LISTS_THE_MARKS = {"StringLike": {"s3:prefix": "verification/*"}}
+# The verification: the name of its action, the canary's secret, the prefix it writes under, the tag
+# its stage's workspace is named by, the name of a pool's release parameter, the variable that names
+# its stage's heartbeats table to it, as an output of a deployed stack, and the actions its role
+# may be allowed, each with the kind of resource it may be allowed on. The last three groups are
+# what CDK Pipelines gives every project of the pipeline.
+VERIFY_ACTION = "Verify"
+CANARY_SECRET = "rhi/canary-key"
+VERIFICATION_PREFIX = "verification"
+STAGE_TAG = "rhi-stage"
+RELEASE_PARAMETER = re.compile(r"/rhi/pools/[a-z0-9-]+/release")
+HEARTBEATS_TABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
+STACK_OUTPUT = re.compile(r"#\{(\w+)\.(\w+)\}")
+VERIFICATION_MAY = {
+    "secretsmanager:GetSecretValue": "secret",
+    "aps:QueryMetrics": "workspaces",
+    "ssm:GetParameter": "parameters",
+    "dynamodb:Query": "heartbeats",
+    "s3:PutObject": "verification",
+    "s3:GetBucket*": "artifacts",
+    "s3:GetObject*": "artifacts",
+    "s3:List*": "artifacts",
+    "logs:CreateLogGroup": "logs",
+    "logs:CreateLogStream": "logs",
+    "logs:PutLogEvents": "logs",
+    "codebuild:BatchPutCodeCoverages": "reports",
+    "codebuild:BatchPutTestCases": "reports",
+    "codebuild:CreateReport": "reports",
+    "codebuild:CreateReportGroup": "reports",
+    "codebuild:UpdateReport": "reports",
 }
 # What reads a secret, and every ARN of the reporter's secret and of the measurement bus, as patterns
 # that a resource of a statement must overlap to reach them (`overlaps`): any partition, region and
@@ -204,8 +264,12 @@ WEBHOOK = "a CodeBuild project with a webhook"
 NO_BOUNDARY = "a role without the permissions boundary of the bounded bootstrap"
 READS_MORE = "a synth role that may read more than the parameters under /rhi/config/"
 REPORTS_MORE = (
-    "a reporter's role that may do more than read its secret, its pipeline's records and templates,"
-    " and publish to its own topic"
+    "a reporter's role that may do more than read its secret, its pipeline's records, templates and"
+    " verification marks, and publish to its own topic"
+)
+VERIFIES_MORE = (
+    "a verification's role that may do more than read the canary's secret, query its stage's workspace,"
+    " read its stage's release parameters, query its stage's heartbeats table and write under verification/"
 )
 SECRET_ELSEWHERE = "a role other than the reporter function's that may read the reporter's secret"
 MEASURES_AND_READS = "a role that may put events on the measurement bus and read the reporter's secret"
@@ -560,8 +624,8 @@ def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
 def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, list[re.Pattern[str]]]:
     """For each kind of resource of `REPORTER_READS`, what the reporter's role may name, as
     `arn_text` writes it: the secret, the template's own pipelines, the stacks they deploy, their
-    artifact buckets' objects, the topic of the template that the function's `REPORTER_TOPIC`
-    names, and the function's own log group."""
+    artifact buckets' objects, those buckets themselves for a listing of the marks, the topic of
+    the template that the function's `REPORTER_TOPIC` names, and the function's own log group."""
     pipelines = resources({"": template}, "AWS::CodePipeline::Pipeline")
     stacks = {
         action.get("Configuration", {}).get("StackName")
@@ -597,25 +661,182 @@ def reporter_resources(template: Mapping[str, Any], function: str) -> dict[str, 
             for store in stores
             if isinstance(store, dict) and isinstance(store.get("Ref"), str)
         ],
+        MARKS: [
+            re.compile(rf"\$\{{{re.escape(store['Ref'])}\.Arn\}}")
+            for store in stores
+            if isinstance(store, dict) and isinstance(store.get("Ref"), str)
+        ],
         "topic": [re.compile(rf"\$\{{{re.escape(own_topic)}\}}")] if own_topic in topics else [],
         "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
     }
 
 
-def reports_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]]) -> bool:
+def reports_more(
+    statement: Mapping[str, Any],
+    allowed: Mapping[str, list[re.Pattern[str]]],
+    may: Mapping[str, str] = REPORTER_READS,
+) -> bool:
     """Whether an allowed statement of the reporter's role reaches an action it is not given, or
-    a resource beyond those of the action's kind."""
+    a resource beyond those of the action's kind, or lists a bucket under any condition but
+    `LISTS_THE_MARKS`. `may` is the role's actions, each with its kind: the reporter's, or another
+    role's held the same way."""
     if "NotAction" in statement or "NotResource" in statement:
         return True
-    reads = {action.lower(): kind for action, kind in REPORTER_READS.items()}
+    reads = {action.lower(): kind for action, kind in may.items()}
     named = [arn_text(resource) for resource in as_list(statement.get("Resource", []))]
     for action in as_list(statement.get("Action", [])):
         kind = reads.get(action.lower()) if isinstance(action, str) else None
         if kind is None or not named:
             return True
+        if kind == MARKS and statement.get("Condition") != LISTS_THE_MARKS:
+            return True
         if not all(arn is not None and any(shape.fullmatch(arn) for shape in allowed[kind]) for arn in named):
             return True
     return False
+
+
+def verifications(template: Mapping[str, Any]) -> list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]]:
+    """The CodeBuild actions named `Verify` of the pipelines of a template, each as `(the actions
+    of its stage, its pipeline, what names it, its project's role)`: named by its project when the
+    template holds it, by its stage and name otherwise, and the role None when the template does
+    not hold it."""
+    held = template.get("Resources", {})
+    found: list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]] = []
+    for _, _, pipeline, _ in resources({"": template}, "AWS::CodePipeline::Pipeline"):
+        for stage, actions in stages_of(pipeline):
+            for action in actions:
+                if action["Name"] != VERIFY_ACTION or type_of(action) != CODEBUILD:
+                    continue
+                named = action.get("Configuration", {}).get("ProjectName")
+                project = named.get("Ref") if isinstance(named, dict) else None
+                if not isinstance(project, str) or held.get(project, {}).get("Type") != "AWS::CodeBuild::Project":
+                    found.append((actions, pipeline, f"{stage}/{action['Name']}", None))
+                    continue
+                role = held[project].get("Properties", {}).get("ServiceRole")
+                role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+                held_role = role_id if isinstance(role_id, str) and role_id in held else None
+                found.append((actions, pipeline, project, held_role))
+    return found
+
+
+def deployed_by(actions: list[dict[str, Any]], templates: Templates) -> list[Mapping[str, Any]]:
+    """The templates of the stacks a stage's CloudFormation actions deploy, among `templates`: an
+    action names its template by its path in the synth step's output."""
+    paths = {
+        str(action.get("Configuration", {}).get("TemplatePath", "")).partition("::")[2]
+        for action in actions
+        if type_of(action) == CLOUDFORMATION
+    }
+    return [template for path, template in sorted(templates.items()) if path in paths]
+
+
+def workspace_tags(template: Mapping[str, Any]) -> set[str]:
+    """The values of the tag `rhi-stage` on the workspaces of a template."""
+    return {
+        tag.get("Value")
+        for _, _, workspace, _ in resources({"": template}, "AWS::APS::Workspace")
+        for tag in as_list(workspace.get("Tags", []))
+        if isinstance(tag, dict) and tag.get("Key") == STAGE_TAG and isinstance(tag.get("Value"), str)
+    }
+
+
+def heartbeat_tables(templates: Templates, actions: list[dict[str, Any]]) -> list[str]:
+    """The heartbeats tables that the verifications of a stage are told of, each as the pattern of
+    the name CloudFormation gives it: the stack's name, a hyphen, the table's logical ID, a hyphen
+    and a wildcard for the generated suffix. A table is one when an action named `Verify` of the
+    stage is given, in `HEARTBEATS_TABLE`, an output of a stack that the stage deploys, and that
+    output is a reference to a DynamoDB table of the stack's template that has no name of its own."""
+    found = []
+    deployments = [action for action in actions if type_of(action) == CLOUDFORMATION]
+    for action in actions:
+        if action["Name"] != VERIFY_ACTION or type_of(action) != CODEBUILD:
+            continue
+        variables = action.get("Configuration", {}).get("EnvironmentVariables")
+        for variable in json.loads(variables) if isinstance(variables, str) else []:
+            output = STACK_OUTPUT.fullmatch(str(variable.get("value")))
+            if variable.get("name") != HEARTBEATS_TABLE or output is None:
+                continue
+            # The action that executes a stack's change set carries the namespace of its outputs, and
+            # the one that prepares the change set names the stack's template.
+            for stack in sorted(
+                {d["Configuration"]["StackName"] for d in deployments if d.get("Namespace") == output[1]}, key=str
+            ):
+                of_the_stack = [d for d in deployments if d["Configuration"]["StackName"] == stack]
+                for template in deployed_by(of_the_stack, templates):
+                    value = template.get("Outputs", {}).get(output[2], {}).get("Value")
+                    table = value.get("Ref") if isinstance(value, dict) and list(value) == ["Ref"] else None
+                    held = template.get("Resources", {}).get(table, {}) if isinstance(table, str) else {}
+                    unnamed = "TableName" not in held.get("Properties", {})
+                    if isinstance(stack, str) and held.get("Type") == "AWS::DynamoDB::Table" and unnamed:
+                        found.append(f"{stack}-{table}-*")
+    return found
+
+
+def verification_resources(
+    templates: Templates,
+    actions: list[dict[str, Any]],
+    pipeline: Mapping[str, Any],
+    project: str,
+) -> tuple[dict[str, list[re.Pattern[str]]], set[str]]:
+    """For each kind of resource of `VERIFICATION_MAY`, what the role of the verification of a
+    stage may name, as `arn_text` writes it: the canary's secret, every workspace of the deploying
+    account and region, the release parameters the stage's stacks hold, the heartbeats table the
+    stage's verification is told of (`heartbeat_tables`), the objects under
+    `verification/` of the pipeline's artifact bucket, that bucket and its objects, and the
+    project's own log group and report groups. With them, the values of the tag `rhi-stage` that
+    name the stage's workspace: those a workspace of a stack the stage deploys carries, and no
+    workspace of any other template."""
+    deployed = deployed_by(actions, templates)
+    parameters = sorted(
+        {
+            parameter["Name"]
+            for template in deployed
+            for _, _, parameter, _ in resources({"": template}, "AWS::SSM::Parameter")
+            if isinstance(parameter.get("Name"), str) and RELEASE_PARAMETER.fullmatch(parameter["Name"])
+        }
+    )
+    stores = [
+        re.escape(store["Ref"])
+        for store in [pipeline.get("ArtifactStore", {}).get("Location")]
+        + [entry.get("ArtifactStore", {}).get("Location") for entry in pipeline.get("ArtifactStores", [])]
+        if isinstance(store, dict) and isinstance(store.get("Ref"), str)
+    ]
+    own = rf"\$\{{{re.escape(project)}\}}"
+    elsewhere = [template for template in templates.values() if not any(template is one for one in deployed)]
+    tags = set().union(*map(workspace_tags, deployed)) - set().union(*map(workspace_tags, elsewhere))
+    allowed = {
+        "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(CANARY_SECRET)}-\?{{6}}")],
+        "workspaces": [re.compile(rf"{PARTITION}:aps:{HERE}:workspace/\*")],
+        "parameters": [re.compile(rf"{PARTITION}:ssm:{HERE}:parameter{re.escape(name)}") for name in parameters],
+        "heartbeats": [
+            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}")
+            for name in heartbeat_tables(templates, actions)
+        ],
+        "verification": [re.compile(rf"\$\{{{store}\.Arn\}}/{VERIFICATION_PREFIX}/\*") for store in stores],
+        "artifacts": [re.compile(rf"\$\{{{store}\.Arn\}}(/\*)?") for store in stores],
+        "logs": [re.compile(rf"{PARTITION}:logs:{HERE}:log-group:/aws/codebuild/{own}(:\*)?")],
+        "reports": [re.compile(rf"{PARTITION}:codebuild:{HERE}:report-group/{own}-\*")],
+    }
+    return allowed, tags
+
+
+def verifies_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]) -> bool:
+    """Whether an allowed statement of a verification's role reaches an action it is not given, a
+    resource beyond those of the action's kind, or, where it queries workspaces, any workspace but
+    its stage's: its condition must be the one that admits a workspace by the stage's tag, alone."""
+    if reports_more(statement, allowed, VERIFICATION_MAY):
+        return True
+    queries = {action.lower() for action, kind in VERIFICATION_MAY.items() if kind == "workspaces"}
+    if not any(action.lower() in queries for action in as_list(statement.get("Action", []))):
+        return False
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict) or list(condition) != ["StringEquals"]:
+        return True
+    tagged = condition["StringEquals"]
+    if not isinstance(tagged, dict) or list(tagged) != [f"aws:ResourceTag/{STAGE_TAG}"]:
+        return True
+    (value,) = tagged.values()
+    return not (isinstance(value, str) and value in tags)
 
 
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
@@ -679,6 +900,12 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
             statements = statements_of(template, role) if role is not None else None
             if statements is None or any(reports_more(statement, allowed) for statement in statements):
                 found.append((path, role or function, REPORTS_MORE))
+    for path, template in sorted(templates.items()):
+        for actions, pipeline, named, role in verifications(template):
+            allowed, tags = verification_resources(templates, actions, pipeline, named)
+            statements = statements_of(template, role) if role is not None else None
+            if statements is None or any(verifies_more(statement, allowed, tags) for statement in statements):
+                found.append((path, role or named, VERIFIES_MORE))
     # The reporter's secret, read by its function's role and by no other; never by a role that may
     # also put events on the measurement bus.
     for path, template in sorted(templates.items()):
@@ -726,6 +953,7 @@ def built(
     approval: str = "first",
     step: tuple[str, list[str]] | None = None,
     stack_with_an_asset: str | None = None,
+    verification: bool = False,
     change: Change | None = None,
 ) -> dict[str, dict[str, Any]]:
     """The templates of an app, built in the test, whose pipeline CDK Pipelines makes as the
@@ -742,6 +970,10 @@ def built(
     - one more step before the stage's deployment, by its name and its commands;
     - one more stack in the stage, with a file asset and a role under the boundary of the name
       given or, when the name is empty, under none;
+    - a verification: a CodeBuild step named `Verify` after the stage's deployment, and in the
+      stage's stack what it reads, a workspace tagged with the stage's name, the release
+      parameter of the pool `mock` and the table `Heartbeats`, whose name the stack declares as
+      an output that the step is given. Its role holds what CDK Pipelines gives it, until `change`;
     - anything `change` does to the pipeline's stack and to the pipeline once it is built.
     """
     pipelines, iam = cdk.pipelines, cdk.aws_iam
@@ -770,6 +1002,21 @@ def built(
     endpoint = cdk.Stack(stage, "Endpoint")
     bounded(endpoint, boundary)
     iam.Role(endpoint, "Role", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"))
+    told: dict[str, Any] = {}
+    if verification:
+        cdk.aws_aps.CfnWorkspace(endpoint, "Workspace", tags=[cdk.CfnTag(key=STAGE_TAG, value="Rhi")])
+        cdk.aws_ssm.StringParameter(endpoint, "Release", parameter_name="/rhi/pools/mock/release", string_value="{}")
+        dynamodb = cdk.aws_dynamodb
+        table = dynamodb.CfnTable(
+            endpoint,
+            "Heartbeats",
+            key_schema=[dynamodb.CfnTable.KeySchemaProperty(attribute_name="pool", key_type="HASH")],
+            attribute_definitions=[
+                dynamodb.CfnTable.AttributeDefinitionProperty(attribute_name="pool", attribute_type="S")
+            ],
+            billing_mode="PAY_PER_REQUEST",
+        )
+        told = {HEARTBEATS_TABLE: cdk.CfnOutput(endpoint, "HeartbeatsTable", value=table.ref)}
     if stack_with_an_asset is not None:
         other = cdk.Stack(stage, "Other")
         (folder / "asset.txt").write_text("An asset.\n", encoding="utf-8")
@@ -785,7 +1032,10 @@ def built(
         gate = [pipelines.ConfirmPermissionsBroadening("Check", stage=stage)]
     more = [pipelines.ShellStep(step[0], commands=step[1])] if step is not None else []
     last = approval == "last"
-    pipeline.add_stage(stage, pre=more if last else gate + more, post=gate if last else [])
+    verify = (
+        [pipelines.CodeBuildStep(VERIFY_ACTION, commands=["true"], env_from_cfn_outputs=told)] if verification else []
+    )
+    pipeline.add_stage(stage, pre=more if last else gate + more, post=(gate if last else []) + verify)
     pipeline.build_pipeline()
     if change is not None:
         change(cdk, stack, pipeline.pipeline)
@@ -1097,6 +1347,20 @@ def test_the_reporter_s_role_is_the_one_held(templates: dict[str, dict[str, Any]
         for _, role in reporter_roles(template)
     ]
     assert len(found) == 1 and found[0] is not None
+    # And so is the bucket whose marks it may list, the pipeline's artifact bucket: the role holds
+    # that listing, under its condition.
+    ((template, function, role),) = [
+        (template, function, role)
+        for template in templates.values()
+        if resources({"": template}, "AWS::CodePipeline::Pipeline")
+        for function, role in reporter_roles(template)
+    ]
+    (bucket,) = reporter_resources(template, function)[MARKS]
+    assert role is not None
+    listings = [s for s in statements_of(template, role) or [] if "s3:ListBucket" in as_list(s.get("Action"))]
+    assert [(bucket.fullmatch(arn_text(s["Resource"]) or "") is not None, s["Condition"]) for s in listings] == [
+        (True, LISTS_THE_MARKS)
+    ]
 
 
 def the_secret(name: str) -> Names:
@@ -1126,8 +1390,17 @@ def another_pipeline(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
     return stack.format_arn(service="codepipeline", resource="Another")
 
 
+def the_bucket(_cdk: ModuleType, _stack: Any, pipeline: Any) -> str:
+    """The pipeline's artifact bucket itself, which a listing names."""
+    return pipeline.artifact_bucket.bucket_arn
+
+
 def another_bucket(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
     return cdk.aws_s3.Bucket(stack, "Another").arn_for_objects("*")
+
+
+def another_bucket_itself(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return cdk.aws_s3.Bucket(stack, "Another").bucket_arn
 
 
 def every_resource(_cdk: ModuleType, _stack: Any, _pipeline: Any) -> str:
@@ -1143,10 +1416,10 @@ def another_topic(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
     return cdk.aws_sns.Topic(stack, "AnotherTopic").topic_arn
 
 
-# The narrow role: each action of `REPORTER_READS` on what it reads. The stage of `built` deploys
-# the stack `Rhi-Endpoint`.
-NARROW: list[tuple[list[str], Names]] = [
-    (["secretsmanager:GetSecretValue"], the_secret(f"{REPORTER_SECRET}-??????")),
+# The narrow role: each action of `REPORTER_READS` on what it reads, under its condition when it
+# has one. The stage of `built` deploys the stack `Rhi-Endpoint`.
+NARROW: list[tuple[list[str], Names, dict[str, Any] | None]] = [
+    (["secretsmanager:GetSecretValue"], the_secret(f"{REPORTER_SECRET}-??????"), None),
     (
         [
             "codepipeline:GetPipelineExecution",
@@ -1155,29 +1428,33 @@ NARROW: list[tuple[list[str], Names]] = [
             "codepipeline:ListPipelineExecutions",
         ],
         the_pipeline,
+        None,
     ),
-    (["cloudformation:DescribeStackEvents"], the_stack("Rhi-Endpoint")),
-    (["s3:GetObject"], the_artifacts),
-    (["sns:Publish"], the_topic),
+    (["cloudformation:DescribeStackEvents"], the_stack("Rhi-Endpoint"), None),
+    (["s3:GetObject"], the_artifacts, None),
+    (["s3:ListBucket"], the_bucket, LISTS_THE_MARKS),
+    (["sns:Publish"], the_topic, None),
 ]
 
 
-def a_reporter(more: tuple[str, Names] | None = None, *, managed: bool = False) -> Change:
+def a_reporter(
+    more: tuple[str, Names] | None = None, *, managed: bool = False, condition: dict[str, Any] | None = None
+) -> Change:
     """A rule on the pipeline's state that invokes a function, told its own topic, whose role
-    holds the narrow statements, writes its own log group and, when asked, one more statement or
-    the AWS managed policy for a function's logs."""
+    holds the narrow statements, writes its own log group and, when asked, one more statement,
+    under `condition` when one is given, or the AWS managed policy for a function's logs."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         iam, lambda_ = cdk.aws_iam, cdk.aws_lambda
         topic = cdk.aws_sns.Topic(stack, "ReporterTopic")
         logs = cdk.aws_logs.LogGroup(stack, "ReporterLogs")
         role = iam.Role(stack, "ReporterRole", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"))
-        statements = [(["logs:CreateLogStream", "logs:PutLogEvents"], logs.log_group_arn)]
-        statements += [(actions, arn(cdk, stack, pipeline)) for actions, arn in NARROW]
+        statements = [(["logs:CreateLogStream", "logs:PutLogEvents"], logs.log_group_arn, None)]
+        statements += [(actions, arn(cdk, stack, pipeline), held) for actions, arn, held in NARROW]
         if more is not None:
-            statements.append(([more[0]], more[1](cdk, stack, pipeline)))
-        for actions, resource in statements:
-            role.add_to_policy(iam.PolicyStatement(actions=actions, resources=[resource]))
+            statements.append(([more[0]], more[1](cdk, stack, pipeline), condition))
+        for actions, resource, held in statements:
+            role.add_to_policy(iam.PolicyStatement(actions=actions, resources=[resource], conditions=held))
         if managed:
             role.add_managed_policy(
                 iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
@@ -1227,11 +1504,203 @@ def test_keeps_a_reporter_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) 
         pytest.param(a_reporter(("sns:Publish", another_topic)), id="publishing to another topic"),
         pytest.param(a_reporter(("sns:Publish", every_resource)), id="publishing to every topic"),
         pytest.param(a_reporter(("sns:*", the_topic)), id="every action on its own topic"),
+        pytest.param(a_reporter(("s3:ListBucket", the_bucket)), id="a listing of the whole artifact bucket"),
+        pytest.param(
+            a_reporter(("s3:ListBucket", the_bucket), condition={"StringLike": {"s3:prefix": "*"}}),
+            id="a listing under another prefix",
+        ),
+        pytest.param(
+            a_reporter(("s3:ListBucket", another_bucket_itself), condition=LISTS_THE_MARKS),
+            id="a listing of another bucket",
+        ),
+        pytest.param(a_reporter(("s3:PutObject", the_artifacts)), id="a write to the artifact bucket"),
     ],
 )
 def test_refuses_a_reporter_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
     assert refused(built(cdk, tmp_path / "kept", change=a_reporter())) == set()
     assert refused(built(cdk, tmp_path / "breached", change=change)) == {REPORTS_MORE}
+
+
+def test_the_verification_s_role_is_the_one_held(templates: dict[str, dict[str, Any]]) -> None:
+    # The rule holds a role only once it finds it: the app's verification is found, with its role,
+    # and so are the workspace and the release parameters of the stage it verifies.
+    (found,) = [found for template in templates.values() for found in verifications(template)]
+    actions, pipeline, project, role = found
+    assert role is not None
+    allowed, tags = verification_resources(templates, actions, pipeline, project)
+    assert tags == {"Rhi"} and allowed["parameters"] and allowed["verification"]
+    # And so is the heartbeats table it is told of, the one table its role may query: the pools
+    # stack's, by the logical ID recorded for it, and no other action of DynamoDB.
+    recorded = json.loads((Path(__file__).resolve().parent / "stateful_logical_ids.json").read_text(encoding="utf-8"))
+    (table,) = heartbeat_tables(templates, actions)
+    assert table in {f"{stack}-{logical_id}-*" for stack, ids in recorded.items() for logical_id in ids}
+    (template,) = [template for template in templates.values() if role in template["Resources"]]
+    queries = [
+        statement
+        for statement in statements_of(template, role) or []
+        if any(str(action).lower().startswith("dynamodb:") for action in as_list(statement.get("Action")))
+    ]
+    (heartbeats,) = allowed["heartbeats"]
+    assert [(s["Action"], heartbeats.fullmatch(arn_text(s["Resource"]) or "") is not None) for s in queries] == [
+        ("dynamodb:Query", True)
+    ]
+
+
+def the_workspaces(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return stack.format_arn(service="aps", resource="workspace", resource_name="*")
+
+
+def the_parameter(name: str) -> Names:
+    def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        return stack.format_arn(service="ssm", resource="parameter", resource_name=name)
+
+    return arn
+
+
+def the_table(name: str) -> Names:
+    def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        return stack.format_arn(service="dynamodb", resource="table", resource_name=name)
+
+    return arn
+
+
+def under(prefix: str, bucket: Names | None = None) -> Names:
+    """The objects under a prefix of the pipeline's artifact bucket, or of the bucket `bucket` makes."""
+
+    def arn(cdk: ModuleType, stack: Any, pipeline: Any) -> str:
+        if bucket is None:
+            return pipeline.artifact_bucket.arn_for_objects(f"{prefix}/*")
+        return bucket(cdk, stack, pipeline).removesuffix("*") + f"{prefix}/*"
+
+    return arn
+
+
+def tagged(stage: str) -> dict[str, Any]:
+    """The condition that admits a workspace by the name of its stage."""
+    return {"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": stage}}
+
+
+# One more statement of a verification's role: its action, what it names and its condition.
+More = tuple[str, "Names", "dict[str, Any] | None"]
+# The heartbeats table of the stage of `built`, as CloudFormation names it: the stage deploys the
+# stack `Rhi-Endpoint`, which holds the table under the logical ID `Heartbeats`.
+HEARTBEATS = "Rhi-Endpoint-Heartbeats-*"
+# The narrow role: what the verification of the stage of `built` reads and writes.
+VERIFIES: list[More] = [
+    ("secretsmanager:GetSecretValue", the_secret(f"{CANARY_SECRET}-??????"), None),
+    ("aps:QueryMetrics", the_workspaces, tagged("Rhi")),
+    ("ssm:GetParameter", the_parameter("rhi/pools/mock/release"), None),
+    ("dynamodb:Query", the_table(HEARTBEATS), None),
+    ("s3:PutObject", under(VERIFICATION_PREFIX), None),
+]
+
+
+def a_verification(more: More | None = None, *, managed: bool = False, elsewhere: bool = False) -> Change:
+    """Gives the role of the verification of `built` the narrow statements and, when asked, one
+    more statement, an AWS managed policy, or, in a stack the pipeline does not deploy, a second
+    workspace that carries the stage's tag."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        iam = cdk.aws_iam
+        (project,) = [
+            node
+            for node in stack.node.find_all()
+            if isinstance(node, cdk.aws_codebuild.Project) and f"/Rhi/{VERIFY_ACTION}" in node.node.path
+        ]
+        for action, arn, condition in [*VERIFIES, *([more] if more is not None else [])]:
+            statement = iam.PolicyStatement(
+                actions=[action], resources=[arn(cdk, stack, pipeline)], conditions=condition
+            )
+            project.role.add_to_principal_policy(statement)
+        if managed:
+            # The one managed policy the rules on the reporter's secret know: only this rule refuses it.
+            project.role.add_managed_policy(
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
+            )
+        if elsewhere:
+            other = cdk.Stack(stack.node.scope, "Elsewhere")
+            cdk.aws_aps.CfnWorkspace(other, "Workspace", tags=[cdk.CfnTag(key=STAGE_TAG, value="Rhi")])
+
+    return change
+
+
+def test_keeps_a_verification_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path, verification=True, change=a_verification())
+    ((_, _, _, role),) = [found for template in templates.values() for found in verifications(template)]
+    assert role is not None
+    assert breaches(templates) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(
+            a_verification(("secretsmanager:GetSecretValue", the_secret("rhi/other-??????"), None)),
+            id="another secret",
+        ),
+        pytest.param(
+            a_verification(("secretsmanager:*", the_secret(f"{CANARY_SECRET}-??????"), None)),
+            id="every action on the canary's secret",
+        ),
+        pytest.param(a_verification(("aps:QueryMetrics", the_workspaces, None)), id="every workspace"),
+        pytest.param(
+            a_verification(("aps:QueryMetrics", the_workspaces, tagged("Other"))),
+            id="the workspace of another stage",
+        ),
+        pytest.param(
+            a_verification(("aps:QueryMetrics", the_workspaces, {"StringLike": tagged("Rhi")["StringEquals"]})),
+            id="workspaces under another condition",
+        ),
+        pytest.param(
+            a_verification(elsewhere=True), id="a second workspace of the stage's tag, in a stack it does not deploy"
+        ),
+        pytest.param(a_verification(("aps:RemoteWrite", the_workspaces, tagged("Rhi"))), id="a write to the workspace"),
+        pytest.param(
+            a_verification(("ssm:GetParameter", the_parameter("rhi/pools/*/release"), None)),
+            id="every pool's release parameter",
+        ),
+        pytest.param(
+            a_verification(("ssm:GetParameter", the_parameter("rhi/pools/other/release"), None)),
+            id="the release parameter of a pool the stage does not deploy",
+        ),
+        pytest.param(
+            a_verification(("ssm:GetParameter", the_parameter("rhi/config/domain"), None)), id="another parameter"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table("Rhi-Endpoint-Other-*"), None)),
+            id="another table of the stage",
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table("Rhi-Endpoint-Heartbeats*"), None)),
+            id="every table whose logical ID starts as the heartbeats table's",
+        ),
+        pytest.param(a_verification(("dynamodb:Query", the_table("*"), None)), id="every table"),
+        pytest.param(
+            a_verification(("dynamodb:Scan", the_table(HEARTBEATS), None)), id="a scan of the heartbeats table"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:PutItem", the_table(HEARTBEATS), None)), id="a write to the heartbeats table"
+        ),
+        pytest.param(
+            a_verification(("dynamodb:Query", the_table(f"{HEARTBEATS}/index/*"), None)),
+            id="the indexes of the heartbeats table",
+        ),
+        pytest.param(a_verification(("s3:PutObject", the_artifacts, None)), id="a write outside verification/"),
+        pytest.param(
+            a_verification(("s3:PutObject", under(VERIFICATION_PREFIX, another_bucket), None)),
+            id="a write under verification/ of another bucket",
+        ),
+        pytest.param(
+            a_verification(("s3:DeleteObject", under(VERIFICATION_PREFIX), None)),
+            id="another action under verification/",
+        ),
+        pytest.param(a_verification(("s3:PutObject", every_resource, None)), id="every resource"),
+        pytest.param(a_verification(managed=True), id="a managed policy the template does not hold"),
+    ],
+)
+def test_refuses_a_verification_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
+    assert refused(built(cdk, tmp_path / "kept", verification=True, change=a_verification())) == set()
+    assert refused(built(cdk, tmp_path / "breached", verification=True, change=change)) == {VERIFIES_MORE}
 
 
 def a_role(

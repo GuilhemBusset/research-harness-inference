@@ -1,0 +1,49 @@
+# What the roles of `src/rhi/pools/release.py` may do, each action on each resource, with its reason.
+# The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The policy each pool's release attaches to the pool's instance role (`pools_role.toml`):
+# - ssm:GetParameter on the pool's release parameter, /rhi/pools/<pool>/release, and no other: the
+#   boot program and the lifecycle agent read the release at every start.
+# - s3:GetObject on the one object of the release's archive in the bootstrap's bucket, and no
+#   other: the boot program fetches the unit files, the collector's configuration and the agent.
+# - ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer and ecr:BatchGetImage on the
+#   bootstrap's repository, where the asset step pushes the pool's engine image: the host pulls it.
+# - ecr:GetAuthorizationToken on every resource: the host logs in to the registry before it pulls.
+#
+# The policy of each pool's custom resource that reads the image's digest, attached to the role of
+# the function the CDK shares among the stack's AWS SDK custom resources (`pools_stack.toml`):
+# - ecr:DescribeImages on the bootstrap's repository: the release names the image by the digest
+#   the registry gave it, read for the asset's tag when the stack is deployed.
+#
+# The role of the two functions that start a pool's instance refresh and say when it has ended:
+# - logs:CreateLogStream and logs:PutLogEvents on their own log group.
+# - autoscaling:StartInstanceRefresh and autoscaling:CancelInstanceRefresh on the groups of this
+#   stack's pools only, a group ARN whose conditions are the group's tag rhi-pool with a pool's
+#   name and the tag CloudFormation gives it with this stack's ID.
+# - autoscaling:DescribeInstanceRefreshes on every resource: the deployment waits for the refresh.
+#
+# The two roles of the CDK's provider framework, which calls those functions for CloudFormation:
+# - logs:CreateLogStream and logs:PutLogEvents on the framework's own log group.
+# - lambda:InvokeFunction and lambda:GetFunction on the two functions above.
+# - states:StartExecution on the framework's state machine, for the role of the function that
+#   starts it only.
+#
+# The role of the framework's state machine, which waits for the refresh:
+# - lambda:InvokeFunction on the framework's two functions that ask whether the refresh has ended
+#   and report a wait that ran out.
+
+[nag]
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants ecr:GetAuthorizationToken and autoscaling:DescribeInstanceRefreshes on every resource only; each statement that names every resource holds that one action."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its conditions on the tags rhi-pool and aws:cloudformation:stack-id narrow it to the groups of this stack's pools."
+"AwsSolutions-IAM5[Resource::<InstanceRefresherStart9C07E845.Arn>:*]" = "The CDK's provider framework is allowed to invoke the function that starts a refresh and each of its versions; the statement names that one function and nothing else."
+"AwsSolutions-IAM5[Resource::<InstanceRefresherQueryA43B560A.Arn>:*]" = "The CDK's provider framework is allowed to invoke the function that says whether a refresh has ended and each of its versions; the statement names that one function and nothing else."
+"AwsSolutions-IAM5[Resource::<InstanceRefresherProviderframeworkisCompleteAAD3D9FC.Arn>:*]" = "The framework's state machine is allowed to invoke the framework's own function that asks whether the refresh has ended and each of its versions; the statement names that one function and nothing else."
+"AwsSolutions-IAM5[Resource::<InstanceRefresherProviderframeworkonTimeout3C4BD398.Arn>:*]" = "The framework's state machine is allowed to invoke the framework's own function that reports a wait that ran out and each of its versions; the statement names that one function and nothing else."
+"AwsSolutions-L1" = "The two functions of the instance refresh run on the Lambda runtime of the Python that .python-version names, which packaging.RUNTIME holds for every function of the app."
+"AwsSolutions-SF1" = "The state machine of the CDK's provider framework only calls the framework's functions until the refresh has ended, and each call is in those functions' log group; logging its events would give its role Step Functions' log delivery actions on every resource."
+"AwsSolutions-SF2" = "The state machine of the CDK's provider framework has one task, repeated until the refresh has ended; there is no path through it for a trace to show, and tracing would give its role X-Ray actions on every resource."
+
+[wildcard_actions]
+"ecr:GetAuthorizationToken" = "AWS grants the registry's authorization token on every resource only; an instance needs it to log in before it pulls its pool's engine image, and the pull itself is granted on the one repository."
+"autoscaling:DescribeInstanceRefreshes" = "AWS grants the Describe calls of Auto Scaling on every resource only; the function that waits for a pool's refresh reads its status with this one."

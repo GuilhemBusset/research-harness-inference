@@ -18,9 +18,11 @@ import httpx
 import pytest
 from botocore.exceptions import ClientError
 
+from rhi_common.engine_metrics import MOCK
 from rhi_lifecycle import release
 from rhi_lifecycle.host import Host, HostError
 from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, Engine, Launch, Metadata, Outcome, fetch
+from rhi_lifecycle.termination import Termination
 from rhi_mock_engine.app import Settings, create_app
 
 if TYPE_CHECKING:
@@ -94,14 +96,20 @@ class World(Host):
         self.warm_up: tuple[int, bytes] | None = (200, b'{"choices": []}')
 
     def launch(self) -> Launch:
+        metadata = Metadata(self.fetch)
         return Launch(
             NAME,
-            metadata=Metadata(self.fetch),
+            metadata=metadata,
             autoscaling=self,
             ssm=self,
             secrets=self,
+            dynamodb=self,
             host=self,
             engine=Engine(self.fetch),
+            # An instance that leaves service is handed over: tests/unit/lifecycle/test_termination.py.
+            termination=Termination(
+                NAME, metadata, autoscaling=self, ssm=self, host=self, engine=MOCK, fetch=self.fetch, sleep=self.sleep
+            ),
             held=self.held,
             served=self.served,
             clock=lambda: self.now,
@@ -151,6 +159,14 @@ class World(Host):
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         self.calls.append("complete")
         self.completions.append(request)
+        return {}
+
+    # The heartbeats table, where a launch names the stage it has reached: tests/unit/lifecycle/test_stages.py.
+
+    def Table(self, name: str) -> World:
+        return self
+
+    def put_item(self, **request: Any) -> dict[str, Any]:
         return {}
 
     # The instance metadata and the engine: what answers when the agent opens a URL.
@@ -342,18 +358,6 @@ def test_each_transition_keeps_its_own_deadline(tmp_path: Path) -> None:
         unmeasured.launch().run()
     assert unmeasured.now >= AN_HOUR
     assert unmeasured.completions == []
-
-
-def test_an_instance_that_returns_from_service_to_the_warm_pool_is_not_an_entry(tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
-    assert world.launch().run() is Outcome.CONTINUED
-    served = list(world.calls)
-
-    # The same wait state, and a warm-pool target: the instance is draining (evidence E10).
-    world.target = WARM
-
-    assert world.launch().run() is Outcome.NOT_A_LAUNCH
-    assert world.calls == served
 
 
 @pytest.mark.parametrize("target", ["Terminated", "Warmed:Terminated", None])

@@ -33,6 +33,7 @@ from starlette.responses import Response
 
 from rhi_common.causes import Cause
 from rhi_common.keys import is_valid_key, key_hash
+from rhi_gateway import telemetry
 from rhi_gateway.app import Handler
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.keystore import KeyRecord, KeyStore
@@ -134,9 +135,11 @@ def authenticated(authenticator: Authenticator, handler: AuthenticatedHandler) -
         try:
             student = await authenticator.authenticate(request.headers)
         except GatewayError as refused:
+            telemetry.note_cause(refused.cause)
             # A route the gateway answers itself has no wire format: it answers as `not_found` does.
             answer = render_json(refused, entry.wire_format or WireFormat.MESSAGES)
             return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
+        telemetry.note_student(student)
         return await handler(request, entry, student)
 
     return slot

@@ -1,22 +1,31 @@
 """The pipeline's reporter, in the app's synthesized templates (system design, section 8.2, step 7):
 a rule on this pipeline's state changes and nothing else, the function it invokes, the secret
 the function reads, which the stack refers to and never creates, and the owner's topic, where the
-function sends what a public status may not carry (section 8.4). Beside them, the measurement bus,
+function sends what a public status may not carry (section 8.4); the allow-list of smoke test IDs,
+the allow-list of lifecycle stages and the artifact bucket the function is told, and its role's
+read of the verification's marks in that bucket. Beside them, the measurement bus,
 a rule on it for a job's measurements that invokes the same function, and the grant a job's role
 is given to put events on that bus (sections 8.4 and 12).
 """
 
 from __future__ import annotations
 
+import runpy
+from pathlib import Path
 from typing import Any
 
 from rhi import config
+from rhi_lifecycle.stages import Stage
 from rhi_reporter import handler, measure
 
 PIPELINE_TEMPLATE = "RhiPipeline.template.json"
 # The secret's fixed name, which the owner creates (section 8.6, step 3).
 SECRET_NAME = "rhi/reporter/github-app"
 MEASUREMENT_BUS = "rhi-measurements"
+# The ID of every smoke test, where the smoke tests list them: the reporter's allow-list.
+SMOKE_TEST_IDS: tuple[str, ...] = runpy.run_path(str(Path(__file__).resolve().parents[1] / "smoke/ids.py"))[
+    "SMOKE_TEST_IDS"
+]
 
 
 def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
@@ -39,12 +48,13 @@ def reporter_functions(template: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
-    # The one rule on the default bus: the other is on the measurement bus.
+    # The one rule on the default bus that matches events: the other is on the measurement bus, and
+    # a schedule matches none.
     (rule,) = [
         rule
         for template in templates.values()
         for rule in of_type(template, "AWS::Events::Rule").values()
-        if "EventBusName" not in rule
+        if "EventBusName" not in rule and "EventPattern" in rule
     ]
     pattern = rule["EventPattern"]
     assert pattern["source"] == ["aws.codepipeline"]
@@ -109,13 +119,33 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
     template = templates[PIPELINE_TEMPLATE]
     (function,) = reporter_functions(template).values()
     (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    (pipeline,) = of_type(template, "AWS::CodePipeline::Pipeline").values()
     example = config.load({"RHI_CONFIG": "example"})
     assert function["Environment"]["Variables"] == {
         "RHI_REPORTER_SECRET": SECRET_NAME,
         "RHI_REPORTER_REPOSITORY": f"{example.github_owner}/{example.github_repo}",
         handler.STAGES_VARIABLE: "Rhi",
         handler.TOPIC_VARIABLE: {"Ref": topic_id},
+        "RHI_SMOKE_TEST_IDS": ",".join(SMOKE_TEST_IDS),
+        "RHI_LIFECYCLE_STAGES": ",".join(stage.value for stage in Stage),
+        # The bucket the verification step writes its marks to: the pipeline's artifact bucket.
+        handler.ARTIFACTS_VARIABLE: pipeline["ArtifactStore"]["Location"],
     }
+    # The allow-list as the function reads it: every ID the smoke tests list, and nothing else.
+    assert handler.SMOKE_TESTS_VARIABLE == "RHI_SMOKE_TEST_IDS"
+    assert handler.smoke_test_ids(function["Environment"]["Variables"]) == SMOKE_TEST_IDS != ()
+
+
+def test_the_function_s_lifecycle_stages_are_the_members_of_the_stages_enumeration(
+    templates: dict[str, dict[str, Any]],
+) -> None:
+    (function,) = reporter_functions(templates[PIPELINE_TEMPLATE]).values()
+    # Each member by its value, the name a launch writes into its instance's heartbeat row: what
+    # the function reads back from the variable is the enumeration, whole and nothing else.
+    members = tuple(stage.value for stage in Stage)
+    assert handler.LIFECYCLE_STAGES_VARIABLE == "RHI_LIFECYCLE_STAGES"
+    assert handler.lifecycle_stages(function["Environment"]["Variables"]) == members
+    assert "weights" in members and len(set(members)) == len(members)
 
 
 def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:
@@ -150,7 +180,11 @@ def test_the_stack_creates_no_secret(templates: dict[str, dict[str, Any]]) -> No
     from rhi.pipeline import reporter
 
     assert reporter.SECRET_NAME == SECRET_NAME
-    assert all(not of_type(template, "AWS::SecretsManager::Secret") for template in templates.values())
+    assert all(
+        secret.get("Name") != SECRET_NAME
+        for template in templates.values()
+        for secret in of_type(template, "AWS::SecretsManager::Secret").values()
+    )
 
 
 def test_the_synth_step_the_handler_reads_is_the_pipeline_s(templates: dict[str, dict[str, Any]]) -> None:
@@ -172,6 +206,7 @@ ROLE_ACTIONS = {
     "codepipeline:ListPipelineExecutions",
     "cloudformation:DescribeStackEvents",
     "s3:GetObject",
+    "s3:ListBucket",
     "sns:Publish",
     "logs:CreateLogStream",
     "logs:PutLogEvents",
@@ -198,6 +233,8 @@ def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
     statements = role_statements(template)
+    # As narrow as before the function read the instances' last stages: that mark is one more
+    # object under verification/, which the role already reads and lists.
     actions = [action for statement in statements for action in as_list(statement["Action"])]
     assert sorted(actions) == sorted(ROLE_ACTIONS)
     (listing,) = [s for s in statements if "codepipeline:ListPipelineExecutions" in as_list(s["Action"])]
@@ -206,6 +243,27 @@ def test_the_role_may_list_this_pipeline_s_executions(templates: dict[str, dict[
     parts = listing["Resource"]["Fn::Join"][1]
     assert parts[-1] == {"Ref": pipeline_id}
     assert [part for part in parts if isinstance(part, str)] == ["arn:", ":codepipeline:", ":", ":"]
+
+
+def test_the_role_reads_the_verification_s_marks_and_lists_no_other_key(templates: dict[str, dict[str, Any]]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    (pipeline,) = of_type(template, "AWS::CodePipeline::Pipeline").values()
+    bucket = {"Fn::GetAtt": [pipeline["ArtifactStore"]["Location"]["Ref"], "Arn"]}
+    on_s3 = [s for s in role_statements(template) if any(a.startswith("s3:") for a in as_list(s["Action"]))]
+    # The objects of the artifact bucket, the marks under verification/ among them, as before; and
+    # a listing of that bucket that is shown the keys under the marks' prefix and no other, which
+    # is the prefix the function lists and the one the verification step writes under.
+    marks = f"{handler.MARKS_PREFIX}/*"
+    assert marks == "verification/*"
+    assert sorted(on_s3, key=lambda statement: statement["Action"]) == [
+        {"Action": "s3:GetObject", "Effect": "Allow", "Resource": {"Fn::Join": ["", [bucket, "/*"]]}},
+        {
+            "Action": "s3:ListBucket",
+            "Effect": "Allow",
+            "Resource": bucket,
+            "Condition": {"StringLike": {"s3:prefix": marks}},
+        },
+    ]
 
 
 def test_the_role_may_publish_to_the_owner_s_topic_only(templates: dict[str, dict[str, Any]]) -> None:

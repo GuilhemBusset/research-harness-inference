@@ -25,6 +25,7 @@ root = [
     "tools/measurements",
     "tools/examiner-pilot",
     "tests/examiner",
+    "tests/replay",
     "src",
     "services/common",
     "services/gateway",

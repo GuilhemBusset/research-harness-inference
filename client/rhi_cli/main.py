@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from rhi_cli import login
+from rhi_cli import login, revoke, token, wait
 
-COMMANDS = [login]
+COMMANDS = [login, token, wait, revoke]
 
 
 def main(argv: Sequence[str] | None = None) -> int:

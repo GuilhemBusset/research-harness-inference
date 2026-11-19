@@ -18,7 +18,7 @@ A fact is assembled only from allow-listed parts, and each part has one filter:
   `FAILED_STATUSES`: an event with any other member is no failure and is passed over. The logical
   ID must be in `logical_ids`, the names of the templates synthesized from the same commit;
 - each failed smoke test's ID, which must be in `smoke_test_ids`;
-- the last lifecycle stage an instance reached, which must be in `lifecycle_stages`.
+- the last lifecycle stage each instance reached, which must be in `lifecycle_stages`.
 
 A fact is published whole or not at all. One whose description would be longer than
 `DESCRIPTION_LIMIT` fails a last filter: a shortened name would stand for every name that shares
@@ -34,11 +34,12 @@ named Verify), a slash and a suffix:
 - `action`: the description is the stage, a space and the action;
 - `resource/<n>`: the logical ID, a space and the status code;
 - `test/<n>`: the smoke test's ID;
-- `lifecycle`: the lifecycle stage;
+- `lifecycle/<n>`: a lifecycle stage that an instance reached last;
 - `dropped`: the count, only when something was dropped.
 
-The resources and the tests are numbered from 1 in the report's order, which is sorted, so the
-same failure gives the same statuses. The names are in the descriptions and not in the contexts:
+The resources, the tests and the lifecycle stages are numbered from 1 in the report's order, which
+is sorted, so the same failure gives the same statuses. A stage is named once, whatever number of
+instances stopped at it. The names are in the descriptions and not in the contexts:
 GitHub reads a context without regard to case, and two names can differ by case alone.
 
 No description is longer than `DESCRIPTION_LIMIT`, and every name in one is whole: `build_report`
@@ -112,7 +113,8 @@ class Report:
     resources: tuple[tuple[str, ResourceStatus], ...]
     # The failed smoke tests' IDs, sorted, each once.
     tests: tuple[str, ...]
-    lifecycle_stage: str | None
+    # The last lifecycle stages the instances reached, sorted, each once.
+    last_stages: tuple[str, ...]
     # How many values failed their filter.
     dropped: int
 
@@ -136,14 +138,15 @@ def build_report(
     event: Mapping[str, object],
     resource_events: Iterable[Mapping[str, object]] = (),
     failed_tests: Iterable[object] = (),
-    lifecycle_stage: object = None,
+    last_stages: Iterable[object] = (),
     *,
     logical_ids: Iterable[str],
     smoke_test_ids: Iterable[str],
     lifecycle_stages: Iterable[str],
 ) -> Report:
-    """The report of the failure the pipeline's event `event` tells. ValueError, with nothing of
-    the event in its message, when the event has no status (`status_for`) or is not a failure."""
+    """The report of the failure the pipeline's event `event` tells. `last_stages` holds the last
+    lifecycle stage each instance reached, one value per instance. ValueError, with nothing of the
+    event in its message, when the event has no status (`status_for`) or is not a failure."""
     status = status_for(event)
     if status.state is not State.FAILURE:
         raise ValueError("the event is not a failure")
@@ -174,8 +177,12 @@ def build_report(
             dropped += 1
 
     known_stages = frozenset(lifecycle_stages)
-    if not (isinstance(lifecycle_stage, str) and lifecycle_stage in known_stages and _fits(lifecycle_stage)):
-        lifecycle_stage, dropped = None, dropped + (lifecycle_stage is not None)
+    reached: set[str] = set()
+    for stage_reached in last_stages:
+        if isinstance(stage_reached, str) and stage_reached in known_stages and _fits(stage_reached):
+            reached.add(stage_reached)
+        else:
+            dropped += 1
 
     return Report(
         commit=status.commit,
@@ -184,7 +191,7 @@ def build_report(
         action=action,
         resources=tuple(sorted(resources)),
         tests=tuple(sorted(tests)),
-        lifecycle_stage=lifecycle_stage,
+        last_stages=tuple(sorted(reached)),
         dropped=dropped,
     )
 
@@ -200,8 +207,8 @@ def statuses_of(report: Report) -> list[CommitStatus]:
         facts.append((f"resource/{number}", _resource_fact(logical_id, code)))
     for number, test_id in enumerate(report.tests, start=1):
         facts.append((f"test/{number}", test_id))
-    if report.lifecycle_stage is not None:
-        facts.append(("lifecycle", report.lifecycle_stage))
+    for number, stage_reached in enumerate(report.last_stages, start=1):
+        facts.append((f"lifecycle/{number}", stage_reached))
     if report.dropped:
         facts.append(("dropped", str(report.dropped)))
     if not all(_fits(text) for _, text in facts):

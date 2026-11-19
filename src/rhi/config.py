@@ -17,10 +17,11 @@ it.
 key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the pool's name:
 an empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
 `false` (`True` and `False` are read too), a date as YYYY-MM-DD, a list as a JSON array (an empty
-one as `[]`) and a pool's entry as a JSON object. The prefix holds the configuration and nothing
-else. The source reads the prefix, in one read by path, and nothing outside it, and refuses a
-parameter under it that names no key, like an unknown key. No value is a credential (system
-design, section 10), so none is a SecureString. The module names no region and no account.
+one as `[]`), a pool's entry as a JSON object and the rate limits as a TOML inline table
+(`{ issuer = 100 }`). The prefix holds the configuration and nothing else. The source reads the
+prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
+no key, like an unknown key. No value is a credential (system design, section 10), so none is a
+SecureString. The module names no region and no account.
 
 `write_ssm` and `write_file` write a configuration back out, in the form the ssm source and the
 file source read: each source loads what its writer wrote as the same object. The AWS SDK is
@@ -78,6 +79,16 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class RateLimits:
+    """The web ACL's rate limits, in requests per 5 minutes per source address (system design,
+    sections 6.5 and 17): every request, the issuer's under `/auth/`, Grafana's under `/grafana/`."""
+
+    per_address: int
+    issuer: int
+    grafana: int
+
+
+@dataclass(frozen=True)
 class Config:
     """The typed configuration. One field per key of `KEYS`, under the same name."""
 
@@ -115,6 +126,23 @@ class Config:
     # day, which reaches the issuer as RHI_ISSUANCES_PER_DAY (sections 6.4 and 17).
     issuer_reserved_concurrency: int
     key_issuances_per_day: int
+    # The time of day, HH:MM in `time_zone`, at which each pool's group is set to no instance
+    # (sections 5.1 and 17). Only synthesis reads it: it reaches no service.
+    nightly_stop: str
+    # How many gateway tasks the service runs (sections 2 and 11.2). Only the deployment reads it.
+    gateway_tasks: int
+    # The gateway's numeric settings (section 17), each of which the deployment writes into the
+    # variable `services/gateway/rhi_gateway/settings.py` reads it from: the largest request body
+    # in bytes, the longest request and the keep-alive interval of a hold in seconds, and the
+    # seconds of `Retry-After` for the three causes that carry one.
+    request_body_limit_bytes: int
+    longest_request_seconds: int
+    keepalive_seconds: int
+    retry_after_warming_seconds: int
+    retry_after_capacity_unavailable_seconds: int
+    retry_after_concurrency_limit_seconds: int
+    # The web ACL's three rate limits, read at synthesis only.
+    rate_limits: RateLimits
 
 
 def _as_stored(text: str) -> object:
@@ -170,6 +198,13 @@ def _time_zone(value: object) -> str:
     return value
 
 
+def _time_of_day(value: object) -> str:
+    # Hours and minutes, each of two digits, on a 24-hour clock.
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError
+    return value
+
+
 def _boolean(value: object) -> bool:
     if type(value) is not bool:
         raise ValueError
@@ -210,6 +245,22 @@ def _dollars_an_hour(value: object) -> float:
     return float(value)
 
 
+# What WAF accepts as the limit of a rate-based rule.
+RATE_LIMIT_RANGE = range(10, 2_000_000_001)
+# Section 17's rate limits.
+_RATE_LIMIT_DEFAULTS: dict[str, int] = {"per_address": 2000, "issuer": 100, "grafana": 300}
+
+
+def _rate_limits(value: object) -> RateLimits:
+    # Each entry of the table is optional: the one left out takes its default.
+    if not isinstance(value, dict) or set(value) - set(_RATE_LIMIT_DEFAULTS):
+        raise ValueError
+    limits = _RATE_LIMIT_DEFAULTS | value
+    if any(type(limit) is not int or limit not in RATE_LIMIT_RANGE for limit in limits.values()):
+        raise ValueError
+    return RateLimits(**limits)
+
+
 def _number_from_text(text: str) -> object:
     # ASCII digits only, and few enough that `int` accepts them.
     return int(text) if re.fullmatch(r"[0-9]{1,18}", text) else text
@@ -237,6 +288,14 @@ def _price_from_text(text: str) -> object:
     return float(text) if re.fullmatch(r"[0-9]{1,18}(\.[0-9]{1,18})?", text) else text
 
 
+def _table_from_text(text: str) -> object:
+    # A TOML inline table, as `write_ssm` writes it.
+    try:
+        return tomllib.loads(f"value = {text}")["value"]
+    except tomllib.TOMLDecodeError:
+        return text
+
+
 def _json_from_text(text: str) -> object:
     # A text that is not JSON is returned as it is, for the key's parser to refuse.
     try:
@@ -247,6 +306,7 @@ def _json_from_text(text: str) -> object:
 
 _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
+_WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -266,8 +326,21 @@ KEYS: dict[str, Key] = {
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
     "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
     "default_pool": _STRING,
-    "issuer_reserved_concurrency": Key("a whole number above zero", _whole_number, _number_from_text),
-    "key_issuances_per_day": Key("a whole number above zero", _whole_number, _number_from_text),
+    "issuer_reserved_concurrency": _WHOLE_NUMBER,
+    "key_issuances_per_day": _WHOLE_NUMBER,
+    "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
+    "gateway_tasks": _WHOLE_NUMBER,
+    "request_body_limit_bytes": _WHOLE_NUMBER,
+    "longest_request_seconds": _WHOLE_NUMBER,
+    "keepalive_seconds": _WHOLE_NUMBER,
+    "retry_after_warming_seconds": _WHOLE_NUMBER,
+    "retry_after_capacity_unavailable_seconds": _WHOLE_NUMBER,
+    "retry_after_concurrency_limit_seconds": _WHOLE_NUMBER,
+    "rate_limits": Key(
+        "a table whose optional entries per_address, issuer and grafana are whole numbers from 10 to 2000000000",
+        _rate_limits,
+        _table_from_text,
+    ),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -283,6 +356,23 @@ DEFAULTS: dict[str, object] = {
     # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
     "issuer_reserved_concurrency": 5,
     "key_issuances_per_day": 5,
+    # Section 17: the nightly stop is at 02:00 in the configured time zone.
+    "nightly_stop": "02:00",
+    # Sections 2 and 11.2: the gateway runs two tasks.
+    "gateway_tasks": 2,
+    # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, a keep-alive
+    # every 10 seconds of a hold, and a `Retry-After` of 30 seconds for `warming`, 60 for
+    # `capacity_unavailable` and 5 for `concurrency_limit`. The gateway's reader of its environment
+    # (`rhi_gateway.settings`) has the same defaults.
+    "request_body_limit_bytes": 8_388_608,
+    "longest_request_seconds": 1800,
+    "keepalive_seconds": 10,
+    "retry_after_warming_seconds": 30,
+    "retry_after_capacity_unavailable_seconds": 60,
+    "retry_after_concurrency_limit_seconds": 5,
+    # Section 17: generous per address, since a campus shares one address; tighter on the issuer
+    # and on Grafana.
+    "rate_limits": dict(_RATE_LIMIT_DEFAULTS),
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
@@ -463,7 +553,7 @@ def read_ssm(client: Any = None) -> Config:
     return parse(data, "ssm")
 
 
-def _entry(pool: Pool) -> dict[str, object]:
+def pool_entry(pool: Pool) -> dict[str, object]:
     """A pool's entry, as the pool parser reads it: every field the pool holds, but its name."""
     entry: dict[str, object] = {}
     for field in dataclasses.fields(Pool):
@@ -480,7 +570,7 @@ def _pool_entries(value: object) -> dict[str, dict[str, object]] | None:
     """The table of a tuple of pools, or None when the value is not one."""
     if not isinstance(value, tuple) or not value or not all(isinstance(pool, Pool) for pool in value):
         return None
-    return {pool.name: _entry(pool) for pool in value}
+    return {pool.name: pool_entry(pool) for pool in value}
 
 
 def _json(value: object) -> str:
@@ -505,6 +595,9 @@ def _ssm_text(value: object) -> str:
         return value.isoformat()
     if isinstance(value, tuple) and not value:
         return "[]"
+    if isinstance(value, RateLimits):
+        # A TOML inline table, in SSM as in a file.
+        return "{ " + ", ".join(f"{name} = {_ssm_text(limit)}" for name, limit in vars(value).items()) + " }"
     table = _pool_entries(value)
     if table is not None:
         return _json(table)
@@ -559,7 +652,7 @@ def write_ssm(config: Config, client: Any = None) -> None:
     texts = _written(config, _ssm_text, lambda key, text: key.from_text(text), "SSM")
     # The pools table has no parameter of its own: each entry is one, under the pool's name.
     del texts["pools"]
-    texts |= {f"pools/{pool.name}": _json(_entry(pool)) for pool in config.pools}
+    texts |= {f"pools/{pool.name}": _json(pool_entry(pool)) for pool in config.pools}
     client, errors = _ssm(client)
     for key, text in texts.items():
         name = SSM_PREFIX + key

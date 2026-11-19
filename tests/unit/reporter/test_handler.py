@@ -3,8 +3,9 @@ events of a job, with stubs of the AWS services it reads and of the GitHub clien
 
 The events are shaped as EventBridge delivers them for the pipeline of `src/rhi/pipeline/stack.py`:
 the steps `Build/Synth` before the stage `Rhi`, whose actions check widened permissions, wait for
-an approval and deploy the stack `Rhi-Network`. The account is the documented one, and the commit
-is made here.
+an approval and deploy the stack `Rhi-Network`, and whose verification, the action `Verify`, leaves
+its marks in the artifact bucket under `verification/<execution ID>/`. The account is the
+documented one, and the commit is made here.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from botocore.exceptions import ClientError
 
 from rhi_reporter import handler, measure
 from rhi_reporter.github import SECRET_VARIABLE, RefusedError
-from rhi_reporter.status import CommitStatus, State
+from rhi_reporter.status import VERIFIED_DESCRIPTION, CommitStatus, Description, State
 
 ACCOUNT = "123456789012"
 REGION = "us-east-1"
@@ -112,6 +113,14 @@ def failed(execution: str) -> list[dict[str, Any]]:
     ]
 
 
+def verification(execution: str, state: str) -> list[dict[str, Any]]:
+    """The events of the stage's verification, which ends in `state`."""
+    return [
+        action_event(execution, STAGE, "Verify", "Build", "STARTED"),
+        action_event(execution, STAGE, "Verify", "Build", state),
+    ]
+
+
 def assembly() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -131,6 +140,14 @@ class Stub:
         self.stage_states: dict[str, str] = {}
         self.status = "InProgress"
         self.objects_read: list[tuple[str, str]] = []
+        # The verification's marks, by their key in the artifact bucket, and whether S3 refuses to
+        # list them.
+        self.marks: dict[str, bytes] = {}
+        self.refuses_to_list = False
+
+    def mark(self, name: str, held: str, execution: str | None = None) -> None:
+        """Leaves a mark, as the verification step of an execution does: this one's unless named."""
+        self.marks[f"verification/{execution or self.execution}/{name}"] = held.encode()
 
     # Secrets Manager.
     def get_secret_value(self, SecretId: str) -> dict[str, str]:
@@ -185,10 +202,20 @@ class Stub:
         }
         return {"actionExecutionDetails": [deploy, synth]}
 
-    # S3: the artifact store.
+    # S3: the artifact store. It lists under verification/ only, as the function's role may, and
+    # answers a read of an object that is not there as it answers a role that may not list it.
+    def list_objects_v2(self, Bucket: str, Prefix: str) -> dict[str, Any]:
+        assert Bucket == BUCKET and Prefix.startswith("verification/")
+        if self.refuses_to_list:
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": MARKER}}, "ListObjectsV2")
+        return {"Contents": [{"Key": key} for key in sorted(self.marks) if key.startswith(Prefix)]}
+
     def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
+        assert Bucket == BUCKET
         self.objects_read.append((Bucket, Key))
-        return {"Body": io.BytesIO(assembly())}
+        if Key not in {SYNTH_KEY, *self.marks}:
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": MARKER}}, "GetObject")
+        return {"Body": io.BytesIO(self.marks[Key] if Key in self.marks else assembly())}
 
     # CloudFormation: newest first, as the API gives them.
     def describe_stack_events(self, StackName: str) -> dict[str, Any]:
@@ -231,17 +258,34 @@ def stub(commit: str, monkeypatch: pytest.MonkeyPatch) -> Stub:
     return Stub(str(uuid.uuid4()), commit)
 
 
-def run(events: list[dict[str, Any]], stub: Stub, client: Client) -> None:
-    """Hands each event to the function, as CodePipeline's state stands when it is sent."""
+def run(
+    events: list[dict[str, Any]],
+    stub: Stub,
+    client: Client,
+    smoke_tests: tuple[str, ...] = (),
+    lifecycle_stages: tuple[str, ...] = (),
+) -> None:
+    """Hands each event to the function, as CodePipeline's state stands when it is sent, with
+    `smoke_tests` as the allow-list of smoke test IDs and `lifecycle_stages` as that of stages."""
     aws = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub)
     for event in events:
         detail = event["detail"]
         if event["detail-type"] == handler.STAGE_CHANGE:
             stub.stage_states[detail["stage"]] = STAGE_STATES[detail["state"]]
-        assert handler.handle(event, aws=aws, client=client, stages=[STAGE]) is None
+        told = handler.handle(
+            event,
+            aws=aws,
+            client=client,
+            stages=[STAGE],
+            smoke_tests=smoke_tests,
+            artifacts=BUCKET,
+            lifecycle_stages=lifecycle_stages,
+        )
+        assert told is None
 
 
 DEPLOY = f"deploy/{STAGE}"
+VERIFY = f"verify/{STAGE}"
 
 
 def test_a_successful_execution_ends_in_the_deployment_s_success(stub: Stub, commit: str) -> None:
@@ -276,6 +320,214 @@ def test_a_failed_execution_reports_only_resources_of_its_templates(stub: Stub, 
     known = {logical_id for template in TEMPLATES.values() for logical_id in template["Resources"]}
     named = [description.split()[0] for _, _, context, description in client.posted if "/resource/" in context]
     assert named and set(named) <= known
+
+
+def test_a_failed_verification_names_its_failed_smoke_tests_by_their_listed_ids(stub: Stub, commit: str) -> None:
+    # What the step left: two IDs of the allow-list, and a line that is none, as a test's name with
+    # what it printed would be.
+    unlisted = f"tests/smoke/test_smoke.py::test_hello {MARKER}"
+    stub.mark("failed-smoke-tests", f"no-key\n{unlisted}\nhello\n")
+    client = Client()
+    run(verification(stub.execution, "FAILED"), stub, client, ("hello", "no-key", "environment"))
+    assert client.posted == [
+        (commit, "pending", VERIFY, "The verification is running."),
+        (commit, "failure", VERIFY, "The verification failed."),
+        (commit, "failure", f"{VERIFY}/action", f"{STAGE} Verify"),
+        (commit, "failure", f"{VERIFY}/test/1", "hello"),
+        (commit, "failure", f"{VERIFY}/test/2", "no-key"),
+        # The unlisted line, as a count and nothing else.
+        (commit, "failure", f"{VERIFY}/dropped", "1"),
+    ]
+    assert MARKER not in str(client.posted)
+    # The mark was read from the folder of the event's own execution.
+    assert stub.objects_read == [(BUCKET, f"verification/{stub.execution}/failed-smoke-tests")]
+
+
+def test_a_failed_verification_names_the_last_stage_an_instance_reached(
+    stub: Stub, commit: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # What the step left: the stage of two instances that never served, and a line that is no
+    # stage of the allow-list, as anything else of a heartbeat's row would be.
+    unlisted = f"instance {MARKER}"
+    stub.mark("last-stages", f"weights\n{unlisted}\nweights\n")
+    client = Client()
+    with caplog.at_level(logging.DEBUG):
+        run(verification(stub.execution, "FAILED"), stub, client, lifecycle_stages=("boot", "weights", "warm-up"))
+    assert client.posted == [
+        (commit, "pending", VERIFY, "The verification is running."),
+        (commit, "failure", VERIFY, "The verification failed."),
+        (commit, "failure", f"{VERIFY}/action", f"{STAGE} Verify"),
+        (commit, "failure", f"{VERIFY}/lifecycle/1", "weights"),
+        # The unlisted line, as a count and nothing else.
+        (commit, "failure", f"{VERIFY}/dropped", "1"),
+    ]
+    assert MARKER not in str(client.posted) and MARKER not in caplog.text
+    # The mark was read from the folder of the event's own execution.
+    assert stub.objects_read == [(BUCKET, f"verification/{stub.execution}/last-stages")]
+
+
+@pytest.mark.parametrize("left", ["nothing", "another execution's", "marks that cannot be listed"])
+def test_a_failed_verification_with_no_marks_to_read_names_no_test_and_no_stage(
+    stub: Stub, commit: str, left: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    marks = {"failed-smoke-tests": "hello\n", "last-stages": "weights\n"}
+    if left == "another execution's":
+        other = str(uuid.uuid4())
+        for name, held in marks.items():
+            stub.mark(name, held, execution=other)
+    # Marks of this execution that S3 does not let the function list.
+    stub.refuses_to_list = left == "marks that cannot be listed"
+    if stub.refuses_to_list:
+        for name, held in marks.items():
+            stub.mark(name, held)
+    client = Client()
+    with caplog.at_level(logging.DEBUG):
+        run(verification(stub.execution, "FAILED")[1:], stub, client, ("hello", "no-key"), ("weights",))
+    # The failure and its action, and no status of a smoke test or of a stage, not even a count.
+    assert client.posted == [
+        (commit, "failure", VERIFY, "The verification failed."),
+        (commit, "failure", f"{VERIFY}/action", f"{STAGE} Verify"),
+    ]
+    assert stub.objects_read == []
+    assert [record.getMessage() for record in caplog.records] == (
+        [handler.NO_FAILED_TESTS, handler.NO_LAST_STAGES] if stub.refuses_to_list else []
+    )
+    assert MARKER not in caplog.text
+
+
+def test_the_function_reads_its_allow_list_and_its_bucket_from_its_environment(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub.mark("failed-smoke-tests", "hello\nno-key\nenvironment\n")
+    aws, client = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub), Client()
+    monkeypatch.setattr(handler, "_clients", lambda: (aws, client))
+    monkeypatch.setenv(handler.STAGES_VARIABLE, STAGE)
+    (event,) = verification(stub.execution, "FAILED")[1:]
+
+    def reported() -> list[tuple[str, str]]:
+        """The contexts and descriptions of the report the function posts for the event."""
+        client.posted.clear()
+        handler.handler(event, None)
+        return [(context, description) for _, _, context, description in client.posted[1:]]
+
+    # The variables as the function's construct writes them. Without the allow-list no test is
+    # named, and without the bucket no mark is read.
+    monkeypatch.delenv("RHI_SMOKE_TEST_IDS", raising=False)
+    monkeypatch.setenv("RHI_REPORTER_ARTIFACTS", BUCKET)
+    assert reported() == [(f"{VERIFY}/action", f"{STAGE} Verify"), (f"{VERIFY}/dropped", "3")]
+    monkeypatch.setenv("RHI_SMOKE_TEST_IDS", "hello,no-key")
+    assert reported() == [
+        (f"{VERIFY}/action", f"{STAGE} Verify"),
+        (f"{VERIFY}/test/1", "hello"),
+        (f"{VERIFY}/test/2", "no-key"),
+        (f"{VERIFY}/dropped", "1"),
+    ]
+    monkeypatch.delenv("RHI_REPORTER_ARTIFACTS")
+    assert reported() == [(f"{VERIFY}/action", f"{STAGE} Verify")]
+
+
+def test_the_function_reads_its_lifecycle_stages_from_its_environment(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub.mark("last-stages", "weights\nnot-a-stage\nboot\n")
+    aws, client = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub), Client()
+    monkeypatch.setattr(handler, "_clients", lambda: (aws, client))
+    monkeypatch.setenv(handler.STAGES_VARIABLE, STAGE)
+    monkeypatch.setenv("RHI_REPORTER_ARTIFACTS", BUCKET)
+    (event,) = verification(stub.execution, "FAILED")[1:]
+
+    def reported() -> list[tuple[str, str]]:
+        """The contexts and descriptions of the report the function posts for the event."""
+        client.posted.clear()
+        handler.handler(event, None)
+        return [(context, description) for _, _, context, description in client.posted[1:]]
+
+    # The variable as the function's construct writes it. Without it the allow-list is empty, and
+    # no stage is named.
+    monkeypatch.delenv("RHI_LIFECYCLE_STAGES", raising=False)
+    assert reported() == [(f"{VERIFY}/action", f"{STAGE} Verify"), (f"{VERIFY}/dropped", "3")]
+    monkeypatch.setenv("RHI_LIFECYCLE_STAGES", "boot,release-check,weights")
+    assert reported() == [
+        (f"{VERIFY}/action", f"{STAGE} Verify"),
+        (f"{VERIFY}/lifecycle/1", "boot"),
+        (f"{VERIFY}/lifecycle/2", "weights"),
+        (f"{VERIFY}/dropped", "1"),
+    ]
+
+
+def test_a_verification_that_ran_nothing_is_not_verified(stub: Stub, commit: str) -> None:
+    def described(reason: str | None) -> str:
+        """The description posted for a verification that passed and left `reason` as its
+        not-run mark, or no such mark."""
+        stub.marks.clear()
+        if reason is not None:
+            stub.mark("not-run", f"{reason}\n")
+        client = Client()
+        run(verification(stub.execution, "SUCCEEDED")[1:], stub, client)
+        ((posted_on, state, context, description),) = client.posted
+        # A success of the verification's context either way: the step did not fail.
+        assert (posted_on, state, context) == (commit, "success", VERIFY)
+        return description
+
+    canary, listener, parked = (described(reason) for reason in ("canary-missing", "listener-off", "parked"))
+    # One description of the vocabulary for each known reason, and one for a reason not known yet.
+    assert (canary, listener, parked) == (
+        Description.NOT_RUN_CANARY_MISSING,
+        Description.NOT_RUN_LISTENER_OFF,
+        Description.NOT_RUN_OTHER,
+    )
+    assert len({canary, listener, parked}) == 3 and VERIFIED_DESCRIPTION not in (canary, listener, parked)
+    # A mark that holds nothing still says that no test ran.
+    assert described("") == Description.NOT_RUN_OTHER
+    # Only a verification that left no such mark ran its tests.
+    assert described(None) == VERIFIED_DESCRIPTION
+
+
+def test_a_success_is_not_posted_while_the_marks_cannot_be_read(stub: Stub, caplog: pytest.LogCaptureFixture) -> None:
+    stub.refuses_to_list = True
+    client = Client()
+    # The function fails, so that the event is invoked again: the verification may have run nothing.
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClientError):
+        run(verification(stub.execution, "SUCCEEDED")[1:], stub, client)
+    assert client.posted == []
+    assert [record.getMessage() for record in caplog.records] == [handler.NO_NOT_RUN]
+    assert MARKER not in caplog.text
+
+
+def test_a_superseded_commit_is_not_verified_by_a_verification_that_ran_nothing(stub: Stub, commit: str) -> None:
+    earlier, superseded_commit = str(uuid.uuid4()), secrets.token_hex(20)
+
+    class Covering(Stub):
+        """The stub's execution after an earlier one that a self-update superseded: it ended in
+        success, and so did its verification."""
+
+        def list_pipeline_executions(self, pipelineName: str, maxResults: int) -> dict[str, Any]:
+            own, before = STARTED, STARTED - datetime.timedelta(hours=1)
+            return {
+                "pipelineExecutionSummaries": [
+                    summary(self.execution, "Succeeded", own, self.commit),
+                    summary(earlier, "Superseded", before, superseded_commit),
+                ]
+            }
+
+        def list_action_executions(self, pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+            assert filter == {"pipelineExecutionId": self.execution}
+            verify = {"stageName": STAGE, "actionName": "Verify", "status": "Succeeded", "startTime": STARTED}
+            return {"actionExecutionDetails": [verify]}
+
+    def summary(execution: str, status: str, started: datetime.datetime, deploys: str) -> dict[str, Any]:
+        revisions = [{"actionName": "GitHub", "revisionId": deploys}]
+        return {"pipelineExecutionId": execution, "status": status, "startTime": started, "sourceRevisions": revisions}
+
+    covering = Covering(stub.execution, commit)
+    covering.mark("not-run", "listener-off\n")
+    client = Client()
+    run([pipeline_event(covering.execution, "SUCCEEDED")], covering, client)
+    # The superseded commit takes the covering execution's verdict, and its verification's as it ran.
+    assert client.posted == [
+        (superseded_commit, "success", DEPLOY, Description.DEPLOYED),
+        (superseded_commit, "success", VERIFY, Description.NOT_RUN_LISTENER_OFF),
+    ]
 
 
 def test_a_failed_step_before_the_stage_fails_its_deployment(stub: Stub, commit: str) -> None:
