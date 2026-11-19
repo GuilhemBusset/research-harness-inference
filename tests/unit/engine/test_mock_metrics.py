@@ -27,7 +27,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from starlette.applications import Starlette
 from starlette.types import Message
 
-from rhi_common.engine_metrics import MOCK, Kind, Quantity, metric_names
+from rhi_common.engine_metrics import MOCK, Kind, Quantity, cache_capacity, metric_names
 from rhi_mock_engine.app import Settings, SettingsError, create_app
 
 REPO = Path(__file__).resolve().parents[3]
@@ -117,6 +117,27 @@ def test_the_metrics_route_serves_every_name_to_a_loopback_client_only() -> None
             assert await asgi_get(app, "/metrics", other) == 404, other
         # The same client is served the rest: only the metrics are kept to the loopback address.
         assert await asgi_get(app, "/health", ("203.0.113.7", 40000)) == 200
+
+    asyncio.run(scenario())
+
+
+def test_the_cache_capacity_is_the_label_of_an_information_metric() -> None:
+    app = create_app(Settings(secret=SECRET, cache_tokens=1_500_000), sleep=no_sleep)
+    place = cache_capacity(MOCK)
+    assert place is not None
+    metric, label = place.metric, place.label
+
+    async def scenario() -> None:
+        async with http(app) as client:
+            response = await client.get("/metrics")
+        samples = [
+            sample
+            for family in text_string_to_metric_families(response.text)
+            for sample in family.samples
+            if sample.name == metric
+        ]
+        # The number is the label's value: the metric's own value only says that it is there.
+        assert [(sample.labels, sample.value) for sample in samples] == [({label: "1500000"}, 1)]
 
     asyncio.run(scenario())
 

@@ -1,5 +1,5 @@
-"""What the agent does while its instance serves: the heartbeat, the release it reports, and
-liveness by inference (system design, sections 4.1, 4.3 and 5.1).
+"""What the agent does while its instance serves: the heartbeat, the release and the cache capacity
+it reports, and liveness by inference (system design, sections 4.1, 4.3, 5.1 and 7.2).
 
 **The heartbeat.** Every 5 seconds the agent reads the engine's running and waiting requests from
 the engine's `/metrics` on localhost, under the names of the engine's row in
@@ -17,6 +17,12 @@ does not know to be idle.
 **The release, as a metric.** `rhi_lifecycle_release_info` is 1, and its labels `image_digest` and
 `model_revision` carry what the heartbeat carries. The pipeline's verification and the deployments
 dashboard read it.
+
+**The cache capacity, as a metric.** The answer of the engine's `/metrics` that each heartbeat
+fetches also goes to `rhi_lifecycle.cache`, which reads the engine's cache capacity in tokens where
+the engine's row says and exports it as a number. The reading starts with the heartbeat, so once
+the engine serves, and an answer that gives no capacity takes the metric away: the agent never
+reports a capacity it did not just read.
 
 **Liveness by inference.** An engine can hang with its health route still answering (evidence
 E23). So every minute, and first when the duty starts, the agent reads the pool's secret from
@@ -51,6 +57,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from rhi_common.engine_metrics import Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import launch, metrics
+from rhi_lifecycle.cache import Capacity
 from rhi_lifecycle.host import Host, HostError
 from rhi_lifecycle.release import Release, Settings
 
@@ -143,6 +150,7 @@ class Serving:
         self._restarts = Counter(
             RESTARTS_METRIC, "Restarts of the engine after a completion it did not answer.", registry=registry
         )
+        self._capacity = Capacity(engine, registry)
 
     async def run(self) -> None:
         """Do both duties until cancelled."""
@@ -167,8 +175,10 @@ class Serving:
             await self._sleep(next_at - self._clock())
 
     def beat(self) -> bool:
-        """Write one heartbeat row with the engine's load now, and say whether it was written."""
+        """Write one heartbeat row with the engine's load now, and say whether it was written.
+        The same answer of the engine gives the cache capacity the agent reports."""
         answer = self._fetch(urllib.request.Request(f"{launch.ENGINE_URL}/metrics"), METRICS_SECONDS)
+        self._capacity.read(answer)
         load = read_load(answer[1], self._engine_name) if answer is not None and answer[0] == 200 else None
         if (load is not None) != self._readable:
             self._readable = load is not None
