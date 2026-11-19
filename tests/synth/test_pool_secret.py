@@ -16,7 +16,7 @@ import pytest
 from rhi import config
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
     from types import ModuleType
 
     import aws_cdk as cdk
@@ -126,16 +126,15 @@ def test_detects_a_secrets_value_written_out(app_module: ModuleType) -> None:
 
 
 def test_each_pools_secret_is_read_by_its_own_instance_role_and_by_no_other_pools(
-    build_with_pools: Callable[..., Any], tmp_path: Path
+    app_module: ModuleType, tmp_path: Path
 ) -> None:
-    """Two pools: the app passes cdk-nag, once the finding of Grafana's role for each pool's log
-    group is acknowledged as the example's is, and each secret is read by its own pool's instance
-    role and by no other pool's."""
+    """Two pools: the app passes cdk-nag, and each secret is read by its own pool's instance role
+    and by no other pool's."""
     pools = (MOCK, dataclasses.replace(MOCK, name="second"))
     configured = dataclasses.replace(EXAMPLE, pools=pools)
     cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
     context = json.loads(cdk_json.read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    app = build_with_pools(configured, outdir=str(tmp_path), context=context)
+    app = app_module.build(configured, outdir=str(tmp_path), context=context)
     app.synth()  # Fails on a finding no file acknowledges.
     stage = app.node.find_child("Rhi")
     template = json.loads((Path(stage.outdir) / stage.pools.template_file).read_text(encoding="utf-8"))

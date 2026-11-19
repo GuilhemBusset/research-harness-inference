@@ -36,7 +36,14 @@ A file has at most two tables, and no other key:
 - `[nag]`: a key is a cdk-nag finding id, exactly as cdk-nag reports it. That is a rule id
   (`AwsSolutions-S1`), or a rule id with its finding in brackets
   (`AwsSolutions-IAM5[Resource::*]`). cdk-nag 3 acknowledges each finding by its own id: there is
-  no prefix matching, so a rule id alone does not cover its bracketed findings.
+  no prefix matching, so a rule id alone does not cover its bracketed findings. One key is not a
+  finding id as it stands: cdk-nag names a finding after its resource, so a statement on a pool's
+  resource brings a finding that holds the pool's name, and no file here names the pools of a
+  deployed configuration. A key that holds `<pool>` in place of the name
+  (`...:log-group:/rhi/pools/<pool>:*]`) lists that finding for each pool of the configuration,
+  and for no other name. The example's pool keeps an entry under its own name beside it, with the
+  same reason: `test_nag_acknowledgements.py` holds the example's templates to the ids as cdk-nag
+  writes them.
 - `[wildcard_actions]`: a key is one IAM action that AWS grants only on every resource
   (`ec2:DescribeInstances`, `ecr:GetAuthorizationToken`, `cloudwatch:PutMetricData`). The key is
   the action as the policy statement writes it. `*`, every action, is never accepted.

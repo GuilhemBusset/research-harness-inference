@@ -55,11 +55,10 @@ with its reason, and nothing else:
 Listing the account's log groups, stopping a query and reading alarms are left out: a dashboard
 whose panels name their log groups and their metrics is shown without them.
 
-**A new pool needs its line in the acknowledgement file.** cdk-nag raises a finding for an ARN
-that ends `:*`, and the finding's id holds the ARN, so each pool's log group brings a finding of
-its own name. `tests/policy/acknowledged/observability_grafana.toml` lists the one of the
-example's pool, `mock`. A configuration with a pool of another name fails synthesis, before
-anything is deployed, until the merge that brings the pool adds the pool's line to that file.
+**Each pool's log group brings a cdk-nag finding of its own.** cdk-nag raises a finding for an ARN
+that ends `:*`, and the finding's id holds the ARN, so it holds the pool's name.
+`tests/policy/acknowledged/observability_grafana.toml` lists it once, with `<pool>` in place of
+the name, and `rhi.nag` acknowledges it for each pool of the configuration and for no other name.
 
 **A deployment that cannot start its task fails**: the service's circuit breaker ends it and
 returns the service to the task it had.
