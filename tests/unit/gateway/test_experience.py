@@ -255,10 +255,10 @@ def test_speed_per_request(wire_format: WireFormat, held: bool) -> None:
 )
 def test_no_speed_without_two_tokens_sent_at_two_moments(sent_at: tuple[float, ...], output_tokens: int) -> None:
     registry, now = CollectorRegistry(), [0.0]
-    turn = Experience(registry, clock=lambda: now[0]).request(POOL, WireFormat.MESSAGES)
+    turn = Experience(registry, clock=lambda: now[0]).request(POOL, WireFormat.MESSAGES, held=False, first_turn=True)
     for at in sent_at:
         now[0] = at
-        turn.token_sent()
+        turn.token_sent(True)
     turn.settled(INPUT, output_tokens)
 
     labels = {"pool": POOL, "wire_format": "messages"}
@@ -324,9 +324,10 @@ def test_no_student_label() -> None:
             assert post(made, entry, alias=alias) == 200
 
     samples = served(made)
-    # Every series of the module is there, with the pool, the wire format and a histogram's boundary for labels.
+    # Every series of the module is there. Its labels are the pool, the wire format and a histogram's
+    # boundary, and for the two waits how the request started and which turn it is.
     assert all(any(sample.name.startswith(name) for sample in samples) for name in SERIES)
-    assert {label for sample in samples for label in sample.labels} == {"pool", "wire_format", "le"}
+    assert {label for sample in samples for label in sample.labels} == {"pool", "wire_format", "le", "start", "turn"}
     names = [str(name) for alias, github_id in students for name in (alias, github_id, made.keys[alias])]
     for sample in samples:
         written = " ".join([sample.name, *sample.labels, *sample.labels.values()])
