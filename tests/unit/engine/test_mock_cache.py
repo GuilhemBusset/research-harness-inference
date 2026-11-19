@@ -112,8 +112,10 @@ def test_the_cached_tokens_are_those_shared_from_the_start_with_the_last_input_o
     # A request that leaves the transcript at its fourth token shares three, and is then the one kept.
     assert cache.serve("ana", tuple("abcXYZgh")) == 3
     assert cache.serve("ana", tuple("abcdefgh")) == 3
-    # A request that repeats the last one whole still has its last token computed.
-    assert cache.serve("ana", tuple("abcdefgh")) == 7
+    # A request that repeats the last one whole has all its tokens cached, and so has one that stops short of its end.
+    assert cache.serve("ana", tuple("abcdefgh")) == 8
+    assert cache.serve("ana", tuple("abcde")) == 5
+    assert cache.serve("ana", tuple("abcdefgh")) == 5
     assert (cache.kept, cache.use) == (16, 0.16)
 
 
