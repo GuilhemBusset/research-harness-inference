@@ -8,6 +8,11 @@ exports it on its own metrics endpoint (`rhi_lifecycle.metrics`), where the node
 scrapes it, as `rhi_lifecycle_engine_cache_capacity_tokens`: a gauge with no label, whose value is
 the number of tokens.
 
+vLLM's row names the label `kv_cache_size_tokens` of `vllm:cache_config_info`. Its value is the
+number vLLM logs at start as its KV cache size in tokens, so what the agent exports is what the
+engine logged. vLLM gives one series for each engine index, each with the capacity of one engine,
+and writes `None` in the label where it set no capacity: that reading gives none.
+
 **No reading, no series.** The series exists exactly while the latest reading gave a capacity. It
 is absent before the first reading and after a reading that gave none: the engine did not answer,
 its answer was not 200 or not Prometheus' text format, its row names no place, the information
