@@ -23,7 +23,9 @@
 #   writes the container's logs.
 #
 # The service's target group and its rule on the public load balancer's listener bring no role, no
-# action and no finding.
+# action and no finding. Neither does the image's build context, which is assembled at synthesis
+# with the dashboards of the configuration: the image is still one asset, pulled from the
+# bootstrap's image repository with the execution role's actions above.
 #
 # cdk-nag's finding for a log group's ARN holds the log group's name, so each pool brings a finding
 # of its own, and no file of the repository names the pools of a deployed configuration. The entry

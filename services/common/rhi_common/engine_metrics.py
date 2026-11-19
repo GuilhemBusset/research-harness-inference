@@ -90,6 +90,7 @@ class _Row:
 
 
 MOCK = "mock"
+VLLM = "vllm"
 
 _TABLE: dict[str, _Row] = {
     MOCK: _Row(
@@ -106,6 +107,23 @@ _TABLE: dict[str, _Row] = {
             }
         ),
         cache_capacity=CacheCapacity(metric="rhi_mock:cache_config_info", label="capacity_tokens"),
+    ),
+    # vLLM's names at version 0.33, the version `services/engine/vllm/Dockerfile` pins: those of
+    # the system design, section 7.2 (evidence E3). The row does not say where vLLM gives its
+    # cache capacity: the evidence names the information metric and not its label.
+    VLLM: _Row(
+        names=MappingProxyType(
+            {
+                Quantity.RUNNING_REQUESTS: "vllm:num_requests_running",
+                Quantity.WAITING_REQUESTS: "vllm:num_requests_waiting",
+                Quantity.TIME_TO_FIRST_TOKEN: "vllm:time_to_first_token_seconds",
+                Quantity.TIME_PER_OUTPUT_TOKEN: "vllm:request_time_per_output_token_seconds",
+                Quantity.INPUT_TOKENS: "vllm:prompt_tokens",
+                Quantity.CACHED_INPUT_TOKENS: "vllm:prompt_tokens_cached",
+                Quantity.OUTPUT_TOKENS: "vllm:generation_tokens",
+                Quantity.CACHE_USAGE: "vllm:kv_cache_usage_perc",
+            }
+        ),
     ),
 }
 

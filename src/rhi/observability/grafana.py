@@ -8,6 +8,20 @@ image is `services/grafana/`: the pinned upstream image with its settings, its t
 and its dashboards. Grafana keeps no state outside the task: a user is created again from the
 identity header, and the dashboards are files of the image.
 
+**The dashboards are built at synthesis, from the configuration that is being deployed**
+(sections 4.7 and 7.4). In the repository the image's dashboards folder holds none: the pools are
+part of the real configuration, which is never committed. So the image's build context is not
+`services/grafana/` itself but a directory `image_context` assembles: the files of that folder,
+and, in its dashboards folder, every dashboard `rhi_dashboards.build` writes from the
+configuration the construct is given, with a row for each of its pools. Nothing is written into
+the repository, and no container is started: the pipeline's asset step builds the image from the
+context the cloud assembly holds. The build gives the same bytes for the same configuration, and
+the asset's hash covers the context's files and nothing of the run, so Grafana is redeployed when
+the image's folder, a dashboard's module or the configuration's pools change, and not otherwise.
+A dashboard reads an engine's metrics by the names of the engine's row in the per-engine table
+(`rhi_common.engine_metrics`), so a pool whose engine had no row would fail synthesis here, with
+the engine's name, and nothing would be deployed.
+
 **How it is reached.** One rule of the public load balancer's HTTPS listener, at priority
 `PRIORITY` (the gateway's is at 10 and the issuer's at 20), for the paths under `/grafana/`. Its
 first action authenticates against the admin's user pool (`rhi.access.sign_in`), and only its
@@ -68,6 +82,10 @@ returns the service to the task it had.
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
@@ -88,6 +106,7 @@ from rhi.network.security import GRAFANA_PORT
 from rhi.observability import prometheus
 from rhi.pools import scaler
 from rhi.pools.role import log_group_name
+from rhi_dashboards import build as dashboards
 
 if TYPE_CHECKING:
     from rhi.access.sign_in import SignIn
@@ -99,8 +118,10 @@ CPU_UNITS = 256
 MEMORY_MIB = 1024
 CPU_ARCHITECTURE = ecs.CpuArchitecture.ARM64
 IMAGE_PLATFORM = ecr_assets.Platform.LINUX_ARM64
-# The image's build context: its Dockerfile, its settings, its data sources and its dashboards.
-IMAGE_CONTEXT = packaging.REPO / "services" / "grafana"
+# The image's folder: its Dockerfile, its settings, its data sources and an empty dashboards folder.
+IMAGE_FOLDER = packaging.REPO / "services" / "grafana"
+# The folder of the build context that the Dockerfile copies the dashboards from.
+DASHBOARDS_FOLDER = "dashboards"
 
 LOG_GROUP_NAME = "/rhi/grafana"
 LOG_RETENTION = logs.RetentionDays.THREE_MONTHS
@@ -142,6 +163,22 @@ def readable_log_groups(config: Config) -> tuple[str, ...]:
     configuration, `/rhi/pools/<pool>`. No pattern: a pool the configuration does not hold has no
     log group here."""
     return (*SERVICE_LOG_GROUPS, *(log_group_name(pool.name) for pool in config.pools))
+
+
+def image_context(config: Config, *, folder: Path = IMAGE_FOLDER) -> str:
+    """A build context for Grafana's image, for the `directory` of a `DockerImageAsset`: the files
+    of `folder`, and in its dashboards folder every dashboard built from the configuration, each
+    as `<uid>.json`.
+
+    The same folder and the same configuration give the same files, so the same asset hash. The
+    directory is a temporary one, removed when the process ends: CDK copies it into the cloud
+    assembly when the asset is created.
+    """
+    context = Path(tempfile.mkdtemp(prefix="rhi-grafana-image-")) / "context"
+    atexit.register(shutil.rmtree, context.parent, ignore_errors=True)
+    shutil.copytree(folder, context)
+    dashboards.write(config, context / DASHBOARDS_FOLDER)
+    return str(context)
 
 
 class Grafana(Construct):
@@ -219,7 +256,7 @@ class Grafana(Construct):
         )
         self.task_definition.add_container(
             CONTAINER,
-            image=ecs.ContainerImage.from_asset(str(IMAGE_CONTEXT), platform=IMAGE_PLATFORM),
+            image=ecs.ContainerImage.from_asset(image_context(config), platform=IMAGE_PLATFORM),
             environment={
                 PROMETHEUS_URL_VARIABLE: workspace.workspace.attr_prometheus_endpoint,
                 REGION_VARIABLE: stack.region,
