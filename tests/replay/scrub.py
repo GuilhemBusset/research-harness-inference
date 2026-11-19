@@ -13,9 +13,12 @@ machine that recorded it knew. `check` reads a capture, as the JSON value of its
 **A host passes only as it is written for the example domain**: `example.com` or a name below it,
 in ASCII letters, digits, hyphens and underscores, with a port or without. Any other writing is
 refused, a name that only continues `example.com` with another character included. The host of a
-URL is everything after `://`, and after whoever signs in, up to the first `/`, `?`, `#`,
-backslash, `<`, `>` or white space: no other character ends it, since a client reads it as part of
-the name. Only the punctuation that closes a sentence is left out, at the very end.
+URL is everything after `://`, and after whoever signs in, up to the first `/`, `?`, `#`, space or
+ASCII control character: no other character ends it, since a client reads it as part of the name,
+an accent that joins the letter before it included. A backslash in it is refused, since one client
+reads it as the end of the host and another as part of who signs in. Only the ASCII punctuation
+that closes a sentence or a quotation (`CLOSING`) is left out, and only where the URL ends with its
+host: no name that can be registered ends in one of those.
 
 **Every text** is read: each name and each string of the capture, at any depth. A body is itself
 JSON, or a stream of events whose `data` lines are, and JSON can write a character as an escape; so
@@ -28,8 +31,8 @@ A refusal names its rule and where in the capture it was found, never the value:
 safe to print in a log that is public.
 
 What no pattern can see is not checked here: a real domain written without a scheme outside a
-header, the name of a student, a secret of no known shape. Those stay the job of whoever records a
-capture; e-mail addresses and the other credentials are refused in every file by the hygiene
+header, a name that the events of a stream write in pieces, the name of a student, a secret of no
+known shape. Those stay the job of whoever records a capture; e-mail addresses and the other credentials are refused in every file by the hygiene
 scanner (`tools/hygiene/`).
 
 Nothing here reads a file or the network.
@@ -58,7 +61,11 @@ _KEY = re.compile(KEY_PATTERN, re.ASCII)
 # A host of the example domain as it may be written, with a port or without. ASCII only: no other letter is one of these.
 _EXAMPLE = re.compile(r"(?:[a-z0-9_-]+\.)*" + re.escape(EXAMPLE_DOMAIN) + r"\.?(?::[0-9]*)?", re.ASCII | re.IGNORECASE)
 # A URL as far as its authority: `://`, whatever the scheme before it, then everything up to what ends the authority.
-_URL = re.compile(r"://([^/?#\\\s<>]*)")
+# A space and a control character end it, as they end the URL; a space of another alphabet does not.
+# Looked for at every `://`, one that stands in the authority of another included.
+_URL = re.compile(r"(?=://([^/?#\x00-\x20\x7f]*)(.?))", re.DOTALL)
+# What closes a sentence or a quotation after a URL, in ASCII: none of these is of a name that can be registered.
+CLOSING = ".,;:!)]}>'\"`"
 # Four numbers with dots between them, which no further number continues on either side.
 _IPV4 = re.compile(r"(?<!\d)(?<!\d\.)\d{1,3}(?:\.\d{1,3}){3}(?!\d)(?!\.\d)")
 # A run of what an IPv6 address is written with. The address may be only a part of it: see `_has_address`.
@@ -135,19 +142,21 @@ def _headers(value: object, where: str) -> Iterator[tuple[str, str]]:
 
 def _is_example(host: str) -> bool:
     """Whether a host, with a port or without, is written as `example.com` or as a name below it."""
-    return _EXAMPLE.fullmatch(host.strip()) is not None
+    return _EXAMPLE.fullmatch(host) is not None
 
 
 def _has_foreign_url(text: str) -> bool:
     """Whether a plain text holds a URL whose host is not of the example domain."""
     for found in _URL.finditer(text):
-        # Whoever signs in stands before the last `@`; the host is all that follows, whatever it is written with.
-        host = found.group(1).rpartition("@")[2]
-        # What closes a sentence or a quotation after the URL is not of the name; a letter of any alphabet is.
-        while host and not host[-1].isalnum():
-            host = host[:-1]
+        authority, after = found.groups()
+        # A path, a query or a fragment follows: the authority is whole, and nothing of it closes a sentence.
+        if after not in ("/", "?", "#"):
+            authority = authority.rstrip(CLOSING)
         # A URL with no authority, as `file:///` is, names no host.
-        if host and not _is_example(host):
+        if not authority:
+            continue
+        # Whoever signs in stands before the last `@`; the host is all that follows, whatever it is written with.
+        if "\\" in authority or not _is_example(authority.rpartition("@")[2]):
             return True
     return False
 
@@ -212,7 +221,8 @@ def check(capture: object) -> None:
     """Raise `Refused` if the capture holds a key, a host outside `example.com`, or an address."""
     capture = _with_whole_bodies(capture)
     for where, value in _headers(capture, "capture"):
-        if not _is_example(value):
+        # A header's value may stand between spaces and tabs.
+        if not _is_example(value.strip(" \t")):
             raise Refused(HOST, where)
     for where, text, plain in _texts(capture, "capture"):
         if _KEY.search(text):
