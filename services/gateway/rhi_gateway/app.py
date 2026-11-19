@@ -65,6 +65,12 @@ that escapes a handler is answered 500 with no body and logged with the cause `n
 **The metrics** (sections 6.6 and 7.2): `build_app` given the gateway's metrics
 (`rhi_gateway.metrics.Metrics`) counts each of these requests once, from its finished record: per
 student by alias and per pool, the requests, the tokens settled and the errors by cause.
+
+**What students experience** (section 7.2): `build_app` given the metrics also puts on their
+registry the series of `rhi_gateway.experience`, per pool and wire format and never by student,
+and with the heartbeat the requests in flight and held as its rows report them. A forwarded
+request tells them two things: the proxy, each time a token of its stream has been sent to the
+client, and its settlement, the tokens it observed.
 """
 
 from __future__ import annotations
@@ -95,6 +101,7 @@ from rhi_gateway import routes, telemetry
 from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
+from rhi_gateway.experience import Experience
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
 from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
 from rhi_gateway.readiness import PoolView, Readiness
@@ -184,7 +191,9 @@ def build_app(
     without it, whoever builds the application runs the cycle.
 
     `metrics`, when given, counts every request the application answers, the local routes, the
-    refusals and the paths outside the table included (`rhi_gateway.metrics`).
+    refusals and the paths outside the table included (`rhi_gateway.metrics`). Its registry then
+    also holds what students experience (`rhi_gateway.experience`), which the forwarded routes
+    report, with the heartbeat's own counts of the requests in flight and held when it is given too.
 
     `local`, when given, answers the models, status, wake and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
@@ -205,6 +214,10 @@ def build_app(
         # One log record per request, counted as it is logged, and the gateway's own faults answered
         # 500 with no text.
         middleware=[Middleware(telemetry.Telemetry, ended=None if metrics is None else metrics.count)],
+    )
+    # Where the forwarded routes find it (`_experience`): the handlers are made before the application.
+    app.state.experience = (
+        None if metrics is None else Experience(metrics.registry, None if heartbeat is None else heartbeat.rows)
     )
     router = app.router
     router.redirect_slashes = False
@@ -445,6 +458,12 @@ async def _hold_silently(held: _Held, receive: Receive) -> bool:
     return True
 
 
+def _experience(request: Request) -> Experience | None:
+    """The experience series of the application that serves the request; none when it was built without metrics."""
+    app = request.scope.get("app")
+    return None if app is None else getattr(app.state, "experience", None)
+
+
 def _refusal(error: GatewayError, entry: Route, retry_after: Mapping[Cause, int]) -> Response:
     telemetry.note_cause(error.cause)
     answer = render_json(error, entry.wire_format or WireFormat.MESSAGES, retry_after)
@@ -486,10 +505,18 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             # Token counting has no hold: it is never demand.
             demand = held.demand = forwarding.heartbeat.received(forwarded.pool.name, held=not held.ready)
 
+        # From here the request settles exactly once: what students experience is told its tokens then.
+        experience = _experience(request)
+        wire_format = entry.wire_format or WireFormat.MESSAGES
+        turn = None if experience is None else experience.request(forwarded.pool.name, wire_format)
+        token_sent = None if turn is None else turn.token_sent
+
         async def settle(observed: Observed) -> None:
             telemetry.note_tokens(observed.input_tokens, observed.output_tokens)
             if demand is not None:
                 demand.end()
+            if turn is not None:
+                turn.settled(observed.input_tokens, observed.output_tokens)
             await run_in_threadpool(
                 forwarding.ledger.settle,
                 reservation,
@@ -501,7 +528,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         if held is not None and not held.ready:
             if held.streams:
                 # Answered 200 at once: the keep-alives, then the engine's stream on the same connection.
-                return forwarding.proxy.held(entry, forwarded, settle, held)
+                return forwarding.proxy.held(entry, forwarded, settle, held, token_sent=token_sent)
             try:
                 left = await _hold_silently(held, request.receive)
             except GatewayError as ended:
@@ -514,7 +541,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             if left:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return Response(status_code=CLIENT_LEFT_STATUS)
-        return await forwarding.proxy.forward(entry, forwarded, settle, receive=request.receive)
+        return await forwarding.proxy.forward(entry, forwarded, settle, receive=request.receive, token_sent=token_sent)
 
     return handler
 
