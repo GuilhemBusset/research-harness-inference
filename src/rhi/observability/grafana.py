@@ -39,12 +39,13 @@ with its reason, and nothing else:
 
 - `prometheus.QUERY_ACTIONS` on the one workspace, by its ARN: the dashboards' queries;
 - `LOG_ACTIONS` on the log groups of the gateway, the scaler and the issuer, `/rhi/gateway`,
-  `/rhi/scaler` and `/rhi/issuer`, and on those of the pools' instances, `/rhi/pools/<pool>`: the
-  dashboards' log queries. Each is named by its fixed name, as text, and never by a reference to
-  the stack that creates it: the pools stack and the gateway stack depend on this one, which
-  must not depend on them. Each ARN ends `:*`, which is how CloudWatch Logs names a log group and
-  its streams in a policy. No other log group is named: not a build project's, whose logs hold
-  the real configuration, and not Grafana's own;
+  `/rhi/scaler` and `/rhi/issuer`, and on that of each pool of the configuration,
+  `/rhi/pools/<pool>`: the dashboards' log queries. Each is named by its fixed name, as text, and
+  never by a reference to the stack that creates it: the pools stack and the gateway stack depend
+  on this one, which must not depend on them. Each ARN ends `:*`, which is how CloudWatch Logs
+  names a log group and its streams in a policy. No other log group is named, and none by a
+  pattern: not a build project's, whose logs hold the real configuration, not Grafana's own, and
+  not that of a pool the configuration does not hold;
 - `EVERY_RESOURCE_ACTIONS` on every resource, the only way CloudWatch grants them: reading
   metrics (the load balancers', Auto Scaling's, the pipeline's and the account's month-to-date
   charge) and fetching the results of a log query. Grafana can start a query only on a log
@@ -54,14 +55,11 @@ with its reason, and nothing else:
 Listing the account's log groups, stopping a query and reading alarms are left out: a dashboard
 whose panels name their log groups and their metrics is shown without them.
 
-**The pools' log groups are named by one pattern**, `POOLS_LOG_GROUPS`: every log group under
-`/rhi/pools/`, the prefix that `rhi.pools.role` gives each pool's log group and that no other
-log group of the stage is under. The pools come from the deployed configuration, and cdk-nag's
-finding for an ARN that ends `:*` holds the ARN: a statement that named each pool's log group
-would bring a finding for each pool's name, which the protected file
-`tests/policy/acknowledged/observability_grafana.toml` could only list for the names known when
-it was written. A pool added to the configuration would then fail synthesis. With the pattern the
-finding is one, whatever the pools are named.
+**A new pool needs its line in the acknowledgement file.** cdk-nag raises a finding for an ARN
+that ends `:*`, and the finding's id holds the ARN, so each pool's log group brings a finding of
+its own name. `tests/policy/acknowledged/observability_grafana.toml` lists the one of the
+example's pool, `mock`. A configuration with a pool of another name fails synthesis, before
+anything is deployed, until the merge that brings the pool adds the pool's line to that file.
 
 **A deployment that cannot start its task fails**: the service's circuit breaker ends it and
 returns the service to the task it had.
@@ -129,17 +127,22 @@ DEREGISTRATION_SECONDS = 30
 # What the load balancer asks of the user pool: who signed in, and nothing else.
 SCOPE = "openid"
 
-# The log groups of the services, by their fixed names, and those of the pools' instances, by the
-# pattern that takes `log_group_name(pool)` for any pool.
+# The log groups of the services, by their fixed names. Those of the pools' instances are added
+# for the pools of the configuration, each by its own name (`readable_log_groups`).
 SERVICE_LOG_GROUPS = (gateway.LOG_GROUP_NAME, scaler.LOG_GROUP_NAME, issuer.LOG_GROUP_NAME)
-POOLS_LOG_GROUPS = log_group_name("*")
-READABLE_LOG_GROUPS = (*SERVICE_LOG_GROUPS, POOLS_LOG_GROUPS)
 # What a log query of the CloudWatch data source takes on a log group: starting the query, the
 # fields the query editor lists, and the events around a line.
 LOG_ACTIONS = ("logs:StartQuery", "logs:GetLogGroupFields", "logs:GetLogEvents")
 # What CloudWatch grants on every resource only: reading metrics, listing them, and fetching the
 # results of a log query. `tests/policy/acknowledged/observability_grafana.toml` lists each.
 EVERY_RESOURCE_ACTIONS = ("cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "logs:GetQueryResults")
+
+
+def readable_log_groups(config: Config) -> tuple[str, ...]:
+    """The names of the log groups Grafana may query: the services', and that of each pool of the
+    configuration, `/rhi/pools/<pool>`. No pattern: a pool the configuration does not hold has no
+    log group here."""
+    return (*SERVICE_LOG_GROUPS, *(log_group_name(pool.name) for pool in config.pools))
 
 
 class Grafana(Construct):
@@ -188,7 +191,7 @@ class Grafana(Construct):
                         resource_name=f"{name}:*",
                         arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
                     )
-                    for name in READABLE_LOG_GROUPS
+                    for name in readable_log_groups(config)
                 ],
             )
         )

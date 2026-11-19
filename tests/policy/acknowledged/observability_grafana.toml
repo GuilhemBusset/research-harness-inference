@@ -6,9 +6,9 @@
 # - aps:QueryMetrics, aps:GetSeries, aps:GetLabels and aps:GetMetricMetadata on the metrics
 #   workspace only, by its ARN: the dashboards' queries.
 # - logs:StartQuery, logs:GetLogGroupFields and logs:GetLogEvents on the log groups /rhi/gateway,
-#   /rhi/scaler and /rhi/issuer, each by its fixed name, and on the log groups of the pools'
-#   instances, /rhi/pools/<pool>, by the one pattern /rhi/pools/*; each ARN ends `:*`, the log
-#   group and its streams: the dashboards' log queries. No other log group is named, and no build
+#   /rhi/scaler and /rhi/issuer, and on the log group of each pool of the configuration,
+#   /rhi/pools/<pool>, each by its fixed name; each ARN ends `:*`, the log group and its streams:
+#   the dashboards' log queries. No other log group is named, none by a pattern, and no build
 #   project's.
 # - cloudwatch:GetMetricData, cloudwatch:ListMetrics and logs:GetQueryResults on every resource:
 #   the metrics of the load balancers, of Auto Scaling and of the pipeline, the account's
@@ -25,16 +25,17 @@
 # The service's target group and its rule on the public load balancer's listener bring no role, no
 # action and no finding.
 #
-# The pools' log groups are named by a pattern because the pools come from the deployed
-# configuration: a finding for each pool's own name could only be listed here for the names known
-# when this file was written, and a pool added to the configuration would fail synthesis.
+# cdk-nag's finding for a log group's ARN holds the log group's name, so each pool brings a finding
+# of its own. The table lists the one of the example's pool, mock. A pool of another name fails
+# synthesis until the merge that brings it adds its line here, the mock pool's line with the
+# pool's name in place of `mock`.
 
 [nag]
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants GetMetricData, ListMetrics and GetQueryResults, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds those actions alone."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/gateway:*]" = "Grafana queries the gateway's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/scaler:*]" = "Grafana queries the scaler's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/issuer:*]" = "Grafana queries the issuer's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/*:*]" = "Grafana queries the log groups of the pools' instances, which rhi.pools.role names /rhi/pools/<pool>; the pools come from the deployed configuration, so the statement names them by their prefix, which no other log group of the stage is under, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/mock:*]" = "Grafana queries the log group of a configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-ECS2" = "The task definition gives Grafana the workspace's query address, the region and the domain as environment variables, which is how the image's settings and data sources read them, and none holds a secret: both data sources sign their requests with the task's role."
 "AwsSolutions-ECS4" = "Grafana shows the metrics of the Managed Prometheus workspace and of CloudWatch, and its own logs go to its log group, so Container Insights would be a paid store of metrics that no dashboard of the design reads."
 
