@@ -1,12 +1,13 @@
 """The owner's walkthrough (setup/owner-setup.sh), run in a scratch copy of the repository.
 
 `aws`, `gh`, `cdk` and `npm` are stand-ins that record every call, so no test reaches AWS or
-GitHub. The `gh` stand-in answers for an App a test has registered with it: it applies the query
-of the call, with `jq`, to the App as GitHub's API would describe it. `uv` is a stand-in too,
-which runs the configuration module on the test's own interpreter and, as uv does, makes the
-project environment where `UV_PROJECT_ENVIRONMENT` says, or else in `.venv` in the tree. It
-records the module that stores the reporter's secret and never runs it. One test runs the real uv
-instead, offline. After every run the scratch copy is compared with what it was, byte for byte.
+GitHub. `uv` is a stand-in too, which runs the configuration module and the module that reads the
+GitHub Apps back on the test's own interpreter and, as uv does, makes the project environment
+where `UV_PROJECT_ENVIRONMENT` says, or else in `.venv` in the tree. The Apps are read from the
+stand-in for GitHub of tests/unit/test_owner_apps.py, which answers 404 to anything but an App's
+own token. The `uv` stand-in records the module that stores the reporter's secret and never runs
+it. One test runs the real uv instead, offline. After every run the scratch copy is compared with
+what it was, byte for byte.
 
 The scanner's list of local values is a file in the test's temporary folder in every run: by
 `HYGIENE_LOCAL_VALUES`, or, for the scanner's default file, under a home directory made there.
@@ -14,6 +15,7 @@ The scanner's list of local values is a file in the test's temporary folder in e
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -34,6 +36,9 @@ REPO = Path(__file__).resolve().parents[2]
 # Not files of the repository: git's own folder, and what the tools leave behind as they run.
 LEFT_OUT = shutil.ignore_patterns(".git", ".venv", "node_modules", "cdk.out", "__pycache__", ".*_cache")
 EXAMPLE = (REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8")
+# The example with its mock pool broken: a file the loader refuses.
+REFUSED = EXAMPLE.replace("max_instances = 2\n", "max_instances = 0\n")
+assert REFUSED != EXAMPLE
 # Part of every bad value below, so a test can tell that a refusal does not repeat the value.
 MARK = "7701"
 SECRET = "rhi/reporter/github-app"
@@ -43,6 +48,22 @@ KEY = f"{KEY_MARK} first line\n{KEY_MARK} last line\n"
 # The values of the example configuration's private keys, and one the owner enters at the prompt.
 PRIVATE = sorted(str(getattr(config.load({"RHI_CONFIG": "example"}), key)) for key in config.PRIVATE_KEYS)
 ENTERED = "Entered At The Prompt"
+
+
+def _load_github_stand_in() -> Any:
+    """The stand-in for GitHub that tests/unit/test_owner_apps.py defines, loaded from its file."""
+    name = "owner_apps_github_stand_in"
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("test_owner_apps.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # a dataclass looks its module up while it is defined
+    spec.loader.exec_module(module)
+    return module
+
+
+STAND_IN = _load_github_stand_in()
+REPOSITORY = STAND_IN.REPOSITORY
+FACTORY = STAND_IN.FACTORY
 
 
 def snapshot(tree: Path) -> dict[str, bytes | None]:
@@ -70,11 +91,9 @@ class Walkthrough:
         record = f'echo "$(basename "$0") $*" >> {shlex.quote(str(self.calls))}'
         for name in ("cdk", "npm"):
             self.stand_in(name, record)
-        # `gh api apps/<slug> --jq <query>`: the query, applied to the App a test registered.
-        self.apps = tmp_path / "apps"
-        self.apps.mkdir()
-        registered = f'{shlex.quote(str(self.apps))}/"${{2#apps/}}".json'
-        self.stand_in("gh", f'{record}\n[ "$1 $3" != "api --jq" ] || [ ! -f {registered} ] || jq -r "$4" {registered}')
+        self.stand_in("gh", record)
+        # GitHub, for the module that reads the Apps back. It answers to an App's own tokens only.
+        self.github = STAND_IN.GitHub(tmp_path / "github")
         # The one answer the walkthrough reads from AWS: a quota's code and its value.
         self.stand_in("aws", f"{record}\n[ \"$2\" != list-service-quotas ] || printf 'L-EXAMPLE\\t0.0\\n'")
         self.stand_in(
@@ -84,7 +103,7 @@ class Walkthrough:
             'mkdir -p "${UV_PROJECT_ENVIRONMENT:-$PWD/.venv}"\n'
             # Recorded, never run: the two writers would look for AWS.
             '[ "$6" != rhi.owner_secret ] || exit 0\n'
-            '[ "$6" = rhi.owner_config ] || exit 64\n'
+            '[ "$6" = rhi.owner_config ] || [ "$6" = rhi.owner_apps ] || exit 64\n'
             '[ "$7" != write ] || exit 0\n'
             "shift 4\n"
             f'exec {shlex.quote(sys.executable)} "$@"',
@@ -94,11 +113,6 @@ class Walkthrough:
         path = self.stand_ins / name
         path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
         path.chmod(0o755)
-
-    def app(self, slug: str, app_id: int, **permissions: str) -> None:
-        """Registers an App with the `gh` stand-in, in the shape of GitHub's `GET /apps/{slug}`."""
-        described = {"id": app_id, "slug": slug, "permissions": permissions, "events": []}
-        (self.apps / f"{slug}.json").write_text(json.dumps(described), encoding="utf-8")
 
     def owner_file(self, text: str = EXAMPLE, name: str = "owner.toml") -> Path:
         path = self.outside / name
@@ -114,7 +128,9 @@ class Walkthrough:
             (self.stand_ins / "uv").unlink()
         # Nothing the caller's shell sets may keep bytecode or an environment out of the tree: the
         # script has to. The real uv finds everything it installs in its cache.
+        # Nor may the region the caller's shell sets: a run names its own.
         dropped = ("PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV")
+        dropped += ("AWS_REGION", "AWS_DEFAULT_REGION")
         added = env or {}
         env = {name: value for name, value in os.environ.items() if name not in dropped}
         env |= {
@@ -122,7 +138,10 @@ class Walkthrough:
             "TMPDIR": str(self.tmp_path / "tmp"),
             "UV_OFFLINE": "1",
             "HYGIENE_LOCAL_VALUES": str(self.values),
+            # The owner's own `gh` login, which no request to GitHub may carry.
+            "GH_TOKEN": STAND_IN.OWNER_LOGIN,
         }
+        env |= self.github.env
         env |= added
         self.calls.write_text("", encoding="utf-8")
         before = snapshot(self.tree)
@@ -146,8 +165,10 @@ class Walkthrough:
 
 
 @pytest.fixture
-def walkthrough(tmp_path: Path) -> Walkthrough:
-    return Walkthrough(tmp_path)
+def walkthrough(tmp_path: Path) -> Any:
+    walkthrough = Walkthrough(tmp_path)
+    yield walkthrough
+    walkthrough.github.server.shutdown()
 
 
 def commands(output: str) -> list[str]:
@@ -181,7 +202,8 @@ def test_the_dry_run_prints_the_nine_steps_in_order(walkthrough: Walkthrough) ->
     # Every command of a real run is printed, and nothing was started: not AWS, not GitHub.
     printed = commands(done.stdout)
     started = "aws service-quotas, aws ssm, aws cloudformation, cdk bootstrap, gh repo edit, setup/apply-ruleset.sh"
-    started += f", gh api 'apps/<slug>', rhi.owner_secret {SECRET}, aws secretsmanager"
+    started += ", rhi.owner_apps reporter, rhi.owner_apps login, rhi.owner_apps factory"
+    started += f", rhi.owner_secret {SECRET}, aws secretsmanager"
     started += ", rhi.owner_config values"
     for tool in started.split(", "):
         assert any(tool in command for command in printed), tool
@@ -240,45 +262,77 @@ def test_the_apps_step_names_the_permissions_and_the_page(walkthrough: Walkthrou
     assert done.stdout.count("Permissions:") == 3  # one list for each App
     assert "login_client_id" in done.stdout  # where the login App's client ID goes
     assert "stays on the factory's host" in done.stdout
-    # One read-back for each App, with a placeholder for the slug; nothing was started.
-    assert sum(command.startswith("gh api 'apps/<slug>'") for command in commands(done.stdout)) == 3
+    # One read-back for each App, with placeholders for what a real run asks; nothing was started.
+    read = [command.split()[9:11] for command in commands(done.stdout) if "rhi.owner_apps" in command]
+    assert read == [["reporter", "--app-id"], ["login", "--slug"], ["factory", "--app-id"]]
     assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+
+
+def apps(github: Any, reporter: str = "selected", factory: str = "selected", **reporter_permissions: str) -> list[Path]:
+    """The three Apps, registered with the stand-in for GitHub; the reporter's and the factory's
+    keys. Each is installed on this repository, alone when its selection is `selected`."""
+    reach = {"selected": [REPOSITORY], "all": [REPOSITORY, STAND_IN.OTHER]}
+    permissions = reporter_permissions or STAND_IN.REPORTER
+    keys = [github.app(202, "course-reporter", [(404, reporter, reach[reporter])], permissions)]
+    keys.append(github.app(303, "course-factory", [(505, factory, reach[factory])], FACTORY))
+    github.app(101, "course-login")
+    return keys
 
 
 def test_each_app_is_read_back_and_judged(walkthrough: Walkthrough) -> None:
     said = "the permissions of section 8.6"
-    walkthrough.app("course-login", 101)
-    walkthrough.app("course-reporter", 202, statuses="write", metadata="read")
+    reporter, factory = apps(walkthrough.github)
+    # The reporter's ID, key, this repository, a yes; no to storing; the login App; the factory's App.
+    answers = f"202\n{reporter}\n{REPOSITORY}\ny\nn\ncourse-login\ny\n303\n{factory}\ny\n"
 
-    # The login App and the reporter, each read after a yes. No installation yet, no factory App.
-    done = walkthrough.run("--step", "apps", answers="course-login\ny\ncourse-reporter\ny\n\n\n")
+    done = walkthrough.run("--step", "apps", answers=answers)
     assert done.returncode == 0, done.stderr
-    login, reporter = walkthrough.called("gh")
-    assert login.startswith("gh api apps/course-login --jq ")
-    assert reporter.startswith("gh api apps/course-reporter --jq ")
-    assert "ID: 101" in done.stdout
-    assert "ID: 202" in done.stdout
-    assert "metadata=read statuses=write" in done.stdout
-    assert done.stdout.count(f"These are {said}") == 2
-    assert f"NOT {said}" not in done.stdout
-    assert walkthrough.called("aws", "uv") == []
+    assert [call.split()[6:8] for call in walkthrough.called("uv")] == [
+        ["rhi.owner_apps", "reporter"],
+        ["rhi.owner_apps", "login"],
+        ["rhi.owner_apps", "factory"],
+    ]
+    for app_id in (202, 101, 303):
+        assert f"ID {app_id}" in done.stdout
+    assert done.stdout.count(f"These are {said}") == 3
+    assert f"Installation 404: selected repositories: {REPOSITORY}" in done.stdout
+    assert "device flow is on" in done.stdout
+    assert walkthrough.called("aws", "gh") == []
 
-    # A permission too many on the first two; the factory's App as the step prints it.
-    walkthrough.app("course-login", 101, metadata="read")
-    walkthrough.app("course-reporter", 202, statuses="write", metadata="read", contents="read")
-    factory = {"contents": "write", "pull_requests": "write", "issues": "write"}
-    factory |= {"statuses": "read", "checks": "read", "actions": "read", "metadata": "read"}
-    walkthrough.app("course-factory", 303, **factory)
-    done = walkthrough.run("--step", "apps", answers="course-login\ny\ncourse-reporter\ny\n\ncourse-factory\ny\n")
+    # A permission too many on the reporter, a factory's App on every repository, and a login App
+    # whose device flow is off: judged, refused and refused, and the step goes on to the end.
+    apps(walkthrough.github, factory="all", statuses="write", contents="read")
+    walkthrough.github.app(101, "course-login", device_flow=False)
+    done = walkthrough.run("--step", "apps", answers=answers)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.count(f"NOT {said}") == 2
-    assert done.stdout.count(f"These are {said}") == 1
-    assert done.stdout.index(f"NOT {said}") < done.stdout.index("ID: 303") < done.stdout.index(f"These are {said}")
+    assert done.stdout.count(f"NOT {said}") == 1
+    assert done.stderr.count("refused: ") == 2
+    assert "device flow is off" in done.stderr
+    assert "installation 505 is on all repositories" in done.stderr
 
     # Without a yes no App is read.
-    done = walkthrough.run("--step", "apps", answers="course-login\nn\n")
+    done = walkthrough.run("--step", "apps", answers=f"202\n{reporter}\n{REPOSITORY}\nn\n\n")
     assert done.returncode == 0, done.stderr
+    assert walkthrough.called("uv") == []
+
+
+def test_no_command_of_the_apps_step_is_a_call_with_the_owners_login(walkthrough: Walkthrough) -> None:
+    reporter, factory = apps(walkthrough.github)
+    keys = ["--reporter-key", reporter, "--factory-key", factory]
+
+    dry = walkthrough.run("--dry-run", "--step", "apps", *keys)
+    real = walkthrough.run("--step", "apps", *keys, answers=f"202\n{REPOSITORY}\ny\ny\ny\ncourse-login\ny\n303\ny\n")
+    for done in (dry, real):
+        assert done.returncode == 0, done.stderr
+        assert not [command for command in commands(done.stdout) if command.split()[0] in ("gh", "curl")]
     assert walkthrough.called("gh") == []
+    # GitHub was asked, by the module only, and never with the owner's login (`GH_TOKEN` was set):
+    # each request carried an App's JWT or a token minted from one, but for the device code.
+    github = walkthrough.github
+    minted = set(github.tokens)
+    assert minted
+    assert STAND_IN.OWNER_LOGIN not in github.tokens_seen()
+    assert {token for token in github.tokens_seen() if token.count(".") != 2} <= minted
 
 
 def test_the_reporter_key_comes_from_outside_the_tree(walkthrough: Walkthrough) -> None:
@@ -310,34 +364,86 @@ def test_the_reporter_key_comes_from_outside_the_tree(walkthrough: Walkthrough) 
         assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
 
 
-def test_the_reporter_step_asks_before_it_stores(walkthrough: Walkthrough) -> None:
-    walkthrough.app("course-reporter", 202, statuses="write", metadata="read")
-    key = walkthrough.owner_file(KEY, "reporter.pem")
-    # No login App yet; the reporter is read back; then the installation ID and the key file.
-    asked = f"\ncourse-reporter\ny\n404\n{key}\n"
+def test_the_app_keys_come_from_outside_the_tree(walkthrough: Walkthrough) -> None:
+    def step(option: str, file: Path | str) -> subprocess.CompletedProcess[str]:
+        return walkthrough.run("--dry-run", "--step", "apps", option, file)
 
-    # No to the writing: nothing is started, and the check of the secret is not offered.
+    # The reporter's key signs the reading of the reporter and of the login App; the factory's key
+    # the reading of the factory's App. Neither is opened by the step, nor printed.
+    key = walkthrough.owner_file(KEY, "app.pem")
+    accepted = step("--reporter-key", key)
+    assert accepted.returncode == 0, accepted.stderr
+    reporter, login = [command for command in commands(accepted.stdout) if " reporter " in command or " login " in command]
+    assert f"--key-file {key}" in reporter
+    assert f"--key-file {key}" in login
+    accepted = step("--factory-key", key)
+    assert accepted.returncode == 0, accepted.stderr
+    (factory,) = [command for command in commands(accepted.stdout) if "rhi.owner_apps factory" in command]
+    assert f"--key-file {key}" in factory
+    assert KEY_MARK not in accepted.stdout + accepted.stderr
+    assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+
+    # The factory's key inside the tree, or a link in the tree to the file outside: refused.
+    (walkthrough.tree / "factory.pem").write_text(KEY, encoding="utf-8")
+    (walkthrough.tree / "link.pem").symlink_to(key)
+    for inside in (walkthrough.tree / "factory.pem", "factory.pem", walkthrough.tree / "link.pem"):
+        refused = step("--factory-key", inside)
+        assert refused.returncode != 0
+        assert "inside the working tree" in refused.stderr
+        assert "rhi.owner_apps factory" not in refused.stdout  # the reading is not offered
+        assert KEY_MARK not in refused.stdout + refused.stderr
+        assert walkthrough.called("aws", "gh", "cdk", "npm", "uv") == []
+
+
+def test_the_reporter_step_asks_before_it_stores(walkthrough: Walkthrough) -> None:
+    reporter, _ = apps(walkthrough.github)
+    # The reporter's ID, its key, this repository, and a yes to reading it; then the writing.
+    asked = f"202\n{reporter}\n{REPOSITORY}\ny\n"
+
+    # No to the writing: the check of the secret is not offered, and nothing stores.
     done = walkthrough.run("--step", "apps", answers=f"{asked}n\ny\n")
     assert done.returncode == 0, done.stderr
-    assert walkthrough.called("uv", "aws") == []
+    assert not [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
+    assert walkthrough.called("aws") == []
 
-    # Yes to the writing, no to the check: the module gets the App's ID that GitHub gave.
+    # Yes to the writing, no to the check: the module stores, and nothing is left behind.
     done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
     assert done.returncode == 0, done.stderr
-    (stored,) = walkthrough.called("uv")
-    assert stored.endswith(f"rhi.owner_secret {SECRET} --app-id 202 --installation-id 404 --private-key-file {key}")
+    (stored,) = [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
+    assert f"rhi.owner_secret {SECRET} " in stored
     assert walkthrough.called("aws") == []
-    assert KEY_MARK not in done.stdout + done.stderr
+    key_lines = [line for line in reporter.read_text(encoding="utf-8").splitlines() if "KEY" not in line]
+    assert not [line for line in key_lines if line in done.stdout + done.stderr]
     assert list((walkthrough.tmp_path / "tmp").glob("rhi-owner-setup.*")) == []
 
     # A key file inside the tree is refused in a real run too, whichever way it is named.
     (walkthrough.tree / "reporter.pem").write_text(KEY, encoding="utf-8")
-    done = walkthrough.run("--step", "apps", answers=f"\ncourse-reporter\ny\n404\n{walkthrough.tree}/reporter.pem\ny\n")
+    done = walkthrough.run("--step", "apps", answers=f"202\n{walkthrough.tree}/reporter.pem\ny\n")
     assert done.returncode != 0
     assert "inside the working tree" in done.stderr
-    done = walkthrough.run("--step", "apps", "--reporter-key", "reporter.pem", answers="\ncourse-reporter\ny\n404\ny\n")
+    done = walkthrough.run("--step", "apps", "--reporter-key", "reporter.pem", answers="202\ny\n")
     assert done.returncode != 0
     assert walkthrough.called("uv", "aws") == []
+
+
+def test_the_reporter_step_stores_the_installation_github_reports(walkthrough: Walkthrough) -> None:
+    reporter, _ = apps(walkthrough.github)
+    asked = f"202\n{reporter}\n{REPOSITORY}\ny\n"
+
+    # The App's ID and the installation's ID are GitHub's, and no answer gave the installation's.
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert done.returncode == 0, done.stderr
+    (stored,) = [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
+    assert stored.endswith(f"rhi.owner_secret {SECRET} --app-id 202 --installation-id 404 --private-key-file {reporter}")
+
+    # A reporter on every repository, or with no installation yet: nothing is offered to store.
+    apps(walkthrough.github, reporter="all")
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert "refused: " in done.stderr
+    walkthrough.github.app(202, "course-reporter", [], STAND_IN.REPORTER)
+    done = walkthrough.run("--step", "apps", answers=f"{asked}y\nn\n")
+    assert "no installation" in done.stdout
+    assert not [call for call in walkthrough.called("uv") if "rhi.owner_secret" in call]
 
 
 class Secrets:
@@ -381,6 +487,46 @@ def test_the_module_stores_the_three_fields(tmp_path: Path, capsys: pytest.Captu
     printed = capsys.readouterr()
     assert SECRET in printed.out
     assert KEY_MARK not in printed.out + printed.err
+
+
+@pytest.mark.parametrize(
+    ("error", "named"),
+    [
+        (botocore.exceptions.NoRegionError(), "must give a region"),
+        (botocore.exceptions.MissingDependencyException(msg=f"no awscrt {MARK}"), "MissingDependencyException"),
+    ],
+)
+def test_a_client_the_sdk_cannot_make_is_named_by_its_cause(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, named: str
+) -> None:
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *_: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError) as raised:
+        owner_secret.store(SECRET, "{}")
+    assert named in str(raised.value)
+    assert MARK not in str(raised.value)  # the SDK's own text is not repeated
+    if not isinstance(error, botocore.exceptions.NoRegionError):
+        assert "region" not in str(raised.value)
+
+
+def test_only_aws_region_gives_the_region_to_every_command(walkthrough: Walkthrough) -> None:
+    file = walkthrough.owner_file()
+    seen = walkthrough.tmp_path / "region"
+    # The stand-in for uv records the region the SDK of a Python step would read, then goes on.
+    uv = walkthrough.stand_ins / "uv"
+    uv.write_text(
+        uv.read_text(encoding="utf-8").replace(
+            "#!/usr/bin/env bash\n", f'#!/usr/bin/env bash\necho "${{AWS_DEFAULT_REGION-unset}}" >> {seen}\n', 1
+        ),
+        encoding="utf-8",
+    )
+    region = {"AWS_REGION": "us-west-2"}
+    for only, expected in ((region, "us-west-2"), (region | {"AWS_DEFAULT_REGION": "us-east-1"}, "us-east-1")):
+        seen.write_text("", encoding="utf-8")
+        done = walkthrough.run("--step", "configuration", "--config", file, answers="y\ny\nn\n", env=only)
+        assert done.returncode == 0, done.stderr
+        assert seen.read_text(encoding="utf-8").split() == [expected, expected]  # the check and the writing
 
 
 def test_the_configuration_comes_from_outside_the_tree(walkthrough: Walkthrough) -> None:
@@ -433,7 +579,7 @@ def test_the_configuration_step_asks_before_it_writes(walkthrough: Walkthrough) 
     assert walkthrough.called("aws") == []
 
     # A file the loader refuses stops the step before the writing is offered.
-    refused = walkthrough.owner_file(EXAMPLE.replace("pools = []", "pools = [1]"), "refused.toml")
+    refused = walkthrough.owner_file(REFUSED, "refused.toml")
     done = walkthrough.run("--step", "configuration", "--config", refused, answers="y\ny\ny\n")
     assert done.returncode != 0
     assert [call.split()[7] for call in walkthrough.called("uv")] == ["check"]
@@ -462,7 +608,7 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
 
     # A check writes nothing, and a file the loader refuses is refused before anything is written.
     assert owner_config.main(["check", str(file)], untouched) == 0
-    file.write_text(EXAMPLE.replace("pools = []", "pools = [1]"), encoding="utf-8")
+    file.write_text(REFUSED, encoding="utf-8")
     assert owner_config.main(["write", str(file)], untouched) == 1
     assert untouched.put == []
 
@@ -580,6 +726,7 @@ def test_the_scratch_copy_is_byte_identical_afterwards(walkthrough: Walkthrough)
     # The whole dry run, with every option and a file to check. `run` compares the copy.
     file, key = walkthrough.owner_file(), walkthrough.owner_file(KEY, "reporter.pem")
     options = ["--max-instances", "2", "--upgrade-pool", "--xl-pool", "--config", file, "--reporter-key", key]
+    options += ["--factory-key", key]
     done = walkthrough.run("--dry-run", *options)
 
     assert done.returncode == 0, done.stderr

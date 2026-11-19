@@ -34,14 +34,14 @@ def build(
     event: Mapping[str, object],
     resource_events: Iterable[Mapping[str, object]] = (),
     failed_tests: Iterable[object] = (),
-    lifecycle_stage: object = None,
+    last_stages: Iterable[object] = (),
 ) -> Report:
     """The report of a failure, with the lists above."""
     return build_report(
         event,
         resource_events,
         failed_tests,
-        lifecycle_stage,
+        last_stages,
         logical_ids=LOGICAL_IDS,
         smoke_test_ids=SMOKE_TEST_IDS,
         lifecycle_stages=LIFECYCLE_STAGES,
@@ -100,13 +100,16 @@ def test_a_recorded_failure_gives_one_status_per_fact() -> None:
         CommitStatus(SHA, State.FAILURE, "deploy/Prod/test/1", "key-refused"),
     ]
     # The verification's facts are under the verification's context, and the last lifecycle stage
-    # an instance reached is one more fact.
-    verification = build(failed("Verify"), [], ["chat-completion", "key-refused"], "engine-started")
+    # each instance reached is one more fact: a stage once, whatever number of instances stopped at it.
+    reached = ["model-loaded", "engine-started", "model-loaded"]
+    verification = build(failed("Verify"), [], ["chat-completion", "key-refused"], reached)
+    assert verification.dropped == 0
     assert [(status.context, status.description) for status in statuses_of(verification)] == [
         ("verify/Prod/action", "Prod Verify"),
         ("verify/Prod/test/1", "chat-completion"),
         ("verify/Prod/test/2", "key-refused"),
-        ("verify/Prod/lifecycle", "engine-started"),
+        ("verify/Prod/lifecycle/1", "engine-started"),
+        ("verify/Prod/lifecycle/2", "model-loaded"),
     ]
 
 
@@ -125,14 +128,14 @@ def test_free_text_never_leaves() -> None:
         *(resource(text, "CREATE_FAILED", ResourceStatusReason=reason) for text in free_text),
         *(resource("KeysTable4D1E0A55", text, ResourceStatusReason=reason) for text in (*free_text, reason)),
     ]
-    report = build(event, events, [*free_text, reason, "key-refused"], reason)
+    report = build(event, events, [*free_text, reason, "key-refused"], [reason])
     assert report.resources == (("GatewayService9F2C61B7", ResourceStatus.CREATE_FAILED),)
     assert report.tests == ("key-refused",)
     assert report.dropped == 3 + 4 + 4 + 1
     assert not [text for text in free_text if text in written(report)]
     # A lifecycle stage that is such text leaves no more, nor does an action or a stage that is no name.
     for text in (*free_text, reason):
-        assert not [value for value in free_text if value in written(build(failed(), [], [], text))]
+        assert not [value for value in free_text if value in written(build(failed(), [], [], [text]))]
     for text in (arn, reason):
         assert not [value for value in free_text if value in written(build(failed(action=text)))]
         with pytest.raises(ValueError, match="^the event's stage is not a stage name$"):
@@ -172,14 +175,13 @@ def test_each_part_has_its_own_filter() -> None:
         assert (report.resources, report.dropped) == ((), 1), code
     # A name is kept as it is in its list, and only so.
     for name in ("keystable4d1e0a55", "KeysTable", "", None, 7, ["KeysTable4D1E0A55"]):
-        report = build(failed(), [resource(name, "CREATE_FAILED")], [name], name)
-        assert (report.resources, report.tests, report.lifecycle_stage) == ((), (), None), name
-        assert report.dropped == (2 if name is None else 3), name
+        report = build(failed(), [resource(name, "CREATE_FAILED")], [name], [name])
+        assert (report.resources, report.tests, report.last_stages, report.dropped) == ((), (), (), 3), name
     # An action that is no action's name is dropped; the stage's own event has none.
     assert build(failed("Deploy to prod")).dropped == 1
-    own = build(failed(None, category=None), [], [], "booted")
-    assert (own.action, own.lifecycle_stage, own.dropped) == (None, "booted", 0)
-    assert [status.context for status in statuses_of(own)] == ["deploy/Prod/lifecycle"]
+    own = build(failed(None, category=None), [], [], ["booted"])
+    assert (own.action, own.last_stages, own.dropped) == (None, ("booted",), 0)
+    assert [status.context for status in statuses_of(own)] == ["deploy/Prod/lifecycle/1"]
     # Of one of CloudFormation's events, the logical ID and the code are all that is read.
     recorded = Recorded(resource("KeysTable4D1E0A55", "UPDATE_FAILED", ResourceStatusReason="a reason"))
     assert build(failed(), [recorded]).resources == (("KeysTable4D1E0A55", "UPDATE_FAILED"),)
@@ -201,7 +203,7 @@ def test_every_fact_has_a_context_and_a_description_github_accepts() -> None:
         failed(action, stage=stage),
         [resource(name, str(code)) for name in whole_ids],
         [whole_test],
-        "l" * DESCRIPTION_LIMIT,
+        ["l" * DESCRIPTION_LIMIT],
         logical_ids=whole_ids,
         smoke_test_ids=[whole_test],
         lifecycle_stages=["l" * DESCRIPTION_LIMIT],
@@ -228,8 +230,8 @@ def test_a_fact_too_long_for_a_description_is_dropped_and_never_shortened() -> N
     stage = "Stage." + "s" * 94
     for name in ids:
         lists = {"logical_ids": ids, "smoke_test_ids": ids, "lifecycle_stages": ids}
-        report = build_report(failed(stage=stage), [resource(name, "CREATE_FAILED")], [name], name, **lists)
-        assert (report.resources, report.tests, report.lifecycle_stage, report.dropped) == ((), (), None, 3)
+        report = build_report(failed(stage=stage), [resource(name, "CREATE_FAILED")], [name], [name], **lists)
+        assert (report.resources, report.tests, report.last_stages, report.dropped) == ((), (), (), 3)
         assert [(status.context, status.description) for status in statuses_of(report)] == [
             (f"deploy/{stage}/action", f"{stage} Deploy"),
             (f"deploy/{stage}/dropped", "3"),

@@ -1,0 +1,11 @@
+diff --git a/src/rhi/network/security.py b/src/rhi/network/security.py
+index 24d2e6c..371f844 100644
+--- a/src/rhi/network/security.py
++++ b/src/rhi/network/security.py
+@@ -62,3 +62,6 @@ class SecurityGroups(Construct):
+         self.instances.add_ingress_rule(
+             self.internal_load_balancer, ec2.Port.tcp(ENGINE_PORT), "The engine, from the internal load balancer"
+         )
++        self.instances.add_ingress_rule(
++            ec2.Peer.any_ipv4(), ec2.Port.tcp(ENGINE_PORT), "Health checks of the engine while a pool warms"
++        )

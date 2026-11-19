@@ -1,0 +1,144 @@
+"""The stages of an instance's start, and the seconds each took (system design, section 5.2).
+
+Cold-start time is the central number of the design, and nobody has published it for a stopped GPU
+instance. The lifecycle agent sees every stage of a start, so it measures them: `Stage` names the
+stages, and a `Timings` holds what each took in one launch, under that launch's `Transition`.
+`rhi_lifecycle.launch` marks the stages where they happen.
+
+**What a stage covers**, as the agent sees it, in the order a launch goes through them:
+
+| Stage | Starts | Ends |
+| --- | --- | --- |
+| boot | when the kernel starts | when the launch starts |
+| image | when the launch starts: it reads the instance metadata and the pool's parameter, and asks the host for the image the parameter names | when the disk holds the image: at once, or after a pull |
+| release check | then | when the release on disk is known to be the pool's current one |
+| container start | then: the pool's secret is read, and the host starts the engine's unit | when the unit is started |
+| weights | then | when the engine's health route first answers 200: the model can serve |
+| warm-up | then | when the engine has answered the warm-up request |
+| hook | then | when Auto Scaling has answered the completion of the launch hook |
+
+Each stage ends where the next starts, so the stages of a launch sum to the time from the kernel's
+start to the completed hook. An entry to the warm pool starts no engine: it has the boot, the image,
+the release check and the hook, and no duration for the three others.
+
+Two limits of what the agent can see. The time between Auto Scaling's decision and the kernel's
+start is in no stage. And the agent cannot tell the load of the weights from the engine's own
+initialization: both end when the health route answers.
+
+**The metric.** `rhi_lifecycle_stage_seconds`, with the labels `transition` and `stage`, is what a
+stage took in the agent's last launch, set when the stage ends. A stage that did not end, or that
+the transition does not have, has no series. A launch that was abandoned keeps the stages it went
+through, the one it was abandoned in included. The node's collector scrapes the metric from the
+agent's endpoint (`rhi_lifecycle.metrics`), with the instance's own labels.
+
+**The heartbeat.** A launch also names the stage it has reached in the instance's row of the
+heartbeats table (`rhi_lifecycle.launch`), by the stage's value here. Once the instance serves,
+`rhi_lifecycle.serving` writes the row, under its own name.
+"""
+
+from __future__ import annotations
+
+import enum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from prometheus_client import Gauge
+
+from rhi_lifecycle import metrics
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+METRIC = "rhi_lifecycle_stage_seconds"
+
+# The seconds since the kernel started, first on the file's one line. The agent's container reads
+# the host's own.
+UPTIME_FILE = Path("/proc/uptime")
+
+
+class Stage(enum.Enum):
+    """A stage of a start. The value is the stage's name in the metric and in the heartbeat."""
+
+    BOOT = "boot"
+    RELEASE_CHECK = "release-check"
+    IMAGE = "image"
+    CONTAINER_START = "container-start"
+    WEIGHTS = "weights"
+    WARM_UP = "warm-up"
+    HOOK = "hook"
+
+
+class Transition(enum.Enum):
+    """The launch transitions of `rhi_lifecycle.launch`."""
+
+    # A new instance enters the warm pool.
+    ENTRY = "entry"
+    # A warm instance, with the image on its disk, is promoted to service.
+    PROMOTION = "promotion"
+    # An instance is launched straight into service: the cold launch of section 5.2.
+    COLD_LAUNCH = "cold-launch"
+
+
+SECONDS = Gauge(
+    METRIC,
+    "The seconds a stage of the instance's last launch took.",
+    ("transition", "stage"),
+    registry=metrics.REGISTRY,
+)
+
+
+def uptime(path: Path = UPTIME_FILE) -> float | None:
+    """The seconds since the kernel started, or None when the host does not say."""
+    try:
+        return float(path.read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class Timings:
+    """The seconds each stage of one launch took. `clock` gives the moments the stages are marked
+    at, in seconds, and `gauge` is where the durations are exposed: a new launch empties it."""
+
+    def __init__(self, transition: Transition, clock: Callable[[], float], gauge: Gauge = SECONDS) -> None:
+        self.seconds: dict[Stage, float] = {}
+        self._transition = transition
+        self._clock = clock
+        self._gauge = gauge
+        # The stage under way, and when it started.
+        self._under_way: tuple[Stage, float] | None = None
+        gauge.clear()
+
+    @property
+    def transition(self) -> Transition:
+        return self._transition
+
+    @transition.setter
+    def transition(self, transition: Transition) -> None:
+        # A launch into service is taken for a promotion until the host says its disk has no
+        # image: what was exposed under the first name moves to the second.
+        self._transition = transition
+        self._gauge.clear()
+        self._expose()
+
+    def start(self, stage: Stage, at: float | None = None) -> None:
+        """Mark the start of `stage`, now or at the moment `at` of the clock. The stage under way
+        ends at the same moment."""
+        moment = self._clock() if at is None else at
+        self._end(moment)
+        self._under_way = (stage, moment)
+
+    def end(self) -> None:
+        """Mark the end of the stage under way, if there is one."""
+        self._end(self._clock())
+
+    def _end(self, moment: float) -> None:
+        if self._under_way is None:
+            return
+        stage, since = self._under_way
+        self._under_way = None
+        self.seconds[stage] = self.seconds.get(stage, 0.0) + moment - since
+        self._expose()
+
+    def _expose(self) -> None:
+        for stage, seconds in self.seconds.items():
+            self._gauge.labels(transition=self._transition.value, stage=stage.value).set(seconds)

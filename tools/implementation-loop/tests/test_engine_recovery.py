@@ -3,6 +3,7 @@ suite of the earlier engines (ADR 0008, ADR 0011) to the builder/examiner workfl
 Real git, the real ship.sh, the real verifier and real squash merges into a local bare remote;
 only the agents and GitHub are fakes."""
 
+import os
 import signal
 import stat
 import subprocess
@@ -875,6 +876,13 @@ class KilledCallOnALostBranchTests(IsolationCase):
     """A killed agent call left an executable bit only in its private index, and the issue's
     branch was then deleted (#34's): reattaching must carry the bit without HEAD, and a failed
     carry must keep the private metadata for the next try."""
+
+    def setUp(self):
+        # The mode checks below expect files created 0644, whatever umask runs the tests (a
+        # systemd user service has 0002).
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        super().setUp()
 
     def killed_with_staged_executable_bit(self):
         wt = self.worktree()

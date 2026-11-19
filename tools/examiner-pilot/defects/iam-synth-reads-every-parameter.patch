@@ -1,0 +1,19 @@
+diff --git a/src/rhi/pipeline/synth.py b/src/rhi/pipeline/synth.py
+index 9768218..a238a9f 100644
+--- a/src/rhi/pipeline/synth.py
++++ b/src/rhi/pipeline/synth.py
+@@ -69,9 +69,11 @@ def import_path(pyproject: Path = config.REPO_ROOT / "pyproject.toml") -> list[s
+ def config_reader(scope: cdk.Stack) -> iam.PolicyStatement:
+     """The one read the step makes of SSM: every parameter under the configuration prefix, which is
+     what the `ssm` source asks for, by path."""
+-    prefix = config.SSM_PREFIX.strip("/")
+-    parameters = f"arn:{scope.partition}:ssm:{scope.region}:{scope.account}:parameter/{prefix}"
+-    return iam.PolicyStatement(actions=["ssm:GetParametersByPath"], resources=[parameters, f"{parameters}/*"])
++    parameters = f"arn:{scope.partition}:ssm:{scope.region}:{scope.account}:parameter"
++    return iam.PolicyStatement(
++        actions=["ssm:GetParametersByPath", "ssm:GetParameter", "ssm:GetParameters"],
++        resources=[f"{parameters}/*"],
++    )
+ 
+ 
+ def synth_step(scope: cdk.Stack, source: pipelines.IFileSetProducer) -> pipelines.CodeBuildStep:

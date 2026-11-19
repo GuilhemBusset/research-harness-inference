@@ -10,8 +10,13 @@ A service imports `rhi_common`, its own package and the libraries of its depende
   nothing for a stack that the context `aws:cdk:bundling-stacks` excludes.
 - `image_context` gives a container image its build context: the two packages, the service's
   Dockerfile and the group's requirements file with hashes, which the Dockerfile installs.
+  `upstream_image_context` gives the context of an image that adds nothing of the repository to
+  the image it starts from: its Dockerfile alone.
 
-Neither holds anything else of the repository. A function that needs a list kept elsewhere in it
+`bundle` is the layout of a function's bundle, in any directory: the release's files carry the
+lifecycle agent in it (`rhi.pools.release`).
+
+None holds anything else of the repository. A function that needs a list kept elsewhere in it
 gets it at synthesis, as an environment variable its construct sets.
 """
 
@@ -150,10 +155,40 @@ def image_context(service: str, dockerfile: Path, *, repo: Path = REPO) -> str:
     _package(service, repo)
     context = Path(tempfile.mkdtemp(prefix=f"rhi-{service}-image-"))
     atexit.register(shutil.rmtree, context, ignore_errors=True)
-    _copy_packages(service, repo, context)
+    copy_packages(service, repo, context)
     shutil.copyfile(dockerfile, context / "Dockerfile")
     (context / "requirements.txt").write_text(requirements(service, repo=repo), encoding="utf-8")
     return str(context)
+
+
+def upstream_image_context(dockerfile: Path) -> str:
+    """A build context for an image that holds nothing of the repository: `Dockerfile` (a copy of
+    `dockerfile`) and nothing else, for the `directory` of a `DockerImageAsset`.
+
+    The image's asset hash covers that one file. The directory is a temporary one, as in
+    `image_context`.
+    """
+    context = Path(tempfile.mkdtemp(prefix="rhi-upstream-image-"))
+    atexit.register(shutil.rmtree, context, ignore_errors=True)
+    shutil.copyfile(dockerfile, context / "Dockerfile")
+    return str(context)
+
+
+def bundle(service: str, platform: str, into: Path, *, repo: Path = REPO, locked: str | None = None) -> None:
+    """Fill `into` with a function's bundle: `rhi_common`, the service's package and the libraries
+    of the service's group, installed for the Lambda runtime's Python on `platform`.
+
+    `locked` is the group's requirements file when the caller already holds it.
+    """
+    copy_packages(service, repo, into)
+    with tempfile.TemporaryDirectory(prefix="rhi-bundle-") as scratch:
+        requirements_file = Path(scratch) / "requirements.txt"
+        requirements_file.write_text(requirements(service, repo=repo) if locked is None else locked, encoding="utf-8")
+        install(install_command(requirements_file, into, platform))
+    # What uv leaves beside the libraries: its lock on the directory, and the libraries'
+    # command-line scripts, which start with the path of the Python of this machine.
+    (into / ".lock").unlink(missing_ok=True)
+    shutil.rmtree(into / "bin", ignore_errors=True)
 
 
 def _package(service: str, repo: Path) -> Path:
@@ -164,7 +199,7 @@ def _package(service: str, repo: Path) -> Path:
     return repo / SERVICES[service]
 
 
-def _copy_packages(service: str, repo: Path, into: Path) -> None:
+def copy_packages(service: str, repo: Path, into: Path) -> None:
     """Copy `rhi_common` and the service's package to the root of a bundle or of a build context."""
     for package in (repo / COMMON, _package(service, repo)):
         shutil.copytree(package, into / package.name, ignore=shutil.ignore_patterns(_CACHE))
@@ -186,14 +221,5 @@ class _LocalBundle:
         The bundling options are not used. jsii passes them as one value, where the interface
         declares keywords, so both forms are accepted.
         """
-        bundle = Path(output_dir)
-        _copy_packages(self._service, self._repo, bundle)
-        with tempfile.TemporaryDirectory(prefix="rhi-bundle-") as scratch:
-            requirements_file = Path(scratch) / "requirements.txt"
-            requirements_file.write_text(self._locked, encoding="utf-8")
-            install(install_command(requirements_file, bundle, self._platform))
-        # What uv leaves beside the libraries: its lock on the directory, and the libraries'
-        # command-line scripts, which start with the path of the Python of this machine.
-        (bundle / ".lock").unlink(missing_ok=True)
-        shutil.rmtree(bundle / "bin", ignore_errors=True)
+        bundle(self._service, self._platform, Path(output_dir), repo=self._repo, locked=self._locked)
         return True

@@ -1,0 +1,13 @@
+diff --git a/src/rhi/access/tables.py b/src/rhi/access/tables.py
+index 0ca6f87..d688965 100644
+--- a/src/rhi/access/tables.py
++++ b/src/rhi/access/tables.py
+@@ -44,7 +44,7 @@ def protected_table(scope: Construct, construct_id: str, schema: Table) -> dynam
+         point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+             point_in_time_recovery_enabled=True
+         ),
+-        deletion_protection=True,
++        deletion_protection=False,
+         removal_policy=cdk.RemovalPolicy.RETAIN,
+     )
+     for index in schema.indexes:

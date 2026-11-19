@@ -15,6 +15,8 @@ The secret is read once, by the first status of an execution environment, and ke
 creates it after the first deployment, so it can be absent: that, a value that is not the three
 fields and a key that cannot sign all raise `CredentialError`, which carries nothing AWS said.
 A read that failed is not kept: the next status reads again.
+`has_credential` reads the secret the same way and only says whether it holds the three fields,
+so that the function can post nothing at all while it does not.
 
 A status is posted with an installation token, which GitHub gives for a token the App's key
 signed. The installation token stays in memory until less than five minutes of its validity
@@ -124,6 +126,42 @@ def _error_code(answer: object) -> str | None:
     return None
 
 
+def _read_credential(secrets: Any) -> _Credential:
+    """The App's credential, from the secret `RHI_REPORTER_SECRET` names, read with `secrets` or,
+    without one, a client the function's credentials and region make. `CredentialError` when the
+    secret cannot be read or lacks one of the three fields."""
+    name = os.environ.get(SECRET_VARIABLE)
+    # The SDK's debug log repeats the answer, which holds the key or AWS's message.
+    quiet = logging.root.manager.disable
+    logging.disable(max(quiet, logging.DEBUG))
+    try:
+        client = boto3.client("secretsmanager") if secrets is None else secrets
+        fields = json.loads(client.get_secret_value(SecretId=name)["SecretString"]) if name else None
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+        fields = None
+    finally:
+        logging.disable(quiet)
+    if not isinstance(fields, dict):
+        fields = {}
+    app_id = _number(fields.get("app_id"))
+    installation_id = _number(fields.get("installation_id"))
+    private_key = fields.get("private_key")
+    if app_id is None or installation_id is None or not (isinstance(private_key, str) and private_key):
+        raise CredentialError
+    return _Credential(app_id, installation_id, private_key)
+
+
+def has_credential(secrets: Any = None) -> bool:
+    """Whether the secret `RHI_REPORTER_SECRET` names can be read and holds the three fields, read
+    as `StatusClient` reads it, with `secrets` or a client of the function's own. Raises nothing
+    and logs nothing: the value stays here."""
+    try:
+        _read_credential(secrets)
+    except CredentialError:
+        return False
+    return True
+
+
 class StatusClient:
     """Posts commit statuses on the repository `RHI_REPORTER_REPOSITORY` names. One per execution
     environment: it holds the credential and the installation token. Making one reads nothing.
@@ -174,25 +212,7 @@ class StatusClient:
 
     def _read_credential(self) -> _Credential:
         if self._credential is None:
-            name = os.environ.get(SECRET_VARIABLE)
-            # The SDK's debug log repeats the answer, which holds the key or AWS's message.
-            quiet = logging.root.manager.disable
-            logging.disable(max(quiet, logging.DEBUG))
-            try:
-                secrets = boto3.client("secretsmanager") if self._secrets is None else self._secrets
-                fields = json.loads(secrets.get_secret_value(SecretId=name)["SecretString"]) if name else None
-            except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
-                fields = None
-            finally:
-                logging.disable(quiet)
-            if not isinstance(fields, dict):
-                fields = {}
-            app_id = _number(fields.get("app_id"))
-            installation_id = _number(fields.get("installation_id"))
-            private_key = fields.get("private_key")
-            if app_id is None or installation_id is None or not (isinstance(private_key, str) and private_key):
-                raise CredentialError
-            self._credential = _Credential(app_id, installation_id, private_key)
+            self._credential = _read_credential(self._secrets)
         return self._credential
 
     def _app_token(self, credential: _Credential) -> str:

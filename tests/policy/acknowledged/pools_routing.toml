@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-ELB2" = "The internal load balancer keeps no access logs: only the gateway reaches it, and the gateway records every request it forwards, so a bucket of access logs would add storage and its cost that nothing in the design reads."

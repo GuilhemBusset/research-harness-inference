@@ -1,0 +1,192 @@
+"""The asset step builds an image for linux/arm64 as well as one for linux/amd64 in the same run
+(system design, sections 4.2, 4.3 and 8.2, step 4).
+
+The app's stage holds no image yet, so these tests give the pipeline stack a stage of their own:
+one image for each platform and one file. CodeBuild's build hosts are x86_64, so a project that
+publishes an image installs an emulator for arm64 and a builder that can target either platform,
+each pinned by a digest or by a version and its checksum, and its publishing builds with them.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+from rhi import config
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+PIPELINE_TEMPLATE = "RhiPipeline.template.json"
+ASSET_STAGE = "Assets"
+PUBLISHES = re.compile(r"cdk-assets .* publish .*")
+# What CDK Pipelines installs in every asset project, file or image: its publisher. The asset step
+# installs the rest to build images.
+INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@\S+")
+
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}")
+EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+")
+CHECKSUM = re.compile(r"\b[0-9a-f]{64}\b")
+
+
+def synthesize(folder: Path) -> dict[str, Any]:
+    """The pipeline stack's template, for a stage with an arm64 image, an amd64 image and a file.
+    A caller asks for `app_module` first: it imports the CDK the way the sandbox needs
+    (`conftest.py`)."""
+    import aws_cdk as cdk
+    from aws_cdk import aws_ecr_assets as ecr_assets
+    from aws_cdk import aws_s3_assets as s3_assets
+
+    from rhi.pipeline.stack import PipelineStack
+
+    (folder / "image").mkdir(parents=True)
+    (folder / "image" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (folder / "file.txt").write_text("A file.\n", encoding="utf-8")
+    context = {"aws:cdk:bundling-stacks": []}
+    app = cdk.App(outdir=str(folder / "cdk.out"), context=context, analytics_reporting=False)
+    stage = cdk.Stage(app, "Rhi")
+    stack = cdk.Stack(stage, "Assets")
+    for name, platform in (("Arm64", ecr_assets.Platform.LINUX_ARM64), ("Amd64", ecr_assets.Platform.LINUX_AMD64)):
+        ecr_assets.DockerImageAsset(stack, name, directory=str(folder / "image"), platform=platform)
+    s3_assets.Asset(stack, "File", path=str(folder / "file.txt"))
+    PipelineStack(app, "RhiPipeline", config=config.load({"RHI_CONFIG": "example"}), stage=stage)
+    outdir = Path(app.synth().directory)
+    return json.loads((outdir / PIPELINE_TEMPLATE).read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="module")
+def template(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    return synthesize(tmp_path_factory.mktemp("assets"))
+
+
+def asset_projects(template: dict[str, Any]) -> list[dict[str, Any]]:
+    """The projects the actions of the asset stage run."""
+    (pipeline,) = [r["Properties"] for r in template["Resources"].values() if r["Type"] == "AWS::CodePipeline::Pipeline"]
+    (stage,) = [stage for stage in pipeline["Stages"] if stage["Name"] == ASSET_STAGE]
+    return [template["Resources"][a["Configuration"]["ProjectName"]["Ref"]]["Properties"] for a in stage["Actions"]]
+
+
+def image_projects(template: dict[str, Any]) -> list[dict[str, Any]]:
+    """The asset projects that run Docker: CDK Pipelines makes privileged those that publish images."""
+    return [project for project in asset_projects(template) if project["Environment"]["PrivilegedMode"]]
+
+
+def build_spec(project: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(project["Source"]["BuildSpec"])
+
+
+def installed(template: dict[str, Any]) -> list[str]:
+    """What the image projects install beyond CDK Pipelines' publisher."""
+    return [
+        command
+        for project in image_projects(template)
+        for command in build_spec(project)["phases"]["install"]["commands"]
+        if not INSTALLS_THE_PUBLISHER.fullmatch(command)
+    ]
+
+
+def images_of(words: list[str]) -> list[str]:
+    """The container images a command names: what `docker run` or `docker pull` starts or pulls
+    (options written as one word), and an `image=` option."""
+    found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
+    if words[:2] in (["docker", "run"], ["docker", "pull"]):
+        found += [next(word for word in words[2:] if not word.startswith("-"))]
+    return found
+
+
+def unpinned(commands: list[str]) -> list[str]:
+    """The tools that install commands name without a version or a digest: an image without its
+    digest, a download without an exact version or whose file no command checks against a
+    checksum, a package without an exact version."""
+    found = []
+    for command in commands:
+        words = shlex.split(command)
+        found += [image for image in images_of(words) if not DIGEST.search(image)]
+        for url in [word for word in words if word.startswith(("https://", "http://"))]:
+            written = words[words.index("-o") + 1] if "-o" in words else url.rsplit("/", 1)[-1]
+            checked = any("sha256sum -c" in other and written in other and CHECKSUM.search(other) for other in commands)
+            if "latest" in url or not EXACT_VERSION.search(url) or not checked:
+                found.append(url)
+        if words[:2] in (["npm", "install"], ["pip", "install"]):
+            packages = [word for word in words[2:] if not word.startswith("-")]
+            found += [package for package in packages if not re.search(r"(@|==)\d+\.\d+\.\d+$", package)]
+    return found
+
+
+def test_each_image_project_installs_the_emulator_and_the_builder_and_builds_with_them(
+    template: dict[str, Any],
+) -> None:
+    projects = image_projects(template)
+    assert len(projects) == 2
+    for project in projects:
+        spec = build_spec(project)
+        install, build = spec["phases"]["install"]["commands"], spec["phases"]["build"]["commands"]
+        words = [shlex.split(command) for command in install]
+        # The emulator: QEMU's arm64 handler, registered with the build host's kernel.
+        assert any(images_of(w) and "binfmt" in images_of(w)[0] and w[-2:] == ["--install", "arm64"] for w in words)
+        # The builder: BuildKit in a container, loading what it builds into Docker, and selected.
+        (create,) = [w for w in words if w[:3] == ["docker", "buildx", "create"]]
+        assert {"--driver", "docker-container", "--use"} <= set(create)
+        assert "default-load=true" in create
+        assert spec["env"]["variables"]["BUILDX_BUILDER"] == create[create.index("--name") + 1]
+        # Installed before the build phase, which publishes, and so builds the image.
+        assert build and all(PUBLISHES.fullmatch(command) for command in build)
+        assert not any(PUBLISHES.fullmatch(command) for command in install)
+
+
+def test_the_file_project_is_left_as_cdk_pipelines_writes_it(template: dict[str, Any]) -> None:
+    (project,) = [p for p in asset_projects(template) if not p["Environment"]["PrivilegedMode"]]
+    spec = build_spec(project)
+    assert "env" not in spec
+    assert all(INSTALLS_THE_PUBLISHER.fullmatch(command) for command in spec["phases"]["install"]["commands"])
+
+
+def test_tools_are_pinned(template: dict[str, Any]) -> None:
+    commands = installed(template)
+    assert commands
+    assert unpinned(commands) == []
+
+
+PINNED_BUILDX = [
+    "curl -fsSL -o docker-buildx https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64",
+    f'echo "{"0" * 64}  docker-buildx" | sha256sum -c -',
+]
+
+
+@pytest.mark.parametrize(
+    "commands",
+    [
+        pytest.param(["docker run --privileged --rm tonistiigi/binfmt:latest --install arm64"], id="an image by tag"),
+        pytest.param(["docker run --privileged --rm tonistiigi/binfmt --install arm64"], id="an image by name"),
+        pytest.param(
+            ["docker buildx create --driver docker-container --driver-opt image=moby/buildkit --use"],
+            id="an image option by name",
+        ),
+        pytest.param(
+            ["curl -fsSL -o docker-buildx https://github.com/docker/buildx/releases/latest/download/buildx.linux-amd64"]
+            + PINNED_BUILDX[1:],
+            id="the latest download",
+        ),
+        pytest.param(PINNED_BUILDX[:1], id="a download no checksum checks"),
+        pytest.param(["npm install -g some-tool"], id="a package by name"),
+    ],
+)
+def test_a_tool_without_a_version_or_a_digest_is_refused(commands: list[str]) -> None:
+    assert unpinned(PINNED_BUILDX) == []
+    assert unpinned(commands) != []
+
+
+def test_tools_are_pinned_fails_on_the_stack_with_an_unpinned_tool(
+    app_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rhi.pipeline import stack
+
+    by_tag = [re.sub(r"(tonistiigi/binfmt):\S+", r"\1:latest", command) for command in stack.IMAGE_BUILDER]
+    assert by_tag != stack.IMAGE_BUILDER
+    monkeypatch.setattr(stack, "IMAGE_BUILDER", by_tag)
+    assert unpinned(installed(synthesize(tmp_path))) == ["tonistiigi/binfmt:latest"] * 2

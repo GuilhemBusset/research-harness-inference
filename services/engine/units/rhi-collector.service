@@ -1,0 +1,44 @@
+# The collector: an OpenTelemetry collector with the release's configuration
+# (services/engine/collector/config.yaml; system design, "What happens on an instance" and
+# "Observability"). The boot program starts it at every start of the instance.
+#
+# The image is named by the digest of its multi-platform index, so the docker of each pool's host
+# takes its own platform from it. It is Bindplane's distribution of the OpenTelemetry collector,
+# release 1.112.0, on Ubuntu. It holds every component the configuration names, from release
+# 0.164.1 of the contrib repository, which reads the configuration as it stands, and it carries
+# journalctl, which the journal receiver runs. The contrib distribution's own image holds the
+# collector and no other program, so its journal receiver could not start. An update is a change
+# to that one line.
+#
+# The network is the host's: the collector scrapes the engine and the lifecycle agent on the
+# loopback address, and the engine's metrics route answers no other. The collector's own
+# listener, its metrics, is on the loopback address too, and no port is published.
+#
+# The journal of the instance's units is the host's, mounted read-only: the persistent one, the
+# one of the current boot, and the machine's ID, which names the journal's folder. The journal's
+# files and the collector's own directory are root's, so the collector runs as root in its
+# container, where the image's own user is another.
+#
+# /var/lib/rhi-collector is where the collector keeps the place it reached in the journal.
+
+[Unit]
+Description=The OpenTelemetry collector: the instance's metrics and its units' journal
+Requires=docker.service
+After=docker.service
+
+[Service]
+EnvironmentFile=/run/rhi/release.env
+StateDirectory=rhi-collector
+ExecStartPre=-/usr/bin/docker rm --force rhi-collector
+ExecStart=/usr/bin/docker run --rm --name rhi-collector --network host --user 0:0 \
+    --env RHI_POOL --env RHI_WORKSPACE_URL --env RHI_REGION --env RHI_LOG_GROUP \
+    --volume /opt/rhi/release/collector/config.yaml:/opt/rhi/release/collector/config.yaml:ro \
+    --volume /var/lib/rhi-collector:/var/lib/rhi-collector \
+    --volume /var/log/journal:/var/log/journal:ro \
+    --volume /run/log/journal:/run/log/journal:ro \
+    --volume /etc/machine-id:/etc/machine-id:ro \
+    observiq/observiq-otel-collector:1.112.0@sha256:92ff58e356e843e18b976866be87678abced55cd5635a4371036c6e8a3879f7a \
+    --config /opt/rhi/release/collector/config.yaml
+ExecStop=/usr/bin/docker stop rhi-collector
+Restart=on-failure
+RestartSec=5

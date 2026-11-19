@@ -36,13 +36,35 @@ OWNERS_KEYS = {
 # Part of every bad value below, so a test can tell that an error does not repeat the value.
 MARK = "7701"
 
+# The gateway's task count and its numeric settings, each at the default of section 17 (the task
+# count: sections 2 and 11.2).
+GATEWAY_KEYS = {
+    "gateway_tasks": 2,
+    "request_body_limit_bytes": 8388608,
+    "longest_request_seconds": 1800,
+    "keepalive_seconds": 10,
+    "retry_after_warming_seconds": 30,
+    "retry_after_capacity_unavailable_seconds": 60,
+    "retry_after_concurrency_limit_seconds": 5,
+}
+
+
+# A pool's table in the example: its header and its lines up to the next header or the end.
+POOL_TABLE = re.compile(r"^\[pools\.[^\]\n]+\]\n(?:[^\[\n].*\n|\n)*", re.MULTILINE)
+
 
 def example_with(**lines: str | None) -> str:
-    """The example's text with the value of each named key replaced, or the key removed (None)."""
+    """The example's text with the value of each named key replaced, or the key removed (None).
+    The pools are tables, `[pools.<name>]`, at the end: `pools` removes them, and a value given
+    for it is written after the other keys."""
     text = EXAMPLE.read_text(encoding="utf-8")
     for key, value in lines.items():
         line = "" if value is None else f"{key} = {value}\n"
-        text, count = re.subn(rf"^{key} = .*\n", line, text, flags=re.MULTILINE)
+        if key == "pools":
+            text, count = POOL_TABLE.subn("", text)
+            text = line + text
+        else:
+            text, count = re.subn(rf"^{key} = .*\n", line, text, flags=re.MULTILINE)
         assert count == 1, key
     return text
 
@@ -78,7 +100,7 @@ def test_the_two_sources_give_the_same_typed_object(tmp_path: Path) -> None:
     assert type(from_example.monthly_budget_usd) is int
     assert type(from_example.course_end) is datetime.date
     assert from_example.session_windows == ()
-    assert from_example.pools == ()
+    assert [pool.name for pool in from_example.pools] == ["mock"]
     # The file source reads its own file, not the example.
     assert load_text(tmp_path, example_with(github_owner='"another-owner"')).github_owner == "another-owner"
 
@@ -164,9 +186,23 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("course_end", f"{MARK}-01-01T10:00:00"),
         ("session_windows", f'"{MARK}"'),
         ("pools", f'"{MARK}"'),
+        ("pools", f"[{MARK}]"),
+        ("allowed_instance_types", f'"{MARK}"'),
+        ("allowed_instance_types", f"[{MARK}]"),
+        ("on_demand_price_limit", f'"{MARK}"'),
+        ("on_demand_price_limit", f"-{MARK}"),
+        ("on_demand_price_limit", "0"),
+        ("on_demand_price_limit", "true"),
+        ("default_pool", MARK),
         ("https_listener", f'"{MARK}"'),
         ("https_listener", '"true"'),
         ("https_listener", "1"),
+        *(
+            (key, value)
+            for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
+            for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")
+        ),
+        *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -203,6 +239,36 @@ def test_https_listener_reads_false_when_left_out(tmp_path: Path) -> None:
     assert load_text(tmp_path, example_with(https_listener="false")).https_listener is False
 
 
+def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
+    # Section 17: the issuer's reserved concurrency and a student's issuances a day are both 5.
+    left_out = load_text(tmp_path, example_with(issuer_reserved_concurrency=None, key_issuances_per_day=None))
+    assert (left_out.issuer_reserved_concurrency, left_out.key_issuances_per_day) == (5, 5)
+    # The example gives each, at its default; a source that gives another value keeps it.
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert (example["issuer_reserved_concurrency"], example["key_issuances_per_day"]) == (5, 5)
+    given = load_text(tmp_path, example_with(issuer_reserved_concurrency="2", key_issuances_per_day="3"))
+    assert (given.issuer_reserved_concurrency, given.key_issuances_per_day) == (2, 3)
+
+
+def test_nightly_stop_reads_02_00_when_left_out(tmp_path: Path) -> None:
+    # Section 17: the nightly stop is at 02:00; the example gives that, and a given time is kept.
+    assert load_text(tmp_path, example_with(nightly_stop=None)).nightly_stop == "02:00"
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["nightly_stop"] == "02:00"
+    assert load_text(tmp_path, example_with(nightly_stop='"23:30"')).nightly_stop == "23:30"
+
+
+def test_the_gateway_s_seven_keys_read_their_defaults_when_left_out(tmp_path: Path) -> None:
+    # The owner's deployed configuration has none of them: a source that leaves them out loads.
+    left_out = load_text(tmp_path, example_with(**dict.fromkeys(GATEWAY_KEYS)))
+    assert {key: getattr(left_out, key) for key in GATEWAY_KEYS} == GATEWAY_KEYS
+    assert GATEWAY_KEYS.keys() & config.required_keys() == set()
+    # The example gives each, at its default; a source that gives another value keeps it.
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert {key: example.get(key) for key in GATEWAY_KEYS} == GATEWAY_KEYS
+    given = load_text(tmp_path, example_with(**{key: str(value + 1) for key, value in GATEWAY_KEYS.items()}))
+    assert {key: getattr(given, key) for key in GATEWAY_KEYS} == {key: value + 1 for key, value in GATEWAY_KEYS.items()}
+
+
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     later = dataclasses.make_dataclass("Later", [("later_key", str | None)], bases=(config.Config,), frozen=True)
     monkeypatch.setattr(config, "Config", later)
@@ -210,7 +276,7 @@ def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert "'later_key'" in refusal(tmp_path, example_with())
 
-    monkeypatch.setattr(config, "OPTIONAL", frozenset({"later_key"}))
+    monkeypatch.setattr(config, "OPTIONAL", config.OPTIONAL | {"later_key"})
     assert getattr(load_text(tmp_path, example_with()), "later_key", "unset") is None
 
 
@@ -257,13 +323,15 @@ def test_only_the_owners_keys_are_required(tmp_path: Path, monkeypatch: pytest.M
     assert config.required_keys() == OWNERS_KEYS
     assert {field.name for field in dataclasses.fields(config.Config)} == set(config.KEYS)
 
-    # The two lists are keys, and neither accepts an entry yet, in either TOML spelling.
-    for key in ("session_windows", "pools"):
-        for text in (example_with(**{key: f'[{{ name = "entry{MARK}" }}]'}),
-                     example_with(**{key: None}) + f'[[{key}]]\nname = "entry{MARK}"\n'):
-            message = refusal(tmp_path, text)
-            assert repr(key) in message
-            assert MARK not in message
+    # A valid pool entry is accepted, as a table or inline; a session window is not, in either spelling.
+    inline = "{ mock = { " + ", ".join(f"{field} = {value}" for field, value in MOCK_LINES) + " } }"
+    for text in (example_with(), example_with(pools=inline)):
+        assert [pool.name for pool in load_text(tmp_path, text).pools] == ["mock"]
+    for text in (example_with(session_windows=f'[{{ name = "entry{MARK}" }}]'),
+                 example_with(session_windows=None) + f'[[session_windows]]\nname = "entry{MARK}"\n'):
+        message = refusal(tmp_path, text)
+        assert repr("session_windows") in message
+        assert MARK not in message
 
     # The set is derived: a key added with no default, and not optional, would be required.
     monkeypatch.setitem(config.KEYS, "later_key", config.KEYS["domain"])
@@ -271,7 +339,7 @@ def test_only_the_owners_keys_are_required(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setitem(config.DEFAULTS, "later_key", "a default")
     assert config.required_keys() == OWNERS_KEYS
     monkeypatch.delitem(config.DEFAULTS, "later_key")
-    monkeypatch.setattr(config, "OPTIONAL", frozenset({"later_key"}))
+    monkeypatch.setattr(config, "OPTIONAL", config.OPTIONAL | {"later_key"})
     assert config.required_keys() == OWNERS_KEYS
 
 
@@ -298,4 +366,84 @@ def test_rate_limits_read_the_defaults_of_section_17_when_left_out(tmp_path: Pat
 def test_rate_limits_refuse_what_waf_would_not_take(tmp_path: Path, value: str) -> None:
     message = refusal(tmp_path, example_with(rate_limits=value))
     assert "'rate_limits'" in message
+    assert MARK not in message
+
+
+# The mock pool's lines, as the example gives them (sections 4.2 and 17, evidence E15).
+MOCK_LINES = (
+    ("engine", '"mock"'),
+    ("instance_types", '["t4g.small"]'),
+    ("prices", '{ "t4g.small" = 0.02 }'),
+    ("wake", '"on-demand"'),
+    ("max_instances", "2"),
+    ("warm_instances", "1"),
+    ("target_concurrency", "8"),
+    ("context_length", "262144"),
+    ("largest_output", "32000"),
+)
+
+
+def with_a_second_pool(text: str) -> str:
+    """The text with a second pool, `second`, the mock's copy."""
+    return text + "\n[pools.second]\n" + "".join(f"{field} = {value}\n" for field, value in MOCK_LINES)
+
+
+def test_the_example_holds_the_mock_pool() -> None:
+    loaded = config.load({"RHI_CONFIG": "example"})
+    (mock,) = loaded.pools
+    assert (mock.name, mock.engine, mock.instance_types) == ("mock", "mock", ("t4g.small",))
+    assert mock.prices == {"t4g.small": 0.02}
+    assert (mock.wake, mock.max_instances, mock.warm_instances, mock.target_concurrency) == ("on-demand", 2, 1, 8)
+    assert (mock.context_length, mock.largest_output) == (262144, 32000)
+    assert (mock.expected, mock.measured_start_seconds) == (None, None)
+    assert (loaded.allowed_instance_types, loaded.on_demand_price_limit) == (("t4g.small",), 5)
+    assert loaded.default_pool == "mock"
+    # The pools are those the example's lines give, parsed.
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["pools"] == {
+        "mock": {field: tomllib.loads(f"v = {value}")["v"] for field, value in MOCK_LINES}
+    }
+
+
+def test_the_three_pool_keys_default_from_the_only_pool(tmp_path: Path) -> None:
+    text = example_with(allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
+    loaded = load_text(tmp_path, text)
+    assert loaded.default_pool == "mock"
+    assert loaded.allowed_instance_types == ("t4g.small",)
+    assert loaded.on_demand_price_limit == 5
+    assert config.DEFAULTS["on_demand_price_limit"] == 5
+
+
+def test_an_empty_pools_table_needs_no_new_key(tmp_path: Path) -> None:
+    # The deployed configuration until the owner adds the mock pool; `[]` is its earlier spelling.
+    for pools in ("{}", "[]"):
+        text = example_with(pools=pools, allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
+        loaded = load_text(tmp_path, text)
+        assert (loaded.pools, loaded.allowed_instance_types, loaded.default_pool) == ((), (), None)
+        assert loaded.on_demand_price_limit == 5
+
+
+def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
+    wider = load_text(tmp_path, example_with(allowed_instance_types='["t4g.small", "g7e.2xlarge"]'))
+    assert wider.allowed_instance_types == ("t4g.small", "g7e.2xlarge")
+    two = load_text(tmp_path, with_a_second_pool(example_with(default_pool='"second"')))
+    assert ([pool.name for pool in two.pools], two.default_pool) == (["mock", "second"], "second")
+    assert load_text(tmp_path, example_with(on_demand_price_limit="0.5")).on_demand_price_limit == 0.5
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        pytest.param(example_with(default_pool=f'"pool{MARK}"'), "default_pool", id="default-names-no-pool"),
+        pytest.param(example_with(pools="{}", default_pool=f'"pool{MARK}"'), "default_pool", id="default-with-no-pool"),
+        pytest.param(with_a_second_pool(example_with(default_pool=None)), "default_pool", id="two-pools-no-default"),
+        pytest.param(
+            example_with(allowed_instance_types=f'["t{MARK}.small"]'), "allowed_instance_types", id="not-allowed"
+        ),
+        pytest.param(example_with(allowed_instance_types="[]"), "allowed_instance_types", id="none-allowed"),
+        pytest.param(example_with(on_demand_price_limit="0.01"), "on_demand_price_limit", id="priced-above-limit"),
+    ],
+)
+def test_a_key_read_against_the_pools_is_refused_by_name(tmp_path: Path, text: str, key: str) -> None:
+    message = refusal(tmp_path, text)
+    assert repr(key) in message
     assert MARK not in message

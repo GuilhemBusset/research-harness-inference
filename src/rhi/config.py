@@ -14,17 +14,27 @@ to the example. An error names a key, a parameter or a source and never a value:
 it.
 
 **The configuration in SSM.** One String parameter per key, named `SSM_PREFIX` followed by the
-key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the entry: an
-empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
-`false` (`True` and `False` are read too), a date as YYYY-MM-DD, an empty list as `[]` and a
-table as a TOML inline table (`{ issuer = 100 }`). The prefix holds the configuration and
-nothing else. The source reads the prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
+key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the pool's name:
+an empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
+`false` (`True` and `False` are read too), a date as YYYY-MM-DD, a list as a JSON array (an empty
+one as `[]`), a pool's entry as a JSON object and the rate limits as a TOML inline table
+(`{ issuer = 100 }`). The prefix holds the configuration and nothing else. The source reads the
+prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
 no key, like an unknown key. No value is a credential (system design, section 10), so none is a
 SecureString. The module names no region and no account.
 
 `write_ssm` and `write_file` write a configuration back out, in the form the ssm source and the
 file source read: each source loads what its writer wrote as the same object. The AWS SDK is
 imported by the ssm source and by `write_ssm` only, when one of them runs.
+
+**The pools.** The `pools` table maps each pool's name to its entry (`[pools.<name>]` in TOML),
+which the pool parser of `rhi_common.pool_config` validates when the configuration loads, with the
+configuration's `on_demand_price_limit`. Two keys are then read against the pools:
+`allowed_instance_types`, left out, is every instance type the pools list, so that it never needs
+a value the deployed configuration lacks; given, a pool that lists another type is refused.
+`default_pool`, the pool the gateway maps `claude-*` model names to (sections 5.4 and 6.2), left
+out, is the only pool when there is one and none when there is none; with two pools or more it
+must be given, and given, it must name a pool.
 
 The region and the account are not configuration. They come from the deploying credentials
 (assumption A4), so no key holds either.
@@ -37,8 +47,10 @@ It is added to `Config`, to `KEYS` and to `config.example.toml` together.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
+import math
 import os
 import re
 import tomllib
@@ -46,6 +58,8 @@ import zoneinfo
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from rhi_common.pool_config import DEFAULT_ON_DEMAND_PRICE_LIMIT, Pool, PoolConfigError, parse_pools
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -96,12 +110,37 @@ class Config:
     time_zone: str
     course_end: datetime.date
     session_windows: tuple[()]
-    # One entry per pool.
-    pools: tuple[()]
+    # One entry per pool, parsed by `rhi_common.pool_config`, in the table's order.
+    pools: tuple[Pool, ...]
+    # The instance types a pool may list: a hard cap (section 11.3).
+    allowed_instance_types: tuple[str, ...]
+    # Dollars an hour: a pool with an instance type priced above it may not wake on demand (17).
+    on_demand_price_limit: float
+    # The pool of the `claude-*` model names, or None when no pool is configured (5.4, 6.2).
+    default_pool: str | None
     # Whether the public load balancer has its certificate, its HTTPS listener and the domain's
     # alias record. Off until the owner's domain resolves through the hosted zone: before that,
     # the certificate's DNS validation never completes and the deployment fails.
     https_listener: bool
+    # The issuer's reserved concurrency, and the most keys a student may be issued over one UTC
+    # day, which reaches the issuer as RHI_ISSUANCES_PER_DAY (sections 6.4 and 17).
+    issuer_reserved_concurrency: int
+    key_issuances_per_day: int
+    # The time of day, HH:MM in `time_zone`, at which each pool's group is set to no instance
+    # (sections 5.1 and 17). Only synthesis reads it: it reaches no service.
+    nightly_stop: str
+    # How many gateway tasks the service runs (sections 2 and 11.2). Only the deployment reads it.
+    gateway_tasks: int
+    # The gateway's numeric settings (section 17), each of which the deployment writes into the
+    # variable `services/gateway/rhi_gateway/settings.py` reads it from: the largest request body
+    # in bytes, the longest request and the keep-alive interval of a hold in seconds, and the
+    # seconds of `Retry-After` for the three causes that carry one.
+    request_body_limit_bytes: int
+    longest_request_seconds: int
+    keepalive_seconds: int
+    retry_after_warming_seconds: int
+    retry_after_capacity_unavailable_seconds: int
+    retry_after_concurrency_limit_seconds: int
     # The web ACL's three rate limits, read at synthesis only.
     rate_limits: RateLimits
 
@@ -135,6 +174,13 @@ def _whole_dollars(value: object) -> int:
     return value
 
 
+def _whole_number(value: object) -> int:
+    # A TOML boolean is a Python int: it is not a count.
+    if type(value) is not int or value <= 0:
+        raise ValueError
+    return value
+
+
 def _date(value: object) -> datetime.date:
     # A date with a time of day is a subclass of a date: it is refused too.
     if type(value) is not datetime.date:
@@ -152,6 +198,13 @@ def _time_zone(value: object) -> str:
     return value
 
 
+def _time_of_day(value: object) -> str:
+    # Hours and minutes, each of two digits, on a 24-hour clock.
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError
+    return value
+
+
 def _boolean(value: object) -> bool:
     if type(value) is not bool:
         raise ValueError
@@ -164,6 +217,32 @@ def _no_entries(value: object) -> tuple[()]:
     if not isinstance(value, list) or value:
         raise ValueError
     return ()
+
+
+def _pool_table(value: object) -> Mapping[str, object]:
+    # An empty list is read as an empty table: the spelling of the table before pools had a shape.
+    if isinstance(value, list) and not value:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError  # noqa: TRY004 - every refusal of a value is a ValueError, which `parse` turns into a ConfigError
+    return value
+
+
+def _pools(value: object) -> tuple[Pool, ...]:
+    # The shape of every entry. The price limit is another key's: `parse` checks it once both are read.
+    return parse_pools(_pool_table(value), on_demand_price_limit=math.inf)
+
+
+def _instance_types(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError
+    return tuple(value)
+
+
+def _dollars_an_hour(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError
+    return float(value)
 
 
 # What WAF accepts as the limit of a rate-based rule.
@@ -205,6 +284,10 @@ def _list_from_text(text: str) -> object:
     return [] if text == "[]" else text
 
 
+def _price_from_text(text: str) -> object:
+    return float(text) if re.fullmatch(r"[0-9]{1,18}(\.[0-9]{1,18})?", text) else text
+
+
 def _table_from_text(text: str) -> object:
     # A TOML inline table, as `write_ssm` writes it.
     try:
@@ -213,8 +296,17 @@ def _table_from_text(text: str) -> object:
         return text
 
 
+def _json_from_text(text: str) -> object:
+    # A text that is not JSON is returned as it is, for the key's parser to refuse.
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
 _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
+_WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -229,8 +321,21 @@ KEYS: dict[str, Key] = {
     "time_zone": Key("an IANA time zone name that this host's time zone database knows", _time_zone),
     "course_end": Key("a date, written YYYY-MM-DD without quotes", _date, _date_from_text),
     "session_windows": _EMPTY_LIST,
-    "pools": _EMPTY_LIST,
+    "pools": Key("a table of pools, one entry per pool, each as section 4.2 gives it", _pools, _json_from_text),
     "https_listener": Key("true or false, without quotes", _boolean, _boolean_from_text),
+    "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
+    "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
+    "default_pool": _STRING,
+    "issuer_reserved_concurrency": _WHOLE_NUMBER,
+    "key_issuances_per_day": _WHOLE_NUMBER,
+    "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
+    "gateway_tasks": _WHOLE_NUMBER,
+    "request_body_limit_bytes": _WHOLE_NUMBER,
+    "longest_request_seconds": _WHOLE_NUMBER,
+    "keepalive_seconds": _WHOLE_NUMBER,
+    "retry_after_warming_seconds": _WHOLE_NUMBER,
+    "retry_after_capacity_unavailable_seconds": _WHOLE_NUMBER,
+    "retry_after_concurrency_limit_seconds": _WHOLE_NUMBER,
     "rate_limits": Key(
         "a table whose optional entries per_address, issuer and grafana are whole numbers from 10 to 2000000000",
         _rate_limits,
@@ -246,13 +351,33 @@ DEFAULTS: dict[str, object] = {
     # The design gives no such key (issue E2-47): off keeps a deployed stage as it was, with no
     # certificate waiting on a domain that does not resolve yet.
     "https_listener": False,
+    # Section 17: 5 dollars an hour.
+    "on_demand_price_limit": DEFAULT_ON_DEMAND_PRICE_LIMIT,
+    # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
+    "issuer_reserved_concurrency": 5,
+    "key_issuances_per_day": 5,
+    # Section 17: the nightly stop is at 02:00 in the configured time zone.
+    "nightly_stop": "02:00",
+    # Sections 2 and 11.2: the gateway runs two tasks.
+    "gateway_tasks": 2,
+    # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, a keep-alive
+    # every 10 seconds of a hold, and a `Retry-After` of 30 seconds for `warming`, 60 for
+    # `capacity_unavailable` and 5 for `concurrency_limit`. The gateway's reader of its environment
+    # (`rhi_gateway.settings`) has the same defaults.
+    "request_body_limit_bytes": 8_388_608,
+    "longest_request_seconds": 1800,
+    "keepalive_seconds": 10,
+    "retry_after_warming_seconds": 30,
+    "retry_after_capacity_unavailable_seconds": 60,
+    "retry_after_concurrency_limit_seconds": 5,
     # Section 17: generous per address, since a campus shares one address; tighter on the issuer
     # and on Grafana.
     "rate_limits": dict(_RATE_LIMIT_DEFAULTS),
 }
 
-# Keys a source may leave out without a default: the field is then None.
-OPTIONAL: frozenset[str] = frozenset()
+# Keys a source may leave out without a default: the field is then None. `parse` fills the two
+# below from the pools (the module's docstring, "The pools").
+OPTIONAL: frozenset[str] = frozenset({"allowed_instance_types", "default_pool"})
 
 # The keys whose values must never appear in the repository. The pipeline's leak check and the
 # owner's list of local values look for exactly these. Numbers and dates are not among them: no
@@ -274,6 +399,9 @@ def parse(data: Mapping[str, object], source: str) -> Config:
         names = ", ".join(repr(name) for name in unknown)
         raise ConfigError(f"the configuration source {source!r} holds an unknown key: {names}")
     values: dict[str, Any] = {}
+    # Where each key's value came from, and the value as it came, for the keys read against the pools.
+    origins: dict[str, str] = {}
+    raws: dict[str, object] = {}
     for name, key in KEYS.items():
         if name in data:
             origin = f"the configuration source {source!r}"
@@ -286,11 +414,50 @@ def parse(data: Mapping[str, object], source: str) -> Config:
             continue
         else:
             raise ConfigError(f"the configuration source {source!r} lacks the key {name!r}, which has no default")
+        origins[name], raws[name] = origin, raw
         try:
             values[name] = key.parse(raw)
-        except ValueError:
-            raise ConfigError(f"the key {name!r} in {origin} must be {key.expected}") from None
+        except ValueError as error:
+            # The pool parser's message names the pool and the field, never a value.
+            detail = f" ({error})" if isinstance(error, PoolConfigError) else ""
+            raise ConfigError(f"the key {name!r} in {origin} must be {key.expected}{detail}") from None
+    values |= _read_against_the_pools(values, origins, raws["pools"], source)
     return Config(**values)
+
+
+def _read_against_the_pools(
+    values: Mapping[str, Any], origins: Mapping[str, str], table: object, source: str
+) -> dict[str, Any]:
+    """The pools parsed again with the configuration's price limit, and the two optional keys
+    that are read against them, checked or filled."""
+    try:
+        pools = parse_pools(_pool_table(table), on_demand_price_limit=values["on_demand_price_limit"])
+    except PoolConfigError as error:
+        raise ConfigError(
+            f"the key 'pools' in {origins['pools']} must hold no pool that wakes on demand above the key "
+            f"'on_demand_price_limit' in {origins['on_demand_price_limit']} ({error})"
+        ) from None
+    allowed = values["allowed_instance_types"]
+    if allowed is None:
+        allowed = tuple(dict.fromkeys(kind for pool in pools for kind in pool.instance_types))
+    for pool in pools:
+        if any(kind not in allowed for kind in pool.instance_types):
+            raise ConfigError(
+                f"the pool {pool.name!r} lists an instance type that the key 'allowed_instance_types' "
+                f"in {origins['allowed_instance_types']} does not allow"
+            )
+    names = [pool.name for pool in pools]
+    default = values["default_pool"]
+    if default is None and len(names) > 1:
+        raise ConfigError(
+            f"the configuration source {source!r} lacks the key 'default_pool': "
+            "with two pools or more, it must name one"
+        )
+    if default is None:
+        default = names[0] if names else None
+    elif default not in names:
+        raise ConfigError(f"the key 'default_pool' in {origins['default_pool']} must name a configured pool")
+    return {"pools": pools, "allowed_instance_types": allowed, "default_pool": default}
 
 
 def _read(path: Path, source: str, where: str) -> dict[str, Any]:
@@ -334,8 +501,12 @@ def _ssm(client: Any) -> tuple[Any, tuple[type[Exception], ...]]:
     errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
     try:
         return (boto3.client("ssm") if client is None else client), errors
-    except errors:
+    except botocore.exceptions.NoRegionError:
         raise ConfigError("no SSM client can be made: the caller's AWS configuration must give a region") from None
+    except errors as error:
+        # The class names the cause (a missing dependency, a profile that cannot be read); its
+        # text is the SDK's and is not repeated.
+        raise ConfigError(f"no SSM client can be made: the AWS SDK raised {type(error).__name__}") from None
 
 
 def read_ssm(client: Any = None) -> Config:
@@ -355,7 +526,7 @@ def read_ssm(client: Any = None) -> Config:
         raise ConfigError(f"the configuration source 'ssm' cannot be read: the parameters under {SSM_PREFIX}") from None
 
     data: dict[str, object] = {}
-    entries: list[object] = []
+    entries: dict[str, object] = {}
     stray: list[str] = []
     not_strings: list[str] = []
     for parameter in sorted(stored, key=lambda parameter: parameter["Name"]):
@@ -370,16 +541,42 @@ def read_ssm(client: Any = None) -> Config:
         elif parameter.get("Type") != "String":
             not_strings.append(name)
         elif is_entry:
-            entries.append(parameter["Value"])
+            entries[entry] = _json_from_text(parameter["Value"])
         else:
             data[key] = KEYS[key].from_text(parameter["Value"])
     for names, problem in ((stray, "that names no key"), (not_strings, "that is not of type String")):
         if names:
             listed = ", ".join(repr(name) for name in names)
             raise ConfigError(f"the configuration source 'ssm' holds a parameter {problem}: {listed}")
-    # The pools table is its entries. `parse` refuses one until entries have a shape.
+    # The pools table is its entries, each under the pool's name.
     data["pools"] = entries
     return parse(data, "ssm")
+
+
+def pool_entry(pool: Pool) -> dict[str, object]:
+    """A pool's entry, as the pool parser reads it: every field the pool holds, but its name."""
+    entry: dict[str, object] = {}
+    for field in dataclasses.fields(Pool):
+        value = getattr(pool, field.name)
+        if field.name == "name" or value is None:
+            continue
+        if dataclasses.is_dataclass(value):
+            value = {key: list(bounds) for key, bounds in dataclasses.asdict(value).items() if bounds is not None}
+        entry[field.name] = list(value) if isinstance(value, tuple) else value
+    return entry
+
+
+def _pool_entries(value: object) -> dict[str, dict[str, object]] | None:
+    """The table of a tuple of pools, or None when the value is not one."""
+    if not isinstance(value, tuple) or not value or not all(isinstance(pool, Pool) for pool in value):
+        return None
+    return {pool.name: pool_entry(pool) for pool in value}
+
+
+def _json(value: object) -> str:
+    text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    text.encode()  # a string that is not text is a ValueError here, not in the middle of the writing
+    return text
 
 
 def _ssm_text(value: object) -> str:
@@ -391,6 +588,9 @@ def _ssm_text(value: object) -> str:
         return "true" if value else "false"
     if type(value) is int:
         return str(value)
+    if type(value) is float and math.isfinite(value):
+        # A whole number of dollars as the owner types it: 5, not 5.0.
+        return str(int(value)) if value.is_integer() and abs(value) < 1e18 else repr(value)
     if type(value) is datetime.date:
         return value.isoformat()
     if isinstance(value, tuple) and not value:
@@ -398,15 +598,30 @@ def _ssm_text(value: object) -> str:
     if isinstance(value, RateLimits):
         # A TOML inline table, in SSM as in a file.
         return "{ " + ", ".join(f"{name} = {_ssm_text(limit)}" for name, limit in vars(value).items()) + " }"
+    table = _pool_entries(value)
+    if table is not None:
+        return _json(table)
+    if isinstance(value, tuple) and all(isinstance(item, str) for item in value):
+        return _json(list(value))
     raise ValueError
+
+
+def _toml_value(value: object) -> str:
+    """A value of a pool's entry or of a list, as TOML writes it inline."""
+    if isinstance(value, str):
+        # A JSON string is a TOML basic string, but for U+007F, which TOML has escaped.
+        return _json(value).replace("\x7f", "\\u007f")
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_value(str(key))} = {_toml_value(item)}" for key, item in value.items()) + " }"
+    return _ssm_text(value)
 
 
 def _toml_text(value: object) -> str:
     """The value as TOML writes it."""
-    if isinstance(value, str):
-        # A JSON string is a TOML basic string, but for U+007F, which TOML has escaped.
-        return json.dumps(_ssm_text(value), ensure_ascii=False).replace("\x7f", "\\u007f")
-    return _ssm_text(value)
+    table = _pool_entries(value)
+    return _toml_value(value if table is None else table)
 
 
 def _written(
@@ -435,8 +650,9 @@ def write_ssm(config: Config, client: Any = None) -> None:
     It deletes none. `client` is as for `read_ssm`. Nothing is written when a key is refused; a
     parameter SSM refuses stops the writing there."""
     texts = _written(config, _ssm_text, lambda key, text: key.from_text(text), "SSM")
-    # The pools table has no parameter of its own: each entry is one, and the table has none.
+    # The pools table has no parameter of its own: each entry is one, under the pool's name.
     del texts["pools"]
+    texts |= {f"pools/{pool.name}": _json(pool_entry(pool)) for pool in config.pools}
     client, errors = _ssm(client)
     for key, text in texts.items():
         name = SSM_PREFIX + key

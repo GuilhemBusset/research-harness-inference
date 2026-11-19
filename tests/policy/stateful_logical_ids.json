@@ -1,0 +1,5 @@
+{
+  "Rhi-Access": ["TablesKeys6B5A3ABF", "TablesRosterDAE02BAB", "TablesUsageA60E9525"],
+  "Rhi-Pools": ["TablesPoolState68A872F7", "TablesHeartbeats613D6AB3"],
+  "Rhi-Observability": ["PrometheusWorkspaceF3098DB6"]
+}

@@ -72,8 +72,7 @@ class HappyPathTests(EngineCase):
         self.assertEqual(self.repo.main_file("docs/a.txt"), "alpha")
         self.assertEqual(self.repo.main_file("docs/b.txt"), "beta")
         self.assertTrue(present(self.repo.main_file("checks/issue_2.sh")).startswith("#!/usr/bin/env bash"))
-        self.assertTrue(present(self.repo.main_file("checks/probe_2.sh")).startswith("#!/usr/bin/env bash"),
-                        "the examiner's passing probe is adopted as locked evidence")
+        self.assertIsNone(self.repo.main_file("checks/probe_2.sh"), "a passing probe of an approved item is not kept")
         self.assertEqual([e["issue"] for e in self.events("merged")], [2, 3])
         first_b = min(e["seq"] for e in self.events("phase", 3) if e["to"] == "plan")
         a_done = min(e["seq"] for e in self.events("phase", 2) if e["to"] == "done")
@@ -109,10 +108,21 @@ class HappyPathTests(EngineCase):
         self.add_work(2, "docs/a.txt", "alpha")
         self.add_work(3, "docs/b.txt", "beta")
         self.epic(2, 3)
-        self.run_engine()
+        self.run_engine(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2))
         building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
         merged = {e["issue"]: e["seq"] for e in self.events("merged")}
         self.assertLess(max(building.values()), min(merged.values()))
+        self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
+
+    def test_by_default_one_issue_is_built_at_a_time(self):
+        self.add_work(2, "docs/a.txt", "alpha")
+        self.add_work(3, "docs/b.txt", "beta")
+        self.epic(2, 3)
+        self.run_engine()
+        building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
+        merged = {e["issue"]: e["seq"] for e in self.events("merged")}
+        first, second = sorted((2, 3), key=lambda n: building[n])
+        self.assertLess(merged[first], building[second])
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
 
     def test_unquoted_triage_objections_are_dropped(self):
@@ -135,9 +145,18 @@ class RoundTests(EngineCase):
         self.assertEqual(len([c for c in self.agents.calls if c[0] == "build"]), 1, "it never blocked")
 
     def test_a_probe_that_fails_unconditionally_is_rejected(self):
-        self.add_work(2, "docs/a.txt", "alpha", probe="unconditional")
+        self.add_work(2, "docs/a.txt", "alpha", probe="unconditional", findings=1)
         self.epic(2)
-        self.run_engine()
+        agents = FakeAgents(self.scripts)
+        examine = agents.examine
+
+        def naming_its_probe(*args):   # only a probe a finding names is looked at
+            result = examine(*args)
+            for f in result.findings:
+                f.probe = agents.probe_file(2)
+            return result
+        agents.examine = naming_its_probe  # ty: ignore[invalid-assignment]  # test double
+        self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertIsNone(self.repo.main_file("checks/probe_2.sh"))
         self.assertTrue(self.events("examined", 2)[0]["rejected"])

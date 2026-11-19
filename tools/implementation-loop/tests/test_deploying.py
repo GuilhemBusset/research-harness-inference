@@ -1,6 +1,7 @@
 """The deployment verdict between the merge and the evidence step (ADR 0001, decision 5 and
 amendment 4; issue #12): `deploy_status`, the table `[deploy]` of loop.toml, the phase `deploying`
-and its two waits.
+and its two waits. And what a verified deployment discharges (decision 6; issue #143): an item
+that needs a deployed environment and names a smoke test.
 
 The engine runs are real (git, the verifier, squash merges into a local remote). The agents and
 GitHub are fakes; the fake GitHub also plays the pipeline, which posts a commit status on each
@@ -14,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +30,12 @@ HERE = Path(__file__).resolve().parent
 EPIC = 1
 DEPLOY, VERIFY = "deploy/beta", "verify/beta"
 APPROVAL = "waiting for the owner's approval"
+# The engine compares a description with its configuration and imports no reporter: any text does here.
+VERIFIED, PARKED = "the verification's tests ran and passed", "the system is parked: no test ran"
+DEPLOYED, GPU = "aws:deployed-environment", "gpu:capacity"
+SMOKE = "tests/smoke/deployed/test_sign_in.py"
+SIGNS_IN = f"`{SMOKE}::test_a_student_signs_in` passes on the deployed endpoint (needs aws:deployed-environment)."
+LEFT_OUT = "tests/smoke/deployed/test_internal_routes.py"   # a file of which the verification leaves a test out
 
 
 def loop_beside_these_tests() -> SimpleNamespace:
@@ -104,23 +113,29 @@ class Pipeline(L.github.FakeGitHub):
 
 class Agents(L.agents.FakeAgents):
     """The fake agents, with two additions. The build of an issue in `after` starts once the issue
-    it names has merged, so the order of two landings is the test's and not a race. And a round
+    it names has merged, or once the condition it gives holds, so the order of two landings is the
+    test's and not a race. And a round
     whose feedback speaks of the deployment changes a file of its own, unless `repairs` is off: a
     fix-forward then has something to land."""
 
-    def __init__(self, scripts, after, repairs, merged):
+    def __init__(self, scripts, after, repairs, merged, needs=None):
         super().__init__(scripts)
         self.after, self.repairs, self.merged = after, repairs, merged
+        self.needs = needs or {}   # (issue, item) -> the capability the plan gives that owner item
 
     def plan(self, vendor, req, worktree):
         result = super().plan(vendor, req, worktree)
         result.zones.append(f"docs/repair_{req.issue.number}.txt")
+        for item in result.items:
+            if item.proof == "owner":
+                item.capability = self.needs[req.issue.number, item.id]
         return result
 
     def build(self, vendor, req, plan, worktree, feedback):
         n = req.issue.number
         if n in self.after:
-            wait_until(lambda: self.merged(self.after[n]))
+            after = self.after[n]
+            wait_until(after if callable(after) else lambda: self.merged(after))
         result = super().build(vendor, req, plan, worktree, feedback)
         if self.repairs and any("deployment" in f for f in feedback):
             (worktree / f"docs/repair_{n}.txt").write_text("repaired\n")
@@ -130,33 +145,41 @@ class Agents(L.agents.FakeAgents):
 class Loop:
     """A throwaway repository, the fake GitHub with its pipeline, and engine runs with `[deploy]` set."""
 
-    def __init__(self, contexts=(DEPLOY,), timeout_s=2, approval=""):
+    def __init__(self, contexts=(DEPLOY,), timeout_s=2, approval="", verified="", lacks=(), unverified=None):
         self.repo = TempRepo()
-        self.deploy = L.config.Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval)
+        self.deploy = L.config.Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval,
+                                      verified_description=verified, unverified_tests=unverified)
+        self.lacks = list(lacks)
         self.fake = Pipeline(self.repo, self.deploy.contexts)
         self.scripts = {}
-        self.after: dict[int, int] = {}
+        self.needs: dict[tuple[int, str], str] = {}
+        self.after: dict[int, int | Callable[[], bool]] = {}
         self.repairs = True
         self.stores = {}
         self.root = L.state.runs_root(self.repo.work)
 
-    def add_work(self, *numbers, epic=EPIC):
+    def add_work(self, *numbers, epic=EPIC, owner=(), files=()):
+        """One issue per number. Its first deliverable is the agents'; then comes one owner item per
+        (text, capability) of `owner`: D2, D3. The build also writes each path of `files`."""
         for n in numbers:
             path = f"docs/{n}.txt"
-            body = issue_body(f"feat/issue-{n}", [f"`{path}` contains `text`."], ["The test passes on main."])
+            body = issue_body(f"feat/issue-{n}", [f"`{path}` contains `text`.", *(text for text, _ in owner)],
+                              ["The test passes on main."])
             self.fake.add_issue(n, f"Issue {n}", body, labels=("size:M",))
-            self.scripts[n] = L.agents.Script(files={path: "text"})
+            self.needs.update({(n, f"D{k}"): capability for k, (_, capability) in enumerate(owner, start=2)})
+            self.scripts[n] = L.agents.Script(files={path: "text", **dict.fromkeys(files, "# a smoke test")},
+                                              owner_items=tuple(f"D{k}" for k in range(2, 2 + len(owner))))
         self.fake.add_issue(epic, "Epic", "An epic.\n", subs=numbers)
 
     def run(self, root=EPIC, **caps):
-        self.agents = Agents(self.scripts, self.after, self.repairs, lambda n: bool(self.fake.commits.get(n)))
+        self.agents = Agents(self.scripts, self.after, self.repairs, lambda n: bool(self.fake.commits.get(n)), self.needs)
         store = self.stores[root] = L.state.RunStore.for_root(self.repo.work, root)
         engine = L.engine.Engine(
             L.graph.build_plan(self.fake, root, self.repo.work), store, self.fake,
             L.workspace.Workspace(self.repo.work, root, SHIP, base_dir=self.repo.tmp / f"loop-{root}"), self.agents,
             L.config.Config(repo="test/test", caps=L.config.Caps(ci_poll_s=0, queue_poll_s=0, **caps)),
             repo_root=self.repo.work, log=lambda m: None, sleep=lambda s: None,
-            policy={"lacks": [], "deploy": self.deploy})
+            policy={"lacks": self.lacks, "deploy": self.deploy})
         return engine.run()
 
     def issue(self, n, root=EPIC):
@@ -242,6 +265,32 @@ def test_loop_toml_has_the_table_with_neutral_values_and_no_other_key_is_read():
             read('[deploy]\ntimeout_s = "an hour"\n')
 
 
+def test_loop_toml_has_an_empty_verified_description_and_a_set_one_is_read():
+    committed = tomllib.loads((HERE.parent / "loop.toml").read_text())["deploy"]
+    assert committed["verified_description"] == "", "the key is there, and the loop never fills it"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "loop.toml"
+        path.write_text(f'[deploy]\nverified_description = "{VERIFIED}"\n')
+        assert L.config.load_policy(path)["deploy"] == L.config.Deploy(verified_description=VERIFIED)
+        path.write_text("[deploy]\nverified_description = true\n")
+        with pytest.raises(TypeError, match="verified_description"):
+            L.config.load_policy(path)
+
+
+def test_the_tests_a_verification_leaves_out_are_read_from_the_table():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "loop.toml"
+
+        def read(value):
+            path.write_text(f"[deploy]\nunverified_tests = {value}\n")
+            return L.config.load_policy(path)["deploy"].unverified_tests
+        assert L.config.Deploy().unverified_tests is None, "a table that does not say is not one that says none"
+        assert (read("[]"), read(f'["{LEFT_OUT}"]')) == ((), (LEFT_OUT,))
+        for not_a_list_of_files in (f'"{LEFT_OUT}"', "[1]"):
+            with pytest.raises(TypeError, match="unverified_tests"):
+                read(not_a_list_of_files)
+
+
 # ---------------------------------------------------------------------- the phase
 def test_an_empty_contexts_list_waits_for_nothing():
     with loop(2, contexts=()) as run:
@@ -321,7 +370,8 @@ def test_the_landing_claim_is_held():
             wait_until(lambda: run.issue(3).phase == Phase.LAND or 3 in run.fake.commits)
             seen.append((run.issue(3).phase, run.queue_claimed(), len(run.fake.merges())))
         run.fake.before_read = at_each_read
-        run.run()
+        run.run(max_parallel_writers=2)   # #3 is built while #2 waits: with one writer it would start
+        # only when the engine's 30-second wait for a finished call ends, as #2's call is held here
 
         [commit] = run.fake.commits[2]
         assert set(seen) == {(Phase.LAND, True, 1)}, "while #2 polls: #3 stays in land, the claim is held, one merge"
@@ -360,10 +410,12 @@ def test_a_run_for_another_root_does_not_land_before_the_verdict():
 
 def test_an_approval_releases_the_claim():
     with loop(2, 3, approval=APPROVAL) as run:
-        run.after[3] = 2
+        # #3 builds once #2 waits for the owner and has let go of the claim: built as soon as #2
+        # merged, #3 could reach its landing first and find the claim still held
+        run.after[3] = lambda: run.waits(2)[1] == "owner_approval" and not run.queue_claimed()
         run.fake.posts[2] = [("pending", APPROVAL)]
         run.fake.posts[3] = ["success"]
-        run.run()
+        run.run(max_parallel_writers=2)   # with one writer, #3 could take the slot first and wait on #2 forever
 
         [commit] = run.fake.commits[2]
         assert run.waits(2) == (Phase.WAITING, "owner_approval", "deploying")
@@ -475,3 +527,87 @@ def test_a_run_stopped_while_it_polls_is_reported_and_resumes_in_deploying():
         run.fake.set_status(commit, DEPLOY, "success")
         run.run()
         assert run.waits(2)[0] == Phase.DONE and len(run.fake.merges()) == 1
+
+
+# ---------------------------------------------------------------------- what a verified deployment discharges
+@contextmanager
+def deployed(item=SIGNS_IN, capability=DEPLOYED, configured=VERIFIED, contexts=(DEPLOY, VERIFY), said=VERIFIED,
+             in_the_commit=(SMOKE,), left_out=(LEFT_OUT,)):
+    """Issue #2 after one engine run, on a deploy table built here, which says that the verification
+    leaves out a test of each file of `left_out`. Its second deliverable, D2, is `item`, which the
+    plan gives to the owner for `capability`; its change holds the files `in_the_commit`. Every
+    context succeeds on the merge commit, each with the description `said`."""
+    with loop(contexts=contexts, verified=configured, lacks=(DEPLOYED, GPU), unverified=left_out) as run:
+        run.add_work(2, owner=((item, capability),), files=in_the_commit)
+        run.fake.posts[2] = [("success", said)]
+        run.summary = run.run()
+        yield run
+
+
+def test_a_verified_deployment_discharges_a_smoke_test_item():
+    with deployed() as run:
+        [commit] = run.fake.commits[2]
+        st = run.issue(2)
+        assert st.phase == Phase.DONE and run.fake.issues[2]["state"] == "closed", "done, not delivered"
+        # proven, with the verification's status as its evidence
+        [record] = [e for e in st.evidence if e["criterion"] == "D2"]
+        assert record["passed"] and record["kind"] == L.engine.COMMIT_STATUS_EVIDENCE
+        assert (record["head_sha"], record["context"], record["description"]) == (commit, VERIFY, VERIFIED)
+        [row] = [line for line in run.comment(present(st.pr), L.report.EVIDENCE_MARKER).splitlines() if line.startswith("| D2 ")]
+        assert commit[:12] in row and VERIFY in row and VERIFIED in row, "the evidence comment carries it"
+        assert f"- [x] {SIGNS_IN} ([evidence](" in run.fake.issues[2]["body"]
+        assert run.events("obligations_discharged", 2)[0]["items"] == {"D2": VERIFY}
+        # and not listed for the owner, on the issue, in the run summary or in the pull request
+        assert (st.obligations, st.human_tasks, run.summary["owner_obligations"]) == ([], [], {})
+        assert "D2:" not in "\n".join(c["body"] for c in run.fake.comments.get(2, []))
+        assert "D2:" not in run.fake.prs[present(st.pr)]["body"]
+        assert "#2 D2" not in run.comment(EPIC, L.report.RUN_MARKER)
+
+
+NO_TEST_NAMED = "The smoke tests of `tests/smoke/` pass on the deployed endpoint (needs aws:deployed-environment)."
+NEEDS_GPU = f"`{SMOKE}::test_a_pool_starts` passes on the deployed endpoint (needs gpu:capacity)."
+# Two tests decide this one, and the verification runs only the first.
+PARTLY_RUN = f"`{SMOKE}` and `{LEFT_OUT}` pass on the deployed endpoint (needs aws:deployed-environment)."
+
+
+@pytest.mark.parametrize("case", [
+    pytest.param({"said": PARKED}, id="another-description"),
+    pytest.param({"configured": "", "said": ""}, id="no-description-configured"),
+    pytest.param({"contexts": (DEPLOY,)}, id="no-verification-context"),
+    pytest.param({"item": NO_TEST_NAMED}, id="no-smoke-test-named"),
+    pytest.param({"in_the_commit": ()}, id="a-smoke-test-the-commit-does-not-hold"),
+    pytest.param({"item": SIGNS_IN.replace(SMOKE, LEFT_OUT), "in_the_commit": (LEFT_OUT,)},
+                 id="a-smoke-test-the-verification-leaves-out"),
+    pytest.param({"item": PARTLY_RUN, "in_the_commit": (SMOKE, LEFT_OUT)}, id="one-of-its-smoke-tests-left-out"),
+    pytest.param({"left_out": None}, id="a-table-that-does-not-say-what-is-left-out"),
+    pytest.param({"item": NEEDS_GPU, "capability": GPU}, id="gpu-capacity"),
+    pytest.param({"item": NEEDS_GPU}, id="gpu-capacity-whatever-the-plan-says"),
+    pytest.param({"item": NEEDS_GPU.replace(" (needs gpu:capacity)", ""), "capability": GPU}, id="gpu-capacity-by-the-plan-alone"),
+])
+def test_only_a_verified_smoke_test_item_is_discharged(case):
+    item, capability = case.get("item", SIGNS_IN), case.get("capability", DEPLOYED)
+    with deployed(**case) as run:
+        st = run.issue(2)
+        assert [e["kind"] for e in st.evidence if e["criterion"] == "deployment"] == ["deployment"], "the deployment succeeded"
+        # the item is the owner's, as before
+        assert st.phase == Phase.DELIVERED and run.fake.issues[2]["state"] == "open"
+        assert st.obligations == [{"item": "D2", "kind": "capability", "detail": capability,
+                                   "agent_part": "time it on this host"}]
+        assert f"- [ ] {item}" in run.fake.issues[2]["body"]
+        assert len(st.human_tasks) == 1 and st.human_tasks[0].startswith(f"D2: needs {capability}")
+        assert run.summary["owner_obligations"] == {2: st.human_tasks}
+        assert f"D2: needs {capability}" in run.fake.prs[present(st.pr)]["body"]
+        assert not [e for e in st.evidence if e["criterion"] == "D2"] and not run.events("obligations_discharged", 2)
+
+
+def test_a_table_without_the_key_discharges_nothing():
+    """`engine.py` also runs beside an older `config.py`, whose table has no `verified_description`:
+    the verifier's pytest loads the tests' engine into the package of the engine that runs the loop."""
+    with loop(contexts=(DEPLOY, VERIFY), lacks=(DEPLOYED,)) as run:
+        older = SimpleNamespace(contexts=run.deploy.contexts, timeout_s=2, approval_description="")
+        run.deploy = older   # a test double: the table as an older config.py reads it
+        run.add_work(2, owner=((SIGNS_IN, DEPLOYED),), files=(SMOKE,))
+        run.fake.posts[2] = [("success", VERIFIED)]
+        run.run()
+        assert not run.events("step_crashed"), "the evidence step reads a key the table may not have"
+        assert run.issue(2).phase == Phase.DELIVERED and len(run.issue(2).human_tasks) == 1, "the item stays the owner's"

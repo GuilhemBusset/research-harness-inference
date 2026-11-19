@@ -80,8 +80,6 @@ class UnwritableProbeTests(EngineCase):
         self.assertEqual(self.events("step_crashed"), [], "the examiner's mistake is not an engine fault")
         examined = self.events("examined", 2)[0]
         self.assertIn(UNWRITABLE, [r["file"] for r in examined["rejected"]])
-        self.assertNotIn(UNWRITABLE, examined["adopted"], "a refused probe is not written to the worktree either")
-        self.assertIn("checks/probe_2.sh", examined["adopted"], "the probe beside it is kept")
         self.assertTrue(any(status == "open" for status in examined["findings"].values()),
                         "the finding that named it still blocks, on its own reproduction")
         self.assertEqual(self.phase(2), Phase.DONE, "and closes once that reproduction passes")

@@ -1,0 +1,2 @@
+[nag]
+"AwsSolutions-L1" = "The issuer runs on the Lambda runtime of the Python that .python-version names, the one its tests and its bundle's libraries are built for, which packaging.RUNTIME holds for every function of the app."

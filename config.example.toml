@@ -33,9 +33,6 @@ course_end = 2099-12-31
 # Entries have no shape yet: the loader refuses any.
 session_windows = []
 
-# One entry per pool. Entries have no shape yet: the loader refuses any.
-pools = []
-
 # Whether the public load balancer has its certificate, its HTTPS listener on 443 and the domain's
 # alias record. Left out, it reads false: the owner turns it on once the domain resolves through
 # the hosted zone above. The example turns it on, so that synthesis and the policy tests see the
@@ -46,3 +43,56 @@ https_listener = true
 # since a campus shares one address), the issuer's under /auth/ and Grafana's under /grafana/. Each
 # entry is optional; the values below are the defaults.
 rate_limits = { per_address = 2000, issuer = 100, grafana = 300 }
+
+# The instance types a pool may list, a hard cap (system design, section 11.3). Left out, it is the
+# types the pools below list.
+allowed_instance_types = ["t4g.small"]
+
+# Dollars an hour: a pool with an instance type priced above it may only wake on schedule
+# (section 17). Left out, it is 5.
+on_demand_price_limit = 5
+
+# The pool the gateway maps `claude-*` model names to (sections 5.4 and 6.2). Left out, it is the
+# only pool when there is one; with two pools or more it must be given.
+default_pool = "mock"
+
+# The key issuer's reserved concurrency, and the most keys a student may be issued over one UTC
+# day (sections 6.4 and 17). Left out, each is 5.
+issuer_reserved_concurrency = 5
+key_issuances_per_day = 5
+
+# The time of day, in the time zone above, at which a scheduled action sets every pool's desired
+# capacity to zero (sections 5.1 and 17). Left out, it is 02:00.
+nightly_stop = "02:00"
+
+# How many gateway tasks the service runs (sections 2 and 11.2). Left out, it is 2.
+gateway_tasks = 2
+
+# The gateway's numeric settings (section 17), which the deployment writes into the gateway's
+# environment. Left out, each is the value below: the largest request body, in bytes (8 MB); the
+# longest a request may run and the interval between the keep-alives of a held request, in
+# seconds; and the seconds of Retry-After for the three causes that carry one.
+request_body_limit_bytes = 8388608
+longest_request_seconds = 1800
+keepalive_seconds = 10
+retry_after_warming_seconds = 30
+retry_after_capacity_unavailable_seconds = 60
+retry_after_concurrency_limit_seconds = 5
+
+# One entry per pool, under the model name students choose it by (section 4.2). An empty table,
+# `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
+#
+# The mock pool, phase 1's only pool: the mock engine on t4g.small, woken on demand. Its context
+# length is the coursework pool's, so that the mock exercises the same limits; its largest output
+# is the 32,000 tokens Claude Code asks for on its main turns (evidence E15), which the body filter
+# then leaves as they are sent. It gives no expected values and has no measured start.
+[pools.mock]
+engine = "mock"
+instance_types = ["t4g.small"]
+prices = { "t4g.small" = 0.02 }
+wake = "on-demand"
+max_instances = 2
+warm_instances = 1
+target_concurrency = 8
+context_length = 262144
+largest_output = 32000

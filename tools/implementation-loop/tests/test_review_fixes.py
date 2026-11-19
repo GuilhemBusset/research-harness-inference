@@ -18,7 +18,7 @@ from unittest import mock
 
 from helpers import HAS_PYTEST, SHIP, git, issue_body, present
 from implement_loop import VERSION, gate, verify
-from implement_loop.agents import Decision, FakeAgents, Objection, Probe, Request, Ruling, Script
+from implement_loop.agents import Decision, FakeAgents, Objection, Probe, Request, Script
 from implement_loop.config import Caps, Config
 from implement_loop.engine import Engine
 from implement_loop.graph import build_plan
@@ -255,7 +255,7 @@ class Finding02RevertGates(FixCase):
 
 
 class Finding03DeltaAfterAdoption(FixCase):
-    def test_3_adopted_probes_make_a_new_head_that_a_delta_examination_certifies(self):
+    def test_3_the_lock_commit_makes_a_new_head_that_a_delta_examination_certifies(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
         certified = []
@@ -271,9 +271,8 @@ class Finding03DeltaAfterAdoption(FixCase):
             self.run_engine()
         self.assertEqual(self.phase(2), Phase.DONE)
         examined = self.events("examined", 2)
-        self.assertEqual([bool(e["adopted"]) for e in examined], [True, False])
         locked = self.events("tests_locked", 2)[0]["sha"]
-        self.assertEqual(examined[1]["head"], locked, "the head adopting the probes made was examined itself")
+        self.assertEqual(examined[1]["head"], locked, "the head the lock commit made was examined itself")
         self.assertEqual([c[3] for c in self.agents.calls if c[0] == "examine"], [False, True], "a delta examination")
         self.assertTrue(certified)
         self.assertTrue(set(certified) <= {e["head"] for e in examined}, "certified_sha only ever equals an examined head")
@@ -386,6 +385,11 @@ class Finding08TriageDependency(FixCase):
         self.assertIn("- [ ] It plays in the widget.", self.gh.issues[2]["body"])
 
 
+# #3 is still in flight when #2 asks for it: with one writer, whichever issue takes the slot
+# first decides the order, and #3 may land before #2 ever asks
+TWO_WRITERS = Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2)
+
+
 class Finding09MidBuildDependency(FixCase):
     def test_9_an_approved_mid_build_dependency_waits_and_survives_a_restart(self):
         self.gh.add_issue(3, "Prerequisite widget", issue_body("feat/issue-3", ["`docs/b.txt` contains `beta`."],
@@ -408,7 +412,7 @@ class Finding09MidBuildDependency(FixCase):
             if n == 2 and engine.store.issue(2).phase == Phase.PENDING:
                 (engine.store.dir / "STOP").write_text("stop\n")
         with mock.patch.object(Engine, "_step_build", stop_once_it_waits):
-            self.run_engine(agents=agents)
+            self.run_engine(agents=agents, caps=TWO_WRITERS)
         st = self.store.issue(2)
         self.assertEqual((st.phase, st.extra_deps), (Phase.PENDING, [3]))
         self.assertTrue(self.events("waits_for_prerequisite", 2))
@@ -416,7 +420,7 @@ class Finding09MidBuildDependency(FixCase):
         (self.store_dir() / "STOP").unlink()
 
         restart = self.last_seq()
-        self.run_engine(agents=agents)   # a fresh plan: the edge comes back from the state
+        self.run_engine(agents=agents, caps=TWO_WRITERS)   # a fresh plan: the edge comes back from the state
         self.assertIn(3, self.engine.plan.deps[2])
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
         three_done = min(e["seq"] for e in self.after("phase", restart, 3) if e["to"] == "done")
@@ -452,6 +456,21 @@ class Finding10OwnerAgentPart(FixCase):
         self.assertFalse(self.gh.prs)
         self.assertTrue(self.events("examination_incomplete", 2))
         self.assertTrue(any("no verdict on D2" in p for e in self.events("round_failed", 2) for p in e["problems"]))
+
+    def test_10_an_owner_only_item_is_not_asked_for_a_verdict(self):
+        self.add_work(2, "docs/a.txt", "alpha", items=["`docs/a.txt` contains `alpha`.",
+                                                        "The endpoint answers (needs aws:deployed-environment)."],
+                      owner_items=("D2",))
+        self.epic(2)
+
+        def no_verdict_on_d2(result, req, plan, since):
+            result.verdicts = [v for v in result.verdicts if v["item"] != "D2"]
+            return result
+        self.run_engine(agents=Agents(self.scripts, examine=no_verdict_on_d2))
+        self.assertEqual(self.phase(2), Phase.DELIVERED)
+        self.assertEqual([e["missing"] for e in self.events("examined", 2)], [[], []])
+        self.assertFalse(self.events("examination_incomplete", 2) or self.events("round_failed", 2))
+        self.assertEqual([o["item"] for o in self.store.issue(2).obligations], ["D2"])
 
     def test_10_a_command_proves_the_agent_part_without_a_verdict(self):
         self.owner_issue()
@@ -534,64 +553,37 @@ class Finding12And15Manifest(FixCase):
         self.assertFalse([p for e in self.events("verified", 2) for p in e["problems"] if "did not run" in p])
 
 
-class Finding13ProbeCoverage(FixCase):
-    def test_13_missing_probes_are_asked_twice_then_an_arbiter_waiver_is_a_recorded_decision(self):
+class Finding13ProbesOnlyForFindings(FixCase):
+    def test_13_an_approved_item_without_a_probe_passes_and_nothing_is_asked_again(self):
         self.add_work(2, "docs/a.txt", "alpha", probe="none")
         self.epic(2)
         agents = Agents(self.scripts)
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
-        incomplete = self.events("examination_incomplete", 2)
-        self.assertEqual([(e["retry"], e["unprobed"]) for e in incomplete], [(1, ["A1", "D1"]), (2, ["A1", "D1"])])
-        asked = [x for x in agents.exams if any("write an independent probe for A1, D1" in f for f in x["feedback"])]
-        self.assertEqual(len(asked), 2)
-        self.assertEqual([c[3] for c in agents.calls if c[0] == "arbitrate"], ["probe_waiver"])
-        st = self.store.issue(2)
-        waiver = [d for d in st.decisions if d["id"] == "probe-waiver"]
-        self.assertEqual(len(waiver), 1)
-        self.assertIn("A1, D1", waiver[0]["choice"])
-        assert st.pr is not None
-        self.assertIn("probe-waiver", self.gh.prs[st.pr]["body"])
-        self.assertEqual(len(self.builds()), 1, "the examiner's gap is not the builder's failure")
+        self.assertEqual(self.events("examination_incomplete", 2), [])
+        self.assertFalse([c for c in agents.calls if c[0] == "arbitrate"], "no waiver either")
+        self.assertEqual(self.store.issue(2).probes, [])
+        self.assertEqual(len(self.builds()), 1)
 
-    def test_13_a_refused_waiver_sends_the_builder_back_to_strengthen_its_tests(self):
-        self.add_work(2, "docs/a.txt", "alpha", probe="none")
+    def test_13_a_probe_witnesses_its_finding_until_it_passes_and_is_never_committed(self):
+        self.add_work(2, "docs/a.txt", "alpha", findings=1)   # the fake's finding: edge_2.txt is missing
         self.epic(2)
-        agents = Agents(self.scripts)
-        rulings = []
+        probe = "checks/probe_2_edge.sh"
 
-        def refuse_once(vendor, req, dispute, worktree=None):
-            rulings.append(dispute["kind"])
-            upheld = len(rulings) > 1
-            return agents._metered(req.issue.number, "arbitrate", vendor,
-                                   lambda: Ruling(upheld, "the test reads the file as the item asks" if upheld
-                                                  else "the test never checks the content the item names"))
-        agents.arbitrate = refuse_once  # ty: ignore[invalid-assignment]  # test double
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(rulings, ["probe_waiver", "probe_waiver"])
-        failed = self.events("round_failed", 2)
-        self.assertTrue(any("arbiter judges your tests do not prove them" in p for p in failed[0]["problems"]))
-        self.assertTrue(any("arbiter judges" in f for f in self.builds()[1][3]), "the builder is told why")
-
-    def test_13_a_probe_given_on_the_second_ask_is_adopted_and_certified(self):
-        self.add_work(2, "docs/a.txt", "alpha", probe="none")
-        self.epic(2)
-
-        def probe_when_asked(result, req, plan, since):
-            if any("independent probe" in f for f in req.feedback):
-                body = "#!/usr/bin/env bash\nset -e\ntest -s docs/a.txt\n"
-                result.probes = [Probe(f"checks/probe_2_{i}.sh", i, f"bash checks/probe_2_{i}.sh", content=body)
-                                 for i in ("A1", "D1")]
+        def witness_with_a_probe(result, req, plan, since):
+            for f in result.findings:
+                f.probe, f.reproduction = probe, None
+            if result.findings:
+                result.probes = [*result.probes, Probe(probe, "D1", f"bash {probe}",
+                                                       content="#!/usr/bin/env bash\ntest -f edge_2.txt\n")]
             return result
-        agents = Agents(self.scripts, examine=probe_when_asked)
-        self.run_engine(agents=agents)
+        self.run_engine(agents=Agents(self.scripts, examine=witness_with_a_probe))
         self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(len(self.events("examination_incomplete", 2)), 1)
         st = self.store.issue(2)
-        self.assertEqual(st.probes, ["checks/probe_2_A1.sh", "checks/probe_2_D1.sh"])
-        self.assertFalse([d for d in st.decisions if d["id"] == "examination-gaps"])
-        self.assertIn(st.certified_sha, [e["head"] for e in self.events("examined", 2)])
+        self.assertEqual((st.probes, [f["reason"] for f in st.findings if f.get("probe") == probe]),
+                         ([], ["its probe passes"]))
+        self.assertIsNone(self.repo.main_file(probe))
+        self.assertIsNone(self.repo.main_file("checks/probe_2.sh"), "nor the passing probes beside it")
 
 
 class Finding14Budget(FixCase):

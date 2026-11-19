@@ -1,0 +1,59 @@
+# The collector beside the gateway, a container of its task: the OpenTelemetry collector (the
+# contrib distribution) runs with this file (system design, "Observability").
+#
+# It scrapes the gateway's metrics at 127.0.0.1 port 9091, where the gateway serves them to its own
+# task only, and pushes them to the Prometheus workspace with signed remote write. Every series
+# carries the task's ID as the label instance, in place of the scrape address: a task's counters
+# start from zero, so the series of two tasks must never merge into one.
+#
+# The task gives RHI_WORKSPACE_URL (the workspace's remote-write address) and RHI_REGION in the
+# container's environment: nothing here names an address, a region or an account. The task's ID
+# comes from the task metadata ECS gives the container. A collector that cannot read it does not
+# start: it never pushes a series under the scrape address, which is the same in every task.
+#
+# The task's logs go through its own log group, not through this collector.
+#
+# The component names and options are those of collector release 0.165.0, and
+# `otelcol-contrib validate` of that release accepts this file.
+
+extensions:
+  sigv4auth:
+    region: ${env:RHI_REGION}
+    service: aps
+
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: gateway
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:9091"]
+
+processors:
+  resource_detection:
+    detectors: [ecs]
+    fail_on_missing_metadata: true
+  resource/origin:
+    attributes:
+      # The exporter makes service.instance.id the label instance.
+      - key: service.instance.id
+        from_attribute: aws.ecs.task.id
+        action: upsert
+
+exporters:
+  prometheus_remote_write:
+    http:
+      endpoint: ${env:RHI_WORKSPACE_URL}
+      auth:
+        authenticator: sigv4auth
+    # A series is named by its metric and its labels, not by the collector's version.
+    disable_scope_info: true
+
+service:
+  extensions: [sigv4auth]
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [resource_detection, resource/origin]
+      exporters: [prometheus_remote_write]
