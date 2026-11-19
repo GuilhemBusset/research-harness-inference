@@ -8,6 +8,7 @@ The CDK is imported inside the tests, after `app_module` has started jsii (see c
 
 from __future__ import annotations
 
+import dataclasses
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -78,8 +79,11 @@ def test_one_internal_listener_on_port_80_with_a_default_404(pools: dict[str, An
     assert balancer["Scheme"] == "internal"
     attributes = {a["Key"]: a["Value"] for a in balancer["LoadBalancerAttributes"]}
     assert attributes["idle_timeout.timeout_seconds"] == "1200"
-    assert all("Fn::ImportValue" in group for group in balancer["SecurityGroups"])
-    assert all("Fn::ImportValue" in subnet for subnet in balancer["Subnets"])
+    # The network stack's: the internal load balancer's group alone, and its private subnets.
+    (group,) = balancer["SecurityGroups"]
+    assert "SecurityGroupsInternalLoadBalancer" in group["Fn::ImportValue"]
+    assert len(balancer["Subnets"]) == 3
+    assert all("PrivateSubnet" in subnet["Fn::ImportValue"] for subnet in balancer["Subnets"])
     (listener,) = of_type(pools, "AWS::ElasticLoadBalancingV2::Listener").values()
     assert (listener["Port"], listener["Protocol"]) == (80, "HTTP")
     (default,) = listener["DefaultActions"]
@@ -114,6 +118,48 @@ def test_the_mock_pool_target_group(pools: dict[str, Any]) -> None:
     assert attributes["deregistration_delay.timeout_seconds"] == "300"
     assert attributes["load_balancing.algorithm.type"] == "least_outstanding_requests"
     assert "stickiness.enabled" not in attributes or attributes["stickiness.enabled"] == "false"
+
+
+def routing(app_module: ModuleType, pools: tuple[Any, ...]) -> Mapping[str, Any]:
+    """The template of a stack that holds the routing of these pools and a network for it."""
+    from aws_cdk import assertions
+    from aws_cdk import aws_ec2 as ec2
+
+    from rhi.pools.routing import Routing
+
+    cdk = app_module.cdk
+    stack = cdk.Stack(cdk.App(analytics_reporting=False), "Routing")
+    vpc = ec2.Vpc(stack, "Vpc", max_azs=2, nat_gateways=1)
+    group = ec2.SecurityGroup(stack, "Group", vpc=vpc, allow_all_outbound=False)
+    Routing(stack, "Routing", vpc=vpc, security_group=group, pools=pools)
+    return assertions.Template.from_stack(stack).to_json()
+
+
+def test_each_pool_has_its_own_rules_target_group_and_drain(app_module: ModuleType) -> None:
+    (mock,) = EXAMPLE.pools
+    template = routing(app_module, (mock, dataclasses.replace(mock, name="second", drain_seconds=120)))
+    groups = of_type(template, "AWS::ElasticLoadBalancingV2::TargetGroup")
+    rules = forwards(template)
+    drains = {}
+    for pool in ("mock", "second"):
+        mine = [rule for rule in rules if rule["pool"] == {pool}]
+        assert set().union(*(rule["paths"] for rule in mine)) == ROUTES
+        assert len(mine) == 4
+        # The four send to one group, which is no other pool's.
+        (target,) = {target["Ref"] for rule in mine for target in rule["targets"]}
+        attributes = {a["Key"]: a["Value"] for a in groups.pop(target)["TargetGroupAttributes"]}
+        drains[pool] = attributes["deregistration_delay.timeout_seconds"]
+    assert drains == {"mock": "300", "second": "120"}
+    assert groups == {}
+    assert len(rules) == 8
+
+
+def test_no_pool_leaves_the_listener_and_its_default_404(app_module: ModuleType) -> None:
+    template = routing(app_module, ())
+    (listener,) = of_type(template, "AWS::ElasticLoadBalancingV2::Listener").values()
+    assert [action["FixedResponseConfig"]["StatusCode"] for action in listener["DefaultActions"]] == ["404"]
+    assert of_type(template, "AWS::ElasticLoadBalancingV2::ListenerRule") == {}
+    assert of_type(template, "AWS::ElasticLoadBalancingV2::TargetGroup") == {}
 
 
 def test_no_rule_forwards_the_health_route(pools: dict[str, Any], app_module: ModuleType) -> None:
