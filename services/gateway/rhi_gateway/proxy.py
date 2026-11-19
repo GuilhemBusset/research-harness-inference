@@ -101,6 +101,18 @@ given up at the time limit, for a keep-alive, or for an answer that is not a str
 the last call of a request are its two times; whoever is called reads the clock
 (`rhi_gateway.experience`).
 
+The model reasons before it answers (section 4.2), and a student sees an answer begin at the first
+token that is not reasoning. So each call also says whether what was just written carries answer
+text or a tool call (`output_of`), as each format's reference marks its events:
+
+- Messages: a `text_delta` or an `input_json_delta` is the answer, a `thinking_delta` reasoning;
+- Responses: the reference names its reasoning events `response.reasoning_text.delta` and
+  `response.reasoning_summary_text.delta`. A `.delta` event whose name begins `response.reasoning`
+  is reasoning, and any other the answer: its text, a refusal, a tool call's arguments or input;
+- Chat Completions: the reference gives a delta `content`, `refusal` and `tool_calls` and no
+  reasoning field, so a delta with one of the first two, or with a tool call's arguments, is the
+  answer, and a delta that carries output in any other field, the engine's own, is reasoning.
+
 Nothing here reads configuration or the environment: the address, the secrets and the limit are
 given.
 """
@@ -108,6 +120,7 @@ given.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import aclosing
@@ -286,20 +299,36 @@ def _is_failure(event: SseEvent) -> bool:
     return event.name in FAILURE_EVENTS or _reports_failure(_json_object(event.data))
 
 
+class Output(enum.Enum):
+    """What an event that carries output carries: the model's reasoning, or its answer (text or a tool call)."""
+
+    REASONING = "reasoning"
+    ANSWER = "answer"
+
+
+# What `forward` and `held` call once output has been written to the client: with whether some of it is the answer.
+TokenSent = Callable[[bool], None]
+
 # The events that carry output. Messages names one kind of event, and the field of each kind of piece: a
 # thinking block's signature is a `signature_delta`, which is not output. Responses ends the name of
 # each of its kinds alike, and the piece is the event's `delta`.
 MESSAGES_OUTPUT_EVENT = "content_block_delta"
 MESSAGES_OUTPUT_FIELDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}
 RESPONSES_OUTPUT_SUFFIX = ".delta"
+# Which of them carry reasoning: one kind of piece of Messages, the events of Responses named so. Chat
+# Completions has no reasoning field: its answer is in these fields of a delta and in its tool calls.
+MESSAGES_REASONING_PIECE = "thinking_delta"
+RESPONSES_REASONING_PREFIX = "response.reasoning"
+CHAT_ANSWER_FIELDS = frozenset({"content", "refusal"})
 
 
 def _is_text(value: object) -> bool:
     return isinstance(value, str) and value != ""
 
 
-def _chat_delta_carries_output(delta: Mapping[str, object]) -> bool:
-    """Whether a chunk's delta adds text (the answer's, the reasoning's) or a piece of a tool call's arguments."""
+def _chat_delta_output(delta: Mapping[str, object]) -> Output | None:
+    """What a chunk's delta adds: answer text or a piece of a tool call's arguments, else any other text, as reasoning."""
+    found = None
     for name, value in delta.items():
         if name == "tool_calls":
             # A call's first chunk names it, with no arguments yet: that is not a token.
@@ -310,39 +339,50 @@ def _chat_delta_carries_output(delta: Mapping[str, object]) -> bool:
                 and _is_text(function.get("arguments"))
                 for call in calls
             ):
-                return True
+                return Output.ANSWER
         elif name != "role" and _is_text(value):
-            return True
-    return False
+            if name in CHAT_ANSWER_FIELDS:
+                return Output.ANSWER
+            found = Output.REASONING
+    return found
+
+
+def output_of(wire_format: WireFormat, event: SseEvent) -> Output | None:
+    """What an event of a stream carries of the output, if any: a piece, not empty, of reasoning or of the answer.
+
+    The answer is its text or a tool call's arguments. An event that carries both is the answer's.
+    """
+    if event.comment:
+        return None
+    data = _json_object(event.data)
+    if wire_format is WireFormat.CHAT_COMPLETIONS:
+        choices = data.get("choices")
+        found = {
+            _chat_delta_output(delta)
+            for choice in (choices if isinstance(choices, list) else [])
+            if isinstance(choice, dict) and isinstance(delta := choice.get("delta"), dict)
+        }
+        return Output.ANSWER if Output.ANSWER in found else Output.REASONING if Output.REASONING in found else None
+    kind = event.name or data.get("type")
+    if not isinstance(kind, str):
+        return None
+    if wire_format is WireFormat.RESPONSES:
+        if not kind.endswith(RESPONSES_OUTPUT_SUFFIX) or not _is_text(data.get("delta")):
+            return None
+        return Output.REASONING if kind.startswith(RESPONSES_REASONING_PREFIX) else Output.ANSWER
+    delta = data.get("delta")
+    if kind != MESSAGES_OUTPUT_EVENT or not isinstance(delta, dict):
+        return None
+    piece = delta.get("type")
+    field = MESSAGES_OUTPUT_FIELDS.get(piece) if isinstance(piece, str) else None
+    if field is None or not _is_text(delta.get(field)):
+        return None
+    return Output.REASONING if piece == MESSAGES_REASONING_PIECE else Output.ANSWER
 
 
 def carries_output(wire_format: WireFormat, event: SseEvent) -> bool:
     """Whether an event of a stream carries output: a piece, not empty, of text, reasoning or a tool call's arguments."""
-    if event.comment:
-        return False
-    data = _json_object(event.data)
-    if wire_format is WireFormat.CHAT_COMPLETIONS:
-        choices = data.get("choices")
-        return isinstance(choices, list) and any(
-            isinstance(choice, dict)
-            and isinstance(delta := choice.get("delta"), dict)
-            and _chat_delta_carries_output(delta)
-            for choice in choices
-        )
-    kind = event.name or data.get("type")
-    if not isinstance(kind, str):
-        return False
-    if wire_format is WireFormat.RESPONSES:
-        return kind.endswith(RESPONSES_OUTPUT_SUFFIX) and _is_text(data.get("delta"))
-    delta = data.get("delta")
-    if kind != MESSAGES_OUTPUT_EVENT or not isinstance(delta, dict):
-        return False
-    piece = delta.get("type")
-    return (
-        isinstance(piece, str)
-        and piece in MESSAGES_OUTPUT_FIELDS
-        and _is_text(delta.get(MESSAGES_OUTPUT_FIELDS[piece]))
-    )
+    return output_of(wire_format, event) is not None
 
 
 def _event_name(line: bytes) -> str:
@@ -561,7 +601,7 @@ class _Stream:
         *,
         upstream: AsyncIterator[bytes] | None = None,
         first: bytes | None = None,
-        token_sent: Callable[[], None] | None = None,
+        token_sent: TokenSent | None = None,
     ) -> None:
         self._response = response
         # Decoded, should the engine compress what it was asked to send as it is: the client is
@@ -607,15 +647,18 @@ class _Stream:
                 before = self._gate.client_has
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
-                    carried = self._token_sent is not None and any(
-                        carries_output(self._wire_format, event) for event in self._sent.feed(forward)
+                    carried = (
+                        set()
+                        if self._token_sent is None
+                        else {output_of(self._wire_format, event) for event in self._sent.feed(forward)} - {None}
                     )
                     yield forward
                     if self._abandoned:
                         client_has = before
                         raise TimeLimitReached
                     if carried and self._token_sent is not None:
-                        self._token_sent()  # The write has returned: the client has the token.
+                        # The write has returned: the client has the token, and the answer's first if it is one.
+                        self._token_sent(Output.ANSWER in carried)
                 if self._gate.failed_event_ended:
                     break
         except TimeLimitReached:
@@ -718,14 +761,15 @@ class Proxy:
         on_end: Callable[[Observed], Awaitable[None]],
         *,
         receive: Receive | None = None,
-        token_sent: Callable[[], None] | None = None,
+        token_sent: TokenSent | None = None,
     ) -> Response:
         """Forward the request and return the client's answer; `on_end` is called exactly once, at its end.
 
         `receive` is the client's, whose body has been read: it is listened to for the client's
         disconnect until a stream starts. A stream's end comes once the client's answer has been
         sent or abandoned; every other end comes before this returns. `token_sent` is called each
-        time an event of a stream that carries output has been written to the client.
+        time an event of a stream that carries output has been written to the client, with whether
+        the output written is the answer's (text or a tool call) and not only reasoning.
         """
         settle = _Settlement(on_end)
         wire_format = route.wire_format or WireFormat.MESSAGES
@@ -775,7 +819,7 @@ class Proxy:
         on_end: Callable[[Observed], Awaitable[None]],
         held: HeldRequest,
         *,
-        token_sent: Callable[[], None] | None = None,
+        token_sent: TokenSent | None = None,
     ) -> Response:
         """A held stream's answer: 200 at once, the hold's keep-alives, then the engine's stream on the same connection.
 
@@ -856,7 +900,7 @@ class _HeldStream:
         forwarded: Forwarded,
         settle: _Settlement,
         held: HeldRequest,
-        token_sent: Callable[[], None] | None = None,
+        token_sent: TokenSent | None = None,
     ) -> None:
         self._proxy = proxy
         self._token_sent = token_sent

@@ -69,8 +69,10 @@ student by alias and per pool, the requests, the tokens settled and the errors b
 **What students experience** (section 7.2): `build_app` given the metrics also puts on their
 registry the series of `rhi_gateway.experience`, per pool and wire format and never by student,
 and with the heartbeat the requests in flight and held as its rows report them. A forwarded
-request tells them two things: the proxy, each time a token of its stream has been sent to the
-client, and its settlement, the tokens it observed.
+request tells them, once its reservation is made, which is when it is accepted, whether it is held
+(its pool was not ready, so it waits for it) and whether it is a first turn (`first_turn`). Then
+the proxy tells them each time a token of its stream has been sent to the client, and whether it
+is one of the answer or of the reasoning before it; and its settlement, the tokens it observed.
 """
 
 from __future__ import annotations
@@ -350,6 +352,29 @@ def _streams(forwarded: Forwarded) -> bool:
     return json.loads(forwarded.body).get("stream") is True
 
 
+def first_turn(wire_format: WireFormat, forwarded: Forwarded) -> bool:
+    """Whether the request's conversation carries no earlier output of the model (section 7.2).
+
+    Messages and Chat Completions give the model's earlier turns the role `assistant`. Responses
+    does too, for a message; its other input items that are the model's own are its reasoning and
+    its calls of tools, whose types the reference all ends in `_call`. What answers a call
+    (`function_call_output` and the like) is the client's, and never comes without its call.
+    """
+    body = json.loads(forwarded.body)
+    conversation = body.get("input" if wire_format is WireFormat.RESPONSES else "messages")
+    if not isinstance(conversation, list):
+        return True  # The one text of a Responses request, or nothing at all.
+    for item in conversation:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "assistant":
+            return False
+        kind = item.get("type") if wire_format is WireFormat.RESPONSES else None
+        if isinstance(kind, str) and (kind == "reasoning" or kind.endswith("_call")):
+            return False
+    return True
+
+
 class _Held:
     """One request's hold (`rhi_gateway.hold`), on the gateway's clock and its kept view of the pool.
 
@@ -505,10 +530,18 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             # Token counting has no hold: it is never demand.
             demand = held.demand = forwarding.heartbeat.received(forwarded.pool.name, held=not held.ready)
 
-        # From here the request settles exactly once: what students experience is told its tokens then.
+        # From here the request is accepted, and settles exactly once: what students experience counts
+        # its waits from this moment, warm or held, and is told its tokens at its settlement.
         experience = _experience(request)
         wire_format = entry.wire_format or WireFormat.MESSAGES
-        turn = None if experience is None else experience.request(forwarded.pool.name, wire_format)
+        turn = None
+        if experience is not None:
+            turn = experience.request(
+                forwarded.pool.name,
+                wire_format,
+                held=held is not None and not held.ready,
+                first_turn=first_turn(wire_format, forwarded),
+            )
         token_sent = None if turn is None else turn.token_sent
 
         async def settle(observed: Observed) -> None:
