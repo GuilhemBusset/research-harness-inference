@@ -15,7 +15,11 @@ password is recovered through the same address.
 **State.** The user pool holds the admin's account and MFA enrolment, so replacing it would lock
 the admin out. It has deletion protection, it is retained on deletion and on replacement, and its
 logical ID is recorded in `tests/policy/stateful_logical_ids.json`: the construct IDs here are part
-of it, and renaming one replaces the user pool.
+of it, and renaming one replaces the user pool. The user is a resource of its own, and
+CloudFormation deletes a resource it is not told to keep, whatever the user pool's own policy: the
+user is retained on deletion and on replacement too, so the account and its enrolment stay in the
+retained user pool. Changing `admin_email` therefore adds a user and keeps the previous one, which
+the owner removes by hand.
 
 **The domain.** The prefix of the hosted sign-in domain becomes a host name under AWS's Cognito
 domain, and the host name of a deployed resource is not in the repository (section 10). So the
@@ -83,7 +87,7 @@ class SignIn(Construct):
 
         # The one user. The address is the owner's own, so it is created verified: recovering a
         # forgotten password needs a verified address. Cognito e-mails it a temporary password.
-        cognito.CfnUserPoolUser(
+        admin = cognito.CfnUserPoolUser(
             self,
             "Admin",
             user_pool_id=self.user_pool.user_pool_id,
@@ -94,6 +98,9 @@ class SignIn(Construct):
                 cognito.CfnUserPoolUser.AttributeTypeProperty(name="email_verified", value="true"),
             ],
         )
+        # Kept with its user pool: without this, deleting the stack or replacing the user deletes
+        # the account and its MFA enrolment from the retained user pool.
+        admin.apply_removal_policy(cdk.RemovalPolicy.RETAIN)
 
         self.domain = self.user_pool.add_domain(
             "Domain",
