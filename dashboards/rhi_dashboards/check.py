@@ -7,16 +7,17 @@ without the helpers is held to the same rules as one made with them. It reports:
 | --- | --- |
 | `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
-| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query whose zero reads "asleep", or, in a panel of one value, a query over the range |
+| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range |
 | `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise |
-| `percentile` | A `histogram_quantile` with no increase of the same histogram's count, for the same series over the same window, in its panel |
-| `undeclared` | A metric name no declaration covers |
+| `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
+| `undeclared` | A metric name no declaration covers: neither a declared family nor that family's name followed by a sample's suffix |
 | `declaration` | A declared file that is not in the repository or does not contain the name; an exporter with no exact version |
 | `unreadable` | An expression this module cannot read |
 
 Only the Prometheus queries are read for metric names. An expression is read by its tokens, not
 parsed: enough to tell a metric name from a function, a label and a keyword, and to find what a
-function was called on.
+function was called on. A query is shown unless it is disabled (`hide`): Grafana does not run a
+disabled query, so what it would return is on no panel.
 """
 
 from __future__ import annotations
@@ -264,11 +265,59 @@ def _keeps_awake(expression: _Expression, pool: str) -> bool:
         return False
 
 
+def _is_shown(target: Mapping[str, Any]) -> bool:
+    """Whether the query's result reaches its panel: a disabled query is not run."""
+    return not target.get("hide")
+
+
+def _is_prometheus(target: Mapping[str, Any]) -> bool:
+    source = target.get("datasource")
+    return isinstance(source, dict) and source.get("uid") == rules.PROMETHEUS_UID
+
+
+def _counted(expression: _Expression) -> _Selector | None:
+    """The series whose increase, summed, is all the expression returns; None when it returns anything else.
+
+    What `rules.awake` adds for the series' own pool is not counted against it. A mean, a ratio or
+    a comparison that holds the same increase is not a count.
+    """
+    tokens = expression.tokens
+    start, end = 0, len(tokens)
+    if len(expression.selectors) == 2:
+        pools = [
+            value
+            for label, operator, value in expression.selectors[0].matchers
+            if (label, operator) == (rules.POOL, "=")
+        ]
+        if len(pools) != 1 or not _keeps_awake(expression, pools[0]):
+            return None
+        start, end = 1, _closing(tokens, 0)
+    elif len(expression.selectors) != 1:
+        return None
+    selector = expression.selectors[0]
+    increases = [call for call in expression.calls if call.function == "increase"]
+    if len(increases) != 1 or expression.argument(increases[0]) != selector:
+        return None
+    index = start
+    while index < end:
+        if index == selector.start:
+            index = selector.end
+        elif tokens[index].lower() in {"by", "without"} and tokens[index + 1 : index + 2] == ("(",):
+            index = _closing(tokens, index + 1) + 1
+        elif tokens[index].lower() in {"sum", "increase", "(", ")"}:
+            index += 1
+        else:
+            return None
+    return selector
+
+
 def _reads_asleep(panel: Mapping[str, Any], pool: str) -> bool:
-    """Whether the panel holds `rules.asleep` for the pool, as a query whose zero reads "asleep"."""
+    """Whether the panel holds `rules.asleep` for the pool, as a query, shown, whose zero reads "asleep"."""
     state = _tokens(rules.asleep(pool))[0]
     references = {
-        target.get("refId") for target in panel.get("targets") or () if _tokens(target.get("expr") or "")[0] == state
+        target.get("refId")
+        for target in panel.get("targets") or ()
+        if _is_shown(target) and _is_prometheus(target) and _tokens(target.get("expr") or "")[0] == state
     }
     for override in (panel.get("fieldConfig") or {}).get("overrides") or ():
         matcher = override.get("matcher") or {}
@@ -292,12 +341,12 @@ def _panel_problems(
     engine_names = _engine_names()
     targets = panel.get("targets") or ()
     read: list[_Expression] = []
+    counts: set[tuple[str, frozenset[tuple[str, str, str]], str | None]] = set()
     asleep_for: set[str] = set()
     for target in targets:
-        source = target.get("datasource")
-        if source is None:
+        if target.get("datasource") is None:
             yield Violation("data-source", where, f"query {target.get('refId')!r} names no data source")
-        if not isinstance(source, dict) or source.get("uid") != rules.PROMETHEUS_UID:
+        if not _is_prometheus(target):
             continue
         try:
             expression = _read(target.get("expr") or "")
@@ -305,6 +354,9 @@ def _panel_problems(
             yield Violation("unreadable", where, f"query {target.get('refId')!r}: {problem}")
             continue
         read.append(expression)
+        counted = _counted(expression) if _is_shown(target) else None
+        if counted is not None:
+            counts.add((counted.name, counted.matchers, counted.window))
 
         for call in expression.calls:
             argument = expression.argument(call)
@@ -316,7 +368,7 @@ def _panel_problems(
             rows = engine_names.get(selector.name)
             if rows is None:
                 name = selector.name
-                if not any(name == family or name.removeprefix(family) in SAMPLES for family in families):
+                if not any(name == family or name in {family + sample for sample in SAMPLES} for family in families):
                     yield Violation("undeclared", where, f"{name} is not declared")
                 continue
             if not any(quantity in covered for _, quantity in rows):
@@ -338,12 +390,6 @@ def _panel_problems(
     if asleep_for and panel.get("type") in ONE_VALUE_PANELS and not all(target.get("instant") for target in targets):
         yield Violation("asleep", where, "a panel of one value asks for the range, and would keep an old value")
 
-    counts = set()
-    for expression in read:
-        for call in expression.calls:
-            argument = expression.argument(call)
-            if call.function == "increase" and argument is not None:
-                counts.add((argument.name, argument.matchers, argument.window))
     for expression in read:
         for call in expression.calls:
             if call.function != "histogram_quantile":
@@ -358,7 +404,7 @@ def _panel_problems(
             for bucket in buckets:
                 count = bucket.name.removesuffix("_bucket") + "_count"
                 if (count, bucket.matchers, bucket.window) not in counts:
-                    yield Violation("percentile", where, f"no increase of {count} over the same window")
+                    yield Violation("percentile", where, f"no query shows the increase of {count} over the same window")
 
 
 def violations(
