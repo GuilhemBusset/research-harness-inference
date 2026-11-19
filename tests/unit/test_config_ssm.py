@@ -68,9 +68,12 @@ def example_parameters() -> dict[str, str]:
     # One parameter per pool, its entry as a JSON object; the table has none.
     entries = {f"/rhi/config/pools/{name}": json.dumps(entry) for name, entry in values.pop("pools").items()}
     # A boolean as the owner types it, `true` or `false`, and a list as a JSON array.
+    # The rate-limits table is a TOML inline table.
     def typed(value: object) -> str:
         if type(value) is bool:
             return str(value).lower()
+        if isinstance(value, dict):
+            return "{ " + ", ".join(f"{name} = {limit}" for name, limit in value.items()) + " }"
         return json.dumps(value) if type(value) is list else str(value)
 
     return {f"/rhi/config/{key}": typed(value) for key, value in values.items()} | entries
@@ -145,6 +148,7 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         time_zone="Europe/Paris",
         course_end=datetime.date(2031, 2, 3),
         https_listener=False,
+        rate_limits=config.RateLimits(per_address=5000, issuer=20, grafana=150),
     )
     stand_in = StandIn()
     for written in (EXAMPLE, other):  # the second writing goes over the first

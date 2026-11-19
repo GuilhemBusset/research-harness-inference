@@ -17,10 +17,11 @@ it.
 key, and one per entry of the pools table, named `SSM_POOLS_PREFIX` followed by the pool's name:
 an empty table has none. A string is stored as it is, a number in digits, a boolean as `true` or
 `false` (`True` and `False` are read too), a date as YYYY-MM-DD, a list as a JSON array (an empty
-one as `[]`) and a pool's entry as a JSON object. The prefix holds the configuration and nothing
-else. The source reads the prefix, in one read by path, and nothing outside it, and refuses a
-parameter under it that names no key, like an unknown key. No value is a credential (system
-design, section 10), so none is a SecureString. The module names no region and no account.
+one as `[]`), a pool's entry as a JSON object and the rate limits as a TOML inline table
+(`{ issuer = 100 }`). The prefix holds the configuration and nothing else. The source reads the
+prefix, in one read by path, and nothing outside it, and refuses a parameter under it that names
+no key, like an unknown key. No value is a credential (system design, section 10), so none is a
+SecureString. The module names no region and no account.
 
 `write_ssm` and `write_file` write a configuration back out, in the form the ssm source and the
 file source read: each source loads what its writer wrote as the same object. The AWS SDK is
@@ -78,6 +79,16 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class RateLimits:
+    """The web ACL's rate limits, in requests per 5 minutes per source address (system design,
+    sections 6.5 and 17): every request, the issuer's under `/auth/`, Grafana's under `/grafana/`."""
+
+    per_address: int
+    issuer: int
+    grafana: int
+
+
+@dataclass(frozen=True)
 class Config:
     """The typed configuration. One field per key of `KEYS`, under the same name."""
 
@@ -130,6 +141,8 @@ class Config:
     retry_after_warming_seconds: int
     retry_after_capacity_unavailable_seconds: int
     retry_after_concurrency_limit_seconds: int
+    # The web ACL's three rate limits, read at synthesis only.
+    rate_limits: RateLimits
 
 
 def _as_stored(text: str) -> object:
@@ -232,6 +245,22 @@ def _dollars_an_hour(value: object) -> float:
     return float(value)
 
 
+# What WAF accepts as the limit of a rate-based rule.
+RATE_LIMIT_RANGE = range(10, 2_000_000_001)
+# Section 17's rate limits.
+_RATE_LIMIT_DEFAULTS: dict[str, int] = {"per_address": 2000, "issuer": 100, "grafana": 300}
+
+
+def _rate_limits(value: object) -> RateLimits:
+    # Each entry of the table is optional: the one left out takes its default.
+    if not isinstance(value, dict) or set(value) - set(_RATE_LIMIT_DEFAULTS):
+        raise ValueError
+    limits = _RATE_LIMIT_DEFAULTS | value
+    if any(type(limit) is not int or limit not in RATE_LIMIT_RANGE for limit in limits.values()):
+        raise ValueError
+    return RateLimits(**limits)
+
+
 def _number_from_text(text: str) -> object:
     # ASCII digits only, and few enough that `int` accepts them.
     return int(text) if re.fullmatch(r"[0-9]{1,18}", text) else text
@@ -257,6 +286,14 @@ def _list_from_text(text: str) -> object:
 
 def _price_from_text(text: str) -> object:
     return float(text) if re.fullmatch(r"[0-9]{1,18}(\.[0-9]{1,18})?", text) else text
+
+
+def _table_from_text(text: str) -> object:
+    # A TOML inline table, as `write_ssm` writes it.
+    try:
+        return tomllib.loads(f"value = {text}")["value"]
+    except tomllib.TOMLDecodeError:
+        return text
 
 
 def _json_from_text(text: str) -> object:
@@ -299,6 +336,11 @@ KEYS: dict[str, Key] = {
     "retry_after_warming_seconds": _WHOLE_NUMBER,
     "retry_after_capacity_unavailable_seconds": _WHOLE_NUMBER,
     "retry_after_concurrency_limit_seconds": _WHOLE_NUMBER,
+    "rate_limits": Key(
+        "a table whose optional entries per_address, issuer and grafana are whole numbers from 10 to 2000000000",
+        _rate_limits,
+        _table_from_text,
+    ),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -328,6 +370,9 @@ DEFAULTS: dict[str, object] = {
     "retry_after_warming_seconds": 30,
     "retry_after_capacity_unavailable_seconds": 60,
     "retry_after_concurrency_limit_seconds": 5,
+    # Section 17: generous per address, since a campus shares one address; tighter on the issuer
+    # and on Grafana.
+    "rate_limits": dict(_RATE_LIMIT_DEFAULTS),
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
@@ -550,6 +595,9 @@ def _ssm_text(value: object) -> str:
         return value.isoformat()
     if isinstance(value, tuple) and not value:
         return "[]"
+    if isinstance(value, RateLimits):
+        # A TOML inline table, in SSM as in a file.
+        return "{ " + ", ".join(f"{name} = {_ssm_text(limit)}" for name, limit in vars(value).items()) + " }"
     table = _pool_entries(value)
     if table is not None:
         return _json(table)

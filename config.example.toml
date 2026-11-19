@@ -39,6 +39,11 @@ session_windows = []
 # listener and the rules on it.
 https_listener = true
 
+# The web ACL's rate limits, in requests per 5 minutes per source address: every request (generous,
+# since a campus shares one address), the issuer's under /auth/ and Grafana's under /grafana/. Each
+# entry is optional; the values below are the defaults.
+rate_limits = { per_address = 2000, issuer = 100, grafana = 300 }
+
 # The instance types a pool may list, a hard cap (system design, section 11.3). Left out, it is the
 # types the pools below list.
 allowed_instance_types = ["t4g.small"]

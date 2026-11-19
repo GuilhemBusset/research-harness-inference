@@ -348,6 +348,27 @@ def test_the_module_names_the_private_keys() -> None:
     assert set(config.KEYS) >= config.PRIVATE_KEYS
 
 
+def test_rate_limits_read_the_defaults_of_section_17_when_left_out(tmp_path: Path) -> None:
+    defaults = config.RateLimits(per_address=2000, issuer=100, grafana=300)
+    assert load_text(tmp_path, example_with(rate_limits=None)).rate_limits == defaults
+    assert config.load({"RHI_CONFIG": "example"}).rate_limits == defaults
+    # Each entry is optional on its own.
+    partial = load_text(tmp_path, example_with(rate_limits="{ issuer = 50 }")).rate_limits
+    assert partial == config.RateLimits(per_address=2000, issuer=50, grafana=300)
+    assert load_text(tmp_path, example_with(rate_limits="{}")).rate_limits == defaults
+
+
+@pytest.mark.parametrize(
+    "value",
+    [f'"{MARK}"', MARK, f"{{ issuer = {MARK}.5 }}", "{ grafana = true }", "{ issuer = 9 }",
+     f"{{ per_address = 2{MARK}000000 }}", f"{{ surprise{MARK} = 100 }}", f'{{ issuer = "{MARK}" }}'],
+)
+def test_rate_limits_refuse_what_waf_would_not_take(tmp_path: Path, value: str) -> None:
+    message = refusal(tmp_path, example_with(rate_limits=value))
+    assert "'rate_limits'" in message
+    assert MARK not in message
+
+
 # The mock pool's lines, as the example gives them (sections 4.2 and 17, evidence E15).
 MOCK_LINES = (
     ("engine", '"mock"'),
