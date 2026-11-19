@@ -89,6 +89,32 @@ ends a quiet stream. An idle upstream connection is closed after 5 seconds, one 
 let a pool's instance leave service quickly (section 5.1). The time limit is waited for with the
 `sleep` the proxy is given, `asyncio.sleep` unless a test gives its own clock.
 
+**Token times** (section 7.2). The speed a student got is counted from the first token sent to the
+last, so `forward` and `held` take a `token_sent`, which the proxy calls each time a write to the
+client that completed an event carrying output has returned (`carries_output`). Output is text,
+reasoning or a tool call's arguments, as in the engine's output tokens, and an event carries some
+when the piece it adds is not empty: a `content_block_delta` of Messages with text, thinking or a
+tool's input, a `.delta` event of Responses, a Chat Completions chunk whose delta holds text or a
+tool call's arguments. An empty piece is no token, and neither is what an engine sends beside its
+output: a thinking block's signature, a tool call's name, the role. It is not called for a write
+given up at the time limit, for a keep-alive, or for an answer that is not a stream. The first and
+the last call of a request are its two times; whoever is called reads the clock
+(`rhi_gateway.experience`).
+
+The model reasons before it answers (section 4.2), and a student sees an answer begin at the first
+token that is not reasoning. So each call also says whether what was just written carries answer
+text or a tool call (`output_of`), as each format's reference marks its events:
+
+- Messages: a `text_delta` or an `input_json_delta` is the answer, a `thinking_delta` reasoning;
+- Responses: the reference names its reasoning events `response.reasoning_text.delta` and
+  `response.reasoning_summary_text.delta`. A `.delta` event whose name begins `response.reasoning`
+  is reasoning, and any other the answer: its text, a refusal, a tool call's arguments or input;
+- Chat Completions: the reference gives a delta `content`, `refusal`, `tool_calls` and the
+  deprecated `function_call`, which the gateway still accepts in a request, and no reasoning
+  field. So a delta with one of the first two, or with the arguments of a tool call or of a
+  function call, is the answer, and a delta that carries output in any other field, the engine's
+  own, is reasoning.
+
 Nothing here reads configuration or the environment: the address, the secrets and the limit are
 given.
 """
@@ -96,6 +122,7 @@ given.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import aclosing
@@ -272,6 +299,98 @@ def _is_failure(event: SseEvent) -> bool:
     if event.comment:
         return False
     return event.name in FAILURE_EVENTS or _reports_failure(_json_object(event.data))
+
+
+class Output(enum.Enum):
+    """What an event that carries output carries: the model's reasoning, or its answer (text or a tool call)."""
+
+    REASONING = "reasoning"
+    ANSWER = "answer"
+
+
+# What `forward` and `held` call once output has been written to the client: with whether some of it is the answer.
+TokenSent = Callable[[bool], None]
+
+# The events that carry output. Messages names one kind of event, and the field of each kind of piece: a
+# thinking block's signature is a `signature_delta`, which is not output. Responses ends the name of
+# each of its kinds alike, and the piece is the event's `delta`.
+MESSAGES_OUTPUT_EVENT = "content_block_delta"
+MESSAGES_OUTPUT_FIELDS = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}
+RESPONSES_OUTPUT_SUFFIX = ".delta"
+# Which of them carry reasoning: one kind of piece of Messages, the events of Responses named so. Chat
+# Completions has no reasoning field: its answer is in these fields of a delta, in its tool calls and
+# in the deprecated function call, the one call a delta carried before it carried a list of them.
+MESSAGES_REASONING_PIECE = "thinking_delta"
+RESPONSES_REASONING_PREFIX = "response.reasoning"
+CHAT_ANSWER_FIELDS = frozenset({"content", "refusal"})
+CHAT_TOOL_CALLS = "tool_calls"
+CHAT_FUNCTION_CALL = "function_call"
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _has_arguments(function: object) -> bool:
+    """Whether a function, as a delta gives it, adds a piece of its arguments: its name alone is not a token."""
+    return isinstance(function, dict) and _is_text(function.get("arguments"))
+
+
+def _chat_delta_output(delta: Mapping[str, object]) -> Output | None:
+    """What a chunk's delta adds: answer text or a piece of a call's arguments, else any other text, as reasoning."""
+    found = None
+    for name, value in delta.items():
+        if name == CHAT_TOOL_CALLS:
+            # A call's first chunk names it, with no arguments yet: that is not a token.
+            calls = value if isinstance(value, list) else []
+            if any(isinstance(call, dict) and _has_arguments(call.get("function")) for call in calls):
+                return Output.ANSWER
+        elif name == CHAT_FUNCTION_CALL:
+            if _has_arguments(value):
+                return Output.ANSWER
+        elif name != "role" and _is_text(value):
+            if name in CHAT_ANSWER_FIELDS:
+                return Output.ANSWER
+            found = Output.REASONING
+    return found
+
+
+def output_of(wire_format: WireFormat, event: SseEvent) -> Output | None:
+    """What an event of a stream carries of the output, if any: a piece, not empty, of reasoning or of the answer.
+
+    The answer is its text or a tool call's arguments. An event that carries both is the answer's.
+    """
+    if event.comment:
+        return None
+    data = _json_object(event.data)
+    if wire_format is WireFormat.CHAT_COMPLETIONS:
+        choices = data.get("choices")
+        found = {
+            _chat_delta_output(delta)
+            for choice in (choices if isinstance(choices, list) else [])
+            if isinstance(choice, dict) and isinstance(delta := choice.get("delta"), dict)
+        }
+        return Output.ANSWER if Output.ANSWER in found else Output.REASONING if Output.REASONING in found else None
+    kind = event.name or data.get("type")
+    if not isinstance(kind, str):
+        return None
+    if wire_format is WireFormat.RESPONSES:
+        if not kind.endswith(RESPONSES_OUTPUT_SUFFIX) or not _is_text(data.get("delta")):
+            return None
+        return Output.REASONING if kind.startswith(RESPONSES_REASONING_PREFIX) else Output.ANSWER
+    delta = data.get("delta")
+    if kind != MESSAGES_OUTPUT_EVENT or not isinstance(delta, dict):
+        return None
+    piece = delta.get("type")
+    field = MESSAGES_OUTPUT_FIELDS.get(piece) if isinstance(piece, str) else None
+    if field is None or not _is_text(delta.get(field)):
+        return None
+    return Output.REASONING if piece == MESSAGES_REASONING_PIECE else Output.ANSWER
+
+
+def carries_output(wire_format: WireFormat, event: SseEvent) -> bool:
+    """Whether an event of a stream carries output: a piece, not empty, of text, reasoning or a tool call's arguments."""
+    return output_of(wire_format, event) is not None
 
 
 def _event_name(line: bytes) -> str:
@@ -490,6 +609,7 @@ class _Stream:
         *,
         upstream: AsyncIterator[bytes] | None = None,
         first: bytes | None = None,
+        token_sent: TokenSent | None = None,
     ) -> None:
         self._response = response
         # Decoded, should the engine compress what it was asked to send as it is: the client is
@@ -504,6 +624,8 @@ class _Stream:
         self._settle = settle
         self._clean = False
         self._abandoned = False  # The last write of a chunk to the client was given up at the time limit.
+        self._token_sent = token_sent
+        self._sent = SseReader()  # Reads what is written to the client, for the events that carry output.
 
     def abandon_write(self) -> None:
         """The write of the chunk last given was given up: the client does not have it."""
@@ -533,10 +655,18 @@ class _Stream:
                 before = self._gate.client_has
                 forward = self._gate.feed(self._meter.feed(chunk))
                 if forward:
+                    carried = (
+                        set()
+                        if self._token_sent is None
+                        else {output_of(self._wire_format, event) for event in self._sent.feed(forward)} - {None}
+                    )
                     yield forward
                     if self._abandoned:
                         client_has = before
                         raise TimeLimitReached
+                    if carried and self._token_sent is not None:
+                        # The write has returned: the client has the token, and the answer's first if it is one.
+                        self._token_sent(Output.ANSWER in carried)
                 if self._gate.failed_event_ended:
                     break
         except TimeLimitReached:
@@ -639,12 +769,15 @@ class Proxy:
         on_end: Callable[[Observed], Awaitable[None]],
         *,
         receive: Receive | None = None,
+        token_sent: TokenSent | None = None,
     ) -> Response:
         """Forward the request and return the client's answer; `on_end` is called exactly once, at its end.
 
         `receive` is the client's, whose body has been read: it is listened to for the client's
         disconnect until a stream starts. A stream's end comes once the client's answer has been
-        sent or abandoned; every other end comes before this returns.
+        sent or abandoned; every other end comes before this returns. `token_sent` is called each
+        time an event of a stream that carries output has been written to the client, with whether
+        the output written is the answer's (text or a tool call) and not only reasoning.
         """
         settle = _Settlement(on_end)
         wire_format = route.wire_format or WireFormat.MESSAGES
@@ -664,7 +797,7 @@ class Proxy:
                     await ends.stop_listening()
                     streaming = True
                     meter = _stream_meter(route, forwarded)
-                    return ProxiedResponse(_Stream(response, meter, ends, wire_format, settle))
+                    return ProxiedResponse(_Stream(response, meter, ends, wire_format, settle, token_sent=token_sent))
                 chunks = response.aiter_bytes()
                 while (chunk := await ends.race(_next_chunk(chunks))) is not None:
                     received += chunk
@@ -688,14 +821,21 @@ class Proxy:
                 await _to_the_end(_close_and_settle(ends, response, settle, seen if whole else seen.unclean()))
 
     def held(
-        self, route: Route, forwarded: Forwarded, on_end: Callable[[Observed], Awaitable[None]], held: HeldRequest
+        self,
+        route: Route,
+        forwarded: Forwarded,
+        on_end: Callable[[Observed], Awaitable[None]],
+        held: HeldRequest,
+        *,
+        token_sent: TokenSent | None = None,
     ) -> Response:
         """A held stream's answer: 200 at once, the hold's keep-alives, then the engine's stream on the same connection.
 
         `on_end` is called exactly once: with nothing observed when the hold ends the request,
         else as `forward` calls it. The request is forwarded when `held.waiting()` ends.
+        `token_sent` is called as `forward` calls it, for the engine's stream.
         """
-        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held))
+        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held, token_sent))
 
 
 class HeldRequest(Protocol):
@@ -762,9 +902,16 @@ class _HeldStream:
     """A held stream: the hold's keep-alives, then the request forwarded, with keep-alives until the engine's first event."""
 
     def __init__(
-        self, proxy: Proxy, route: Route, forwarded: Forwarded, settle: _Settlement, held: HeldRequest
+        self,
+        proxy: Proxy,
+        route: Route,
+        forwarded: Forwarded,
+        settle: _Settlement,
+        held: HeldRequest,
+        token_sent: TokenSent | None = None,
     ) -> None:
         self._proxy = proxy
+        self._token_sent = token_sent
         self._route = route
         self._forwarded = forwarded
         self._settle = settle
@@ -828,6 +975,7 @@ class _HeldStream:
                     self._settle,
                     upstream=upstream,
                     first=bytes(before_first) or None,
+                    token_sent=self._token_sent,
                 )
                 async for chunk in stream.chunks():
                     yield chunk

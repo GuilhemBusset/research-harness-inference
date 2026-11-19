@@ -79,9 +79,18 @@ def data_of(stream: Any) -> list[tuple[str | None, Any]]:
 
 
 def messages_usage(stream: Any) -> tuple[bool, int, int]:
-    """Whether a Messages stream ended with its last event, and the input and output tokens it reported."""
+    """Whether a Messages stream ended with its last event, and the input and output tokens it reported.
+
+    In this format `input_tokens` leaves out what was read from the cache or written to it, which the
+    usage counts beside it: the input is their sum, and a request repeated whole may have all of it cached.
+    """
     events = data_of(stream)
-    starts = [data["message"]["usage"]["input_tokens"] for name, data in events if name == "message_start"]
+    parts = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    starts = [
+        sum(data["message"]["usage"].get(part) or 0 for part in parts)
+        for name, data in events
+        if name == "message_start"
+    ]
     deltas = [data["usage"]["output_tokens"] for name, data in events if name == "message_delta"]
     ended = bool(events) and events[-1][0] == "message_stop"
     return ended, sum(starts), max(deltas, default=0)

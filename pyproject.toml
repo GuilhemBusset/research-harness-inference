@@ -16,11 +16,16 @@ requires-python = ">=3.12"
 # below carry (one lock holds one version); tests/unit/test_config_ssm.py checks this pin. Its crt
 # extra installs awscrt, without which the SDK cannot use a profile signed in with `aws login`;
 # the service groups carry boto3 without it, so no bundle or image installs awscrt.
+# grafana-foundation-sdk is what the dashboards are written with (dashboards/rhi_dashboards/;
+# system design, section 7.3). It is a public preview at 0.0.x (docs/design/evidence.md, E19):
+# PyPI also holds older releases of it under version epochs, which sort above every 0.0.x, so the
+# pin is the only thing that selects this one. tests/unit/dashboards/test_build.py checks the pin.
 dependencies = [
     "aws-cdk-lib==2.276.0",
     "constructs==10.8.1",
     "cdk-nag==3.0.2",
     "boto3[crt]==1.43.126",
+    "grafana-foundation-sdk==0.0.22",
 ]
 
 # Exact pins, shared with the vendored implement loop (tools/implementation-loop/UPSTREAM.md) so

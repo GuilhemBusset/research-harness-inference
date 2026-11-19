@@ -20,10 +20,27 @@ declares, unless the request declares none or already ends with a tool's result,
 text: a harness that runs the call and sends its result back gets a turn that ends. Each piece of
 `REASONING`, `ANSWER` and `ARGUMENTS` is one output token and, in a stream, one delta.
 
-**The input count.** `count_input_tokens` is a pure function of the request: one token for every
-four characters of its prompt (system text, messages or input, and tools), written as canonical
-JSON. The usage of an answer and the token-counting route both report it, so the same request
-always costs the same.
+**The input.** `input_tokens` is a pure function of the request: its prompt as an engine reads it,
+cut into tokens. What stands before the transcript comes first (system text or instructions, and
+tools), then the transcript (messages or input), item by item. Each of these parts is written as
+canonical JSON, and every four characters of a part are one token. So a transcript that grows at
+its end keeps the tokens it had, and the same request always costs the same: `count_input_tokens`
+is their number, which the usage of an answer and the token-counting route both report.
+
+**The cache.** The mock computes nothing, so it has nothing to keep; it imitates a prefix cache by
+counting (`rhi_mock_engine.cache`; section 5.5). A request to a generation route carries the cache
+salt the gateway derived from its student, in `cache_salt`, the field vLLM's API reference names.
+Its cached tokens are those its input shares, from its start, with the last input this engine
+served under the same salt: all of them, when it repeats that input whole. The
+cache holds `cache_tokens` tokens and forgets the salt whose last request is the oldest first. A
+request with no salt is not one the gateway forwarded: nothing of it is kept, and none of its
+tokens is cached. Each format's usage reports the cached tokens where its reference puts them:
+
+| Format | The whole input | Of which read from the cache |
+| --- | --- | --- |
+| Chat Completions | `prompt_tokens` | `prompt_tokens_details.cached_tokens` |
+| Responses | `input_tokens` | `input_tokens_details.cached_tokens` |
+| Messages | `input_tokens` plus `cache_read_input_tokens` | `cache_read_input_tokens` |
 
 **The secret.** The four inference routes answer 401 unless the request carries
 `Authorization: Bearer` and the pool's secret, which `Settings.from_env` reads from
@@ -41,6 +58,7 @@ block, and they do nothing here but answer.
 | `RHI_MOCK_START_SECONDS` | time after start during which `/health` answers 503 | 0 |
 | `RHI_MOCK_HANG` | `1`: an inference request is never answered, and `/health` still is | `0` |
 | `RHI_MOCK_MAX_RUNNING` | requests generated at once; the others wait for a slot | 8 |
+| `RHI_MOCK_CACHE_TOKENS` | capacity of the imitated prefix cache, in tokens | 1000000 |
 
 **The limit and the metrics.** A request to one of the three generation routes waits for one of
 `max_running` slots, in the order it came, and holds it until its answer or its stream ends, or its
@@ -48,10 +66,12 @@ client goes away; the token-counting route takes none. `GET /metrics` serves the
 contract's metrics row under the mock's names in `rhi_common.engine_metrics`, and each follows the
 work done: the running and waiting requests; the time from a request's arrival to its first output
 token; the gap between two output tokens of a stream (a whole answer is not paced, so it has no
-gap); the input tokens of each request when it starts to run; each output token when it is sent.
-The mock has no cache, so the cached input tokens and the cache use stay at zero. The route answers
-only a client on a loopback address, where the node's collector scrapes it; any other gets the
-404 of a route that does not exist.
+gap); the input tokens of each request when it starts to run, cached or not, and the cached part
+of them; each output token when it is sent; the cache use, which is the tokens the cache keeps
+over its capacity. The capacity itself, `cache_tokens`, is served the way vLLM gives its own: as a
+label of an information metric whose value is 1, named in the mock's row beside the other names.
+The lifecycle agent reads it there. The route answers only a client on a loopback address, where
+the node's collector scrapes it; any other gets the 404 of a route that does not exist.
 
 **Shutdown.** `main` serves the application on port 8000 through `serve`. On SIGTERM the server
 accepts nothing new, lets every request already accepted run to its end, with no deadline that
@@ -69,7 +89,7 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -81,7 +101,8 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response, Strea
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from rhi_common.engine_metrics import MOCK, Quantity, metric_names
+from rhi_common.engine_metrics import MOCK, Quantity, cache_capacity, metric_names
+from rhi_mock_engine.cache import PrefixCache
 
 # Every engine listens here (system design, section 4.1).
 PORT = 8000
@@ -92,6 +113,7 @@ RATE_VARIABLE = "RHI_MOCK_TOKENS_PER_SECOND"
 START_VARIABLE = "RHI_MOCK_START_SECONDS"
 HANG_VARIABLE = "RHI_MOCK_HANG"
 MAX_RUNNING_VARIABLE = "RHI_MOCK_MAX_RUNNING"
+CACHE_TOKENS_VARIABLE = "RHI_MOCK_CACHE_TOKENS"
 
 INFERENCE_ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens")
 # The routes vLLM answers without its key (evidence E23).
@@ -103,9 +125,13 @@ ANSWER = ("This", " is", " the", " mock", " engine", "'s", " canned", " answer",
 # The arguments of the canned tool call, as the pieces of one JSON object.
 ARGUMENTS = ('{"', "canned", '":', " true", "}")
 
-# The parts of a request that are its prompt, in any of the three formats.
-_PROMPT_KEYS = ("system", "instructions", "messages", "input", "tools")
+# The parts of a request that are its prompt, in any of the three formats: what an engine's template
+# puts before the transcript, and the transcript.
+_HEAD_KEYS = ("system", "instructions", "tools")
+_TRANSCRIPT_KEYS = ("messages", "input")
 _CHARACTERS_PER_TOKEN = 4
+# The gateway writes the student's cache salt here, the field of vLLM's API reference (section 6.2).
+CACHE_SALT_FIELD = "cache_salt"
 
 _HANG_VALUES = {"": False, "0": False, "false": False, "1": True, "true": True}
 
@@ -116,7 +142,7 @@ class SettingsError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    """What the mock is started with: the pool's secret, and the five settings that shape its answers."""
+    """What the mock is started with: the pool's secret, and the settings that shape its answers."""
 
     secret: str
     first_byte_seconds: float = 0.0
@@ -125,6 +151,8 @@ class Settings:
     hang: bool = False
     # The coursework pool's engine runs at most 8 requests at once (system design, section 4.2).
     max_running: int = 8
+    # Near the least a coursework instance is expected to hold (system design, section 4.7).
+    cache_tokens: int = 1_000_000
 
     def __post_init__(self) -> None:
         if not self.secret:
@@ -137,6 +165,8 @@ class Settings:
             raise SettingsError(f"{START_VARIABLE} must be a number of seconds, zero or more")
         if isinstance(self.max_running, bool) or not isinstance(self.max_running, int) or self.max_running < 1:
             raise SettingsError(f"{MAX_RUNNING_VARIABLE} must be a whole number of requests, one or more")
+        if isinstance(self.cache_tokens, bool) or not isinstance(self.cache_tokens, int) or self.cache_tokens < 1:
+            raise SettingsError(f"{CACHE_TOKENS_VARIABLE} must be a whole number of tokens, one or more")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -148,32 +178,51 @@ class Settings:
             except ValueError:
                 raise SettingsError(f"{variable} must be a number") from None
 
+        def whole(variable: str, default: int) -> int:
+            try:
+                return int(environ.get(variable) or default)
+            except ValueError:
+                raise SettingsError(f"{variable} must be a whole number") from None
+
         hang = _HANG_VALUES.get(environ.get(HANG_VARIABLE, "").strip().lower())
         if hang is None:
             raise SettingsError(f"{HANG_VARIABLE} must be 0 or 1")
-        try:
-            max_running = int(environ.get(MAX_RUNNING_VARIABLE) or cls.max_running)
-        except ValueError:
-            raise SettingsError(f"{MAX_RUNNING_VARIABLE} must be a whole number") from None
         return cls(
             secret=environ.get(SECRET_VARIABLE, ""),
             first_byte_seconds=number(FIRST_BYTE_VARIABLE, cls.first_byte_seconds),
             tokens_per_second=number(RATE_VARIABLE, cls.tokens_per_second),
             start_seconds=number(START_VARIABLE, cls.start_seconds),
             hang=hang,
-            max_running=max_running,
+            max_running=whole(MAX_RUNNING_VARIABLE, cls.max_running),
+            cache_tokens=whole(CACHE_TOKENS_VARIABLE, cls.cache_tokens),
         )
 
 
-def _prompt(body: Mapping[str, Any]) -> str:
-    """The request's prompt as canonical JSON: the same text for the same prompt, whatever the key order."""
-    prompt = {key: body[key] for key in _PROMPT_KEYS if key in body}
-    return json.dumps(prompt, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _canonical(value: object) -> str:
+    """A value as canonical JSON: the same text for the same value, whatever the key order."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def input_tokens(body: Mapping[str, Any]) -> tuple[str, ...]:
+    """The input of a request, in any of the three formats, as its tokens: a pure function of its prompt.
+
+    The parts of the prompt in the order an engine reads them: what stands before the transcript,
+    then each item of the transcript. A part is cut by itself, so the tokens of a transcript do not
+    change when an item is added at its end.
+    """
+    parts = [_canonical({key: body[key] for key in _HEAD_KEYS if key in body})]
+    for key in _TRANSCRIPT_KEYS:
+        if key in body:
+            items = body[key]
+            parts += [_canonical(item) for item in (items if isinstance(items, list) else [items])]
+    return tuple(
+        part[at : at + _CHARACTERS_PER_TOKEN] for part in parts for at in range(0, len(part), _CHARACTERS_PER_TOKEN)
+    )
 
 
 def count_input_tokens(body: Mapping[str, Any]) -> int:
-    """The input tokens of a request, in any of the three formats: a pure function of its prompt."""
-    return math.ceil(len(_prompt(body)) / _CHARACTERS_PER_TOKEN)
+    """The number of input tokens of a request."""
+    return len(input_tokens(body))
 
 
 @dataclass(frozen=True)
@@ -184,7 +233,9 @@ class Turn:
     key: str
     model: str
     created: int
+    # The whole input, and the part of it the cache held.
     input_tokens: int
+    cached_tokens: int
     reasoning: tuple[str, ...]
     # The pieces of the text, or of the call's arguments when `tool` names a function.
     answer: tuple[str, ...]
@@ -226,11 +277,12 @@ def _chat_tool(body: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _chat_usage(turn: Turn) -> dict[str, int]:
+def _chat_usage(turn: Turn) -> dict[str, Any]:
     return {
         "prompt_tokens": turn.input_tokens,
         "completion_tokens": turn.output_tokens,
         "total_tokens": turn.input_tokens + turn.output_tokens,
+        "prompt_tokens_details": {"cached_tokens": turn.cached_tokens},
     }
 
 
@@ -330,6 +382,7 @@ def _responses_items(turn: Turn) -> tuple[dict[str, Any], dict[str, Any]]:
 def _responses_answer(turn: Turn, *, completed: bool = True) -> dict[str, Any]:
     usage = {
         "input_tokens": turn.input_tokens,
+        "input_tokens_details": {"cached_tokens": turn.cached_tokens},
         "output_tokens": turn.output_tokens,
         "total_tokens": turn.input_tokens + turn.output_tokens,
     }
@@ -408,6 +461,12 @@ def _messages_answer(turn: Turn, *, finished: bool = True) -> dict[str, Any]:
         tool_input = json.loads("".join(turn.answer))
         content.append({"type": "tool_use", "id": f"toolu_{turn.key}", "name": turn.tool, "input": tool_input})
     stop_reason = "end_turn" if turn.tool is None else "tool_use"
+    # In this format `input_tokens` is the part of the input that was not read from the cache.
+    usage = {
+        "input_tokens": turn.input_tokens - turn.cached_tokens,
+        "cache_read_input_tokens": turn.cached_tokens,
+        "output_tokens": turn.output_tokens if finished else 0,
+    }
     return {
         "id": f"msg_{turn.key}",
         "type": "message",
@@ -416,7 +475,7 @@ def _messages_answer(turn: Turn, *, finished: bool = True) -> dict[str, Any]:
         "content": content if finished else [],
         "stop_reason": stop_reason if finished else None,
         "stop_sequence": None,
-        "usage": {"input_tokens": turn.input_tokens, "output_tokens": turn.output_tokens if finished else 0},
+        "usage": usage,
     }
 
 
@@ -470,13 +529,14 @@ _WIRES = {
 }
 
 
-def _turn(body: Mapping[str, Any], tool: str | None) -> Turn:
+def _turn(body: Mapping[str, Any], tool: str | None, tokens: Sequence[str], cached: int) -> Turn:
     model = body.get("model")
     return Turn(
-        key=hashlib.sha256(_prompt(body).encode()).hexdigest()[:24],
+        key=hashlib.sha256("".join(tokens).encode()).hexdigest()[:24],
         model=model if isinstance(model, str) else "mock",
         created=int(time.time()),
-        input_tokens=count_input_tokens(body),
+        input_tokens=len(tokens),
+        cached_tokens=cached,
         reasoning=REASONING,
         answer=ANSWER if tool is None else ARGUMENTS,
         tool=tool,
@@ -530,9 +590,10 @@ _TOKEN_GAP_BUCKETS = (0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2
 
 
 class _Metrics:
-    """The quantities of the contract's metrics row, under the mock's names, in a registry of one application."""
+    """The quantities of the contract's metrics row, under the mock's names, in a registry of one
+    application, and the capacity of the cache in tokens where the mock's row says."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_tokens: int) -> None:
         names = metric_names(MOCK)
         self.registry = CollectorRegistry(auto_describe=True)
         registry = self.registry
@@ -552,10 +613,15 @@ class _Metrics:
         )
         self.input_tokens = Counter(names[Quantity.INPUT_TOKENS], "Input tokens of the requests run.", registry=registry)
         self.cached_input_tokens = Counter(
-            names[Quantity.CACHED_INPUT_TOKENS], "Input tokens read from the cache: none here.", registry=registry
+            names[Quantity.CACHED_INPUT_TOKENS], "Input tokens the cache held, of those.", registry=registry
         )
         self.output_tokens = Counter(names[Quantity.OUTPUT_TOKENS], "Output tokens sent.", registry=registry)
-        self.cache_usage = Gauge(names[Quantity.CACHE_USAGE], "Share of the cache in use: none here.", registry=registry)
+        self.cache_usage = Gauge(names[Quantity.CACHE_USAGE], "Share of the cache in use.", registry=registry)
+        capacity = cache_capacity(MOCK)
+        if capacity is not None:
+            Gauge(capacity.metric, "The cache: its capacity in tokens.", (capacity.label,), registry=registry).labels(
+                str(cache_tokens)
+            ).set(1)
 
 
 class _Holding:
@@ -592,7 +658,8 @@ def create_app(
     started = clock()
     secret = settings.secret.encode()
     slots = _Slots(settings.max_running)
-    metrics = _Metrics()
+    metrics = _Metrics(settings.cache_tokens)
+    cache = PrefixCache(settings.cache_tokens)
 
     def authorized(request: Request) -> bool:
         scheme, _, credential = request.headers.get("authorization", "").partition(" ")
@@ -653,8 +720,14 @@ def create_app(
                     slots.give_back()
 
             try:
-                turn = _turn(body, wire.tool(body))
+                tokens = input_tokens(body)
+                salt = body.get(CACHE_SALT_FIELD)
+                # Counted when the request starts to run: that is when an engine reads its prompt.
+                cached = cache.serve(salt, tokens) if isinstance(salt, str) and salt else 0
+                turn = _turn(body, wire.tool(body), tokens, cached)
                 metrics.input_tokens.inc(turn.input_tokens)
+                metrics.cached_input_tokens.inc(cached)
+                metrics.cache_usage.set(cache.use)
                 await sleep(settings.first_byte_seconds)
                 if body.get("stream") is True:
                     response: Response = StreamingResponse(

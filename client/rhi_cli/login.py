@@ -18,6 +18,9 @@
 
 Every call goes through a `Transport`, and the waiting through `sleep` and `clock`: the tests give
 stubs of all three.
+
+The other commands share what is here: the transport, the stored endpoint and key (`signed_in`),
+and the device flow (`start_device_flow`, `redeem`), which `rhi revoke --all` runs afresh.
 """
 
 from __future__ import annotations
@@ -55,14 +58,15 @@ NO_ENDPOINT = (
 
 
 class LoginError(Exception):
-    """A login that cannot go on; the message is for the student and never holds the key."""
+    """A command that cannot go on; the message is for the student and never holds the key."""
 
 
 @dataclass(frozen=True)
 class Call:
     """One HTTP call. GitHub's device endpoint takes a form; the issuer takes JSON.
 
-    `headers` are sent with it: the gateway is given the key in one.
+    `headers` are sent with it: the gateway, and the issuer's `POST /auth/revoke`, are given the
+    key in one.
     """
 
     method: str
@@ -86,7 +90,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def http_transport(call: Call) -> tuple[int, Any]:
-    """The transport of a real login: the standard library's HTTP client."""
+    """The transport of a real command: the standard library's HTTP client."""
     data = None
     headers = {"Accept": "application/json", "User-Agent": "rhi-cli", **(call.headers or {})}
     if call.fields is not None:
@@ -129,24 +133,41 @@ def _when(epoch: int) -> str:
     return datetime.datetime.fromtimestamp(epoch, tz=datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def login(
-    endpoint: str | None,
-    *,
-    transport: Transport = http_transport,
-    sleep: Callable[[float], object] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-    out: TextIO | None = None,
-) -> None:
-    """Log in, store the key, and print what the student needs; `LoginError` when it fails."""
-    out = out or sys.stdout
-    config = store.load_config()
-    address = _endpoint(endpoint) if endpoint is not None else config.endpoint
-    if not address:
-        raise LoginError(NO_ENDPOINT)
-    installation = config.installation or secrets.token_urlsafe(32)
-    if (address, installation) != (config.endpoint, config.installation):
-        store.save_config(store.Config(endpoint=address, installation=installation))
+def address_of(endpoint: str | None, config: store.Config) -> str | None:
+    """The endpoint's address: the one given on the command line, or else the stored one, None when there is neither."""
+    return _endpoint(endpoint) if endpoint is not None else config.endpoint
 
+
+def signed_in() -> tuple[str, str]:
+    """The stored endpoint's address and the stored key; `LoginError` before the first login."""
+    address, key = store.load_config().endpoint, store.load_key()
+    if not address or not key:
+        raise LoginError("No key is stored. Run rhi login.")
+    return address, key
+
+
+def refusal(status: int, body: Any) -> str:
+    """An answer that is not a 200, for the student: the error's name and sentence, or the status alone.
+
+    The gateway names its error in `type` and the issuer in `code`; both give a sentence.
+    """
+    error = _member(body, "error", dict) or {}
+    name = _member(error, "type", str) or _member(error, "code", str)
+    message = _member(error, "message", str)
+    return ": ".join(part for part in (name, message) if part) or f"HTTP {status}"
+
+
+@dataclass(frozen=True)
+class DeviceFlow:
+    """A device flow GitHub has started: its device code, how often it may be redeemed, and for how long."""
+
+    device_code: str
+    interval: int
+    expires_in: int
+
+
+def start_device_flow(address: str, transport: Transport, out: TextIO) -> DeviceFlow:
+    """Start a device flow for the login app the issuer names, and print the code the student confirms."""
     status, body = transport(Call("GET", address + CONFIG_PATH))
     client_id = _member(body, "client_id", str)
     if status != 200 or not client_id:
@@ -158,23 +179,40 @@ def login(
     verification_uri = _member(device, "verification_uri", str)
     if status != 200 or not (device_code and user_code and verification_uri):
         raise LoginError(f"GitHub gave no device code (HTTP {status}): try again later.")
-    interval = _member(device, "interval", int) or DEFAULT_INTERVAL
-    expires_in = _member(device, "expires_in", int) or 900
 
     print(f"Open {verification_uri} and enter the code {user_code}", file=out)
     print("Confirm only a code that your own terminal has just printed.", file=out, flush=True)
+    return DeviceFlow(
+        device_code=device_code,
+        interval=_member(device, "interval", int) or DEFAULT_INTERVAL,
+        expires_in=_member(device, "expires_in", int) or 900,
+    )
 
-    deadline = clock() + expires_in
+
+def redeem(
+    flow: DeviceFlow,
+    call: Call,
+    command: str,
+    *,
+    transport: Transport,
+    sleep: Callable[[float], object],
+    clock: Callable[[], float],
+) -> Any:
+    """Send `call`, which carries the flow's device code, to the issuer until it answers 200; that answer.
+
+    The call is sent at the interval GitHub gave, five seconds longer after each `slow_down`,
+    while the issuer answers that the student has not confirmed the code yet. `LoginError` on any
+    other refusal, and when the code expires; `command` is the one the student runs again then.
+    """
+    interval = flow.interval
+    deadline = clock() + flow.expires_in
     while True:
         sleep(interval)
         if clock() >= deadline:
-            raise LoginError("The code has expired: run rhi login again.")
-        status, answer = transport(
-            Call("POST", address + LOGIN_PATH, {"device_code": device_code, "installation": installation})
-        )
-        key = _member(answer, "key", str)
-        if status == 200 and key:
-            break
+            raise LoginError(f"The code has expired: run {command} again.")
+        status, answer = transport(call)
+        if status == 200:
+            return answer
         error = _member(answer, "error", dict) or {}
         code = _member(error, "code", str)
         if code == "authorization_pending":
@@ -183,7 +221,33 @@ def login(
             interval += SLOW_DOWN_STEP
             continue
         message = _member(error, "message", str)
-        raise LoginError(message or f"The endpoint refused the login (HTTP {status}).")
+        raise LoginError(message or f"The endpoint refused the request (HTTP {status}).")
+
+
+def login(
+    endpoint: str | None,
+    *,
+    transport: Transport = http_transport,
+    sleep: Callable[[float], object] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    out: TextIO | None = None,
+) -> None:
+    """Log in, store the key, and print what the student needs; `LoginError` when it fails."""
+    out = out or sys.stdout
+    config = store.load_config()
+    address = address_of(endpoint, config)
+    if not address:
+        raise LoginError(NO_ENDPOINT)
+    installation = config.installation or secrets.token_urlsafe(32)
+    if (address, installation) != (config.endpoint, config.installation):
+        store.save_config(store.Config(endpoint=address, installation=installation))
+
+    flow = start_device_flow(address, transport, out)
+    request = Call("POST", address + LOGIN_PATH, {"device_code": flow.device_code, "installation": installation})
+    answer = redeem(flow, request, "rhi login", transport=transport, sleep=sleep, clock=clock)
+    key = _member(answer, "key", str)
+    if not key:
+        raise LoginError("The endpoint answered the login with no key.")
 
     where = store.save_key(key)
     print(f"Logged in. Your key is stored in {where}.", file=out)

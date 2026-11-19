@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from rhi_common.engine_metrics import ENGINES, MOCK, NAME, Kind, Quantity, metric_names
+from rhi_common.engine_metrics import ENGINES, LABEL, MOCK, NAME, Kind, Quantity, cache_capacity, metric_names
 
 
 def test_the_contract_row_has_its_eight_quantities() -> None:
@@ -35,7 +35,24 @@ def test_each_row_names_every_quantity_once(engine: str) -> None:
     assert not any(row[quantity].endswith("_total") for quantity in Quantity if quantity.kind is Kind.COUNTER)
 
 
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_row_that_says_where_the_cache_capacity_is_names_a_metric_of_its_own_and_a_label(engine: str) -> None:
+    place = cache_capacity(engine)
+
+    if place is not None:
+        assert NAME.fullmatch(place.metric)
+        assert LABEL.fullmatch(place.label)
+        # An information metric beside the row's quantities, not one of them.
+        assert place.metric not in metric_names(engine).values()
+
+
+def test_the_mock_says_where_it_gives_its_cache_capacity() -> None:
+    assert cache_capacity(MOCK) is not None
+
+
 def test_the_mock_has_a_row_and_an_unknown_engine_has_none() -> None:
     assert MOCK in ENGINES
     with pytest.raises(KeyError):
         metric_names("no-such-engine")
+    with pytest.raises(KeyError):
+        cache_capacity("no-such-engine")

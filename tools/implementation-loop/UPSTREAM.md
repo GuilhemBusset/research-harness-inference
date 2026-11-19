@@ -25,6 +25,20 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## A failed CI run's feedback is the failed job's log (2026-11-19)
+
+A local patch, not in upstream. When the required check fails, the builder gets the tail of the
+failed jobs' logs. The required check is a failed job too: its lines come last in the log and only
+name the jobs that failed, so they filled the tail and the failing job's own lines were lost.
+#102's builder could not see that an apt mirror's 503 had failed `engine-tests`, and it failed on
+`no_progress`. The engine's version stays 1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/github.py` | `failed_log` takes `skip`, a job whose lines are left out before the tail is cut. |
+| `implement_loop/engine.py` | `_ci_failed` passes the required check's name as `skip`. |
+| `tests/test_github.py` | New: the tail keeps the failed job's last line and none of the required check's. |
+
 ## An issue closed by another run no longer keeps a root running (2026-11-19)
 
 A local patch, not in upstream. A root's state keeps every issue it ever recorded, prerequisites

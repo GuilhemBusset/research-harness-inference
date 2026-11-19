@@ -1,8 +1,8 @@
-"""The access stack: the students' state, the key issuer, and later the admin's sign-in (system
-design, sections 2 and 6.4).
+"""The access stack: the students' state, the key issuer and the admin's sign-in (system design,
+sections 2, 6.4 and 7.4).
 
-The stack and the logical IDs of its tables are recorded in `tests/policy/stateful_logical_ids.json`:
-moving a table to another stack replaces it.
+The stack and the logical IDs of its tables and of its user pool are recorded in
+`tests/policy/stateful_logical_ids.json`: moving one to another stack replaces it.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import aws_cdk as cdk
 
 from rhi.access.issuer import Issuer
+from rhi.access.sign_in import SignIn
 from rhi.access.tables import AccessTables
 
 if TYPE_CHECKING:
@@ -24,7 +25,8 @@ if TYPE_CHECKING:
 class AccessStack(cdk.Stack):
     """Holds the keys, roster and usage tables, which the other stacks of the stage take from
     `tables` (`tables.keys`, ...), and the key issuer, as `issuer`, reached through `listener`, the
-    public load balancer's HTTPS listener, or from nowhere while it is None."""
+    public load balancer's HTTPS listener, or from nowhere while it is None. It also holds the
+    admin's user pool, with its sign-in domain and the load balancer's client, as `sign_in`."""
 
     def __init__(
         self,
@@ -48,3 +50,4 @@ class AccessStack(cdk.Stack):
             keys=self.tables.keys,
             listener=listener,
         )
+        self.sign_in = SignIn(self, "SignIn", config=config)
