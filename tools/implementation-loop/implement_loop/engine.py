@@ -395,7 +395,22 @@ class Engine:
         for name, color, desc in (DEFERRED_LABEL, FOLLOWUP_LABEL):
             self._safe(self.gh.ensure_label, name, color, desc)
 
+    def _settle_closed_elsewhere(self) -> None:
+        """An issue this run recorded once (a prerequisite pulled in from another epic) that is no
+        longer its work and is closed on GitHub, by another run or by hand, is done here too: its
+        stale phase would otherwise keep the root from ever settling (#2, 2026-11-19)."""
+        for n in self.store.known():
+            st = self.store.issue(n)
+            if n in self.plan.work or st.phase in (Phase.DONE, Phase.DELIVERED, Phase.FAILED):
+                continue
+            data = self._safe(self.gh.get_issue, n) or {}
+            if data.get("state") == "closed":
+                st.phase, st.wait = Phase.DONE, None
+                self.store.put(st)
+                self.store.event("closed_elsewhere", issue=n, state_reason=data.get("state_reason"))
+
     def _reconcile(self) -> None:
+        self._settle_closed_elsewhere()
         for n in list(self.plan.work):
             self._settle_interrupted(n)
             st = self.store.issue(n)
