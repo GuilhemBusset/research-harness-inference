@@ -87,6 +87,13 @@ def test_the_user_pool_is_kept_and_its_logical_id_is_recorded(access: dict[str, 
     assert pool_id in json.loads(RECORD.read_text(encoding="utf-8"))[STACK_NAME]
 
 
+def test_the_admins_account_is_kept_with_its_user_pool(access: dict[str, Any]) -> None:
+    # The user is a resource of its own: the user pool's policy does not keep it.
+    ((_, user),) = of_type(access, "AWS::Cognito::UserPoolUser").items()
+    assert user["DeletionPolicy"] == "Retain"
+    assert user["UpdateReplacePolicy"] == "Retain"
+
+
 def test_the_domain_prefix_is_computed_at_deployment(
     access: dict[str, Any], templates: dict[str, dict[str, Any]]
 ) -> None:
