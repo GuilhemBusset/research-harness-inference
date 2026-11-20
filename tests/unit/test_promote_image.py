@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from botocore.exceptions import ClientError
+from botocore.handlers import decode_console_output
 
 import promote_image
 from rhi import config
@@ -70,8 +71,11 @@ class Stub:
 
 
 def console(*lines: str) -> dict[str, str]:
-    """EC2's answer to a read of the console: its output, in base64."""
-    return {"Output": base64.b64encode("\n".join(["[  OK  ] Started boot.", *lines]).encode()).decode()}
+    """What boto3 returns for a read of the console: EC2 answers in base64, and the handler botocore
+    registers on that call decodes it before the caller sees it (it makes no request)."""
+    answer = {"Output": base64.b64encode("\n".join(["[  OK  ] Started boot.", *lines]).encode()).decode()}
+    decode_console_output(answer)
+    return answer
 
 
 def failure(code: str) -> ClientError:
