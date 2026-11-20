@@ -1,0 +1,39 @@
+# The DCGM exporter: NVIDIA's exporter of a GPU's numbers, for the collector to scrape (system
+# design, "What happens on an instance" and "Observability"). It is a unit of a GPU instance: the
+# boot program installs the files of this folder only on an instance whose PCI bus lists an
+# NVIDIA device.
+#
+# It has no [Install] section and the boot program does not name it: the collector's drop-in of
+# this folder (rhi-collector.service.d/dcgm.conf) makes the collector's unit want it, so starting
+# the collector starts it.
+#
+# The image is NVIDIA's, named by the digest of its multi-platform index. That digest is release
+# 4.9.0 of the exporter, which services/engine/dcgm/VERSION records, and it ships DCGM 4.7.0: an
+# update is a change to that line and to VERSION. From 4.9.0 the exporter names its fields as DCGM 4.7 does,
+# with their units, and the fields file uses those names: a 4.8 image still exports the old ones.
+#
+# The network is the host's, and the exporter's one listener is on the loopback address, where
+# the collector scrapes it: no port is published, and nothing outside the instance reaches it.
+#
+# The fields are the release's (services/engine/dcgm/counters.csv), mounted read-only and given
+# in place of the image's own list. None of them is a profiling field, so the container is given
+# no capability.
+#
+# The NVIDIA runtime gives the container every GPU of the instance, as it does the engine's. The
+# exporter ends with a failure when it cannot reach the driver, and at a start of the instance
+# the driver may still be loading: the unit starts it again.
+
+[Unit]
+Description=The NVIDIA DCGM exporter: the GPU's metrics, on the loopback address
+Requires=docker.service
+After=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm --force rhi-dcgm
+ExecStart=/usr/bin/docker run --rm --name rhi-dcgm --network host --runtime nvidia --gpus all \
+    --volume /opt/rhi/release/dcgm/counters.csv:/opt/rhi/release/dcgm/counters.csv:ro \
+    nvcr.io/nvidia/k8s/dcgm-exporter:4.9.0@sha256:2490e1dfb5baaee6765ef2841813af7d978bb459a566c22c326a8fc27c64eea9 \
+    --address 127.0.0.1:9400 --collectors /opt/rhi/release/dcgm/counters.csv
+ExecStop=/usr/bin/docker stop rhi-dcgm
+Restart=on-failure
+RestartSec=5

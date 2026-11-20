@@ -9,6 +9,7 @@ at run time.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import secrets
@@ -30,6 +31,24 @@ NAMES = ("rhi-engine", "rhi-collector", "rhi-lifecycle")
 TEXTS = {name: (ENGINE_FOLDER / "units" / f"{name}.service").read_text(encoding="utf-8") for name in NAMES}
 # The units of a GPU instance only, which the boot program installs on no other.
 GPU_DROP_IN = ENGINE_FOLDER / "units/gpu/rhi-engine.service.d/gpu.conf"
+# The DCGM exporter's unit, and the drop-in that makes the collector's unit want it.
+DCGM_UNIT = ENGINE_FOLDER / "units/gpu/rhi-dcgm.service"
+DCGM_TEXT = DCGM_UNIT.read_text(encoding="utf-8")
+COLLECTOR_DROP_IN = ENGINE_FOLDER / "units/gpu/rhi-collector.service.d/dcgm.conf"
+# The exporter's fields, where the release's archive puts them on an instance, and its version.
+DCGM_FIELDS = "/opt/rhi/release/dcgm/counters.csv"
+DCGM_FOLDER = ENGINE_FOLDER / "dcgm"
+# The quantities of the GPU row (system design, section 7.2), each with the field of exporter
+# 4.9.0 that gives it and that field's type. Tokens per joule are a rate of the energy counter.
+GPU_QUANTITIES = {
+    "utilization of memory bandwidth": ("DCGM_FI_DEV_MEMORY_UTIL_RATIO", "gauge"),
+    "utilization of compute": ("DCGM_FI_DEV_GPU_UTIL_RATIO", "gauge"),
+    "memory": ("DCGM_FI_DEV_FB_USED_BYTES", "gauge"),
+    "temperature": ("DCGM_FI_DEV_GPU_TEMP_CELSIUS", "gauge"),
+    "power": ("DCGM_FI_DEV_BOARD_POWER_WATTS", "gauge"),
+    "energy": ("DCGM_FI_DEV_GPU_ENERGY_JOULES_TOTAL", "counter"),
+    "Xid errors": ("DCGM_FI_DEV_XID_ERROR", "gauge"),
+}
 
 SETTINGS = "/run/rhi/release.env"
 ARCHITECTURES = ("arm64", "aarch64", "amd64", "x86_64")
@@ -138,6 +157,26 @@ def moving_images(text: str) -> list[str]:
     return [] if image == RELEASE_IMAGE or PINNED.fullmatch(image) else [image]
 
 
+def exporter_version(text: str) -> tuple[int, ...]:
+    """A version of the DCGM exporter, as numbers. One below 4.9.0, which still exports the old
+    names of the fields, fails."""
+    assert re.fullmatch(r"\d+\.\d+\.\d+", text), text
+    found = tuple(int(part) for part in text.split("."))
+    assert found >= (4, 9, 0), f"DCGM exporter {text} is below 4.9.0"
+    return found
+
+
+def exporter_fields(text: str) -> dict[str, str]:
+    """The fields of an exporter's list, each with its Prometheus type. The exporter's format: a
+    line that starts with # is a comment, and every other one is a field, a type and a help text."""
+    rows = list(csv.reader(line for line in text.splitlines() if line and not line.startswith("#")))
+    assert all(len(row) == 3 and all(value.strip() for value in row) for row in rows), rows
+    fields = {row[0].strip(): row[1].strip() for row in rows}
+    assert len(fields) == len(rows), "a field is listed twice"
+    assert set(fields.values()) <= {"gauge", "counter", "label"}
+    return fields
+
+
 def architectures_named(text: str) -> list[str]:
     return [name for name in ARCHITECTURES if name in text.lower()]
 
@@ -215,13 +254,19 @@ def test_the_engine_listens_on_port_8000_and_every_other_listener_is_on_localhos
     for name in NAMES:
         assert container(TEXTS[name]).options["--network"] == ["host"], name
         assert "0.0.0.0" not in TEXTS[name], name
-    # The engine's is port 8000, and the agent's is on the loopback address: the two the collector scrapes.
+    # The engine's is port 8000, and the agent's is on the loopback address. So is the DCGM
+    # exporter's, the one listener it is told to open: the three the collector scrapes.
     assert app.PORT == 8000
     assert (metrics.HOST, metrics.PORT) == ("127.0.0.1", 9110)
+    exporter = container(DCGM_TEXT)
+    assert exporter.options["--network"] == ["host"]
+    assert "0.0.0.0" not in DCGM_TEXT
+    assert exporter.command[:2] == ["--address", "127.0.0.1:9400"]
+    assert exporter.command.count("--address") == 1
     collector = yaml.safe_load((ENGINE_FOLDER / "collector/config.yaml").read_text(encoding="utf-8"))
     jobs = collector["receivers"]["prometheus"]["config"]["scrape_configs"]
     scraped = [target for job in jobs for static in job["static_configs"] for target in static["targets"]]
-    assert scraped == [f"127.0.0.1:{app.PORT}", f"{metrics.HOST}:{metrics.PORT}"]
+    assert scraped == [f"127.0.0.1:{app.PORT}", f"{metrics.HOST}:{metrics.PORT}", exporter.command[1]]
     # The collector's configuration names no address to listen on, and leaves the collector's own
     # metrics where the pinned release serves them by default: on the loopback address.
     assert "endpoint" not in json.dumps([collector["receivers"], collector["extensions"]])
@@ -259,15 +304,16 @@ def test_the_agent_runs_its_program_from_the_release() -> None:
 def test_images_are_pinned() -> None:
     for name in NAMES:
         assert moving_images(TEXTS[name]) == [], name
+    assert moving_images(DCGM_TEXT) == []
     assert container(TEXTS["rhi-engine"]).image == RELEASE_IMAGE
     agent = container(TEXTS["rhi-lifecycle"]).image
     # The official image, at a tag of Python 3.13.
     assert re.fullmatch(r"python:3\.13(?:[.\-][^@:]*)?@sha256:[0-9a-f]{64}", agent), agent
 
     # An image named by a tag alone is found, in each unit.
-    for name in ("rhi-collector", "rhi-lifecycle"):
-        tagged = re.sub(r"@sha256:[0-9a-f]{64}", "", TEXTS[name])
-        assert moving_images(tagged) == [container(TEXTS[name]).image.partition("@")[0]], name
+    for text in (TEXTS["rhi-collector"], TEXTS["rhi-lifecycle"], DCGM_TEXT):
+        tagged = re.sub(r"@sha256:[0-9a-f]{64}", "", text)
+        assert moving_images(tagged) == [container(text).image.partition("@")[0]]
     assert moving_images(TEXTS["rhi-engine"].replace('"$$RHI_ENGINE_IMAGE" -c', "rhi/engine:latest -c")) == [
         "rhi/engine:latest"
     ]
@@ -276,7 +322,8 @@ def test_images_are_pinned() -> None:
 def test_no_architecture_is_named() -> None:
     # Every file of the folder, with those of a GPU instance.
     files = [path for path in (ENGINE_FOLDER / "units").rglob("*") if path.is_file()]
-    assert {GPU_DROP_IN, *(ENGINE_FOLDER / "units" / f"{name}.service" for name in NAMES)} <= set(files)
+    gpu = {GPU_DROP_IN, DCGM_UNIT, COLLECTOR_DROP_IN}
+    assert {*gpu, *(ENGINE_FOLDER / "units" / f"{name}.service" for name in NAMES)} <= set(files)
     for path in files:
         text = path.read_text(encoding="utf-8")
         assert architectures_named(text) == [], path.name
@@ -387,6 +434,53 @@ def test_the_gpu_drop_in_adds_the_nvidia_runtime_every_gpu_and_the_region(host: 
     added = {"--runtime": ["nvidia"], "--gpus": ["all"], "--env": [f"AWS_REGION={REGION}"]}
     assert gpu.options == {name: alone.options.get(name, []) + added.get(name, []) for name in alone.options | added}
     assert (gpu.image, gpu.command) == (alone.image, alone.command)
+
+
+def test_the_exporter_runs_on_every_gpu_with_the_releases_fields_and_restarts_on_failure() -> None:
+    sections = read(DCGM_TEXT)
+    assert sections["Service"]["Restart"] == ["on-failure"]
+    exporter = container(DCGM_TEXT)
+    # The NVIDIA runtime with every GPU, as the engine's container, and nothing more: no
+    # capability, no privilege, no published port.
+    assert (exporter.options["--runtime"], exporter.options["--gpus"]) == (["nvidia"], ["all"])
+    assert set(exporter.options) == {"--rm", "--name", "--network", "--runtime", "--gpus", "--volume"}
+    # The fields are the release's, read-only, in place of the image's own list.
+    assert exporter.mounts() == {DCGM_FIELDS: (DCGM_FIELDS, "ro")}
+    assert exporter.command[2:] == ["--collectors", DCGM_FIELDS]
+
+
+def test_starting_the_collector_starts_the_exporter_on_a_gpu_instance() -> None:
+    # Nothing else starts the exporter: its unit has no [Install] section, and the boot program
+    # starts the collector's and the agent's units by name.
+    assert "Install" not in read(DCGM_TEXT)
+    assert "rhi-dcgm" not in (ENGINE_FOLDER / "boot/rhi-boot.sh").read_text(encoding="utf-8")
+    # The drop-in adds one key to the collector's unit, and restates nothing of it.
+    drop_in = read(COLLECTOR_DROP_IN.read_text(encoding="utf-8"))
+    assert drop_in == {"Unit": {"Wants": [DCGM_UNIT.name]}}
+
+
+def test_the_exporters_image_is_the_recorded_version_which_is_4_9_0_or_later() -> None:
+    recorded = (DCGM_FOLDER / "VERSION").read_text(encoding="utf-8")
+    assert recorded.endswith("\n") and recorded.count("\n") == 1, "VERSION holds one line"
+    image = container(DCGM_TEXT).image
+    named = re.fullmatch(r"nvcr\.io/nvidia/k8s/dcgm-exporter:([0-9.]+)@sha256:[0-9a-f]{64}", image)
+    assert named, f"{image} is not NVIDIA's image by digest, at a tag of the exporter's version"
+    assert exporter_version(named[1]) == exporter_version(recorded.strip())
+
+    # A version below 4.9.0 is refused. 4.10.0 is above 4.9.0 as numbers, and below it as text.
+    for below in ("4.8.4", "3.12.0"):
+        with pytest.raises(AssertionError, match="below"):
+            exporter_version(below)
+    assert exporter_version("4.10.0") > exporter_version("4.9.0")
+
+
+def test_the_exporters_fields_name_one_for_each_quantity_of_the_gpu_panels() -> None:
+    fields = exporter_fields((DCGM_FOLDER / "counters.csv").read_text(encoding="utf-8"))
+    for quantity, (field, kind) in GPU_QUANTITIES.items():
+        assert fields.get(field) == kind, quantity
+    # A line that is not a field, a type and a help text is found.
+    with pytest.raises(AssertionError):
+        exporter_fields("DCGM_FI_DEV_BOARD_POWER_WATTS, gauge\n")
 
 
 def test_dockers_data_and_the_compile_cache_are_on_the_ebs_volume(host: Host, tmp_path: Path) -> None:

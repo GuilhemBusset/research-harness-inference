@@ -57,11 +57,15 @@ MEMBERS = {
     "units/rhi-lifecycle.service": "[Service]\nExecStart=/usr/bin/true the lifecycle agent\n",
     "units/later/rhi-other.service": "[Service]\nExecStart=/usr/bin/true a later issue\n",
     "units/gpu/rhi-engine.service.d/gpu.conf": "[Service]\nEnvironment=RHI_ENGINE_OPTIONS=--gpus=all\n",
+    "units/gpu/rhi-dcgm.service": "[Service]\nExecStart=/usr/bin/true the DCGM exporter\n",
+    "units/gpu/rhi-collector.service.d/dcgm.conf": "[Unit]\nWants=rhi-dcgm.service\n",
     "collector/config.yaml": "receivers: {}\n",
     "agent/rhi_lifecycle/__main__.py": "print('the agent')\n",
 }
 TOP_UNITS = {"rhi-collector.service", "rhi-lifecycle.service"}
-GPU_DROP_IN = "rhi-engine.service.d/gpu.conf"
+# What a GPU instance has more: the engine's drop-in, the DCGM exporter's unit, and the
+# collector's drop-in, which makes the collector's unit want the exporter's.
+GPU_UNITS = {"rhi-engine.service.d/gpu.conf", "rhi-dcgm.service", "rhi-collector.service.d/dcgm.conf"}
 # The vendor IDs of two PCI devices: NVIDIA's, and Amazon's, which a network adapter has.
 NVIDIA, AMAZON = "0x10de", "0x1d0f"
 
@@ -342,15 +346,19 @@ def test_the_mock_pool_gets_no_gpu_unit(instance: Instance) -> None:
     assert instance.files_under("run/systemd/system") == TOP_UNITS
     assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
 
-    # The same release on a GPU instance, whose bus lists one more device: the drop-in is
-    # installed in the folder of its unit, before systemd reads the units. No other subfolder is.
+    # The same release on a GPU instance, whose bus lists one more device: the exporter's unit
+    # is installed, and each drop-in in the folder of its unit, before systemd reads the units.
+    # No other subfolder is. Only the same two units are started: the collector's wants the exporter's.
     instance.stop()
     instance.pci_device("0000:00:1e.0", NVIDIA)
     assert instance.run(PROGRAM).returncode == 0
-    assert instance.files_under("run/systemd/system") == {*TOP_UNITS, GPU_DROP_IN}
-    installed = (instance.root / "run/systemd/system" / GPU_DROP_IN).read_text(encoding="utf-8")
-    assert installed == MEMBERS[f"units/gpu/{GPU_DROP_IN}"]
-    assert GPU_DROP_IN.split("/")[0] in (instance.state / "at-start").read_text(encoding="utf-8").split()
+    assert instance.files_under("run/systemd/system") == TOP_UNITS | GPU_UNITS
+    at_start = (instance.state / "at-start").read_text(encoding="utf-8").split()
+    for name in GPU_UNITS:
+        installed = (instance.root / "run/systemd/system" / name).read_text(encoding="utf-8")
+        assert installed == MEMBERS[f"units/gpu/{name}"]
+        assert name.split("/")[0] in at_start
+    assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
 
 
 def test_the_engine_flags_reach_the_unit(instance: Instance) -> None:

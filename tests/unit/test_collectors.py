@@ -82,7 +82,8 @@ def remote_write(config: dict[str, Any]) -> dict[str, Any]:
 
 def test_each_collector_scrapes_localhost_and_the_node_its_host() -> None:
     node = load(NODE)
-    assert targets(node) == ["127.0.0.1:8000", "127.0.0.1:9110"]
+    # The engine, the lifecycle agent and the DCGM exporter, which only a GPU instance runs.
+    assert targets(node) == ["127.0.0.1:8000", "127.0.0.1:9110", "127.0.0.1:9400"]
     assert targets(load(GATEWAY)) == ["127.0.0.1:9091"]
     for pipeline in pipelines(node, "metrics"):
         assert "host_metrics" in pipeline["receivers"]
@@ -142,8 +143,10 @@ def test_every_series_says_where_it_comes_from() -> None:
         written = origin(node, pipeline, "ec2")
         assert written["service.instance.id"] == {"from_attribute": "host.id", "action": "upsert"}
         assert written["instance_type"] == {"from_attribute": "host.type", "action": "upsert"}
+        # The instance's availability zone, which the detector reads from the instance metadata.
+        assert written["zone"] == {"from_attribute": "cloud.availability_zone", "action": "upsert"}
         assert written["pool"] == {"value": "${env:RHI_POOL}", "action": "upsert"}
-    assert {"pool", "instance_type"} <= set(remote_write(node)["resource_constant_labels"]["included"])
+    assert {"pool", "instance_type", "zone"} <= set(remote_write(node)["resource_constant_labels"]["included"])
 
     for pipeline in pipelines(gateway, "metrics"):
         written = origin(gateway, pipeline, "ecs")
