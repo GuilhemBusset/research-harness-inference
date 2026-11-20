@@ -13,14 +13,16 @@ alone moves it (section 5.1).
 
 1. **Two instances.** It holds twice the pool's `target_concurrency` of streams open, each sending
    one short stream after another, as the canary students after the first two, until the workspace
-   shows two instances serving: the scaler adds the second once the load is above target for 60
-   seconds. It records how many zones the two are in, by the label `zone` the node's collector
+   shows two instances serving in one observation, both present and serving at once: the scaler
+   adds the second once the load is above target for 60 seconds. It records how many zones the two are in, by the label `zone` the node's collector
    adds to every series. Then it stops the load and waits until the workspace shows nothing running
    or waiting on the pool.
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
    one of them has to move. Then each student in turn sends the number of requests it is given, one
-   after another, and the job reads how many of them each instance served.
+   after another, and the job reads how many of them each instance served. A student's first
+   request counts among its requests of the phase (`with_firsts`): its sent number is one more than
+   it was given.
 3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance
    (no request for 10 minutes, and 15 since the scale-out, section 5.1), then each student sends
    its requests again, and every one of them must have reached the instance that stayed.
@@ -67,6 +69,7 @@ import asyncio
 import math
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
 from http import HTTPStatus
@@ -229,6 +232,43 @@ def served_between(series: Sequence[common.Series], start: float, end: float) ->
     return {instance: count for instance, count in served.items() if count > 0}
 
 
+def with_firsts(firsts: Mapping[str, int], counts: PhaseCounts) -> PhaseCounts:
+    """Each student's counts with its first request, one of the requests sent at once that
+    `firsts` counts by instance, added to them.
+
+    The workspace cannot say whose first request an instance served, since both were sent at once,
+    so a student is given the first that the instance it was on afterwards served, when there is
+    one left; otherwise any other, which makes its counts split between two instances. Two students
+    found afterwards on one instance whose firsts reached two instances are thus not both on one
+    instance: one of them moved. The one case counts cannot show is two students that swapped
+    instances. A first left over is another request on the pool: it is added to the first
+    student's counts, which then do not add up, and the phase is measured again."""
+    left = dict(firsts)
+    given: dict[int, str | None] = {}
+    for student, held in counts.items():
+        stayed_on = next(iter(held.served)) if len(held.served) == 1 else None
+        if stayed_on is not None and left.get(stayed_on, 0) > 0:
+            given[student] = stayed_on
+            left[stayed_on] -= 1
+    for student in counts:
+        if student not in given:
+            other = next((instance for instance, count in left.items() if count > 0), None)
+            given[student] = other
+            if other is not None:
+                left[other] -= 1
+    spare = {instance: count for instance, count in left.items() if count > 0}
+    result: dict[int, Counts] = {}
+    for position, (student, held) in enumerate(counts.items()):
+        served = Counter(held.served)
+        first = given[student]
+        if first is not None:
+            served[first] += 1
+        if position == 0:
+            served.update(spare)
+        result[student] = Counts(held.sent + 1, dict(served))
+    return result
+
+
 class Disturbed(RuntimeError):
     """A phase was disturbed on every attempt: the run is not a measurement."""
 
@@ -367,8 +407,15 @@ class Run:
         def two() -> bool:
             if held.done():
                 raise RuntimeError("the load ended before two instances served: a held stream was refused")
-            found.update(self.pool.serving())
-            return len(found) >= INSTANCES
+            # One observation: the instances serving now and present now, never an earlier one's.
+            serving = self.pool.serving()
+            present = self.pool.present()
+            now = {instance: zone for instance, zone in serving.items() if instance in present}
+            if len(now) < INSTANCES:
+                return False
+            found.clear()
+            found.update(now)
+            return True
 
         try:
             await _wait(two, SCALE_OUT_WAIT_SECONDS, "two instances serving")
@@ -389,13 +436,19 @@ class Run:
         return Counts(self.requests, served)
 
     async def phase(self, *, first_at_once: bool) -> PhaseCounts:
-        """Each student's requests in turn, after the two students' first requests at once if asked."""
+        """Each student's requests in turn, after the two students' first requests at once if asked,
+        which then count among each student's requests of the phase (`with_firsts`)."""
+        firsts: dict[str, int] | None = None
         if first_at_once:
+            start = time.time()
             keys = [self.keys[student - 1] for student in STUDENTS]
-            firsts = loadgen.Load(tuple(_session(self.pool.name, 1, student) for student in STUDENTS))
-            _all_answered(await loadgen.replay(firsts, keys, self.endpoint, at_once=len(STUDENTS)), len(STUDENTS))
+            load = loadgen.Load(tuple(_session(self.pool.name, 1, student) for student in STUDENTS))
+            _all_answered(await loadgen.replay(load, keys, self.endpoint, at_once=len(STUDENTS)), len(STUDENTS))
             await asyncio.sleep(SETTLE_SECONDS)
-        return {student: await self.student(student, seed=100 * student) for student in STUDENTS}
+            firsts = await asyncio.to_thread(self.pool.served, start, time.time())
+            print(f"first requests at once: served as {sorted(firsts.values(), reverse=True)}")
+        counts = {student: await self.student(student, seed=100 * student) for student in STUDENTS}
+        return counts if firsts is None else with_firsts(firsts, counts)
 
     def measured(self, phase: Phase, *, first_at_once: bool) -> PhaseCounts:
         def measure() -> PhaseCounts:
