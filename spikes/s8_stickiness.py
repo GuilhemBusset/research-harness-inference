@@ -13,10 +13,13 @@ alone moves it (section 5.1).
 
 1. **Two instances.** It holds twice the pool's `target_concurrency` of streams open, each sending
    one short stream after another, as the canary students after the first two, until the workspace
-   shows two instances serving in one observation, both present and serving at once: the scaler
-   adds the second once the load is above target for 60 seconds. It records how many zones the two are in, by the label `zone` the node's collector
-   adds to every series. Then it stops the load and waits until the workspace shows nothing running
-   or waiting on the pool.
+   shows two instances in service in one observation (`Pool.present`): both writing, both streaming
+   answers, and both asked for and read in service by the scaler, whose gauge of the instances in
+   service is in the workspace too. The scaler adds the second once the load is above target for 60
+   seconds, and an instance writes, and answers its launch's warm-up, before its launch completes and
+   it enters service. It records how many zones the two are in, by the label `zone` the node's
+   collector adds to every series. Then it stops the load and waits until the workspace shows
+   nothing running or waiting on the pool.
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
    one of them has to move. Then each student in turn sends the number of requests it is given, one
@@ -34,9 +37,10 @@ alone moves it (section 5.1).
    run not measured rather than failed. A scale-in the scaler asks for while it looks began after
    the phase, when both instances were in service: the split stands, and the run goes on.
 3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance:
-   its note asks for one, and the workspace shows exactly one writing (load that fits in one
-   instance for 10 minutes, and 15 since the scale-out, section 5.1). A sample that has gone stale
-   while the scaler still asks for two is not a departure. Then
+   its note asks for one, its gauge reads one in service, and the workspace shows exactly one
+   writing (load that fits in one instance for 10 minutes, and 15 since the scale-out, section 5.1).
+   A sample that has gone stale is not a departure while the scaler still asks for two, nor while it
+   still reads two in service: an instance being drained stays in service until it is gone. Then
    each student sends its requests again, and every one of them must have reached the instance
    that stayed. The job prints, for each student, the instance it was on before the departure,
    whether that one stayed or left, and whether its requests after reached the remaining one.
@@ -46,10 +50,14 @@ instances: one of them then has to move, to the remaining instance, and the othe
 run whose students were both on one instance, the one that stayed (neither moved) or the one that
 left (both moved), would pass without asking it, so it is not measured (`NotExercised`).
 
-**Which instance served** is read from the workspace: the count of the mock's time-to-first-token
-histogram, one per request, on each `instance` series (section 7.2). A student's window opens before
-its first request and closes `SETTLE_SECONDS` after its last, so the collector's scrape has carried
-the last count to the workspace.
+**Which instance served** is read from the workspace: the count of the mock's histogram of the gaps
+between two output tokens of a stream, on each `instance` series (section 7.2). A student's request
+is a stream, and the mock streams its canned turn, so each request adds `GAPS_PER_REQUEST`. The
+lifecycle agent's completion of one token, which it sends every instance at launch and every minute
+after (section 4.3), is a whole answer: it has a first token, and so is counted by the
+time-to-first-token histogram, but no gap. A student's window opens before its first request and
+closes `SETTLE_SECONDS` after its last, so the collector's scrape has carried the last count to the
+workspace.
 
 **Whose first request an instance served.** The two first requests are sent at once, so their window
 cannot say which student each instance served. The mock's cache imitation can (section 5.5, issue
@@ -57,17 +65,20 @@ E2-75): an instance keeps, for each student, the input of the last request of th
 served, and a request it serves has as cached the input it shares with that one from its start. A
 student's second request repeats its first whole, so it has all of the first's input cached exactly
 when it reached the instance that served the first, as each answer's usage reports. The two first
-requests are then given to the two students in the one way that agrees with this: a student that
+requests are then given to the two students in the ways that agree with this: a student that
 kept its first's instance has its first on an instance its window reached; one that did not, when
 its window reached a single instance, has it on another. A student whose window reached two
-instances is split wherever its first was. Counts that no way agrees with are measured again.
+instances is split wherever its first was. Counts that no way agrees with, or that two ways agree
+with and give the students different counts, are measured again.
 
 **The rebalance number.** For each new rebalance number the gateway drops about one student in ten
 of its cookies (section 5.5), which would move a student for a reason that is not the one measured.
 One student sending one request after another never leaves an instance with waiting requests, so
 the scaler has no cause to raise it, but the job checks: it reads the pool's number from the
 scaler's note at the start and the end of each measured phase, and measures a phase again when it
-changed. It does the same when a student's counts do not add up to the requests it sent, which is
+changed. A gateway task judges a request on the number it last read, every readiness cycle, so a
+phase sends nothing until `GATEWAY_SECONDS` after the job first read the number it started with:
+a number the scaler wrote just before the phase then acts before it, not during it. It does the same when a student's counts do not add up to the requests it sent, which is
 another request on the pool during the window. After `ATTEMPTS` disturbed attempts it gives up, and
 the run is not measured. The note is read with a strongly consistent read, so the reading at a
 phase's end sees a change the scaler wrote during it. Each attempt is a new conversation, and each
@@ -118,7 +129,10 @@ from rhi import config
 from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
 from rhi_common.records import NOTE_RECORD, ScalerNote
+from rhi_gateway.readiness import INTERVAL_SECONDS as GATEWAY_CYCLE_SECONDS
+from rhi_mock_engine.app import ANSWER, REASONING
 from rhi_reporter.measure import Verdict
+from rhi_scaler.metrics import INSTANCES_IN_SERVICE
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
@@ -161,9 +175,17 @@ START_TOKENS = 200
 TURN_INPUT_TOKENS = 50
 OUTPUT_TOKENS = 64
 
+# Seconds. Every gateway task reads the scaler's note once a readiness cycle, and judges a student's
+# request on the rebalance number it last read: a number has reached them all two cycles after the
+# job first read it, the second for the time a cycle's reads take.
+GATEWAY_SECONDS = 2 * GATEWAY_CYCLE_SECONDS
+# The gaps between the output tokens of one streamed answer of the mock: its canned turn has one
+# token per piece. A whole answer, as the lifecycle agent's completion of one token, has none.
+GAPS_PER_REQUEST = len(REASONING) + len(ANSWER) - 1
+
 # Seconds: a sample this close to an instant is the query's sample at that instant.
 _SAME_INSTANT = 1.0
-_SERVED = f"{metric_names(MOCK)[Quantity.TIME_TO_FIRST_TOKEN]}_count"
+_GAPS = f"{metric_names(MOCK)[Quantity.TIME_PER_OUTPUT_TOKEN]}_count"
 _RUNNING = metric_names(MOCK)[Quantity.RUNNING_REQUESTS]
 _WAITING = metric_names(MOCK)[Quantity.WAITING_REQUESTS]
 
@@ -276,27 +298,34 @@ def with_openings(openings: Mapping[str, int], counts: PhaseCounts, kept: Mappin
     requests, sent at once, by instance, and `kept` says for each student whether its next request
     reached the instance that served its first (`kept_opening`).
 
-    The firsts are given to the students in the first way that agrees with what each student's
-    window shows (`_agrees`). When none does, or the window of the firsts holds another request,
-    none is placed: the counts then do not add up to the requests sent, and the phase is measured
-    again."""
+    The firsts are given to the students in the ways that agree with what each student's window
+    shows (`_agrees`). They are placed only when every such way gives each student the same counts.
+    When none does, when two give different counts (the evidence does not say which student's first
+    an instance served), or when the window of the firsts holds another request, none is placed:
+    the counts then do not add up to the requests sent, and the phase is measured again."""
     left = Counter({instance: count for instance, count in openings.items() if count > 0})
-    placed: dict[int, str] = {}
+    ways: list[PhaseCounts] = []
     if left.total() == len(counts):
         for order in dict.fromkeys(itertools.permutations(left.elements())):
             if all(
                 _agrees(place, counts[student], kept[student]) for student, place in zip(counts, order, strict=True)
             ):
-                placed = dict(zip(counts, order, strict=True))
-                left.clear()
-                break
+                ways.append(_placed(counts, dict(zip(counts, order, strict=True)), Counter()))
+    if ways and all(way == ways[0] for way in ways):
+        return ways[0]
+    return _placed(counts, {}, left)
+
+
+def _placed(counts: PhaseCounts, placed: Mapping[int, str], unplaced: Counter[str]) -> PhaseCounts:
+    """Each student's counts with its first request: on the instance `placed` gives it, and the
+    firsts that are `unplaced` with the first student's, where they cannot add up."""
     result: dict[int, Counts] = {}
     for position, (student, held) in enumerate(counts.items()):
         served = Counter(held.served)
         if student in placed:
             served[placed[student]] += 1
         if position == 0:
-            served.update(+left)
+            served.update(+unplaced)
         result[student] = Counts(held.sent + 1, dict(served))
     return result
 
@@ -345,8 +374,9 @@ class NotExercised(RuntimeError):
 
 
 class Leaving(RuntimeError):
-    """The scaler asks for fewer instances than the workspace shows: one is leaving, and the
-    workspace cannot say which. `present` are the instances the workspace shows."""
+    """The scaler asks for fewer instances than the workspace shows, or than it reads in service:
+    one is leaving, and the workspace cannot say which. `present` are the instances the workspace
+    shows."""
 
     def __init__(self, message: str, present: set[str]) -> None:
         super().__init__(message)
@@ -354,8 +384,9 @@ class Leaving(RuntimeError):
 
 
 class Unseen(RuntimeError):
-    """The scaler asks for more instances than the workspace shows: one is starting, or one stopped
-    writing without the scaler asking for fewer."""
+    """The instances writing to the workspace are not those the scaler asks for and reads in
+    service, and not because it asks for fewer: one is starting (it writes, or is asked for, before
+    it is in service), or one stopped writing without the scaler asking for fewer."""
 
 
 def measure_undisturbed(
@@ -395,27 +426,46 @@ class Pool:
         return self.workspace.read_series(query, start=start, end=end, step=step)
 
     def serving(self) -> dict[str, str]:
-        """The instances that served a request in the last minutes, each with its zone."""
+        """The instances that streamed an answer in the last minutes, each with its zone: those whose
+        count of token gaps rose. The lifecycle agent's completions, at launch and every minute
+        after, are whole answers, with no gap."""
         end = time.time()
-        series = self._read(f'{_SERVED}{{pool="{self.name}"}}', end - 2 * FRESH_SECONDS, end, FRESH_SECONDS)
+        series = self._read(f'{_GAPS}{{pool="{self.name}"}}', end - 2 * FRESH_SECONDS, end, FRESH_SECONDS)
         rising = served_between(series, end - 2 * FRESH_SECONDS, end)
         return {
             one.labels["instance"]: one.labels.get("zone", "") for one in series if rising.get(one.labels["instance"])
         }
 
+    def in_service(self) -> int | None:
+        """The instances in service as the scaler last read them from the group, from its gauge in
+        the workspace (`rhi_scaler.metrics`): `None` while the workspace has no recent value."""
+        end = time.time()
+        series = self._read(f'{INSTANCES_IN_SERVICE}{{pool="{self.name}"}}', end - FRESH_SECONDS, end, 15)
+        recent = [
+            sample
+            for one in series
+            if one.labels.get("pool") == self.name
+            for sample in one.samples
+            if sample[0] >= end - FRESH_SECONDS
+        ]
+        return None if not recent else round(max(recent)[1])
+
     def present(self) -> set[str]:
         """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`,
-        as many as the scaler asks for. `Leaving` while it asks for fewer: an instance being drained
-        still writes. `Unseen` while it asks for more: a stale sample is not an instance the scaler
-        took away."""
+        as many as the scaler asks for and as many as it reads in service. `Leaving` while it asks
+        for fewer: an instance being drained still writes, and stays in service until it is gone.
+        `Unseen` otherwise when the numbers differ: an instance that writes is not in service until
+        its launch is complete, and a stale sample is not an instance the scaler took away."""
         end = time.time()
         series = self._read(f'timestamp({_RUNNING}{{pool="{self.name}"}})', end - FRESH_SECONDS, end, 15)
         fresh = {one.labels["instance"] for one in series if one.samples and one.samples[-1][1] >= end - FRESH_SECONDS}
         note = self._note()
-        if note is not None and note.capacity_asked < len(fresh):
-            raise Leaving(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present", fresh)
-        if note is not None and note.capacity_asked > len(fresh):
-            raise Unseen(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present")
+        asked = None if note is None else note.capacity_asked
+        in_service = self.in_service()
+        if asked is not None and (asked < len(fresh) or (in_service is not None and asked < in_service)):
+            raise Leaving(f"the scaler asks for {asked} instances, {len(fresh)} are present", fresh)
+        if any(count != len(fresh) for count in (asked, in_service) if count is not None):
+            raise Unseen(f"the scaler asks for {asked} and reads {in_service} in service, {len(fresh)} are present")
         return fresh
 
     def busy(self) -> float:
@@ -426,8 +476,10 @@ class Pool:
         return sum(one.samples[-1][1] for one in series if one.samples)
 
     def served(self, start: float, end: float) -> dict[str, int]:
-        """Requests each instance served from `start` to `end`."""
-        return served_between(self._read(f'{_SERVED}{{pool="{self.name}"}}', start, end, end - start), start, end)
+        """Streamed requests each instance served from `start` to `end`: its token gaps, over those of
+        one answer. A stream with fewer, cut short, still counts as one request."""
+        gaps = served_between(self._read(f'{_GAPS}{{pool="{self.name}"}}', start, end, end - start), start, end)
+        return {instance: math.ceil(count / GAPS_PER_REQUEST) for instance, count in gaps.items()}
 
     def _note(self) -> ScalerNote | None:
         """The scaler's note, read strongly consistent: a write the scaler completed is seen."""
@@ -534,6 +586,24 @@ class Run:
     _conversations: Iterator[int] = field(
         default_factory=lambda: itertools.count(secrets.randbits(48)), init=False, repr=False
     )
+    # When the job first read each rebalance number, and the number it read last.
+    _first_read: dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    _number: int = field(default=0, init=False, repr=False)
+
+    def rebalance_number(self) -> int:
+        """The pool's rebalance number, noting when the job first read it."""
+        self._number = self.pool.rebalance_number()
+        self._first_read.setdefault(self._number, time.time())
+        return self._number
+
+    def _gateway_holds(self) -> None:
+        """Waits until every gateway task holds the number last read: `GATEWAY_SECONDS` after the job
+        first read it, which is after the scaler wrote it. A request is judged on the number its
+        gateway task holds (`rhi_gateway.affinity`), so a phase that starts sooner could see a
+        number the job read before it act during it, and its start and end readings would not show it."""
+        remaining = self._first_read[self._number] + GATEWAY_SECONDS - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
 
     async def two_instances(self) -> dict[str, str]:
         """Holds the load until two instances serve, and returns them with their zones once it has ended."""
@@ -642,6 +712,7 @@ class Run:
         """The phase, measured again while disturbed, with `in_service` all in service at its end."""
 
         def measure() -> PhaseCounts:
+            self._gateway_holds()
             counts = asyncio.run(self.phase(first_at_once=first_at_once))
             self._in_service(in_service, phase)
             if any(held.most_served < held.sent for held in counts.values()):
@@ -651,9 +722,11 @@ class Run:
                 self._recheck(in_service, phase)
             return counts
 
-        return measure_undisturbed(phase, measure, self.pool.rebalance_number)
+        return measure_undisturbed(phase, measure, self.rebalance_number)
 
     def measure(self) -> dict[str, int | float]:
+        # Read before the load, so that a number the scaler does not change during it needs no wait.
+        self.rebalance_number()
         found = asyncio.run(self.two_instances())
         zones = len(set(found.values()))
         print(f"two instances in service, in {zones} zone(s)")
