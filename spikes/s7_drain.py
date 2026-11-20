@@ -22,8 +22,8 @@ alone moves it, by load and by idleness (section 5.1).
    job begins with may be a new one, which the stream could be on.
 2. **Two instances.** It holds twice the pool's `target_concurrency` of short streams until the
    scaler asks for two instances and reads two in service, then stops the load.
-3. **The departures.** It sends nothing more but the stream across a scale-in (`Run.relay`), as one
-   canary student, from while the scaler still asks for two until the first instance the scaler
+3. **The departures.** It sends nothing more but the stream across a scale-in (`Run.relay`), one
+   held response and requests relayed beside it, as one canary student, from while the scaler still asks for two until the first instance the scaler
    takes away has stopped. It watches the scaler's note: each time the note asks for fewer
    instances, the scaler has chosen an idle one to leave, and the note's `written_at` is when the
    leave began.
@@ -38,9 +38,9 @@ alone moves it, by load and by idleness (section 5.1).
    them, which are not wakes and are not counted, until one is answered or the scaler asks.
 
 A stream completed when it was answered 200 and its closing event, `message_stop`, arrived, with no
-error event. The mock streams its canned turn in well under a second at its default rate, so no one
-inference request lasts as long as a gateway deployment: that stream is held open where the
-deployment acts, on the gateway task (below).
+error event. The mock streams its canned turn in well under a second at its default rate: the stream
+across a gateway deployment is held open where the deployment acts, on the gateway task, and the
+stream across a scale-in where the scale-in acts, between the gateway and the instance (below).
 
 **The stream across a gateway deployment** (`slow_stream`) is held on the gateway task that took it,
 which the deployment replaces. The gateway reads a request's whole body before it does anything
@@ -49,41 +49,39 @@ with it, so the job sends the body but its last byte, then one byte of padding e
 the rollout has reached the old tasks. Until then its connection is open on that task, and its
 answer, forwarded to the pool then, comes from a task the deployment is draining.
 
-**The stream across a scale-in** (`Run.relay`) is held on the pool, whose instance the scale-in
-removes: inference must be in flight there when it happens. It is a relay of whole streamed
-requests, each sent once the one before has ended, from while the scaler still asks for two
-instances until the job has seen the first departure over. One canary student sends them, one at a
-time, below the load that keeps an instance in service. The job reads each to its end as it comes:
-a response is never held open by the job, since a part the engine has already sent depends no
-longer on the instance, and reading it late would show nothing of the scale-in. A request whose
-connection never opened (`NOT_OPENED`) was never in flight, and says nothing of the scale-in. The
-job sees a departure over only
+**The stream across a scale-in** (`Run.relay`) is one response held open across the instance's
+leave, with whole streamed requests relayed beside it, from while the scaler still asks for two
+instances until the job has seen the first departure over. One canary student sends them. The held
+response is sent first. Once its first event from the engine (`INFERENCE_EVENT`) has arrived, which
+says its inference has begun on the pool, the job reads nothing more of it until it has seen the
+departure over, then reads the rest. It was in flight from that first event until the job read on:
+its end had not arrived, and its connection through the gateway and the internal load balancer to
+the pool stayed open. The mock at its default rate streams its canned turn in under a second, so its
+last bytes may wait in that connection's buffers rather than on the instance; a mock that streams
+slowly keeps the turn's generation itself on the instance. The relayed requests are each sent once
+the one before has ended and read to its end as it comes, one at a time, below the load that keeps
+an instance in service: they show whether a request sent while the instance was leaving completed.
+A request whose connection never opened (`NOT_OPENED`) was never in flight, and says nothing of the
+scale-in. The job sees a departure over only
 `QUIET_SECONDS` after the instance stopped, so the streams across the scale-in are told afterwards,
 from the departure as measured (`across_scale_in`). Neither event of a departure is seen at its
 moment, only between two bounds (`Departure.events`): the scaler asks for fewer after its run began,
 the note's `written_at`, and before it writes the note (`rhi_scaler.aws_io.apply`), which the job
 read by the time it saw it; the instance stopped after its last write and within a scrape of it. A
 stream spanned the scale-in when it alone was in flight across one of its events wherever between
-its bounds the event happened: its inference began, its first event from the engine
-(`INFERENCE_EVENT`) arrived, by the earliest bound, and its stream ended after the latest. Streams
-that follow one another, each short, do not show that any one request lived through the event. A
-stream that only crosses a bound may have begun and ended on one side of the event, and streams
-that began and ended between the two events did not span either. A stream that only overlaps the
-wait for the stop to show is not one of them. The number is 1 when one spanned an event and no
-stream failed while the instance was surely leaving, 0 when one did: one that did not complete
-while in flight from the latest the scaler may have asked to the latest the instance may have
-stopped. One that ended before says nothing of the scale-in, nor does one the gateway refused with
-a client error (`Answer.refused`): a student's limit, budget or key. When none spanned an event, or
-no stop was seen, the next cycle holds one again, and a run in which none did is not measured.
-
-**What the mock allows.** The mock's turn is canned, about twenty output tokens, paced at its
-`RHI_MOCK_TOKENS_PER_SECOND` (`rhi_mock_engine.app`), 50 unless the pool's engine is given another,
-and nothing in a request makes it longer: at that rate a stream lasts under a second, while the
-scaler's run, the first event's bounds, lasts seconds, and the stop's bounds a scrape. So on the
-mock as deployed no stream spans an event, and the run says so (not measured) rather than count a
-response it did not see in flight. The job does not change the pool or its engine (the scaler
-alone moves it); a mock pool whose engine streams slowly enough that one turn outlasts a scrape is
-the owner's to deploy before the run (`docs/measurements/s7.md`).
+its bounds the event happened: its inference began, its first event from the engine arrived, by the
+earliest bound, and it was still in flight after the latest. That is what the held response is for:
+streams that follow one another, each short, do not show that any one request lived through the
+event. A stream that only crosses a bound may have begun and ended on one side of the event, and
+streams that began and ended between the two events did not span either. A stream that only
+overlaps the wait for the stop to show is not one of them. The number is 1 when one spanned an
+event and no stream failed while the instance was surely leaving, 0 when one did: one that did not
+complete while in flight from the latest the scaler may have asked to the latest the instance may
+have stopped, the held response included, which then did not complete. One that ended before says
+nothing of the scale-in, nor does one the gateway refused with a client error (`Answer.refused`): a
+student's limit, budget or key. When none spanned an event, the held response having been refused
+or ended early, or no stop was seen, the next cycle holds one again, and a run in which none did is
+not measured.
 
 **When the gateway was deployed** (`rollout_under`). The gateway's collector writes the series `up`
 of its scrape, job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task
@@ -736,10 +734,13 @@ async def _answer(
     content: bytes | AsyncIterator[bytes],
     transport: httpx.AsyncBaseTransport | None,
     over: Callable[[], bool] | None = None,
+    hold: Callable[[], Awaitable[None]] | None = None,
 ) -> Answer:
     """Sends `request` with `content` as its body, as the student whose key is given: whether it
     completed, answered 200, with its closing event and no error event, and, `over` given, whether
-    it held as its inference began and as its stream ended (`Answer`). Raises httpx's errors."""
+    it held as its inference began and as its stream ended (`Answer`). `hold` given, once its
+    inference has begun and its end has not arrived, nothing more of it is read until `hold`
+    returns. Raises httpx's errors."""
     headers = {name: value for name, value in request.headers.items() if name.lower() != "content-length"}
     headers["authorization"] = f"Bearer {key}"
     reader, closed, failed = SseReader(), False, False
@@ -761,6 +762,9 @@ async def _answer(
                     as_begun = None if over is None else over()
                 closed = closed or event.name == CLOSING_EVENT
                 failed = failed or event.name == ERROR_EVENT
+            if hold is not None and begun_at is not None and not closed:
+                await hold()
+                hold = None
         # Read as the stream's end arrives, before the connection is let go.
         as_ended = None if over is None else over()
     return Answer(closed and not failed, as_begun, as_ended, begun_at)
@@ -1071,33 +1075,71 @@ class Run:
         self.leaving.append(departure)
         return departure
 
+    async def _streamed(
+        self, over: Callable[[], bool], hold: Callable[[], Awaitable[None]] | None = None
+    ) -> tuple[Streamed, Answer]:
+        """One streamed request of the stream across a scale-in, as the canary student, and how it
+        ended. With `hold`, it is the held response: it was in flight from its first event from the
+        engine until the job read on, when `hold` returned (`Run.relay`)."""
+        request = _request(self.pool.name)
+        sent_at = time.time()
+        entered: list[float] = []
+        resumed: list[float] = []
+
+        async def held() -> None:
+            entered.append(time.time())
+            if hold is not None:
+                await hold()
+            resumed.append(time.time())
+
+        try:
+            answer = await _answer(
+                self.endpoint, self.student, request, request.body, self.transport, over, None if hold is None else held
+            )
+        except NOT_OPENED:
+            answer = Answer(completed=False, opened=False)
+        except httpx.HTTPError:
+            answer = Answer(completed=False)
+        began = entered[0] if entered else (sent_at if answer.begun_at is None else answer.begun_at)
+        return Streamed(began, resumed[0] if resumed else time.time(), answer), answer
+
     async def relay(self, over: Callable[[], bool]) -> bool | None:
-        """The stream across a scale-in: whole streamed requests, each sent once the one before has
-        ended and each read to its end as it comes, until `over` says the scale-in is over, which is
-        when the job has seen the first departure it watches from now over (`departure`). Whether
-        the streams in flight while that instance left completed (`across_scale_in`): `None` when
-        none was, or no stop was seen, and it is not measured. A request whose connection never
-        opened was never in flight. RuntimeError when the scale-in is not over after
-        `SCALE_IN_HOLD_SECONDS`."""
+        """The stream across a scale-in, until `over` says the scale-in is over, which is when the
+        job has seen the first departure it watches from now over (`departure`). One response is
+        held: once its inference has begun, nothing more of it is read until the scale-in is over.
+        Beside it, whole streamed requests, each sent once the one before has ended and each read
+        to its end as it comes. Whether the streams in flight while that instance left completed
+        (`across_scale_in`): `None` when none spanned its leave, or no stop was seen, and it is not
+        measured. A request whose connection never opened was never in flight. RuntimeError when
+        the scale-in is not over after `SCALE_IN_HOLD_SECONDS`."""
         deadline = time.monotonic() + SCALE_IN_HOLD_SECONDS
         watched = len(self.leaving)
         streams: list[Streamed] = []
-        while not over():
-            request = _request(self.pool.name)
-            sent_at = time.time()
-            try:
-                answer = await _answer(self.endpoint, self.student, request, request.body, self.transport, over)
-            except NOT_OPENED:
-                answer = Answer(completed=False, opened=False)
-            except httpx.HTTPError:
-                answer = Answer(completed=False)
-            streams.append(Streamed(sent_at if answer.begun_at is None else answer.begun_at, time.time(), answer))
-            if not answer.completed:
-                print(f"stream {len(streams)} of the relay did not complete")
-                # Not sent again at once: a refusal comes back fast.
-                await asyncio.sleep(TRICKLE_SECONDS)
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"the scale-in was not over after {SCALE_IN_HOLD_SECONDS} s")
+        released, holding = asyncio.Event(), asyncio.Event()
+
+        async def hold() -> None:
+            holding.set()
+            await released.wait()
+
+        held = asyncio.create_task(self._streamed(over, hold))
+        held.add_done_callback(lambda _: holding.set())
+        # The relay begins once the held response is in flight, or has ended.
+        await holding.wait()
+        try:
+            while not over():
+                stream, answer = await self._streamed(over)
+                streams.append(stream)
+                if not answer.completed:
+                    print(f"stream {len(streams)} of the relay did not complete")
+                    # Not sent again at once: a refusal comes back fast.
+                    await asyncio.sleep(TRICKLE_SECONDS)
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"the scale-in was not over after {SCALE_IN_HOLD_SECONDS} s")
+        finally:
+            released.set()
+            stream, answer = await held
+        print(f"the response held across the scale-in {'completed' if answer.completed else 'did not complete'}")
+        streams = sorted([stream, *streams], key=lambda one: one.began)
         departure = self.leaving[watched] if len(self.leaving) > watched else None
         completed = across_scale_in(streams, departure)
         if completed is None:
@@ -1173,11 +1215,7 @@ class Run:
             if scale_in is not None and {departure.path for departure in self.departures} >= set(Path):
                 break
         if scale_in is None:
-            message = (
-                f"no stream spanned a scale-in in {CYCLES} cycles: the run is not measured; a mock turn"
-                " must outlast a scrape (docs/measurements/s7.md)"
-            )
-            raise RuntimeError(message)
+            raise RuntimeError(f"no stream spanned a scale-in in {CYCLES} cycles: the run is not measured")
         print(f"the stream across the scale-in {'completed' if scale_in else 'did not complete'}")
         streams = {
             Number.STREAM_COMPLETED_SCALE_IN: bool(scale_in),
