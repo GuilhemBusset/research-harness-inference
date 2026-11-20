@@ -1,4 +1,4 @@
-"""The admin CLI: the roster, direct keys, revocation and the canary (system design, section 6.4).
+"""The admin CLI: the roster, direct keys, revocation, the canary and the spikes' students (system design, section 6.4).
 
 There is no public admin API: the admin runs this with their own AWS credentials, from the
 repository, and it reaches the tables directly.
@@ -12,6 +12,7 @@ repository, and it reaches the tables directly.
     key issue <github-id>                                       a key without a login, printed once
     key revoke <github-id>                                      every key of the student revoked
     canary                                                      the canary's entry, and a new key in rhi/canary-key
+    spike-keys <students>                                       the spikes' students, and new keys in rhi/spike-keys
 
 The account and the region are the caller's, from the AWS SDK's own configuration. Each table is
 found in the deployed access stack by its logical ID, which `tests/policy/stateful_logical_ids.json`
@@ -35,6 +36,8 @@ from rhi_admin import keys as admin_keys
 from rhi_admin import roster as admin_roster
 from rhi_admin.canary import CANARY_SECRET, run_canary
 from rhi_admin.roster import AdminError
+from rhi_admin.spikes import run_spike_keys
+from rhi_common.spike_keys import SPIKE_KEYS_SECRET
 
 # The deployed stack that holds the students' tables, and their logical IDs in it.
 STACK_NAME = "Rhi-Access"
@@ -103,6 +106,9 @@ def _parser() -> argparse.ArgumentParser:
     key.add_parser("revoke", help="revoke every key of a student").add_argument("github_id", type=int)
 
     commands.add_parser("canary", help=f"the canary's entry, and a new key in {CANARY_SECRET}")
+    commands.add_parser(
+        "spike-keys", help=f"the spikes' students, one of them with no budget, and new keys in {SPIKE_KEYS_SECRET}"
+    ).add_argument("students", type=int, help="how many students with the default budget")
     return parser
 
 
@@ -149,6 +155,21 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
     elif command == ("key", "revoke"):
         revoked = admin_keys.revoke(arguments.github_id, keys=admin.keys, now=now)
         print(f"Revoked {revoked} key(s).", file=out)
+    elif command == ("spike-keys", None):
+        run_spike_keys(
+            arguments.students,
+            roster=admin.roster,
+            keys=admin.keys,
+            secrets=admin.secrets,
+            course_end=admin.course_end(),
+            now=now,
+        )
+        # The count and the secret's name: the keys are in the secret and nowhere else.
+        print(
+            f"The spikes have new keys for {arguments.students} student(s) and for one with no budget, "
+            f"in the secret {SPIKE_KEYS_SECRET}.",
+            file=out,
+        )
     else:
         run_canary(roster=admin.roster, keys=admin.keys, secrets=admin.secrets, course_end=admin.course_end(), now=now)
         print(f"The canary has a new key, in the secret {CANARY_SECRET}.", file=out)

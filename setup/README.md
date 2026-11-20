@@ -32,13 +32,14 @@ exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the a
 (aws-cdk-lib, constructs and cdk-nag), boto3 (the AWS SDK, with which the app reads its
 configuration from SSM and writes it there), the Grafana Foundation SDK (with which the dashboards
 are written), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty,
-moto and cfn-lint) and the libraries the services import. `scripts/check.sh` does this itself.
-Remove it with `rm -rf .venv`.
+moto and cfn-lint), the libraries the services import and the ones the spikes import.
+`scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
 
 The services' libraries are in dependency groups, one per service and named after it, listed in
-the [installation inventory](#installation-inventory). The dev group, which `uv sync` installs,
-includes every one of them, so the tests and ty see every library. A library a service imports
-goes into that service's group, at one exact version, the same in every group that names it.
+the [installation inventory](#installation-inventory); the group `spikes` holds what the validation
+spikes under `spikes/` import. The dev group, which `uv sync` installs, includes every one of
+them, so the tests and ty see every library. A library a service imports goes into that service's
+group, at one exact version, the same in every group that names it.
 
 A deployed service never gets the dev group. [`src/rhi/packaging.py`](../src/rhi/packaging.py)
 gives it its own group and nothing more, at the versions in `uv.lock`:
@@ -179,6 +180,7 @@ when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no 
 | Group `lifecycle` | boto3 and prometheus-client |
 | Group `admin` | boto3 |
 | Group `cli` | keyring |
+| Group `spikes` | The OpenAI and Anthropic Python SDKs, with which the SDK scripts of the validation spikes under `spikes/` call the endpoint, and boto3, for `spikes/common.py`. No service imports the two SDKs, so no function's bundle and no service's image installs them. Both are built on httpx2, an HTTP client apart from the httpx the gateway's group pins, and on pydantic with its compiled core; the lock holds them, and what they need, for the spikes alone |
 | CDK CLI (`aws-cdk`) | Exact version and integrity hash in `package-lock.json`; installed by `npm ci --ignore-scripts` into `node_modules/`, never globally |
 | Node.js 24, the version `.node-version` names | Installed by the contributor, usually with a version manager that reads `.node-version` (mise with idiomatic version files on, fnm, nodenv, `actions/setup-node` through `node-version-file`). The CDK CLI and the synthesis tests run on it; nothing in this repository installs or enforces it |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |

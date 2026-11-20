@@ -57,6 +57,8 @@ dev = [
     { include-group = "lifecycle" },
     { include-group = "admin" },
     { include-group = "cli" },
+    # And the spikes' group, for the same reason.
+    { include-group = "spikes" },
 ]
 # One group per service: every library the service imports, through rhi_common included, each at
 # one exact version, the same in every group that names it (one lock holds one version). A
@@ -97,6 +99,15 @@ lifecycle = [
 admin = ["boto3==1.43.126"]
 # client/pyproject.toml, from which students install the CLI, declares the same requirement.
 cli = ["keyring==25.7.0"]
+# Not a service: what the spikes under spikes/ import (system design, section 12). The OpenAI and
+# Anthropic SDKs are what the SDK scripts of spikes S2, S3 and S6 call the endpoint with, as a
+# student's own program would; no service imports them. boto3 is for spikes/common.py, which signs
+# its reads of the Prometheus workspace, reads the canary students' keys and sends a run's numbers.
+spikes = [
+    "openai==3.57.0",
+    "anthropic==2.11.0",
+    "boto3==1.43.126",
+]
 
 [tool.uv]
 package = false
@@ -122,9 +133,9 @@ norecursedirs = [
 # tests/policy/test_pipeline.py) are both collected, with no `__init__.py` in the tests tree.
 addopts = ["--import-mode=importlib"]
 # The Python roots of the "Repository layout" (system design, section 8.1): one package under each,
-# and scripts/pipeline, whose scripts are modules the tests import by name. A new module goes into
-# an existing root; ruff.toml (`src`) and ty.toml (`root`, `include`) list the same folders, and
-# tests/unit/test_layout.py holds the three lists together.
+# and scripts/pipeline and spikes, whose scripts are modules the tests import by name. A new module
+# goes into an existing root; ruff.toml (`src`) and ty.toml (`root`, `include`) list the same
+# folders, and tests/unit/test_layout.py holds the three lists together.
 pythonpath = [
     "src",
     "services/common",
@@ -138,6 +149,9 @@ pythonpath = [
     "admin",
     "dashboards",
     "scripts/pipeline",
+    # The spikes' modules, imported by name like the pipeline's scripts (spikes/common.py is
+    # `import common`). `testpaths` does not list the folder: its tests are in tests/unit/spikes.
+    "spikes",
     # Not roots of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
     # this configuration too, and import their helpers and each other by bare name, which the
     # default import mode allowed by putting each test file's folder on the path. The examiner's
