@@ -5,17 +5,20 @@ an engine gave to it. [`tests/replay/test_replay.py`](../replay/test_replay.py) 
 capture of this folder through the gateway
 ([`docs/design/system-design.md`](../../docs/design/system-design.md), section 6.2), with the
 answer cut at byte positions and with the client leaving after each event
-([`tests/replay/harness.py`](../replay/harness.py)). A capture added here is replayed with no
-change to the tests.
+([`tests/replay/harness.py`](../replay/harness.py)). A capture added here, or in a subdirectory
+of this folder at any depth, is replayed with no change to the tests. It is named by its path under
+this folder without `.json`: `coursework/effort.json` is the capture `coursework/effort`.
 
 ## What a capture is
 
-One JSON file, `<name>.json`, an object of four parts:
+One JSON file, `<name>.json`, an object of four parts, and of a fifth when it states a request
+profile:
 
 | Part | What it holds |
 | --- | --- |
 | `request` | The request as the client sent it: `method`, `path` (with its query string, if it had one), `headers` (an object of names and values) and `body` |
-| `forward` | Optional. The body the gateway must forward to the engine for this request, as a JSON object |
+| `profile` | Optional. The request profile the capture is replayed with: `request_profile`, the names of its entries in the order they apply, and `reasoning_effort`, optional, the mapping from each value of reasoning effort a request may send to the value the engine receives |
+| `forward` | Optional, and required with `profile`. The engine-side body: what the gateway must forward to the engine for this request, as a JSON object |
 | `answer` | The upstream's answer: `status`, `headers` and `body`, the bytes the engine sent |
 | `usage` | The usage expected: `input_tokens`, the whole input, cached or not, and `output_tokens` |
 
@@ -33,8 +36,18 @@ How the parts are used:
 - `forward`, when given, is compared with the body the upstream receives in every replay, as JSON
   values, field by field. The request ID (`request_id`) and the cache salt (`cache_salt`) are left
   out of the comparison and need not be written: the gateway sets them for each request and each
-  student. Any other difference fails the replay. This is how a capture covers an entry of a
-  pool's request profile (section 6.2, step 4).
+  student. Any other difference fails the replay.
+- `profile`, when given, is written as a pool's configuration writes the two fields
+  (`rhi_common.pool_config`), for example
+  `{"request_profile": ["first_entry", "second_entry"], "reasoning_effort": {"high": "xhigh"}}`.
+  Every pool of the replay then has that profile, and the gateway's body filters run its entries,
+  in that order, as the gateway's entry point has them run (`rhi_gateway.profile`). `forward` is
+  then the body the engine must receive with the profile applied. This is how a capture covers an
+  entry of a pool's request profile (section 6.2, step 4): it states the profile itself, not a
+  pool of the example configuration, so it can be shown before any pool names the entry. A
+  profile that names an entry the gateway does not have fails the replay.
+- A capture that states neither `profile` nor `forward` is replayed with no profile, and what the
+  gateway forwards is not compared; one that states only `forward` is compared with no profile.
 - `usage` is what the gateway must settle the request to when the answer ends cleanly. It comes
   from the engine's own count where there is one, not from reading the answer again.
 - The client must receive the answer's body byte for byte. So a streamed Chat Completions capture
