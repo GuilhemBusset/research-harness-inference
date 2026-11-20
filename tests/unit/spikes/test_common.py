@@ -218,7 +218,8 @@ def test_the_run_label(environ: dict[str, str]) -> None:
     common.run_spike(SPIKE, "s3_harness_task", lambda: NUMBERS, environ=environ, events=bus)
     assert runs(bus)[0][1].label == "s3-harness-task"
 
-    # A label of another shape, given or made from the job's name: nothing is measured and nothing is sent.
+    # A label of another shape, given (an empty one too) or made from the job's name: nothing is
+    # measured and nothing is sent.
     measured: list[str] = []
 
     def measure() -> dict[str, int | float]:
@@ -226,7 +227,7 @@ def test_the_run_label(environ: dict[str, str]) -> None:
         return NUMBERS
 
     bus = Bus()
-    for label in ("warm_start", "Warm"):
+    for label in ("warm_start", "Warm", ""):
         with pytest.raises(ValueError, match="run label"):
             common.run_spike(SPIKE, "s1_warm_start", measure, environ={**environ, "RHI_RUN_LABEL": label}, events=bus)
     with pytest.raises(ValueError, match="run label"):
