@@ -43,6 +43,7 @@
 [nag]
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/mock/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/coursework/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/<pool>/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants the five actions of Session Manager only on every resource, and the session policy holds those five actions alone."
 
