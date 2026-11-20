@@ -252,13 +252,15 @@ def _gateway_environment(pool: str) -> dict[str, str]:
     }
 
 
-def _canary_key() -> str:
-    """A key drawn now, its item written to the keys table as the issuer writes the canary's."""
+def enrol(github_id: int = 0, alias: str = "canary") -> str:
+    """A key drawn now for one student, its item written to the keys table as the issuer writes the
+    canary's. While the local stack is served, a test that needs more students than the canary
+    enrols each under a GitHub ID of its own (`tests/unit/spikes/test_loadgen.py`)."""
     key, now = generate_key(), int(time.time())
     item = StudentKey(
         key_hash=key_hash(key),
-        github_id=0,
-        alias="canary",
+        github_id=github_id,
+        alias=alias,
         installation=None,
         issued_at=now - 60,
         expires_at=now + 86_400,
@@ -275,7 +277,7 @@ def local_stack(pool: str) -> Generator[tuple[str, str]]:
     """The local stack of the one pool, served while the context lasts: its address and the canary's key."""
     with _moto():
         environ = _gateway_environment(pool)
-        key = _canary_key()
+        key = enrol()
         settings = read_settings(environ)
         clients = aws_clients()
         pool_secret = clients.secretsmanager.get_secret_value(SecretId=settings.pool_secrets[pool])["SecretString"]

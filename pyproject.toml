@@ -105,12 +105,14 @@ cli = ["keyring==25.7.0"]
 # its reads of the Prometheus workspace, reads the canary students' keys and sends a run's numbers.
 # highspy is HiGHS, an open-source linear and mixed-integer solver (MIT), as a wheel with no system
 # library: the solver of the task spike S3 gives each harness (spikes/s3_task/), which the test of
-# that task's check runs.
+# that task's check runs. httpx, at the gateway's version, is what the load generator
+# (spikes/loadgen.py) sends its replayed sessions with: the two SDKs are built on another client.
 spikes = [
     "openai==3.57.0",
     "anthropic==2.11.0",
     "boto3==1.43.126",
     "highspy==1.16.0",
+    "httpx==0.28.1",
 ]
 
 [tool.uv]
