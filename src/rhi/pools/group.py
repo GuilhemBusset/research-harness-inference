@@ -36,6 +36,10 @@ instance with its pool, `rhi-pool`, and with the name of its pool's release para
 (`services/engine/boot/user-data.sh`) reads that tag to find its release, so the user data holds no
 setting.
 
+A GPU pool's instance gets a volume of 150 GB: the engine's image, Docker's data and the engine's
+compile cache live on it (section 4.3), and a stopped warm instance costs only its disk, about $12 a
+month at that size (section 5.2). The mock pool's volume keeps the size of its image.
+
 The group and the launch template themselves carry the pool's name under the tag `rhi-pool` and its
 engine under the tag `rhi-engine`. The pipeline's jobs that work on a pool (the promotion of a
 machine image, the GPU verification) cannot refer to a resource of the stage, so they find a pool's
@@ -95,6 +99,9 @@ MOCK_ROOT_DEVICE = "/dev/xvda"
 # The process that replaces instances in service to even out the zones.
 REBALANCING = "AZRebalance"
 
+# The size, in GiB, of a GPU pool's volume (sections 4.3 and 5.2).
+GPU_VOLUME_GIB = 150
+
 
 def machine_image(pool: Pool) -> tuple[ec2.IMachineImage, str]:
     """The pool's machine image, resolved when the stack is deployed, and the image's root device."""
@@ -133,12 +140,17 @@ class PoolGroup(Construct):
             require_imdsv2=True,
             http_tokens=ec2.LaunchTemplateHttpTokens.REQUIRED,
             instance_metadata_tags=True,
-            # The image's root volume, at the image's size, encrypted with the account's EBS key.
+            # The image's root volume, encrypted with the account's EBS key: a GPU pool's at 150 GB,
+            # the mock pool's at the image's size.
             block_devices=[
                 ec2.BlockDevice(
                     device_name=root_device,
                     volume=ec2.BlockDeviceVolume(
-                        ebs_device=ec2.EbsDeviceProps(encrypted=True, volume_type=ec2.EbsDeviceVolumeType.GP3)
+                        ebs_device=ec2.EbsDeviceProps(
+                            encrypted=True,
+                            volume_type=ec2.EbsDeviceVolumeType.GP3,
+                            volume_size=GPU_VOLUME_GIB if image.is_gpu_pool(pool) else None,
+                        )
                     ),
                 )
             ],
