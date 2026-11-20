@@ -6,13 +6,18 @@ here is a measurement; the instance names are made up.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
 
 import common
 import s7_drain as s7
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
+from rhi_common.records import ScalerNote
+from rhi_gateway.errors import WireFormat, render_stream_event
 from rhi_mock_engine.app import Settings, create_app
 from rhi_reporter.measure import Verdict, measurement_event
 
@@ -100,3 +105,141 @@ def test_a_slow_stream_is_read_over_the_seconds_given_and_completes() -> None:
     # A student the engine refuses has no stream to complete.
     refused = httpx.ASGITransport(app=create_app(Settings(secret=key), sleep=no_delay))
     assert not asyncio.run(s7.slow_stream("http://engine", generate_key(), request, 60.0, transport=refused))
+
+
+class _Departing:
+    """A pool whose one instance, writing when the scaler asked for fewer, wrote last at `last`,
+    and whose warm count the scaler read as `warm`."""
+
+    name = "mock"
+
+    def __init__(self, asked_at: int, last: float, warm: list[tuple[float, float]]) -> None:
+        self.asked_at, self.last, self.warm = asked_at, last, warm
+
+    def note(self) -> ScalerNote:
+        return ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=self.asked_at)
+
+    def writes(self, start: float, end: float) -> dict[str, float]:
+        return {"instance-a": float(self.asked_at) if end == self.asked_at else self.last}
+
+    def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
+        return self.warm
+
+
+@pytest.mark.parametrize(
+    ("last", "warm", "path"),
+    [
+        (1005.0, [(990.0, 0.0), (1080.0, 0.0)], s7.Path.TERMINATED),
+        (1005.0, [(990.0, 0.0), (1080.0, 1.0)], s7.Path.WARM_POOL),
+        # No reading of the warm count across the departure: its path is not told.
+        (1005.0, [], None),
+        (1005.0, [(990.0, 0.0), (1010.0, 0.0)], None),
+        # Still writing when the job stops waiting: no stop was seen.
+        (2000.0, [(990.0, 0.0), (1980.0, 1.0)], None),
+    ],
+)
+def test_a_departure_has_a_path_only_when_its_stop_and_the_warm_count_were_seen(
+    monkeypatch: pytest.MonkeyPatch, last: float, warm: list[tuple[float, float]], path: s7.Path | None
+) -> None:
+    now = 1000 + (s7.LEAVE_WAIT_SECONDS + 1 if last > 1500 else 110)
+    monkeypatch.setattr(s7.time, "time", lambda: now)
+    pool = _Departing(1000, last, warm)
+    run = s7.Run(pool, "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
+    departure = asyncio.run(run.departure(1, 1))
+    assert departure.path is path
+    if path is not None:
+        assert departure.seconds == s7.leave_seconds(1000, last)
+
+
+def test_a_held_stream_is_answered_only_once_the_event_it_spans_is_over() -> None:
+    key, happened = generate_key(), []
+    engine = create_app(Settings(secret=key))
+
+    async def recorded(scope: Any, receive: Any, send: Any) -> None:
+        async def sent(message: Any) -> None:
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                happened.append("answered")
+
+        await engine(scope, receive, sent)
+
+    async def over() -> bool:
+        if len(happened) < 3:
+            happened.append("held")
+            return False
+        happened.append("over")
+        return True
+
+    async def no_wait(seconds: float) -> None:
+        pass
+
+    transport = httpx.ASGITransport(app=recorded)
+    request = s7._request("mock")
+    held = s7.slow_stream("http://engine", key, request, 600.0, until=over, transport=transport, sleep=no_wait)
+    assert asyncio.run(held)
+    assert happened == ["held", "held", "held", "over", "answered"]
+
+
+def _warming_stream(request: httpx.Request) -> httpx.Response:
+    event = render_stream_event(Cause.WARMING, WireFormat.MESSAGES)
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=event)
+
+
+def _cut(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadError("cut", request=request)
+
+
+def test_a_wake_is_lost_unless_its_inference_completes() -> None:
+    key = generate_key()
+    engine = httpx.ASGITransport(app=create_app(Settings(secret=key)))
+    assert asyncio.run(s7.wake("http://gateway", key, "mock", 5, transport=engine))
+    for respond in (_warming_stream, _cut, lambda request: httpx.Response(503)):
+        lost = s7.wake("http://gateway", key, "mock", 5, transport=httpx.MockTransport(respond))
+        assert not asyncio.run(lost)
+
+
+def test_each_wake_goes_when_no_instance_serves_and_a_lost_one_does_not_end_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pool as the scaler reads it, (asked, in service), one reading per look.
+    readings = iter([(1, 1), (0, 1), (0, 0), (1, 1), (0, 0), (1, 1), (0, 0)])
+    now = next(readings)
+    pool = SimpleNamespace(name="mock", asked=lambda: now[0], gauge=lambda name: now[1])
+    answers = iter([True, False, True, True, True])  # the second request is a lost wake
+    sent: list[tuple[int, int]] = []
+
+    async def wait(condition: Any, *arguments: Any) -> None:
+        nonlocal now
+        while not condition():
+            now = next(readings)
+
+    async def wake(*arguments: Any, **options: Any) -> bool:
+        sent.append(now)
+        return next(answers)
+
+    monkeypatch.setattr(s7, "_wait", wait)
+    monkeypatch.setattr(s7, "wake", wake)
+    settings = SimpleNamespace(hold_seconds=30, idle_minutes=1)
+    run = s7.Run(pool, "http://gateway", [generate_key()], settings, 3, 60)  # ty: ignore[invalid-argument-type] - a double
+    assert asyncio.run(run.send_wakes()) == (3, 1)
+    # A request to bring the pool back, the first wake, lost, at zero in service, another request
+    # to bring the pool back, then the two other wakes, each at zero in service.
+    assert sent == [(1, 1), (0, 0), (0, 0), (0, 0), (0, 0)]
+
+
+def test_a_gateway_deployment_counts_only_when_seen_under_the_stream() -> None:
+    tasks = {"task-a": (900.0, 1500.0), "task-b": (1100.0, 1500.0)}
+    assert s7.rollout_at({"task-a"}, tasks) == 1100.0
+    assert s7.rollout_at({"task-a", "task-b"}, tasks) is None
+    assert s7.across_rollout(completed=True, spanned=True, rolled_out_at=1100.0)
+    assert not s7.across_rollout(completed=False, spanned=False, rolled_out_at=1100.0)
+    for completed, spanned in ((True, False), (False, False)):
+        with pytest.raises(ValueError, match="no gateway deployment"):
+            s7.across_rollout(completed=completed, spanned=spanned, rolled_out_at=None)
+    # A stream the mock answers while the same task writes throughout is no survived deployment.
+    key = generate_key()
+    pool = SimpleNamespace(name="mock", gateway_tasks=lambda start, end: {"task-a": (start, end)})
+    engine = httpx.ASGITransport(app=create_app(Settings(secret=key)))
+    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=engine)  # ty: ignore[invalid-argument-type] - a double
+    with pytest.raises(RuntimeError, match="no gateway deployment"):
+        asyncio.run(run.across_deployment())
