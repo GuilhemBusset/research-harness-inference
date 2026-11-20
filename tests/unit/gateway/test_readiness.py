@@ -162,6 +162,26 @@ def test_the_records_are_kept_and_a_failed_read_keeps_the_previous_ones() -> Non
     assert readiness.pool("coursework").mode == disabled
 
 
+def test_each_pool_gives_the_rebalance_number_of_the_note_last_read() -> None:
+    _, _, table, readiness = build()
+    assert readiness.pool("coursework").rebalance_number is None  # nothing read yet
+    table.put(ScalerNote("coursework", capacity_asked=2, no_capacity_at=None, written_at=2, rebalance_number=7))
+    table.put(ScalerNote("upgrade", capacity_asked=1, no_capacity_at=None, written_at=2))
+    readiness.refresh()
+    numbers = {pool: readiness.pool(pool).rebalance_number for pool in POOLS}
+    # A note the scaler has raised no number in gives 0, and a pool with no note gives none.
+    assert numbers == {"coursework": 7, "upgrade": 0, "mock": None}
+
+    # A read that fails keeps the note, and so its number; the next one that answers gives the new number.
+    table.put(ScalerNote("coursework", capacity_asked=2, no_capacity_at=None, written_at=9, rebalance_number=8))
+    table.failing = True
+    readiness.refresh()
+    assert readiness.pool("coursework").rebalance_number == 7
+    table.failing = False
+    readiness.refresh()
+    assert readiness.pool("coursework").rebalance_number == 8
+
+
 def test_read_every_5_seconds_for_every_pool() -> None:
     clock, elbv2, table, readiness = build()
     slept, _ = run_for(readiness, clock, cycles=6)

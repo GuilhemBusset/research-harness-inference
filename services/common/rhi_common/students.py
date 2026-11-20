@@ -10,7 +10,7 @@ reads and writes it. The tables and their keys are in `rhi_common.tables`.
 | --- | --- | --- |
 | keys | `StudentKey` | `key_hash`, `github_id`, `alias`, `installation`, `issued_at`, `expires_at`, `revoked_at`, `daily_token_budget`, `concurrency_limit` |
 | roster | `RosterEntry` | `github_id`, `alias`, `daily_token_budget`, `concurrency_limit`, `added_at`, `expires_at` |
-| usage | `UsageDay` | `github_id`, `day`, `alias`, `tokens`, `leases`, `expires_at`, `affinity_cookies`, and in Phase 2 `rebalance_applied` |
+| usage | `UsageDay` | `github_id`, `day`, `alias`, `tokens`, `leases`, `expires_at`, `affinity_cookies`, `rebalance_applied` |
 
 A lease, one value of the map `leases`, holds `tokens`, `estimate` and `expires`.
 
@@ -179,10 +179,12 @@ class UsageDay:
     against both (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
     stays in the item of the day its request started. `affinity_cookies` maps a pool's name to the
     cookie the internal load balancer last set for this student, as it set it (section 5.5).
-    Phase 2 adds, per pool, the last rebalance number applied. Each of the two maps is left out
-    of the item form while it holds nothing, and an item without one reads as an empty map. The
-    gateway's reservation leaves an empty map of cookies in the table's item, for its settlement
-    to store the cookie in (`rhi_gateway.budget`): it reads as none too.
+    `rebalance_applied` maps a pool's name to the last rebalance number of that pool the gateway
+    applied to this student, a whole number, so that each number moves a student once at most
+    (`rhi_gateway.affinity`). Each of the two maps is left out of the item form while it holds
+    nothing, and an item without one reads as an empty map. The gateway's reservation leaves each
+    of them empty in the table's item, for its settlement to store the cookie and the number in
+    (`rhi_gateway.budget`): an empty map reads as none too.
     """
 
     github_id: int

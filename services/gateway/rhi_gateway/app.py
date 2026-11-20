@@ -18,7 +18,10 @@ The reservation is made once the body is read and filtered, because it needs wha
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
 long the lease lasts. It is still made before anything is sent to the engine. It names the pool,
 and returns the load balancer's cookie the student's record holds for it: the proxy sends that
-cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`).
+cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`). It
+returns the last rebalance number the record has applied for the pool as well: the request is
+judged on the pool's number as the gateway holds it then, which may drop the cookie for this
+request, and the settlement stores that number (section 5.5).
 
 **The hold** (sections 5.3 and 6.2, step 5) runs between the body filter and the proxy. Whether
 the pool can serve is read from the values the gateway keeps of it (`rhi_gateway.readiness`),
@@ -529,8 +532,16 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         except GatewayError as refused:
             return _refusal(refused, entry, forwarding.retry_after)
         # The load balancer's cookie the student's record holds for the pool: the proxy sends it,
-        # and the settlement stores the one the request ends with (section 5.5).
-        affinity = Affinity(reservation.cookie)
+        # and the settlement stores the one the request ends with (section 5.5). The request is
+        # judged here on the pool's rebalance number, as the gateway holds it now: a number new to
+        # the student that selects them drops the cookie, and the settlement stores the number.
+        affinity = Affinity.judged(
+            student.github_id,
+            reservation.cookie,
+            applied=reservation.rebalance_applied,
+            number=holding.view(forwarded.pool).rebalance_number,
+            share=forwarded.pool.rebalance_share,
+        )
 
         demand: Demand | None = None
         if held is not None and forwarding.heartbeat is not None:
@@ -564,6 +575,8 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 output_tokens=observed.output_tokens,
                 ended_cleanly=observed.ended_cleanly,
                 cookie=affinity.ended,
+                rebalance_number=affinity.number,
+                cookie_dropped=affinity.dropped,
             )
 
         if held is not None and not held.ready:

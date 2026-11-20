@@ -78,6 +78,26 @@ def reserve(
     )
 
 
+def settle(
+    ledger: InMemoryLedger,
+    reservation: Reservation,
+    *,
+    cookie: str | None = None,
+    rebalance_number: int | None = None,
+    cookie_dropped: bool = False,
+) -> int | None:
+    """Settle a clean end of 1,000 input tokens and 200 output tokens, with what the request's affinity gives."""
+    return ledger.settle(
+        reservation,
+        input_tokens=1000,
+        output_tokens=200,
+        ended_cleanly=True,
+        cookie=cookie,
+        rebalance_number=rebalance_number,
+        cookie_dropped=cookie_dropped,
+    )
+
+
 def refusal(ledger: InMemoryLedger, who: StudentKey, request: str) -> Cause:
     """The cause a reservation is refused with."""
     with pytest.raises(GatewayError) as refused:
@@ -220,22 +240,25 @@ def test_two_writes_per_request() -> None:
     who = student()
 
     reservation = reserve(ledger, who, "request-1", pool="coursework")
+    assert (reservation.cookie, reservation.rebalance_applied) == (None, None)
     assert ledger.writes == 1
-    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="first-cookie")
+    settle(ledger, reservation, cookie="first-cookie", rebalance_number=7)
     assert ledger.writes == 2
 
     # The read writes nothing, and neither does a settlement that finds nothing to settle.
     ledger.tokens_left(who)
-    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="late-cookie")
+    settle(ledger, reservation, cookie="late-cookie", rebalance_number=9)
     assert ledger.writes == 2
 
-    # The cookie is carried by those two writes: the next request's reservation returns it, and
-    # that request makes two writes too.
+    # The cookie and the last rebalance number applied are carried by those two writes: the next
+    # request's reservation returns them, and that request makes two writes too.
     second = reserve(ledger, who, "request-2", pool="coursework")
-    assert second.cookie == "first-cookie"
+    assert (second.cookie, second.rebalance_applied) == ("first-cookie", 7)
     assert ledger.writes == 3
-    ledger.settle(second, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="second-cookie")
+    settle(ledger, second, cookie="second-cookie", rebalance_number=8)
     assert ledger.writes == 4
+    record = written(ledger)
+    assert (record.affinity_cookies, record.rebalance_applied) == ({"coursework": "second-cookie"}, {"coursework": 8})
 
 
 def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
@@ -275,18 +298,58 @@ def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
     assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
 
 
-def test_a_new_day_starts_with_the_cookies_of_the_day_before() -> None:
+def test_a_new_day_starts_with_the_cookies_and_the_rebalance_numbers_of_the_day_before() -> None:
     clock = Clock()
     ledger = InMemoryLedger(clock=clock)
     who = student()
     first = reserve(ledger, who, "request-1", pool="coursework")
-    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-cookie")
+    settle(ledger, first, cookie="coursework-cookie", rebalance_number=7)
 
     clock.now = NOON + 86_400
-    assert reserve(ledger, who, "request-2", pool="coursework").cookie == "coursework-cookie"
+    second = reserve(ledger, who, "request-2", pool="coursework")
+    assert (second.cookie, second.rebalance_applied) == ("coursework-cookie", 7)
     today = ledger.day(7, "2026-11-16")
     assert today is not None
     assert today.affinity_cookies == {"coursework": "coursework-cookie"}
+    assert today.rebalance_applied == {"coursework": 7}
+
+
+def test_a_rebalance_number_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
+    clock = Clock()
+    ledger = InMemoryLedger(clock=clock)
+    who = student(limit=1)
+    settle(ledger, reserve(ledger, who, "request-1", pool="coursework"), cookie="held", rebalance_number=7)
+
+    # Another pool's reservation returns none of it, and its settlement leaves it in place.
+    other = reserve(ledger, who, "request-2", pool="upgrade")
+    assert other.rebalance_applied is None
+    settle(ledger, other, rebalance_number=0)
+    assert written(ledger).rebalance_applied == {"coursework": 7, "upgrade": 0}
+
+    # A request that was not judged stores no number, and one that ended with no cookie stores its number still.
+    settle(ledger, reserve(ledger, who, "request-3", pool="coursework"), cookie="newer")
+    assert written(ledger).rebalance_applied["coursework"] == 7
+    settle(ledger, reserve(ledger, who, "request-4", pool="coursework"), rebalance_number=8)
+    record = written(ledger)
+    assert (record.affinity_cookies, record.rebalance_applied["coursework"]) == ({"coursework": "newer"}, 8)
+
+    # A request whose cookie was dropped, and that ended with none, takes the pool's cookie off the record.
+    settle(ledger, reserve(ledger, who, "request-5", pool="coursework"), rebalance_number=9, cookie_dropped=True)
+    record = written(ledger)
+    assert (record.affinity_cookies, record.rebalance_applied) == ({}, {"coursework": 9, "upgrade": 0})
+    # One that ended with the cookie its answer set stores that cookie.
+    moved = reserve(ledger, who, "request-6", pool="coursework")
+    settle(ledger, moved, cookie="moved", rebalance_number=10, cookie_dropped=True)
+    assert written(ledger).affinity_cookies == {"coursework": "moved"}
+
+    # The reservation that removes an expired lease stores nothing, and neither does the
+    # settlement that then finds its lease gone.
+    late = reserve(ledger, who, "request-7", pool="coursework")
+    clock.now = NOON + 2280
+    assert reserve(ledger, who, "request-8", pool="coursework").rebalance_applied == 10
+    assert settle(ledger, late, rebalance_number=11, cookie_dropped=True) is None
+    record = written(ledger)
+    assert (record.affinity_cookies, record.rebalance_applied["coursework"]) == ({"coursework": "moved"}, 10)
 
 
 def test_a_lease_expires_after_2280_seconds() -> None:

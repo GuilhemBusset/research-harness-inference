@@ -7,7 +7,8 @@ nothing else (section 5.3).
 
 On the same cycle it reads the pool's two records in the pool-state table: `mode`, the admin's
 (`rhi_common.records.PoolState`, section 11.3), and `note`, the scaler's (`ScalerNote`: whether
-it asked for capacity, and when a launch last found none).
+it asked for capacity, when a launch last found none, and the pool's rebalance number, which
+`PoolView.rebalance_number` gives: section 5.5).
 
 `Readiness.run` repeats the cycle every 5 seconds for every pool, whether or not anyone asks, and
 keeps the last values. Callers read only the kept values (`Readiness.pool`): no request causes a
@@ -52,6 +53,15 @@ class PoolView:
     mode: PoolState | None = None
     note: ScalerNote | None = None
     observed_at: float | None = None
+
+    @property
+    def rebalance_number(self) -> int | None:
+        """The pool's rebalance number, from the scaler's note last read (section 5.5).
+
+        It is 0 for a note that holds none, and `None` while no note is kept: the gateway then
+        does not know the number, and judges no request on one (`rhi_gateway.affinity`).
+        """
+        return None if self.note is None else self.note.rebalance_number
 
 
 # Called after each cycle with the new views.

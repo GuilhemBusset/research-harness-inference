@@ -52,8 +52,7 @@ USAGE = UsageDay(
 )
 FULL = [KEY, ROSTER, USAGE]
 
-# The attributes of the issue's Context, written out here and not read from the module. The
-# Phase 2 attribute of a day of usage, `rebalance_applied`, is named by the module's decision.
+# The attributes of each item, written out here and not read from the module.
 LISTED: dict[type, set[str]] = {
     StudentKey: {
         "key_hash",
@@ -173,6 +172,22 @@ def test_a_day_of_usage_reads_back_each_pool_s_cookie() -> None:
     assert "affinity_cookies" not in UsageDay.from_item(without).to_item()
 
 
+def test_a_day_of_usage_reads_back_each_pool_s_rebalance_number() -> None:
+    usage = UsageDay.from_item({**USAGE.to_item(), "rebalance_applied": {"coursework": 7, "upgrade": 0}})
+    assert usage.rebalance_applied == {"coursework": 7, "upgrade": 0}
+    assert usage.to_item()["rebalance_applied"] == {"coursework": 7, "upgrade": 0}
+    read = UsageDay.from_item(as_read(usage.to_item()))
+    assert read == usage
+    assert all(type(number) is int for number in read.rebalance_applied.values())
+
+    # Absent until written: a day without the attribute has applied no number, and writes none.
+    without = {name: value for name, value in USAGE.to_item().items() if name != "rebalance_applied"}
+    assert UsageDay.from_item(without).rebalance_applied == {}
+    assert "rebalance_applied" not in UsageDay.from_item(without).to_item()
+    # The empty map the gateway's reservation leaves in the table reads as none too.
+    assert UsageDay.from_item({**without, "rebalance_applied": {}}).rebalance_applied == {}
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -184,6 +199,10 @@ def test_a_day_of_usage_reads_back_each_pool_s_cookie() -> None:
         ("leases", {"req-1": 40_000}),
         ("leases", ["req-1"]),
         ("affinity_cookies", {"coursework": 7}),
+        ("rebalance_applied", {"coursework": Decimal("7.5")}),
+        ("rebalance_applied", {"coursework": "7"}),
+        ("rebalance_applied", {"coursework": -1}),
+        ("rebalance_applied", 7),
     ],
 )
 def test_a_mistyped_day_of_usage_is_refused(name: str, value: object) -> None:

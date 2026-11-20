@@ -280,6 +280,75 @@ def test_the_first_request_of_a_day_returns_the_cookie_of_the_day_before(client:
     assert written("2026-11-16").affinity_cookies == {"coursework": "coursework-1"}
 
 
+def test_the_two_writes_of_a_request_carry_the_last_rebalance_number_of_its_pool(client: Calls) -> None:
+    clock = Clock()
+    ledger = DynamoDBLedger(client, TABLE, clock=clock)
+    who = student()
+
+    def settle(reservation: Reservation, **affinity: Any) -> int | None:
+        return ledger.settle(reservation, input_tokens=1000, output_tokens=20, ended_cleanly=True, **affinity)
+
+    # The record has applied none: none is returned, and the settlement's one call stores the
+    # number with the cookie.
+    first = reserve(ledger, who, "request-1", pool="coursework")
+    assert first.rebalance_applied is None
+    assert written().rebalance_applied == {}
+    client.made.clear()
+    settle(first, cookie="coursework-1", rebalance_number=7)
+    assert client.made == ["update_item"]
+    assert written().rebalance_applied == {"coursework": 7}
+
+    # From then on the reservation's one call returns it, for the request's pool only, and the
+    # settlement's one call replaces it, with a cookie or without, whatever else is in flight.
+    client.made.clear()
+    second = reserve(ledger, who, "request-2", pool="coursework")
+    other = reserve(ledger, who, "request-3", pool="upgrade")
+    assert (second.cookie, second.rebalance_applied) == ("coursework-1", 7)
+    assert (other.cookie, other.rebalance_applied) == (None, None)
+    settle(other, rebalance_number=0)
+    settle(second, cookie="coursework-2", rebalance_number=8)
+    assert client.made == ["update_item"] * 4
+    record = written()
+    assert record.rebalance_applied == {"coursework": 8, "upgrade": 0}
+    assert record.affinity_cookies == {"coursework": "coursework-2"}
+
+    # A request that was not judged stores no number. One whose cookie was dropped and that ended
+    # with none takes the pool's cookie off the record, in its one call, and stores its number.
+    settle(reserve(ledger, who, "request-4", pool="coursework"), cookie="coursework-3")
+    assert written().rebalance_applied["coursework"] == 8
+    dropped = reserve(ledger, who, "request-5", pool="coursework")
+    client.made.clear()
+    settle(dropped, rebalance_number=9, cookie_dropped=True)
+    assert client.made == ["update_item"]
+    record = written()
+    assert (record.affinity_cookies, record.rebalance_applied) == ({}, {"coursework": 9, "upgrade": 0})
+    # A settlement that finds nothing to settle stores nothing.
+    assert settle(dropped, cookie="too-late", rebalance_number=10) is None
+    assert written().rebalance_applied["coursework"] == 9
+
+    # The first request of the next day returns the number of the day before.
+    clock.now = NOON + 86_400
+    assert reserve(ledger, who, "request-6", pool="coursework").rebalance_applied == 9
+    assert written("2026-11-16").rebalance_applied == {"coursework": 9, "upgrade": 0}
+
+
+def test_the_first_numbers_of_requests_in_flight_each_cost_one_settlement_call(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    who = student()
+    # A day's item that no reservation naming a pool has written holds no map of numbers.
+    ledger.settle(reserve(ledger, who, "request-0"), input_tokens=0, output_tokens=0, ended_cleanly=True)
+    assert "rebalance_applied" not in client.get_item(TableName=TABLE, Key=KEY)["Item"]
+
+    one = reserve(ledger, who, "request-1", pool="coursework")
+    two = reserve(ledger, who, "request-2", pool="upgrade")
+    client.made.clear()
+    ledger.settle(two, input_tokens=1000, output_tokens=30, ended_cleanly=True, rebalance_number=3)
+    ledger.settle(one, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="held", rebalance_number=7)
+    assert client.made == ["update_item"] * 2
+    record = written()
+    assert (record.rebalance_applied, record.leases) == ({"coursework": 7, "upgrade": 3}, {})
+
+
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
     ledger = DynamoDBLedger(client, TABLE, clock=Clock())
     who = student(limit=4)
