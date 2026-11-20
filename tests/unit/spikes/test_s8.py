@@ -5,15 +5,23 @@ names are made up.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import urllib.request
+from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
+from prometheus_client.parser import text_string_to_metric_families
+from starlette.testclient import TestClient
 
 import common
 import s8_stickiness as s8
 from rhi_common.keys import generate_key
 from rhi_common.records import ScalerNote
+from rhi_lifecycle.launch import Engine
+from rhi_mock_engine.app import Settings, create_app
 from rhi_reporter.measure import Verdict, measurement_event
 
 if TYPE_CHECKING:
@@ -383,3 +391,158 @@ def test_a_scale_in_after_the_phase_keeps_its_split(monkeypatch: pytest.MonkeyPa
     scaling = _Scaling(clock, stops_writing=1000, scales_in=2000)
     with pytest.raises(s8.Departed):
         _scaling_run(monkeypatch, clock, scaling, split, []).measure()
+
+
+class _Launching:
+    """A workspace and a pool-state table over instance-a, in zone-1, and instance-b, in zone-2,
+    both writing and streaming answers from the start, as a launch's warm-up does: the scaler asks
+    for two and reads instance-b in service only from `in_service_at`."""
+
+    def __init__(self, clock: _Clock, in_service_at: float) -> None:
+        self.clock, self.in_service_at = clock, in_service_at
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query:
+            return [common.Series({"pool": "mock"}, ((end, 2 if self.clock.now >= self.in_service_at else 1),))]
+        if query.startswith("sum("):
+            return [common.Series({}, ((end, 0.0),))]
+        samples = ((end, end),) if query.startswith("timestamp(") else ((start, 0.0), (end, 20.0))
+        return [
+            common.Series({"instance": one, "zone": f"zone-{n}"}, samples)
+            for n, one in ((1, "instance-a"), (2, "instance-b"))
+        ]
+
+    def get_item(self, *, Key: dict, ConsistentRead: bool = False) -> dict:
+        return {"Item": ScalerNote(Key["pool"], 2, None, int(self.clock.now)).to_item()}
+
+
+def test_the_load_is_held_until_the_scaler_reads_two_instances_in_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock, stopped = _Clock(1000), []
+
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+        await load.sessions[0].stop.wait()  # ty: ignore[unresolved-attribute] - the load's held streams
+        stopped.append(clock.now)
+        return []
+
+    async def wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
+        while not condition():
+            clock.sleep(s8.POLL_SECONDS)
+
+    monkeypatch.setattr(s8.loadgen, "replay", held)
+    monkeypatch.setattr(s8, "_wait", wait)
+    monkeypatch.setattr(s8.time, "time", lambda: clock.now)
+    fleet = _Launching(clock, in_service_at=1060)
+    pool = s8.Pool("mock", fleet, fleet)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8)
+    assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
+    assert stopped == [1060]
+
+
+def _unlabelled(client: TestClient) -> dict[str, float]:
+    """The samples of an engine's metrics that have no label, by name."""
+    answer = client.get("/metrics")
+    assert answer.status_code == 200
+    families = text_string_to_metric_families(answer.text)
+    return {sample.name: sample.value for family in families for sample in family.samples if not sample.labels}
+
+
+def test_the_lifecycle_agent_s_completions_are_not_a_student_s_requests() -> None:
+    key = generate_key()
+
+    async def no_delay(seconds: float) -> None:
+        pass
+
+    apps = {one: create_app(Settings(secret=key), sleep=no_delay) for one in ("instance-a", "instance-b")}
+    with ExitStack() as stack:
+        clients = {one: stack.enter_context(TestClient(app, client=("127.0.0.1", 40000))) for one, app in apps.items()}
+        before = {one: _unlabelled(client) for one, client in clients.items()}
+        # One student sends two requests, both to instance-a; the agent checks each instance meanwhile.
+        load = s8.loadgen.Load((s8._session("mock", 2, 1),))
+        transport = httpx.ASGITransport(app=apps["instance-a"])
+        records = asyncio.run(s8.loadgen.replay(load, [key], "http://engine", at_once=1, transport=transport))
+        assert [record.status for record in records] == [200, 200]
+        for client in clients.values():
+
+            def fetch(request: urllib.request.Request, timeout: float | None, client: TestClient = client) -> tuple:
+                path = request.full_url.removeprefix("http://127.0.0.1:8000")
+                answer = client.post(path, content=request.data, headers=dict(request.header_items()))  # ty: ignore[invalid-argument-type] - bytes
+                return answer.status_code, answer.content
+
+            assert Engine(fetch).warm_up("mock", key)
+        after = {one: _unlabelled(client) for one, client in clients.items()}
+
+    class Scrapes:
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            name = query.split("{")[0]
+            return [
+                common.Series({"instance": one}, ((start, before[one][name]), (end, after[one][name]))) for one in after
+            ]
+
+    # Each engine counted the agent's completion as a request with a first token.
+    first_tokens = "rhi_mock:time_to_first_token_seconds_count"
+    assert {one: after[one][first_tokens] - before[one][first_tokens] for one in after} == {
+        "instance-a": 3,
+        "instance-b": 1,
+    }
+    assert s8.Pool("mock", Scrapes(), None).served(0.0, 1.0) == {"instance-a": 2}  # ty: ignore[invalid-argument-type] - a test double
+
+
+class _Draining(_Scaling):
+    """`_Scaling` whose scaler reads instance-b in service until `leaves`."""
+
+    def __init__(self, clock: _Clock, *, stops_writing: float, scales_in: float, leaves: float) -> None:
+        super().__init__(clock, stops_writing=stops_writing, scales_in=scales_in)
+        self.leaves = leaves
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query:
+            return [common.Series({"pool": "mock"}, ((end, 1 if self.clock.now >= self.leaves else 2),))]
+        return super().read_series(query, start=start, end=end, step=step)
+
+
+def test_the_phase_after_waits_for_the_scaler_to_read_one_in_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Instance-b stops writing at 1000 and the scaler asks for one instance from 1060, but instance-b
+    # stays in service, drained, until 1150.
+    clock, after = _Clock(1000), []
+    scaling = _Draining(clock, stops_writing=1000, scales_in=1060, leaves=1150)
+    stuck = {1: Counts(3, {"instance-a": 3}), 2: Counts(3, {"instance-b": 3})}
+    numbers = _scaling_run(monkeypatch, clock, scaling, stuck, after).measure()
+    assert after and after[0] >= 1150
+    assert s8.SPIKE.verdict(numbers) is Verdict.PASS
+
+
+def test_a_number_raised_before_a_phase_reaches_the_gateway_before_the_phase_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The scaler raised the number at 999; each gateway task reads it within a readiness cycle.
+    clock, raised_at, held = _Clock(1000), 999, []
+
+    class Raised:
+        name = "mock"
+
+        def rebalance_number(self) -> int:
+            return 1
+
+        def present(self) -> set[str]:
+            return {"instance-a", "instance-b"}
+
+    async def phase(self: s8.Run, *, first_at_once: bool) -> s8.PhaseCounts:
+        held.append(clock.now >= raised_at + s8.GATEWAY_CYCLE_SECONDS)
+        return STUCK
+
+    monkeypatch.setattr(s8.time, "time", lambda: clock.now)
+    monkeypatch.setattr(s8.time, "sleep", clock.sleep)
+    monkeypatch.setattr(s8.Run, "phase", phase)
+    run = s8.Run(Raised(), "https://gateway.example.com", [generate_key(), generate_key()], 2, 8)  # ty: ignore[invalid-argument-type] - a test double
+    assert run.measured(Phase.BEFORE, first_at_once=True, in_service={"instance-a", "instance-b"}) == STUCK
+    assert held == [True]
+
+
+def test_firsts_the_evidence_cannot_tell_apart_are_measured_again() -> None:
+    # Each student misses its first's cache, then reaches both instances: either could have opened
+    # on instance-a, and the two ways give the students different counts.
+    windows = {student: Counts(3, {"instance-a": 2, "instance-b": 1}) for student in s8.STUDENTS}
+    counts = s8.with_openings({"instance-a": 1, "instance-b": 1}, windows, dict.fromkeys(s8.STUDENTS, False))
+    assert not any(held.adds_up() for held in counts.values())
+    with pytest.raises(s8.Disturbed):
+        s8.measure_undisturbed(Phase.BEFORE, lambda: counts, lambda: 0, attempts=1, log=lambda _: None)
