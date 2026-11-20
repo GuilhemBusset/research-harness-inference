@@ -40,6 +40,9 @@ src = [
   "scripts/pipeline",
   "spikes",
 ]
+# The task spike S3 gives each harness, and its reference fix, are input to a harness, not this
+# project's code: the task is incomplete on purpose. ty.toml leaves the same two folders out.
+extend-exclude = ["spikes/s3_task", "spikes/s3_reference"]
 
 [lint]
 # The rules are Ruff 0.17.3's default selection (no `select`), less the `ignore` list below, so the

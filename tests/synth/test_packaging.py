@@ -40,8 +40,9 @@ GROUPS = {
     "lifecycle": {"boto3", "prometheus-client"},
     "admin": {"boto3"},
     "cli": {"keyring"},
-    # Not a service: what the spikes under spikes/ import, the two SDKs their scripts call the endpoint with.
-    "spikes": {"openai", "anthropic", "boto3"},
+    # Not a service: what the spikes under spikes/ import, the two SDKs their scripts call the endpoint
+    # with, and the solver of the task spike S3 gives each harness.
+    "spikes": {"openai", "anthropic", "boto3", "highspy"},
 }
 # The name each library is imported by, where it is not the name it is installed by.
 IMPORT_NAMES = {"prometheus-client": "prometheus_client", "protobuf": "google.protobuf", "pyjwt": "jwt"}

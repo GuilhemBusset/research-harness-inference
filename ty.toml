@@ -62,6 +62,9 @@ include = [
     "spikes",
     "tests",
 ]
+# The task spike S3 gives each harness, and its reference fix, are input to a harness, not this
+# project's code: the task is incomplete on purpose. ruff.toml leaves the same two folders out.
+exclude = ["spikes/s3_task", "spikes/s3_reference"]
 
 [terminal]
 error-on-warning = true

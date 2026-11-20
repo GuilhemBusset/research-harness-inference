@@ -32,7 +32,7 @@ exact versions in [`pyproject.toml`](../pyproject.toml): the CDK libraries the a
 (aws-cdk-lib, constructs and cdk-nag), boto3 (the AWS SDK, with which the app reads its
 configuration from SSM and writes it there), the Grafana Foundation SDK (with which the dashboards
 are written), the tools (pytest, pytest-xdist, PyYAML, Ruff, ty,
-moto and cfn-lint), the libraries the services import and the ones the spikes import.
+moto and cfn-lint), the libraries the services import and the ones the spikes import (the HiGHS solver among them).
 `scripts/check.sh` does this itself. Remove it with `rm -rf .venv`.
 
 The services' libraries are in dependency groups, one per service and named after it, listed in
@@ -180,7 +180,7 @@ when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no 
 | Group `lifecycle` | boto3 and prometheus-client |
 | Group `admin` | boto3 |
 | Group `cli` | keyring |
-| Group `spikes` | The OpenAI and Anthropic Python SDKs, with which the SDK scripts of the validation spikes under `spikes/` call the endpoint, and boto3, for `spikes/common.py`. No service imports the two SDKs, so no function's bundle and no service's image installs them. Both are built on httpx2, an HTTP client apart from the httpx the gateway's group pins, and on pydantic with its compiled core; the lock holds them, and what they need, for the spikes alone |
+| Group `spikes` | The OpenAI and Anthropic Python SDKs, with which the SDK scripts of the validation spikes under `spikes/` call the endpoint, and boto3, for `spikes/common.py`. No service imports the two SDKs, so no function's bundle and no service's image installs them. Both are built on httpx2, an HTTP client apart from the httpx the gateway's group pins, and on pydantic with its compiled core; the lock holds them, and what they need, for the spikes alone. highspy is HiGHS, an open-source linear and mixed-integer solver under the MIT licence, as a compiled wheel with no system library: the solver of the task spike S3 gives each harness (`spikes/s3_task/`), installed so that `tests/unit/spikes/test_s3_task.py` can run that task's check. It brings NumPy, also a compiled wheel |
 | CDK CLI (`aws-cdk`) | Exact version and integrity hash in `package-lock.json`; installed by `npm ci --ignore-scripts` into `node_modules/`, never globally |
 | Node.js 24, the version `.node-version` names | Installed by the contributor, usually with a version manager that reads `.node-version` (mise with idiomatic version files on, fnm, nodenv, `actions/setup-node` through `node-version-file`). The CDK CLI and the synthesis tests run on it; nothing in this repository installs or enforces it |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
