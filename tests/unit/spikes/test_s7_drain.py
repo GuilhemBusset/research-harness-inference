@@ -14,7 +14,6 @@ import pytest
 import s7_drain as s7
 from rhi_common.keys import generate_key
 from rhi_common.records import ScalerNote
-from rhi_mock_engine.app import Settings, create_app
 
 
 def _note(asked: int, at: int) -> ScalerNote:
@@ -49,90 +48,6 @@ def test_an_instance_stopped_before_the_scaler_asked_is_not_the_departure(monkey
     departure = asyncio.run(run.departure(2, 1))
     assert (departure.instance, departure.path) == ("idle-node", s7.Path.TERMINATED)
     assert departure.seconds == s7.leave_seconds(1000, 1030.0)
-
-
-class _Frames(httpx.AsyncBaseTransport):
-    """Runs the mock to its end, its pacing moving the clock, then hands the client each part of
-    its answer as the moment it was written."""
-
-    def __init__(self, app: Any, clock: list[float]) -> None:
-        self.app, self.clock = app, clock
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        body = await request.aread()
-        frames: list[tuple[float, bytes]] = []
-        start: list[Any] = []
-        received = False
-
-        async def receive() -> dict[str, Any]:
-            nonlocal received
-            if not received:
-                received = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            await asyncio.Event().wait()
-            return {"type": "http.disconnect"}
-
-        async def send(message: Any) -> None:
-            if message["type"] == "http.response.start":
-                start.append(message)
-            elif message.get("body"):
-                frames.append((self.clock[0], message["body"]))
-
-        scope = {
-            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": request.method,
-            "headers": [(name.lower(), value) for name, value in request.headers.raw], "scheme": "http",
-            "path": request.url.path, "raw_path": request.url.raw_path, "query_string": request.url.query,
-            "server": ("gateway", 80), "client": ("127.0.0.1", 1), "root_path": "",
-        }  # fmt: skip
-        await self.app(scope, receive, send)
-        clock = self.clock
-
-        class Parts(httpx.AsyncByteStream):
-            async def __aiter__(self) -> Any:
-                for moment, data in frames:
-                    clock[0] = max(clock[0], moment)
-                    yield data
-
-        return httpx.Response(start[0]["status"], headers=start[0].get("headers", []), stream=Parts())
-
-
-def test_the_scale_in_relay_holds_one_mock_response_open_across_the_decision(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [999.75]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-    key = generate_key()
-
-    async def pace(seconds: float) -> None:
-        clock[0] += seconds
-
-    real_sleep = asyncio.sleep
-
-    async def sleep(seconds: float) -> None:
-        clock[0] += seconds
-        await real_sleep(0)
-
-    monkeypatch.setattr(s7.asyncio, "sleep", sleep)
-    # The mock writes its whole turn in under half a second; the scaler's run began at 1000, and the
-    # job read its note at 1005; the instance last wrote at 1030, so stopped by 1045.
-    gone = s7.Departure(s7.Path.TERMINATED, 45.0, "idle-node", 1000.0, 1045.0, 1005.0, 1030.0)
-    sent: list[float] = []
-
-    def over() -> bool:
-        if not run.leaving and clock[0] >= 1045.0 + s7.QUIET_SECONDS:
-            run.leaving.append(gone)
-        return bool(run.leaving)
-
-    def counted(app: Any) -> Any:
-        async def gateway(scope: Any, receive: Any, send: Any) -> None:
-            sent.append(clock[0])
-            await app(scope, receive, send)
-
-        return gateway
-
-    transport = _Frames(counted(create_app(Settings(secret=key), sleep=pace)), clock)
-    run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=transport)  # ty: ignore[invalid-argument-type] - a double
-    assert asyncio.run(run.relay(over)) is True
-    # One response, begun before the decision, was held open until the scale-in was over.
-    assert sent == [999.75]
 
 
 def test_a_connection_that_never_opened_is_not_a_cut_stream(monkeypatch: pytest.MonkeyPatch) -> None:
