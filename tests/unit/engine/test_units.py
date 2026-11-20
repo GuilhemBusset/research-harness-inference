@@ -28,6 +28,8 @@ from rhi_mock_engine import app
 ENGINE_FOLDER = Path(__file__).resolve().parents[3] / "services/engine"
 NAMES = ("rhi-engine", "rhi-collector", "rhi-lifecycle")
 TEXTS = {name: (ENGINE_FOLDER / "units" / f"{name}.service").read_text(encoding="utf-8") for name in NAMES}
+# The units of a GPU instance only, which the boot program installs on no other.
+GPU_DROP_IN = ENGINE_FOLDER / "units/gpu/rhi-engine.service.d/gpu.conf"
 
 SETTINGS = "/run/rhi/release.env"
 ARCHITECTURES = ("arm64", "aarch64", "amd64", "x86_64")
@@ -37,8 +39,14 @@ PINNED = re.compile(r"[^\s@:]+(?::[^\s@:]+)?@sha256:[0-9a-f]{64}", re.ASCII)
 RELEASE_IMAGE = "$RHI_ENGINE_IMAGE"
 
 # The options of `docker run` that take a value, and those that take none. Any other fails a test.
-VALUED = {"--name", "--network", "--pid", "--user", "--env", "--env-file", "--volume", "--workdir", "--entrypoint"}
+VALUED = {
+    "--name", "--network", "--pid", "--user", "--env", "--env-file", "--volume", "--workdir", "--entrypoint",
+    "--runtime", "--gpus",
+}  # fmt: skip
 FLAGS = {"--rm", "--interactive", "--privileged"}
+# Where the engine's start command places the options of a drop-in, and where it reads its flags.
+DROP_IN_OPTIONS = "${options[@]}"
+ENGINE_FLAGS = "/run/rhi/engine-flags"
 
 REGION, SECRET_ID = "eu-west-3", "/rhi/pools/mock/bearer"
 IMAGE = "registry.example.com/rhi/engine@sha256:" + "0" * 64
@@ -119,7 +127,9 @@ def run_of(command: list[str]) -> Container:
 def container(text: str) -> Container:
     """The container a unit starts. The engine's `docker run` ends a shell script."""
     start = words(read(text)["Service"]["ExecStart"][0])
-    return run_of(shlex.split(start[2]) if start[0] == "/bin/bash" else start)
+    if start[0] != "/bin/bash":
+        return run_of(start)
+    return run_of([word for word in shlex.split(start[2]) if word != DROP_IN_OPTIONS])
 
 
 def moving_images(text: str) -> list[str]:
@@ -132,6 +142,13 @@ def architectures_named(text: str) -> list[str]:
     return [name for name in ARCHITECTURES if name in text.lower()]
 
 
+def drop_in_variables(text: str) -> dict[str, str]:
+    """The variables a drop-in sets with Environment=, as systemd reads them: quotes group the
+    words of an assignment, and a dollar sign is itself."""
+    assignments = [word for line in read(text)["Service"]["Environment"] for word in shlex.split(line)]
+    return dict(assignment.split("=", 1) for assignment in assignments)
+
+
 class Host:
     """A folder of stand-ins for the host's `aws` and `docker`, and what they are told to answer."""
 
@@ -142,17 +159,35 @@ class Host:
         for name, text in (("aws", AWS), ("docker", DOCKER)):
             (self.bin / name).write_text(text.format(python=sys.executable), encoding="utf-8")
             (self.bin / name).chmod(0o755)
+        # The engine's flags, as the boot program writes those of a release that has none.
+        self.flags = self.state / "engine-flags"
+        self.flags.write_text("", encoding="utf-8")
+        # The start command of the engine's unit, which names the file of its flags last.
+        *start, flags = words(read(TEXTS["rhi-engine"])["Service"]["ExecStart"][0])
+        assert flags == ENGINE_FLAGS
+        self.start = [*start, str(self.flags)]
 
-    def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
-        """Run a command of a unit, with the variables of release.env that the engine's unit reads."""
+    def run(self, command: list[str], drop_in: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        """Run a command of a unit, with the variables of release.env that the engine's unit reads
+        and those a drop-in sets."""
         environment = {
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "RHI_TEST_STATE": str(self.state),
             "RHI_REGION": REGION,
             "RHI_SECRET_ID": SECRET_ID,
             "RHI_ENGINE_IMAGE": IMAGE,
+            **(drop_in or {}),
         }
         return subprocess.run(command, env=environment, capture_output=True, text=True, timeout=60, check=False)
+
+    def started(self, drop_in: dict[str, str] | None = None) -> Container:
+        """The container the engine's unit starts, on a host that holds the secret and the image."""
+        (self.state / "secret").write_text(secrets.token_urlsafe(36), encoding="utf-8")
+        (self.state / "image-command").write_text("engine\nserve\n", encoding="utf-8")
+        ran = self.run(self.start, drop_in)
+        assert ran.returncode == 0, ran.stderr
+        given = json.loads((self.state / "run.json").read_text(encoding="utf-8"))
+        return run_of(["docker", *given["arguments"]])
 
 
 @pytest.fixture
@@ -239,11 +274,15 @@ def test_images_are_pinned() -> None:
 
 
 def test_no_architecture_is_named() -> None:
-    for name in NAMES:
-        assert architectures_named(TEXTS[name]) == [], name
+    # Every file of the folder, with those of a GPU instance.
+    files = [path for path in (ENGINE_FOLDER / "units").rglob("*") if path.is_file()]
+    assert {GPU_DROP_IN, *(ENGINE_FOLDER / "units" / f"{name}.service" for name in NAMES)} <= set(files)
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert architectures_named(text) == [], path.name
         # Each of the four names is found, in any case, wherever a unit would hold it.
         for architecture in ARCHITECTURES:
-            assert architectures_named(f"{TEXTS[name]}# --platform linux/{architecture.upper()}\n") == [architecture]
+            assert architectures_named(f"{text}# --platform linux/{architecture.upper()}\n") == [architecture]
 
 
 def test_the_engine_finds_the_secret_in_its_environment_and_docker_is_never_given_it(host: Host) -> None:
@@ -254,7 +293,7 @@ def test_the_engine_finds_the_secret_in_its_environment_and_docker_is_never_give
     # The image's command: its entry point, then its command, a word on each line.
     (host.state / "image-command").write_text(f"{printenv}\nRHI_POOL_SECRET\n", encoding="utf-8")
 
-    started = host.run(words(read(TEXTS["rhi-engine"])["Service"]["ExecStart"][0]))
+    started = host.run(host.start)
 
     assert started.returncode == 0, started.stderr
     asked = json.loads((host.state / "aws.json").read_text(encoding="utf-8"))
@@ -285,7 +324,7 @@ def test_the_engine_finds_the_secret_in_its_environment_and_docker_is_never_give
 
 
 def test_the_engine_does_not_start_without_the_secret_or_the_image(host: Host) -> None:
-    start = words(read(TEXTS["rhi-engine"])["Service"]["ExecStart"][0])
+    start = host.start
     true = shutil.which("true")
     assert true is not None
     (host.state / "image-command").write_text(f"{true}\n", encoding="utf-8")
@@ -304,6 +343,50 @@ def test_the_engine_does_not_start_without_the_secret_or_the_image(host: Host) -
     (host.state / "image-command").unlink()
     assert host.run(start).returncode != 0
     assert not (host.state / "run.json").exists()
+
+
+def test_the_engine_is_given_the_releases_flags_after_the_images_command(host: Host) -> None:
+    flags = ["--served-model-name", "a name of four words", "--max-model-len=65536"]
+    host.flags.write_text("".join(flag + "\n" for flag in flags), encoding="utf-8")
+    # In order, each one argument, after the image's own command.
+    assert host.started().command[2:] == ["rhi-engine", "engine", "serve", *flags]
+    # A release with no flag: the image's command alone.
+    host.flags.write_text("", encoding="utf-8")
+    assert host.started().command[2:] == ["rhi-engine", "engine", "serve"]
+    # The boot program wrote no flags: no container is run.
+    host.flags.unlink()
+    (host.state / "run.json").unlink()
+    assert host.run(host.start).returncode != 0
+    assert not (host.state / "run.json").exists()
+
+
+def test_the_engine_starts_as_before_without_a_drop_in_and_with_the_options_of_one(host: Host) -> None:
+    alone = host.started()
+    # The options the unit names, and the image's command.
+    assert alone.options == container(TEXTS["rhi-engine"]).options
+    assert (alone.image, alone.command[2:]) == (IMAGE, ["rhi-engine", "engine", "serve"])
+
+    # A drop-in sets one variable. The start shell reads its words: quotes group, and a variable
+    # of release.env is given its value.
+    more = host.started({"RHI_ENGINE_OPTIONS": '--workdir /srv --env "EXAMPLE=the region is $RHI_REGION"'})
+    added = {"--workdir": ["/srv"], "--env": [f"EXAMPLE=the region is {REGION}"]}
+    assert more.options == {name: alone.options.get(name, []) + added.get(name, []) for name in alone.options | added}
+    assert (more.image, more.command) == (alone.image, alone.command)
+
+
+def test_the_gpu_drop_in_adds_the_nvidia_runtime_every_gpu_and_the_region(host: Host) -> None:
+    text = GPU_DROP_IN.read_text(encoding="utf-8")
+    # It sets the one variable of the unit's options, and restates no key of the unit.
+    assert {section: set(keys) for section, keys in read(text).items()} == {"Service": {"Environment"}}
+    variables = drop_in_variables(text)
+    assert set(variables) == {"RHI_ENGINE_OPTIONS"}
+
+    alone, gpu = host.started(), host.started(variables)
+
+    # AWS_REGION has the value of RHI_REGION, not its name. Every other option is the unit's, once.
+    added = {"--runtime": ["nvidia"], "--gpus": ["all"], "--env": [f"AWS_REGION={REGION}"]}
+    assert gpu.options == {name: alone.options.get(name, []) + added.get(name, []) for name in alone.options | added}
+    assert (gpu.image, gpu.command) == (alone.image, alone.command)
 
 
 def test_dockers_data_and_the_compile_cache_are_on_the_ebs_volume(host: Host, tmp_path: Path) -> None:
