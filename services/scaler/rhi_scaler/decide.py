@@ -4,12 +4,13 @@
 `Inputs.now`. Every rule is therefore tested without AWS, and a run that acts is judged on what
 that run read, which is the re-check "at the moment of acting".
 
-The rules here take a pool from zero, grow it, and take it back:
+The rules here take a pool from zero, grow it, even its load out, and take it back:
 
 | Transition | Rule |
 | --- | --- |
 | 0 to 1 | A held request for a pool in mode `enabled` at zero asks for one instance, however many are held |
 | 1 to n | The instances in service full for 60 seconds, in a pool nobody stopped: one more instance, up to `max_instances`, and none while one asked for is still starting |
+| rebalance | An instance in service that has reported waiting requests for 60 seconds, while another instance in service runs fewer requests than half of `target_concurrency`: the pool's rebalance number goes up by one, at most once every `rebalance_interval_seconds`. The size is what the other rules make it |
 | n to n - 1 | Two instances or more in service and none starting or leaving, the requests in flight at most (n - 1) times half of `target_concurrency` for 10 minutes, 15 minutes after the last scale-out, in a pool nobody stopped: one instance fewer, one that reports nothing running and nothing waiting, and none when no instance does |
 | to 0 | No request received and none in flight or held for `idle_minutes`, in any mode: zero, naming every instance |
 | stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
@@ -26,6 +27,20 @@ instance of the pool has room: fewer requests running than `target_concurrency` 
 in a fresh heartbeat. An instance that waits while another has room is not a reason to grow (the
 rebalance transition moves students to the emptier one), and the time it spends so does not count.
 The 60 seconds are counted in the memory, from one run to the next.
+
+The rebalance rule sets no size: it stands apart from the others, which decide the capacity as
+if it were not there. For each new number the gateway moves a share of the pool's
+students to the emptiest instance (section 5.5), a few at a time: each move costs the instance that
+receives it a prefill. The rule keeps its own count of how long each instance in service has
+reported waiting requests, whether or not another has room: a pool that has just grown is lopsided
+from the first run that sees its new instance in service, since the 60 seconds went by while it
+started. The other instance has room for this rule when its fresh heartbeat reports fewer requests
+running than half of `target_concurrency`, whatever it reports waiting. The number goes up only in
+a run that sees the pool lopsided, and only when the pool's `rebalance_interval_seconds` have
+passed since the run that last raised it, a time the memory keeps. A decision names one reason:
+it is `rebalance` when no other rule gives the run one, and that rule's when one does (the pool
+grows, shrinks, goes to zero, or is kept from growing), in which case the number goes up all the
+same.
 
 A decision that lowers the capacity names the instances whose scale-in protection to lift: the
 ones released by a stop, the one a scale-in removes, and every instance of the pool when it goes
@@ -60,6 +75,8 @@ from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs,
 STOPPED_MODES = frozenset({Mode.DISABLED, Mode.BUDGET_LATCHED})
 # How long the instances in service must have been full before the pool grows.
 SCALE_OUT_SECONDS = 60
+# How long an instance must have reported waiting requests before the pool is lopsided.
+REBALANCE_WAITING_SECONDS = 60
 # How long the load must have fit in one instance fewer before the pool shrinks.
 LOW_LOAD_SECONDS = 10 * 60
 # How long after the last scale-out the pool may shrink.
@@ -122,6 +139,17 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
     room = any(heartbeat.running < target and not heartbeat.waiting for heartbeat in serving)
     waiting = () if room else sorted({heartbeat.instance for heartbeat in serving if heartbeat.waiting})
     waiting_before = dict(pool.memory.waiting_since)
+    # The rebalance rule's own count: an instance that waits, whether or not another has room.
+    queuing_before = dict(pool.memory.queuing_since)
+    queuing_since = tuple(
+        (name, queuing_before.get(name, now)) for name in sorted({h.instance for h in serving if h.waiting})
+    )
+    # The instances below half of the target, without the division.
+    below_half = {heartbeat.instance for heartbeat in serving if 2 * heartbeat.running < target}
+    # One instance has waited 60 seconds while another, not itself, runs below half of the target.
+    lopsided = any(
+        _lasted(since, REBALANCE_WAITING_SECONDS, now) and below_half - {name} for name, since in queuing_since
+    )
     # A run that sees it for the first time starts the count; the runs after it keep that time.
     above_since = now if pool.memory.above_target_since is None else pool.memory.above_target_since
     n = len(supply.in_service)
@@ -210,6 +238,13 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         desired, lift, reason = n - 1, (unused[0],), Reason.SCALE_IN
         # The next scale-in is judged on the smaller pool: its 10 minutes start again.
         low_load_since = None
+    # The rebalance, whatever the rules above decided: it changes no size. A rule that gave the
+    # run its reason keeps it.
+    rebalance_number, last_rebalance_at = before.rebalance_number, before.last_rebalance_at
+    if lopsided and _older_than(last_rebalance_at, pool.config.rebalance_interval_seconds, now):
+        rebalance_number, last_rebalance_at = rebalance_number + 1, now
+        if reason is Reason.UNCHANGED:
+            reason = Reason.REBALANCE
     if suspended and reason is Reason.UNCHANGED:
         reason = Reason.LAUNCH_SUSPENDED
 
@@ -229,8 +264,12 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
             launch_suspended=suspended,
             suspended_at=suspended_at,
             abandons_counted_from=abandons_counted_from,
+            queuing_since=queuing_since,
+            rebalance_number=rebalance_number,
+            last_rebalance_at=last_rebalance_at,
         ),
         reason=reason,
+        rebalance_number=rebalance_number,
     )
 
 

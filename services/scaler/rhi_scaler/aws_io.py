@@ -50,7 +50,8 @@ history too, whatever came after it.
    suspended for good, so no call here names it.
 
 Then it writes the pool's note (`rhi_common.records.ScalerNote`) and its memory record, on every
-run, whether or not a call was made.
+run, whether or not a call was made. The note carries the decision's rebalance number, raised or
+not, which is how the number reaches the gateway (section 5.5).
 """
 
 from __future__ import annotations
@@ -294,6 +295,9 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
     waiting = item.get("waiting_since") or {}
     if not isinstance(waiting, Mapping):
         raise RecordError("`waiting_since` of the memory record is not a map")
+    queuing = item.get("queuing_since") or {}
+    if not isinstance(queuing, Mapping):
+        raise RecordError("`queuing_since` of the memory record is not a map")
     suspended = item.get(LAUNCH_SUSPENDED, False)
     if not isinstance(suspended, bool):
         raise RecordError(f"`{LAUNCH_SUSPENDED}` of the memory record is not a boolean")
@@ -308,11 +312,16 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
         launch_suspended=suspended,
         suspended_at=_time(item, "suspended_at"),
         abandons_counted_from=_time(item, "abandons_counted_from"),
+        queuing_since=tuple(sorted((str(name), _time(queuing, name) or 0) for name in queuing)),
+        # A record stored before the scaler kept a number holds none.
+        rebalance_number=_time(item, "rebalance_number") or 0,
+        last_rebalance_at=_time(item, "last_rebalance_at"),
     )
 
 
 def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
-    """The memory record of a pool, in plain values; a time that is `None` is left out."""
+    """The memory record of a pool, in plain values; a time that is `None` is left out, and so
+    are the instances that wait when there are none and the rebalance number while it is 0."""
     item: dict[str, Any] = {
         "pool": pool,
         "record": MEMORY_RECORD,
@@ -328,10 +337,15 @@ def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
         "last_gateway_at",
         "suspended_at",
         "abandons_counted_from",
+        "last_rebalance_at",
     ):
         value = getattr(memory, name)
         if value is not None:
             item[name] = value
+    if memory.queuing_since:
+        item["queuing_since"] = dict(memory.queuing_since)
+    if memory.rebalance_number:
+        item["rebalance_number"] = memory.rebalance_number
     return item
 
 
@@ -423,7 +437,11 @@ def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) ->
             clients.autoscaling.resume_processes(AutoScalingGroupName=state.group, ScalingProcesses=[LAUNCH_PROCESS])
 
         note = ScalerNote(
-            pool=pool.pool, capacity_asked=pool.desired, no_capacity_at=state.no_capacity_at, written_at=run.inputs.now
+            pool=pool.pool,
+            capacity_asked=pool.desired,
+            no_capacity_at=state.no_capacity_at,
+            written_at=run.inputs.now,
+            rebalance_number=pool.rebalance_number,
         )
         _put(clients, tables.pool_state, note.to_item())
         _put(clients, tables.pool_state, memory_to_item(pool.pool, pool.memory))
