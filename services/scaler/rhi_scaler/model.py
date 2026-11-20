@@ -61,7 +61,7 @@ class Memory:
     saw two instances or more in service and the requests in flight at most (n - 1) times half of
     `target_concurrency`, and `None` when the last run did not, or when it removed an instance.
 
-    The rest serve the fail-safes (section 5.1). `last_gateway_at` is the time of the last fresh
+    The next four serve the fail-safes (section 5.1). `last_gateway_at` is the time of the last fresh
     gateway heartbeat seen (when it was written), and `None` when no run has seen one: nobody can
     reach the fleet without the gateway, so a pool none has reported on for 10 minutes goes to
     zero. `launch_suspended` is the mark of the launch loop, the attribute
@@ -71,6 +71,13 @@ class Memory:
     `suspended_at` is set is a mark the admin has cleared. `abandons_counted_from` is the time of the
     run that found the mark cleared, and `None` before any did: the edge counts no abandoned launch
     before it, since the group's activity history still holds the ones that set the mark.
+
+    The last three serve the rebalance (sections 5.1 and 5.5). `queuing_since` pairs, in sorted
+    order, each instance in service that reports waiting requests with the time of the first of
+    the runs in a row that saw it so, whether or not another instance has room: unlike
+    `waiting_since`, it goes on while the pool grows. `rebalance_number` is the pool's rebalance
+    number, 0 until a run first raises it. `last_rebalance_at` is the time of the run that last
+    raised it, and `None` when none has.
     """
 
     last_request_at: int | None = None
@@ -83,6 +90,9 @@ class Memory:
     launch_suspended: bool = False
     suspended_at: int | None = None
     abandons_counted_from: int | None = None
+    queuing_since: tuple[tuple[str, int], ...] = ()
+    rebalance_number: int = 0
+    last_rebalance_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +144,10 @@ class Reason(StrEnum):
     # Three launches abandoned in a row: the group's launches are suspended and nothing wakes or
     # grows the pool until the admin clears the mark.
     LAUNCH_SUSPENDED = "launch-suspended"
-    # No rule asks for another size.
+    # An instance has waited for 60 seconds while another runs below half of `target_concurrency`:
+    # the pool's rebalance number goes up by one, in a run where no other rule acts.
+    REBALANCE = "rebalance"
+    # No rule asks for another size, or for another rebalance number.
     UNCHANGED = "unchanged"
 
 
@@ -147,7 +160,9 @@ class PoolDecision:
     lift before the capacity is lowered: Auto Scaling lowers the desired capacity of a group whose
     instances are all protected and terminates none of them. `suspend_launches` is whether the
     group's launches are to be suspended (true) or resumed (false); setting it again changes
-    nothing. `memory` is what to store for the next run.
+    nothing. `memory` is what to store for the next run. `rebalance_number` is the pool's rebalance
+    number, for the pool's note: one more than the memory held in a run that raises it, and the
+    same number in every other run.
     """
 
     pool: str
@@ -156,6 +171,7 @@ class PoolDecision:
     suspend_launches: bool
     memory: Memory
     reason: Reason
+    rebalance_number: int = 0
 
 
 @dataclass(frozen=True)
