@@ -36,12 +36,16 @@ instance with its pool, `rhi-pool`, and with the name of its pool's release para
 (`services/engine/boot/user-data.sh`) reads that tag to find its release, so the user data holds no
 setting.
 
+The group and the launch template themselves carry the pool's name under the tag `rhi-pool` and its
+engine under the tag `rhi-engine`. The pipeline's jobs that work on a pool (the promotion of a
+machine image, the GPU verification) cannot refer to a resource of the stage, so they find a pool's
+group by asking Auto Scaling for these tags.
+
 The mock pool's machine image is the ECS-optimized Amazon Linux 2023 image for arm64, which carries
 Docker: its ID is read from the parameter AWS publishes for it when the stack is deployed, and
-nothing is looked up at synthesis. A GPU pool's image is AWS's base GPU image on Ubuntu, whose ID
-the promotion job writes to a parameter of the owner's account, `/rhi/images/gpu`, after a canary
-start on it passes (section 4.3): it too is read when the stack is deployed, so a merge never
-changes the image, and a stage with a GPU pool deploys once that parameter exists.
+nothing is looked up at synthesis. A GPU pool, a pool whose engine is not mock, takes its image
+from its own parameter of the owner's account (`rhi.pools.image`): it too is read when the stack is
+deployed, so a merge never changes the image.
 
 The custom resource may suspend processes only of a group tagged with its pool: Auto Scaling puts an
 identifier it chooses at creation before the group's name in the group's ARN, so the ARN is named by
@@ -60,6 +64,8 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import custom_resources as cr
 from constructs import Construct
 
+from rhi.pools import image
+
 if TYPE_CHECKING:
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 
@@ -72,6 +78,9 @@ USER_DATA = Path(__file__).resolve().parents[3] / "services" / "engine" / "boot"
 POOL_TAG = "rhi-pool"
 RELEASE_PARAMETER_TAG = "rhi-release-parameter"
 
+# The tag that holds the pool's engine, beside `POOL_TAG`, on the group and on the launch template.
+ENGINE_TAG = "rhi-engine"
+
 
 def release_parameter(pool: str) -> str:
     """The name of a pool's release parameter, which the pipeline writes (issue E2-42)."""
@@ -83,20 +92,15 @@ def release_parameter(pool: str) -> str:
 MOCK_IMAGE_PARAMETER = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 MOCK_ROOT_DEVICE = "/dev/xvda"
 
-# The parameter of the owner's account that the promotion job writes with the GPU image's ID, and
-# the root device of that image (an Ubuntu image).
-GPU_IMAGE_PARAMETER = "/rhi/images/gpu"
-GPU_ROOT_DEVICE = "/dev/sda1"
-
 # The process that replaces instances in service to even out the zones.
 REBALANCING = "AZRebalance"
 
 
 def machine_image(pool: Pool) -> tuple[ec2.IMachineImage, str]:
     """The pool's machine image, resolved when the stack is deployed, and the image's root device."""
-    if pool.engine == "mock":
-        return ec2.MachineImage.from_ssm_parameter(MOCK_IMAGE_PARAMETER), MOCK_ROOT_DEVICE
-    return ec2.MachineImage.from_ssm_parameter(GPU_IMAGE_PARAMETER), GPU_ROOT_DEVICE
+    if image.is_gpu_pool(pool):
+        return image.gpu_image(pool.name), image.ROOT_DEVICE
+    return ec2.MachineImage.from_ssm_parameter(MOCK_IMAGE_PARAMETER), MOCK_ROOT_DEVICE
 
 
 class PoolGroup(Construct):
@@ -116,11 +120,11 @@ class PoolGroup(Construct):
         time_zone: str,
     ) -> None:
         super().__init__(scope, construct_id)
-        image, root_device = machine_image(pool)
+        pool_image, root_device = machine_image(pool)
         self.launch_template = ec2.LaunchTemplate(
             self,
             "LaunchTemplate",
-            machine_image=image,
+            machine_image=pool_image,
             user_data=ec2.UserData.custom(USER_DATA.read_text(encoding="utf-8")),
             security_group=security_group,
             # Through an instance profile the launch template makes for it.
@@ -141,6 +145,7 @@ class PoolGroup(Construct):
         )
         # On the template, and through its tag specifications on each instance and its volume.
         cdk.Tags.of(self.launch_template).add(POOL_TAG, pool.name)
+        cdk.Tags.of(self.launch_template).add(ENGINE_TAG, pool.engine)
         cdk.Tags.of(self.launch_template).add(RELEASE_PARAMETER_TAG, release_parameter(pool.name))
 
         self.group = autoscaling.CfnAutoScalingGroup(
@@ -169,11 +174,11 @@ class PoolGroup(Construct):
                     on_demand_percentage_above_base_capacity=100,
                 ),
             ),
-            # The template's tags reach the instances; the group's tag says which pool it is.
+            # The template's tags reach the instances; the group's tags say which pool it is, and
+            # which engine it runs.
             tags=[
-                autoscaling.CfnAutoScalingGroup.TagPropertyProperty(
-                    key=POOL_TAG, value=pool.name, propagate_at_launch=False
-                )
+                autoscaling.CfnAutoScalingGroup.TagPropertyProperty(key=key, value=value, propagate_at_launch=False)
+                for key, value in ((POOL_TAG, pool.name), (ENGINE_TAG, pool.engine))
             ],
         )
 

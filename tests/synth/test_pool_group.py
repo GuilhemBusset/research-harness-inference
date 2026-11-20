@@ -182,9 +182,9 @@ def test_no_warm_pool_at_zero(app_module: ModuleType) -> None:
 def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(
     app_module: ModuleType, tmp_path: Path
 ) -> None:
-    """A pool of any name, and a GPU pool, each get a group: the app passes cdk-nag, the GPU image
-    is read at deployment from the parameter the promotion job writes, and each custom resource
-    suspends processes only of its own pool's group."""
+    """A pool of any name, and a GPU pool, each get a group: the app passes cdk-nag, and each
+    custom resource suspends processes only of its own pool's group. Where the GPU pool's image
+    comes from is checked in test_pool_image.py."""
     gpu = dataclasses.replace(
         MOCK,
         name="coursework",
@@ -212,11 +212,6 @@ def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(
         "coursework",
         "second",
     ]
-    images = [
-        template["Parameters"][launch["LaunchTemplateData"]["ImageId"]["Ref"]]
-        for launch in of_type(template, "AWS::EC2::LaunchTemplate").values()
-    ]
-    assert sorted(image["Default"] for image in images) == sorted([IMAGE_PARAMETER, "/rhi/images/gpu"])
     conditions = [
         statement["Condition"]
         for policy in of_type(template, "AWS::IAM::Policy").values()
