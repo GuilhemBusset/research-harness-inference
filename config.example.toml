@@ -142,6 +142,17 @@ retry_after_concurrency_limit_seconds = 5
 #                                      about one student in ten.
 #   rebalance_interval_seconds = 60    the least time between two rebalance numbers, of at least 1
 #                                      second. Left out, it is 60.
+#
+# A pool may choose whose cached prefixes its requests reuse (sections 4.7 and 6.6), which the pool
+# here leaves out. The gateway gives every request a cache salt, and the engine reuses a prefix
+# only under the salt it was computed for.
+#   cache_salt_scope = "student"       a salt for each student: a prefix is reused only by the
+#                                      student who sent it, so no student can find out whether
+#                                      another has sent a given text. Left out, it is "student".
+#   cache_salt_scope = "class"         one salt for the pool, derived from its name: students share
+#                                      whatever part of their opening is identical, so a class that
+#                                      starts together does not queue behind its own openings. One
+#                                      student can then test whether another has sent a given text.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]

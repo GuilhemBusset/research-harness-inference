@@ -257,6 +257,42 @@ def test_shared_rewrites() -> None:
     assert refused(lambda: forwarded(message({"type": "image_url", "image_url": deep})))
 
 
+def test_the_salt_scope() -> None:
+    entry = {**MOCK, "context_length": 8192, "largest_output": 1024}
+    table = {
+        "left-out": entry,
+        "per-student": {**entry, "cache_salt_scope": "student"},
+        "shared": {**entry, "cache_salt_scope": "class"},
+        "shared-2": {**entry, "cache_salt_scope": "class"},
+    }
+    body_filter = BodyFilter(ALLOW_LIST, parse_pools(table))
+
+    def salt(pool: str, student: str, body_filter: BodyFilter = body_filter) -> str:
+        # Whatever the client sent: the salt is the gateway's on either scope.
+        return forwarded({"model": pool, "cache_salt": "chosen by the client"}, body_filter, student)["cache_salt"]
+
+    # A pool that leaves the scope out gives each student their own salt, as one that says `student`.
+    first, second = salt("left-out", "student-1"), salt("left-out", "student-2")
+    assert first != second
+    assert (salt("per-student", "student-1"), salt("per-student", "student-2")) == (first, second)
+    # They are the salts of a pool written before the field: the scope moved no student's cache.
+    assert first == forwarded({"model": "coursework"})["cache_salt"]
+
+    # A pool whose scope is `class` gives both students one salt, which holds neither's identity:
+    # it is no student's own salt, and names no student.
+    shared = salt("shared", "student-1")
+    assert shared == salt("shared", "student-2")
+    assert shared not in (first, second)
+    assert "student-1" not in shared and "student-2" not in shared
+    assert 1 <= len(shared) <= 1024  # what the engine accepts
+
+    # It comes from the pool's name alone: a filter built apart, as another gateway task builds
+    # its own, gives the same salt, and a class pool of another name gives another.
+    apart = BodyFilter(ALLOW_LIST, parse_pools({"shared": table["shared"]}))
+    assert salt("shared", "student-3", apart) == shared
+    assert salt("shared-2", "student-1") not in (shared, first)
+
+
 def test_the_profile_step_sees_the_filtered_body() -> None:
     seen: list[dict[str, Any]] = []
 

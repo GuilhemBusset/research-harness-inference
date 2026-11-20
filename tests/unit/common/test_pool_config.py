@@ -194,6 +194,11 @@ def test_optional_fields() -> None:
             )
             for value in values
         ),
+        # A cache salt is a student's or the class's: the scope is one of the two words, as text.
+        *(
+            pytest.param("coursework", {"cache_salt_scope": scope}, "cache_salt_scope", id=f"salt-scope-{scope!r}")
+            for scope in ("team", "Class", "", True)
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -381,6 +386,20 @@ def test_every_pool_has_the_three_settings_of_student_affinity() -> None:
     assert affinity(COURSEWORK, stickiness_seconds=1, rebalance_share=0, rebalance_interval_seconds=1) == (1, 0, 1)
     assert affinity(COURSEWORK, stickiness_seconds=604800, rebalance_share=1)[:2] == (604800, 1)
     # Outside them a setting is refused, by the pool's name and the field: `test_refusals`.
+
+
+def test_a_pools_cache_salt_scope_is_student_unless_it_says_class() -> None:
+    # Left out, as in every entry written before the field: a salt for each student.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert pool.cache_salt_scope == "student"
+
+    for scope in ("student", "class"):
+        (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"cache_salt_scope": scope})})
+        assert pool.cache_salt_scope == scope
+        # The entry the deployment writes for the gateway reads back the same.
+        assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+    # Any other scope, such as `team`, is refused by the pool's name and the field: `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A

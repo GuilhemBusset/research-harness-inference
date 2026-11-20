@@ -71,6 +71,16 @@ section 17:
 - `rebalance_interval_seconds`, the least time between two rebalance numbers, of at least 1
   second. Left out, it is 60.
 
+A pool may give `cache_salt_scope`, whose cached prefixes a request on the pool may reuse (sections
+4.7, 6.2 and 6.6): the gateway writes a cache salt into every request, and the engine reuses a
+prefix only under the salt it was computed for.
+
+- `student`: a salt for each student. A prefix is reused only by the student who sent it, so no
+  student can find out whether another has sent a given text. Left out, the field is `student`.
+- `class`: one salt for the pool, the same for every student. A class that starts together shares
+  whatever part of its opening is identical, and one student can then test whether another has sent
+  a given text.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -105,6 +115,11 @@ DEFAULT_REBALANCE_INTERVAL_SECONDS = 60
 LONGEST_STICKINESS_SECONDS = 7 * 24 * 3600
 # Dollars an hour: a pool with an instance type priced above it may not wake on demand (11.3, 17).
 DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
+
+# Whose cached prefixes a request may reuse: its student's alone, or those of the pool's whole
+# class (sections 4.7 and 6.6). A pool that gives no scope has the first.
+CACHE_SALT_SCOPES = ("student", "class")
+DEFAULT_CACHE_SALT_SCOPE = "student"
 
 # The keys of `expected`, each a low and a high bound (section 4.7).
 EXPECTED_KEYS = ("stream_tokens_per_second", "time_to_first_token_seconds", "cache_tokens")
@@ -228,6 +243,8 @@ class Pool:
     rebalance_share: float
     # The least time between two rebalance numbers.
     rebalance_interval_seconds: int
+    # Whose cached prefixes a request on the pool may reuse: `student` or `class` (section 4.7).
+    cache_salt_scope: str
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -518,6 +535,11 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         rebalance_share=_rebalance_share(name, entry),
         rebalance_interval_seconds=_whole(
             name, entry, "rebalance_interval_seconds", least=1, default=DEFAULT_REBALANCE_INTERVAL_SECONDS
+        ),
+        cache_salt_scope=(
+            _choice(name, entry, "cache_salt_scope", CACHE_SALT_SCOPES)
+            if "cache_salt_scope" in entry
+            else DEFAULT_CACHE_SALT_SCOPE
         ),
     )
 
