@@ -1,0 +1,26 @@
+# The fields the DCGM exporter of a GPU instance exports (rhi-dcgm.service gives it this file),
+# one for each quantity of the GPU row of the system design, "Observability". The names and the
+# units are those of exporter 4.9.0, from its own etc/default-counters.csv at that tag: a 4.8
+# exporter still exports the old ones. VERSION, beside this file, records the exporter's version.
+#
+# The exporter's format. A line that starts with # is a comment.
+# DCGM field, Prometheus metric type, help text
+
+# Utilization of compute and of memory bandwidth: the share of the sample period in which a
+# kernel ran, and the share in which the GPU's memory was read or written.
+DCGM_FI_DEV_GPU_UTIL_RATIO, gauge, GPU utilization as a ratio.
+DCGM_FI_DEV_MEMORY_UTIL_RATIO, gauge, Memory utilization as a ratio.
+
+# Memory
+DCGM_FI_DEV_FB_USED_BYTES, gauge, Used framebuffer memory in bytes.
+DCGM_FI_DEV_FB_CAPACITY_BYTES, gauge, Total framebuffer capacity in bytes.
+
+# Temperature
+DCGM_FI_DEV_GPU_TEMP_CELSIUS, gauge, GPU temperature (in C).
+
+# Power, and energy: the counter that tokens per joule are computed from.
+DCGM_FI_DEV_BOARD_POWER_WATTS, gauge, Power draw (in W).
+DCGM_FI_DEV_GPU_ENERGY_JOULES_TOTAL, counter, GPU energy consumed since the driver was reloaded in joules.
+
+# Xid errors
+DCGM_FI_DEV_XID_ERROR, gauge, Value of the last XID error encountered.

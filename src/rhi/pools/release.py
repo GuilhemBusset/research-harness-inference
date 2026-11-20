@@ -19,7 +19,8 @@ digest, which only the registry knows: a custom resource reads it for the asset'
 stack is deployed.
 
 **The files.** One tar archive, in the layout the boot program unpacks: `units/` (the unit files of
-`services/engine/units/`), `collector/config.yaml` (the node's collector configuration) and
+`services/engine/units/`), `collector/config.yaml` (the node's collector configuration),
+`dcgm/counters.csv` (the fields of the DCGM exporter, which a GPU instance's unit reads) and
 `agent/` (the lifecycle agent: `rhi_common`, `rhi_lifecycle` and the libraries of the lifecycle
 group at their locked versions, in the layout of a function's bundle, built without Docker). The
 libraries are pure Python, so the one archive serves both processor architectures, and the Python
@@ -129,6 +130,7 @@ ENGINES = {
 # What the archive holds beside the agent, under the repository.
 UNITS = "services/engine/units"
 COLLECTOR_CONFIG = "services/engine/collector/config.yaml"
+DCGM_FIELDS = "services/engine/dcgm/counters.csv"
 # One modification time for every entry: 1 January 1980, the earliest every archive tool reads.
 ARCHIVE_TIME = 315532800
 # Left out of the archive: Python's bytecode cache, and what the installer records about its own
@@ -193,6 +195,8 @@ def build_archive(into: Path, *, repo: Path = packaging.REPO, libraries: bool = 
         shutil.copytree(repo / UNITS, root / "units")
         (root / "collector").mkdir()
         shutil.copyfile(repo / COLLECTOR_CONFIG, root / "collector" / "config.yaml")
+        (root / "dcgm").mkdir()
+        shutil.copyfile(repo / DCGM_FIELDS, root / "dcgm" / "counters.csv")
         agent = root / "agent"
         agent.mkdir()
         if libraries:

@@ -60,7 +60,7 @@ PARAMETER = "/rhi/pools/mock/release"
 REFRESH = "Custom::RhiInstanceRefresh"
 UNITS = {"rhi-collector.service", "rhi-engine.service", "rhi-lifecycle.service"}
 # The units of a GPU instance only, in a folder of their own, which the boot program installs on no other.
-GPU_UNITS = {"gpu/rhi-engine.service.d/gpu.conf"}
+GPU_UNITS = {"gpu/rhi-engine.service.d/gpu.conf", "gpu/rhi-dcgm.service", "gpu/rhi-collector.service.d/dcgm.conf"}
 # What the sources of a release are, for a copy of them: the lock, the services and their images.
 SOURCES = ("pyproject.toml", "uv.lock", "services/common", "services/engine")
 
@@ -359,12 +359,14 @@ def test_the_archive_holds_the_units_the_collector_configuration_and_the_agent(m
     files = {name for name, member in found.items() if member.isfile()}
     assert {name for name in files if name.startswith("units/")} == {f"units/{unit}" for unit in UNITS | GPU_UNITS}
     assert {name for name in files if name.startswith("collector/")} == {"collector/config.yaml"}
+    # The fields of the DCGM exporter, where its unit mounts them from.
+    assert {name for name in files if name.startswith("dcgm/")} == {"dcgm/counters.csv"}
     # The agent: the two packages, as `python -m rhi_lifecycle` finds them in its working directory.
     for package in (REPO / "services/common/rhi_common", REPO / "services/engine/lifecycle/rhi_lifecycle"):
         sources = {p.relative_to(package.parent).as_posix() for p in package.rglob("*.py")}
         assert sources and {f"agent/{source}" for source in sources} <= files
     assert "agent/rhi_lifecycle/__main__.py" in files
-    assert {name.split("/")[0] for name in found} == {"units", "collector", "agent"}
+    assert {name.split("/")[0] for name in found} == {"units", "collector", "dcgm", "agent"}
     assert not [name for name in found if "__pycache__" in name]
     # A file of the archive is the repository's, byte for byte.
     with tarfile.open(mock.archive) as tar:

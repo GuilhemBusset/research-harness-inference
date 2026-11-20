@@ -3,10 +3,15 @@
 # It is the only way an instance's numbers and lines leave it: the engine's metrics route is on
 # localhost only.
 #
-# Metrics: the engine at port 8000, the lifecycle agent at port 9110 and the host, pushed to the
-# Prometheus workspace with signed remote write. Every series carries the labels pool, instance
-# (the instance's ID, in place of the scrape address) and instance_type, because the engine labels
-# its series with the model's name only, and the dashboards take rates per instance.
+# Metrics: the engine at port 8000, the lifecycle agent at port 9110, the DCGM exporter at port
+# 9400 and the host, pushed to the Prometheus workspace with signed remote write. Every series
+# carries the labels pool, instance (the instance's ID, in place of the scrape address),
+# instance_type and zone (the instance's availability zone), because the engine labels its series
+# with the model's name only, and the dashboards take rates per instance. A zone's name is a
+# region and a letter: it identifies no account.
+#
+# The file is the same on every pool. Only a GPU instance runs the DCGM exporter (rhi-dcgm): on
+# the others nothing listens at its port, and all its scrape gives is that the target is down.
 #
 # Logs: the journal of the instance's units and of no other, written to the pool's log group, one
 # stream per instance. A line is shipped as it was written, with the name of the unit that wrote
@@ -20,8 +25,8 @@
 # - the directory /var/lib/rhi-collector (StateDirectory=rhi-collector), where the place reached in
 #   the journal is kept, so that a line is shipped once across restarts of the collector and of the
 #   instance.
-# The instance's ID and type come from the instance metadata, which the collector reads with a
-# session token (IMDSv2). A collector that cannot read them does not start: it never pushes a
+# The instance's ID, type and zone come from the instance metadata, which the collector reads with
+# a session token (IMDSv2). A collector that cannot read them does not start: it never pushes a
 # series under the scrape address, which is the same on every instance.
 #
 # The component names and options are those of collector release 0.165.0, and
@@ -47,6 +52,10 @@ receivers:
           scrape_interval: 15s
           static_configs:
             - targets: ["127.0.0.1:9110"]
+        - job_name: dcgm
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:9400"]
   host_metrics:
     collection_interval: 15s
     scrapers:
@@ -91,10 +100,10 @@ processors:
     detectors: [ec2]
     fail_on_missing_metadata: true
     ec2:
-      # The instance's ID (host.id) and type (host.type), and nothing else.
+      # The instance's ID (host.id), type (host.type) and availability zone
+      # (cloud.availability_zone), and nothing else.
       resource_attributes:
         cloud.account.id: {enabled: false}
-        cloud.availability_zone: {enabled: false}
         cloud.platform: {enabled: false}
         cloud.provider: {enabled: false}
         cloud.region: {enabled: false}
@@ -109,6 +118,9 @@ processors:
       - key: instance_type
         from_attribute: host.type
         action: upsert
+      - key: zone
+        from_attribute: cloud.availability_zone
+        action: upsert
       - key: pool
         value: ${env:RHI_POOL}
         action: upsert
@@ -122,7 +134,7 @@ exporters:
     # A series is named by its metric and its labels, not by the collector's version.
     disable_scope_info: true
     resource_constant_labels:
-      included: [pool, instance_type]
+      included: [pool, instance_type, zone]
   awscloudwatchlogs:
     region: ${env:RHI_REGION}
     log_group_name: ${env:RHI_LOG_GROUP}
