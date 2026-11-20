@@ -28,6 +28,26 @@ holds (section 4.4; evidence E28). That is off for every pool that does not ask:
 is a reviewed exception, and records why in `trust_remote_code_reason`, without which it is
 refused. Left out, the first is false and the second is None.
 
+A pool served by vLLM may give its serving settings, which its release carries into the engine's
+flags (sections 4.2 and 4.3; `rhi.pools.vllm_command`). Each is optional, and left out it leaves
+the engine as vLLM runs by itself:
+
+- `tool_call_parser` and `reasoning_parser`, vLLM's names for the parsers of the model's tool
+  calls and of its reasoning. Left out, each is None: no parser.
+- `kv_cache_bits`, the precision of the engine's cache, 8 or 16 bits (section 4.7). Left out, it
+  is 16, vLLM's own for the coursework model.
+- `prefix_caching`, whether the engine keeps what it computed for a transcript (sections 4.7 and
+  5.5). Left out, it is true, vLLM's own default.
+- `step_budget_tokens`, the most tokens the engine computes in one step (section 4.7). Left out,
+  it is None: vLLM's own budget.
+- `histogram_buckets`, the boundaries, in seconds, of the bucket families of `BUCKET_FAMILIES`
+  (section 7.2): a table that holds any of the three, each a list of increasing numbers above 0.
+  Left out, it is None, and a family left out of it is None: vLLM's own boundaries.
+- `draft_head_tokens`, which turns the model's draft head on and is the number of tokens it
+  proposes (section 4.7). Left out, it is None: no draft head.
+
+The mock engine reads none of them.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -39,6 +59,7 @@ because it came before the first pool reached the deployed configuration.
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 from collections.abc import Mapping
@@ -58,11 +79,21 @@ DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
 # The keys of `expected`, each a low and a high bound (section 4.7).
 EXPECTED_KEYS = ("stream_tokens_per_second", "time_to_first_token_seconds", "cache_tokens")
 
+# The precisions of the engine's cache, in bits, and the one of a pool that gives none (4.7).
+KV_CACHE_BITS = (8, 16)
+DEFAULT_KV_CACHE_BITS = 16
+# The keys of `histogram_buckets`: vLLM's names for the bucket families of the three times the
+# dashboards read (section 7.2; evidence E3).
+BUCKET_FAMILIES = ("request_latency", "time_to_first_token", "inter_token_latency")
+
 # Students choose a pool by model name, and Claude Code requires a served name without a slash
 # (section 4.2): the pool's name is that model name.
 _NAME = re.compile(r"[a-z0-9-]+", re.ASCII)
 # A commit of the model repository, in full: a branch or a tag would move under a deployed pool.
 _COMMIT = re.compile(r"[0-9a-f]{40}", re.ASCII)
+# A parser's name, which becomes an argument of the engine: it starts with a letter or a digit, so
+# the engine never reads it as an option.
+_PARSER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 
 
 class PoolConfigError(ValueError):
@@ -88,6 +119,17 @@ class ExpectedValues:
     time_to_first_token_seconds: tuple[float, float] | None
     # Tokens of cache.
     cache_tokens: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
+class HistogramBuckets:
+    """The boundaries a pool gives a bucket family, in seconds and increasing, or None for vLLM's own."""
+
+    # The whole request, and each of its phases.
+    request_latency: tuple[float, ...] | None
+    time_to_first_token: tuple[float, ...] | None
+    # The time between two tokens of a stream.
+    inter_token_latency: tuple[float, ...] | None
 
 
 @dataclass(frozen=True)
@@ -128,6 +170,19 @@ class Pool:
     # section 4.4, recorded with the pool. A pool that sets the first gives the second.
     trust_remote_code: bool
     trust_remote_code_reason: str | None
+    # The serving settings of a vllm pool, each as vLLM runs by itself when the pool leaves it out
+    # (sections 4.2 and 4.7). vLLM's names for the two parsers, or None for no parser.
+    tool_call_parser: str | None
+    reasoning_parser: str | None
+    # The precision of the engine's cache, in bits: 8 or 16.
+    kv_cache_bits: int
+    prefix_caching: bool
+    # The most tokens of one engine step, or None for vLLM's own budget.
+    step_budget_tokens: int | None
+    # None when the pool replaces no family's boundaries (section 7.2).
+    histogram_buckets: HistogramBuckets | None
+    # The tokens the model's draft head proposes, or None when the head is off.
+    draft_head_tokens: int | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -244,6 +299,61 @@ def _trust_remote_code(pool: str, entry: Mapping[str, object]) -> tuple[bool, st
     return trusted, reason
 
 
+def _parser(pool: str, entry: Mapping[str, object], field: str) -> str | None:
+    """The name of a parser, or None when the pool names none."""
+    if field not in entry:
+        return None
+    if _PARSER.fullmatch(_text(pool, entry, field)) is None:
+        raise PoolConfigError(
+            pool, field, "must be a parser's name: letters, digits, '_', '.' and '-', and no '-' or '.' first"
+        )
+    return str(entry[field])
+
+
+def _kv_cache_bits(pool: str, entry: Mapping[str, object]) -> int:
+    value = entry.get("kv_cache_bits", DEFAULT_KV_CACHE_BITS)
+    # True is 1 to Python and 8.0 is 8: neither is a number of bits to whoever wrote the entry.
+    if type(value) is not int or value not in KV_CACHE_BITS:
+        raise PoolConfigError(pool, "kv_cache_bits", "must be 8 or 16")
+    return value
+
+
+def _prefix_caching(pool: str, entry: Mapping[str, object]) -> bool:
+    value = entry.get("prefix_caching", True)
+    if not isinstance(value, bool):
+        raise PoolConfigError(pool, "prefix_caching", "must be true or false")
+    return value
+
+
+def _boundaries(pool: str, value: object) -> tuple[float, ...]:
+    """The boundaries of one bucket family, as vLLM accepts them: numbers above 0, each above the last."""
+    field = "histogram_buckets"
+    if not isinstance(value, (list, tuple)) or not value:
+        raise PoolConfigError(pool, field, "must give each family a list of boundaries that is not empty")
+    boundaries: list[float] = []
+    for item in value:
+        boundary = _number(item)
+        if boundary is None or boundary <= 0:
+            raise PoolConfigError(pool, field, "must hold numbers above 0, in seconds")
+        boundaries.append(boundary)
+    if any(low >= high for low, high in itertools.pairwise(boundaries)):
+        raise PoolConfigError(pool, field, "must give each family's boundaries in increasing order")
+    return tuple(boundaries)
+
+
+def _histogram_buckets(pool: str, entry: Mapping[str, object]) -> HistogramBuckets | None:
+    field = "histogram_buckets"
+    if field not in entry:
+        return None
+    value = entry[field]
+    if not isinstance(value, Mapping):
+        raise PoolConfigError(pool, field, f"must be a table of: {', '.join(BUCKET_FAMILIES)}")
+    if any(family not in BUCKET_FAMILIES for family in value):
+        raise PoolConfigError(pool, field, f"may only hold: {', '.join(BUCKET_FAMILIES)}")
+    given = {family: _boundaries(pool, value[family]) if family in value else None for family in BUCKET_FAMILIES}
+    return HistogramBuckets(**given)
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -302,6 +412,17 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         expected=_expected(name, entry),
         trust_remote_code=trust_remote_code,
         trust_remote_code_reason=trust_remote_code_reason,
+        tool_call_parser=_parser(name, entry, "tool_call_parser"),
+        reasoning_parser=_parser(name, entry, "reasoning_parser"),
+        kv_cache_bits=_kv_cache_bits(name, entry),
+        prefix_caching=_prefix_caching(name, entry),
+        step_budget_tokens=(
+            _whole(name, entry, "step_budget_tokens", least=1) if "step_budget_tokens" in entry else None
+        ),
+        histogram_buckets=_histogram_buckets(name, entry),
+        draft_head_tokens=(
+            _whole(name, entry, "draft_head_tokens", least=1) if "draft_head_tokens" in entry else None
+        ),
     )
 
 

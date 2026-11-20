@@ -93,6 +93,29 @@ retry_after_concurrency_limit_seconds = 5
 #                                             holds. Left out, it is false.
 #   trust_remote_code_reason = "<the reason>" why this pool needs it. Left out, there is none, and
 #                                             a pool that sets trust_remote_code without it is refused.
+#
+# A pool served by vLLM may also give its serving settings, which its release carries into the
+# engine's flags (sections 4.2, 4.7 and 7.2). Each is optional: left out, the engine runs as vLLM
+# does by itself. The values shown are examples, not defaults.
+#   tool_call_parser = "qwen3_coder"   vLLM's parser for the model's tool calls, with automatic
+#                                      tool choice. Left out, there is none.
+#   reasoning_parser = "qwen3"         vLLM's parser for the model's reasoning. Left out, there is
+#                                      none.
+#   kv_cache_bits = 8                  the precision of the engine's cache, 8 or 16 bits. Left out,
+#                                      it is 16, vLLM's own for the coursework model.
+#   prefix_caching = false             whether the engine keeps what it computed for a transcript.
+#                                      Left out, it is true, vLLM's own default.
+#   step_budget_tokens = 8192          the most tokens the engine computes in one step. Left out,
+#                                      it is vLLM's own budget.
+#   draft_head_tokens = 3              turns the model's draft head on, with the number of tokens
+#                                      it proposes. Left out, the draft head is off.
+#   histogram_buckets = { inter_token_latency = [0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05] }
+#                                      the boundaries, in seconds and increasing, of any of vLLM's
+#                                      three bucket families: request_latency, time_to_first_token
+#                                      and inter_token_latency. Left out, or for a family left out,
+#                                      they are vLLM's own.
+# The served context is the pool's context_length, the served model name is the pool's name, and
+# the most requests running at once is its target_concurrency: none has a field of its own.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]
