@@ -42,6 +42,7 @@ RECORDS = [
     *(PoolState(pool="mock", mode=mode, set_by="admin", set_at=NOW) for mode in Mode),
     NOTE,
     ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=NOW),
+    ScalerNote(pool="mock", capacity_asked=2, no_capacity_at=None, written_at=NOW, rebalance_number=7),
 ]
 
 
@@ -78,6 +79,24 @@ def test_item_keys() -> None:
 
 def test_the_modes_are_the_four_of_the_design() -> None:
     assert {mode.value for mode in Mode} == {"enabled", "scheduled-only", "disabled", "budget-latched"}
+
+
+def test_a_note_without_a_rebalance_number_reads_as_0() -> None:
+    # The number is 0 until the scaler first raises it, and the item holds none until then.
+    assert NOTE.rebalance_number == 0
+    stored = NOTE.to_item()
+    assert "rebalance_number" not in stored
+    assert ScalerNote.from_item(stored).rebalance_number == 0
+
+    raised = ScalerNote.from_item({**stored, "rebalance_number": Decimal(3)})
+    assert raised.rebalance_number == 3
+    assert raised.to_item()["rebalance_number"] == 3
+
+
+@pytest.mark.parametrize("number", [Decimal("1.5"), 1.0, "1", True, -1])
+def test_a_rebalance_number_that_is_not_a_whole_number_is_refused(number: object) -> None:
+    with pytest.raises(RecordError):
+        ScalerNote.from_item({**NOTE.to_item(), "rebalance_number": number})
 
 
 @pytest.mark.parametrize("mode", ["parked", "ENABLED", "scheduled_only", "", 1, None])

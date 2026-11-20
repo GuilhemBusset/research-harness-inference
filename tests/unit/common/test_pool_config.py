@@ -112,7 +112,7 @@ def test_optional_fields() -> None:
         pytest.param(
             "coursework", {"hold_seconds_non_streaming": 0}, "hold_seconds_non_streaming", id="other-hold-below-1"
         ),
-        # No field but the four of section 17 has a default: left out, it is refused.
+        # None of these fields has a default: left out, it is refused.
         *(
             pytest.param("coursework", {field: ABSENT}, field, id=f"without-{field}")
             for field in (
@@ -183,6 +183,16 @@ def test_optional_fields() -> None:
                 ("a-value-not-text", {"high": 3}),
                 ("an-empty-value", {"high": ""}),
             )
+        ),
+        # Student affinity: the load balancer's 1 second to 7 days, a share, and a time of 1 second or more.
+        *(
+            pytest.param("coursework", {field: value}, field, id=f"{field}-{value!r}")
+            for field, values in (
+                ("stickiness_seconds", (0, 604801, 3600.0, "3600", True)),
+                ("rebalance_share", (-0.1, 1.5, "0.1", True, float("nan"))),
+                ("rebalance_interval_seconds", (0, 60.0, "60")),
+            )
+            for value in values
         ),
     ],
 )
@@ -347,6 +357,30 @@ def test_a_pools_request_profile_and_effort_mapping_parse_as_written() -> None:
         (pool,) = parse_pools({name: entry})
         assert (pool.request_profile, pool.reasoning_effort) == ((), None)
         assert parse_pools({name: pool_entry(pool)}) == (pool,)
+
+
+AFFINITY = ("stickiness_seconds", "rebalance_share", "rebalance_interval_seconds")
+
+
+def affinity(entry: Mapping[str, object], **changes: object) -> tuple[object, ...]:
+    """The three settings of student affinity that the entry, with the changes, parses to."""
+    (pool,) = parse_pools({"pool": changed(entry, changes)})
+    # The entry the deployment writes for the gateway and the scaler reads back the same.
+    assert parse_pools({"pool": pool_entry(pool)}) == (pool,)
+    return tuple(getattr(pool, field) for field in AFFINITY)
+
+
+def test_every_pool_has_the_three_settings_of_student_affinity() -> None:
+    # Left out, as in every entry written before the fields: the defaults of section 17.
+    for entry in (COURSEWORK, MOCK, FIRST_DEPLOYED_MOCK):
+        assert affinity(entry) == (3600, 0.1, 60)
+
+    given = {"stickiness_seconds": 900, "rebalance_share": 0.25, "rebalance_interval_seconds": 120}
+    assert affinity(COURSEWORK, **given) == (900, 0.25, 120)
+    # The limits themselves are accepted: 1 second and 7 days, no student and every student.
+    assert affinity(COURSEWORK, stickiness_seconds=1, rebalance_share=0, rebalance_interval_seconds=1) == (1, 0, 1)
+    assert affinity(COURSEWORK, stickiness_seconds=604800, rebalance_share=1)[:2] == (604800, 1)
+    # Outside them a setting is refused, by the pool's name and the field: `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A
