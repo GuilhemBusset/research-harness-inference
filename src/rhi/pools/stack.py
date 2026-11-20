@@ -1,9 +1,9 @@
-"""The pools stack: the pools' state and heartbeats, the internal load balancer, the groups, the
-scaler that sizes them, the releases their instances run and the lifecycle hooks their instances
-complete (system design, sections 2, 4.2, 4.3 and 5).
+"""The pools stack: the pools' state and heartbeats, the model bucket, the internal load balancer,
+the groups, the scaler that sizes them, the releases their instances run and the lifecycle hooks
+their instances complete (system design, sections 2, 4.2, 4.3, 4.4 and 5).
 
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
-reference it back. The stack and the logical IDs of its tables are recorded in
+reference it back. The stack and the logical IDs of its tables and of its bucket are recorded in
 `tests/policy/stateful_logical_ids.json`: moving a table to another stack replaces it.
 
 The stack declares two outputs, which the pipeline's verification takes as inputs
@@ -23,8 +23,10 @@ from typing import TYPE_CHECKING
 import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 
+from rhi.pools import image
 from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
+from rhi.pools.model_store import ModelStore
 from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
@@ -57,8 +59,10 @@ def release_parameters_text(parameters: Mapping[str, str]) -> str:
 
 class PoolsStack(cdk.Stack):
     """Holds the pool-state and heartbeat tables, which the stack's later constructs take from
-    `tables` (`tables.pool_state`, `tables.heartbeats`), the internal load balancer with one
-    target group per pool, which they take from `routing` (`routing.target_groups[name]`), each
+    `tables` (`tables.pool_state`, `tables.heartbeats`), the model bucket, from `model_store`
+    (`model_store.bucket`), which each GPU pool's instance role reads under its own pool's prefix,
+    the internal load balancer with one target group per pool, which they take from `routing`
+    (`routing.target_groups[name]`), each
     pool's instance role and log group, from `roles[name]` (`roles[name].role`, which later issues
     grant what their resources need), each pool's bearer secret, from `secrets[name]`
     (`secrets[name].secret`, whose `secrets[name].grant_read(grantee)` lets another construct of the
@@ -93,6 +97,9 @@ class PoolsStack(cdk.Stack):
             description="The name of the heartbeats table.",
             value=self.tables.heartbeats.table_name,
         )
+        # The pools' weights, read through the network's S3 gateway endpoint and no other way. The
+        # stage holds the one bucket whatever its pools: a pool's weights outlive the pool.
+        self.model_store = ModelStore(self, "ModelStore", endpoint=network.s3_endpoint)
         # With the pools table empty, the listener and its default 404, and no target group.
         self.routing = Routing(
             self,
@@ -101,12 +108,14 @@ class PoolsStack(cdk.Stack):
             security_group=network.security_groups.internal_load_balancer,
             pools=config.pools,
         )
-        # One instance role per pool, with its log group, by the pool's name.
+        # One instance role per pool, with its log group, by the pool's name. A GPU pool's role
+        # reads its own pool's weights; the mock pool has none.
         self.roles = {
             pool.name: PoolRole(
                 self,
                 f"Role-{pool.name}",
                 pool=pool.name,
+                reads_weights=image.is_gpu_pool(pool),
                 heartbeats=self.tables.heartbeats,
                 workspace=observability.prometheus,
             )

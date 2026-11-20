@@ -18,7 +18,12 @@ what exists when the role does:
   so that another stack can name it without a reference to this one;
 - completing the lifecycle actions of the pool's own group and recording their heartbeats. Auto
   Scaling puts an identifier it chooses at creation in a group's ARN, so the ARN is named by
-  pattern and the group's tag `rhi-pool` narrows it to the pool's group.
+  pattern and the group's tag `rhi-pool` narrows it to the pool's group;
+- for a GPU pool, reading its weights in the model bucket (section 4.4): the objects under its
+  own pool's prefix, and the listing of that prefix, which is how the engine's loader finds the
+  files of a revision. The bucket is named by its fixed name (`rhi.pools.model_store`), so the
+  statement reads the same to an invariant in any stack. The mock pool has no weights, and its
+  role nothing on the bucket. No instance role writes there: the copy job's role alone does.
 
 The role is tagged with its pool, which `tests/policy/test_instance_role.py` reads: an instance
 role may read no parameter and no secret other than its own pool's.
@@ -34,6 +39,7 @@ from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from rhi.observability import prometheus
+from rhi.pools import model_store
 from rhi.pools.group import POOL_TAG
 
 if TYPE_CHECKING:
@@ -53,6 +59,9 @@ SESSION_ACTIONS = (
 HEARTBEAT_ACTIONS = ("dynamodb:PutItem", "dynamodb:UpdateItem")
 LOG_ACTIONS = ("logs:CreateLogStream", "logs:PutLogEvents")
 LIFECYCLE_ACTIONS = ("autoscaling:CompleteLifecycleAction", "autoscaling:RecordLifecycleActionHeartbeat")
+# Reading a pool's weights: its objects, and the listing of its prefix.
+WEIGHTS_READ_ACTION = "s3:GetObject"
+WEIGHTS_LIST_ACTION = "s3:ListBucket"
 
 LOG_RETENTION = logs.RetentionDays.ONE_MONTH
 
@@ -64,7 +73,8 @@ def log_group_name(pool: str) -> str:
 
 class PoolRole(Construct):
     """One pool's instance role, as `role`, its session policy, as `session_policy`, and the log
-    group of its instances, as `log_group`."""
+    group of its instances, as `log_group`. With `reads_weights`, which a GPU pool's role is given,
+    the role reads its pool's prefix of the model bucket."""
 
     def __init__(
         self,
@@ -74,6 +84,7 @@ class PoolRole(Construct):
         pool: str,
         heartbeats: dynamodb.ITable,
         workspace: PrometheusWorkspace,
+        reads_weights: bool = False,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -124,6 +135,18 @@ class PoolRole(Construct):
                 conditions={"StringEquals": {f"autoscaling:ResourceTag/{POOL_TAG}": pool}},
             )
         )
+        if reads_weights:
+            self.role.add_to_policy(
+                iam.PolicyStatement(actions=[WEIGHTS_READ_ACTION], resources=[model_store.objects_arn(stack, pool)])
+            )
+            self.role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=[WEIGHTS_LIST_ACTION],
+                    resources=[model_store.bucket_arn(stack)],
+                    # A listing names the whole bucket: the condition keeps it to the pool's prefix.
+                    conditions={"StringLike": {"s3:prefix": f"{model_store.pool_prefix(pool)}*"}},
+                )
+            )
 
         self.session_policy = iam.Policy(
             self,

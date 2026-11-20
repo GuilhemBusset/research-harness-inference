@@ -26,8 +26,8 @@ ZONES = 3
 
 
 class Network(Construct):
-    """A VPC over three zones: a public and a private subnet in each, one NAT gateway, and a
-    gateway endpoint for S3 on the private subnets' route tables."""
+    """A VPC over three zones, as `vpc`: a public and a private subnet in each, one NAT gateway,
+    and a gateway endpoint for S3 on the private subnets' route tables, as `s3_endpoint`."""
 
     def __init__(self, scope: Construct, construct_id: str, *, availability_zones: Sequence[str]) -> None:
         super().__init__(scope, construct_id)
@@ -48,10 +48,11 @@ class Network(Construct):
                 # Tasks and instances: no public address, outbound calls through the NAT gateway.
                 ec2.SubnetConfiguration(name="Private", subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS, cidr_mask=20),
             ],
-            gateway_endpoints={
-                "S3": ec2.GatewayVpcEndpointOptions(
-                    service=ec2.GatewayVpcEndpointAwsService.S3,
-                    subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)],
-                )
-            },
+        )
+        # The endpoint instances read weights through. The model bucket's policy names it
+        # (`rhi.pools.model_store`).
+        self.s3_endpoint = self.vpc.add_gateway_endpoint(
+            "S3",
+            service=ec2.GatewayVpcEndpointAwsService.S3,
+            subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)],
         )

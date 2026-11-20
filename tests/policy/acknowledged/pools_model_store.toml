@@ -1,0 +1,16 @@
+# What the roles of `src/rhi/pools/model_store.py` may do, each action on each resource, with its
+# reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The module creates no role, and its bucket's policy allows nothing to anyone. That policy holds
+# two refusals: of every request that does not use TLS, and of s3:GetObject and
+# s3:GetObjectVersion on every object by a request that does not come through the VPC's S3 gateway
+# endpoint. Who reads the bucket is said by the reader's own policy: each GPU pool's instance role
+# (`pools_role.toml`), under its own pool's prefix. Who writes it is the copy job's role alone,
+# listed in the file of the module that creates it.
+#
+# cdk-nag's other findings on a bucket are fixed in the module: public access is blocked
+# (AwsSolutions-S2) and requests must use TLS (AwsSolutions-S10).
+
+[nag]
+"AwsSolutions-S1" = "The bucket keeps no server access log: it holds copies of published model weights, only the copy job's role writes them, an object is read only through the VPC's endpoint, and an access log would add a second bucket that nothing in the design reads."
