@@ -36,14 +36,13 @@
 # cdk-nag names a finding after the resource it found, so the finding of a pool's prefix holds the
 # pool's name, and no file of the repository names the pools of a deployed configuration. The entry
 # whose key holds `<pool>` lists that finding for each pool of the configuration, and for no other
-# name (`src/rhi/nag.py`). The example's pools, mock and coursework, keep their entries under their
-# own names beside it, with the same reason: `test_nag_acknowledgements.py` holds the example's
-# templates to the ids as cdk-nag writes them.
+# name (`src/rhi/nag.py`). The example's pool keeps its entry under its own name beside it, with
+# the same reason: `test_nag_acknowledgements.py` holds the example's templates to the ids as
+# cdk-nag writes them.
 
 [nag]
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/mock/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/coursework/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/<pool>/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants the five actions of Session Manager only on every resource, and the session policy holds those five actions alone."
 
