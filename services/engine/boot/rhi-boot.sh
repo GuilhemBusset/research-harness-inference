@@ -5,8 +5,13 @@
 # The instance's tag rhi-release-parameter names the pool's release parameter. The tag and the
 # region come from the instance metadata, read with a session token. Everything else comes from
 # the parameter: the bucket, the key and the SHA-256 digest of the release's archive, the engine
-# image, and the settings, which every unit reads from /run/rhi/release.env. The archive holds
-# units/, collector/config.yaml and agent/.
+# image, the settings, which every unit reads from /run/rhi/release.env, and the engine's flags,
+# which the engine's unit reads from /run/rhi/engine-flags. The archive holds units/,
+# collector/config.yaml and agent/.
+#
+# The units of units/gpu/ are for an instance that has an NVIDIA GPU, and are installed on no
+# other. The PCI bus says which it is, whether or not the driver has finished loading: a device
+# whose vendor file under /sys/bus/pci/devices reads 0x10de, NVIDIA's vendor ID.
 #
 # Nothing of the archive is unpacked, installed or started unless its bytes have the digest the
 # parameter names. Whatever fails, the program ends with a failure before it starts a unit.
@@ -24,6 +29,7 @@ metadata="${RHI_BOOT_METADATA:-http://169.254.169.254}"
 release="$root/opt/rhi/release"
 units="$root/run/systemd/system"
 settings="$root/run/rhi/release.env"
+flags="$root/run/rhi/engine-flags"
 
 fail() {
   echo "rhi-boot: $1" >&2
@@ -53,7 +59,8 @@ aws ssm get-parameter --region "$region" --name "$parameter" --output json >"$wo
   || fail "the release parameter cannot be read"
 
 # The parameter's value is JSON (services/engine/lifecycle/rhi_lifecycle/release.py gives its
-# keys). This writes the settings, one NAME=value line each, and where the archive is.
+# keys). This writes the settings, one NAME=value line each, the engine's flags, an argument on
+# each line, and where the archive is.
 python3 -I - "$work" "$region" "$parameter" <<'PY' || fail "the release parameter does not hold a release"
 import json
 import os
@@ -88,6 +95,10 @@ try:
         if isinstance(measured, bool) or not isinstance(measured, int) or measured < 1:
             raise ValueError("measured_start_seconds")
         variables.append(("RHI_MEASURED_START", str(measured)))
+    flags = release["engine_flags"]
+    # An argument is one line of its file: a string with no control character. It may be empty.
+    if not isinstance(flags, list) or not all(isinstance(flag, str) and flag.isprintable() for flag in flags):
+        raise ValueError("engine_flags")
     archive = [text(files[name], "files." + name) for name in ("bucket", "key", "sha256")]
 except (KeyError, TypeError, ValueError) as error:
     # The message names a key or a place in the text, never a value.
@@ -95,6 +106,8 @@ except (KeyError, TypeError, ValueError) as error:
 
 with open(os.path.join(work, "release.env"), "w", encoding="utf-8") as stream:
     stream.writelines(name + "=" + value + "\n" for name, value in variables)
+with open(os.path.join(work, "engine-flags"), "w", encoding="utf-8") as stream:
+    stream.writelines(flag + "\n" for flag in flags)
 with open(os.path.join(work, "archive"), "w", encoding="utf-8") as stream:
     stream.writelines(line + "\n" for line in archive)
 PY
@@ -115,10 +128,19 @@ tar --extract --file "$work/release.tar" --directory "$work/release" --no-same-o
 mv "$work/release" "$release"
 mkdir -p "$units" "${settings%/*}"
 install -m 0644 "$work/release.env" "$settings"
-# The unit files at the top of units/; a subfolder is left to the issue that adds it.
+install -m 0644 "$work/engine-flags" "$flags"
+# The unit files at the top of units/. Of its subfolders only gpu/ is installed, and only on an
+# instance that has an NVIDIA GPU: each file at its own path under systemd's folder, so a
+# drop-in keeps the folder of its unit.
 for unit in "$release/units"/*; do
   if [ -f "$unit" ]; then
     install -m 0644 "$unit" "$units/"
+  fi
+done
+for vendor in "$root/sys/bus/pci/devices"/*/vendor; do
+  if [ -f "$vendor" ] && [ "$(<"$vendor")" = 0x10de ] && [ -d "$release/units/gpu" ]; then
+    cp --recursive "$release/units/gpu/." "$units/"
+    break
   fi
 done
 

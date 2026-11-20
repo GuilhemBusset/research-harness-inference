@@ -59,6 +59,8 @@ GPU = dataclasses.replace(
 PARAMETER = "/rhi/pools/mock/release"
 REFRESH = "Custom::RhiInstanceRefresh"
 UNITS = {"rhi-collector.service", "rhi-engine.service", "rhi-lifecycle.service"}
+# The units of a GPU instance only, in a folder of their own, which the boot program installs on no other.
+GPU_UNITS = {"gpu/rhi-engine.service.d/gpu.conf"}
 # What the sources of a release are, for a copy of them: the lock, the services and their images.
 SOURCES = ("pyproject.toml", "uv.lock", "services/common", "services/engine")
 
@@ -355,7 +357,7 @@ def members(archive: Path) -> dict[str, tarfile.TarInfo]:
 def test_the_archive_holds_the_units_the_collector_configuration_and_the_agent(mock: Release) -> None:
     found = members(mock.archive)
     files = {name for name, member in found.items() if member.isfile()}
-    assert {name for name in files if name.startswith("units/")} == {f"units/{unit}" for unit in UNITS}
+    assert {name for name in files if name.startswith("units/")} == {f"units/{unit}" for unit in UNITS | GPU_UNITS}
     assert {name for name in files if name.startswith("collector/")} == {"collector/config.yaml"}
     # The agent: the two packages, as `python -m rhi_lifecycle` finds them in its working directory.
     for package in (REPO / "services/common/rhi_common", REPO / "services/engine/lifecycle/rhi_lifecycle"):
@@ -931,7 +933,9 @@ def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> 
 
     # The digest the parameter names is the archive's: the program went on to unpack and start it.
     assert (ran.returncode, ran.stderr) == (0, "")
+    # The units of every instance: the folder of the test's root lists no NVIDIA device.
     assert {path.name for path in (root / "run/systemd/system").iterdir()} == UNITS
+    assert (root / "run/rhi/engine-flags").read_text(encoding="utf-8") == ""
     collector = root / "opt/rhi/release/collector/config.yaml"
     assert collector.read_bytes() == (REPO / "services/engine/collector/config.yaml").read_bytes()
     assert (root / "opt/rhi/release/agent/rhi_lifecycle/__main__.py").is_file()

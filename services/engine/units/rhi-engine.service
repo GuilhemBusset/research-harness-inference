@@ -28,6 +28,18 @@
 # container's /var/cache/rhi-engine, which XDG_CACHE_HOME names to the engine. The engine writes
 # there under its image's user, whichever it is.
 #
+# The engine's flags. The boot program writes the release's engine flags to
+# /run/rhi/engine-flags, an argument on each line, and the start command gives them to the
+# container after the image's own command, in order. A release with no flag, the mock pool's,
+# leaves the file empty, and the container starts with the image's command alone. Without the
+# file the engine does not start.
+#
+# More options. A drop-in gives the container more options of `docker run` in RHI_ENGINE_OPTIONS,
+# with Environment=, and restates nothing of this file (gpu/rhi-engine.service.d/gpu.conf).
+# systemd puts no variable's value into an Environment= line, so the start shell reads the words
+# as it reads its own: a variable of release.env that one of them names is given its value
+# there. It reads them first, before it holds the secret. Without a drop-in there are none.
+#
 # A value of systemd's own syntax: $$ is a dollar sign and %% a percent sign, for the shell.
 
 [Unit]
@@ -50,6 +62,9 @@ ExecStartPre=/bin/bash -c ' \
     rhi-engine /var/lib/docker /var/lib/rhi/engine-cache /
 ExecStart=/bin/bash -c ' \
     set -euo pipefail; \
+    eval "options=($${RHI_ENGINE_OPTIONS:-})"; \
+    [ -f "$$2" ] || { echo "rhi-engine: the boot program wrote no engine flags" >&2; exit 1; }; \
+    mapfile -t flags <"$$2"; \
     secret="$$(aws secretsmanager get-secret-value --region "$$RHI_REGION" --secret-id "$$RHI_SECRET_ID" \
         --query SecretString --output text)"; \
     [ -n "$$secret" ] || { echo "rhi-engine: the secret is empty" >&2; exit 1; }; \
@@ -61,14 +76,15 @@ ExecStart=/bin/bash -c ' \
         || { echo "rhi-engine: the engine image is not held, or it names no command" >&2; exit 1; }; \
     exec docker run --rm --name rhi-engine --interactive --network host \
         --volume /var/lib/rhi/engine-cache:/var/cache/rhi-engine \
-        --env XDG_CACHE_HOME=/var/cache/rhi-engine \
-        --entrypoint /bin/sh "$$RHI_ENGINE_IMAGE" -c "$$1" rhi-engine "$${command[@]}" \
+        --env XDG_CACHE_HOME=/var/cache/rhi-engine "$${options[@]}" \
+        --entrypoint /bin/sh "$$RHI_ENGINE_IMAGE" -c "$$1" rhi-engine "$${command[@]}" "$${flags[@]}" \
         < <(printf %%s "$$secret")' \
     rhi-engine \
     'IFS= read -r RHI_POOL_SECRET; \
     [ -n "$$RHI_POOL_SECRET" ] || { echo "rhi-engine: no secret on the standard input" >&2; exit 1; }; \
     export RHI_POOL_SECRET; \
-    exec "$$@"'
+    exec "$$@"' \
+    /run/rhi/engine-flags
 ExecStop=/usr/bin/docker stop rhi-engine
 Restart=on-failure
 RestartSec=5

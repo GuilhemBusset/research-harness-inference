@@ -6,6 +6,10 @@ the instance metadata does and refuses a read that carries no session token, an 
 one region, one parameter and one object, and a `systemctl` that records its calls. `PATH` holds
 those two and the tools the issue allows, so a call to any other program fails the run. Every
 digest and every secret-shaped value below is made at run time.
+
+The engine's flags are followed to the engine's container: the start command of the engine's unit
+runs, with bash, against stand-ins for the host's `aws` and `docker`, with the settings and the
+flags the boot program wrote.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -40,6 +45,7 @@ if TYPE_CHECKING:
 
 BOOT = Path(__file__).resolve().parents[3] / "services/engine/boot"
 USER_DATA, PROGRAM, UNIT = BOOT / "user-data.sh", BOOT / "rhi-boot.sh", BOOT / "rhi-boot.service"
+ENGINE_UNIT = BOOT.parent / "units/rhi-engine.service"
 
 REGION = "eu-west-3"
 PARAMETER = "/rhi/pools/coursework/release"
@@ -50,10 +56,14 @@ MEMBERS = {
     "units/rhi-collector.service": "[Service]\nExecStart=/usr/bin/true the collector\n",
     "units/rhi-lifecycle.service": "[Service]\nExecStart=/usr/bin/true the lifecycle agent\n",
     "units/later/rhi-other.service": "[Service]\nExecStart=/usr/bin/true a later issue\n",
+    "units/gpu/rhi-engine.service.d/gpu.conf": "[Service]\nEnvironment=RHI_ENGINE_OPTIONS=--gpus=all\n",
     "collector/config.yaml": "receivers: {}\n",
     "agent/rhi_lifecycle/__main__.py": "print('the agent')\n",
 }
 TOP_UNITS = {"rhi-collector.service", "rhi-lifecycle.service"}
+GPU_DROP_IN = "rhi-engine.service.d/gpu.conf"
+# The vendor IDs of two PCI devices: NVIDIA's, and Amazon's, which a network adapter has.
+NVIDIA, AMAZON = "0x10de", "0x1d0f"
 
 # The programs of GNU coreutils. With bash, tar, curl and python3 they are all the boot program may call.
 COREUTILS = """[ b2sum base32 base64 basename basenc cat chcon chgrp chmod chown chroot cksum comm cp csplit cut date dd
@@ -98,6 +108,21 @@ case " $* " in
   *" start "*) ls "$RHI_BOOT_ROOT/run/systemd/system" "$RHI_BOOT_ROOT/run/rhi" >"$RHI_TEST_STATE/at-start" 2>&1 ;;
 esac
 exit 0
+"""
+HOST = """#!{python}
+# The host's `aws` and `docker`, for the engine's start: a secret, the command of the image, and
+# a record of what a `docker run` is given.
+import json, os, sys
+call = sys.argv[1:]
+if os.path.basename(sys.argv[0]) == "aws":
+    print(os.environ["RHI_TEST_SECRET"])
+elif call[:2] == ["image", "inspect"]:
+    print("engine\\nserve")
+elif call[0] == "run":
+    with open(os.path.join(os.environ["RHI_TEST_STATE"], "run.json"), "w", encoding="utf-8") as stream:
+        json.dump(call, stream)
+else:
+    sys.exit(1)
 """
 
 
@@ -224,6 +249,38 @@ class Instance:
         top = self.root / folder
         return {path.relative_to(top).as_posix() for path in top.rglob("*") if path.is_file()}
 
+    def pci_device(self, address: str, vendor: str) -> None:
+        """One more device on the PCI bus, as the kernel lists it: a folder with its vendor file."""
+        device = self.root / "sys/bus/pci/devices" / address
+        device.mkdir(parents=True)
+        (device / "vendor").write_text(vendor + "\n", encoding="utf-8")
+
+    def engine_arguments(self) -> list[str]:
+        """What the engine's unit gives the container after the command of its image, which is
+        `engine serve`. The unit's start command runs as systemd runs it, with the settings the
+        boot program wrote and the file the unit names for its flags, both under the root."""
+        unit = ENGINE_UNIT.read_text(encoding="utf-8").replace("\\\n", " ")
+        start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+        # For systemd, `$$` is a dollar sign and `%%` a percent sign.
+        *command, flags = shlex.split(start.removeprefix("ExecStart=").replace("$$", "$").replace("%%", "%"))
+        host = self.state / "host"
+        host.mkdir(exist_ok=True)
+        for name in ("aws", "docker"):
+            (host / name).write_text(HOST.format(python=sys.executable), encoding="utf-8")
+            (host / name).chmod(0o755)
+        settings = (self.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+        environment = {
+            **dict(line.split("=", 1) for line in settings),
+            "PATH": f"{host}{os.pathsep}{self.bin}",
+            "RHI_TEST_STATE": str(self.state),
+            "RHI_TEST_SECRET": secrets.token_urlsafe(36),
+        }
+        subprocess.run([*command, str(self.root / flags.lstrip("/"))], env=environment, timeout=60, check=True)
+        given = json.loads((self.state / "run.json").read_text(encoding="utf-8"))
+        at = given.index("serve", given.index("engine", given.index("--entrypoint")))
+        assert given[at - 1 : at + 1] == ["engine", "serve"]
+        return given[at + 1 :]
+
 
 @pytest.fixture
 def instance(tmp_path: Path) -> Iterator[Instance]:
@@ -274,7 +331,37 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
     # systemd had read the installed units, and the settings were written, before the start.
     commands = [call[0] for call in instance.calls()]
     assert commands.index("daemon-reload") < commands.index("start")
-    assert {*TOP_UNITS, "release.env"} <= set((instance.state / "at-start").read_text(encoding="utf-8").split())
+    at_start = set((instance.state / "at-start").read_text(encoding="utf-8").split())
+    assert {*TOP_UNITS, "release.env", "engine-flags"} <= at_start
+
+
+def test_the_mock_pool_gets_no_gpu_unit(instance: Instance) -> None:
+    # A mock pool's instance: its PCI bus lists a network adapter, and no device of NVIDIA's.
+    instance.pci_device("0000:00:05.0", AMAZON)
+    assert instance.run(PROGRAM).returncode == 0
+    assert instance.files_under("run/systemd/system") == TOP_UNITS
+    assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
+
+    # The same release on a GPU instance, whose bus lists one more device: the drop-in is
+    # installed in the folder of its unit, before systemd reads the units. No other subfolder is.
+    instance.stop()
+    instance.pci_device("0000:00:1e.0", NVIDIA)
+    assert instance.run(PROGRAM).returncode == 0
+    assert instance.files_under("run/systemd/system") == {*TOP_UNITS, GPU_DROP_IN}
+    installed = (instance.root / "run/systemd/system" / GPU_DROP_IN).read_text(encoding="utf-8")
+    assert installed == MEMBERS[f"units/gpu/{GPU_DROP_IN}"]
+    assert GPU_DROP_IN.split("/")[0] in (instance.state / "at-start").read_text(encoding="utf-8").split()
+
+
+def test_the_engine_flags_reach_the_unit(instance: Instance) -> None:
+    three = ["--served-model-name", "a name of four words", "--max-model-len=65536"]
+    for flags in (three, []):
+        instance.value["engine_flags"] = flags
+        instance.publish(json.dumps(instance.value), instance.files)
+
+        assert instance.run(PROGRAM).returncode == 0
+        # In order, each one argument; with none, the command of the image alone.
+        assert instance.engine_arguments() == flags
 
 
 def test_the_tag_and_the_region_are_read_with_a_session_token(instance: Instance) -> None:
@@ -320,6 +407,16 @@ def a_setting_of_two_lines(instance: Instance) -> None:
     instance.publish(json.dumps(instance.value), instance.files)
 
 
+def a_flag_of_two_lines(instance: Instance) -> None:
+    instance.value["engine_flags"] = ["--max-model-len", "65536\n--another"]
+    instance.publish(json.dumps(instance.value), instance.files)
+
+
+def flags_that_are_no_list(instance: Instance) -> None:
+    instance.value["engine_flags"] = "--max-model-len 65536"
+    instance.publish(json.dumps(instance.value), instance.files)
+
+
 def no_archive(instance: Instance) -> None:
     instance.publish(json.dumps(instance.value), None)
 
@@ -333,7 +430,8 @@ def one_byte_changed(instance: Instance) -> None:
 
 
 FAILURES = [
-    no_tag, no_metadata, no_parameter, not_json, no_secret_id, a_setting_of_two_lines, no_archive, one_byte_changed,
+    no_tag, no_metadata, no_parameter, not_json, no_secret_id, a_setting_of_two_lines, a_flag_of_two_lines,
+    flags_that_are_no_list, no_archive, one_byte_changed,
 ]  # fmt: skip
 
 
