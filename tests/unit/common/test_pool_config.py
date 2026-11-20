@@ -7,7 +7,8 @@ from collections.abc import Mapping
 
 import pytest
 
-from rhi_common.pool_config import PoolConfigError, parse_pools
+from rhi.config import pool_entry
+from rhi_common.pool_config import HistogramBuckets, PoolConfigError, parse_pools
 
 # A commit hash made when the test runs: 40 hexadecimal characters that name no real commit.
 REVISION = hashlib.sha1(b"a pinned commit", usedforsecurity=False).hexdigest()
@@ -141,6 +142,29 @@ def test_optional_fields() -> None:
         ),
         pytest.param("coursework", {"trust_remote_code": "true"}, "trust_remote_code", id="trust-as-text"),
         pytest.param("coursework", {"trust_remote_code": 1}, "trust_remote_code", id="trust-as-a-number"),
+        # The engine's cache has 8 or 16 bits, as a number.
+        *(
+            pytest.param("coursework", {"kv_cache_bits": bits}, "kv_cache_bits", id=f"cache-bits-{bits!r}")
+            for bits in (4, 12, 32, "8", True)
+        ),
+        pytest.param("coursework", {"prefix_caching": "false"}, "prefix_caching", id="prefix-caching-as-text"),
+        pytest.param("coursework", {"step_budget_tokens": 0}, "step_budget_tokens", id="step-budget-below-1"),
+        pytest.param("coursework", {"draft_head_tokens": 0}, "draft_head_tokens", id="draft-head-below-1"),
+        pytest.param("coursework", {"draft_head_tokens": True}, "draft_head_tokens", id="draft-head-as-boolean"),
+        pytest.param("coursework", {"tool_call_parser": ""}, "tool_call_parser", id="tool-parser-empty"),
+        # A parser's name becomes an argument of the engine, which must not read it as an option.
+        pytest.param("coursework", {"reasoning_parser": "--an-option"}, "reasoning_parser", id="parser-an-option"),
+        *(
+            pytest.param("coursework", {"histogram_buckets": buckets}, "histogram_buckets", id=f"buckets-{case}")
+            for case, buckets in (
+                ("not-a-table", [0.02, 0.05]),
+                ("another-family", {"request_tokens": [1, 10]}),
+                ("empty", {"inter_token_latency": []}),
+                ("not-increasing", {"inter_token_latency": [0.02, 0.05, 0.05]}),
+                ("not-above-0", {"time_to_first_token": [0, 1]}),
+                ("as-text", {"request_latency": ["1", "5"]}),
+            )
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -241,6 +265,50 @@ def test_trusting_a_model_repositorys_code_is_off_unless_the_pool_records_its_ex
     (explicit,) = parse_pools({"coursework": changed(COURSEWORK, {"trust_remote_code": False})})
     assert (explicit.trust_remote_code, explicit.trust_remote_code_reason) == (False, None)
     # Without its reason the exception is refused, by the pool's name and the field: `test_refusals`.
+
+
+SERVING = {
+    "tool_call_parser": "qwen3_coder",
+    "reasoning_parser": "qwen3",
+    "kv_cache_bits": 8,
+    "prefix_caching": False,
+    "step_budget_tokens": 8192,
+    "histogram_buckets": {
+        "request_latency": [1, 5, 30, 120],
+        "time_to_first_token": [0.5, 1, 2.5, 5],
+        "inter_token_latency": [0.02, 0.03, 0.04, 0.05],
+    },
+    "draft_head_tokens": 3,
+}
+
+
+def test_a_vllm_pools_serving_settings_are_optional_and_default_to_what_vllm_does_by_itself() -> None:
+    (pool,) = parse_pools({"coursework": changed(COURSEWORK, SERVING)})
+    assert (pool.tool_call_parser, pool.reasoning_parser) == ("qwen3_coder", "qwen3")
+    assert (pool.kv_cache_bits, pool.prefix_caching) == (8, False)
+    assert (pool.step_budget_tokens, pool.draft_head_tokens) == (8192, 3)
+    assert pool.histogram_buckets == HistogramBuckets(
+        request_latency=(1, 5, 30, 120),
+        time_to_first_token=(0.5, 1, 2.5, 5),
+        inter_token_latency=(0.02, 0.03, 0.04, 0.05),
+    )
+    # The entry the deployment writes for the gateway and the scaler reads back the same.
+    assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+
+    # Both precisions parse as written, and a family the pool leaves out keeps vLLM's boundaries.
+    partial = {"kv_cache_bits": 16, "prefix_caching": True, "histogram_buckets": {"inter_token_latency": [0.03]}}
+    (pool,) = parse_pools({"coursework": changed(COURSEWORK, partial)})
+    assert (pool.kv_cache_bits, pool.prefix_caching) == (16, True)
+    assert pool.histogram_buckets == HistogramBuckets(None, None, (0.03,))
+
+    # Left out, as in every entry written before the fields: no parser, 16 bits, prefix caching
+    # on, vLLM's own step budget and boundaries, and no draft head.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert (pool.tool_call_parser, pool.reasoning_parser) == (None, None)
+        assert (pool.kv_cache_bits, pool.prefix_caching) == (16, True)
+        assert (pool.step_budget_tokens, pool.histogram_buckets, pool.draft_head_tokens) == (None, None, None)
+    # A precision other than 8 or 16 bits is refused, by the pool's name and the field: `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A

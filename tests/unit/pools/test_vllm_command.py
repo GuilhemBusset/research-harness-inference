@@ -1,6 +1,6 @@
 """The arguments a vllm pool's engine is started with (`rhi.pools.vllm_command`; system design,
-sections 4.1 and 4.4): what the engine contract asks of every vllm pool, and the one exception a
-pool may record.
+sections 4.1, 4.2 and 4.4): what the engine contract asks of every vllm pool, the one exception a
+pool may record, and the serving settings of a pool's release.
 
 The names are vLLM's at version 0.33.0, written here as the contract's table gives them, not read
 from the module. The revision is made when the test runs and names no real commit.
@@ -8,7 +8,9 @@ from the module. The revision is made when the test runs and names no real commi
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -62,6 +64,36 @@ ABSENT = (
 )
 TRUST = "--trust-remote-code"
 
+# The boundaries a pool gives the three bucket families, in seconds (section 7.2).
+BUCKETS = {
+    "request_latency": [1, 2.5, 5, 10, 20, 30, 60, 120, 300, 600, 1800],
+    "time_to_first_token": [0.25, 0.5, 1, 1.5, 2, 3, 5, 7.5, 10, 20, 40, 80],
+    "inter_token_latency": [0.01, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.06, 0.075, 0.1, 0.25, 1],
+}
+# The serving settings of the coursework pool's release (section 4.2). `VLLM` holds its context
+# length and its target concurrency.
+SECTION_4_2: dict[str, object] = {
+    "kv_cache_bits": 8,
+    "prefix_caching": True,
+    "step_budget_tokens": 8192,
+    "tool_call_parser": "qwen3_coder",
+    "reasoning_parser": "qwen3",
+    "histogram_buckets": BUCKETS,
+}
+DRAFT_HEAD: dict[str, object] = {"draft_head_tokens": 3}
+# What a pool's serving settings may add. Left at their defaults, they add none of these.
+BY_SETTING = (
+    "--kv-cache-dtype",
+    "--enable-prefix-caching",
+    "--no-enable-prefix-caching",
+    "--max-num-batched-tokens",
+    "--enable-auto-tool-choice",
+    "--tool-call-parser",
+    "--reasoning-parser",
+    "--custom-histogram-buckets",
+    "--speculative-config",
+)
+
 
 def pool(changes: Mapping[str, object] | None = None, *, name: str = "coursework") -> Pool:
     (parsed,) = parse_pools({name: {**VLLM, **(changes or {})}})
@@ -74,13 +106,19 @@ def options(arguments: list[str]) -> list[str]:
 
 
 def values(arguments: list[str], option: str) -> list[str]:
-    """What follows an option, up to the next one."""
-    (at,) = [index for index, argument in enumerate(arguments) if argument == option]
+    """What an option is given: what follows `=` in its own argument, or what follows it up to the next option."""
+    (at,) = [index for index, argument in enumerate(arguments) if argument.split("=", 1)[0] == option]
+    if arguments[at] != option:
+        return [arguments[at].split("=", 1)[1]]
     following = arguments[at + 1 :]
     return following[: next((i for i, argument in enumerate(following) if argument.startswith("-")), len(following))]
 
 
-@pytest.mark.parametrize("changes", [{}, EXCEPTION], ids=["as-every-pool", "with-the-exception"])
+@pytest.mark.parametrize(
+    "changes",
+    [{}, EXCEPTION, {**SECTION_4_2, **DRAFT_HEAD}],
+    ids=["as-every-pool", "with-the-exception", "with-every-serving-setting"],
+)
 def test_every_vllm_pool_has_the_contracts_settings(changes: dict[str, object]) -> None:
     arguments = vllm_command.arguments(pool(changes), bucket=BUCKET)
     assert all(isinstance(argument, str) and argument for argument in arguments)
@@ -106,7 +144,8 @@ def test_the_model_is_read_from_the_pools_prefix_at_its_revision_by_the_streamer
     other_revision = hashlib.sha1(b"another commit", usedforsecurity=False).hexdigest()
     other = vllm_command.arguments(pool({"revision": other_revision}, name="other-model"), bucket="another-bucket")
     assert other[0] == f"s3://another-bucket/other-model/{other_revision}/"
-    assert other[1:] == arguments[1:]
+    # The served name is the pool's; nothing else follows the pool, its revision or the bucket.
+    assert [a.replace("other-model", "coursework") for a in other[1:]] == arguments[1:]
     # The model repository's name is Hugging Face's, which the engine never calls.
     assert not any("example/model" in argument for argument in arguments)
 
@@ -127,3 +166,87 @@ def test_a_pool_that_is_not_served_by_vllm_has_no_arguments() -> None:
     with pytest.raises(vllm_command.VllmCommandError) as refusal:
         vllm_command.arguments(mock, bucket=BUCKET)
     assert repr("mock") in str(refusal.value)
+
+
+def test_the_serving_settings_of_the_coursework_pool_reach_the_command() -> None:
+    arguments = vllm_command.arguments(pool(SECTION_4_2), bucket=BUCKET)
+    assert values(arguments, "--max-model-len") == ["262144"]
+    assert values(arguments, "--kv-cache-dtype") == ["fp8"]
+    assert values(arguments, "--max-num-seqs") == ["8"]
+    assert values(arguments, "--max-num-batched-tokens") == ["8192"]
+    # vLLM parses tool calls only with automatic tool choice on, and refuses it without a parser.
+    assert values(arguments, "--enable-auto-tool-choice") == []
+    assert values(arguments, "--tool-call-parser") == ["qwen3_coder"]
+    assert values(arguments, "--reasoning-parser") == ["qwen3"]
+    # The engine's cache metrics, a switch.
+    assert values(arguments, "--kv-cache-metrics") == []
+
+    # Prefix caching is on in vLLM unless the command turns it off, which only a pool that asks gets.
+    assert not {"--enable-prefix-caching", "--no-enable-prefix-caching"} & set(options(arguments))
+    off = vllm_command.arguments(pool({**SECTION_4_2, "prefix_caching": False}), bucket=BUCKET)
+    assert off.count("--no-enable-prefix-caching") == 1
+    assert "--enable-prefix-caching" not in off
+
+    # One JSON object, with each family's boundaries as the pool gave them.
+    (written,) = values(arguments, "--custom-histogram-buckets")
+    boundaries = json.loads(written)
+    assert boundaries == BUCKETS
+    # At 20 to 45 tokens a second a token takes 22 to 50 ms, which vLLM's own boundaries split in two.
+    assert len([boundary for boundary in boundaries["inter_token_latency"] if 0.022 < boundary < 0.05]) > 2
+
+
+def test_the_engine_serves_the_model_under_the_pools_name() -> None:
+    # As vLLM declares the option: a list of names, so one value or more.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--served-model-name", nargs="+")
+    # Every name the configuration accepts, and it accepts one that starts with a hyphen or is all hyphens.
+    for name in ("coursework", "upgrade", "-coursework", "--", "-1"):
+        arguments = vllm_command.arguments(pool(SECTION_4_2, name=name), bucket=BUCKET)
+        # The name students choose the pool by, which the gateway forwards: never the model's location.
+        assert values(arguments, "--served-model-name") == [name]
+        # The name reaches vLLM as the option's value, and is not read as another option.
+        served, _ = parser.parse_known_args(arguments)
+        assert served.served_model_name == [name]
+
+
+def test_a_serving_setting_left_at_its_default_adds_no_flag() -> None:
+    plain = vllm_command.arguments(pool(), bucket=BUCKET)
+    assert not set(options(plain)) & set(BY_SETTING)
+    # Every pool has a context length and a target concurrency, and the cache metrics.
+    assert values(plain, "--max-model-len") == ["262144"]
+    assert values(plain, "--max-num-seqs") == ["8"]
+    assert "--kv-cache-metrics" in plain
+    # The defaults, written out, are the defaults.
+    written_out = {"kv_cache_bits": 16, "prefix_caching": True, "histogram_buckets": {}}
+    assert vllm_command.arguments(pool(written_out), bucket=BUCKET) == plain
+
+    # A family the pool leaves out keeps vLLM's boundaries: it is not in the object.
+    one = vllm_command.arguments(pool({"histogram_buckets": {"inter_token_latency": [0.02, 0.03]}}), bucket=BUCKET)
+    assert json.loads(values(one, "--custom-histogram-buckets")[0]) == {"inter_token_latency": [0.02, 0.03]}
+
+
+def test_the_draft_head_is_off_by_default() -> None:
+    for changes in ({}, SECTION_4_2):
+        off = options(vllm_command.arguments(pool(changes), bucket=BUCKET))
+        # Neither the option of vLLM's recipe nor one of vLLM's shorter ways to ask for a draft.
+        assert not [option for option in off if option == "-sc" or option.startswith("--spec")]
+
+    for tokens in (3, 5):
+        on = vllm_command.arguments(pool({**SECTION_4_2, "draft_head_tokens": tokens}), bucket=BUCKET)
+        # As vLLM's recipe for the model writes it, with the pool's number of tokens.
+        (written,) = values(on, "--speculative-config")
+        assert json.loads(written) == {"method": "mtp", "num_speculative_tokens": tokens}
+        assert [option for option in options(on) if option == "-sc" or option.startswith("--spec")] == [
+            "--speculative-config"
+        ]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, SECTION_4_2, {**SECTION_4_2, **DRAFT_HEAD}, {"prefix_caching": False}, EXCEPTION],
+    ids=["plain", "section-4-2", "draft-head-on", "prefix-caching-off", "with-the-exception"],
+)
+def test_no_effort_mapping_in_the_engine(changes: dict[str, object]) -> None:
+    # The gateway's request profile maps reasoning effort (section 6.2): the engine never does.
+    arguments = vllm_command.arguments(pool(changes), bucket=BUCKET)
+    assert not [argument for argument in arguments if "reasoning-effort" in argument.replace("_", "-")]
