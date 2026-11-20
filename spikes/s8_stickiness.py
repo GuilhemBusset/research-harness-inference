@@ -18,7 +18,8 @@ alone moves it (section 5.1).
    service is in the workspace too. The scaler adds the second once the load is above target for 60
    seconds, and an instance writes, and answers its launch's warm-up, before its launch completes and
    it enters service. It records how many zones the two are in, by the label `zone` the node's
-   collector adds to every series. Then it stops the load and waits until the workspace shows
+   collector adds to every series; an instance whose series has no zone label is not a zone, and
+   the load is held until both have one. Then it stops the load and waits until the workspace shows
    nothing running or waiting on the pool.
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
@@ -68,8 +69,10 @@ when it reached the instance that served the first, as each answer's usage repor
 requests are then given to the two students in the ways that agree with this: a student that
 kept its first's instance has its first on an instance its window reached; one that did not, when
 its window reached a single instance, has it on another. A student whose window reached two
-instances is split wherever its first was. Counts that no way agrees with, or that two ways agree
-with and give the students different counts, are measured again.
+instances is split wherever its first was. The firsts are given only when their window counts one
+request per student and each student's window counts exactly the requests it sent: a miscount in
+one window is never made up by another. Counts with a miscount, that no way agrees with, or that two
+ways agree with and give the students different counts, are measured again.
 
 **The rebalance number.** For each new rebalance number the gateway drops about one student in ten
 of its cookies (section 5.5), which would move a student for a reason that is not the one measured.
@@ -255,14 +258,17 @@ class Counts:
 
     sent: int
     served: Mapping[str, int] = field(default_factory=dict)
+    # False when some of the student's requests could not be given an instance (`with_openings`).
+    accounted: bool = True
 
     @property
     def most_served(self) -> int:
         return max(self.served.values(), default=0)
 
     def adds_up(self) -> bool:
-        """Whether the instances served exactly the student's requests: no other request came in its window."""
-        return sum(self.served.values()) == self.sent
+        """Whether the instances served exactly the student's requests: each of them was given an
+        instance, and no other request came in its window."""
+        return self.accounted and sum(self.served.values()) == self.sent
 
 
 type PhaseCounts = Mapping[int, Counts]
@@ -298,34 +304,33 @@ def with_openings(openings: Mapping[str, int], counts: PhaseCounts, kept: Mappin
     requests, sent at once, by instance, and `kept` says for each student whether its next request
     reached the instance that served its first (`kept_opening`).
 
-    The firsts are given to the students in the ways that agree with what each student's window
-    shows (`_agrees`). They are placed only when every such way gives each student the same counts.
-    When none does, when two give different counts (the evidence does not say which student's first
-    an instance served), or when the window of the firsts holds another request, none is placed:
-    the counts then do not add up to the requests sent, and the phase is measured again."""
+    The firsts are placed only when the window of the firsts counts exactly one request per student
+    and each student's own window counts exactly the requests it sent. They are then given to the
+    students in the ways that agree with what each student's window shows (`_agrees`), and placed
+    only when every such way gives each student the same counts. Otherwise (a window with a request
+    too many or too few, no way that agrees, or two that give different counts, so the evidence does
+    not say which student's first an instance served) none is placed: every student's counts are
+    marked as not accounted for (`Counts.accounted`), they do not add up, and the phase is measured
+    again. A miscount in one window is never made up by one in another."""
     left = Counter({instance: count for instance, count in openings.items() if count > 0})
     ways: list[PhaseCounts] = []
-    if left.total() == len(counts):
+    if left.total() == len(counts) and all(held.adds_up() for held in counts.values()):
         for order in dict.fromkeys(itertools.permutations(left.elements())):
             if all(
                 _agrees(place, counts[student], kept[student]) for student, place in zip(counts, order, strict=True)
             ):
-                ways.append(_placed(counts, dict(zip(counts, order, strict=True)), Counter()))
+                ways.append(_placed(counts, dict(zip(counts, order, strict=True))))
     if ways and all(way == ways[0] for way in ways):
         return ways[0]
-    return _placed(counts, {}, left)
+    return {student: Counts(held.sent + 1, dict(held.served), accounted=False) for student, held in counts.items()}
 
 
-def _placed(counts: PhaseCounts, placed: Mapping[int, str], unplaced: Counter[str]) -> PhaseCounts:
-    """Each student's counts with its first request: on the instance `placed` gives it, and the
-    firsts that are `unplaced` with the first student's, where they cannot add up."""
+def _placed(counts: PhaseCounts, placed: Mapping[int, str]) -> PhaseCounts:
+    """Each student's counts with its first request on the instance `placed` gives it."""
     result: dict[int, Counts] = {}
-    for position, (student, held) in enumerate(counts.items()):
+    for student, held in counts.items():
         served = Counter(held.served)
-        if student in placed:
-            served[placed[student]] += 1
-        if position == 0:
-            served.update(+unplaced)
+        served[placed[student]] += 1
         result[student] = Counts(held.sent + 1, dict(served))
     return result
 
@@ -425,15 +430,17 @@ class Pool:
     def _read(self, query: str, start: float, end: float, step: float) -> list[common.Series]:
         return self.workspace.read_series(query, start=start, end=end, step=step)
 
-    def serving(self) -> dict[str, str]:
-        """The instances that streamed an answer in the last minutes, each with its zone: those whose
-        count of token gaps rose. The lifecycle agent's completions, at launch and every minute
-        after, are whole answers, with no gap."""
+    def serving(self) -> dict[str, str | None]:
+        """The instances that streamed an answer in the last minutes, each with its zone label, `None`
+        when its series has none: those whose count of token gaps rose. The lifecycle agent's
+        completions, at launch and every minute after, are whole answers, with no gap."""
         end = time.time()
         series = self._read(f'{_GAPS}{{pool="{self.name}"}}', end - 2 * FRESH_SECONDS, end, FRESH_SECONDS)
         rising = served_between(series, end - 2 * FRESH_SECONDS, end)
         return {
-            one.labels["instance"]: one.labels.get("zone", "") for one in series if rising.get(one.labels["instance"])
+            one.labels["instance"]: one.labels.get("zone") or None
+            for one in series
+            if rising.get(one.labels["instance"])
         }
 
     def in_service(self) -> int | None:
@@ -454,8 +461,10 @@ class Pool:
         """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`,
         as many as the scaler asks for and as many as it reads in service. `Leaving` while it asks
         for fewer: an instance being drained still writes, and stays in service until it is gone.
-        `Unseen` otherwise when the numbers differ: an instance that writes is not in service until
-        its launch is complete, and a stale sample is not an instance the scaler took away."""
+        `Unseen` otherwise when the numbers differ, or while the workspace has no recent reading of
+        the scaler's gauge: an instance that writes is not in service until its launch is complete,
+        a stale sample is not an instance the scaler took away, and neither a lower capacity asked
+        for nor a series gone quiet shows that a scale-in has completed."""
         end = time.time()
         series = self._read(f'timestamp({_RUNNING}{{pool="{self.name}"}})', end - FRESH_SECONDS, end, 15)
         fresh = {one.labels["instance"] for one in series if one.samples and one.samples[-1][1] >= end - FRESH_SECONDS}
@@ -464,6 +473,8 @@ class Pool:
         in_service = self.in_service()
         if asked is not None and (asked < len(fresh) or (in_service is not None and asked < in_service)):
             raise Leaving(f"the scaler asks for {asked} instances, {len(fresh)} are present", fresh)
+        if in_service is None:
+            raise Unseen(f"the workspace has no recent reading of the instances in service, {len(fresh)} are present")
         if any(count != len(fresh) for count in (asked, in_service) if count is not None):
             raise Unseen(f"the scaler asks for {asked} and reads {in_service} in service, {len(fresh)} are present")
         return fresh
@@ -631,10 +642,15 @@ class Run:
             except (Leaving, Unseen):
                 return False
             now = {instance: zone for instance, zone in serving.items() if instance in present}
-            if len(now) < INSTANCES:
+            # The zones are those the workspace labels: an instance whose series has no zone label
+            # is not counted as a zone of its own, and the load is held until it has one.
+            zoned = {instance: zone for instance, zone in now.items() if zone is not None}
+            if len(now) < INSTANCES or len(zoned) < len(now):
+                if len(now) >= INSTANCES:
+                    print("two instances in service, one with no zone label: held until both have one")
                 return False
             found.clear()
-            found.update(now)
+            found.update(zoned)
             return True
 
         try:
