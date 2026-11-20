@@ -9,6 +9,7 @@ import pytest
 
 import common
 import s8_stickiness as s8
+from rhi_common.keys import generate_key
 from rhi_reporter.measure import Verdict, measurement_event
 
 Counts, Phase = s8.Counts, s8.Phase
@@ -73,3 +74,79 @@ def test_a_phase_disturbed_on_every_attempt_is_not_measured() -> None:
     extra = {1: Counts(10, {"instance-a": 11}), 2: STUCK[2]}
     with pytest.raises(s8.Disturbed):
         s8.measure_undisturbed(Phase.BEFORE, lambda: extra, lambda: 0, attempts=2, log=lambda _: None)
+
+
+def _answered(load: s8.loadgen.Load) -> list[s8.loadgen.Record]:
+    """A record answered 200 for every request of the load's sessions."""
+    records = []
+    for number, session in enumerate(load.sessions):
+        requests = session.requests()
+        step = next(requests, None)
+        while step is not None:
+            records.append(s8.loadgen.Record(0, number, True, 200, 0.1, 0.1, 50.0, 200, 0, 20))
+            try:
+                step = requests.send("answer")
+            except StopIteration:
+                step = None
+    return records
+
+
+class _Pool:
+    """A pool whose workspace answers are given in the order the job reads them."""
+
+    name = "mock"
+
+    def __init__(self, served: list[dict[str, int]] | None = None, observed: list[dict[str, str]] | None = None):
+        self.windows, self.observed, self.seen = iter(served or []), observed or [], []
+
+    def served(self, start: float, end: float) -> dict[str, int]:
+        return next(self.windows)
+
+    def serving(self) -> dict[str, str]:
+        self.seen.append(self.observed[min(len(self.seen), len(self.observed) - 1)])
+        return self.seen[-1]
+
+    def present(self) -> set[str]:
+        return set(self.seen[-1])
+
+    def busy(self) -> int:
+        return 0
+
+
+@pytest.mark.parametrize(
+    ("second_student_on", "verdict"),
+    [("instance-a", Verdict.PASS), ("instance-b", Verdict.FAIL)],
+)
+def test_the_first_requests_at_once_count_toward_the_verdict(
+    monkeypatch: pytest.MonkeyPatch, second_student_on: str, verdict: Verdict
+) -> None:
+    # The two first requests reach two instances; student 1 is then on instance-b. Student 2 then
+    # either stays on instance-a, or moves to instance-b while both instances are in service.
+    async def replay(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+        return _answered(load)
+
+    monkeypatch.setattr(s8.loadgen, "replay", replay)
+    monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
+    firsts = {"instance-a": 1, "instance-b": 1}
+    pool = _Pool([firsts, {"instance-b": 3}, {second_student_on: 3}])
+    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 2, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
+    before = s8.asyncio.run(run.phase(first_at_once=True))
+    assert all(held.sent == 4 and held.adds_up() for held in before.values())
+    assert s8.SPIKE.verdict(s8.numbers_of(2, {Phase.BEFORE: before, Phase.AFTER: REMAINED})) is verdict
+
+
+def test_two_instances_are_two_seen_in_service_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+        (stream, *_) = load.sessions
+        assert isinstance(stream, s8.HeldStream)
+        await stream.stop.wait()
+        return []
+
+    monkeypatch.setattr(s8.loadgen, "replay", held)
+    monkeypatch.setattr(s8, "POLL_SECONDS", 0)
+    observed = [{"instance-a": "zone-1"}, {"instance-b": "zone-2"}, {"instance-a": "zone-1", "instance-b": "zone-2"}]
+    pool = _Pool(observed=observed)
+    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
+    # Instance-a alone, then instance-b alone, is not two instances: the load is held until both are seen at once.
+    assert s8.asyncio.run(run.two_instances()) == observed[2]
+    assert len(pool.seen) == 3
