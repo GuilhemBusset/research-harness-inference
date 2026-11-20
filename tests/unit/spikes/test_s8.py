@@ -678,3 +678,64 @@ def test_scale_out_ends_only_with_exactly_two_in_service(monkeypatch: pytest.Mon
     run = s8.Run(Three(), "https://gateway.example.com", [generate_key()] * 8, 1, 8)  # ty: ignore[invalid-argument-type] - a test double
     assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
     assert stopped_at == [2]
+
+
+@pytest.mark.parametrize(
+    ("in_service", "student_2_on"),
+    [
+        # A third instance joins before the students' requests, and student 2 is on it.
+        pytest.param({"instance-a", "instance-b", "instance-c"}, "instance-c", id="third-in-service"),
+        # Only the two are in service at the phase's end, but a third served a measured request.
+        pytest.param({"instance-a", "instance-b"}, "instance-c", id="third-served"),
+    ],
+)
+def test_a_third_instance_cannot_prove_two_instance_stickiness(
+    monkeypatch: pytest.MonkeyPatch, in_service: set[str], student_2_on: str
+) -> None:
+    class Pool:
+        name = "mock"
+
+        def rebalance_number(self) -> int:
+            return 0
+
+        def present(self) -> set[str]:
+            return in_service
+
+    async def two_instances(self: s8.Run) -> dict[str, str]:
+        return {"instance-a": "zone-1", "instance-b": "zone-2"}
+
+    async def phase(self: s8.Run, *, first_at_once: bool) -> s8.PhaseCounts:
+        return {1: Counts(2, {"instance-a": 2}), 2: Counts(2, {student_2_on: 2})}
+
+    monkeypatch.setattr(s8, "GATEWAY_SECONDS", 0)
+    monkeypatch.setattr(s8.Run, "two_instances", two_instances)
+    monkeypatch.setattr(s8.Run, "phase", phase)
+    run = s8.Run(Pool(), "https://gateway.example.com", [generate_key(), generate_key()], 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+    with pytest.raises(s8.Departed):
+        run.measure()
+
+
+class _Minutely(_Scaling):
+    """`_Scaling` whose scaler runs once a minute from 1000, its sample of each run reaching the
+    workspace two seconds after the run's start, which it carries: it asks for one instance, and
+    reads one in service, from its run at 1180; instance-b stops writing at 1182."""
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query:
+            written = 1000 + 60 * ((int(end) - 1002) // 60)
+            value = written if query.startswith("timestamp(") else (1 if written >= 1180 else 2)
+            return [common.Series({"pool": "mock"}, ((end, value),))]
+        active = ("instance-a",) if end >= 1182 else ("instance-a", "instance-b")
+        return [common.Series({"instance": one}, ((end, end),)) for one in active]
+
+
+def test_the_scaler_s_next_sample_on_its_way_does_not_discard_a_stable_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The phase ends at 1061: the scaler's last visible sample is from its run at 1000, and its run
+    # at 1060 has not yet reached the workspace. Both instances are in service.
+    clock, after = _Clock(1061), []
+    scaling = _Minutely(clock, stops_writing=1182, scales_in=1180)
+    monkeypatch.setattr(s8, "GATEWAY_SECONDS", 0)
+    stuck = {1: Counts(3, {"instance-a": 3}), 2: Counts(3, {"instance-b": 3})}
+    numbers = _scaling_run(monkeypatch, clock, scaling, stuck, after).measure()
+    assert after and after[0] >= 1182
+    assert s8.SPIKE.verdict(numbers) is Verdict.PASS
