@@ -554,11 +554,14 @@ def read_ssm(client: Any = None) -> Config:
 
 
 def pool_entry(pool: Pool) -> dict[str, object]:
-    """A pool's entry, as the pool parser reads it: every field the pool holds, but its name."""
+    """A pool's entry, as the pool parser reads it: every field the pool holds, but its name.
+
+    A start delay of 0 is left out: only a mock pool may give the field, and 0 is its default.
+    """
     entry: dict[str, object] = {}
     for field in dataclasses.fields(Pool):
         value = getattr(pool, field.name)
-        if field.name == "name" or value is None:
+        if field.name == "name" or value is None or (field.name == "start_delay_seconds" and value == 0):
             continue
         if dataclasses.is_dataclass(value):
             value = {key: list(bounds) for key, bounds in dataclasses.asdict(value).items() if bounds is not None}

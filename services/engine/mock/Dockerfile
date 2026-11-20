@@ -29,5 +29,8 @@ USER 65534:65534
 
 EXPOSE 8000
 
-# Exec form: Python is process 1 and receives SIGTERM itself, so requests in flight finish.
-CMD ["python", "-m", "rhi_mock_engine.app"]
+# Exec form: Python is process 1 and receives SIGTERM itself, so requests in flight finish. An
+# entry point with no command: the container's arguments (a pool's engine flags, such as
+# --start-delay-seconds) are added to the mock's command, and a container started with none runs
+# it as before.
+ENTRYPOINT ["python", "-m", "rhi_mock_engine.app"]

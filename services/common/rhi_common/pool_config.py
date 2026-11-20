@@ -85,6 +85,12 @@ prefix only under the salt it was computed for.
   whatever part of its opening is identical, and one student can then test whether another has sent
   a given text.
 
+A mock pool may give `start_delay_seconds`, a whole number of seconds during which its engine's
+health route answers 503 after the engine starts, so that the gateway holds a request that long
+(sections 4.1 and 5.3; spike S2 in section 12). The design gives no such setting: left out, it is
+0, the mock ready at once. Its release passes it to the mock as the flag `--start-delay-seconds`
+(`rhi.pools.release`). Only a pool whose engine is mock may give it, even at 0.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -124,6 +130,9 @@ DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
 # class (sections 4.7 and 6.6). A pool that gives no scope has the first.
 CACHE_SALT_SCOPES = ("student", "class")
 DEFAULT_CACHE_SALT_SCOPE = "student"
+
+# The start delay of a mock pool that gives none: its engine is ready at once.
+DEFAULT_START_DELAY_SECONDS = 0
 
 # How a vllm pool's engine reads the model's weights: streamed from S3, or copied to the instance's
 # disk first (section 4.4). A pool that gives no loader streams.
@@ -256,6 +265,9 @@ class Pool:
     rebalance_interval_seconds: int
     # Whose cached prefixes a request on the pool may reuse: `student` or `class` (section 4.7).
     cache_salt_scope: str
+    # Seconds after its start during which a mock engine's health route answers 503 (section 4.1).
+    # 0 for every pool that does not give it, and only a mock pool may give it.
+    start_delay_seconds: int
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -471,6 +483,13 @@ def _rebalance_share(pool: str, entry: Mapping[str, object]) -> float:
     return share
 
 
+def _start_delay_seconds(pool: str, entry: Mapping[str, object], engine: str) -> int:
+    field = "start_delay_seconds"
+    if field in entry and engine != "mock":
+        raise PoolConfigError(pool, field, "may only be given by a pool whose engine is mock")
+    return _whole(pool, entry, field, least=0, default=DEFAULT_START_DELAY_SECONDS)
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -553,6 +572,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
             if "cache_salt_scope" in entry
             else DEFAULT_CACHE_SALT_SCOPE
         ),
+        start_delay_seconds=_start_delay_seconds(name, entry, engine),
     )
 
 
