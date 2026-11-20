@@ -7,8 +7,8 @@ dashboards all read the same entry, so its shape is decided here and nowhere els
 needs the standard library only, and knows nothing of where the configuration comes from:
 `parse_pools` takes the table as the source gave it.
 
-Four fields have a default of section 17, which gives them to every pool: the two holds, the idle
-time and the drain. `target_concurrency` and `gpu_hours_per_day` are a pool's own values, so
+Seven fields have a default of section 17, which gives them to every pool: the two holds, the idle
+time, the drain and the three settings of student affinity, below. `target_concurrency` and `gpu_hours_per_day` are a pool's own values, so
 every pool gives the first and every vllm pool the second. A mock pool serves canned responses
 from no model repository: it may leave out `model`, `revision` and `gpu_hours_per_day`.
 
@@ -60,6 +60,17 @@ Both are optional, and the design gives no default beyond leaving them out:
   the engine receives. It is configuration because it is also a lever on speed (section 4.7): the
   profile's entry for reasoning effort reads it. Left out, it is None: no mapping.
 
+Every pool has the three settings of student affinity (section 5.5), each with its default of
+section 17:
+
+- `stickiness_seconds`, how long the pool's target group keeps a student on the instance that
+  served their last request, renewed by every request. From 1 second to 7 days, which is what the
+  load balancer accepts (evidence E13). Left out, it is 3600.
+- `rebalance_share`, the share of the pool's students that one rebalance number moves, from 0 to
+  1. Left out, it is 0.1: about one student in ten.
+- `rebalance_interval_seconds`, the least time between two rebalance numbers, of at least 1
+  second. Left out, it is 60.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -85,6 +96,13 @@ DEFAULT_HOLD_SECONDS = 420
 DEFAULT_HOLD_SECONDS_NON_STREAMING = 240
 DEFAULT_IDLE_MINUTES = 20
 DEFAULT_DRAIN_SECONDS = 300
+# Student affinity (section 5.5): the stickiness of a pool's target group, the share of its students
+# one rebalance number moves, and the least time between two numbers.
+DEFAULT_STICKINESS_SECONDS = 3600
+DEFAULT_REBALANCE_SHARE = 0.1
+DEFAULT_REBALANCE_INTERVAL_SECONDS = 60
+# The longest stickiness the load balancer accepts: 7 days (evidence E13).
+LONGEST_STICKINESS_SECONDS = 7 * 24 * 3600
 # Dollars an hour: a pool with an instance type priced above it may not wake on demand (11.3, 17).
 DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
 
@@ -203,6 +221,13 @@ class Pool:
     # The value of reasoning effort the engine receives for each value a request may send, or
     # None when the pool maps none.
     reasoning_effort: dict[str, str] | None
+    # Student affinity (section 5.5). How long the pool's target group keeps a student on one
+    # instance, renewed by every request: from 1 second to 7 days.
+    stickiness_seconds: int
+    # The share of the pool's students one rebalance number moves, from 0 to 1.
+    rebalance_share: float
+    # The least time between two rebalance numbers.
+    rebalance_interval_seconds: int
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -402,6 +427,22 @@ def _reasoning_effort(pool: str, entry: Mapping[str, object]) -> dict[str, str] 
     return dict(value)
 
 
+def _stickiness_seconds(pool: str, entry: Mapping[str, object]) -> int:
+    field = "stickiness_seconds"
+    value = _whole(pool, entry, field, least=1, default=DEFAULT_STICKINESS_SECONDS)
+    if value > LONGEST_STICKINESS_SECONDS:
+        raise PoolConfigError(pool, field, f"must be at most {LONGEST_STICKINESS_SECONDS}, which is 7 days")
+    return value
+
+
+def _rebalance_share(pool: str, entry: Mapping[str, object]) -> float:
+    field = "rebalance_share"
+    share = _number(entry.get(field, DEFAULT_REBALANCE_SHARE))
+    if share is None or not 0 <= share <= 1:
+        raise PoolConfigError(pool, field, "must be a number from 0 to 1")
+    return share
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -473,6 +514,11 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         ),
         request_profile=_request_profile(name, entry),
         reasoning_effort=_reasoning_effort(name, entry),
+        stickiness_seconds=_stickiness_seconds(name, entry),
+        rebalance_share=_rebalance_share(name, entry),
+        rebalance_interval_seconds=_whole(
+            name, entry, "rebalance_interval_seconds", least=1, default=DEFAULT_REBALANCE_INTERVAL_SECONDS
+        ),
     )
 
 

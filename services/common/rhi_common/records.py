@@ -14,7 +14,8 @@ An item is in the form boto3's table resource takes and returns: attribute names
 strings and whole numbers. `to_item` writes every number as an `int`; `from_item` also takes the
 `Decimal` that boto3 gives back for a number. A time is a whole number of seconds since the epoch.
 A time that may be unknown (no request received yet, no launch that found no capacity) is `None`
-in the record and absent from the item.
+in the record and absent from the item. A pool's rebalance number is absent from the scaler's note
+while it is 0, and a note stored without one reads as 0.
 
 A heartbeat is rewritten every 5 seconds and ignored once it is older than 20 seconds (section
 17): `is_fresh` is that rule. Its item also carries `expires_at`, the table's expiry attribute, one
@@ -214,12 +215,17 @@ class ScalerNote:
     `capacity_asked` is the number of instances the scaler last asked the pool's group for: zero
     says it asked for none. `no_capacity_at` is when a launch last found no capacity, `None` if
     none did.
+
+    `rebalance_number` is the pool's rebalance number (section 5.5): the scaler raises it while the
+    pool is lopsided, and for each new number the gateway moves a share of the pool's students. It
+    is 0 until the scaler first raises it, and the item holds it only once it is above 0.
     """
 
     pool: str
     capacity_asked: int
     no_capacity_at: int | None
     written_at: int
+    rebalance_number: int = 0
 
     def to_item(self) -> Item:
         item: Item = {
@@ -230,6 +236,8 @@ class ScalerNote:
         }
         if self.no_capacity_at is not None:
             item["no_capacity_at"] = self.no_capacity_at
+        if self.rebalance_number > 0:
+            item["rebalance_number"] = self.rebalance_number
         return item
 
     @classmethod
@@ -240,6 +248,8 @@ class ScalerNote:
             capacity_asked=_whole(item, "capacity_asked"),
             no_capacity_at=_optional_time(item, "no_capacity_at"),
             written_at=_whole(item, "written_at"),
+            # A note written before the scaler raised a number, or before it kept one, holds none.
+            rebalance_number=0 if item.get("rebalance_number") is None else _whole(item, "rebalance_number"),
         )
 
 

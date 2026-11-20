@@ -129,6 +129,19 @@ retry_after_concurrency_limit_seconds = 5
 #                                      the value of reasoning effort the engine receives for each
 #                                      value a request may send, which the profile's entry for
 #                                      reasoning effort reads. Left out, there is no mapping.
+#
+# Every pool has three settings of student affinity (section 5.5), which keeps a student's turns on
+# the instance that holds their transcript. The pool here leaves them out, and the values shown are
+# the defaults (section 17).
+#   stickiness_seconds = 3600          how long the pool's target group keeps a student on the
+#                                      instance that served their last request, renewed by every
+#                                      request: from 1 second to 7 days (604800). Left out, it is
+#                                      3600.
+#   rebalance_share = 0.1              the share of the pool's students that one rebalance number
+#                                      moves to another instance, from 0 to 1. Left out, it is 0.1:
+#                                      about one student in ten.
+#   rebalance_interval_seconds = 60    the least time between two rebalance numbers, of at least 1
+#                                      second. Left out, it is 60.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]
