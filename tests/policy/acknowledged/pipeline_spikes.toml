@@ -1,0 +1,37 @@
+# What the role of the spike jobs (`src/rhi/pipeline/spikes.py`) may do, each action on each
+# resource, with its reason. The file's tables hold only what cdk-nag and the wildcard check read,
+# so the inventory is written here as comments. `tests/synth/test_spike_jobs.py` and
+# `tests/policy/test_pipeline.py` hold the role to it.
+#
+# One role, created once whatever the list of jobs holds, is given to every job as a role that
+# takes no new statement, so these are all its statements, for any number of jobs:
+# - ssm:GetParametersByPath on parameter/rhi/config and parameter/rhi/config/*: a spike reads the
+#   configuration as the synth step does, by path (the pools, their settings, the domain).
+# - dynamodb:GetItem and dynamodb:Query on the stage's pool-state table, by the name CloudFormation
+#   gives it (the pools stack's name, the table's logical ID and a generated suffix): a spike reads
+#   a pool's records, its state and its lifecycle, and writes none.
+# - secretsmanager:GetSecretValue on the secret rhi/spike-keys-?????? only: the keys of the spikes'
+#   canary students, through which a spike reaches a pool by the gateway. No other secret.
+# - aps:QueryMetrics on workspace/* of the deploying account and region, under the condition that
+#   the workspace carries the tag rhi-stage with the stage's name: what a spike measures, read from
+#   the stage's Prometheus workspace.
+# - events:PutEvents on event-bus/rhi-measurements only, through `measuring_job`: the measurement
+#   event that hands a run's numbers to the reporter, since a job holds no GitHub credential.
+# - codeconnections:GetConnection and codeconnections:GetConnectionToken on the pipeline's
+#   connection only: CodeBuild reads this repository through it, as CodeBuild's user guide asks of a
+#   project's role ("Grant CodeBuild project IAM role access to use the connection").
+# - logs:CreateLogStream and logs:PutLogEvents on the shared log group, /aws/codebuild/rhi-spikes,
+#   only: every job's logs.
+# - kms:Decrypt, kms:DescribeKey, kms:Encrypt and kms:GenerateDataKey on the shared key only: what
+#   CodeBuild encrypts of a build, with the key every job is encrypted with.
+# Nothing of Auto Scaling, EC2 or IAM, and no report group: a project declares none.
+#
+# What the AWS Solutions pack finds on a project is fixed, never acknowledged here, since an
+# acknowledgement would carry that project's logical ID: every project is encrypted with the
+# shared key (AwsSolutions-CB4), runs CodeBuild's standard image (AwsSolutions-CB5) and is not
+# privileged (AwsSolutions-CB3). The key rotates (AwsSolutions-KMS5).
+
+[nag]
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/config/*]" = "A spike reads the configuration by path, as the synth step does, and the path holds one parameter for each key, whose names change with the configuration."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "A spike queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "A spike reads the stage's pool-state table, whose name CloudFormation ends with a suffix it generates when the table is created; the pattern holds the stack's name and the table's logical ID, so it matches that one table."
