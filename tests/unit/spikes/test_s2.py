@@ -423,7 +423,63 @@ def test_only_a_request_the_client_ended_is_a_hold(client: s2.Client, ends: byte
         assert held.cause == (None if ends is None else Cause.WARMING)
 
 
-def test_two_builds_of_one_commit_post_apart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+class CutShort(BaseHTTPRequestHandler):
+    """Answers 200 with `payload`, having declared `missing` bytes more than it sends, then closes."""
+
+    media, payload, missing = "", b"", 0
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", self.media)
+        self.send_header("Content-Length", str(len(self.payload) + self.missing))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("client", "kind", "media", "payload", "missing"),
+    [
+        (Client.CODEX_PROFILE, Kind.STREAM, "text/event-stream",
+         b": keep-alive\n\nevent: response.completed\ndata: {", 0),
+        (Client.OPENAI_SDK, Kind.CALL, "application/json", b'{"choices":[{"message":', 10),
+        (Client.ANTHROPIC_SDK, Kind.CALL, "application/json", b'{"content":[]}', 10),
+    ],
+    ids=["unfinished-last-event", "short-unreadable-body", "short-readable-body"],
+)  # fmt: skip
+def test_an_answer_the_gateway_cut_short_is_not_a_hold(
+    client: s2.Client, kind: s2.Kind, media: str, payload: bytes, missing: int
+) -> None:
+    handler = type("Handler", (CutShort,), {"media": media, "payload": payload, "missing": missing})
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as gateway:
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        try:
+            with s2.Forwarder(f"http://127.0.0.1:{gateway.server_port}", "mock", clock=lambda: 0.0) as forwarder:
+                body = json.dumps({"model": "mock", "stream": kind is Kind.STREAM, "input": f"Reply. {MARKER}"})
+                request = urllib.request.Request(f"{forwarder.url}{s2.ROUTE_OF[client]}", data=body.encode())
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as answer:
+                        answer.read()
+                except (OSError, http.client.HTTPException):
+                    pass  # the client saw the answer cut short
+                time.sleep(0.2)
+            (held,) = forwarder.recorded()
+        finally:
+            gateway.shutdown()
+    # The pool became ready just under the deadline after the request: the gateway, not the client, ended it.
+    deadline = 420 if kind is Kind.STREAM else 240
+    assert not held.completed
+    assert not s2.ended_by_client(held)
+    assert not s2.exercised(held, deadline - 10.0, deadline)
+
+
+@pytest.mark.parametrize("given", [{}, {"RHI_RUN_LABEL": "profile"}], ids=["default-label", "owner-label"])
+def test_two_builds_of_one_commit_post_apart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, given: dict[str, str]
+) -> None:
     spec = importlib.util.spec_from_file_location("record", RECORD.parents[2] / "tools" / "measurements" / "record.py")
     assert spec is not None and spec.loader is not None
     record = importlib.util.module_from_spec(spec)
@@ -448,8 +504,10 @@ def test_two_builds_of_one_commit_post_apart(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setattr(s2.harnesses, "versions", lambda binaries: VERSIONS)
     measured = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
     environ = {"RHI_SPIKE_ENDPOINT": "https://example.com", BUS_VARIABLE: "bus", s2.common.COMMIT_VARIABLE: "a" * 40}
+    environ |= given
 
-    # A measured build, then one that was not measured, of the same commit and environment.
+    # A measured build, then one that was not measured, of the same commit and environment,
+    # the owner's label given to both or to neither.
     monkeypatch.setattr(s2.Run, "measure", lambda run: measured)
     assert s2.main(environ) is Verdict.PASS
     monkeypatch.setattr(s2.Run, "measure", lambda run: (_ for _ in ()).throw(s2.NotExercised("no hold")))
@@ -459,8 +517,8 @@ def test_two_builds_of_one_commit_post_apart(monkeypatch: pytest.MonkeyPatch, tm
     assert [run.verdict for run, _ in runs] == [Verdict.PASS, Verdict.NOT_MEASURED]
     assert runs[0][0].numbers == measured
     assert runs[0][0].label != runs[1][0].label
-    # A label the owner gives is the run's.
-    assert s2.build_label({s2.common.RUN_LABEL_VARIABLE: "profile"}) == "profile"
+    # A label the owner gives starts the run's.
+    assert all(run.label.startswith(f"{given.get('RHI_RUN_LABEL', 's2-client-hold')}-") for run, _ in runs)
 
 
 def test_a_client_s_home_is_what_rhi_login_writes(tmp_path: Path) -> None:
