@@ -36,7 +36,9 @@ measurement bus and a rule on it that invokes the same function, through which a
 canary's job hands its numbers to the reporter as events (sections 8.4 and 12). It adds no step to
 the pipeline.
 
-Beside the pipeline too, the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
+Beside the pipeline too, the spike jobs of `rhi.pipeline.spikes`, one CodeBuild project for each
+entry of its list, which the owner starts on a commit of `main` and nothing else starts (sections
+8.4 and 12); and the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
 machine image after a canary start on it passes, writes the pool's image parameter and then starts
 an execution of the pipeline (section 4.3). The owner starts it by hand, and nothing else starts it.
 
@@ -66,15 +68,19 @@ from aws_cdk import pipelines
 from rhi.pipeline.image_promotion import ImagePromotion
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
+from rhi.pipeline.spikes import JOBS, SpikeJobs
 from rhi.pipeline.synth import synth_step
 from rhi.pipeline.verify import verify_step
 from rhi.pipeline.weights import copy_weights_step
 from rhi.stage import PERMISSIONS_BOUNDARY
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from constructs import Construct, IConstruct
 
     from rhi.config import Config
+    from rhi.pipeline.spikes import SpikeJob
 
 # The only branch that starts the pipeline.
 BRANCH = "main"
@@ -117,9 +123,18 @@ IMAGE_BUILDER_ENVIRONMENT = {"DOCKER_BUILDKIT": "1", "BUILDX_BUILDER": BUILDER}
 
 class PipelineStack(cdk.Stack):
     """The pipeline, which deploys `stage` and nothing else. `stage` must not be deployed any
-    other way."""
+    other way. Beside it, a spike job for each entry of `spike_jobs`, the list of
+    `rhi.pipeline.spikes` unless a test gives its own."""
 
-    def __init__(self, scope: Construct, construct_id: str, *, config: Config, stage: cdk.Stage) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        config: Config,
+        stage: cdk.Stage,
+        spike_jobs: Sequence[SpikeJob] = JOBS,
+    ) -> None:
         super().__init__(
             scope, construct_id, permissions_boundary=cdk.PermissionsBoundary.from_name(PERMISSIONS_BOUNDARY)
         )
@@ -188,6 +203,15 @@ class PipelineStack(cdk.Stack):
         )
         # Started by the owner, by hand: it writes a pool's image parameter, then starts the pipeline.
         self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
+        # Started by the owner, each on a commit of `main`: the spikes that need AWS.
+        self.spikes = SpikeJobs(
+            self,
+            "Spikes",
+            jobs=spike_jobs,
+            connection_arn=connection.attr_connection_arn,
+            repository=f"{config.github_owner}/{config.github_repo}",
+            stage=stage,
+        )
         self._as_cfn_lint_reads_it(underlying)
 
     def _builds_images_for_both_platforms(self) -> None:

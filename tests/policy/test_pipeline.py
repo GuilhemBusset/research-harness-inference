@@ -101,7 +101,22 @@ Rules hold those two, and every action:
   when one of its actions matches `ec2:RunInstances` or `ec2:StartInstances` and one of its
   resources may name an instance, read as above. Auto Scaling starts a pool's instances with its
   own service-linked role, which no template holds, at the size the scaler alone sets
-  (section 5.1).
+  (section 5.1);
+- a spike job, a CodeBuild project whose build specification runs a script under `spikes/`
+  (sections 8.4 and 12), is started by the owner and by nothing else, as the promotion job is: it
+  has no webhook, no action of any pipeline runs it, and no EventBridge rule or schedule of any
+  template targets it, by a reference in its own template, by an import of what that template
+  exports of it, or by its name in a CodeBuild ARN;
+- a spike job's role may do what `SPIKES_MAY` lists, each action on resources of its kind only,
+  and nothing else: read the parameters under /rhi/config/ by path; read the records of the stage's
+  pool-state table, an unnamed table of a stack a pipeline deploys whose logical ID is the pool
+  tables' `PoolState`, by the name CloudFormation gives it; read the spikes' one secret,
+  `rhi/spike-keys`; query the workspace of a stage a pipeline deploys, by the condition on its tag
+  alone, as the verification's role does; put events on the measurement bus; use the connection of
+  its own template; write to the log group its project names and use the key its project is
+  encrypted with. So no action of Auto Scaling, EC2 or IAM, and no other secret. A wildcard
+  action, `NotAction`, `NotResource` and a managed policy the template does not hold are taken as
+  reaching more.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -326,6 +341,34 @@ INSTANCE_ARN = f"arn:{FIELD}:ec2:{FIELD}:{FIELD}:instance/*"
 PROMOTION_STARTED = "a promotion job that something other than the owner may start"
 WRITES_IMAGES = "a role other than the promotion job's that may write an image parameter"
 STARTS_INSTANCES = "a role other than the promotion job's that may start an instance"
+# A spike job: a command of its project's build specification runs a script under `spikes/`. The
+# spikes' one secret, the construct ID of the pool-state table, which its logical ID begins with
+# after its parents' (`src/rhi/pools/tables.py`), and the actions a spike job's role may be allowed,
+# each with the kind of resource it may be allowed on.
+RUNS_A_SPIKE = re.compile(r"(^|\s)spikes/[\w./-]+")
+SPIKE_SECRET = "rhi/spike-keys"
+POOL_STATE = "PoolState"
+SPIKES_MAY = {
+    "ssm:GetParametersByPath": "configuration",
+    "dynamodb:GetItem": "pool-state",
+    "dynamodb:Query": "pool-state",
+    "secretsmanager:GetSecretValue": "secret",
+    "aps:QueryMetrics": "workspaces",
+    "events:PutEvents": "bus",
+    "codeconnections:GetConnection": "connection",
+    "codeconnections:GetConnectionToken": "connection",
+    "logs:CreateLogStream": "logs",
+    "logs:PutLogEvents": "logs",
+    "kms:Decrypt": "key",
+    "kms:DescribeKey": "key",
+    "kms:Encrypt": "key",
+    "kms:GenerateDataKey": "key",
+}
+SPIKE_STARTED = "a spike job that something other than the owner may start"
+SPIKES_MORE = (
+    "a spike job's role that may do more than read the configuration, the pool-state records and the spikes'"
+    " secret, query its stage's workspace, send a measurement, read the repository and write its logs"
+)
 
 
 def resources(templates: Templates, kind: str) -> list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]:
@@ -1023,6 +1066,144 @@ def promotion_breaches(templates: Templates) -> list[tuple[str, str, str]]:
     return found
 
 
+def spike_jobs(template: Mapping[str, Any]) -> list[tuple[str, str | None, str | None]]:
+    """The spike jobs of a template, each as `(its logical ID, its name, its role)`: the CodeBuild
+    projects one of whose build commands runs a script under `spikes/`. The name and the role are
+    None when the template does not write the one or hold the other."""
+    held = template.get("Resources", {})
+    found: list[tuple[str, str | None, str | None]] = []
+    for _, logical_id, project, _ in resources({"": template}, "AWS::CodeBuild::Project"):
+        spec = project.get("Source", {}).get("BuildSpec")
+        if not any(RUNS_A_SPIKE.search(command) for command in commands_of(spec) or []):
+            continue
+        role = project.get("ServiceRole")
+        role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+        name = project.get("Name") if isinstance(project.get("Name"), str) else None
+        found.append((logical_id, name, role_id if isinstance(role_id, str) and role_id in held else None))
+    return found
+
+
+def names_a_project(value: Any, name: str) -> bool:
+    """Whether a value of a template holds text of a CodeBuild project's ARN by its name, or the
+    name alone."""
+    if isinstance(value, dict):
+        return any(names_a_project(part, name) for part in value.values())
+    if isinstance(value, list):
+        return any(names_a_project(part, name) for part in value)
+    return isinstance(value, str) and (value == name or f"project/{name}" in value)
+
+
+def pool_state_tables(templates: Templates) -> list[str]:
+    """The pool-state tables of the stacks the pipelines of `templates` deploy, each as the pattern
+    of the name CloudFormation gives it: the stack's name, a hyphen, the table's logical ID, a
+    hyphen and a wildcard for the generated suffix. A table is one when it has no name of its own
+    and its logical ID begins with the pool tables' construct ID, after its parents'."""
+    found = []
+    for _, _, pipeline, _ in resources(templates, "AWS::CodePipeline::Pipeline"):
+        for _, actions in stages_of(pipeline):
+            deployments = [action for action in actions if type_of(action) == CLOUDFORMATION]
+            for stack in sorted({str(action["Configuration"].get("StackName")) for action in deployments}):
+                of_the_stack = [action for action in deployments if action["Configuration"].get("StackName") == stack]
+                for template in deployed_by(of_the_stack, templates):
+                    for _, logical_id, table, _ in resources({"": template}, "AWS::DynamoDB::Table"):
+                        if "TableName" not in table and re.fullmatch(rf"\w*{POOL_STATE}[0-9A-F]{{8}}", logical_id):
+                            found.append(f"{stack}-{logical_id}-*")
+    return sorted(set(found))
+
+
+def stage_tags(templates: Templates) -> set[str]:
+    """The values of the tag `rhi-stage` on the workspaces of the stacks the pipelines of
+    `templates` deploy, and of no other template."""
+    deployed = [
+        template
+        for _, _, pipeline, _ in resources(templates, "AWS::CodePipeline::Pipeline")
+        for _, actions in stages_of(pipeline)
+        for template in deployed_by(actions, templates)
+    ]
+    elsewhere = [template for template in templates.values() if not any(template is one for one in deployed)]
+    return set().union(*map(workspace_tags, deployed)) - set().union(*map(workspace_tags, elsewhere))
+
+
+def spike_resources(
+    templates: Templates, template: Mapping[str, Any], project: str
+) -> dict[str, list[re.Pattern[str]]]:
+    """For each kind of resource of `SPIKES_MAY`, what the role of the spike job `project` of
+    `template` may name, as `arn_text` writes it."""
+    properties = template["Resources"][project].get("Properties", {})
+    group = properties.get("LogsConfig", {}).get("CloudWatchLogs", {}).get("GroupName")
+    key = properties.get("EncryptionKey")
+    own_logs = group.get("Ref") if isinstance(group, dict) else None
+    own_key = key["Fn::GetAtt"][0] if isinstance(key, dict) and "Fn::GetAtt" in key else None
+    connections = [logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::CodeConnections::Connection")]
+    return {
+        "configuration": [CONFIGURATION],
+        "pool-state": [
+            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}") for name in pool_state_tables(templates)
+        ],
+        "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(SPIKE_SECRET)}-\?{{6}}")],
+        "workspaces": [re.compile(rf"{PARTITION}:aps:{HERE}:workspace/\*")],
+        "bus": [re.compile(rf"{PARTITION}:events:{HERE}:event-bus/{MEASUREMENT_BUS}")],
+        "connection": [re.compile(rf"\$\{{{re.escape(found)}\.ConnectionArn\}}") for found in connections],
+        "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
+        "key": [re.compile(rf"\$\{{{re.escape(own_key)}\.Arn\}}")] if isinstance(own_key, str) else [],
+    }
+
+
+def spikes_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]) -> bool:
+    """Whether an allowed statement of a spike job's role reaches an action it is not given, a
+    resource beyond those of the action's kind, or, where it queries workspaces, any workspace but
+    its stage's: its condition must be the one that admits a workspace by the stage's tag, alone."""
+    if reports_more(statement, allowed, SPIKES_MAY):
+        return True
+    queries = {action.lower() for action, kind in SPIKES_MAY.items() if kind == "workspaces"}
+    if not any(action.lower() in queries for action in as_list(statement.get("Action", []))):
+        return False
+    return statement.get("Condition") not in [{"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": tag}} for tag in tags]
+
+
+def spike_breaches(templates: Templates) -> list[tuple[str, str, str]]:
+    """What the rules on the spike jobs refuse: something that starts one, and a role that may do
+    more than a spike job does."""
+    found = []
+    jobs = [(path, *job) for path, template in sorted(templates.items()) for job in spike_jobs(template)]
+    exports = [
+        output["Export"]["Name"]
+        for path, project, _, _ in jobs
+        for output in templates[path].get("Outputs", {}).values()
+        if "Name" in output.get("Export", {}) and names(output.get("Value"), project)
+    ]
+
+    def starts_one(value: Any, path: str) -> bool:
+        own = [project for job_path, project, _, _ in jobs if job_path == path]
+        return (
+            any(names(value, project) for project in own)
+            or imports(value, exports)
+            or any(names_a_project(value, name) for _, _, name, _ in jobs if name is not None)
+        )
+
+    for path, project, _, _ in jobs:
+        properties = templates[path]["Resources"][project].get("Properties", {})
+        if properties.get("Triggers", {"Webhook": False}) != {"Webhook": False}:
+            found.append((path, project, SPIKE_STARTED))
+    for path, _, pipeline, _ in resources(templates, "AWS::CodePipeline::Pipeline"):
+        for stage, actions in stages_of(pipeline):
+            for action in actions:
+                if starts_one(action.get("Configuration", {}), path):
+                    found.append((path, f"{stage}/{action['Name']}", SPIKE_STARTED))
+    for kind, key in (("AWS::Events::Rule", "Targets"), ("AWS::Scheduler::Schedule", "Target")):
+        for path, logical_id, properties, _ in resources(templates, kind):
+            if starts_one(properties.get(key), path):
+                found.append((path, logical_id, SPIKE_STARTED))
+    tags = stage_tags(templates)
+    for path, project, _, role in jobs:
+        template = templates[path]
+        allowed = spike_resources(templates, template, project)
+        statements = statements_of(template, role) if role is not None else None
+        if statements is None or any(spikes_more(statement, allowed, tags) for statement in statements):
+            found.append((path, role or project, SPIKES_MORE))
+    return found
+
+
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """Everything of the templates that a rule refuses, as `(template path, what it is named,
     what is refused)`: an action by its stage and name, a resource by its logical ID."""
@@ -1112,6 +1293,7 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
             if role not in copies and writes_weights(template, role):
                 found.append((path, role, WRITES_WEIGHTS))
     found += promotion_breaches(templates)
+    found += spike_breaches(templates)
     return found
 
 
@@ -1317,7 +1499,10 @@ def a_publisher_that_installs(installs: list[str]) -> Change:
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         codebuild = cdk.aws_codebuild
-        phases = {"install": {"commands": ["npm install -g cdk-assets@latest", *installs]}, "build": {"commands": [PUBLISH]}}
+        phases = {
+            "install": {"commands": ["npm install -g cdk-assets@latest", *installs]},
+            "build": {"commands": [PUBLISH]},
+        }
         spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
         project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
         synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
@@ -1938,9 +2123,7 @@ def test_keeps_a_job_given_the_measurement_grant(cdk: ModuleType, tmp_path: Path
     ("change", "expected"),
     [
         pytest.param(a_role(reads=the_secret(f"{REPORTER_SECRET}-??????")), {SECRET_ELSEWHERE}, id="by its name"),
-        pytest.param(
-            a_role(reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")), {SECRET_ELSEWHERE}, id="by its full name"
-        ),
+        pytest.param(a_role(reads=the_secret(f"{REPORTER_SECRET}-GhIjKl")), {SECRET_ELSEWHERE}, id="by its full name"),
         pytest.param(a_role(reads=every_resource), {SECRET_ELSEWHERE}, id="on every resource"),
         pytest.param(
             a_role(reads=the_secret("rhi/*"), action="secretsmanager:*"), {SECRET_ELSEWHERE}, id="by wildcards"
@@ -2191,7 +2374,9 @@ def test_keeps_the_promotion_job_as_the_one_writer_of_the_images(cdk: ModuleType
             {PROMOTION_STARTED},
             id="a rule of another stack that starts the promotion job",
         ),
-        pytest.param(an_action_that_promotes, {PROMOTION_STARTED}, id="a pipeline's action that runs the promotion job"),
+        pytest.param(
+            an_action_that_promotes, {PROMOTION_STARTED}, id="a pipeline's action that runs the promotion job"
+        ),
         pytest.param(a_webhook_on_the_job, {PROMOTION_STARTED, WEBHOOK}, id="a webhook on the promotion job"),
     ],
 )
@@ -2200,3 +2385,196 @@ def test_refuses_another_writer_of_the_images_and_a_trigger_of_the_job(
 ) -> None:
     assert refused(built(cdk, tmp_path / "kept", change=a_promotion())) == set()
     assert refused(built(cdk, tmp_path / "breached", change=a_promotion(change))) == expected
+
+
+# Two spike jobs, as their issues add them to the list of `src/rhi/pipeline/spikes.py`.
+TWO_SPIKES = (("first_spike", "first_spike.py"), ("second_spike", "second_spike.py"))
+
+
+@pytest.fixture(scope="module")
+def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    """The templates of the app of `app.py`, from the example configuration, with the two spike
+    jobs of `TWO_SPIKES` in place of the app's list, synthesized under cdk-nag."""
+    import importlib.util
+
+    from rhi import config
+    from rhi.pipeline.spikes import SpikeJob
+    from rhi.pipeline.stack import PipelineStack
+    from rhi.stage import EndpointStage
+
+    repo = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("app", repo / "app.py")
+    assert spec is not None and spec.loader is not None
+    app_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(app_module)
+    context = json.loads((repo / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    outdir = tmp_path_factory.mktemp("spikes")
+    app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
+    example = config.load({"RHI_CONFIG": "example"})
+    stage = EndpointStage(app, "Rhi", config=example)
+    app_module.add_nag(app)
+    jobs = [SpikeJob(name, script) for name, script in TWO_SPIKES]
+    PipelineStack(app, "RhiPipeline", config=example, stage=stage, spike_jobs=jobs)
+    out = Path(app.synth().directory)
+    return {
+        path.relative_to(out).as_posix(): json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(out.rglob("*.template.json"))
+    }
+
+
+def found_spikes(templates: Templates) -> list[tuple[str, str, str | None, str | None]]:
+    return [(path, *job) for path, template in sorted(templates.items()) for job in spike_jobs(template)]
+
+
+def test_the_spike_jobs_are_those_of_the_list(templates: dict[str, dict[str, Any]]) -> None:
+    from rhi.pipeline.spikes import JOBS
+
+    # The rules hold every job of the app's list: each is found, by its name, with its role.
+    found = found_spikes(templates)
+    assert sorted(name for _, _, name, _ in found if name is not None) == sorted(job.project_name for job in JOBS)
+    assert all(role is not None for _, _, _, role in found)
+
+
+def test_two_spike_jobs_keep_the_rules(two_spikes: dict[str, dict[str, Any]]) -> None:
+    found = found_spikes(two_spikes)
+    assert sorted(str(name) for _, _, name, _ in found) == [f"rhi-spike-{name}" for name, _ in TWO_SPIKES]
+    ((path, role),) = {(path, role) for path, _, _, role in found}
+    assert role is not None
+    # The rules found what the role may read: the stage's pool-state table and its workspace's tag.
+    assert pool_state_tables(two_spikes) and stage_tags(two_spikes) == {"Rhi"}
+    assert all(spike_resources(two_spikes, two_spikes[path], project)["logs"] for _, project, _, _ in found)
+    assert breaches(two_spikes) == []
+
+
+def the_spike_role(templates: Templates) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """The template of the spike jobs and the policy document of their role."""
+    ((path, role),) = {(path, role) for path, _, _, role in found_spikes(templates)}
+    template = templates[path]
+    (policy,) = [p for _, _, p, _ in resources({"": template}, "AWS::IAM::Policy") if {"Ref": role} in p["Roles"]]
+    return template, policy["PolicyDocument"]
+
+
+def a_statement(action: str, resource: str, condition: dict[str, Any] | None = None) -> Callable[[Templates], None]:
+    """Allows the spike jobs' role one more action, on one resource of the deploying account."""
+
+    def change(templates: Templates) -> None:
+        _, document = the_spike_role(templates)
+        statement = {"Effect": "Allow", "Action": action, "Resource": {"Fn::Sub": resource}}
+        document["Statement"].append(statement | ({"Condition": condition} if condition is not None else {}))
+
+    return change
+
+
+def an_unconditioned_query(templates: Templates) -> None:
+    _, document = the_spike_role(templates)
+    for statement in document["Statement"]:
+        statement.pop("Condition", None)
+
+
+def a_managed_policy(templates: Templates) -> None:
+    ((path, role),) = {(path, role) for path, _, _, role in found_spikes(templates)}
+    assert role is not None
+    arn = "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+    templates[path]["Resources"][role]["Properties"]["ManagedPolicyArns"] = [{"Fn::Sub": arn}]
+
+
+def a_webhook(templates: Templates) -> None:
+    path, project, _, _ = found_spikes(templates)[0]
+    templates[path]["Resources"][project]["Properties"]["Triggers"] = {"Webhook": True}
+
+
+def a_target(kind: str, *, elsewhere: bool = False) -> Callable[[Templates], None]:
+    """A rule or a schedule, every night, whose target is the first spike job: by a reference in the
+    job's own template, or, `elsewhere`, by the job's ARN in a template of the stage."""
+
+    def change(templates: Templates) -> None:
+        path, project, name, _ = found_spikes(templates)[0]
+        arn: Any = {"Fn::GetAtt": [project, "Arn"]}
+        if elsewhere:
+            path = next(other for other in sorted(templates) if other != path)
+            arn = {"Fn::Sub": f"arn:${{AWS::Partition}}:codebuild:${{AWS::Region}}:${{AWS::AccountId}}:project/{name}"}
+        if kind == "AWS::Events::Rule":
+            properties = {"ScheduleExpression": "rate(1 day)", "Targets": [{"Arn": arn, "Id": "Spike"}]}
+        else:
+            properties = {
+                "ScheduleExpression": "rate(1 day)",
+                "FlexibleTimeWindow": {"Mode": "OFF"},
+                "Target": {"Arn": arn},
+            }
+        templates[path]["Resources"]["Nightly"] = {"Type": kind, "Properties": properties}
+
+    return change
+
+
+def an_action(templates: Templates) -> None:
+    """A CodeBuild action of the pipeline, after the stage's deployment, that runs the first job."""
+    path, project, _, _ = found_spikes(templates)[0]
+    ((_, _, pipeline, _),) = resources({path: templates[path]}, "AWS::CodePipeline::Pipeline")
+    kind = {"Category": "Build", "Owner": "AWS", "Provider": "CodeBuild", "Version": "1"}
+    action = {"Name": "Spike", "ActionTypeId": kind, "Configuration": {"ProjectName": {"Ref": project}}, "RunOrder": 99}
+    pipeline["Stages"][-1]["Actions"].append(action)
+
+
+HERE_ARN = "arn:${AWS::Partition}:{}:${AWS::Region}:${AWS::AccountId}:{}"
+
+
+def here(service: str, resource: str) -> str:
+    return HERE_ARN.replace("{}", service, 1).replace("{}", resource, 1)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(a_webhook, {SPIKE_STARTED, WEBHOOK}, id="a webhook"),
+        pytest.param(a_target("AWS::Events::Rule"), {SPIKE_STARTED}, id="a rule"),
+        pytest.param(a_target("AWS::Scheduler::Schedule"), {SPIKE_STARTED}, id="a schedule"),
+        pytest.param(a_target("AWS::Events::Rule", elsewhere=True), {SPIKE_STARTED}, id="a rule of another stack"),
+        pytest.param(an_action, {SPIKE_STARTED}, id="a pipeline's action"),
+        pytest.param(
+            a_statement("autoscaling:SetDesiredCapacity", "*"), {SPIKES_MORE}, id="setting a group's capacity"
+        ),
+        pytest.param(
+            a_statement("ec2:StartInstances", here("ec2", "instance/*")),
+            {SPIKES_MORE, STARTS_INSTANCES},
+            id="starting an instance",
+        ),
+        pytest.param(
+            a_statement("ec2:StopInstances", here("ec2", "instance/*")), {SPIKES_MORE}, id="stopping an instance"
+        ),
+        pytest.param(a_statement("iam:PassRole", "*"), {SPIKES_MORE}, id="an action of IAM"),
+        pytest.param(
+            a_statement("secretsmanager:GetSecretValue", here("secretsmanager", f"secret:{CANARY_SECRET}-??????")),
+            {SPIKES_MORE},
+            id="reading another secret",
+        ),
+        pytest.param(
+            a_statement("secretsmanager:*", here("secretsmanager", f"secret:{SPIKE_SECRET}-??????")),
+            {SPIKES_MORE},
+            id="every action on the spikes' secret",
+        ),
+        pytest.param(
+            a_statement("dynamodb:PutItem", here("dynamodb", "table/Rhi-Pools-TablesPoolState68A872F7-*")),
+            {SPIKES_MORE},
+            id="writing a pool-state record",
+        ),
+        pytest.param(
+            a_statement("dynamodb:Query", here("dynamodb", "table/*")), {SPIKES_MORE}, id="reading every table"
+        ),
+        pytest.param(an_unconditioned_query, {SPIKES_MORE}, id="every workspace"),
+        pytest.param(
+            a_statement("ssm:GetParametersByPath", here("ssm", "parameter/rhi/*")), {SPIKES_MORE}, id="other parameters"
+        ),
+    ],
+)
+def test_each_rule_on_the_spike_jobs_refuses_its_breach(
+    two_spikes: dict[str, dict[str, Any]], change: Callable[[Templates], None], expected: set[str]
+) -> None:
+    changed = json.loads(json.dumps(two_spikes))
+    change(changed)
+    assert refused(changed) == expected
+
+
+def test_a_spike_role_with_a_managed_policy_may_do_more(two_spikes: dict[str, dict[str, Any]]) -> None:
+    changed = json.loads(json.dumps(two_spikes))
+    a_managed_policy(changed)
+    assert SPIKES_MORE in refused(changed)

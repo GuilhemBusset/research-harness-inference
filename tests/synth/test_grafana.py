@@ -449,6 +449,17 @@ def allowing(template: Template, statement: dict[str, Any], *, inline: bool = Fa
     return changed
 
 
+def logs_as_a_build(template: Template, project: dict[str, Any]) -> bool:
+    """Whether a project logs where CodeBuild logs by default, or to a log group of its template
+    whose name is under `/aws/codebuild/`."""
+    group = project.get("LogsConfig", {}).get("CloudWatchLogs", {}).get("GroupName")
+    if "LogsConfig" not in project:
+        return True
+    held = template["Resources"].get(group.get("Ref"), {}) if isinstance(group, dict) else {}
+    name = held.get("Properties", {}).get("LogGroupName")
+    return held.get("Type") == "AWS::Logs::LogGroup" and isinstance(name, str) and name.startswith("/aws/codebuild/")
+
+
 def log_group_arn(name: str) -> dict[str, Any]:
     account = [{"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}]
     return {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":logs:", *account, f":log-group:{name}"]]}
@@ -478,9 +489,10 @@ def test_build_logs_are_out_of_reach(
     template = observability(templates)
     # Nothing of the role the stage gives Grafana reaches a build project's log group.
     assert build_logs_in_reach(template) == []
-    # The pipeline's build projects exist, and log where CodeBuild logs by default.
-    projects = [project for _, _, project in everywhere(templates, "AWS::CodeBuild::Project")]
-    assert projects and not [project for project in projects if "LogsConfig" in project]
+    # The pipeline's build projects exist, and log under CodeBuild's prefix: where CodeBuild logs by
+    # default, or a log group of their template named under it, as the spike jobs' shared one is.
+    projects = [(path, project) for path, _, project in everywhere(templates, "AWS::CodeBuild::Project")]
+    assert projects and not [project for path, project in projects if not logs_as_a_build(templates[path], project)]
 
     statement = {"Effect": "Allow", "Action": action, "Resource": resource}
     (found,) = build_logs_in_reach(allowing(template, statement, inline=inline))
