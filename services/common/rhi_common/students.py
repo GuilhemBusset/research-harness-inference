@@ -179,8 +179,10 @@ class UsageDay:
     against both (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
     stays in the item of the day its request started. `affinity_cookies` maps a pool's name to the
     cookie the internal load balancer last set for this student, as it set it (section 5.5).
-    Phase 2 adds, per pool, the last rebalance number applied. Each of the two maps is absent
-    from the item until it holds something.
+    Phase 2 adds, per pool, the last rebalance number applied. Each of the two maps is left out
+    of the item form while it holds nothing, and an item without one reads as an empty map. The
+    gateway's reservation leaves an empty map of cookies in the table's item, for its settlement
+    to store the cookie in (`rhi_gateway.budget`): it reads as none too.
     """
 
     github_id: int

@@ -93,15 +93,16 @@ block, and the caller keeps them off the event loop.
 **The affinity cookie** (section 5.5). The same two writes carry the cookie the internal load
 balancer set for the student and the request's pool, which keeps the student on one instance
 (`rhi_gateway.affinity`). It is the record's `affinity_cookies`, a map from a pool's name to the
-cookie, absent until one is stored. The reservation's write returns the cookie the record holds
-for the request's pool (`Reservation.cookie`), and the settlement's write stores the one the
-request ended with, when it ended with one. So affinity costs no call of its own, and every
-gateway task sees the same cookie. No other write touches the map: not the write that takes a
-reservation back, not the removal of expired leases, and a settlement that finds nothing to settle
-stores nothing. A day's first reservation, which reads the day before for its stand-ins, writes
-the new day with the cookies that day held, so that a student keeps their instance across
-midnight. A request that started the day before settles into that day's item, and its cookie stays
-there. A student's requests in flight at once each store theirs, and the last settlement's stays.
+cookie, which holds no pool until a cookie is stored. The reservation's write returns the cookie
+the record holds for the request's pool (`Reservation.cookie`), and the settlement's write stores
+the one the request ended with, when it ended with one. So affinity costs no call of its own,
+whatever else is in flight, and every gateway task sees the same cookie. No other write touches
+the map: not the write that takes a reservation back, not the removal of expired leases, and a
+settlement that finds nothing to settle stores nothing. A day's first reservation, which reads the
+day before for its stand-ins, writes the new day with the cookies that day held, so that a student
+keeps their instance across midnight. A request that started the day before settles into that
+day's item, and its cookie stays there. A student's requests in flight at once each store theirs,
+and for one pool the last settlement's stays.
 """
 
 from __future__ import annotations
@@ -177,8 +178,7 @@ class Reservation:
 
     `pool` is the pool the request is for, if the reservation named one, and `cookie` the
     load balancer's cookie the record held for that pool when the reservation was written: `None`
-    if it held none. `any_cookie` is whether the record then held a cookie for any pool, which
-    tells the DynamoDB ledger's settlement whether the map is there to write into.
+    if it held none.
     """
 
     github_id: int
@@ -187,7 +187,6 @@ class Reservation:
     lease: Lease
     pool: str | None = None
     cookie: str | None = None
-    any_cookie: bool = False
 
 
 class Ledger(Protocol):
@@ -371,9 +370,8 @@ def _reserve_within_the_day(
     now = int(clock())
     lease = _new_lease(body, output_limit, now + seconds)
     reservation = Reservation(student.github_id, utc_day(now), request_id, lease, pool)
-    cookies = write(reservation, now).affinity_cookies
-    held = None if pool is None else cookies.get(pool)
-    reservation = replace(reservation, cookie=held, any_cookie=bool(cookies))
+    held = write(reservation, now).affinity_cookies
+    reservation = replace(reservation, cookie=None if pool is None else held.get(pool))
     answered = int(clock())
     if utc_day(answered) == reservation.day or _carried(reservation, answered, read):
         return reservation
@@ -514,7 +512,8 @@ class InMemoryLedger:
 # The attributes of the usage item, each under a placeholder: `day` is a reserved word of
 # DynamoDB's expressions, and a placeholder for every name needs no list of the others.
 _NAMES = {"#tokens": "tokens", "#leases": "leases"}
-# The attribute that holds the load balancer's cookies, by pool; absent until one is stored.
+# The attribute that holds the load balancer's cookies, by pool. A reservation that names a pool
+# writes it empty where there is none, so that the settlement has a map to store its cookie in.
 _COOKIES = "affinity_cookies"
 # The attribute of a day whose opener has not confirmed it yet (see the module's "Midnight").
 _OPENING = "opening"
@@ -564,10 +563,11 @@ class DynamoDBLedger:
 
     The reservation's write returns the item as it wrote it, which holds the student's cookies, so
     the cookie costs no call. The settlement's write stores the request's cookie under its pool's
-    name in the map of cookies. Where the reservation found no such map, the settlement writes the
-    map itself, on the condition that there is still none; if another settlement of the student
-    wrote one meanwhile, that write changes nothing and one more call stores the cookie in the map
-    that is now there.
+    name in the map of cookies. DynamoDB refuses a write into a map that is not there, and one
+    write cannot both make the map and add to it. So the write of a reservation that names a pool
+    leaves an empty map where the item had none, which reads as no cookie: the map is there for
+    every settlement that stores one, and each is one call whatever other requests of the student
+    are in flight.
 
     An error of DynamoDB other than a failed condition is raised as the SDK raised it. It carries
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
@@ -674,23 +674,14 @@ class DynamoDBLedger:
         condition = "attribute_exists(#leases.#request)"
         if stand_ins is not None:
             names["#opening"] = _OPENING
-        # A path into a map that is not there is refused, so the first cookie of a record is
-        # written as the map itself, only while there is none: no cookie of another pool is lost.
-        creates = False
         if cookie is not None and reservation.pool is not None:
-            names["#cookies"] = _COOKIES
-            if reservation.any_cookie:
-                names["#pool"] = reservation.pool
-                sets.append("#cookies.#pool = :cookie")
-                values[":cookie"] = cookie
-            else:
-                creates = True
-                sets.append("#cookies = :cookies")
-                values[":cookies"] = {reservation.pool: cookie}
-                condition += " AND attribute_not_exists(#cookies)"
+            # The map is there: this request's reservation named the pool, and so left one.
+            names |= {"#cookies": _COOKIES, "#pool": reservation.pool}
+            sets.append("#cookies.#pool = :cookie")
+            values[":cookie"] = cookie
         if sets:
             update += " SET " + ", ".join(sets)
-        written, found = self._conditional(
+        written, _ = self._conditional(
             self._client.update_item,
             Key=self._key(reservation.github_id, reservation.day),
             UpdateExpression=update,
@@ -698,9 +689,6 @@ class DynamoDBLedger:
             ExpressionAttributeNames={**_NAMES, "#request": reservation.request_id, **names},
             ExpressionAttributeValues=_values(values),
         )
-        if not written and creates and found is not None and reservation.request_id in _day(found).leases:
-            # The lease is there, so the map is too: another settlement wrote it meanwhile.
-            return self._remove(replace(reservation, any_cookie=True), charge, stand_ins=stand_ins, cookie=cookie)
         return written
 
     def _read(self, github_id: int, day: str) -> UsageDay | None:
@@ -722,6 +710,7 @@ class DynamoDBLedger:
         both, and holds only while each of them is still in the item. The item must be a
         confirmed day, unless `carried` is given: then the write confirms the day itself, adding
         those stand-ins, which take their slots, and holds only while the day is still unconfirmed.
+        For a reservation that names a pool, it leaves an empty map of cookies where there is none.
         Returns the day as this write left it, which the write itself returns, or `None` and the
         item it found when it wrote nothing.
         """
@@ -733,6 +722,10 @@ class DynamoDBLedger:
             ":slots": student.concurrency_limit + len(gone) - len(carried or {}),
         }
         names, sets = _stand_in_updates(carried or {}, values)
+        if reservation.pool is not None:
+            names["#cookies"] = _COOKIES
+            sets.append("#cookies = if_not_exists(#cookies, :none)")
+            values[":none"] = {}
         removed = {f"#gone{number}": request for number, request in enumerate(gone)}
         update = "SET " + ", ".join(["#leases.#request = :lease", *sets]) + " ADD #tokens :change"
         condition = "#tokens <= :room AND size(#leases) < :slots AND attribute_not_exists(#leases.#request)"
@@ -778,9 +771,13 @@ class DynamoDBLedger:
         _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
         day = _reserved(fresh, reservation.request_id, reservation.lease, {})
         opening = now < _midnight(reservation.day) + OPENING_SECONDS
+        item = day.to_item()
+        if reservation.pool is not None:
+            # The map of cookies, empty if the day before held none: see `_add_lease`.
+            item[_COOKIES] = dict(day.affinity_cookies)
         written, found = self._conditional(
             self._client.put_item,
-            Item=_values({**day.to_item(), _OPENING: True} if opening else day.to_item()),
+            Item=_values({**item, _OPENING: True} if opening else item),
             ConditionExpression="attribute_not_exists(#day)",
             ExpressionAttributeNames={"#day": "day"},
         )
