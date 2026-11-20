@@ -119,14 +119,17 @@ def values(arguments: list[str], option: str) -> list[str]:
     return following[: next((i for i, argument in enumerate(following) if argument.startswith("-")), len(following))]
 
 
-@pytest.mark.parametrize("loader", ["stream", "download"])
 @pytest.mark.parametrize(
     "changes",
     [{}, EXCEPTION, {**SECTION_4_2, **DRAFT_HEAD}],
     ids=["as-every-pool", "with-the-exception", "with-every-serving-setting"],
 )
-def test_every_vllm_pool_has_the_contracts_settings(changes: dict[str, object], loader: str) -> None:
-    arguments = vllm_command.arguments(pool({**changes, "loader": loader}), bucket=BUCKET)
+def test_every_vllm_pool_has_the_contracts_settings(changes: dict[str, object]) -> None:
+    assert_the_contracts_settings(vllm_command.arguments(pool(changes), bucket=BUCKET))
+
+
+def assert_the_contracts_settings(arguments: list[str]) -> None:
+    """The settings of the engine contract that every vllm pool's arguments hold, whatever its loader."""
     assert all(isinstance(argument, str) and argument for argument in arguments)
     assert values(arguments, "--port") == ["8000"]
     assert values(arguments, "--served-model-name") == ["coursework"]
@@ -181,6 +184,8 @@ def test_a_pool_on_download_copies_its_model_to_a_local_folder_first(changes: di
     assert not [argument for argument in downloaded if "runai" in argument]
     # The rest is what a pool on the streamer has after its model and its load format.
     assert rest == streamed[3:]
+    # A pool on download keeps every setting of the engine contract.
+    assert_the_contracts_settings(downloaded)
 
     # The folder is the container's own, on the EBS volume where Docker keeps it: under none of the
     # folders the engine's unit mounts into the container.
