@@ -220,10 +220,12 @@ class Ledger(InMemoryLedger):
         self.reservations += 1
         return super().reserve(*arguments, **named)
 
-    def settle(self, reservation: Any, *, input_tokens: int, output_tokens: int, ended_cleanly: bool) -> int | None:
+    def settle(
+        self, reservation: Any, *, input_tokens: int, output_tokens: int, ended_cleanly: bool, **named: Any
+    ) -> int | None:
         self.settled.append((input_tokens, output_tokens, ended_cleanly))
         return super().settle(
-            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly
+            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly, **named
         )
 
     def open_leases(self) -> dict[str, Any]:

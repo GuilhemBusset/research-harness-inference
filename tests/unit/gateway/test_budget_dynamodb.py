@@ -104,7 +104,13 @@ def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
 
 
 def reserve(
-    ledger: DynamoDBLedger, who: StudentKey, request: str, *, estimate: int = 1000, output: int = 500
+    ledger: DynamoDBLedger,
+    who: StudentKey,
+    request: str,
+    *,
+    estimate: int = 1000,
+    output: int = 500,
+    pool: str | None = None,
 ) -> Reservation:
     return ledger.reserve(
         who,
@@ -113,6 +119,7 @@ def reserve(
         output_limit=output,
         hold_seconds=DEFAULT_HOLD_SECONDS,
         longest_request_seconds=LONGEST_REQUEST_SECONDS,
+        pool=pool,
     )
 
 
@@ -183,6 +190,70 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
     assert ledger.settle(first, input_tokens=5000, output_tokens=500, ended_cleanly=True) is None
     record = written()
     assert (record.tokens, record.leases) == (90_500 + 1000, {})
+
+
+def test_the_two_writes_of_a_request_carry_the_cookie_of_its_pool(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    who = student()
+
+    # The record holds no cookie: none is returned, the item has no map of them, and the
+    # settlement writes the map with its cookie.
+    first = reserve(ledger, who, "request-1", pool="coursework")
+    assert first.cookie is None
+    assert "affinity_cookies" not in client.get_item(TableName=TABLE, Key=KEY)["Item"]
+    client.made.clear()
+    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-1")
+    assert client.made == ["update_item"]
+    assert written().affinity_cookies == {"coursework": "coursework-1"}
+
+    # From then on the reservation's one call returns the cookie, and the settlement's one call
+    # replaces it, for the request's pool only.
+    client.made.clear()
+    second = reserve(ledger, who, "request-2", pool="coursework")
+    other = reserve(ledger, who, "request-3", pool="upgrade")
+    assert (second.cookie, other.cookie) == ("coursework-1", None)
+    ledger.settle(other, input_tokens=1000, output_tokens=20, ended_cleanly=False, cookie="upgrade-1")
+    ledger.settle(second, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-2")
+    assert client.made == ["update_item"] * 4
+    assert written().affinity_cookies == {"coursework": "coursework-2", "upgrade": "upgrade-1"}
+
+    # A request that ended with no cookie stores none, and a settlement that finds nothing to settle neither.
+    third = reserve(ledger, who, "request-4", pool="upgrade")
+    assert third.cookie == "upgrade-1"
+    ledger.settle(third, input_tokens=0, output_tokens=0, ended_cleanly=False)
+    assert ledger.settle(third, input_tokens=0, output_tokens=0, ended_cleanly=False, cookie="too-late") is None
+    record = written()
+    assert record.affinity_cookies == {"coursework": "coursework-2", "upgrade": "upgrade-1"}
+    assert record.leases == {}
+
+
+def test_the_first_cookies_of_two_requests_in_flight_are_both_kept(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    who = student()
+    one = reserve(ledger, who, "request-1", pool="coursework")
+    two = reserve(ledger, who, "request-2", pool="upgrade")
+
+    # Neither reservation found a map of cookies. The first settlement writes it; the second finds
+    # it there, and stores its cookie in it with one more call.
+    client.made.clear()
+    assert ledger.settle(one, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-1") == 1020
+    assert ledger.settle(two, input_tokens=1000, output_tokens=30, ended_cleanly=True, cookie="upgrade-1") == 1030
+    assert client.made == ["update_item"] * 3
+    record = written()
+    assert record.affinity_cookies == {"coursework": "coursework-1", "upgrade": "upgrade-1"}
+    assert (record.tokens, record.leases) == (2050, {})
+
+
+def test_the_first_request_of_a_day_returns_the_cookie_of_the_day_before(client: Calls) -> None:
+    clock = Clock()
+    ledger = DynamoDBLedger(client, TABLE, clock=clock)
+    who = student()
+    first = reserve(ledger, who, "request-1", pool="coursework")
+    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-1")
+
+    clock.now = NOON + 86_400
+    assert reserve(ledger, who, "request-2", pool="coursework").cookie == "coursework-1"
+    assert written("2026-11-16").affinity_cookies == {"coursework": "coursework-1"}
 
 
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:

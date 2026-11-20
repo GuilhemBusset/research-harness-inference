@@ -15,7 +15,17 @@ never reaches the engine and an `X-Rhi-Pool` the client sent is dropped:
 - `Authorization: Bearer` with the pool's own bearer secret (section 4.1, "Reachability");
 - `X-Rhi-Pool` with the name of the pool the body filter chose;
 - `Content-Type: application/json`, and `Accept-Encoding: identity`, so that the bytes that come
-  back are the stream itself and not a compression of it, for the usage parser and for the client.
+  back are the stream itself and not a compression of it, for the usage parser and for the client;
+- `Cookie` with the load balancer's cookie the student's record holds for the pool, which keeps
+  the student on one instance (section 5.5; `rhi_gateway.affinity`), and no `Cookie` header when
+  the record holds none. A cookie the client sent is not copied, like the rest of its headers,
+  and the upstream client, which every student's requests share, keeps no cookie of its own: the
+  proxy sets its jar to accept none, so an answer's cookie is never sent with another request.
+
+The cookie the load balancer's answer sets is read from its headers as soon as they arrive, for
+the request's settlement to store, whatever the answer's status. It never reaches the student:
+the client's answer is written here, and none of the upstream's headers is copied into it, so it
+carries no `Set-Cookie`.
 
 **What comes back.** A stream (an answer of type `text/event-stream`) goes to the client as each
 chunk arrives. Each chunk is also fed to the usage parser of the request's wire format (section
@@ -127,6 +137,7 @@ import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
+from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Protocol
 
 import httpx
@@ -135,6 +146,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from rhi_common.causes import Cause
 from rhi_gateway import routes, telemetry
+from rhi_gateway.affinity import Affinity
 from rhi_gateway.body import Forwarded
 from rhi_gateway.errors import GatewayError, WireFormat, render_json, render_stream_event
 from rhi_gateway.formats.chat import ChatForwarded
@@ -735,6 +747,9 @@ class Proxy:
         if longest_request_seconds <= 0:
             raise ValueError("the longest a request may run must be a positive number of seconds")
         self._client = client
+        # Every student's requests share this client: its jar takes no cookie from an answer and
+        # gives none to a request, so the only cookie sent is the one the request's student holds.
+        client.cookies.jar.set_policy(DefaultCookiePolicy(allowed_domains=()))
         self._base_url = base_url
         self._secrets = dict(secrets)
         self._longest = longest_request_seconds
@@ -744,8 +759,11 @@ class Proxy:
     def longest_request_seconds(self) -> int:
         return self._longest
 
-    async def _send(self, route: Route, forwarded: Forwarded) -> httpx.Response:
-        """Send the request and return the answer as soon as its headers have arrived."""
+    async def _send(self, route: Route, forwarded: Forwarded, affinity: Affinity | None = None) -> httpx.Response:
+        """Send the request and return the answer as soon as its headers have arrived.
+
+        The request carries the cookie of `affinity`, which is told the cookie the answer sets.
+        """
         secret = self._secrets.get(forwarded.pool.name)
         if not secret:
             raise LookupError("the pool has no bearer secret")
@@ -758,9 +776,13 @@ class Proxy:
                 POOL_HEADER: forwarded.pool.name,
                 "Content-Type": "application/json",
                 "Accept-Encoding": "identity",
+                **({} if affinity is None else affinity.headers()),
             },
         )
-        return await self._client.send(request, stream=True)
+        response = await self._client.send(request, stream=True)
+        if affinity is not None:
+            affinity.answered(response.headers.get_list("set-cookie"))
+        return response
 
     async def forward(
         self,
@@ -770,6 +792,7 @@ class Proxy:
         *,
         receive: Receive | None = None,
         token_sent: TokenSent | None = None,
+        affinity: Affinity | None = None,
     ) -> Response:
         """Forward the request and return the client's answer; `on_end` is called exactly once, at its end.
 
@@ -777,7 +800,9 @@ class Proxy:
         disconnect until a stream starts. A stream's end comes once the client's answer has been
         sent or abandoned; every other end comes before this returns. `token_sent` is called each
         time an event of a stream that carries output has been written to the client, with whether
-        the output written is the answer's (text or a tool call) and not only reasoning.
+        the output written is the answer's (text or a tool call) and not only reasoning. `affinity`
+        holds the cookie to send to the load balancer, and is told the one its answer sets before
+        `on_end` is called.
         """
         settle = _Settlement(on_end)
         wire_format = route.wire_format or WireFormat.MESSAGES
@@ -788,7 +813,7 @@ class Proxy:
         streaming = False
         try:
             try:
-                response = await ends.race(self._send(route, forwarded))
+                response = await ends.race(self._send(route, forwarded, affinity))
                 if not response.is_success:
                     # The engine failed: none of its answer reaches the client.
                     return _error_answer(Cause.ENGINE_ERROR, wire_format)
@@ -828,14 +853,16 @@ class Proxy:
         held: HeldRequest,
         *,
         token_sent: TokenSent | None = None,
+        affinity: Affinity | None = None,
     ) -> Response:
         """A held stream's answer: 200 at once, the hold's keep-alives, then the engine's stream on the same connection.
 
         `on_end` is called exactly once: with nothing observed when the hold ends the request,
         else as `forward` calls it. The request is forwarded when `held.waiting()` ends.
-        `token_sent` is called as `forward` calls it, for the engine's stream.
+        `token_sent` is called as `forward` calls it, for the engine's stream, and `affinity` is
+        used as `forward` uses it.
         """
-        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held, token_sent))
+        return HeldResponse(_HeldStream(self, route, forwarded, _Settlement(on_end), held, token_sent, affinity))
 
 
 class HeldRequest(Protocol):
@@ -909,9 +936,11 @@ class _HeldStream:
         settle: _Settlement,
         held: HeldRequest,
         token_sent: TokenSent | None = None,
+        affinity: Affinity | None = None,
     ) -> None:
         self._proxy = proxy
         self._token_sent = token_sent
+        self._affinity = affinity
         self._route = route
         self._forwarded = forwarded
         self._settle = settle
@@ -941,7 +970,9 @@ class _HeldStream:
         cause = Cause.ENGINE_ERROR
         try:
             answer: list[httpx.Response] = []
-            sending = _keeping_alive(ends, self._proxy._send(self._route, self._forwarded), self._held, answer)
+            sending = _keeping_alive(
+                ends, self._proxy._send(self._route, self._forwarded, self._affinity), self._held, answer
+            )
             async with aclosing(sending):
                 async for keep_alive in sending:
                     yield keep_alive

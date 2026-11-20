@@ -58,7 +58,13 @@ def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
 
 
 def reserve(
-    ledger: InMemoryLedger, who: StudentKey, request: str, *, estimate: int = 1000, output: int = 500
+    ledger: InMemoryLedger,
+    who: StudentKey,
+    request: str,
+    *,
+    estimate: int = 1000,
+    output: int = 500,
+    pool: str | None = None,
 ) -> Reservation:
     """Reserve for a request whose body is estimated at `estimate` tokens, with the defaults of section 17."""
     return ledger.reserve(
@@ -68,6 +74,7 @@ def reserve(
         output_limit=output,
         hold_seconds=DEFAULT_HOLD_SECONDS,
         longest_request_seconds=LONGEST_REQUEST_SECONDS,
+        pool=pool,
     )
 
 
@@ -212,15 +219,74 @@ def test_two_writes_per_request() -> None:
     ledger = InMemoryLedger(clock=Clock())
     who = student()
 
-    reservation = reserve(ledger, who, "request-1")
+    reservation = reserve(ledger, who, "request-1", pool="coursework")
     assert ledger.writes == 1
-    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True)
+    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="first-cookie")
     assert ledger.writes == 2
 
     # The read writes nothing, and neither does a settlement that finds nothing to settle.
     ledger.tokens_left(who)
-    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True)
+    ledger.settle(reservation, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="late-cookie")
     assert ledger.writes == 2
+
+    # The cookie is carried by those two writes: the next request's reservation returns it, and
+    # that request makes two writes too.
+    second = reserve(ledger, who, "request-2", pool="coursework")
+    assert second.cookie == "first-cookie"
+    assert ledger.writes == 3
+    ledger.settle(second, input_tokens=1000, output_tokens=200, ended_cleanly=True, cookie="second-cookie")
+    assert ledger.writes == 4
+
+
+def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
+    clock = Clock()
+    ledger = InMemoryLedger(clock=clock)
+    who = student(limit=2)
+
+    def cookies() -> dict[str, str]:
+        day = ledger.day(7, "2026-11-15")
+        assert day is not None
+        return day.affinity_cookies
+
+    first = reserve(ledger, who, "request-1", pool="coursework")
+    assert first.cookie is None
+    assert cookies() == {}
+    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-cookie")
+
+    # Another pool's reservation returns none of it, and its settlement leaves it in place.
+    other = reserve(ledger, who, "request-2", pool="upgrade")
+    assert other.cookie is None
+    ledger.settle(other, input_tokens=1000, output_tokens=20, ended_cleanly=False, cookie="upgrade-cookie")
+    assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
+    assert reserve(ledger, who, "request-3", pool="upgrade").cookie == "upgrade-cookie"
+
+    # A request that ended with none stores none, and removes none.
+    fourth = reserve(ledger, who, "request-4", pool="coursework")
+    assert fourth.cookie == "coursework-cookie"
+    ledger.settle(fourth, input_tokens=0, output_tokens=0, ended_cleanly=False, cookie=None)
+    assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
+
+    # The reservation that removes an expired lease leaves the cookies as they are, and so does
+    # the settlement that then finds its lease gone.
+    fifth = reserve(ledger, who, "request-5", pool="coursework")
+    clock.now = NOON + 2280
+    reserve(ledger, who, "request-6", pool="coursework")
+    assert ledger.settle(fifth, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="too-late") is None
+    assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
+
+
+def test_a_new_day_starts_with_the_cookies_of_the_day_before() -> None:
+    clock = Clock()
+    ledger = InMemoryLedger(clock=clock)
+    who = student()
+    first = reserve(ledger, who, "request-1", pool="coursework")
+    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-cookie")
+
+    clock.now = NOON + 86_400
+    assert reserve(ledger, who, "request-2", pool="coursework").cookie == "coursework-cookie"
+    today = ledger.day(7, "2026-11-16")
+    assert today is not None
+    assert today.affinity_cookies == {"coursework": "coursework-cookie"}
 
 
 def test_a_lease_expires_after_2280_seconds() -> None:
