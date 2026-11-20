@@ -1,0 +1,13 @@
+# What the roles of `src/rhi/pools/image.py` may do, each action on each resource, with its reason.
+# The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The module creates no role and no resource: it has no action to list, and it brings no cdk-nag
+# finding, so the file has no table.
+#
+# A GPU pool's machine image is a parameter of the pools stack's template, whose value is the name
+# of the pool's image parameter in the owner's account. CloudFormation reads that parameter when
+# the stack is deployed, as whoever deploys the stack, so no role of the app reads it. The launch
+# template that names the image, and the group, belong to `src/rhi/pools/group.py`
+# (`pools_group.toml`). The promotion job that writes the parameter is a job of the pipeline
+# stack, and its role's actions are listed with the module that creates it.

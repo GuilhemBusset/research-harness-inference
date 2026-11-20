@@ -11,6 +11,10 @@
 # The launch template gives its instances the pool's role through an instance profile it makes,
 # which holds no action of its own: what that role may do is listed in `pools_role.toml`.
 #
+# The tags rhi-pool and rhi-engine on the group and on the launch template, and the machine image
+# the launch template names (a GPU pool's comes from `src/rhi/pools/image.py`, `pools_image.toml`),
+# bring no role, no action and no cdk-nag finding.
+#
 # The warm pool and the nightly scheduled action that sets the desired capacity to zero are
 # resources Auto Scaling acts on with its own service-linked role: they bring no role of this
 # module, no action and no cdk-nag finding.
