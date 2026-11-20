@@ -12,15 +12,31 @@
 # - autoscaling:CompleteLifecycleAction and autoscaling:RecordLifecycleActionHeartbeat on a group
 #   ARN by pattern, with the condition that the group's tag rhi-pool is the pool's name: an
 #   instance completes, or keeps waiting, the lifecycle actions of its own group.
+# - for a GPU pool only, s3:GetObject on the objects of the model bucket under the pool's own
+#   prefix, <pool>/, the bucket named by its fixed name (`src/rhi/pools/model_store.py`): an engine
+#   loads its pool's weights, at the revision its release names. The mock pool's role has no
+#   statement on the bucket.
+# - for a GPU pool only, s3:ListBucket on the model bucket, with the condition that s3:prefix is
+#   under <pool>/: the engine's loader lists a revision's files before it reads them, and a listing
+#   names the whole bucket, so the condition keeps it to the pool's prefix.
 # - in the session policy, the five actions of Session Manager on every resource, which is the
 #   only way AWS grants them: ssm:UpdateInstanceInformation, ssmmessages:CreateControlChannel,
 #   ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel and
 #   ssmmessages:OpenDataChannel.
 # Each later issue that creates a resource the instances read grants it to this role, and lists
 # it here.
+#
+# cdk-nag names a finding after the resource it found, so the finding of a pool's prefix holds the
+# pool's name, and no file of the repository names the pools of a deployed configuration. The entry
+# whose key holds `<pool>` lists that finding for each pool of the configuration, and for no other
+# name (`src/rhi/nag.py`). The example's pool keeps its entry under its own name beside it, with
+# the same reason: `test_nag_acknowledgements.py` holds the example's templates to the ids as
+# cdk-nag writes them.
 
 [nag]
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/mock/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/<pool>/*]" = "A GPU pool's instances read every file of its weights, whose names the model's repository chooses, so the statement names the objects of the model bucket under the pool's own prefix and no other."
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants the five actions of Session Manager only on every resource, and the session policy holds those five actions alone."
 
 [wildcard_actions]

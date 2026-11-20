@@ -26,12 +26,16 @@ if TYPE_CHECKING:
 
 
 class NetworkStack(cdk.Stack):
-    """Holds the VPC, the security groups and the public load balancer, which the other stacks of
-    the stage take from `vpc`, `security_groups`, `load_balancer` and `https_listener`."""
+    """Holds the VPC, its S3 gateway endpoint, the security groups and the public load balancer,
+    which the other stacks of the stage take from `vpc`, `s3_endpoint`, `security_groups`,
+    `load_balancer` and `https_listener`."""
 
     def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
         super().__init__(scope, construct_id)
-        self.vpc: ec2.Vpc = Network(self, "Network", availability_zones=self.availability_zones).vpc
+        network = Network(self, "Network", availability_zones=self.availability_zones)
+        self.vpc: ec2.Vpc = network.vpc
+        # The endpoint instances read weights through, which the model bucket's policy names.
+        self.s3_endpoint: ec2.GatewayVpcEndpoint = network.s3_endpoint
         # The groups of the load balancers, the tasks and the instances: another stack of the stage
         # takes one from `security_groups` (`security_groups.gateway`, ...).
         self.security_groups = SecurityGroups(self, "SecurityGroups", vpc=self.vpc)
