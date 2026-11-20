@@ -47,13 +47,13 @@ USAGE = UsageDay(
         "req-1": Lease(tokens=40_000, estimate=32_000, expires=NOW + 1800),
         "req-2": Lease(tokens=9_000, estimate=1_000, expires=NOW + 1900),
     },
-    affinity_cookie={"coursework": "opaque-cookie"},
+    affinity_cookies={"coursework": "opaque-cookie", "upgrade": "another-opaque-cookie"},
     rebalance_applied={"coursework": 7},
 )
 FULL = [KEY, ROSTER, USAGE]
 
-# The attributes of the issue's Context, written out here and not read from the module. The two
-# Phase 2 attributes of a day of usage are named by the module's decision.
+# The attributes of the issue's Context, written out here and not read from the module. The
+# Phase 2 attribute of a day of usage, `rebalance_applied`, is named by the module's decision.
 LISTED: dict[type, set[str]] = {
     StudentKey: {
         "key_hash",
@@ -74,7 +74,7 @@ LISTED: dict[type, set[str]] = {
         "tokens",
         "leases",
         "expires_at",
-        "affinity_cookie",
+        "affinity_cookies",
         "rebalance_applied",
     },
 }
@@ -148,7 +148,7 @@ def test_an_absent_optional_attribute_is_not_written() -> None:
     assert "revoked_at" not in bare
     first_day = UsageDay(github_id=7, day="2027-01-16", alias="heron", tokens=0, expires_at=COURSE_END).to_item()
     assert first_day["leases"] == {}
-    assert "affinity_cookie" not in first_day
+    assert "affinity_cookies" not in first_day
     assert "rebalance_applied" not in first_day
 
 
@@ -158,6 +158,19 @@ def test_a_day_of_usage_reads_back_its_two_leases() -> None:
     first, second = read.leases["req-1"], read.leases["req-2"]
     assert (first.tokens, first.estimate, first.expires) == (40_000, 32_000, NOW + 1800)
     assert (second.tokens, second.estimate, second.expires) == (9_000, 1_000, NOW + 1900)
+
+
+def test_a_day_of_usage_reads_back_each_pool_s_cookie() -> None:
+    cookies = {"coursework": "opaque-cookie", "upgrade": "another-opaque-cookie"}
+    assert USAGE.affinity_cookies == cookies
+    assert USAGE.to_item()["affinity_cookies"] == cookies
+    assert UsageDay.from_item(USAGE.to_item()) == USAGE
+    assert UsageDay.from_item(as_read(USAGE.to_item())).affinity_cookies == cookies
+
+    # Absent until written: a day without the attribute holds no cookie, and writes none.
+    without = {name: value for name, value in USAGE.to_item().items() if name != "affinity_cookies"}
+    assert UsageDay.from_item(without).affinity_cookies == {}
+    assert "affinity_cookies" not in UsageDay.from_item(without).to_item()
 
 
 @pytest.mark.parametrize(
@@ -170,6 +183,7 @@ def test_a_day_of_usage_reads_back_its_two_leases() -> None:
         ("leases", {"req-1": {"tokens": 1, "estimate": 1}}),
         ("leases", {"req-1": 40_000}),
         ("leases", ["req-1"]),
+        ("affinity_cookies", {"coursework": 7}),
     ],
 )
 def test_a_mistyped_day_of_usage_is_refused(name: str, value: object) -> None:

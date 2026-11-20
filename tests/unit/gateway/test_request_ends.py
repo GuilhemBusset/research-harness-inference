@@ -151,10 +151,10 @@ class Ledger(InMemoryLedger):
         return reservation
 
     def settle(
-        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool
+        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool, **named: Any
     ) -> int | None:
         charge = super().settle(
-            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly
+            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly, **named
         )
         self.settled.append((input_tokens, output_tokens, ended_cleanly, charge))
         return charge

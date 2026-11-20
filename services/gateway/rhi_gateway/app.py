@@ -16,7 +16,9 @@ is reserved for the proxy's own time limit, so that the two cannot differ.
 
 The reservation is made once the body is read and filtered, because it needs what only the body
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
-long the lease lasts. It is still made before anything is sent to the engine.
+long the lease lasts. It is still made before anything is sent to the engine. It names the pool,
+and returns the load balancer's cookie the student's record holds for it: the proxy sends that
+cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`).
 
 **The hold** (sections 5.3 and 6.2, step 5) runs between the body filter and the proxy. Whether
 the pool can serve is read from the values the gateway keeps of it (`rhi_gateway.readiness`),
@@ -100,6 +102,7 @@ from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
 from rhi_gateway import routes, telemetry
+from rhi_gateway.affinity import Affinity
 from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
@@ -521,9 +524,13 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 output_limit=output_limit(entry, forwarded),
                 hold_seconds=forwarded.pool.hold_seconds,
                 longest_request_seconds=forwarding.proxy.longest_request_seconds,
+                pool=forwarded.pool.name,
             )
         except GatewayError as refused:
             return _refusal(refused, entry, forwarding.retry_after)
+        # The load balancer's cookie the student's record holds for the pool: the proxy sends it,
+        # and the settlement stores the one the request ends with (section 5.5).
+        affinity = Affinity(reservation.cookie)
 
         demand: Demand | None = None
         if held is not None and forwarding.heartbeat is not None:
@@ -556,12 +563,13 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 input_tokens=observed.input_tokens,
                 output_tokens=observed.output_tokens,
                 ended_cleanly=observed.ended_cleanly,
+                cookie=affinity.ended,
             )
 
         if held is not None and not held.ready:
             if held.streams:
                 # Answered 200 at once: the keep-alives, then the engine's stream on the same connection.
-                return forwarding.proxy.held(entry, forwarded, settle, held, token_sent=token_sent)
+                return forwarding.proxy.held(entry, forwarded, settle, held, token_sent=token_sent, affinity=affinity)
             try:
                 left = await _hold_silently(held, request.receive)
             except GatewayError as ended:
@@ -574,7 +582,9 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             if left:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return Response(status_code=CLIENT_LEFT_STATUS)
-        return await forwarding.proxy.forward(entry, forwarded, settle, receive=request.receive, token_sent=token_sent)
+        return await forwarding.proxy.forward(
+            entry, forwarded, settle, receive=request.receive, token_sent=token_sent, affinity=affinity
+        )
 
     return handler
 

@@ -10,7 +10,7 @@ reads and writes it. The tables and their keys are in `rhi_common.tables`.
 | --- | --- | --- |
 | keys | `StudentKey` | `key_hash`, `github_id`, `alias`, `installation`, `issued_at`, `expires_at`, `revoked_at`, `daily_token_budget`, `concurrency_limit` |
 | roster | `RosterEntry` | `github_id`, `alias`, `daily_token_budget`, `concurrency_limit`, `added_at`, `expires_at` |
-| usage | `UsageDay` | `github_id`, `day`, `alias`, `tokens`, `leases`, `expires_at`, and in Phase 2 `affinity_cookie` and `rebalance_applied` |
+| usage | `UsageDay` | `github_id`, `day`, `alias`, `tokens`, `leases`, `expires_at`, `affinity_cookies`, and in Phase 2 `rebalance_applied` |
 
 A lease, one value of the map `leases`, holds `tokens`, `estimate` and `expires`.
 
@@ -177,9 +177,12 @@ class UsageDay:
 
     The budget and the concurrency slots live in one item so that one conditional write reserves
     against both (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
-    stays in the item of the day its request started. Phase 2 adds, per pool, the affinity cookie
-    and the last rebalance number applied (section 5.5): each map is absent from the item until
-    it holds something.
+    stays in the item of the day its request started. `affinity_cookies` maps a pool's name to the
+    cookie the internal load balancer last set for this student, as it set it (section 5.5).
+    Phase 2 adds, per pool, the last rebalance number applied. Each of the two maps is left out
+    of the item form while it holds nothing, and an item without one reads as an empty map. The
+    gateway's reservation leaves an empty map of cookies in the table's item, for its settlement
+    to store the cookie in (`rhi_gateway.budget`): it reads as none too.
     """
 
     github_id: int
@@ -188,7 +191,7 @@ class UsageDay:
     tokens: int
     expires_at: int
     leases: dict[str, Lease] = field(default_factory=dict)
-    affinity_cookie: dict[str, str] = field(default_factory=dict)
+    affinity_cookies: dict[str, str] = field(default_factory=dict)
     rebalance_applied: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -209,8 +212,8 @@ class UsageDay:
             "leases": {request: lease.to_map() for request, lease in self.leases.items()},
             "expires_at": self.expires_at,
         }
-        if self.affinity_cookie:
-            item["affinity_cookie"] = dict(self.affinity_cookie)
+        if self.affinity_cookies:
+            item["affinity_cookies"] = dict(self.affinity_cookies)
         if self.rebalance_applied:
             item["rebalance_applied"] = dict(self.rebalance_applied)
         return item
@@ -224,6 +227,6 @@ class UsageDay:
             tokens=_whole(item, "tokens"),
             expires_at=_whole(item, "expires_at"),
             leases=_map(item, "leases", lambda leases, request: Lease.from_map(leases[request])),
-            affinity_cookie=_map(item, "affinity_cookie", _text),
+            affinity_cookies=_map(item, "affinity_cookies", _text),
             rebalance_applied=_map(item, "rebalance_applied", _whole),
         )
