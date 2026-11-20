@@ -137,6 +137,9 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
         "gpu_hours_per_day": 12,
         "measured_start_seconds": 240,
         "expected": {"stream_tokens_per_second": [40, 60.5], "cache_tokens": [0, 200000]},
+        # The pool's request profile and its effort mapping reach the gateway with the rest.
+        "request_profile": ["second_entry", "first_entry"],
+        "reasoning_effort": {"medium": "medium", "high": "xhigh"},
     }
     loaded = parse_pools({"mock": MOCK, "coursework": vllm}, on_demand_price_limit=10)
     written = json.dumps({pool.name: config.pool_entry(pool) for pool in loaded})
@@ -150,6 +153,9 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
 
     assert settings.pools == loaded
     assert settings.default_pool == loaded[1]
+    assert settings.pools[1].request_profile == ("second_entry", "first_entry")
+    assert settings.pools[1].reasoning_effort == {"medium": "medium", "high": "xhigh"}
+    assert (settings.pools[0].request_profile, settings.pools[0].reasoning_effort) == ((), None)
 
 
 def test_an_environment_with_no_pool_gives_settings_with_no_pool_and_no_default_pool() -> None:

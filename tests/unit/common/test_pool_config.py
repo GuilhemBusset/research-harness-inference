@@ -165,6 +165,25 @@ def test_optional_fields() -> None:
                 ("as-text", {"request_latency": ["1", "5"]}),
             )
         ),
+        # A profile's entry is named as a module of the gateway's profile package, and once.
+        *(
+            pytest.param("coursework", {"request_profile": profile}, "request_profile", id=f"profile-{case}")
+            for case, profile in (
+                ("not-a-list", "reasoning_effort"),
+                ("not-a-module-name", ["Reasoning-Effort"]),
+                ("a-dotted-name", ["os.path"]),
+                ("not-text", [1]),
+                ("an-entry-twice", ["documents", "documents"]),
+            )
+        ),
+        *(
+            pytest.param("coursework", {"reasoning_effort": mapping}, "reasoning_effort", id=f"effort-{case}")
+            for case, mapping in (
+                ("not-a-table", ["high", "xhigh"]),
+                ("a-value-not-text", {"high": 3}),
+                ("an-empty-value", {"high": ""}),
+            )
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -309,6 +328,25 @@ def test_a_vllm_pools_serving_settings_are_optional_and_default_to_what_vllm_doe
         assert (pool.kv_cache_bits, pool.prefix_caching) == (16, True)
         assert (pool.step_budget_tokens, pool.histogram_buckets, pool.draft_head_tokens) == (None, None, None)
     # A precision other than 8 or 16 bits is refused, by the pool's name and the field: `test_refusals`.
+
+
+def test_a_pools_request_profile_and_effort_mapping_parse_as_written() -> None:
+    # Neither name is sorted first: the order is the entry's own.
+    profile = ["system_messages", "reasoning_effort", "documents"]
+    mapping = {"low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+    (pool,) = parse_pools(
+        {"coursework": changed(COURSEWORK, {"request_profile": profile, "reasoning_effort": mapping})}
+    )
+    assert pool.request_profile == ("system_messages", "reasoning_effort", "documents")
+    assert pool.reasoning_effort == mapping
+    # The entry the deployment writes for the gateway reads back the same.
+    assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+
+    # Left out, as in every entry written before the fields: an empty profile and no mapping.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert (pool.request_profile, pool.reasoning_effort) == ((), None)
+        assert parse_pools({name: pool_entry(pool)}) == (pool,)
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A
