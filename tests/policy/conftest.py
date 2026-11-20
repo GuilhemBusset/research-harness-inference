@@ -15,7 +15,8 @@ file imports nothing from here:
 - `created_by`: for every resource of those templates, by `(template path, logical ID)`, the name
   of the acknowledgement file of the module that created it (`acknowledged/README.md`);
 - `module_names`: the name every module of `src/rhi/` gives its acknowledgement file;
-- `acknowledged` and `acknowledged_folder`: the files of `acknowledged/`, read, and the folder;
+- `acknowledged` and `acknowledged_folder`: the files of `acknowledged/`, read for the example
+  configuration (`for_pools`), and the folder;
 - `cdk`, `read_app` and `read_acknowledged`: the CDK library and the two readers, for a test that
   builds its own app or its own folder to show that a check can fail.
 """
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 REPO = Path(__file__).resolve().parents[2]
 SOURCE = REPO / "src" / "rhi"
 ACKNOWLEDGED = Path(__file__).resolve().parent / "acknowledged"
+# In the key of a `[nag]` entry, the place of a pool's name (`acknowledged/README.md`).
+POOL = "<pool>"
 
 Templates = dict[str, dict[str, Any]]
 CreatedBy = dict[tuple[str, str], str]
@@ -106,6 +109,20 @@ def read_folder(folder: Path) -> dict[str, dict[str, Any]]:
     return {path.stem: tomllib.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("*.toml"))}
 
 
+def for_pools(tables: dict[str, Any], pools: list[str]) -> dict[str, Any]:
+    """A file's tables as they hold for a configuration's pools. A `[nag]` key that holds `POOL`
+    lists its finding once for each pool, under the key with the pool's name in its place, and
+    nothing where there is no pool (`acknowledged/README.md`)."""
+    if "nag" not in tables:
+        return tables
+    nag = {
+        finding: reason
+        for key, reason in tables["nag"].items()
+        for finding in ([key.replace(POOL, pool) for pool in pools] if POOL in key else [key])
+    }
+    return tables | {"nag": nag}
+
+
 @pytest.fixture(scope="session")
 def cdk() -> ModuleType:
     """The CDK library, `aws_cdk`. A test file does not import it at its top: this import starts
@@ -164,9 +181,11 @@ def acknowledged_folder() -> Path:
 
 @pytest.fixture(scope="session")
 def acknowledged() -> dict[str, dict[str, Any]]:
-    """The tables of every acknowledgement file, by module name. `test_acknowledged.py` holds
-    the files to their format."""
-    return read_folder(ACKNOWLEDGED)
+    """The tables of every acknowledgement file, by module name, for the pools of the example
+    configuration the app is synthesized from (`for_pools`). `test_acknowledged.py` holds the
+    files to their format."""
+    pools = [pool.name for pool in config.load({"RHI_CONFIG": "example"}).pools]
+    return {module: for_pools(tables, pools) for module, tables in read_folder(ACKNOWLEDGED).items()}
 
 
 @pytest.fixture(scope="session")

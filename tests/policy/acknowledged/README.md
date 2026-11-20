@@ -41,9 +41,8 @@ A file has at most two tables, and no other key:
   resource brings a finding that holds the pool's name, and no file here names the pools of a
   deployed configuration. A key that holds `<pool>` in place of the name
   (`...:log-group:/rhi/pools/<pool>:*]`) lists that finding for each pool of the configuration,
-  and for no other name. The example's pool keeps an entry under its own name beside it, with the
-  same reason: `test_nag_acknowledgements.py` holds the example's templates to the ids as cdk-nag
-  writes them.
+  and for no other name, in the app (`src/rhi/nag.py`) and in the tests that read these files
+  (`conftest.py`, `for_pools`).
 - `[wildcard_actions]`: a key is one IAM action that AWS grants only on every resource
   (`ec2:DescribeInstances`, `ecr:GetAuthorizationToken`, `cloudwatch:PutMetricData`). The key is
   the action as the policy statement writes it. `*`, every action, is never accepted.
