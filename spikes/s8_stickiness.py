@@ -26,10 +26,13 @@ alone moves it (section 5.1).
    one of them has to move. Then each student in turn sends the number of requests it is given, one
    after another, continuing the conversation its first request began, and the job reads how many
    of them each instance served. A student's first request counts among its requests of the phase
-   (`with_openings`): its sent number is one more than it was given. Both instances must still be
-   in service when the phase ends, and the scaler's note must still ask for both; if one has left,
-   or is leaving, the run is not measured (`Departed`), since a student moved by a departure did
-   not leave an instance that was there. The phase ends `SETTLE_SECONDS` after the last request,
+   (`with_openings`): its sent number is one more than it was given. Exactly the two instances must
+   still be in service when the phase ends, the scaler's note must still ask for both, and no other
+   instance may have served a request of the phase; if one has left, or is leaving, or a third
+   joined, the run is not measured (`Departed`), since a student moved by a departure did not leave
+   an instance that was there, and one on a third instance is not on the two whose zones were
+   recorded. The scaler's gauge is read fresh across the gap between two of its runs
+   (`FRESH_SECONDS`), so the wait for its next sample is not a departure. The phase ends `SETTLE_SECONDS` after the last request,
    and the scaler asks Auto Scaling for fewer instances before it writes its note, so a scale-in
    the scaler began while a student's requests were sent shows at the phase's end.
    When a student's requests were split, the job looks again every `POLL_SECONDS` for
@@ -158,9 +161,16 @@ INSTANCES = 2
 # The two measured students: the first two canary keys. The load runs as the others.
 STUDENTS = (1, 2)
 # Seconds. The node's collector scrapes every 15 seconds and writes to the workspace after; a window
-# is read this long after its last request, and a series is fresh when its last sample is this recent.
+# is read this long after its last request.
 SETTLE_SECONDS = 90
-FRESH_SECONDS = 60
+# Seconds. The scaler runs once a minute, and its gauge's sample carries the run's start and reaches
+# the workspace when the run sends it, within the function's 50-second timeout
+# (`src/rhi/pools/scaler.py`): its last sample may be 110 seconds old with every run on time.
+SCALER_PERIOD_SECONDS = 60
+SCALER_RUN_SECONDS = 50
+# Seconds. A series is fresh when its last sample is this recent: the scaler's gauge between two of
+# its runs, with a margin, and a collector's after several of its scrapes.
+FRESH_SECONDS = SCALER_PERIOD_SECONDS + SCALER_RUN_SECONDS + 10
 POLL_SECONDS = 30
 # Seconds. The scaler adds an instance after 60 seconds above target, and the mock starts in about
 # a minute; it removes one after 10 idle minutes and 15 since the scale-out (section 5.1).
@@ -370,7 +380,8 @@ class Disturbed(RuntimeError):
 
 
 class Departed(RuntimeError):
-    """An instance left, or began to leave, while the phase before the departure was measured."""
+    """The pool changed while a phase was measured: an instance left, or began to leave, another
+    joined, or one that is not among the phase's instances served a measured request."""
 
 
 class NotExercised(RuntimeError):
@@ -710,13 +721,16 @@ class Run:
         return with_openings(window, counts, kept)
 
     def _in_service(self, instances: set[str], phase: Phase) -> None:
-        """`Departed` unless every one of `instances` is still in service, none of them leaving."""
+        """`Departed` unless exactly `instances` are still in service, none of them leaving: another
+        in service is another target the phase's requests could have reached."""
         try:
             present = self.pool.present()
         except (Leaving, Unseen) as changing:
             raise Departed(f"an instance began to leave during the phase {phase}") from changing
         if not instances <= present:
             raise Departed(f"an instance left during the phase {phase}")
+        if present != instances:
+            raise Departed(f"{len(present) - len(instances)} more instance(s) in service during the phase {phase}")
 
     def _recheck(self, instances: set[str], phase: Phase) -> None:
         """After a split in `phase`, at whose end `instances` were in service and the scaler asked
@@ -744,6 +758,8 @@ class Run:
             self._gateway_holds()
             counts = asyncio.run(self.phase(first_at_once=first_at_once))
             self._in_service(in_service, phase)
+            if any(set(held.served) - in_service for held in counts.values()):
+                raise Departed(f"an instance other than the phase's served a request in the phase {phase}")
             if any(held.most_served < held.sent for held in counts.values()):
                 # A split is a failure only if no instance was leaving: look again once a departure
                 # that began during the phase has had time to show in the workspace.
@@ -778,8 +794,6 @@ class Run:
             raise RuntimeError("the instance that remains is not one of the two measured")
         print("one instance remains")
         after = self.measured(Phase.AFTER, first_at_once=False, in_service=remaining)
-        if any(set(counts.served) - remaining for counts in after.values()):
-            raise RuntimeError("an instance other than the remaining one served after the departure")
         (stayed,) = remaining
         for student in STUDENTS:
             on = instance_of(before[student])
