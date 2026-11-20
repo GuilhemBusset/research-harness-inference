@@ -164,7 +164,7 @@ def test_the_settings_name_every_pool_s_group_and_target_group_and_read(
     settings = parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
 
     assert [pool.config for pool in settings.pools] == list(EXAMPLE.pools)
-    assert [pool.config.name for pool in settings.pools] == ["mock"]
+    assert [pool.config.name for pool in settings.pools] == ["coursework", "mock"]
     groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
     for pool in settings.pools:
         group = groups[pool.group.removeprefix("ref:")]

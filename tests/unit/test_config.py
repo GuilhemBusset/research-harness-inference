@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import re
 import tomllib
 import traceback
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from rhi import config
+from rhi_common.pool_config import ExpectedValues
 
 EXAMPLE = config.REPO_ROOT / "config.example.toml"
 
@@ -49,19 +51,19 @@ GATEWAY_KEYS = {
 }
 
 
-# A pool's table in the example: its header and its lines up to the next header or the end.
-POOL_TABLE = re.compile(r"^\[pools\.[^\]\n]+\]\n(?:[^\[\n].*\n|\n)*", re.MULTILINE)
+# The pools' tables in the example: from the first pool's header to the end of the file.
+POOL_TABLES = re.compile(r"^\[pools\..*", re.MULTILINE | re.DOTALL)
 
 
 def example_with(**lines: str | None) -> str:
     """The example's text with the value of each named key replaced, or the key removed (None).
-    The pools are tables, `[pools.<name>]`, at the end: `pools` removes them, and a value given
+    The pools are tables, `[pools.<name>]`, at the end: `pools` removes them all, and a value given
     for it is written after the other keys."""
     text = EXAMPLE.read_text(encoding="utf-8")
     for key, value in lines.items():
         line = "" if value is None else f"{key} = {value}\n"
         if key == "pools":
-            text, count = POOL_TABLE.subn("", text)
+            text, count = POOL_TABLES.subn("", text)
             text = line + text
         else:
             text, count = re.subn(rf"^{key} = .*\n", line, text, flags=re.MULTILINE)
@@ -100,7 +102,7 @@ def test_the_two_sources_give_the_same_typed_object(tmp_path: Path) -> None:
     assert type(from_example.monthly_budget_usd) is int
     assert type(from_example.course_end) is datetime.date
     assert from_example.session_windows == ()
-    assert [pool.name for pool in from_example.pools] == ["mock"]
+    assert [pool.name for pool in from_example.pools] == ["coursework", "mock"]
     # The file source reads its own file, not the example.
     assert load_text(tmp_path, example_with(github_owner='"another-owner"')).github_owner == "another-owner"
 
@@ -324,9 +326,8 @@ def test_only_the_owners_keys_are_required(tmp_path: Path, monkeypatch: pytest.M
     assert {field.name for field in dataclasses.fields(config.Config)} == set(config.KEYS)
 
     # A valid pool entry is accepted, as a table or inline; a session window is not, in either spelling.
-    inline = "{ mock = { " + ", ".join(f"{field} = {value}" for field, value in MOCK_LINES) + " } }"
-    for text in (example_with(), example_with(pools=inline)):
-        assert [pool.name for pool in load_text(tmp_path, text).pools] == ["mock"]
+    assert [pool.name for pool in load_text(tmp_path, example_with()).pools] == ["coursework", "mock"]
+    assert [pool.name for pool in load_text(tmp_path, with_the_mock_pool_alone()).pools] == ["mock"]
     for text in (example_with(session_windows=f'[{{ name = "entry{MARK}" }}]'),
                  example_with(session_windows=None) + f'[[session_windows]]\nname = "entry{MARK}"\n'):
         message = refusal(tmp_path, text)
@@ -384,28 +385,68 @@ MOCK_LINES = (
 
 
 def with_a_second_pool(text: str) -> str:
-    """The text with a second pool, `second`, the mock's copy."""
+    """The text with one more pool, `second`, the mock's copy."""
     return text + "\n[pools.second]\n" + "".join(f"{field} = {value}\n" for field, value in MOCK_LINES)
+
+
+def with_the_mock_pool_alone(**lines: str | None) -> str:
+    """The example's text with the mock as its only pool, written inline, and `example_with`'s changes.
+    The default pool is the mock unless `default_pool` is given."""
+    inline = "{ mock = { " + ", ".join(f"{field} = {value}" for field, value in MOCK_LINES) + " } }"
+    return example_with(**{"pools": inline, "default_pool": '"mock"', **lines})
 
 
 def test_the_example_holds_the_mock_pool() -> None:
     loaded = config.load({"RHI_CONFIG": "example"})
-    (mock,) = loaded.pools
+    mock = next(pool for pool in loaded.pools if pool.name == "mock")
     assert (mock.name, mock.engine, mock.instance_types) == ("mock", "mock", ("t4g.small",))
     assert mock.prices == {"t4g.small": 0.02}
     assert (mock.wake, mock.max_instances, mock.warm_instances, mock.target_concurrency) == ("on-demand", 2, 1, 8)
     assert (mock.context_length, mock.largest_output) == (262144, 32000)
     assert (mock.expected, mock.measured_start_seconds) == (None, None)
-    assert (loaded.allowed_instance_types, loaded.on_demand_price_limit) == (("t4g.small",), 5)
-    assert loaded.default_pool == "mock"
-    # The pools are those the example's lines give, parsed.
-    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["pools"] == {
-        "mock": {field: tomllib.loads(f"v = {value}")["v"] for field, value in MOCK_LINES}
+    assert (loaded.allowed_instance_types, loaded.on_demand_price_limit) == (("t4g.small", "g7e.2xlarge"), 5)
+    # The mock pool is the one the lines above give, parsed.
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["pools"]["mock"] == {
+        field: tomllib.loads(f"v = {value}")["v"] for field, value in MOCK_LINES
     }
 
 
+def test_the_example_coursework_pool() -> None:
+    # The first GPU pool, and the default pool (system design, sections 4.2 and 17).
+    loaded = config.load({"RHI_CONFIG": "example"})
+    coursework = next(pool for pool in loaded.pools if pool.name == "coursework")
+    manifest = json.loads(
+        (config.REPO_ROOT / "models/manifests/qwen--qwen3.8-27b-fp8.json").read_text(encoding="utf-8")
+    )
+    assert (coursework.engine, coursework.model) == ("vllm", "Qwen/Qwen3.8-27B-FP8")
+    assert (coursework.model, coursework.revision) == (manifest["repository"], manifest["revision"])
+    # One 96 GB GPU, with no fallback type, at its price of evidence E5.
+    assert (coursework.instance_types, coursework.prices) == (("g7e.2xlarge",), {"g7e.2xlarge": 3.36})
+    assert "g7e.2xlarge" in loaded.allowed_instance_types
+    assert (coursework.max_instances, coursework.warm_instances, coursework.wake) == (2, 2, "on-demand")
+    assert (coursework.target_concurrency, coursework.gpu_hours_per_day) == (8, 16)
+    assert (coursework.hold_seconds, coursework.idle_minutes, coursework.drain_seconds) == (420, 20, 300)
+    assert (coursework.context_length, coursework.largest_output) == (262144, 32000)
+    # The estimates of section 4.7, and no measured start until spike S1 has one.
+    assert coursework.expected == ExpectedValues(
+        stream_tokens_per_second=(15, 22), time_to_first_token_seconds=(0.3, 1.5), cache_tokens=(1_100_000, 1_800_000)
+    )
+    assert coursework.measured_start_seconds is None
+    # The serving settings of section 4.2, and no exception for model code.
+    assert (coursework.kv_cache_bits, coursework.prefix_caching, coursework.step_budget_tokens) == (8, True, 8192)
+    assert (coursework.tool_call_parser, coursework.reasoning_parser) == ("qwen3_coder", "qwen3")
+    assert coursework.trust_remote_code is False
+    # vLLM's own boundaries put 0.025 alone between 22 and 50 ms, which makes two buckets of that
+    # range (section 7.2; evidence E3). Two boundaries or more inside it make three or more.
+    assert coursework.histogram_buckets is not None
+    boundaries = coursework.histogram_buckets.inter_token_latency or ()
+    assert len([boundary for boundary in boundaries if 0.022 < boundary < 0.05]) >= 2
+    # The gateway sends `claude-*` model names to the default pool (section 6.2, step 4).
+    assert loaded.default_pool == "coursework"
+
+
 def test_the_three_pool_keys_default_from_the_only_pool(tmp_path: Path) -> None:
-    text = example_with(allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
+    text = with_the_mock_pool_alone(allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
     loaded = load_text(tmp_path, text)
     assert loaded.default_pool == "mock"
     assert loaded.allowed_instance_types == ("t4g.small",)
@@ -423,11 +464,11 @@ def test_an_empty_pools_table_needs_no_new_key(tmp_path: Path) -> None:
 
 
 def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
-    wider = load_text(tmp_path, example_with(allowed_instance_types='["t4g.small", "g7e.2xlarge"]'))
-    assert wider.allowed_instance_types == ("t4g.small", "g7e.2xlarge")
-    two = load_text(tmp_path, with_a_second_pool(example_with(default_pool='"second"')))
-    assert ([pool.name for pool in two.pools], two.default_pool) == (["mock", "second"], "second")
-    assert load_text(tmp_path, example_with(on_demand_price_limit="0.5")).on_demand_price_limit == 0.5
+    wider = load_text(tmp_path, example_with(allowed_instance_types='["t4g.small", "g7e.2xlarge", "g7e.4xlarge"]'))
+    assert wider.allowed_instance_types == ("t4g.small", "g7e.2xlarge", "g7e.4xlarge")
+    more = load_text(tmp_path, with_a_second_pool(example_with(default_pool='"second"')))
+    assert ([pool.name for pool in more.pools], more.default_pool) == (["coursework", "mock", "second"], "second")
+    assert load_text(tmp_path, example_with(on_demand_price_limit="4.5")).on_demand_price_limit == 4.5
 
 
 @pytest.mark.parametrize(
@@ -435,7 +476,7 @@ def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
     [
         pytest.param(example_with(default_pool=f'"pool{MARK}"'), "default_pool", id="default-names-no-pool"),
         pytest.param(example_with(pools="{}", default_pool=f'"pool{MARK}"'), "default_pool", id="default-with-no-pool"),
-        pytest.param(with_a_second_pool(example_with(default_pool=None)), "default_pool", id="two-pools-no-default"),
+        pytest.param(example_with(default_pool=None), "default_pool", id="two-pools-no-default"),
         pytest.param(
             example_with(allowed_instance_types=f'["t{MARK}.small"]'), "allowed_instance_types", id="not-allowed"
         ),

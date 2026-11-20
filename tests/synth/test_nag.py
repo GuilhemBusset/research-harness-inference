@@ -194,7 +194,7 @@ def test_an_entry_for_a_pool_lists_the_finding_of_each_configured_pool_and_of_no
     from rhi.stage import EndpointStage
 
     example = config.load({"RHI_CONFIG": "example"})
-    (mock,) = example.pools
+    mock = next(pool for pool in example.pools if pool.name == "mock")
     pools = tuple(dataclasses.replace(mock, name=name) for name in ("first", "second"))
     configured = dataclasses.replace(example, pools=pools, default_pool="first")
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}

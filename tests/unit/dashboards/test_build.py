@@ -95,9 +95,9 @@ def example() -> rhi_config.Config:
 
 @pytest.fixture
 def two_pools(example: rhi_config.Config) -> rhi_config.Config:
-    """The example configuration with a second pool of the first one's engine."""
-    first = example.pools[0]
-    return dataclasses.replace(example, pools=(first, dataclasses.replace(first, name="second")))
+    """The example configuration with two pools: its mock pool, and a second one of the same engine."""
+    mock = next(pool for pool in example.pools if pool.name == "mock")
+    return dataclasses.replace(example, pools=(mock, dataclasses.replace(mock, name="second")))
 
 
 @pytest.fixture
@@ -322,7 +322,7 @@ def test_every_dashboard_follows_the_rules(
 
 
 def test_a_query_names_a_fixed_data_source_and_the_row_of_its_pools_engine(example: rhi_config.Config) -> None:
-    pool = example.pools[0]
+    pool = next(pool for pool in example.pools if pool.name == "mock")
     requests = [rules.EmittedBy("rhi_gateway_student_requests", "services/gateway/rhi_gateway/metrics.py")]
     expression = rules.rate("rhi_gateway_student_requests_total")
 

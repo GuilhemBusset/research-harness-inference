@@ -25,12 +25,18 @@ if TYPE_CHECKING:
     from rhi_common.pool_config import Pool
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(MOCK,) = EXAMPLE.pools
+MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 IMAGE_PARAMETER = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
 
 
 def of_type(template: Mapping[str, Any], kind: str) -> dict[str, dict[str, Any]]:
     return {name: r["Properties"] for name, r in template["Resources"].items() if r["Type"] == kind}
+
+
+def of_mock(template: Mapping[str, Any], kind: str) -> dict[str, dict[str, Any]]:
+    """The resources of a kind that the mock pool's constructs created. The example holds a GPU
+    pool too, and a pool's constructs are named after it, so its logical IDs hold its name."""
+    return {name: properties for name, properties in of_type(template, kind).items() if MOCK.name in name}
 
 
 @pytest.fixture(scope="module")
@@ -43,12 +49,12 @@ def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any
 
 @pytest.fixture(scope="module")
 def group(pools: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    (found,) = of_type(pools, "AWS::AutoScaling::AutoScalingGroup").items()
+    (found,) = of_mock(pools, "AWS::AutoScaling::AutoScalingGroup").items()
     return found
 
 
 def test_the_mock_pool_launch_template(pools: dict[str, Any]) -> None:
-    (template,) = of_type(pools, "AWS::EC2::LaunchTemplate").values()
+    (template,) = of_mock(pools, "AWS::EC2::LaunchTemplate").values()
     data = template["LaunchTemplateData"]
     assert data["MetadataOptions"] == {"HttpTokens": "required", "InstanceMetadataTags": "enabled"}
     assert "KeyName" not in data
@@ -67,7 +73,7 @@ def test_the_mock_pool_launch_template(pools: dict[str, Any]) -> None:
 
 
 def test_the_mock_image_is_read_from_the_public_parameter_at_deployment(pools: dict[str, Any]) -> None:
-    (template,) = of_type(pools, "AWS::EC2::LaunchTemplate").values()
+    (template,) = of_mock(pools, "AWS::EC2::LaunchTemplate").values()
     parameter = template["LaunchTemplateData"]["ImageId"]["Ref"]
     assert pools["Parameters"][parameter] == {
         "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
@@ -86,7 +92,7 @@ def test_the_mock_pool_group(pools: dict[str, Any], group: tuple[str, dict[str, 
     subnets = [subnet["Fn::ImportValue"] for subnet in properties["VPCZoneIdentifier"]]
     assert len(subnets) == 3
     assert all(f"PrivateSubnet{zone}" in subnet for zone, subnet in enumerate(subnets, start=1))
-    (target_group,) = of_type(pools, "AWS::ElasticLoadBalancingV2::TargetGroup")
+    (target_group,) = of_mock(pools, "AWS::ElasticLoadBalancingV2::TargetGroup")
     assert properties["TargetGroupARNs"] == [{"Ref": target_group}]
     assert of_type(pools, "AWS::AutoScaling::ScalingPolicy") == {}
 
@@ -95,7 +101,7 @@ def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
     pools: dict[str, Any], group: tuple[str, dict[str, Any]]
 ) -> None:
     name, _ = group
-    (suspend,) = of_type(pools, "Custom::AWS").values()
+    (suspend,) = of_mock(pools, "Custom::AWS").values()
     for event in ("Create", "Update"):
         parts = suspend[event]["Fn::Join"][1]
         call = json.loads("".join(part if isinstance(part, str) else "NAME" for part in parts))
@@ -107,7 +113,7 @@ def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
 
 def test_the_mock_pool_warm_pool(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
     name, _ = group
-    (warm_pool,) = of_type(pools, "AWS::AutoScaling::WarmPool").values()
+    (warm_pool,) = of_mock(pools, "AWS::AutoScaling::WarmPool").values()
     assert warm_pool["AutoScalingGroupName"] == {"Ref": name}
     assert warm_pool["PoolState"] == "Stopped"
     assert warm_pool["MaxGroupPreparedCapacity"] == MOCK.warm_instances == 1
@@ -117,7 +123,7 @@ def test_the_mock_pool_warm_pool(pools: dict[str, Any], group: tuple[str, dict[s
 
 def test_the_mock_pool_nightly_stop(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
     name, _ = group
-    (action,) = of_type(pools, "AWS::AutoScaling::ScheduledAction").values()
+    (action,) = of_mock(pools, "AWS::AutoScaling::ScheduledAction").values()
     assert action["AutoScalingGroupName"] == {"Ref": name}
     assert EXAMPLE.nightly_stop == "02:00"
     assert action["Recurrence"] == "0 2 * * *"

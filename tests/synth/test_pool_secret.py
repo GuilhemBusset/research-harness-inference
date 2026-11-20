@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import aws_cdk as cdk
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(MOCK,) = EXAMPLE.pools
+MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 SECRET = "AWS::SecretsManager::Secret"
 SECRET_READS = {"secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"}
 
@@ -95,7 +95,10 @@ def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any
 
 
 def test_one_generated_secret_for_the_mock_pool_exposed_by_the_stack(app: cdk.App, pools: dict[str, Any]) -> None:
-    ((name, secret),) = of_type(pools, SECRET).items()
+    # One secret for each pool of the example; the mock pool's is read here.
+    secrets = of_type(pools, SECRET)
+    assert sorted(pool_of(secret) for secret in secrets.values()) == sorted(pool.name for pool in EXAMPLE.pools)
+    ((name, secret),) = [found for found in secrets.items() if pool_of(found[1]) == "mock"]
     assert secret["Name"] == "/rhi/pools/mock/bearer"
     assert pool_of(secret) == "mock"
     generated = secret["GenerateSecretString"]

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     Template = Mapping[str, Any]
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(MOCK,) = EXAMPLE.pools
+MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 GPU_POOLS = ("coursework", "upgrade")
 # The bucket's name and its ARN, as a template of an environment-agnostic stack writes them.
 ACCOUNT, REGION = "${AWS::AccountId}", "${AWS::Region}"

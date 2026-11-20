@@ -383,10 +383,10 @@ def test_the_role_names_the_workspace_and_the_stage_s_log_groups_only(templates:
     assert set(logs["Action"]) == LOG_ACTIONS
 
     # The log groups, each by its own name and none by a pattern: the gateway's, the scaler's, the
-    # issuer's and that of the example's one pool.
-    assert [pool.name for pool in EXAMPLE.pools] == ["mock"]
+    # issuer's and that of each of the example's pools.
+    assert [pool.name for pool in EXAMPLE.pools] == ["coursework", "mock"]
     named = log_groups_named(template)
-    assert named == SERVICE_LOG_GROUPS | {"/rhi/pools/mock"}
+    assert named == SERVICE_LOG_GROUPS | {"/rhi/pools/coursework", "/rhi/pools/mock"}
     # Each is the name of a log group the stage creates. Grafana's own is not among them.
     created = {
         group["LogGroupName"]
@@ -404,7 +404,7 @@ def test_the_role_names_the_log_group_of_each_configured_pool(tmp_path: Path) ->
 
     from rhi.stage import EndpointStage
 
-    (mock,) = EXAMPLE.pools
+    mock = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
     pools = (dataclasses.replace(mock, name="first"), dataclasses.replace(mock, name="second"))
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
     app = cdk.App(outdir=str(tmp_path), context=context, analytics_reporting=False)
