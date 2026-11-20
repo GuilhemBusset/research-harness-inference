@@ -8,6 +8,7 @@ from the module. The revision is made when the test runs and names no real commi
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from typing import TYPE_CHECKING
@@ -105,8 +106,10 @@ def options(arguments: list[str]) -> list[str]:
 
 
 def values(arguments: list[str], option: str) -> list[str]:
-    """What follows an option, up to the next one."""
-    (at,) = [index for index, argument in enumerate(arguments) if argument == option]
+    """What an option is given: what follows `=` in its own argument, or what follows it up to the next option."""
+    (at,) = [index for index, argument in enumerate(arguments) if argument.split("=", 1)[0] == option]
+    if arguments[at] != option:
+        return [arguments[at].split("=", 1)[1]]
     following = arguments[at + 1 :]
     return following[: next((i for i, argument in enumerate(following) if argument.startswith("-")), len(following))]
 
@@ -142,7 +145,7 @@ def test_the_model_is_read_from_the_pools_prefix_at_its_revision_by_the_streamer
     other = vllm_command.arguments(pool({"revision": other_revision}, name="other-model"), bucket="another-bucket")
     assert other[0] == f"s3://another-bucket/other-model/{other_revision}/"
     # The served name is the pool's; nothing else follows the pool, its revision or the bucket.
-    assert [a for a in other[1:] if a != "other-model"] == [a for a in arguments[1:] if a != "coursework"]
+    assert [a.replace("other-model", "coursework") for a in other[1:]] == arguments[1:]
     # The model repository's name is Hugging Face's, which the engine never calls.
     assert not any("example/model" in argument for argument in arguments)
 
@@ -193,10 +196,17 @@ def test_the_serving_settings_of_the_coursework_pool_reach_the_command() -> None
 
 
 def test_the_engine_serves_the_model_under_the_pools_name() -> None:
-    for name in ("coursework", "upgrade"):
+    # As vLLM declares the option: a list of names, so one value or more.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--served-model-name", nargs="+")
+    # Every name the configuration accepts, and it accepts one that starts with a hyphen or is all hyphens.
+    for name in ("coursework", "upgrade", "-coursework", "--", "-1"):
         arguments = vllm_command.arguments(pool(SECTION_4_2, name=name), bucket=BUCKET)
         # The name students choose the pool by, which the gateway forwards: never the model's location.
         assert values(arguments, "--served-model-name") == [name]
+        # The name reaches vLLM as the option's value, and is not read as another option.
+        served, _ = parser.parse_known_args(arguments)
+        assert served.served_model_name == [name]
 
 
 def test_a_serving_setting_left_at_its_default_adds_no_flag() -> None:
