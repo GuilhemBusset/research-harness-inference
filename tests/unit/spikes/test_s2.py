@@ -6,13 +6,16 @@ are local fakes; no number is a measurement.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import json
 import re
 import subprocess
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,7 +27,8 @@ import s2_client_hold as s2
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
 from rhi_common.spike_keys import SpikeKeys
-from rhi_reporter.measure import Verdict, measurement_event
+from rhi_mock_engine.app import _responses_events, _turn
+from rhi_reporter.measure import Run, Verdict, measurement_event
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -61,10 +65,21 @@ def test_a_client_aborting_with_the_profile_fails(pair: tuple[s2.Client, s2.Kind
     assert s2.SPIKE.verdict(s2.numbers_of(holds({pair, (Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)) is Verdict.FAIL
 
 
-def test_the_record_is_pending_with_a_line_per_row_and_one_per_client_for_the_402() -> None:
-    text = RECORD.read_text(encoding="utf-8")
-    assert re.search(r'^verdict = "pending"$', text, flags=re.MULTILINE)
-    assert "[[runs]]" not in text
+def assert_a_record_of_s2(text: str) -> None:
+    """A record of S2: pending until a run is in, a line per row and one per client for the 402,
+    and each row of a run labelled with the client, its version and the kind of call."""
+    data = tomllib.loads(text.split("+++")[1])
+    runs, rows = data.get("runs", []), data.get("rows", [])
+    if not runs:
+        assert data["verdict"] == "pending"
+    for run in runs:
+        if run["verdict"] != "pending":
+            assert sorted(row["name"] for row in rows if row["labels"]["run"] == run["run"]) == sorted(s2.Number)
+    for row in rows:
+        client = next(client for client in Client if row["name"].startswith(f"{client}_"))
+        assert row["labels"]["client"] == client and row["labels"]["version"], row
+        if not row["name"].startswith(f"{client}_402_"):
+            assert row["labels"]["call"] == row["name"].removeprefix(f"{client}_").split("_")[0], row
     lines = text.splitlines()
     for name in s2.Number:
         assert any(f"`{name}`" in line for line in lines), name
@@ -78,6 +93,33 @@ def test_the_record_is_pending_with_a_line_per_row_and_one_per_client_for_the_40
         client = Client(line.split("`")[1])
         assert f"`{s2.shown_402(client)}`" in line
         assert VERSIONS[s2.VERSION_OF[client]] in line
+
+
+def test_the_record_is_pending_with_a_line_per_row_and_one_per_client_for_the_402() -> None:
+    text = RECORD.read_text(encoding="utf-8")
+    assert_a_record_of_s2(text)
+    if "[[runs]]" not in text:
+        assert re.search(r'^verdict = "pending"$', text, flags=re.MULTILINE)
+
+
+def test_the_record_still_reads_once_a_run_is_written_into_it() -> None:
+    # The run as `tools/measurements/record.py` writes it, then labelled as the record's steps say.
+    spec = importlib.util.spec_from_file_location("record", RECORD.parents[2] / "tools" / "measurements" / "record.py")
+    assert spec is not None and spec.loader is not None
+    record = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(record)
+    data, prose = record.read(RECORD.read_text(encoding="utf-8"))
+    numbers = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
+    units = {name: "s" if name.endswith("_seconds_before_giving_up") else "count" for name in numbers}
+    run = Run("S2", "s2-client-hold", s2.SPIKE.verdict(numbers), numbers)
+    record.with_run(data, run, date(2026, 11, 20), "a" * 40, units)
+    for row in data["rows"]:
+        client = next(client for client in Client if row["name"].startswith(f"{client}_"))
+        call = row["name"].removeprefix(f"{client}_").split("_")[0]
+        row["labels"] |= {"client": client.value, "version": VERSIONS[s2.VERSION_OF[client]], "call": call}
+    data["verdict"] = record.verdict_of([run["verdict"] for run in data["runs"]])
+    assert data["verdict"] == "pass"
+    assert_a_record_of_s2(record.written(data) + prose)
 
 
 def test_the_harnesses_are_pinned(tmp_path: Path) -> None:
@@ -296,6 +338,19 @@ def test_the_forwarder_records_when_a_client_gives_up() -> None:
     assert dropped.closed_at - dropped.sent_at < 0.4
 
 
+def test_the_forwarder_sees_a_whole_responses_stream_end_in_one_read() -> None:
+    # The mock's Responses stream, whose last event is longer than any one event name.
+    body = {"model": "mock", "input": "Reply with one word.", "stream": True}
+    payload = b"".join(frame.data for frame in _responses_events(_turn(body, None, (), 0), body))
+    for gateway in serving(lambda path: (200, [payload], 0.01)):
+        with s2.Forwarder(gateway.url, "mock") as forwarder:
+            request = urllib.request.Request(f"{forwarder.url}/v1/responses", data=json.dumps(body).encode())
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                assert answer.read() == payload
+        (whole,) = forwarder.recorded()
+    assert whole.completed and whole.closed_at is None
+
+
 def test_a_client_s_home_is_what_rhi_login_writes(tmp_path: Path) -> None:
     key, endpoint = generate_key(), "http://127.0.0.1:8080"
     binaries = {harness.name: Path(f"/job/{harness.command}") for harness in harnesses.HARNESSES}
@@ -406,3 +461,41 @@ def test_a_run_repeats_a_hold_that_missed_and_aims_the_calls_at_the_measured_sta
     # The calls start 180 seconds after the wake: 400 measured, less 220.
     calls = [at for _, kind, at in started if kind is Kind.CALL]
     assert len(calls) == 2 and calls[0] - pool.woken[0] == 180.0
+
+
+class Refused(FakeClient):
+    """A client whose request the gateway refused at once, 400 `request_refused`."""
+
+    def __init__(self, pool: FakePool, client: s2.Client, kind: s2.Kind, key: str, prompt: str, spent: str) -> None:
+        self.pool, self.client, self.kind = pool, client, kind
+        self.marker, self.sent_at = prompt.split()[-1], pool.clock[0]
+
+    def done(self) -> bool:
+        return True
+
+    def result(self) -> s2.Attempt:
+        request = exchange(
+            self.client, self.kind, self.marker, sent_at=self.sent_at, status=Cause.REQUEST_REFUSED.status,
+            cause=Cause.REQUEST_REFUSED.value, ended_at=self.sent_at + 1,
+        )  # fmt: skip
+        return s2.Attempt(1, "", self.sent_at + 1, [request])
+
+
+def test_a_request_the_gateway_refused_is_not_a_hold() -> None:
+    clock = [0.0]
+    # Every cold start lasts just under 7 minutes, started by the other clients' requests.
+    pool = FakePool(clock, [400.0] * s2.ATTEMPTS)
+    keys = SpikeKeys(tuple(generate_key() for _ in Client), generate_key())
+
+    def start(client: s2.Client, kind: s2.Kind, key: str, prompt: str) -> s2.Started:
+        made = Refused if client is Client.CLAUDE_CODE else FakeClient
+        return made(pool, client, kind, key, prompt, keys.spent)
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    run = s2.Run(pool, s2.Deadlines(420, 240), start, keys, VERSIONS, clock=lambda: clock[0], sleep=sleep, log=print)
+    # Codex with its default timer, which gave up 300 seconds into a held stream, was measured on the
+    # first cold start; Claude Code, refused each time, never was.
+    with pytest.raises(s2.NotExercised, match="for claude_code$"):
+        run.holds(Kind.STREAM)
