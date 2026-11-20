@@ -43,6 +43,10 @@ src = [
 # The task spike S3 gives each harness, and its reference fix, are input to a harness, not this
 # project's code: the task is incomplete on purpose. ty.toml leaves the same two folders out.
 extend-exclude = ["spikes/s3_task", "spikes/s3_reference"]
+# The vLLM image's copy program for the fallback loader (section 4.4). Its folder is not a package
+# root, so it is not in `src`; `ruff check .` finds it, and naming it here keeps it in scope as
+# ty.toml does.
+extend-include = ["services/engine/vllm/fetch_model.py"]
 
 [lint]
 # The rules are Ruff 0.17.3's default selection (no `select`), less the `ignore` list below, so the

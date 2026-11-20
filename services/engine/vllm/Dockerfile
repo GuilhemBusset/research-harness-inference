@@ -2,8 +2,10 @@
 # vLLM image, which the pipeline builds into ECR so that an instance pulls it from the account's
 # own registry, by the digest its pool's release names.
 #
-# The build context is this folder and nothing else: this file, entrypoint.sh and VERSION. The
-# image holds no package of this project and installs nothing.
+# The build context is this folder and nothing else: this file, entrypoint.sh, fetch_model.py and
+# VERSION. The image holds no package of this project and installs nothing: fetch_model.py, the
+# fallback loader's copy (section 4.4), runs with the Python and the boto3 the upstream image
+# ships (boto3 comes with the Run:ai streamer's S3 extra, checked at the digest below).
 #
 # A pool's release carries the engine's flags as arguments and nothing else of the engine, so what
 # vLLM reads from its environment is set here, the same for every vllm pool.
@@ -24,6 +26,8 @@ ENV VLLM_NO_USAGE_STATS=1 \
     HF_HUB_OFFLINE=1
 
 COPY entrypoint.sh /usr/local/bin/rhi-entrypoint.sh
+# Beside the entry point, which runs it from its own folder for a pool on the fallback loader.
+COPY fetch_model.py /usr/local/bin/fetch_model.py
 
 # This project's entry point in place of upstream's `vllm serve`, which it ends by running. Exec
 # form, and the shell is named, so the file's mode does not matter; the image has no command of

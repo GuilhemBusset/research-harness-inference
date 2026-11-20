@@ -67,9 +67,8 @@ def recorded_version(text: str) -> tuple[int, ...]:
 def started(tmp_path: Path, arguments: list[str], **environ: str) -> tuple[subprocess.CompletedProcess[str], Path]:
     """The image's entry point with `arguments`, as the Dockerfile names it. `PATH` holds the
     stand-in and nothing else, so the entry point calls no other program."""
-    (copy,), (entry_point,) = the("COPY"), the("ENTRYPOINT")
-    script, in_the_image = copy.split()
-    assert (script, json.loads(entry_point)) == (ENTRY_POINT.name, ["/bin/sh", in_the_image])
+    copied, (entry_point,) = dict(copy.split() for copy in the("COPY")), the("ENTRYPOINT")
+    assert json.loads(entry_point) == ["/bin/sh", copied[ENTRY_POINT.name]]
     programs, record = tmp_path / "bin", tmp_path / "started"
     programs.mkdir()
     (programs / "vllm").write_text(STAND_IN, encoding="utf-8")
@@ -99,8 +98,8 @@ def test_the_base_is_upstream_vllm_by_digest_at_the_recorded_version() -> None:
             recorded_version(f"{below}\n")
 
 
-def test_the_build_context_holds_three_files() -> None:
-    assert sorted(path.name for path in IMAGE.iterdir()) == ["Dockerfile", "VERSION", "entrypoint.sh"]
+def test_the_build_context_holds_four_files() -> None:
+    assert sorted(path.name for path in IMAGE.iterdir()) == ["Dockerfile", "VERSION", "entrypoint.sh", "fetch_model.py"]
 
 
 def test_the_contract_environment() -> None:

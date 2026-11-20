@@ -45,6 +45,10 @@ the engine as vLLM runs by itself:
   Left out, it is None, and a family left out of it is None: vLLM's own boundaries.
 - `draft_head_tokens`, which turns the model's draft head on and is the number of tokens it
   proposes (section 4.7). Left out, it is None: no draft head.
+- `loader`, how the engine reads the model's weights (section 4.4): `stream`, with the Run:ai
+  streamer straight from S3, or `download`, a copy of the model to the instance's disk before vLLM
+  starts, which then loads it with its default loader (evidence E11; spike S4 compares the two).
+  Left out, it is `stream`.
 
 The mock engine reads none of them.
 
@@ -120,6 +124,11 @@ DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
 # class (sections 4.7 and 6.6). A pool that gives no scope has the first.
 CACHE_SALT_SCOPES = ("student", "class")
 DEFAULT_CACHE_SALT_SCOPE = "student"
+
+# How a vllm pool's engine reads the model's weights: streamed from S3, or copied to the instance's
+# disk first (section 4.4). A pool that gives no loader streams.
+LOADERS = ("stream", "download")
+DEFAULT_LOADER = "stream"
 
 # The keys of `expected`, each a low and a high bound (section 4.7).
 EXPECTED_KEYS = ("stream_tokens_per_second", "time_to_first_token_seconds", "cache_tokens")
@@ -230,6 +239,8 @@ class Pool:
     histogram_buckets: HistogramBuckets | None
     # The tokens the model's draft head proposes, or None when the head is off.
     draft_head_tokens: int | None
+    # How the engine reads the weights: `stream` from S3, or `download` to the disk first.
+    loader: str
     # The gateway's request profile for the pool: the names of its entries, in the order they
     # apply (section 6.2, step 4). Empty when the pool has none.
     request_profile: tuple[str, ...]
@@ -529,6 +540,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         draft_head_tokens=(
             _whole(name, entry, "draft_head_tokens", least=1) if "draft_head_tokens" in entry else None
         ),
+        loader=_choice(name, entry, "loader", LOADERS) if "loader" in entry else DEFAULT_LOADER,
         request_profile=_request_profile(name, entry),
         reasoning_effort=_reasoning_effort(name, entry),
         stickiness_seconds=_stickiness_seconds(name, entry),

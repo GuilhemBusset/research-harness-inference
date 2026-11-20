@@ -19,8 +19,9 @@ name each option in full and take its type and default from an attribute of a co
 
 - the model, first and by position: `model_tag` in `make_arg_parser`, which `ServeSubcommand.cmd`
   in `vllm/entrypoints/cli/serve.py` makes the model;
-- `--load-format runai_streamer`: `--load-format` in `EngineArgs.add_cli_args`, from
-  `LoadConfig.load_format` in `vllm/config/load.py`, which lists `runai_streamer`;
+- `--load-format runai_streamer`, for a pool on the streamer: `--load-format` in
+  `EngineArgs.add_cli_args`, from `LoadConfig.load_format` in `vllm/config/load.py`, which lists
+  `runai_streamer`. Left out, as for a pool on download, it is `auto`, vLLM's default loader;
 - `--port 8000`: `FrontendArgs.port`;
 - `--allowed-media-domains media.invalid`: `--allowed-media-domains` in `EngineArgs.add_cli_args`,
   from `ModelConfig.allowed_media_domains` in `vllm/config/model.py`, a list of domains;
@@ -96,8 +97,8 @@ reason, in `rhi_common.pool_config`):
   request profile maps the effort (section 6.2), where a unit test proves it without a GPU, and
   the engine must not map it a second time.
 
-**The model.** Weights load straight from S3 into GPU memory with the Run:ai streamer (section
-4.4). The model is the pool's prefix in the model bucket at the pool's revision,
+**The model.** By default, weights load straight from S3 into GPU memory with the Run:ai streamer
+(section 4.4). The model is the pool's prefix in the model bucket at the pool's revision,
 `s3://<model bucket>/<pool>/<revision>/`: the layout of `rhi.pools.model_store`, which the copy job
 writes. vLLM reads a model whose name starts with `s3://` from object storage
 (`SUPPORTED_SCHEMES` in `vllm/transformers_utils/runai_utils.py`): it fetches the small files
@@ -105,6 +106,20 @@ beside the weights to a local directory (`ModelConfig.maybe_pull_model_tokenizer
 the streamer loads the weights. The bucket's name is the caller's, from
 `rhi.pools.model_store.bucket_name`: it holds the account and the region, which only a deployment
 knows.
+
+**The fallback loader.** A pool whose `loader` is `download` (`rhi_common.pool_config`) is not
+streamed: its model is copied out of S3 to a local folder before vLLM starts, and vLLM loads it
+from there with its default loader (section 4.4; evidence E11). vLLM copies nothing out of S3 by
+itself, so the image carries a program of this project for it, `services/engine/vllm/fetch_model.py`,
+and the pool's arguments begin with one argument of this project, before vLLM's own:
+`--rhi-fetch-model=<the model's location>,<the local folder>`. The image's entry point runs the
+program with it and takes it off before it starts vLLM with the rest (`entrypoint.sh`). Then comes
+the folder, by position, as vLLM's model, and the arguments every pool has, without
+`--load-format`. The folder, `MODEL_FOLDER`, is in the container's own file system, under none of
+the folders the engine's unit mounts into it (`services/engine/units/rhi-engine.service`): Docker
+keeps that file system on the instance's EBS volume. The container is removed when it stops, so
+the copy is made at every start. A pool on `stream`, the default, has no such argument, and its
+arguments are those above.
 
 **Media only from inline data.** vLLM has no option that turns fetching a media URL off. With an
 allow-list, `MediaConnector` in `vllm/multimodal/media/connector.py` refuses an `http` or `https`
@@ -144,6 +159,11 @@ if TYPE_CHECKING:
 PORT = 8000
 # vLLM's name for loading weights with the Run:ai streamer.
 LOAD_FORMAT = "runai_streamer"
+# The argument of this project that asks the image's entry point for a copy of the model, which it
+# takes off before vLLM starts (`services/engine/vllm/entrypoint.sh` and `fetch_model.py`).
+FETCH_OPTION = "--rhi-fetch-model"
+# Where a pool on download has its model copied to, in the container's own file system.
+MODEL_FOLDER = "/var/lib/rhi-model"
 # The one domain media may be fetched from: reserved by RFC 6761, it never resolves.
 MEDIA_DOMAIN = "media.invalid"
 # vLLM's name for a cache of 8 bits. A cache of 16 bits is the model's own data type: no argument.
@@ -163,6 +183,13 @@ def model_location(pool: Pool, bucket: str) -> str:
     return f"s3://{bucket}/{pool.name}/{pool.revision}/"
 
 
+def fetch_argument(location: str, folder: str) -> str:
+    """The argument that has the image's entry point copy every file under `location` to `folder`."""
+    if "," in location or "," in folder:
+        raise VllmCommandError("a model's location and its local folder hold no comma")
+    return f"{FETCH_OPTION}={location},{folder}"
+
+
 def _json(value: object) -> str:
     """A JSON object as one argument, with no space, as vLLM's recipes write one."""
     return json.dumps(value, separators=(",", ":"), allow_nan=False)
@@ -173,9 +200,15 @@ def arguments(pool: Pool, *, bucket: str) -> list[str]:
 
     `bucket` is the model bucket's name, which may hold deployment-time values.
     """
+    location = model_location(pool, bucket)
+    if pool.loader == "download":
+        # The copy first, which the entry point takes off, then the local folder as vLLM's model,
+        # with vLLM's default loader.
+        model = [fetch_argument(location, MODEL_FOLDER), MODEL_FOLDER]
+    else:
+        model = [location, "--load-format", LOAD_FORMAT]
     built = [
-        model_location(pool, bucket),
-        *("--load-format", LOAD_FORMAT),
+        *model,
         *("--port", str(PORT)),
         *("--allowed-media-domains", MEDIA_DOMAIN),
         # In one argument: a pool's name may start with a hyphen, which alone would read as an option.
