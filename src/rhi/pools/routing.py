@@ -19,7 +19,13 @@ and is a 404 like any route outside the four. A target group routes by least out
 and drains for the pool's `drain_seconds` (section 5.1). Its targets are registered by the pool's
 group, not here.
 
-Stickiness per student (section 5.5) is phase 2's and is not set.
+Each target group also has duration-based stickiness, for the pool's `stickiness_seconds`
+(section 5.5, evidence E13). The load balancer picks the target of a first request by least
+outstanding requests and names it in its own encrypted cookie, `AWSALB`, on the response; a request
+that carries the cookie goes to the same target, and every request renews the duration. When the
+target a cookie names is unhealthy, deregistered or draining, the load balancer picks another and
+issues a new cookie. The gateway is this load balancer's client and keeps the cookie per student
+and pool (`rhi_gateway.affinity`): a request without one is routed by least outstanding requests.
 """
 
 from __future__ import annotations
@@ -96,6 +102,8 @@ class Routing(Construct):
                 target_type=elbv2.TargetType.INSTANCE,
                 load_balancing_algorithm_type=elbv2.TargetGroupLoadBalancingAlgorithmType.LEAST_OUTSTANDING_REQUESTS,
                 deregistration_delay=cdk.Duration.seconds(pool.drain_seconds),
+                # Duration-based, with the load balancer's own cookie: no cookie name is given.
+                stickiness_cookie_duration=cdk.Duration.seconds(pool.stickiness_seconds),
                 health_check=elbv2.HealthCheck(
                     path=HEALTH_ROUTE,
                     port=str(ENGINE_PORT),
