@@ -33,3 +33,20 @@ deployment and needs no import path:
   `RHI_VERIFY_LAST_STAGES_FILE` names, which that phase copies as well. It never prints the key,
   and what the tests print reaches the build's log with `[canary key]` in place of the key and of
   any piece of it.
+
+The rule for model weights (system design, section 4.4), which the job that copies each pool's
+model into the model bucket follows:
+
+- `weights.py` decides which files of a model repository are copied: safetensors files, JSON files
+  and the tokenizer's files `merges.txt`, `tokenizer.model` and `chat_template.jinja`. Pickle
+  formats, Python files and anything else are refused. It reads a repository's manifest,
+  `models/manifests/<name>.json`, and verifies a downloaded file against the SHA-256 the manifest
+  gives for its path. The manifest's format is in the module's docstring. Run with a repository and
+  a revision, it writes that repository's manifest from Hugging Face's API, read anonymously with
+  httpx (the `gateway` group's pin, which the `dev` group includes):
+
+      uv run --locked python scripts/pipeline/weights.py Qwen/Qwen3.8-27B-FP8 <full commit hash>
+
+  A file stored in LFS takes its size and SHA-256 from Hugging Face's listing; any other admitted
+  file is downloaded at that revision and hashed. Moving a model to another revision is running
+  the program again and committing the manifest it writes.
