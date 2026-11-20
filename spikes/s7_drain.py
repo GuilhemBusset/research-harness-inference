@@ -13,22 +13,40 @@ them. **Pass:** an idle instance stops within a minute or two, which the verdict
 the pool only from the workspace and the pool-state table. It never changes the pool: the scaler
 alone moves it, by load and by idleness (section 5.1).
 
-1. **The stream across a gateway deployment.** It holds one slow stream open for
-   `RHI_S7_DEPLOYMENT_HOLD_SECONDS` and prints when the hold begins and how long it lasts. The owner
-   starts the deployment, by releasing the pipeline again once the job has started: the job starts
-   none. It records whether the stream completed.
+1. **The stream across a gateway deployment** (`Run.across_deployment`). It notes the gateway's
+   tasks, opens a held stream and prints when the hold begins and how long it may last. The owner
+   starts the deployment, by releasing the pipeline again: the job starts none. The stream is held
+   until a gateway task the job did not see at its start has been writing for
+   `ROLLOUT_MARGIN_SECONDS`, by which ECS has replaced the tasks it began with, or for
+   `RHI_S7_DEPLOYMENT_HOLD_SECONDS` at most.
 2. **Two instances.** It holds twice the pool's `target_concurrency` of short streams until the
    scaler asks for two instances and reads two in service, then stops the load.
-3. **The departures.** It sends nothing more but one slow stream after another, as one canary
-   student, and watches the scaler's note. Each time the note asks for fewer instances, the scaler
-   has chosen an idle one to leave: its `written_at` is when the leave began. The slow stream open
-   when the job saw the first such note is the stream across a scale-in; once it ends, no other is
-   sent, so that the pool can go idle and the scaler take it to zero.
-4. **The wakes.** It sends one request to bring the pool back, then, as many times as
-   `RHI_S7_WAKES` gives, waits until the scaler's note asks for no instance after the pool's idle
-   period, and sends one request at once. A wake is lost when its request is not answered 200
-   within the pool's hold and `WAKE_MARGIN_SECONDS`. Each answered wake brings the pool back for
-   the next; a lost one ends the wakes, since a pool it did not wake does not reach zero again.
+3. **The departures.** It sends nothing more but one held stream, as one canary student, opened
+   while the scaler still asks for two and held until the first instance the scaler takes away
+   has stopped: the stream across a scale-in. It watches the scaler's note: each time the note
+   asks for fewer instances, the scaler has chosen an idle one to leave, and the note's
+   `written_at` is when the leave began.
+4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it makes sure the pool
+   is awake, waits until the scaler asks for no instance and reads none in service, which it does
+   only after the pool's idle period, and sends one request at once. A wake is lost when its
+   request does not complete (below) within the pool's hold and `WAKE_MARGIN_SECONDS`. After a lost
+   wake, it sends requests to bring the pool back, up to `RECOVERIES` of them, which are not wakes
+   and are not counted, and goes on to the next.
+
+**A held stream** (`slow_stream`). The mock streams its canned turn in well under a second, and
+the gateway reads a request's whole body before it does anything with it, so a stream is held on
+the server by its request: the job sends the body but its last byte, then one byte of padding
+every `TRICKLE_SECONDS`, white space that JSON allows before the closing brace, and the last byte
+once the event the stream spans is over. Until then no server can have answered it: it is open on
+the gateway task that took it. A stream completed when it was answered 200 and its closing event,
+`message_stop`, arrived, with no error event.
+
+**When the gateway was deployed.** The gateway's collector writes the series `up` of its scrape,
+job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task runs. A task that
+first writes after the stream opened is one the deployment started (`rollout_at`). The stream's
+number is measured (`across_rollout`): 1 when it completed and was held until such a task had
+written for `ROLLOUT_MARGIN_SECONDS`; 0 when it did not complete and such a task wrote while it was
+open. Otherwise the job saw no deployment under the stream, and the run is not measured.
 
 **When an instance has left.** The scaler's gauges cannot say it: an instance stops counting as in
 service as soon as its target is draining, and the warm count holds an instance from the moment it
@@ -40,23 +58,19 @@ instance's ID and its pool; it runs until the instance shuts down, after the eng
 the lifecycle agent stops only once the termination hook is complete (`rhi_lifecycle.termination`).
 So the instance that left is the one, among those writing when the note asked for fewer, whose
 last write is `QUIET_SECONDS` old, and it took `leave_seconds` to leave: from the note's
-`written_at` to its last write, plus one scrape, by which it had stopped. One that writes for
-`LEAVE_WAIT_SECONDS` after the note has not left in that time, and the seconds waited are its
-number: far above the pass condition.
+`written_at` to its last write, plus one scrape, by which it had stopped. When none has stopped
+`LEAVE_WAIT_SECONDS` after the note, no stop was seen: that departure has no path, and is not a
+number.
 
-**Which path it took** (`path_of`), from the warm count, which counts an instance going back to
-the warm pool from its first wait state: the warm count rose after the note and no instance new to
+**Which path it took** (`path_of`), from the scaler's readings of the warm count, each at the time
+the scaler wrote it (`Pool.warm_counts`), which counts an instance going back to the warm pool from
+its first wait state. The path is told only from a reading at or before the note and one at or
+after the instance stopped (`warm_around`): with them, the warm count rose and no instance new to
 the pool wrote, so the instance went back to the warm pool; the warm count did not rise, so it was
-terminated. A warm count that rose while a new instance wrote may be a fresh instance launched
-into the warm pool in place of a terminated one: that departure has no path, and is not a number.
-A run whose departures did not take both paths takes the pool to two instances again, up to
-`CYCLES` times, and is not measured when a path is still missing. A path seen twice keeps its
-longer time.
-
-**The slow stream** (`slow_stream`). The mock streams its canned turn in well under a second, so a
-stream is made slow by its reader: it reads the answer through a socket with a small receive
-buffer and pauses after each output token, so that the whole answer takes the seconds given. It
-completed when it was answered 200 and its last event, `message_stop`, arrived.
+terminated. Without them, or with a rise while a new instance wrote (a fresh instance launched into
+the warm pool in place of a terminated one), that departure has no path, and is not a number. A
+run whose departures did not take both paths takes the pool to two instances again, up to `CYCLES`
+times, and is not measured when a path is still missing. A path seen twice keeps its longer time.
 
 **The numbers** (`Number`): the seconds to leave service on each path, whether each held stream
 completed (1 or 0), and the wakes sent and lost.
@@ -69,7 +83,7 @@ completed (1 or 0), and the wakes sent and lost.
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S7_WAKES` | The wakes it sends, each at the moment the pool reaches zero; `DEFAULT_WAKES` unless given |
-| `RHI_S7_DEPLOYMENT_HOLD_SECONDS` | How long the stream across the gateway deployment is held; `DEFAULT_DEPLOYMENT_HOLD_SECONDS` unless given |
+| `RHI_S7_DEPLOYMENT_HOLD_SECONDS` | The longest the stream across the gateway deployment is held; `DEFAULT_DEPLOYMENT_HOLD_SECONDS` unless given |
 | `RHI_SPIKE_POOL` | The pool, `mock` unless given |
 
 The pool's `target_concurrency`, `hold_seconds` and `idle_minutes` come from the deployed
@@ -83,7 +97,6 @@ import asyncio
 import math
 import os
 import secrets
-import socket
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -99,11 +112,10 @@ from rhi import config
 from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.records import NOTE_RECORD, ScalerNote
 from rhi_gateway.sse import SseReader
-from rhi_mock_engine.app import ANSWER, REASONING
 from rhi_scaler.metrics import INSTANCES_IN_SERVICE, WARM_INSTANCES
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
 
 JOB = "s7_drain"
 MEASUREMENT = "S7"
@@ -122,8 +134,8 @@ DEFAULT_DEPLOYMENT_HOLD_SECONDS = 1500
 
 # Seconds: "an idle instance stops within a minute or two" (section 12), read as two minutes.
 LEAVE_PASS_SECONDS = 120
-# Seconds. The node's collector scrapes, and writes `up`, every 15 seconds; an instance whose last
-# write is this old has stopped.
+# Seconds. The collectors scrape, and write `up`, every 15 seconds; an instance whose last write is
+# this old has stopped.
 SCRAPE_SECONDS = 15
 QUIET_SECONDS = 90
 # Seconds the job waits for an instance to stop after the scaler asked for fewer.
@@ -143,18 +155,25 @@ SCALE_IN_WAIT_SECONDS = 30 * 60
 # it does, to see both paths.
 INSTANCES = 2
 CYCLES = 2
-# Seconds a slow stream across a scale-in is read over.
-SLOW_STREAM_SECONDS = 120
+# Seconds between two bytes of a held stream's body: the edge's idle timeout is far longer.
+TRICKLE_SECONDS = 5
+PADDING = b" "
+# The longest the stream across a scale-in is held: the first departure's longest watch.
+SCALE_IN_HOLD_SECONDS = SCALE_IN_WAIT_SECONDS + LEAVE_WAIT_SECONDS + 3 * QUIET_SECONDS
+# Seconds a gateway task new to the job writes before the deployment counts as under the stream: ECS
+# deregisters the tasks it replaces once their successors are healthy, a minute or two after these
+# start (section 8.5).
+ROLLOUT_MARGIN_SECONDS = 300
+GATEWAY_JOB = "gateway"
 # Seconds a wake may take beyond the pool's hold before it counts as lost.
 WAKE_MARGIN_SECONDS = 120
+# The requests the job sends, one after another, to bring the pool back after a lost wake.
+RECOVERIES = 3
 # The streams one student of the load holds: one under a student's limit (as in S8).
 STREAMS_PER_STUDENT = DEFAULT_CONCURRENCY_LIMIT - 1
-# Bytes: the receive buffer of a slow stream's socket, so that the reader's pace reaches the sender.
-RECEIVE_BUFFER_BYTES = 1024
-# The output tokens of the mock's canned turn: a slow stream pauses after each.
-OUTPUT_TOKENS = len(REASONING) + len(ANSWER)
 START_TOKENS = 200
 CLOSING_EVENT = "message_stop"
+ERROR_EVENT = "error"
 
 
 class Number(StrEnum):
@@ -202,12 +221,19 @@ SPIKE = common.Spike(MEASUREMENT, Number, passes)
 def last_writes(series: Sequence[common.Series]) -> dict[str, float]:
     """The time each instance last wrote, from a range query of the time of its samples
     (`timestamp(...)`): the latest value of each instance's series."""
-    written: dict[str, float] = {}
+    return {instance: last for instance, (_, last) in spans(series).items()}
+
+
+def spans(series: Sequence[common.Series]) -> dict[str, tuple[float, float]]:
+    """The first and the last time each instance wrote, from a range query of the time of its
+    samples (`timestamp(...)`)."""
+    found: dict[str, tuple[float, float]] = {}
     for one in series:
         instance = one.labels.get("instance")
         if instance and one.samples:
-            written[instance] = max(written.get(instance, 0.0), *one.values())
-    return written
+            first, last = found.get(instance, (math.inf, 0.0))
+            found[instance] = (min(first, *one.values()), max(last, *one.values()))
+    return found
 
 
 def stopped(written: Mapping[str, float], among: set[str], now: float) -> dict[str, float]:
@@ -234,10 +260,23 @@ def path_of(warm_before: int, warm_after: int, newcomer: bool) -> Path | None:
     return None if newcomer else Path.WARM_POOL
 
 
+def warm_around(
+    samples: Sequence[tuple[float, float]], at: float, through: float | None = None
+) -> tuple[int, int] | None:
+    """The warm count at `at`, the last reading at or before it, and the highest after it. `None`
+    when no reading is at or before `at`, or, `through` given, none is at or after `through`: the
+    count was not observed across the departure."""
+    before = [value for moment, value in samples if moment <= at]
+    if not before or (through is not None and not any(moment >= through for moment, _ in samples)):
+        return None
+    first = round(before[-1])
+    return first, max([first, *(round(value) for moment, value in samples if moment > at)])
+
+
 @dataclass(frozen=True)
 class Departure:
-    """One instance's way out of service: its path, `None` when it cannot be told, its seconds, and
-    the instance, `None` when none stopped in the time the job waits."""
+    """One instance's way out of service: its path, `None` when it was not observed, its seconds,
+    and the instance, `None` when none stopped in the time the job waits."""
 
     path: Path | None
     seconds: float
@@ -259,6 +298,26 @@ def numbers_of(
     numbers[Number.WAKES_SENT] = wakes_sent
     numbers[Number.WAKES_LOST] = wakes_lost
     return numbers
+
+
+# A gateway deployment.
+
+
+def rollout_at(before: set[str], tasks: Mapping[str, tuple[float, float]]) -> float | None:
+    """When the first gateway task not in `before` first wrote, from each task's first and last
+    write: `None` when none did."""
+    return min((first for task, (first, _) in tasks.items() if task not in before), default=None)
+
+
+def across_rollout(completed: bool, spanned: bool, rolled_out_at: float | None) -> bool:
+    """The stream across a gateway deployment, as a number: completed after it was held through the
+    rollout (`spanned`), or cut while a new task wrote (`rolled_out_at`). ValueError otherwise: no
+    deployment was seen under the stream, and the run is not measured."""
+    if completed and spanned:
+        return True
+    if not completed and rolled_out_at is not None:
+        return False
+    raise ValueError("no gateway deployment was seen while the stream was held")
 
 
 # The pool, as the workspace and the pool-state table show it.
@@ -298,22 +357,26 @@ class Pool:
         return round(values[-1]) if values else None
 
     def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
-        """The warm count's samples from `start` to `end`."""
-        series = self.workspace.read_series(f'{WARM_INSTANCES}{{pool="{self.name}"}}', start=start, end=end, step=15)
-        return [sample for one in series for sample in one.samples]
+        """The scaler's readings of the warm count from `start` to `end`, each at the time it wrote
+        it: a range query repeats a reading at every step after it, `timestamp()` says when it was."""
+        selector = f'{WARM_INSTANCES}{{pool="{self.name}"}}'
+        values = dict(
+            sample
+            for one in self.workspace.read_series(selector, start=start, end=end, step=15)
+            for sample in one.samples
+        )
+        stamps = self.workspace.read_series(f"timestamp({selector})", start=start, end=end, step=15)
+        return sorted({(stamp, values[step]) for one in stamps for step, stamp in one.samples if step in values})
 
     def writes(self, start: float, end: float) -> dict[str, float]:
         """Each instance of the pool that wrote from `start` to `end`, with its last write."""
         query = f'max by (instance) (timestamp(up{{pool="{self.name}"}}))'
         return last_writes(self.workspace.read_series(query, start=start, end=end, step=15))
 
-
-def warm_around(samples: Sequence[tuple[float, float]], at: float) -> tuple[int, int]:
-    """The warm count at `at`, the last sample at or before it, and the highest after it."""
-    before = [value for moment, value in samples if moment <= at]
-    after = [value for moment, value in samples if moment > at]
-    first = round(before[-1]) if before else 0
-    return first, max([first, *(round(value) for value in after)])
+    def gateway_tasks(self, start: float, end: float) -> dict[str, tuple[float, float]]:
+        """Each gateway task that wrote from `start` to `end`, with its first and last write."""
+        query = f'max by (instance) (timestamp(up{{job="{GATEWAY_JOB}"}}))'
+        return spans(self.workspace.read_series(query, start=start, end=end, step=15))
 
 
 # The requests.
@@ -325,50 +388,76 @@ def _request(model: str) -> loadgen.Request:
     return next(session.requests())[1]
 
 
+async def _completes(
+    endpoint: str,
+    key: str,
+    request: loadgen.Request,
+    content: bytes | AsyncIterator[bytes],
+    transport: httpx.AsyncBaseTransport | None,
+) -> bool:
+    """Sends `request` with `content` as its body, as the student whose key is given, and says
+    whether it completed: answered 200, with its closing event and no error event. Raises httpx's
+    errors."""
+    headers = {name: value for name, value in request.headers.items() if name.lower() != "content-length"}
+    headers["authorization"] = f"Bearer {key}"
+    reader, closed, failed = SseReader(), False, False
+    async with (
+        httpx.AsyncClient(base_url=endpoint, timeout=loadgen.TIMEOUT, transport=transport, trust_env=False) as http,
+        http.stream(request.method, request.path, headers=headers, content=content) as answer,
+    ):
+        if answer.status_code != HTTPStatus.OK:
+            return False
+        async for chunk in answer.aiter_bytes():
+            for event in reader.feed(chunk):
+                closed = closed or event.name == CLOSING_EVENT
+                failed = failed or event.name == ERROR_EVENT
+    return closed and not failed
+
+
 async def slow_stream(
     endpoint: str,
     key: str,
     request: loadgen.Request,
     seconds: float,
     *,
+    until: Callable[[], Awaitable[bool]] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> bool:
-    """Sends `request` as the student whose key is given, reads its answer pausing after each
-    output token so that it takes about `seconds`, and says whether it completed: answered 200,
-    with its closing event."""
-    pause = seconds / OUTPUT_TOKENS
-    if transport is None:
-        options = [(socket.SOL_SOCKET, socket.SO_RCVBUF, RECEIVE_BUFFER_BYTES)]
-        transport = httpx.AsyncHTTPTransport(socket_options=options)
-    headers = {**request.headers, "authorization": f"Bearer {key}"}
-    reader, closed = SseReader(), False
+    """Sends `request` as a held stream: its body but the last byte, then a byte of padding every
+    `TRICKLE_SECONDS` for `seconds`, or until `until` says that the event the stream spans is over,
+    then the last byte. Says whether it completed (`_completes`)."""
+    body = request.body
+    if not body.endswith(b"}"):
+        raise ValueError("a held stream's body is a JSON object")
+    steps = max(1, math.ceil(seconds / TRICKLE_SECONDS))
+
+    async def held() -> AsyncIterator[bytes]:
+        yield body[:-1]
+        for _ in range(steps):
+            if until is not None and await until():
+                break
+            await sleep(seconds / steps)
+            yield PADDING
+        yield body[-1:]
+
     try:
-        async with (
-            httpx.AsyncClient(base_url=endpoint, timeout=loadgen.TIMEOUT, transport=transport, trust_env=False) as http,
-            http.stream(request.method, request.path, headers=headers, content=request.body) as answer,
-        ):
-            if answer.status_code != HTTPStatus.OK:
-                return False
-            async for chunk in answer.aiter_raw():
-                for event in reader.feed(chunk):
-                    if loadgen.output_of(loadgen.Wire.MESSAGES, event) is not None:
-                        await sleep(pause)
-                    closed = closed or event.name == CLOSING_EVENT
+        return await _completes(endpoint, key, request, held(), transport)
     except httpx.HTTPError:
         return False
-    return closed
 
 
-async def wake(endpoint: str, key: str, model: str, bound: float) -> bool:
-    """Sends one streamed request as the student whose key is given: whether it was answered 200
-    within `bound` seconds."""
-    load = loadgen.Load((loadgen.SyntheticSession(model, START_TOKENS, (), 64, secrets.randbits(48)),))
+async def wake(
+    endpoint: str, key: str, model: str, bound: float, *, transport: httpx.AsyncBaseTransport | None = None
+) -> bool:
+    """Sends one streamed request as the student whose key is given: whether it completed within
+    `bound` seconds. A refusal, an error event, a cut connection or no end in time is a lost wake."""
+    request = _request(model)
     try:
-        records = await asyncio.wait_for(loadgen.replay(load, [key], endpoint, at_once=1), bound)
+        async with asyncio.timeout(bound):
+            return await _completes(endpoint, key, request, request.body, transport)
     except (TimeoutError, httpx.HTTPError):
         return False
-    return len(records) == 1 and records[0].status == HTTPStatus.OK
 
 
 @dataclass(frozen=True)
@@ -393,7 +482,8 @@ async def _wait(condition: Callable[[], bool], seconds: float, what: str, every:
 
 @dataclass
 class Run:
-    """One run of the spike against the pool, through the gateway at `endpoint`."""
+    """One run of the spike against the pool, through the gateway at `endpoint`. `transport` is for
+    the tests: the job gives none."""
 
     pool: Pool
     endpoint: str
@@ -401,12 +491,53 @@ class Run:
     settings: config.Pool
     wakes: int
     deployment_hold_seconds: float
+    transport: httpx.AsyncBaseTransport | None = None
     departures: list[Departure] = field(default_factory=list, init=False)
 
     @property
     def student(self) -> str:
         """The canary student of the held streams and the wakes; the load runs as the others."""
         return self.keys[0]
+
+    async def across_deployment(self) -> bool:
+        """Holds a stream across a gateway deployment (`across_rollout`): whether it completed."""
+        began = time.time()
+        before = set(await asyncio.to_thread(self.pool.gateway_tasks, began - FRESH_SECONDS, began))
+        if not before:
+            raise RuntimeError("no gateway task was writing when the stream was opened")
+        seen: list[float] = []
+        spanned = False
+
+        async def rolled_out() -> bool:
+            nonlocal spanned
+            now = time.time()
+            at = rollout_at(before, await asyncio.to_thread(self.pool.gateway_tasks, began, now))
+            seen[:] = [] if at is None else [at]
+            spanned = at is not None and now >= at + ROLLOUT_MARGIN_SECONDS
+            return spanned
+
+        start = time.strftime("%H:%M:%S UTC", time.gmtime(began))
+        print(f"holding a stream for up to {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
+        request = _request(self.pool.name)
+        completed = await slow_stream(
+            self.endpoint,
+            self.student,
+            request,
+            self.deployment_hold_seconds,
+            until=rolled_out,
+            transport=self.transport,
+        )
+        if not completed and not seen:
+            # Cut before the job looked again: a task that first wrote while it was open is a rollout under it.
+            at = rollout_at(before, await asyncio.to_thread(self.pool.gateway_tasks, began, time.time()))
+            seen[:] = [] if at is None else [at]
+        try:
+            survived = across_rollout(completed, spanned, seen[0] if seen else None)
+        except ValueError:
+            message = "no gateway deployment was seen under the stream: release the pipeline while it is held"
+            raise RuntimeError(message) from None
+        print(f"the stream across the gateway deployment {'completed' if survived else 'did not complete'}")
+        return survived
 
     async def two_instances(self) -> None:
         """Holds the load until the scaler asks for two instances and reads two in service."""
@@ -467,68 +598,78 @@ class Run:
 
         await _wait(left, LEAVE_WAIT_SECONDS + 2 * QUIET_SECONDS, "an instance to stop")
         now = time.time()
-        instance = min(gone, key=gone.__getitem__) if gone else None
-        seconds = now - asked_at if instance is None else leave_seconds(asked_at, gone[instance])
+        if not gone:
+            print(f"no instance stopped in {LEAVE_WAIT_SECONDS} s: the departure is not measured")
+            return Departure(None, now - asked_at)
+        instance = min(gone, key=gone.__getitem__)
+        seconds = leave_seconds(asked_at, gone[instance])
         since = await asyncio.to_thread(self.pool.writes, asked_at, now)
-        warm_before, warm_after = warm_around(
-            await asyncio.to_thread(self.pool.warm_counts, asked_at - FRESH_SECONDS, now), asked_at
+        warm = warm_around(
+            await asyncio.to_thread(self.pool.warm_counts, asked_at - FRESH_SECONDS, now),
+            asked_at,
+            gone[instance] + SCRAPE_SECONDS,
         )
-        path = path_of(warm_before, warm_after, newcomer=bool(set(since) - set(before)))
-        print(f"an instance left in {seconds:.0f} s, path {path or 'not told'}, warm {warm_before} to {warm_after}")
+        path = None if warm is None else path_of(*warm, newcomer=bool(set(since) - set(before)))
+        print(f"an instance left in {seconds:.0f} s, path {path or 'not told'}, warm {warm or 'not read'}")
         return Departure(path, seconds, instance)
 
-    async def cycle(self, scale_in_stream: bool) -> bool | None:
-        """Two instances, then both departures. With `scale_in_stream`, slow streams are held until
-        the first departure begins: whether the one open then completed."""
+    async def cycle(self, *, scale_in_stream: bool) -> bool | None:
+        """Two instances, then both departures. With `scale_in_stream`, a stream is held from while
+        the scaler asks for two until the first departure is over: whether it completed."""
         await self.two_instances()
         # Both departures are watched from now, while the scaler still asks for two: each sees the
         # first note that asks for fewer.
         idle = self.settings.idle_minutes * 60
         first = asyncio.create_task(self.departure(INSTANCES, SCALE_IN_WAIT_SECONDS))
         last = asyncio.create_task(self.departure(1, SCALE_IN_WAIT_SECONDS + LEAVE_WAIT_SECONDS + idle, first))
-        stop, results = asyncio.Event(), []
+        streaming = None
+        if scale_in_stream:
 
-        async def streams() -> None:
-            while not stop.is_set():
-                request = _request(self.pool.name)
-                results.append(await slow_stream(self.endpoint, self.student, request, SLOW_STREAM_SECONDS))
+            async def over() -> bool:
+                return first.done()
 
-        streaming = asyncio.create_task(streams()) if scale_in_stream else None
+            request = _request(self.pool.name)
+            streaming = asyncio.create_task(
+                slow_stream(
+                    self.endpoint, self.student, request, SCALE_IN_HOLD_SECONDS, until=over, transport=self.transport
+                )
+            )
+        completed = None
         try:
-            await _wait(lambda: self.pool.asked() != INSTANCES, SCALE_IN_WAIT_SECONDS, "a scale-in", NOTE_POLL_SECONDS)
+            self.departures.append(await first)
         finally:
-            # The stream open now is the one across the scale-in; none follows it, so that the pool
-            # can go idle.
-            stop.set()
             if streaming is not None:
-                await streaming
-        self.departures.append(await first)
+                completed = await streaming
         self.departures.append(await last)
-        return results[-1] if results else None
+        return completed
+
+    def _at_zero(self) -> bool:
+        return self.pool.asked() == 0 and self.pool.gauge(INSTANCES_IN_SERVICE) == 0
 
     async def send_wakes(self) -> tuple[int, int]:
-        """Sends up to `wakes` requests, each at the moment the scaler asks for no instance after
-        the pool's idle period: the wakes sent and lost. The first lost ends them, since the pool it
-        did not wake does not reach zero again."""
+        """Sends `wakes` requests, each at the moment the pool reaches zero after its idle period:
+        the wakes sent and lost. Before each, the pool is brought back if the last request did not
+        complete, by requests that are not counted."""
         bound = self.settings.hold_seconds + WAKE_MARGIN_SECONDS
-        if not await wake(self.endpoint, self.student, self.pool.name, bound):
-            raise RuntimeError("the request that brings the pool back before the wakes was not answered")
         wait = self.settings.idle_minutes * 60 + SCALE_IN_WAIT_SECONDS
+        awake, lost = False, 0
         for sent in range(1, self.wakes + 1):
+            for _ in range(RECOVERIES):
+                if awake:
+                    break
+                awake = await wake(self.endpoint, self.student, self.pool.name, bound, transport=self.transport)
+            if not awake:
+                print(f"the pool could not be brought back: {sent - 1} wake(s) sent")
+                return sent - 1, lost
             await _wait(lambda: self.pool.asked() != 0, SCALE_OUT_WAIT_SECONDS, "the pool to wake", NOTE_POLL_SECONDS)
-            await _wait(lambda: self.pool.asked() == 0, wait, "the pool to reach zero", NOTE_POLL_SECONDS)
-            answered = await wake(self.endpoint, self.student, self.pool.name, bound)
-            print(f"wake {sent}: {'answered' if answered else 'lost'}")
-            if not answered:
-                return sent, 1
-        return self.wakes, 0
+            await _wait(self._at_zero, wait, "the pool to reach zero", NOTE_POLL_SECONDS)
+            awake = await wake(self.endpoint, self.student, self.pool.name, bound, transport=self.transport)
+            lost += not awake
+            print(f"wake {sent}: {'answered' if awake else 'lost'}")
+        return self.wakes, lost
 
     async def measure(self) -> dict[str, int | float]:
-        began = time.strftime("%H:%M:%S UTC", time.gmtime())
-        print(f"holding a stream for {self.deployment_hold_seconds:.0f} s from {began}: release the pipeline now")
-        request = _request(self.pool.name)
-        deployment = await slow_stream(self.endpoint, self.student, request, self.deployment_hold_seconds)
-        print(f"the stream across the gateway deployment {'completed' if deployment else 'did not complete'}")
+        deployment = await self.across_deployment()
         scale_in = await self.cycle(scale_in_stream=True)
         print(f"the stream across the scale-in {'completed' if scale_in else 'did not complete'}")
         for _ in range(CYCLES - 1):
