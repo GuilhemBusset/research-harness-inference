@@ -130,6 +130,11 @@ class MetadataError(Exception):
     """The instance metadata did not give an item. The message names the item, never a value."""
 
 
+class NoSuchItemError(MetadataError):
+    """The instance metadata answered that it has no such item: the answer is the service's own,
+    to a request that carried its session token, and not a reading that failed."""
+
+
 class Metadata:
     """The instance metadata, read with a session token (IMDSv2 is required; section 4.3)."""
 
@@ -137,7 +142,8 @@ class Metadata:
         self._fetch = fetch
 
     def target_state(self) -> str:
-        """The lifecycle state Auto Scaling is moving the instance to."""
+        """The lifecycle state Auto Scaling is moving the instance to. An instance that belongs to
+        no group has none, and the metadata says so: `NoSuchItemError`."""
         return self._item("autoscaling/target-lifecycle-state")
 
     def instance_id(self) -> str:
@@ -149,13 +155,14 @@ class Metadata:
                 f"{METADATA_URL}/api/token", method="PUT", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}
             ),
             "the session token",
+            token=True,
         )
         return self._text(
             urllib.request.Request(f"{METADATA_URL}/meta-data/{item}", headers={"X-aws-ec2-metadata-token": token}),
             item,
         )
 
-    def _text(self, request: urllib.request.Request, item: str) -> str:
+    def _text(self, request: urllib.request.Request, item: str, *, token: bool = False) -> str:
         answer = self._fetch(request, ANSWER_SECONDS)
         if answer is not None and answer[0] == 200:
             try:
@@ -164,6 +171,8 @@ class Metadata:
                 text = ""
             if text:
                 return text
+        if answer is not None and answer[0] == 404 and not token:
+            raise NoSuchItemError(item)
         raise MetadataError(item)
 
 
@@ -218,8 +227,8 @@ class Outcome(enum.Enum):
     NOT_COMPLETED = "not-completed"
 
 
-class _Abandon(Exception):
-    """A step did not pass, or the deadline did: the hook is completed with `ABANDON`."""
+class Abandon(Exception):
+    """A step did not pass, or the deadline did: a launch completes its hook with `ABANDON`."""
 
 
 def identity(served: release.Release) -> tuple[str, str]:
@@ -227,6 +236,77 @@ def identity(served: release.Release) -> tuple[str, str]:
     # The digest is what follows the repository in the image's reference.
     digest = served.engine_image.rpartition("@")[2]
     return digest, NO_MODEL if served.model_revision is None else served.model_revision
+
+
+@dataclass(frozen=True)
+class Steps:
+    """The steps of a start, as a launch transition and the run of a canary do them
+    (`rhi_lifecycle.canary`): the two share them, so they cannot differ. `parameter`, `ssm`,
+    `secrets`, `host`, `engine`, `held`, `clock` and `sleep` are `Launch`'s. A step takes what is
+    left before `deadline` as its time limit (None: no limit), and raises `Abandon` when it does
+    not pass or the deadline has."""
+
+    parameter: str
+    ssm: Any
+    secrets: Any
+    host: Host
+    engine: Engine
+    held: Path
+    clock: Callable[[], float]
+    sleep: Callable[[float], object]
+
+    def left(self, deadline: float | None) -> float | None:
+        """The seconds left before `deadline`, or None when there is no deadline."""
+        if deadline is None:
+            return None
+        left = deadline - self.clock()
+        if left <= 0:
+            raise Abandon
+        return left
+
+    def pull(self, current: release.Current, deadline: float | None) -> None:
+        try:
+            self.host.pull(current.release.engine_image, timeout=self.left(deadline))
+        except HostError:
+            raise Abandon from None
+
+    def check(self, current: release.Current) -> None:
+        """Abandon unless the disk holds the pool's current release, which is still the one whose
+        image this start pulled or found."""
+        verdict = release.check(self.ssm, self.parameter, self.held)
+        if not verdict.equal or verdict.held != current.release:
+            raise Abandon
+
+    def serve(self, current: release.Current, deadline: float | None, reach: Callable[[Stage], object]) -> None:
+        """With the image on disk: check the release, start the engine, wait for its health route
+        and send the warm-up request. `reach` is told each stage as it starts."""
+        reach(Stage.RELEASE_CHECK)
+        self.check(current)
+        reach(Stage.CONTAINER_START)
+        secret = self._secret(current.settings.secret_id)
+        try:
+            self.host.start_engine(timeout=self.left(deadline))
+        except HostError:
+            raise Abandon from None
+        reach(Stage.WEIGHTS)
+        while not self.engine.healthy(self.left(deadline)):
+            left = self.left(deadline)
+            self.sleep(HEALTH_INTERVAL_SECONDS if left is None else min(HEALTH_INTERVAL_SECONDS, left))
+        reach(Stage.WARM_UP)
+        # The pool's name is the model name the engine serves (section 4.2).
+        if not self.engine.warm_up(current.settings.pool, secret, timeout=self.left(deadline)):
+            raise Abandon
+        self.left(deadline)
+
+    def _secret(self, secret_id: str) -> str:
+        """The pool's bearer secret, which the engine's inference routes require (section 4.1)."""
+        try:
+            secret = self.secrets.get_secret_value(SecretId=secret_id)["SecretString"]
+        except (BotoCoreError, ClientError, KeyError, TypeError):
+            raise Abandon from None
+        if not isinstance(secret, str) or not secret:
+            raise Abandon
+        return secret
 
 
 @dataclass(frozen=True)
@@ -306,7 +386,7 @@ class Launch:
                 self._enter_service(current, started, start)
             else:
                 self._enter_the_warm_pool(current, started + ENTRY_DEADLINE_SECONDS, start)
-        except _Abandon:
+        except Abandon:
             result = ABANDON
             # The stage the launch was in ends here, and the instance's row keeps naming it.
             start.timings.end()
@@ -341,43 +421,32 @@ class Launch:
         table = self.dynamodb.Table(current.settings.heartbeat_table)
         return _Start(stages.Timings(transition, self.clock), table, row, self.wall)
 
+    def _steps(self) -> Steps:
+        return Steps(self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep)
+
     def _enter_the_warm_pool(self, current: release.Current, deadline: float, start: _Start) -> None:
-        self._pull(current, deadline)
+        steps = self._steps()
+        steps.pull(current, deadline)
         start.reach(Stage.RELEASE_CHECK)
-        self._check(current)
-        self._left(deadline)
+        steps.check(current)
+        steps.left(deadline)
         start.reach(Stage.HOOK)
 
     def _enter_service(self, current: release.Current, started: float, start: _Start) -> None:
+        steps = self._steps()
         measured = current.measured_start_seconds
         # A promotion's deadline. The launch may be one until the host says the disk has no image.
         deadline = None if measured is None else started + PROMOTION_DEADLINE_STARTS * measured
         try:
-            warm = self.host.holds(current.release.engine_image, timeout=self._left(deadline))
+            warm = self.host.holds(current.release.engine_image, timeout=steps.left(deadline))
         except HostError:
-            raise _Abandon from None
+            raise Abandon from None
         if not warm:
             # Straight into service: this start is not the measured one, and has no deadline here.
             deadline = None
             start.timings.transition = Transition.COLD_LAUNCH
-            self._pull(current, deadline)
-        start.reach(Stage.RELEASE_CHECK)
-        self._check(current)
-        start.reach(Stage.CONTAINER_START)
-        secret = self._secret(current.settings.secret_id)
-        try:
-            self.host.start_engine(timeout=self._left(deadline))
-        except HostError:
-            raise _Abandon from None
-        start.reach(Stage.WEIGHTS)
-        while not self.engine.healthy(self._left(deadline)):
-            left = self._left(deadline)
-            self.sleep(HEALTH_INTERVAL_SECONDS if left is None else min(HEALTH_INTERVAL_SECONDS, left))
-        start.reach(Stage.WARM_UP)
-        # The pool's name is the model name the engine serves (section 4.2).
-        if not self.engine.warm_up(current.settings.pool, secret, timeout=self._left(deadline)):
-            raise _Abandon
-        self._left(deadline)
+            steps.pull(current, deadline)
+        steps.serve(current, deadline, start.reach)
         start.reach(Stage.HOOK)
         try:
             self.served.parent.mkdir(parents=True, exist_ok=True)
@@ -385,37 +454,4 @@ class Launch:
         except OSError:
             # An instance that could not say it has served would be taken for a new one on its way
             # back to the warm pool.
-            raise _Abandon from None
-
-    def _left(self, deadline: float | None) -> float | None:
-        """The seconds left before `deadline`, or None when there is no deadline. At the deadline
-        the transition is abandoned."""
-        if deadline is None:
-            return None
-        left = deadline - self.clock()
-        if left <= 0:
-            raise _Abandon
-        return left
-
-    def _pull(self, current: release.Current, deadline: float | None) -> None:
-        try:
-            self.host.pull(current.release.engine_image, timeout=self._left(deadline))
-        except HostError:
-            raise _Abandon from None
-
-    def _check(self, current: release.Current) -> None:
-        """Abandon unless the disk holds the pool's current release, which is still the one whose
-        image this launch pulled or found."""
-        verdict = release.check(self.ssm, self.parameter, self.held)
-        if not verdict.equal or verdict.held != current.release:
-            raise _Abandon
-
-    def _secret(self, secret_id: str) -> str:
-        """The pool's bearer secret, which the engine's inference routes require (section 4.1)."""
-        try:
-            secret = self.secrets.get_secret_value(SecretId=secret_id)["SecretString"]
-        except (BotoCoreError, ClientError, KeyError, TypeError):
-            raise _Abandon from None
-        if not isinstance(secret, str) or not secret:
-            raise _Abandon
-        return secret
+            raise Abandon from None

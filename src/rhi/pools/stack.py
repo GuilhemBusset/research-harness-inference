@@ -108,14 +108,14 @@ class PoolsStack(cdk.Stack):
             security_group=network.security_groups.internal_load_balancer,
             pools=config.pools,
         )
-        # One instance role per pool, with its log group, by the pool's name. A GPU pool's role
-        # reads its own pool's weights; the mock pool has none.
+        # One instance role per pool, with its log group, by the pool's name. A GPU pool's role is
+        # under the GPU pools' path and reads its own pool's weights; the mock pool has none.
         self.roles = {
             pool.name: PoolRole(
                 self,
                 f"Role-{pool.name}",
                 pool=pool.name,
-                reads_weights=image.is_gpu_pool(pool),
+                gpu=image.is_gpu_pool(pool),
                 heartbeats=self.tables.heartbeats,
                 workspace=observability.prometheus,
             )

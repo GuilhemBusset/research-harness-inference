@@ -1,7 +1,8 @@
-"""The host, as the lifecycle agent acts on it: its docker and its systemd, through nsenter.
+"""The host, as the lifecycle agent acts on it: its docker, its systemd and its console, through
+nsenter.
 
 The agent runs in a container, and the engine is a systemd unit of the host (system design,
-section 4.3). So every action on the host runs the host's own `docker` or `systemctl` in the
+section 4.3). So every action on the host runs the host's own `docker`, `systemctl` or `tee` in the
 host's namespaces, with `nsenter` on the host's first process: the agent's container is privileged
 and shares the host's process namespace for that. Every other module of the agent acts on the host
 through this one, so a test replaces one module.
@@ -10,6 +11,10 @@ The engine image is in the account's ECR, and the host's docker holds no credent
 pull first asks ECR for an authorization token, with the instance role, and logs the host's docker
 in to the image's registry. The token's password reaches docker on its standard input, never in a
 command's arguments, where any process of the host could read it.
+
+The host's console is the instance's serial console, which EC2 keeps and gives as the instance's
+console output. A line is written there on the host's own console device, and reaches the command
+on its standard input: reading it back needs no permission of the instance role.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
@@ -30,6 +35,9 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 ENGINE_UNIT = "rhi-engine"
 
+# The host's console device: the kernel writes it to the serial console of an instance.
+CONSOLE = "/dev/console"
+
 # The host's first process, and the namespaces of it a command enters.
 HOST_NAMESPACES = ("--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid")
 
@@ -38,8 +46,8 @@ _REGISTRY = re.compile(r"([A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?)/\S+", re.ASCII)
 
 
 class HostError(Exception):
-    """An action on the host failed. `action` is `login`, `pull`, `inspect`, `start`, `restart` or
-    `stop`; `returncode` is the command's exit status, or None when no command ran to its end."""
+    """An action on the host failed. `action` is `login`, `pull`, `inspect`, `start`, `restart`,
+    `stop` or `console`; `returncode` is the command's exit status, or None when no command ran to its end."""
 
     def __init__(self, action: str, returncode: int | None = None) -> None:
         how = "could not be run" if returncode is None else f"exited with status {returncode}"
@@ -49,7 +57,7 @@ class HostError(Exception):
 
 
 class Host:
-    """The host's docker and systemd. `ecr` is an ECR client of the AWS SDK; without one, the
+    """The host's docker, systemd and console. `ecr` is an ECR client of the AWS SDK; without one, the
     instance role and the region of the environment make it at the first pull. `nsenter` is the
     program that enters the host's namespaces."""
 
@@ -91,6 +99,14 @@ class Host:
 
     def stop_engine(self) -> None:
         self._run("stop", ("systemctl", "stop", ENGINE_UNIT))
+
+    def write_console(self, line: str, timeout: float | None = None) -> None:
+        """Write `line`, as one line, on the host's console, within `timeout` seconds when one is
+        given."""
+        end = None if timeout is None else time.monotonic() + timeout
+        # `tee` repeats on its standard output what it writes: a quiet command, so that the line is
+        # not in the agent's own log as well.
+        self._run("console", ("tee", CONSOLE), line + "\n", end=end, quiet=True)
 
     def _credentials(self) -> tuple[str, str]:
         """The user and the password of an authorization token from ECR."""

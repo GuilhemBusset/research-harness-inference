@@ -25,6 +25,14 @@ what exists when the role does:
   statement reads the same to an invariant in any stack. The mock pool has no weights, and its
   role nothing on the bucket. No instance role writes there: the copy job's role alone does.
 
+**The path of the GPU pools' roles.** The promotion job tries a candidate machine image on one
+instance, a canary, which it starts from a pool's launch template with the pool's instance role,
+and a role that starts an instance must be allowed to pass the instance's role. So that the job's
+role may pass the GPU pools' roles and no other, every GPU pool's instance role is under one IAM
+path, `GPU_ROLE_PATH`, and the mock pool's role is outside it. A path adds no right to a role: it
+is part of the role's ARN, by which another role's `iam:PassRole` statement can name these roles
+and no other. The roles keep the names CloudFormation gives them.
+
 The role is tagged with its pool, which `tests/policy/test_instance_role.py` reads: an instance
 role may read no parameter and no secret other than its own pool's.
 """
@@ -65,6 +73,9 @@ WEIGHTS_LIST_ACTION = "s3:ListBucket"
 
 LOG_RETENTION = logs.RetentionDays.ONE_MONTH
 
+# The IAM path of every GPU pool's instance role, and of no other role.
+GPU_ROLE_PATH = "/rhi/gpu-pools/"
+
 
 def log_group_name(pool: str) -> str:
     """The fixed name of a pool's log group."""
@@ -73,8 +84,8 @@ def log_group_name(pool: str) -> str:
 
 class PoolRole(Construct):
     """One pool's instance role, as `role`, its session policy, as `session_policy`, and the log
-    group of its instances, as `log_group`. With `reads_weights`, which a GPU pool's role is given,
-    the role reads its pool's prefix of the model bucket."""
+    group of its instances, as `log_group`. `gpu` says the pool is a GPU pool: its role is under
+    `GPU_ROLE_PATH` and reads its pool's prefix of the model bucket."""
 
     def __init__(
         self,
@@ -84,7 +95,7 @@ class PoolRole(Construct):
         pool: str,
         heartbeats: dynamodb.ITable,
         workspace: PrometheusWorkspace,
-        reads_weights: bool = False,
+        gpu: bool = False,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -97,6 +108,8 @@ class PoolRole(Construct):
             "Role",
             assumed_by=ec2_service,  # ty: ignore[invalid-argument-type]
             description=f"The instances of the pool {pool}.",
+            # Without a path a role is under `/`, outside every other path.
+            path=GPU_ROLE_PATH if gpu else None,
         )
         cdk.Tags.of(self.role).add(POOL_TAG, pool)
 
@@ -135,7 +148,7 @@ class PoolRole(Construct):
                 conditions={"StringEquals": {f"autoscaling:ResourceTag/{POOL_TAG}": pool}},
             )
         )
-        if reads_weights:
+        if gpu:
             self.role.add_to_policy(
                 iam.PolicyStatement(actions=[WEIGHTS_READ_ACTION], resources=[model_store.objects_arn(stack, pool)])
             )
