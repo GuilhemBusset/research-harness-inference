@@ -25,14 +25,19 @@ alone moves it (section 5.1).
    (`with_openings`): its sent number is one more than it was given. Both instances must still be
    in service when the phase ends; if one has left, or is leaving, the run is not measured
    (`Departed`), since a student moved by a departure did not leave an instance that was there.
+   When a student's requests were split, the job looks again `SPLIT_RECHECK_SECONDS` later, so
+   that a departure that began during the phase and had not yet shown in the workspace makes the
+   run not measured rather than failed.
 3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance
    (load that fits in one instance for 10 minutes, and 15 since the scale-out, section 5.1), then
    each student sends its requests again, and every one of them must have reached the instance
-   that stayed.
+   that stayed. The job prints, for each student, the instance it was on before the departure,
+   whether that one stayed or left, and whether its requests after reached the remaining one.
 
-A run whose students were both, before the departure, on the instance that stayed has shown no
-student move: it would pass without asking the second half of the question, so it is not measured
-(`NotExercised`).
+The question is asked only when, before the departure, the two students were on different
+instances: one of them then has to move, to the remaining instance, and the other has to stay. A
+run whose students were both on one instance, the one that stayed (neither moved) or the one that
+left (both moved), would pass without asking it, so it is not measured (`NotExercised`).
 
 **Which instance served** is read from the workspace: the count of the mock's time-to-first-token
 histogram, one per request, on each `instance` series (section 7.2). A student's window opens before
@@ -134,6 +139,10 @@ POLL_SECONDS = 30
 SCALE_OUT_WAIT_SECONDS = 20 * 60
 LOAD_END_WAIT_SECONDS = 5 * 60
 DEPARTURE_WAIT_SECONDS = 40 * 60
+# Seconds. After a phase in which a student's requests were split, the job looks again this much
+# later whether an instance left: an instance that stopped writes no sample after `FRESH_SECONDS`,
+# and one the group replaces shows a third instance once its replacement serves.
+SPLIT_RECHECK_SECONDS = 5 * 60
 # How many times a phase is measured before a disturbed one stops the run.
 ATTEMPTS = 3
 # The sizes of the requests: small, since only where each lands matters.
@@ -288,9 +297,19 @@ def kept_opening(opening: loadgen.Record, following: loadgen.Record) -> bool:
     return first is not None and cached is not None and 0 < first <= cached
 
 
-def moved(before: PhaseCounts, remaining: set[str]) -> bool:
-    """Whether a student was, before the departure, on an instance other than the one that stayed."""
-    return any(set(held.served) - remaining for held in before.values())
+def instance_of(held: Counts) -> str | None:
+    """The one instance that served every request of the window, `None` when none did."""
+    if len(held.served) != 1 or not held.adds_up():
+        return None
+    return next(iter(held.served))
+
+
+def exercised(before: PhaseCounts, remaining: set[str]) -> bool:
+    """Whether the run asked the question: before the departure, each student was on one instance,
+    the two students on different instances, so that exactly one of them, the one on the instance
+    that left, had to move, and the other had to stay."""
+    on = [instance_of(held) for held in before.values()]
+    return None not in on and len(set(on)) == len(on) and sum(instance in remaining for instance in on) == 1
 
 
 class Disturbed(RuntimeError):
@@ -302,7 +321,8 @@ class Departed(RuntimeError):
 
 
 class NotExercised(RuntimeError):
-    """No student was on the instance that left: the run cannot show a student move."""
+    """The two students were on one instance before the departure: either neither had to move, or
+    both did, and the run does not show one student moving while the other stays."""
 
 
 class Leaving(RuntimeError):
@@ -571,6 +591,12 @@ class Run:
         def measure() -> PhaseCounts:
             counts = asyncio.run(self.phase(first_at_once=first_at_once))
             self._in_service(in_service, phase)
+            if any(held.most_served < held.sent for held in counts.values()):
+                # A split is a failure only if no instance was leaving: look again once a departure
+                # that began during the phase has had time to show in the workspace.
+                print(f"a student's requests were split in the phase {phase}: in service checked again")
+                time.sleep(SPLIT_RECHECK_SECONDS)
+                self._in_service(in_service, phase)
             return counts
 
         return measure_undisturbed(phase, measure, self.pool.rebalance_number)
@@ -599,9 +625,17 @@ class Run:
         after = self.measured(Phase.AFTER, first_at_once=False, in_service=remaining)
         if any(set(counts.served) - remaining for counts in after.values()):
             raise RuntimeError("an instance other than the remaining one served after the departure")
+        (stayed,) = remaining
+        for student in STUDENTS:
+            on = instance_of(before[student])
+            print(
+                f"student {student}: before the departure on {on or 'more than one instance'}"
+                f"{'' if on is None else ', which stayed' if on == stayed else ', which left'}; after it on "
+                f"{'the remaining instance' if instance_of(after[student]) == stayed else 'more than one instance'}"
+            )
         numbers = numbers_of(zones, {Phase.BEFORE: before, Phase.AFTER: after})
-        if passes(numbers) and not moved(before, remaining):
-            raise NotExercised("both students were on the instance that stayed: none had to move")
+        if passes(numbers) and not exercised(before, remaining):
+            raise NotExercised("both students were on one instance before the departure: not one moved while one stayed")
         return numbers
 
 
