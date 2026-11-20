@@ -24,7 +24,8 @@ libraries and not the CLI's entry point. An SDK script is given its key as the S
 
 Every client reaches the gateway through a forwarder of its own (`Forwarder`), a local HTTP server
 that sends each request on to the gateway and the answer back as it arrives, and records each
-exchange: when it was sent, its status and cause, whether the whole answer reached the client, and
+exchange: when it was sent, its status and cause, whether the whole answer reached the client (the
+last event of a stream, whole, or a body to the length the gateway declared), and
 when the client closed it before its end. The forwarder writes the mock pool's name as the `model`
 of every request it forwards, so that no request reaches another pool: a `claude-` name would reach
 the default pool, a GPU pool (section 6.2). The clients are also told to ask for that name, so the
@@ -83,7 +84,7 @@ verdict through `common.run_spike`; the versions are printed with the outcomes, 
 | --- | --- |
 | `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output |
 | `RHI_SPIKE_POOL` | The mock pool, `mock` unless given |
-| `RHI_RUN_LABEL` | The run's label; unless given, `s2-client-hold-` and a random suffix of the build's own (`build_label`) |
+| `RHI_RUN_LABEL` | The start of the run's label, `s2-client-hold` unless given; the build adds a random suffix of its own (`build_label`) |
 
 The pool's deadlines and its `start_delay_seconds` come from the deployed configuration
 (`rhi.config.read_ssm`): a pool whose delay is 0, or that is not a mock pool, stops the job before
@@ -431,8 +432,31 @@ _HOP_BY_HOP = {
 }
 # The last event of a stream that ended well, in each format: Messages, Responses, Chat Completions.
 STREAM_ENDS = (b"event: message_stop", b"event: response.completed", b"data: [DONE]")
-# What is kept of the stream so far, so that a last event split between two reads is still seen.
-_TAIL = max(len(event) for event in STREAM_ENDS) - 1
+
+
+def stream_end(event: bytes) -> bool:
+    """Whether a whole event, the blank line that ends it already passed, is the last event of a
+    stream that ended well: its name, or `[DONE]`, and data that is whole JSON."""
+    lines = event.strip(b"\n").split(b"\n")
+    if b"data: [DONE]" in lines:
+        return True
+    if not any(line in STREAM_ENDS for line in lines):
+        return False
+    data = b"\n".join(line[5:].strip() for line in lines if line.startswith(b"data:"))
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
+def whole_json(body: bytes) -> bool:
+    """Whether a non-streaming answer's body is whole: JSON that reads to its end."""
+    try:
+        json.loads(body)
+    except ValueError:
+        return False
+    return True
 
 
 def directed(body: bytes, model: str) -> bytes:
@@ -535,13 +559,17 @@ class Forwarder:
                     handler.send_header(name, value)
             if answer.status >= 400:
                 handler.send_header("Content-Length", str(len(payload)))
+            elif answer.length is not None:
+                # The length the gateway declared, so that a client too sees an answer cut short.
+                handler.send_header("Content-Length", str(answer.length))
             handler.send_header("Connection", "close")
             handler.end_headers()
             handler.wfile.write(payload)
             handler.wfile.flush()
-            # A stream is whole once its last event has passed, which an error event ending it is not.
+            # A stream is whole once its last event has passed, whole, which an error event ending
+            # it is not; a non-streaming answer once its body has, to the length the gateway declared.
             streaming = "text/event-stream" in (answer.getheader("Content-Type") or "")
-            tail, ended, pending = b"", False, b""
+            ended, pending, kept = False, b"", b""
             while True:
                 to_client = False
                 chunk = answer.read1(65536)
@@ -550,17 +578,20 @@ class Forwarder:
                 to_client = True
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
-                # The read with what was kept before it: an event begun in the last read ends in this one.
-                seen = tail + chunk
-                ended = ended or any(event in seen for event in STREAM_ENDS)
-                tail = seen[-_TAIL:]
                 if streaming:
-                    # Each whole event, to see an error that ends the stream: the gateway ended it.
+                    # Each whole event: an event begun in the last read ends in this one.
                     *events, pending = (pending + chunk).replace(b"\r\n", b"\n").split(b"\n\n")
+                    # An error that ends the stream is the gateway ending it.
                     exchange.cause = exchange.cause or next(filter(None, map(stream_error, events)), None)
-                # A client may close as soon as it has the last event: it then has the whole answer.
-                exchange.completed = answer.status == 200 and streaming and ended
-            exchange.completed = answer.status == 200 and (ended or not streaming)
+                    ended = ended or any(map(stream_end, events))
+                    # A client may close as soon as it has the last event: it then has the whole answer.
+                    exchange.completed = answer.status == 200 and ended
+                elif answer.status == 200:
+                    kept += chunk
+            # Whatever the gateway declared and did not send: the answer was cut short.
+            short = bool(answer.length)
+            whole = ended if streaming else whole_json(kept)
+            exchange.completed = exchange.completed or (answer.status == 200 and whole and not short)
         except (OSError, http.client.HTTPException, ValueError, AttributeError):
             # Only a failed write is the client closing the exchange; a failed read is the gateway's doing.
             if to_client and exchange.closed_at is None and not exchange.completed:
@@ -1013,14 +1044,12 @@ def sdk_script(client: Client, kind: Kind, environ: Mapping[str, str]) -> int:
 
 
 def build_label(environ: Mapping[str, str]) -> str:
-    """The run label of this build: `RHI_RUN_LABEL` when the owner gives one, and without it the
-    job's default label with a random suffix of this build's own. A run of S2 is posted in several
-    statuses, and a later build of one commit under the same label (a run not measured, say) would
-    replace only the first of them, leaving a mix no record can read: two builds never share a
-    label unless the owner gives them one."""
-    if common.RUN_LABEL_VARIABLE in environ:
-        return common.run_label(JOB, environ)
-    return f"{common.run_label(JOB, {})}-{secrets.token_hex(4)}"
+    """The run label of this build: `RHI_RUN_LABEL` when the owner gives one, the job's default
+    label otherwise, either with a random suffix of this build's own. A run of S2 is posted in
+    several statuses, and a later build of one commit under the same label (a run not measured,
+    say) would replace only the first of them, leaving a mix no record can read: two builds never
+    share a label, even when the owner gives both the same one."""
+    return f"{common.run_label(JOB, environ)}-{secrets.token_hex(4)}"
 
 
 def main(environ: Mapping[str, str] = os.environ) -> common.Verdict:
