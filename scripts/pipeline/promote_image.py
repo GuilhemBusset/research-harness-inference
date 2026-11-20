@@ -37,8 +37,6 @@ else starts, with `RHI_PROMOTE_PIPELINE` naming the pipeline:
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import enum
 import os
 import re
@@ -294,15 +292,12 @@ def family_of(instance_type: str) -> str:
 
 
 def line_of(output: str | None) -> tuple[bool, str | None] | None:
-    """The canary's line in its console output, which EC2 gives in base64: whether it served, and
-    the stage it failed at. None while there is no line. The last line counts."""
+    """The canary's line in its console output: whether it served, and the stage it failed at. None
+    while there is no line. The last line counts. EC2 answers in base64, and boto3 decodes it
+    before it returns (botocore's `decode_console_output`), so the text arrives decoded."""
     if not output:
         return None
-    try:
-        text = base64.b64decode(output, validate=True).decode("utf-8", errors="replace")
-    except (binascii.Error, ValueError):
-        return None
-    found = LINE.findall(text)
+    found = LINE.findall(output)
     if not found:
         return None
     word, stage = found[-1]
