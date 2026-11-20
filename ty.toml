@@ -38,6 +38,7 @@ root = [
     "admin",
     "dashboards",
     "scripts/pipeline",
+    "spikes",
 ]
 
 [src]
@@ -58,6 +59,7 @@ include = [
     "admin",
     "dashboards",
     "scripts/pipeline",
+    "spikes",
     "tests",
 ]
 

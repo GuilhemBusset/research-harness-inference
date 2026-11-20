@@ -38,6 +38,7 @@ src = [
   "admin",
   "dashboards",
   "scripts/pipeline",
+  "spikes",
 ]
 
 [lint]

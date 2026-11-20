@@ -31,8 +31,8 @@ PACKAGES = {
     "rhi_admin": "admin",
     "rhi_dashboards": "dashboards",
 }
-# scripts/pipeline holds modules the tests import by name, not a package.
-ROOTS = [*PACKAGES.values(), "scripts/pipeline"]
+# scripts/pipeline and spikes hold modules the tests import by name, not a package.
+ROOTS = [*PACKAGES.values(), "scripts/pipeline", "spikes"]
 
 
 def read_toml(name: str) -> dict[str, Any]:
@@ -58,6 +58,15 @@ def test_the_tools_list_the_same_roots() -> None:
         assert folder in ty["environment"]["root"], folder
     for checked in ("app.py", "tests", *ROOTS):
         assert checked in ty["src"]["include"], checked
+
+
+def test_the_spikes_are_imported_by_name_and_hold_no_test() -> None:
+    module = importlib.import_module("common")
+    assert module.__file__ == str(REPO / "spikes" / "common.py")
+    # Their tests are under tests/unit/spikes: pytest is pointed at no folder of spikes/.
+    testpaths = read_toml("pyproject.toml")["tool"]["pytest"]["ini_options"]["testpaths"]
+    assert not any(Path(path).parts[0] == "spikes" for path in testpaths)
+    assert not [path.name for path in (REPO / "spikes").rglob("test_*.py")]
 
 
 def test_same_named_test_files_both_run(tmp_path: Path) -> None:
