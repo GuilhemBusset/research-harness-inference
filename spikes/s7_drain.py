@@ -16,16 +16,15 @@ alone moves it, by load and by idleness (section 5.1).
 1. **The stream across a gateway deployment** (`Run.across_deployment`). It notes the gateway's
    tasks, opens a held stream and prints when the hold begins and how long it may last. The owner
    starts the deployment, by releasing the pipeline again: the job starts none. The stream is held
-   until a gateway task the job did not see at its start has been writing for
-   `ROLLOUT_MARGIN_SECONDS`, by which ECS has replaced the tasks it began with, or for
+   until the rollout has reached the tasks the job began with (`rollout_under`), or for
    `RHI_S7_DEPLOYMENT_HOLD_SECONDS` at most.
 2. **Two instances.** It holds twice the pool's `target_concurrency` of short streams until the
    scaler asks for two instances and reads two in service, then stops the load.
-3. **The departures.** It sends nothing more but one held stream, as one canary student, opened
-   while the scaler still asks for two and held until the first instance the scaler takes away
-   has stopped: the stream across a scale-in. It watches the scaler's note: each time the note
-   asks for fewer instances, the scaler has chosen an idle one to leave, and the note's
-   `written_at` is when the leave began.
+3. **The departures.** It sends nothing more but the stream across a scale-in (`Run.relay`), as one
+   canary student, from while the scaler still asks for two until the first instance the scaler
+   takes away has stopped. It watches the scaler's note: each time the note asks for fewer
+   instances, the scaler has chosen an idle one to leave, and the note's `written_at` is when the
+   leave began.
 4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it makes sure the pool
    is awake, waits until the scaler asks for no instance and reads none in service, which it does
    only after the pool's idle period, and sends one request at once. A wake is lost when its
@@ -33,20 +32,34 @@ alone moves it, by load and by idleness (section 5.1).
    wake, it sends requests to bring the pool back, up to `RECOVERIES` of them, which are not wakes
    and are not counted, and goes on to the next.
 
-**A held stream** (`slow_stream`). The mock streams its canned turn in well under a second, and
-the gateway reads a request's whole body before it does anything with it, so a stream is held on
-the server by its request: the job sends the body but its last byte, then one byte of padding
-every `TRICKLE_SECONDS`, white space that JSON allows before the closing brace, and the last byte
-once the event the stream spans is over. Until then no server can have answered it: it is open on
-the gateway task that took it. A stream completed when it was answered 200 and its closing event,
-`message_stop`, arrived, with no error event.
+A stream completed when it was answered 200 and its closing event, `message_stop`, arrived, with no
+error event. The mock streams its canned turn in well under a second, so no one inference request
+lasts as long as a scale-in or a deployment; each stream is held open where the event it spans acts.
 
-**When the gateway was deployed.** The gateway's collector writes the series `up` of its scrape,
-job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task runs. A task that
-first writes after the stream opened is one the deployment started (`rollout_at`). The stream's
-number is measured (`across_rollout`): 1 when it completed and was held until such a task had
-written for `ROLLOUT_MARGIN_SECONDS`; 0 when it did not complete and such a task wrote while it was
-open. Otherwise the job saw no deployment under the stream, and the run is not measured.
+**The stream across a gateway deployment** (`slow_stream`) is held on the gateway task that took it,
+which the deployment replaces. The gateway reads a request's whole body before it does anything
+with it, so the job sends the body but its last byte, then one byte of padding every
+`TRICKLE_SECONDS`, white space that JSON allows before the closing brace, and the last byte once
+the rollout has reached the old tasks. Until then its connection is open on that task, and its
+answer, forwarded to the pool then, comes from a task the deployment is draining.
+
+**The stream across a scale-in** (`Run.relay`) is held on the pool, whose instance the scale-in
+removes: inference must be in flight there when it happens. It is a relay of whole streamed
+requests, each sent once the one before has completed, from while the scaler still asks for two
+instances until the first departure is over, so that at every moment of the scale-in one has been
+forwarded and is being answered, and the last is answered after the instance has stopped. One
+canary student sends them, one at a time, below the load that keeps an instance in service. The
+number is 1 when every one completed.
+
+**When the gateway was deployed** (`rollout_under`). The gateway's collector writes the series `up`
+of its scrape, job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task
+runs. A task appearing is not a deployment: a deployment replaces tasks. The rollout has reached
+the old tasks under the stream when one of the tasks writing as the stream opened has stopped since
+(silent for `QUIET_SECONDS`), by the time the stream ended, while a task new to the job had begun by
+then and still wrote when the old one stopped. The stream's number is measured (`across_rollout`)
+only when that was seen: 1 when it completed, 0 when it did not. A stream cut short is given
+`QUIET_SECONDS` and two scrapes after the cut for its task's stop to show. Otherwise the job saw no
+deployment under the stream, and the run is not measured.
 
 **When an instance has left.** The scaler's gauges cannot say it: an instance stops counting as in
 service as soon as its target is draining, and the warm count holds an instance from the moment it
@@ -64,8 +77,11 @@ number.
 
 **Which path it took** (`path_of`), from the scaler's readings of the warm count, each at the time
 the scaler wrote it (`Pool.warm_counts`), which counts an instance going back to the warm pool from
-its first wait state. The path is told only from a reading at or before the note and one at or
-after the instance stopped (`warm_around`): with them, the warm count rose and no instance new to
+its first wait state. The path is told only from the reading the decision was made on and one at or
+after the instance stopped (`warm_around`). The scaler reads the pool, decides, acts, then writes
+its readings, as they were before it acted, stamped in milliseconds within the second its note's
+`written_at` gives in whole seconds: the reading the decision was made on is the last one before
+`NOTE_SECOND` after the note. With them, the warm count rose and no instance new to
 the pool wrote, so the instance went back to the warm pool; the warm count did not rise, so it was
 terminated. Without them, or with a rise while a new instance wrote (a fresh instance launched into
 the warm pool in place of a terminated one), that departure has no path, and is not a number. A
@@ -155,15 +171,16 @@ SCALE_IN_WAIT_SECONDS = 30 * 60
 # it does, to see both paths.
 INSTANCES = 2
 CYCLES = 2
-# Seconds between two bytes of a held stream's body: the edge's idle timeout is far longer.
+# Seconds between two bytes of the body of the stream across a gateway deployment: the edge's idle
+# timeout is far longer.
 TRICKLE_SECONDS = 5
 PADDING = b" "
-# The longest the stream across a scale-in is held: the first departure's longest watch.
-SCALE_IN_HOLD_SECONDS = SCALE_IN_WAIT_SECONDS + LEAVE_WAIT_SECONDS + 3 * QUIET_SECONDS
-# Seconds a gateway task new to the job writes before the deployment counts as under the stream: ECS
-# deregisters the tasks it replaces once their successors are healthy, a minute or two after these
-# start (section 8.5).
-ROLLOUT_MARGIN_SECONDS = 300
+# Seconds. The scaler's note keeps its run's time in whole seconds, its gauges in milliseconds: the
+# readings of the run that wrote a note are stamped within this second after its `written_at`.
+NOTE_SECOND = 1
+# Seconds after a stream across the gateway deployment was cut during which the job looks for the
+# stop of the task that held it.
+CUT_WATCH_SECONDS = QUIET_SECONDS + 2 * SCRAPE_SECONDS
 GATEWAY_JOB = "gateway"
 # Seconds a wake may take beyond the pool's hold before it counts as lost.
 WAKE_MARGIN_SECONDS = 120
@@ -263,14 +280,17 @@ def path_of(warm_before: int, warm_after: int, newcomer: bool) -> Path | None:
 def warm_around(
     samples: Sequence[tuple[float, float]], at: float, through: float | None = None
 ) -> tuple[int, int] | None:
-    """The warm count at `at`, the last reading at or before it, and the highest after it. `None`
-    when no reading is at or before `at`, or, `through` given, none is at or after `through`: the
+    """The warm count the scaler decided on in its run of `at`, a note's `written_at`, and the
+    highest it read after that run. The first is the last reading before `NOTE_SECOND` after `at`:
+    that run's own, stamped in that second, or the run's before when that one was not written.
+    `None` when there is no such reading, or, `through` given, none is at or after `through`: the
     count was not observed across the departure."""
-    before = [value for moment, value in samples if moment <= at]
+    run_ended = at + NOTE_SECOND
+    before = [value for moment, value in samples if moment < run_ended]
     if not before or (through is not None and not any(moment >= through for moment, _ in samples)):
         return None
     first = round(before[-1])
-    return first, max([first, *(round(value) for moment, value in samples if moment > at)])
+    return first, max([first, *(round(value) for moment, value in samples if moment >= run_ended)])
 
 
 @dataclass(frozen=True)
@@ -303,21 +323,31 @@ def numbers_of(
 # A gateway deployment.
 
 
-def rollout_at(before: set[str], tasks: Mapping[str, tuple[float, float]]) -> float | None:
-    """When the first gateway task not in `before` first wrote, from each task's first and last
-    write: `None` when none did."""
-    return min((first for task, (first, _) in tasks.items() if task not in before), default=None)
+def rollout_under(
+    before: set[str], tasks: Mapping[str, tuple[float, float]], began: float, ended: float, now: float
+) -> float | None:
+    """When a rollout replaced the gateway's tasks under a stream open from `began` to `ended`, as
+    the tasks' first and last writes show at `now`: the last write of the first task of `before`,
+    the tasks writing as it opened, that stopped, having written since `began`, been silent for
+    `QUIET_SECONDS` and stopped by `ended` and one scrape, while a task not in `before` had begun by
+    `ended` and still wrote when it stopped. `None` when none did: a task that appeared while those
+    of `before` went on writing is no rollout."""
+    latest = min(ended + SCRAPE_SECONDS, now - QUIET_SECONDS)
+    stops = sorted(last for task, (_, last) in tasks.items() if task in before and began < last <= latest)
+    newcomers = [(first, last) for task, (first, last) in tasks.items() if task not in before]
+    return next(
+        (stop for stop in stops if any(first <= ended and last >= stop for first, last in newcomers)),
+        None,
+    )
 
 
-def across_rollout(completed: bool, spanned: bool, rolled_out_at: float | None) -> bool:
-    """The stream across a gateway deployment, as a number: completed after it was held through the
-    rollout (`spanned`), or cut while a new task wrote (`rolled_out_at`). ValueError otherwise: no
-    deployment was seen under the stream, and the run is not measured."""
-    if completed and spanned:
-        return True
-    if not completed and rolled_out_at is not None:
-        return False
-    raise ValueError("no gateway deployment was seen while the stream was held")
+def across_rollout(completed: bool, rolled_out_at: float | None) -> bool:
+    """The stream across a gateway deployment, as a number: whether it completed, once a rollout
+    was seen under it (`rollout_under`). ValueError otherwise: no deployment was seen under the
+    stream, and the run is not measured."""
+    if rolled_out_at is None:
+        raise ValueError("no gateway deployment was seen while the stream was held")
+    return completed
 
 
 # The pool, as the workspace and the pool-state table show it.
@@ -500,34 +530,22 @@ class Run:
         return self.keys[0]
 
     async def across_deployment(self) -> bool:
-        """Holds a stream across a gateway deployment (`across_rollout`): whether it completed.
-
-        The rollout is checked from the gateway's tasks, which `Pool.gateway_tasks` reads. A pool
-        that does not read them gives no check: the stream is then held on the server for the whole
-        `deployment_hold_seconds`, and whether it completed is the number."""
+        """Holds a stream across a gateway deployment (`across_rollout`): whether it completed. The
+        rollout is told from the gateway's tasks, which `Pool.gateway_tasks` reads (`rollout_under`)."""
+        tasks = self.pool.gateway_tasks
         began = time.time()
         start = time.strftime("%H:%M:%S UTC", time.gmtime(began))
-        tasks: Callable[[float, float], Mapping[str, tuple[float, float]]] | None
-        tasks = getattr(self.pool, "gateway_tasks", None)
-        if tasks is None:
-            print(f"holding a stream for {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
-            print("the gateway's tasks are not read: the release under the stream is not checked")
-            request = _request(self.pool.name)
-            hold = self.deployment_hold_seconds
-            return await slow_stream(self.endpoint, self.student, request, hold, transport=self.transport)
         before = set(await asyncio.to_thread(tasks, began - FRESH_SECONDS, began))
         if not before:
             raise RuntimeError("no gateway task was writing when the stream was opened")
-        seen: list[float] = []
-        spanned = False
+
+        async def rollout(ended: float | None = None) -> float | None:
+            now = time.time()
+            current = await asyncio.to_thread(tasks, began - FRESH_SECONDS, now)
+            return rollout_under(before, current, began, now if ended is None else ended, now)
 
         async def rolled_out() -> bool:
-            nonlocal spanned
-            now = time.time()
-            at = rollout_at(before, await asyncio.to_thread(tasks, began, now))
-            seen[:] = [] if at is None else [at]
-            spanned = at is not None and now >= at + ROLLOUT_MARGIN_SECONDS
-            return spanned
+            return await rollout() is not None
 
         print(f"holding a stream for up to {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
         request = _request(self.pool.name)
@@ -539,12 +557,14 @@ class Run:
             until=rolled_out,
             transport=self.transport,
         )
-        if not completed and not seen:
-            # Cut before the job looked again: a task that first wrote while it was open is a rollout under it.
-            at = rollout_at(before, await asyncio.to_thread(tasks, began, time.time()))
-            seen[:] = [] if at is None else [at]
+        ended = time.time()
+        rolled_out_at = await rollout(ended)
+        while rolled_out_at is None and not completed and time.time() < ended + CUT_WATCH_SECONDS:
+            # Cut short: the stop of the task that held it shows once it has been silent long enough.
+            await asyncio.sleep(POLL_SECONDS)
+            rolled_out_at = await rollout(ended)
         try:
-            survived = across_rollout(completed, spanned, seen[0] if seen else None)
+            survived = across_rollout(completed, rolled_out_at)
         except ValueError:
             message = "no gateway deployment was seen under the stream: release the pipeline while it is held"
             raise RuntimeError(message) from None
@@ -625,27 +645,36 @@ class Run:
         print(f"an instance left in {seconds:.0f} s, path {path or 'not told'}, warm {warm or 'not read'}")
         return Departure(path, seconds, instance)
 
+    async def relay(self, over: Callable[[], bool]) -> bool:
+        """The stream across a scale-in: whole streamed requests, each sent once the one before has
+        completed, until `over` says the scale-in is, after one has been answered. Whether every one
+        completed; it stops at the first that did not."""
+        sent = 0
+        while True:
+            request = _request(self.pool.name)
+            try:
+                completed = await _completes(self.endpoint, self.student, request, request.body, self.transport)
+            except httpx.HTTPError:
+                completed = False
+            sent += 1
+            if not completed:
+                print(f"stream {sent} across the scale-in did not complete")
+                return False
+            if over():
+                print(f"{sent} stream(s) across the scale-in, one after another, all completed")
+                return True
+
     async def cycle(self, *, scale_in_stream: bool) -> bool | None:
-        """Two instances, then both departures. With `scale_in_stream`, a stream is held from while
-        the scaler asks for two until the first departure is over: whether it completed."""
+        """Two instances, then both departures. With `scale_in_stream`, the stream across a scale-in
+        (`relay`) runs from while the scaler asks for two until the first departure is over: whether
+        it completed."""
         await self.two_instances()
         # Both departures are watched from now, while the scaler still asks for two: each sees the
         # first note that asks for fewer.
         idle = self.settings.idle_minutes * 60
         first = asyncio.create_task(self.departure(INSTANCES, SCALE_IN_WAIT_SECONDS))
         last = asyncio.create_task(self.departure(1, SCALE_IN_WAIT_SECONDS + LEAVE_WAIT_SECONDS + idle, first))
-        streaming = None
-        if scale_in_stream:
-
-            async def over() -> bool:
-                return first.done()
-
-            request = _request(self.pool.name)
-            streaming = asyncio.create_task(
-                slow_stream(
-                    self.endpoint, self.student, request, SCALE_IN_HOLD_SECONDS, until=over, transport=self.transport
-                )
-            )
+        streaming = asyncio.create_task(self.relay(first.done)) if scale_in_stream else None
         completed = None
         try:
             self.departures.append(await first)
