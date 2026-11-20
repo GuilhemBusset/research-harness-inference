@@ -51,14 +51,19 @@ requests, each sent once the one before has completed, from while the scaler sti
 instances until the job has seen the first departure over. One canary student sends them, one at a
 time, below the load that keeps an instance in service. The job sees a departure over only
 `QUIET_SECONDS` after the instance stopped, so the streams across the scale-in are told afterwards,
-from the departure as measured (`across_scale_in`). A stream spanned the scale-in when it was in
-flight across one of its events, the scaler asking for fewer or the instance having stopped: its
-inference began, its first event from the engine (`INFERENCE_EVENT`) arrived, by the event, and its
-stream ended after. Streams that began and ended between the two events did not span either. A
-stream that only overlaps the wait for the stop to show is not one of them. The number is 1 when
-one spanned an event and every stream in flight while the instance left completed, 0 when one of
-those did not. When none spanned an event, or no stop was seen, the next cycle holds one again,
-and a run in which none did is not measured.
+from the departure as measured (`across_scale_in`). Neither event of a departure is seen at its
+moment, only between two bounds (`Departure.events`): the scaler asks for fewer after its run began,
+the note's `written_at`, and before it writes the note (`rhi_scaler.aws_io.apply`), which the job
+read by the time it saw it; the instance stopped after its last write and within a scrape of it. A
+stream spanned the scale-in when it was in flight across one of its events wherever between its
+bounds the event happened: its inference began, its first event from the engine
+(`INFERENCE_EVENT`) arrived, by the earliest bound, and its stream ended after the latest. A stream
+that only crosses a bound may have begun and ended on one side of the event, and streams that began
+and ended between the two events did not span either. A stream that only overlaps the wait for the
+stop to show is not one of them. The number is 1 when one spanned an event and every stream in
+flight while the instance left completed, 0 when one of those did not. When none spanned an event,
+or no stop was seen, the next cycle holds one again, and a run in which none did is not measured:
+the mock's turns are short beside those bounds, so a run may end that way, and is run again.
 
 **When the gateway was deployed** (`rollout_under`). The gateway's collector writes the series `up`
 of its scrape, job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task
@@ -77,7 +82,11 @@ under the stream drains, kept running by the stream for up to the target group's
 deregistration delay, while another one stops. A completed stream was on a task being replaced
 only when, beside the stopped one, a task the job began with still ran as it ended (`held_under`):
 had it been on a replacement, which may serve before its collector first writes, nothing would
-have kept an old task running. The stream's number is measured (`across_rollout`)
+have kept an old task running. Nor is one that a replacement may have taken as it opened
+(`replacement_may_hold`): a task new to the job that first wrote within `COLLECTOR_LAG_SECONDS`
+after the stream opened may have been serving as it did, its collector starting a moment after it,
+and an old task that still ran may be one the rollout had not reached yet. Neither its end nor its
+cut is then a number. The stream's number is measured (`across_rollout`)
 only when that was seen: 1 when it completed, 0 when it did not. A stream cut short is given
 `QUIET_SECONDS` and two scrapes after the cut for its task's stop to show. Otherwise the job saw no
 deployment under the stream, and the run is not measured.
@@ -219,6 +228,12 @@ CUT_WATCH_SECONDS = QUIET_SECONDS + 2 * SCRAPE_SECONDS
 # Seconds after a stream across the gateway deployment completed during which the job looks for
 # whether an old task still ran as it ended (`held_under`): a write that late, or the task's stop.
 HELD_WATCH_SECONDS = QUIET_SECONDS + 2 * SCRAPE_SECONDS
+# Seconds by which a gateway task's collector first writes once the task has started: ECS starts the
+# task's two containers together, and the collector scrapes every `SCRAPE_SECONDS` and pushes what it
+# scraped within seconds. Four scrapes, so a slow start is still inside. A task new to the job that
+# first wrote no later than this after the stream opened may have been serving as it opened, and
+# have taken it (`replacement_may_hold`).
+COLLECTOR_LAG_SECONDS = 4 * SCRAPE_SECONDS
 GATEWAY_JOB = "gateway"
 # Seconds a wake may take beyond the pool's hold before it counts as lost.
 WAKE_MARGIN_SECONDS = 120
@@ -350,14 +365,31 @@ def warm_around(
 class Departure:
     """One instance's way out of service: its path, `None` when it was not observed, its seconds,
     and the instance, `None` when none stopped in the time the job waits. `asked_at` is when the
-    scaler asked for fewer, and `stopped_at` when the instance had stopped, `asked_at` and its
-    seconds: `None` when not seen."""
+    scaler's run that asked for fewer began, and `stopped_at` when the instance had stopped,
+    `asked_at` and its seconds: `None` when not seen.
+
+    Neither event's moment is observed, only bounds of it (`events`). The scaler asks for fewer
+    after its run began and before it writes its note, which the job read at `seen_at`; the
+    instance stopped after its last write, `last_written`, and by `stopped_at`. Without them, the
+    bound is the moment given."""
 
     path: Path | None
     seconds: float
     instance: str | None = None
     asked_at: float | None = None
     stopped_at: float | None = None
+    seen_at: float | None = None
+    last_written: float | None = None
+
+    def events(self) -> list[tuple[float, float]]:
+        """The earliest and the latest each event of the departure may have happened, the scaler
+        asking for fewer and the instance stopping: none for one not seen."""
+        found: list[tuple[float, float]] = []
+        if self.asked_at is not None:
+            found.append((self.asked_at, max(self.asked_at, self.seen_at or self.asked_at)))
+        if self.stopped_at is not None:
+            found.append((min(self.stopped_at, self.last_written or self.stopped_at), self.stopped_at))
+        return found
 
 
 def warm_bound(asked: int, notes: Sequence[ScalerNote], decided_at: float) -> float:
@@ -388,11 +420,12 @@ class Streamed:
 def across_scale_in(streams: Sequence[Streamed], departure: Departure | None) -> bool | None:
     """The stream across a scale-in, from the streams of the relay and the departure it spanned. A
     stream spanned it when it was in flight across one of its two events, the scaler asking for
-    fewer (`asked_at`) or the instance having stopped (`stopped_at`): its inference began by the
-    event and its stream ended after. False when a stream in flight while the instance left, begun
-    by its stop and ended after the ask, did not complete; otherwise True when one spanned an event,
-    and `None` when none did, the streams having begun and ended between the events, or when no
-    stop was seen.
+    fewer or the instance stopping, wherever in its bounds the event happened (`Departure.events`):
+    its inference began by the earliest the event may have happened and its stream ended after the
+    latest. One that only crosses a bound may have begun and ended on one side of the event. False
+    when a stream in flight while the instance left, begun by its stop and ended after the ask, did
+    not complete; otherwise True when one spanned an event, and `None` when none did, the streams
+    having begun and ended between the events or within their bounds, or when no stop was seen.
 
     A departure that does not say when it began (`asked_at`) is bounded by when it was seen over:
     the stream across it is the one whose inference began before then and ended after, every one
@@ -405,7 +438,9 @@ def across_scale_in(streams: Sequence[Streamed], departure: Departure | None) ->
         if not all(stream.answer.completed for stream in during):
             return False
         spanning = [
-            stream for stream in during if any(stream.began <= event <= stream.ended for event in (asked_at, stopped_at))
+            stream
+            for stream in during
+            if any(stream.began <= earliest and latest <= stream.ended for earliest, latest in departure.events())
         ]
         return True if spanning else None
     for stream in streams:
@@ -448,6 +483,18 @@ def replacement_at_open(before: set[str], tasks: Mapping[str, tuple[float, float
     after may still have been serving, its collector having started late: `held_under` tells that."""
     return any(
         first <= began and last + SCRAPE_SECONDS >= began for task, (first, last) in tasks.items() if task not in before
+    )
+
+
+def replacement_may_hold(before: set[str], tasks: Mapping[str, tuple[float, float]], began: float) -> bool:
+    """Whether the stream opened at `began` may be on a gateway task not in `before`, as the tasks'
+    first and last writes show: one was writing as it opened (`replacement_at_open`), or first wrote
+    within `COLLECTOR_LAG_SECONDS` after, so may have been serving before its collector first wrote.
+    Then neither the stream's end nor its cut says what a rollout does to a stream on a drained task:
+    the stream may have been on the replacement, while an old task went on running for another
+    reason (the rollout waiting for a second replacement)."""
+    return replacement_at_open(before, tasks, began) or any(
+        began < first <= began + COLLECTOR_LAG_SECONDS for task, (first, _) in tasks.items() if task not in before
     )
 
 
@@ -790,10 +837,21 @@ class Run:
             # Cut short: the stop of the task that held it shows once it has been silent long enough.
             await asyncio.sleep(POLL_SECONDS)
             rolled_out_at = await rollout(ended)
+        if opened and (spanned if completed else rolled_out_at is not None):
+            # An outcome is kept only if no replacement may have taken the stream as it opened: one
+            # that did has first written by then.
+            while time.time() < opened[0] + COLLECTOR_LAG_SECONDS + SCRAPE_SECONDS:
+                await asyncio.sleep(POLL_SECONDS)
+            if replacement_may_hold(before, (await read())[1], opened[0]):
+                print("a replacement task may have taken the stream as it opened: it says nothing of a drain")
+                spanned, rolled_out_at = False, None
         try:
             survived = across_rollout(completed, spanned, rolled_out_at)
         except ValueError:
-            message = "no gateway deployment was seen under the stream: release the pipeline while it is held"
+            message = (
+                "no gateway deployment was seen under the stream, on a task it drained: release the pipeline"
+                " while it is held, and not while a deployment is under way"
+            )
             raise RuntimeError(message) from None
         print(f"the stream across the gateway deployment {'completed' if survived else 'did not complete'}")
         return survived
@@ -832,9 +890,12 @@ class Run:
         for fewer only for the first note that does: the watch starts while the scaler still asks
         for `asked`, and reads the note every `NOTE_POLL_SECONDS`, well within one of its runs."""
         notes: list[ScalerNote] = []
+        # When the job read the note that asks for fewer: the scaler had asked by then.
+        seen: list[float] = []
 
         def fewer() -> bool:
             note = self.pool.note()
+            seen[:] = [time.time()]
             notes[:] = [] if note is None else [note]
             return bool(notes) and notes[0].capacity_asked < asked
 
@@ -869,7 +930,7 @@ class Run:
         now = time.time()
         if not gone:
             print(f"no instance stopped in {LEAVE_WAIT_SECONDS} s: the departure is not measured")
-            return self._left(Departure(None, now - asked_at, asked_at=asked_at))
+            return self._left(Departure(None, now - asked_at, asked_at=asked_at, seen_at=seen[0]))
         instance = min(gone, key=gone.__getitem__)
         seconds = leave_seconds(asked_at, gone[instance])
         since = await asyncio.to_thread(self.pool.writes, asked_at, now)
@@ -891,7 +952,8 @@ class Run:
         newcomer = bool((set(since) | set(before)) - set(known))
         path = None if warm is None else path_of(*warm, newcomer=newcomer)
         print(f"an instance left in {seconds:.0f} s, path {path or 'not told'}, warm {warm or 'not read'}")
-        return self._left(Departure(path, seconds, instance, asked_at, asked_at + seconds))
+        stop = asked_at + seconds
+        return self._left(Departure(path, seconds, instance, asked_at, stop, seen[0], gone[instance]))
 
     def _left(self, departure: Departure) -> Departure:
         self.leaving.append(departure)
