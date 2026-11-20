@@ -1,0 +1,50 @@
+# What the role of the image promotion job (`src/rhi/pipeline/image_promotion.py`) may do, each
+# action on each resource, with its reason. The file's tables hold only what cdk-nag and the
+# wildcard check read, so the inventory is written here as comments.
+# `tests/synth/test_image_promotion.py` and `tests/policy/test_pipeline.py` hold the role to it.
+#
+# - ec2:RunInstances on launch-template/* of the deploying account and region, under the condition
+#   that the template carries the tag rhi-engine with a value other than mock: the job starts its
+#   canary from a GPU pool's launch template, whose ID it finds through the pool's group, and from
+#   no other.
+# - ec2:RunInstances on instance/*, volume/*, network-interface/*, subnet/* and security-group/* of
+#   the deploying account and region, and on image/* of its region, under the condition that the
+#   call names a launch template (ec2:LaunchTemplate): the other resources the call creates or
+#   uses, the candidate image among them, whose ID only the owner gives when the job runs.
+# - ec2:CreateTags on instance/* and volume/*, under the condition that the tags are applied by
+#   RunInstances itself (ec2:CreateAction): EC2 asks for it to tag what the call creates, with the
+#   job's tag and those the launch template gives.
+# - iam:PassRole on role/rhi/gpu-pools/* of the deploying account, passed to EC2 only: the launch
+#   template's instance profile holds the pool's role, which is under the GPU pools' IAM path, and
+#   no role outside that path.
+# - ec2:GetConsoleOutput and ec2:TerminateInstances on instance/*, under the condition that the
+#   instance carries the tag rhi-promotion=canary: the canary's line, and its end, on the job's own
+#   instances only.
+# - ssm:PutParameter on parameter/rhi/images/*: the image parameter of the pool the owner names.
+# - codepipeline:StartPipelineExecution on this pipeline only: the deployment that takes the image.
+# - autoscaling:DescribeAutoScalingGroups, ec2:DescribeLaunchTemplateVersions, ec2:DescribeImages
+#   and ec2:DescribeInstances on every resource, listed below.
+# - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
+#   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
+#   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
+
+[nag]
+"AwsSolutions-CB4" = "The promotion job's project keeps no artifact and encrypts what CodeBuild stores with the key AWS manages, the default; a customer managed key would add a monthly cost and a key policy to keep for a build that holds nothing but this public repository."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:launch-template/*]" = "The job starts its canary from the launch template of the pool the owner names, whose ID is only chosen when the pool is deployed; the statement's condition admits only a template tagged with an engine other than mock."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:instance/*]" = "The job starts one instance whose ID EC2 chooses when it starts, tags it in that call only, and reads the console of and terminates only an instance that carries the job's tag."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:volume/*]" = "The canary's volume is created by the start itself, with an ID EC2 chooses, and only in a call that names a launch template."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:network-interface/*]" = "The canary's network interface is created by the start itself, with an ID EC2 chooses, and only in a call that names a launch template."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:subnet/*]" = "The canary starts in one of the subnets of the pool's group, which the job reads from the group when it runs, and only in a call that names a launch template."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:security-group/*]" = "The canary takes the security group of the pool's launch template, whose ID is only chosen when the stage is deployed, and only in a call that names a launch template."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>::image/*]" = "The canary starts on the candidate image, whose ID the owner gives when the job runs, and only in a call that names a launch template."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:iam::<AWS::AccountId>:role/rhi/gpu-pools/*]" = "The job passes the role of the pool's instance profile to EC2, and may pass only the roles under the GPU pools' IAM path, whose names CloudFormation chooses."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/images/*]" = "The job writes the image parameter of the pool the owner names, one of the parameters under the image prefix, and no other parameter."
+"AwsSolutions-IAM5[Resource::*]" = "The job describes groups, launch templates, images and instances, which AWS grants only on every resource, each action listed with its reason in the wildcard_actions table of this module."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<ImagePromotionProject52080920>:*]" = "The promotion job's project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<ImagePromotionProject52080920>-*]" = "The promotion job's project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
+
+[wildcard_actions]
+"autoscaling:DescribeAutoScalingGroups" = "The job finds the pool's group by its rhi-pool tag, and Auto Scaling grants describing groups only on every resource."
+"ec2:DescribeLaunchTemplateVersions" = "The job reads the tags the pool's launch template gives an instance, and EC2 grants describing launch templates only on every resource."
+"ec2:DescribeImages" = "The job checks that the candidate image exists and is available before it starts anything, and EC2 grants describing images only on every resource."
+"ec2:DescribeInstances" = "The job reads the canary's state, to stop waiting once the instance has stopped, and EC2 grants describing instances only on every resource."

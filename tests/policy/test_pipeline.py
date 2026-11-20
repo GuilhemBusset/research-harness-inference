@@ -28,7 +28,8 @@ Rules hold those two, and every action:
   that branch; a trigger filters pushes to that branch, and never pull requests or tags; and no
   EventBridge rule or schedule of any template targets a pipeline: not one of the pipeline's
   template by its reference, not one of another template by an import of the pipeline's
-  export, and none by a CodePipeline ARN (section 8.2);
+  export, and none by a CodePipeline ARN (section 8.2). The promotion job starts an execution
+  through the API, after the owner started the job by hand, which none of these is;
 - no CodeBuild project has a webhook: on a public repository it would run a stranger's code with
   a role of the account (section 8.3);
 - every role of every template carries the permissions boundary of the bounded bootstrap, by its
@@ -85,7 +86,22 @@ Rules hold those two, and every action:
   one of its resources may name an object of a bucket whose name starts as the model bucket's,
   `rhi-models-`, in any partition, read as above. One value of the template is read for what it
   is: a reference to a bucket of the role's own template stands for that bucket's name, and a
-  bucket with no name of its own, which CloudFormation names, is not the model bucket.
+  bucket with no name of its own, which CloudFormation names, is not the model bucket;
+- the promotion job, the CodeBuild project named `rhi-promote-image` in a pipeline's template
+  (section 4.3), is started by the owner by hand and by nothing else: it has no webhook, no action
+  of any pipeline runs it, and no EventBridge rule or schedule of any template targets it, by a
+  reference in its own template, by an import of what that template exports of it, or by its
+  name in a CodeBuild ARN;
+- no role of any template but the promotion job's may write a pool's image parameter: a statement
+  writes one when one of its actions matches `ssm:PutParameter` and one of its resources may name
+  a parameter under /rhi/images/, in any partition, region and account, read as above. The job
+  writes it only after a canary start on the image passed, so no other path changes the driver
+  under a pinned engine;
+- no role of any template but the promotion job's may start an instance: a statement starts one
+  when one of its actions matches `ec2:RunInstances` or `ec2:StartInstances` and one of its
+  resources may name an instance, read as above. Auto Scaling starts a pool's instances with its
+  own service-linked role, which no template holds, at the size the scaler alone sets
+  (section 5.1).
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -300,6 +316,16 @@ MEASURES_AND_READS = "a role that may put events on the measurement bus and read
 WRITES_WEIGHTS = "a role other than the copy step's that may write to the model bucket"
 # The variable that names the reporter's topic to its function.
 REPORTER_TOPIC = "RHI_REPORTER_TOPIC"
+# The promotion job, by its project's name; what writes a parameter, and every ARN of a pool's image
+# parameter; what starts an instance, and every ARN of an instance.
+PROMOTION_PROJECT = "rhi-promote-image"
+PARAMETER_WRITES = ("ssm:PutParameter",)
+IMAGE_PARAMETER_ARN = f"arn:{FIELD}:ssm:{FIELD}:{FIELD}:parameter/rhi/images/*"
+INSTANCE_STARTS = ("ec2:RunInstances", "ec2:StartInstances")
+INSTANCE_ARN = f"arn:{FIELD}:ec2:{FIELD}:{FIELD}:instance/*"
+PROMOTION_STARTED = "a promotion job that something other than the owner may start"
+WRITES_IMAGES = "a role other than the promotion job's that may write an image parameter"
+STARTS_INSTANCES = "a role other than the promotion job's that may start an instance"
 
 
 def resources(templates: Templates, kind: str) -> list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]:
@@ -926,6 +952,77 @@ def verifies_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pa
     return not (isinstance(value, str) and value in tags)
 
 
+def promotions(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
+    """The CodeBuild projects named `PROMOTION_PROJECT` of a template that holds a pipeline, each as
+    `(its logical ID, its role)`, the role None when the template does not hold it."""
+    if not resources({"": template}, "AWS::CodePipeline::Pipeline"):
+        return []
+    held = template.get("Resources", {})
+    found: list[tuple[str, str | None]] = []
+    for _, logical_id, project, _ in resources({"": template}, "AWS::CodeBuild::Project"):
+        if project.get("Name") != PROMOTION_PROJECT:
+            continue
+        role = project.get("ServiceRole")
+        role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+        found.append((logical_id, role_id if isinstance(role_id, str) and role_id in held else None))
+    return found
+
+
+def names_the_job(value: Any) -> bool:
+    """Whether a value of a template holds text of the promotion project's ARN, or its name alone."""
+    if isinstance(value, dict):
+        return any(names_the_job(part) for part in value.values())
+    if isinstance(value, list):
+        return any(names_the_job(part) for part in value)
+    return isinstance(value, str) and (value == PROMOTION_PROJECT or f"project/{PROMOTION_PROJECT}" in value)
+
+
+def promotion_breaches(templates: Templates) -> list[tuple[str, str, str]]:
+    """What the rules on the promotion job refuse: something that starts it, and another role that
+    may write an image parameter or start an instance."""
+    found = []
+    jobs = [(path, project) for path, template in sorted(templates.items()) for project, _ in promotions(template)]
+    exports = [
+        output["Export"]["Name"]
+        for path, project in jobs
+        for output in templates[path].get("Outputs", {}).values()
+        if "Name" in output.get("Export", {}) and names(output.get("Value"), project)
+    ]
+    for path, project in jobs:
+        properties = templates[path]["Resources"][project].get("Properties", {})
+        if properties.get("Triggers", {"Webhook": False}) != {"Webhook": False}:
+            found.append((path, project, PROMOTION_STARTED))
+    # A pipeline's action that runs it, and a rule's or a schedule's target.
+    for path, pipeline_id, pipeline, _ in resources(templates, "AWS::CodePipeline::Pipeline"):
+        own = [project for job_path, project in jobs if job_path == path]
+        for stage, actions in stages_of(pipeline):
+            for action in actions:
+                configuration = action.get("Configuration", {})
+                if (
+                    any(names(configuration, project) for project in own)
+                    or imports(configuration, exports)
+                    or names_the_job(configuration)
+                ):
+                    found.append((path, f"{stage}/{action['Name']}", PROMOTION_STARTED))
+    for kind, key in (("AWS::Events::Rule", "Targets"), ("AWS::Scheduler::Schedule", "Target")):
+        for path, logical_id, properties, _ in resources(templates, kind):
+            targets = properties.get(key)
+            own = [project for job_path, project in jobs if job_path == path]
+            if any(names(targets, project) for project in own) or imports(targets, exports) or names_the_job(targets):
+                found.append((path, logical_id, PROMOTION_STARTED))
+    # The image parameters, and the start of an instance, by the job's role alone.
+    for path, template in sorted(templates.items()):
+        promoters = {role for _, role in promotions(template)}
+        for _, role, _, _ in resources({"": template}, "AWS::IAM::Role"):
+            if role in promoters:
+                continue
+            if may(template, role, PARAMETER_WRITES, IMAGE_PARAMETER_ARN):
+                found.append((path, role, WRITES_IMAGES))
+            if may(template, role, INSTANCE_STARTS, INSTANCE_ARN):
+                found.append((path, role, STARTS_INSTANCES))
+    return found
+
+
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """Everything of the templates that a rule refuses, as `(template path, what it is named,
     what is refused)`: an action by its stage and name, a resource by its logical ID."""
@@ -1014,6 +1111,7 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
         for _, role, _, _ in resources({"": template}, "AWS::IAM::Role"):
             if role not in copies and writes_weights(template, role):
                 found.append((path, role, WRITES_WEIGHTS))
+    found += promotion_breaches(templates)
     return found
 
 
@@ -1969,3 +2067,136 @@ def test_refuses_another_role_that_writes_to_the_model_bucket(cdk: ModuleType, t
     assert refused(built(cdk, tmp_path / "breached", step=COPY, change=a_copy(change))) == {WRITES_WEIGHTS}
     # With no copy step, the bucket has no writer at all: the same role is refused.
     assert refused(built(cdk, tmp_path / "alone", change=change)) == {WRITES_WEIGHTS}
+
+
+def test_the_promotion_job_s_role_is_the_one_held(templates: dict[str, dict[str, Any]]) -> None:
+    # The rules leave out a role only once they find it: the app's promotion job is found, in the
+    # pipeline's template, with a role the rules read as writing an image parameter and starting an
+    # instance.
+    ((template, role),) = [(template, role) for template in templates.values() for _, role in promotions(template)]
+    assert role is not None
+    assert may(template, role, PARAMETER_WRITES, IMAGE_PARAMETER_ARN)
+    assert may(template, role, INSTANCE_STARTS, INSTANCE_ARN)
+
+
+def the_launch_templates(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return stack.format_arn(service="ec2", resource="launch-template", resource_name="*")
+
+
+def the_instances(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    return stack.format_arn(service="ec2", resource="instance", resource_name="*")
+
+
+# What the promotion job's role holds of the image parameters and of a start, in `a_promotion`.
+PROMOTES: list[tuple[list[str], Names]] = [
+    (["ssm:PutParameter"], the_parameter("rhi/images/*")),
+    (["ec2:RunInstances"], the_launch_templates),
+    (["ec2:RunInstances"], the_instances),
+]
+
+
+def a_promotion(then: Change | None = None) -> Change:
+    """Adds to the pipeline's stack the promotion job, a project of its name whose role writes the
+    image parameters and starts an instance, then makes the change `then`, when there is one."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        iam, codebuild = cdk.aws_iam, cdk.aws_codebuild
+        role = iam.Role(stack, "PromotionRole", assumed_by=iam.ServicePrincipal("codebuild.amazonaws.com"))
+        for actions, arn in PROMOTES:
+            role.add_to_policy(iam.PolicyStatement(actions=actions, resources=[arn(cdk, stack, pipeline)]))
+        spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": {"build": {"commands": ["true"]}}})
+        codebuild.Project(stack, "Promotion", project_name=PROMOTION_PROJECT, role=role, build_spec=spec)
+        if then is not None:
+            then(cdk, stack, pipeline)
+
+    return change
+
+
+def the_job(stack: Any) -> Any:
+    return stack.node.find_child("Promotion")
+
+
+def a_rule_that_promotes(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+    nightly = cdk.aws_events.Schedule.rate(cdk.Duration.days(1))
+    target = cdk.aws_events_targets.CodeBuildProject(the_job(stack))
+    cdk.aws_events.Rule(stack, "NightlyPromotion", schedule=nightly, targets=[target])
+
+
+def a_schedule_that_promotes(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+    nightly = cdk.aws_scheduler.ScheduleExpression.rate(cdk.Duration.days(1))
+    target = cdk.aws_scheduler_targets.CodeBuildStartBuild(the_job(stack))
+    cdk.aws_scheduler.Schedule(stack, "NightlyPromotion", schedule=nightly, target=target)
+
+
+def a_rule_of_another_stack_that_promotes(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+    other = cdk.Stack(stack.node.scope, "Nightly")
+    boundary = cdk.aws_iam.ManagedPolicy.from_managed_policy_name(other, "Boundary", BOUNDARY)
+    cdk.aws_iam.PermissionsBoundary.of(other).apply(boundary)
+    nightly = cdk.aws_events.Schedule.rate(cdk.Duration.days(1))
+    target = cdk.aws_events_targets.CodeBuildProject(the_job(stack))
+    cdk.aws_events.Rule(other, "NightlyPromotion", schedule=nightly, targets=[target])
+
+
+def an_action_that_promotes(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+    synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
+    action = cdk.aws_codepipeline_actions.CodeBuildAction(
+        action_name="Promote", project=the_job(stack), input=synthesized, run_order=9
+    )
+    pipeline.stage("Rhi").add_action(action)
+
+
+def a_webhook_on_the_job(_cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
+    the_job(stack).node.default_child.add_property_override("Triggers", {"Webhook": True})
+
+
+def test_keeps_the_promotion_job_as_the_one_writer_of_the_images(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path / "promotes", change=a_promotion())
+    assert [role for template in templates.values() for _, role in promotions(template)] != [None]
+    assert breaches(templates) == []
+
+    # Another role may read the image parameters, and stop or terminate an instance.
+    reads = a_role(reads=the_parameter("rhi/images/*"), action="ssm:GetParameter")
+    assert breaches(built(cdk, tmp_path / "reads", change=a_promotion(reads))) == []
+    stops = a_role(reads=the_instances, action="ec2:TerminateInstances")
+    assert breaches(built(cdk, tmp_path / "stops", change=a_promotion(stops))) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(
+            a_role(reads=the_parameter("rhi/images/coursework"), action="ssm:PutParameter"),
+            {WRITES_IMAGES},
+            id="another role that writes a pool's image parameter",
+        ),
+        pytest.param(
+            a_role(reads=the_parameter("rhi/*"), action="ssm:*"),
+            {WRITES_IMAGES},
+            id="another role that writes every parameter by wildcards",
+        ),
+        pytest.param(
+            a_role(reads=every_resource, action="ec2:RunInstances"),
+            {STARTS_INSTANCES},
+            id="another role that starts an instance",
+        ),
+        pytest.param(
+            a_role(reads=the_instances, action="ec2:StartInstances"),
+            {STARTS_INSTANCES},
+            id="another role that starts a stopped instance",
+        ),
+        pytest.param(a_rule_that_promotes, {PROMOTION_STARTED}, id="a rule that starts the promotion job"),
+        pytest.param(a_schedule_that_promotes, {PROMOTION_STARTED}, id="a schedule that starts the promotion job"),
+        pytest.param(
+            a_rule_of_another_stack_that_promotes,
+            {PROMOTION_STARTED},
+            id="a rule of another stack that starts the promotion job",
+        ),
+        pytest.param(an_action_that_promotes, {PROMOTION_STARTED}, id="a pipeline's action that runs the promotion job"),
+        pytest.param(a_webhook_on_the_job, {PROMOTION_STARTED, WEBHOOK}, id="a webhook on the promotion job"),
+    ],
+)
+def test_refuses_another_writer_of_the_images_and_a_trigger_of_the_job(
+    cdk: ModuleType, tmp_path: Path, change: Change, expected: set[str]
+) -> None:
+    assert refused(built(cdk, tmp_path / "kept", change=a_promotion())) == set()
+    assert refused(built(cdk, tmp_path / "breached", change=a_promotion(change))) == expected

@@ -36,7 +36,12 @@ measurement bus and a rule on it that invokes the same function, through which a
 canary's job hands its numbers to the reporter as events (sections 8.4 and 12). It adds no step to
 the pipeline.
 
-A push to `main` is the only trigger. No CodeBuild project has a webhook: on a public repository
+Beside the pipeline too, the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
+machine image after a canary start on it passes, writes the pool's image parameter and then starts
+an execution of the pipeline (section 4.3). The owner starts it by hand, and nothing else starts it.
+
+A push to `main` is the only trigger of the pipeline, but for the promotion job, which the owner
+starts. No CodeBuild project has a webhook: on a public repository
 it would run a stranger's code with a role of the account (section 8.3). Every role of this stack
 carries the permissions boundary of the bounded bootstrap, by its fixed name, as every role of the
 stage does.
@@ -58,6 +63,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
+from rhi.pipeline.image_promotion import ImagePromotion
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
 from rhi.pipeline.synth import synth_step
@@ -180,6 +186,8 @@ class PipelineStack(cdk.Stack):
             # ty reads the CDK's generated topic as unlike its protocol: jsii passes a renamed parameter by position.
             topic=self.owner_topic.topic,  # ty: ignore[invalid-argument-type]
         )
+        # Started by the owner, by hand: it writes a pool's image parameter, then starts the pipeline.
+        self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
         self._as_cfn_lint_reads_it(underlying)
 
     def _builds_images_for_both_platforms(self) -> None:
