@@ -48,7 +48,9 @@ from the first request, or the wake, to readiness).
 
 An attempt **exercised the hold** when the client's request was held for less than its deadline
 and no more than `BAND_SECONDS` less (`exercised`): one that reached an already ready pool, or one
-the gateway ended at its deadline (the pool not ready in time), does not answer the question. A
+the gateway ended at its deadline (the pool not ready in time), does not answer the question; nor
+does one the gateway refused with an error instead of holding it (`refused`), even when another
+client's request brought the pool to readiness in the band. A
 client whose attempt did not exercise the hold is run again on the next cold start, up to
 `ATTEMPTS` times; after that the run is not measured. So is a client that sent no request, or one
 still running `CLIENT_LIMIT_SECONDS` after it started.
@@ -106,6 +108,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -408,7 +411,8 @@ _HOP_BY_HOP = {
 }
 # The last event of a stream that ended well, in each format: Messages, Responses, Chat Completions.
 STREAM_ENDS = (b"event: message_stop", b"event: response.completed", b"data: [DONE]")
-_TAIL = 256
+# What is kept of the stream so far, so that a last event split between two reads is still seen.
+_TAIL = max(len(event) for event in STREAM_ENDS) - 1
 
 
 def directed(body: bytes, model: str) -> bytes:
@@ -517,8 +521,10 @@ class Forwarder:
             while chunk := answer.read1(65536):
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
-                tail = (tail + chunk)[-_TAIL:]
-                ended = ended or any(event in tail for event in STREAM_ENDS)
+                # The read with what was kept before it: an event begun in the last read ends in this one.
+                seen = tail + chunk
+                ended = ended or any(event in seen for event in STREAM_ENDS)
+                tail = seen[-_TAIL:]
                 # A client may close as soon as it has the last event: it then has the whole answer.
                 exchange.completed = answer.status == 200 and streaming and ended
             exchange.completed = answer.status == 200 and (ended or not streaming)
@@ -572,10 +578,18 @@ def hold_outcome(client: Client, kind: Kind, version: str, attempt: Attempt, req
     return HoldOutcome(client, kind, version, completed=False, seconds_before_giving_up=max(0.0, end - request.sent_at))
 
 
+def refused(request: Exchange) -> bool:
+    """Whether the gateway answered the request with an error rather than holding it: a held stream
+    is answered 200 at once, a held call only when it ends or when the client gives up."""
+    return request.status is not None and request.status != HTTPStatus.OK
+
+
 def exercised(request: Exchange, ready_at: float | None, deadline: float) -> bool:
-    """Whether the request was held through the cold start meant: the pool became ready less than
-    `deadline` seconds after it, and no more than `BAND_SECONDS` less."""
-    if ready_at is None:
+    """Whether the request was held through the cold start meant: the gateway did not refuse it,
+    and the pool became ready less than `deadline` seconds after it, and no more than
+    `BAND_SECONDS` less. Another client's request may have started the pool: a refused request
+    was not held, however the pool's readiness falls."""
+    if ready_at is None or refused(request):
         return False
     return deadline - BAND_SECONDS <= ready_at - request.sent_at < deadline
 
@@ -886,7 +900,14 @@ class Run:
         for client in clients:
             request, attempt = requests[client], attempts[client]
             if request is None or attempt.stopped or not exercised(request, ready_at, deadline):
-                held = "no request" if request is None or ready_at is None else f"{ready_at - request.sent_at:.0f} s"
+                if request is None:
+                    held = "no request"
+                elif refused(request):
+                    held = f"the gateway answered {request.status} {request.cause or ''}".rstrip()
+                elif ready_at is None:
+                    held = "the pool was not ready in time"
+                else:
+                    held = f"{ready_at - request.sent_at:.0f} s"
                 self.log(f"{client} {kind}: the hold was not the one meant ({held}, stopped: {attempt.stopped})")
                 continue
             outcomes.append(hold_outcome(client, kind, self.version(client), attempt, request))

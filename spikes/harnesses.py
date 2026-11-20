@@ -19,9 +19,11 @@ A pin is an exact version, `MAJOR.MINOR.PATCH` with an optional pre-release, nev
 of this table and of the constants below, together.
 
 **Installing.** `install` runs `npm install` of the two pinned packages into a folder of the job,
-with no lock file of its own, no saved manifest and no install script: both packages ship their
-binary as an optional dependency for each platform, which npm picks without a script. The
-harnesses are then the folder's `node_modules/.bin/claude` and `node_modules/.bin/codex`.
+with no lock file of its own and no saved manifest. Both packages ship their binary as an optional
+dependency for each platform, which npm picks. Codex launches it from its own script; Claude Code's
+command is a placeholder until the package's install script copies the native binary over it, so
+the install runs the packages' install scripts: without them `claude` cannot start. The harnesses
+are then the folder's `node_modules/.bin/claude` and `node_modules/.bin/codex`.
 
 **Reporting.** `versions` gives the version of each harness, as the installed binary prints it with
 `--version`, and of each SDK the SDK scripts call, the OpenAI and Anthropic SDKs of the group
@@ -102,7 +104,6 @@ def install_command(folder: Path) -> list[str]:
         "--no-package-lock",
         "--no-audit",
         "--no-fund",
-        "--ignore-scripts",
         *(harness.spec for harness in HARNESSES),
     ]
 
