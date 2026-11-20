@@ -48,6 +48,18 @@ the engine as vLLM runs by itself:
 
 The mock engine reads none of them.
 
+A pool may give the gateway its request profile (sections 6.1 and 6.2, step 4), with two fields.
+Both are optional, and the design gives no default beyond leaving them out:
+
+- `request_profile`, the names of the profile's entries, in the order the gateway applies them to
+  a request's filtered body. Each is the name of a module of `rhi_gateway.profile`, so it holds
+  lower-case letters, digits and `_` and starts with a letter; none is named twice. Whether the
+  gateway has an entry of that name is the gateway's to say, at its start. Left out, it is empty:
+  the pool has no profile.
+- `reasoning_effort`, a table from each value of reasoning effort a request may send to the value
+  the engine receives. It is configuration because it is also a lever on speed (section 4.7): the
+  profile's entry for reasoning effort reads it. Left out, it is None: no mapping.
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -94,6 +106,8 @@ _COMMIT = re.compile(r"[0-9a-f]{40}", re.ASCII)
 # A parser's name, which becomes an argument of the engine: it starts with a letter or a digit, so
 # the engine never reads it as an option.
 _PARSER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
+# An entry of a request profile, which the gateway looks up as a module of its profile package.
+_PROFILE_ENTRY = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
 
 
 class PoolConfigError(ValueError):
@@ -183,6 +197,12 @@ class Pool:
     histogram_buckets: HistogramBuckets | None
     # The tokens the model's draft head proposes, or None when the head is off.
     draft_head_tokens: int | None
+    # The gateway's request profile for the pool: the names of its entries, in the order they
+    # apply (section 6.2, step 4). Empty when the pool has none.
+    request_profile: tuple[str, ...]
+    # The value of reasoning effort the engine receives for each value a request may send, or
+    # None when the pool maps none.
+    reasoning_effort: dict[str, str] | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -354,6 +374,34 @@ def _histogram_buckets(pool: str, entry: Mapping[str, object]) -> HistogramBucke
     return HistogramBuckets(**given)
 
 
+def _request_profile(pool: str, entry: Mapping[str, object]) -> tuple[str, ...]:
+    """The names of the profile's entries, in the order written. A pool that gives none has no entry."""
+    field = "request_profile"
+    value = entry.get(field, ())
+    if not isinstance(value, (list, tuple)):
+        raise PoolConfigError(pool, field, "must be a list of the names of the profile's entries")
+    if not all(isinstance(item, str) and _PROFILE_ENTRY.fullmatch(item) for item in value):
+        raise PoolConfigError(
+            pool, field, "must hold names of lower-case letters, digits and '_' that start with a letter"
+        )
+    if len(set(value)) != len(value):
+        raise PoolConfigError(pool, field, "names an entry twice")
+    return tuple(value)
+
+
+def _reasoning_effort(pool: str, entry: Mapping[str, object]) -> dict[str, str] | None:
+    """The value the engine receives for each value a request may send, or None when the pool maps none."""
+    field = "reasoning_effort"
+    if field not in entry:
+        return None
+    value = entry[field]
+    if not isinstance(value, Mapping):
+        raise PoolConfigError(pool, field, "must be a table from a value a request sends to the value the engine gets")
+    if not all(isinstance(text, str) and text != "" for pair in value.items() for text in pair):
+        raise PoolConfigError(pool, field, "must hold only strings that are not empty")
+    return dict(value)
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -423,6 +471,8 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         draft_head_tokens=(
             _whole(name, entry, "draft_head_tokens", least=1) if "draft_head_tokens" in entry else None
         ),
+        request_profile=_request_profile(name, entry),
+        reasoning_effort=_reasoning_effort(name, entry),
     )
 
 

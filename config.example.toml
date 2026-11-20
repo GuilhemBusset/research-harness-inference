@@ -116,6 +116,19 @@ retry_after_concurrency_limit_seconds = 5
 #                                      they are vLLM's own.
 # The served context is the pool's context_length, the served model name is the pool's name, and
 # the most requests running at once is its target_concurrency: none has a field of its own.
+#
+# A pool may give the gateway its request profile (sections 6.1 and 6.2), which no pool here does:
+# the gateway has no entry yet, and it does not start for a profile that names one it does not
+# have. Both fields are optional, and the values shown are examples, not defaults.
+#   request_profile = ["first_entry", "second_entry"]
+#                                      the names of the rewrites the gateway applies to the pool's
+#                                      requests after its body filter, in the order they apply.
+#                                      Left out, the profile is empty: the filtered body is
+#                                      forwarded unchanged.
+#   reasoning_effort = { low = "low", medium = "medium", high = "xhigh" }
+#                                      the value of reasoning effort the engine receives for each
+#                                      value a request may send, which the profile's entry for
+#                                      reasoning effort reads. Left out, there is no mapping.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]

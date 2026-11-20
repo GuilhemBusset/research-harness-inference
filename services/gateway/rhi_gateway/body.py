@@ -18,9 +18,12 @@ rewrites a few fields and sends its own serialization of the result. The order i
    names: `model` is the pool's name, the name the engine serves the model under (section 4.2);
    `request_id` is the gateway's ID for the request; `cache_salt` is derived from the student, so
    that one student's cached prefixes cannot be probed by another (section 6.6).
-7. **Apply the pool's request profile**: a rewrite registered under the pool's name gets the
-   filtered body and returns the body to send. A pool without one is sent the filtered body
-   unchanged, which is every pool until the profiles are written (phase 2).
+7. **Apply the pool's request profile**: the rewrite given under the pool's name gets the
+   filtered body and returns the body to send. It is the pool's profile on this filter's route
+   (`rhi_gateway.profile`): the entries the pool's configuration names, in that order, built when
+   the gateway starts. The gateway's own fields of step 6 are then written again, so that no
+   entry changes the pool a request is for. A pool whose profile is empty is given no rewrite, and
+   is sent the filtered body unchanged.
 8. **Serialize** the result. What `Forwarded.body` holds was written by this module.
 
 Every refusal is a `GatewayError` with the cause `request_refused`, which the renderers of
@@ -134,7 +137,7 @@ class Shapes:
 
 type Spec = Fields | Items | Shapes | Limit | _Keep
 
-# A request profile's entry point: it gets the filtered body and returns the body to serialize.
+# A pool's request profile on one route: it gets the filtered body and returns the body to serialize.
 type Rewrite = Callable[[dict[str, Any]], dict[str, Any]]
 
 
@@ -334,7 +337,8 @@ class BodyFilter:
 
     `default_pool` is the pool of the `claude-` names; a deployment may have none, and the filter
     is then given none. `profiles` holds the request profile of each pool that has one, under the
-    pool's name. `maximum` is the largest body `read` takes, in bytes.
+    pool's name: what `rhi_gateway.profile.rewrites` gives for the filter's route. `maximum` is the
+    largest body `read` takes, in bytes.
     """
 
     allow_list: Fields
@@ -362,11 +366,13 @@ class BodyFilter:
         try:
             kept = _keep(body, self.allow_list, pool)
             _refuse_references(kept, self.allow_list)
-            kept[MODEL_FIELD] = pool.name
-            kept[REQUEST_ID_FIELD] = request_id
-            kept[CACHE_SALT_FIELD] = cache_salt(student)
+            own = {MODEL_FIELD: pool.name, REQUEST_ID_FIELD: request_id, CACHE_SALT_FIELD: cache_salt(student)}
+            kept.update(own)
             profile = self.profiles.get(pool.name)
-            return Forwarded(pool, _serialize(kept if profile is None else profile(kept)))
+            if profile is not None:
+                # A profile rewrites the request and never whose it is, or which pool's.
+                kept = {**profile(kept), **own}
+            return Forwarded(pool, _serialize(kept))
         except RecursionError:
             # The parser takes deeper nesting than a walk in Python can follow.
             pass

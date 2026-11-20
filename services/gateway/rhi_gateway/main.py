@@ -10,12 +10,15 @@ serves it:
   (`rhi_gateway.metrics`).
 
 A setting that is refused raises before anything listens, and so does a secret that cannot be
-read: the task stops, and the error names a variable or a pool and never a value.
+read: the task stops, and the error names a variable or a pool and never a value. So does a pool's
+request profile that names an entry the gateway does not have (`rhi_gateway.profile`): that error
+names the pool and the entry.
 
 **The parts** (`build`). The keys table is read through `DynamoKeyStore`, the usage table is the
 `DynamoDBLedger`'s, the pool-state table and the target groups are the `Readiness` reader's, the
 scaler function is the `Waker`'s, and the heartbeats table is the `Heartbeat`'s. The body filters
-are the three formats', with the body limit of the settings; the proxy has the upstream address,
+are the three formats', with the body limit of the settings and, on each forwarded route, every
+pool's request profile, which is built first; the proxy has the upstream address,
 the pools' secrets and the longest request; the hold has the keep-alive interval; the refusals
 have the three `Retry-After`. With no pool, every one of these is built the same, over no pool.
 
@@ -53,10 +56,10 @@ import uvicorn
 from starlette.applications import Starlette
 
 from rhi_gateway import metrics as metrics_endpoint
-from rhi_gateway import routes
+from rhi_gateway import profile, routes
 from rhi_gateway.app import Filter, Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import BodyFilter
+from rhi_gateway.body import BodyFilter, Rewrite
 from rhi_gateway.budget import DynamoDBLedger
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
@@ -174,9 +177,12 @@ def build(
 ) -> Gateway:
     """The gateway of these settings, over these clients. It reads each pool's secret and nothing else.
 
-    `task` names the heartbeat rows, a random identifier when none is given. `transport` replaces
-    the network between the gateway and the engines, for tests.
+    Every pool's request profile is built first: one that names an entry the gateway does not have
+    raises `rhi_gateway.profile.ProfileError`, which names the pool and the entry, before a secret
+    is read. `task` names the heartbeat rows, a random identifier when none is given. `transport`
+    replaces the network between the gateway and the engines, for tests.
     """
+    profiles = profile.build(settings.pools)
     secrets = read_secrets(settings, aws.secretsmanager)
     pools, default_pool, maximum = settings.pools, settings.default_pool, settings.body_limit_bytes
 
@@ -192,11 +198,17 @@ def build(
     )
     gateway_metrics = Metrics(ledger)
 
+    def rewrites(route: routes.Route) -> dict[str, Rewrite]:
+        """What a route's filter runs in its per-pool step: the pools' profiles on that route."""
+        return profile.rewrites(profiles, route)
+
     filters: dict[routes.Route, Filter] = {
-        routes.MESSAGES: BodyFilter(messages.MESSAGES, pools, default_pool, maximum=maximum),
-        routes.COUNT_TOKENS: BodyFilter(messages.COUNT_TOKENS, pools, default_pool, maximum=maximum),
-        routes.CHAT_COMPLETIONS: ChatBodyFilter(pools, default_pool, maximum=maximum),
-        routes.RESPONSES: BodyFilter(responses.RESPONSES, pools, default_pool, maximum=maximum),
+        routes.MESSAGES: BodyFilter(messages.MESSAGES, pools, default_pool, rewrites(routes.MESSAGES), maximum),
+        routes.COUNT_TOKENS: BodyFilter(
+            messages.COUNT_TOKENS, pools, default_pool, rewrites(routes.COUNT_TOKENS), maximum
+        ),
+        routes.CHAT_COMPLETIONS: ChatBodyFilter(pools, default_pool, rewrites(routes.CHAT_COMPLETIONS), maximum),
+        routes.RESPONSES: BodyFilter(responses.RESPONSES, pools, default_pool, rewrites(routes.RESPONSES), maximum),
     }
     forwarding = Forwarding(
         authenticator=authenticator,
@@ -249,7 +261,11 @@ def serve(gateway: Gateway, *, metrics_port: int = metrics_endpoint.PORT, **wher
 
 
 def main() -> None:
-    """Serve the gateway on port 8080. A refused setting or an unread secret raises before anything listens."""
+    """Serve the gateway on port 8080.
+
+    A refused setting, a request profile that names an entry the gateway does not have or an unread
+    secret raises before anything listens.
+    """
     settings = read_settings(os.environ)
     serve(build(settings, aws_clients(), task=task_id(os.environ)), host=HOST, port=PORT)
 
