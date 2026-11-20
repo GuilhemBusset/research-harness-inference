@@ -143,6 +143,15 @@ class Config:
     retry_after_concurrency_limit_seconds: int
     # The web ACL's three rate limits, read at synthesis only.
     rate_limits: RateLimits
+    # The provisional targets of section 7.3, held here until spike S5 has measured the pool: the
+    # 95th percentile of the time to first token in seconds, the median and the slowest tenth of a
+    # stream's tokens a second, and the cached share of input, in percent, below which the
+    # dashboard flags a pool. The dashboards read them at synthesis and spike S5's verdict when it
+    # loads the configuration; no running service reads them.
+    target_ttft_p95_seconds: float
+    target_stream_median_tokens_per_second: float
+    target_stream_p10_tokens_per_second: float
+    cached_share_flag_percent: float
 
 
 def _as_stored(text: str) -> object:
@@ -245,6 +254,23 @@ def _dollars_an_hour(value: object) -> float:
     return float(value)
 
 
+_WHOLE_PERCENT = 100
+
+
+def _number_above_zero(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError
+    return float(value)
+
+
+def _percent(value: object) -> float:
+    # A share is at most the whole.
+    number = _number_above_zero(value)
+    if number > _WHOLE_PERCENT:
+        raise ValueError
+    return number
+
+
 # What WAF accepts as the limit of a rate-based rule.
 RATE_LIMIT_RANGE = range(10, 2_000_000_001)
 # Section 17's rate limits.
@@ -307,6 +333,7 @@ def _json_from_text(text: str) -> object:
 _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
 _WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
+_NUMBER_ABOVE_ZERO = Key("a number above zero", _number_above_zero, _price_from_text)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -341,6 +368,10 @@ KEYS: dict[str, Key] = {
         _rate_limits,
         _table_from_text,
     ),
+    "target_ttft_p95_seconds": _NUMBER_ABOVE_ZERO,
+    "target_stream_median_tokens_per_second": _NUMBER_ABOVE_ZERO,
+    "target_stream_p10_tokens_per_second": _NUMBER_ABOVE_ZERO,
+    "cached_share_flag_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -373,6 +404,13 @@ DEFAULTS: dict[str, object] = {
     # Section 17: generous per address, since a campus shares one address; tighter on the issuer
     # and on Grafana.
     "rate_limits": dict(_RATE_LIMIT_DEFAULTS),
+    # Sections 7.3 and 17, provisional until spike S5: a first token within 5 seconds at the 95th
+    # percentile, a median stream of 15 tokens a second and a slowest tenth of 10, and a pool
+    # flagged below a cached share of input of 85%.
+    "target_ttft_p95_seconds": 5,
+    "target_stream_median_tokens_per_second": 15,
+    "target_stream_p10_tokens_per_second": 10,
+    "cached_share_flag_percent": 85,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
