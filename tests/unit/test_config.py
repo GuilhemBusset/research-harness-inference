@@ -50,6 +50,14 @@ GATEWAY_KEYS = {
     "retry_after_concurrency_limit_seconds": 5,
 }
 
+# The provisional targets of section 7.3, each at the default of section 17.
+TARGET_KEYS = {
+    "target_ttft_p95_seconds": 5,
+    "target_stream_median_tokens_per_second": 15,
+    "target_stream_p10_tokens_per_second": 10,
+    "cached_share_flag_percent": 85,
+}
+
 
 # The pools' tables in the example: from the first pool's header to the end of the file.
 POOL_TABLES = re.compile(r"^\[pools\..*", re.MULTILINE | re.DOTALL)
@@ -204,6 +212,8 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
             for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
             for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")
         ),
+        *((key, value) for key in TARGET_KEYS for value in (f'"{MARK}"', "0", f"-{MARK}.5", "true", "nan")),
+        ("cached_share_flag_percent", f"100.{MARK}"),
         *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
@@ -269,6 +279,24 @@ def test_the_gateway_s_seven_keys_read_their_defaults_when_left_out(tmp_path: Pa
     assert {key: example.get(key) for key in GATEWAY_KEYS} == GATEWAY_KEYS
     given = load_text(tmp_path, example_with(**{key: str(value + 1) for key, value in GATEWAY_KEYS.items()}))
     assert {key: getattr(given, key) for key in GATEWAY_KEYS} == {key: value + 1 for key, value in GATEWAY_KEYS.items()}
+
+
+def test_the_provisional_targets_read_the_defaults_of_section_17_when_left_out(tmp_path: Path) -> None:
+    # A configuration written before the targets were keys loads, with section 17's values.
+    left_out = load_text(tmp_path, example_with(**dict.fromkeys(TARGET_KEYS)))
+    assert {key: getattr(left_out, key) for key in TARGET_KEYS} == TARGET_KEYS
+    assert TARGET_KEYS.keys() & config.required_keys() == set()
+    # The example gives each, at its default; a source that gives another value keeps it.
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert {key: example.get(key) for key in TARGET_KEYS} == TARGET_KEYS
+    moved = {
+        "target_ttft_p95_seconds": 3.5,
+        "target_stream_median_tokens_per_second": 20,
+        "target_stream_p10_tokens_per_second": 12.5,
+        "cached_share_flag_percent": 90,
+    }
+    given = load_text(tmp_path, example_with(**{key: str(value) for key, value in moved.items()}))
+    assert {key: getattr(given, key) for key in TARGET_KEYS} == moved
 
 
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

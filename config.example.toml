@@ -80,6 +80,17 @@ retry_after_warming_seconds = 30
 retry_after_capacity_unavailable_seconds = 60
 retry_after_concurrency_limit_seconds = 5
 
+# The provisional targets of section 7.3, which spike S5 measures the pool against and the inference
+# performance dashboard draws: the 95th percentile of the time to first token, in seconds (the first
+# turns of sessions are counted apart); the median stream and the slowest tenth of streams, in
+# tokens a second; and the cached share of input, in percent, below which the dashboard flags a
+# pool. They are held here so that the owner can move them once S5 has measured. Left out, each is
+# the value below, the default of section 17.
+target_ttft_p95_seconds = 5
+target_stream_median_tokens_per_second = 15
+target_stream_p10_tokens_per_second = 10
+cached_share_flag_percent = 85
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They
 # are in the order of their names, which is the order the configuration in SSM is read in.
