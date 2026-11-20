@@ -66,13 +66,16 @@ def plan_faults(plan, instance: dict) -> list[str]:
 
 
 def numbers_in_tables(latex: str) -> list[float]:
-    """Every number inside a `tabular` environment, comments left out."""
+    """Every number inside a `tabular` environment, with its sign, comments left out."""
     latex = re.sub(r"(?<!\\)%.*", "", latex)
     numbers = []
     for body in re.findall(r"\\begin\{tabular\}(.*?)\\end\{tabular\}", latex, flags=re.DOTALL):
         # A thousands separator is part of its number: 10\,846, 10{,}846 and 10,846.
         plain = re.sub(r"(?<=\d)(?:\\,|\{,\}|,)(?=\d{3}(?!\d))", "", body)
-        numbers += [float(number) for number in re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", plain)]
+        # So is a minus sign before it, however it is written: -10846, $-$10846, \textminus 10846.
+        plain = re.sub(r"−|\\textminus(?:\{\})?", "-", plain)
+        signed = r"(-(?:[\s${}]|\\[()])*)?(?<![\w.])(\d+(?:\.\d+)?)(?![\w.])"
+        numbers += [-float(digits) if minus else float(digits) for minus, digits in re.findall(signed, plain)]
     return numbers
 
 
