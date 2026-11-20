@@ -266,9 +266,12 @@ class _Table:
 
 
 class _Workspace:
-    """A workspace in which instance-a and instance-b both wrote a sample just now."""
+    """A workspace in which instance-a and instance-b both wrote a sample just now, and the scaler
+    read both in service."""
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query:
+            return [common.Series({"pool": "mock"}, ((end, 2),))]
         return [common.Series({"instance": one}, ((end, end),)) for one in ("instance-a", "instance-b")]
 
 
@@ -324,12 +327,14 @@ class _Clock:
 
 class _Scaling:
     """A workspace and a pool-state table over instance-a and instance-b: instance-b writes until
-    `stops_writing`, and the scaler asks for one instance from `scales_in`."""
+    `stops_writing`, and the scaler asks for one instance, and reads one in service, from `scales_in`."""
 
     def __init__(self, clock: _Clock, *, stops_writing: float, scales_in: float) -> None:
         self.clock, self.stops_writing, self.scales_in = clock, stops_writing, scales_in
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query:
+            return [common.Series({"pool": "mock"}, ((end, 1 if self.clock.now >= self.scales_in else 2),))]
         latest = {"instance-a": end, "instance-b": min(end, self.stops_writing)}
         return [common.Series({"instance": one}, ((end, at),)) for one, at in latest.items()]
 
@@ -416,7 +421,35 @@ class _Launching:
         return {"Item": ScalerNote(Key["pool"], 2, None, int(self.clock.now)).to_item()}
 
 
-def test_the_load_is_held_until_the_scaler_reads_two_instances_in_service(monkeypatch: pytest.MonkeyPatch) -> None:
+class _Unlabelled(_Launching):
+    """`_Launching` in service from the start, whose instance-b series have no zone label until
+    `labelled_at`."""
+
+    def __init__(self, clock: _Clock, labelled_at: float) -> None:
+        super().__init__(clock, in_service_at=1000)
+        self.labelled_at = labelled_at
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        series = super().read_series(query, start=start, end=end, step=step)
+        if self.clock.now >= self.labelled_at:
+            return series
+        return [
+            common.Series({name: value for name, value in one.labels.items() if (name, value) != ("zone", "zone-2")}, one.samples)
+            for one in series
+        ]
+
+
+@pytest.mark.parametrize(
+    "fleet",
+    [
+        pytest.param(lambda clock: _Launching(clock, in_service_at=1060), id="until-in-service"),
+        # Instance-b has no zone label until 1060: it is not counted as a zone of its own.
+        pytest.param(lambda clock: _Unlabelled(clock, labelled_at=1060), id="until-zone-labelled"),
+    ],
+)
+def test_the_load_is_held_until_the_scaler_reads_two_instances_in_service(
+    monkeypatch: pytest.MonkeyPatch, fleet: Callable[[_Clock], _Launching]
+) -> None:
     clock, stopped = _Clock(1000), []
 
     async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
@@ -431,8 +464,8 @@ def test_the_load_is_held_until_the_scaler_reads_two_instances_in_service(monkey
     monkeypatch.setattr(s8.loadgen, "replay", held)
     monkeypatch.setattr(s8, "_wait", wait)
     monkeypatch.setattr(s8.time, "time", lambda: clock.now)
-    fleet = _Launching(clock, in_service_at=1060)
-    pool = s8.Pool("mock", fleet, fleet)  # ty: ignore[invalid-argument-type] - a test double
+    held_fleet = fleet(clock)
+    pool = s8.Pool("mock", held_fleet, held_fleet)  # ty: ignore[invalid-argument-type] - a test double
     run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8)
     assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
     assert stopped == [1060]
@@ -544,5 +577,37 @@ def test_firsts_the_evidence_cannot_tell_apart_are_measured_again() -> None:
     windows = {student: Counts(3, {"instance-a": 2, "instance-b": 1}) for student in s8.STUDENTS}
     counts = s8.with_openings({"instance-a": 1, "instance-b": 1}, windows, dict.fromkeys(s8.STUDENTS, False))
     assert not any(held.adds_up() for held in counts.values())
+    with pytest.raises(s8.Disturbed):
+        s8.measure_undisturbed(Phase.BEFORE, lambda: counts, lambda: 0, attempts=1, log=lambda _: None)
+
+
+class _Unread(_Scaling):
+    """`_Scaling` whose workspace has no reading of the scaler's gauge from `scales_in` until `reads_one`."""
+
+    def __init__(self, clock: _Clock, *, stops_writing: float, scales_in: float, reads_one: float) -> None:
+        super().__init__(clock, stops_writing=stops_writing, scales_in=scales_in)
+        self.reads_one = reads_one
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        if s8.INSTANCES_IN_SERVICE in query and self.scales_in <= self.clock.now < self.reads_one:
+            return []
+        return super().read_series(query, start=start, end=end, step=step)
+
+
+def test_the_phase_after_waits_for_a_reading_of_one_in_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The scaler asks for one instance from 1060 and instance-b no longer writes, but the workspace
+    # has no reading of the instances in service until 1150: the scale-in is not yet seen complete.
+    clock, after = _Clock(1000), []
+    scaling = _Unread(clock, stops_writing=1000, scales_in=1060, reads_one=1150)
+    stuck = {1: Counts(3, {"instance-a": 3}), 2: Counts(3, {"instance-b": 3})}
+    numbers = _scaling_run(monkeypatch, clock, scaling, stuck, after).measure()
+    assert after and after[0] >= 1150
+    assert s8.SPIKE.verdict(numbers) is Verdict.PASS
+
+
+def test_a_miscounted_window_is_never_made_up_by_another() -> None:
+    # The window of the two firsts counts one; student 2's window counts one too many.
+    windows = {1: Counts(1, {"instance-b": 1}), 2: Counts(1, {"instance-a": 2})}
+    counts = s8.with_openings({"instance-b": 1}, windows, dict.fromkeys(s8.STUDENTS, False))
     with pytest.raises(s8.Disturbed):
         s8.measure_undisturbed(Phase.BEFORE, lambda: counts, lambda: 0, attempts=1, log=lambda _: None)
