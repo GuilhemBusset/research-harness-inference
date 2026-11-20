@@ -47,11 +47,13 @@ under that deadline, the readiness foreseen from the cold start the job last mea
 from the first request, or the wake, to readiness).
 
 An attempt **exercised the hold** when the client's request was held for less than its deadline
-and no more than `BAND_SECONDS` less (`exercised`): one that reached an already ready pool, or one
-the gateway ended at its deadline (the pool not ready in time), does not answer the question; nor
-does one the gateway refused with an error instead of holding it (`refused`), even when another
-client's request brought the pool to readiness in the band. A
-client whose attempt did not exercise the hold is run again on the next cold start, up to
+and no more than `BAND_SECONDS` less, and what became of it is the client's doing: its whole answer
+reached it, or it closed the request itself (`exercised`, `ended_by_client`). One that reached an
+already ready pool, or one the gateway ended at its deadline (the pool not ready in time), does not
+answer the question; nor does one the gateway refused or ended with an error, an error status or an
+error event that ends the stream (`refused`), nor one the gateway closed unanswered or before its
+end, even when another client's request brought the pool to readiness in the band. A client whose
+attempt did not exercise the hold is run again on the next cold start, up to
 `ATTEMPTS` times; after that the run is not measured. So is a client that sent no request, or one
 still running `CLIENT_LIMIT_SECONDS` after it started.
 
@@ -81,6 +83,7 @@ verdict through `common.run_spike`; the versions are printed with the outcomes, 
 | --- | --- |
 | `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output |
 | `RHI_SPIKE_POOL` | The mock pool, `mock` unless given |
+| `RHI_RUN_LABEL` | The run's label; unless given, `s2-client-hold-` and a random suffix of the build's own (`build_label`) |
 
 The pool's deadlines and its `start_delay_seconds` come from the deployed configuration
 (`rhi.config.read_ssm`): a pool whose delay is 0, or that is not a mock pool, stops the job before
@@ -377,16 +380,33 @@ def repeats(exchanges: Sequence[Exchange], first: Exchange) -> int:
     )
 
 
-def cause_of(body: bytes) -> str | None:
-    """The cause an error's body names: its `type` on Messages, its `code` on the OpenAI formats."""
-    try:
-        error = json.loads(body).get("error")
-    except (ValueError, AttributeError):
-        return None
+def _cause_in(held: object) -> str | None:
+    error = held.get("error") if isinstance(held, dict) else None
     if not isinstance(error, dict):
         return None
     cause = error.get("code") or error.get("type")
     return cause if isinstance(cause, str) else None
+
+
+def cause_of(body: bytes) -> str | None:
+    """The cause an error's body names: its `type` on Messages, its `code` on the OpenAI formats."""
+    try:
+        return _cause_in(json.loads(body))
+    except ValueError:
+        return None
+
+
+def stream_error(event: bytes) -> str | None:
+    """The cause an event of a stream names when it is an error ending the stream: `error` on
+    Messages, `response.failed` on Responses, a chunk that holds `error` on Chat Completions."""
+    data = b"\n".join(line[5:].strip() for line in event.splitlines() if line.startswith(b"data:"))
+    try:
+        held = json.loads(data)
+    except ValueError:
+        return None
+    if isinstance(held, dict) and held.get("type") == "response.failed":
+        held = held.get("response")
+    return _cause_in(held)
 
 
 def shows_budget(output: str) -> bool:
@@ -497,6 +517,9 @@ class Forwarder:
         upstream = self._connection()
         done = threading.Event()
         watcher = threading.Thread(target=self._watch, args=(handler.connection, upstream, exchange, done), daemon=True)
+        # Which side the exchange is at: an error while writing to the client is the client closing
+        # it; one while reading the gateway is the gateway ending it, which no client did.
+        to_client = False
         try:
             upstream.request(handler.command, self._parts.path.rstrip("/") + handler.path, body, headers)
             watcher.start()
@@ -505,6 +528,7 @@ class Forwarder:
             payload = answer.read() if answer.status >= 400 else b""
             if answer.status >= 400:
                 exchange.cause = cause_of(payload)
+            to_client = True
             handler.send_response(answer.status)
             for name, value in answer.getheaders():
                 if name.lower() not in _HOP_BY_HOP:
@@ -517,20 +541,29 @@ class Forwarder:
             handler.wfile.flush()
             # A stream is whole once its last event has passed, which an error event ending it is not.
             streaming = "text/event-stream" in (answer.getheader("Content-Type") or "")
-            tail, ended = b"", False
-            while chunk := answer.read1(65536):
+            tail, ended, pending = b"", False, b""
+            while True:
+                to_client = False
+                chunk = answer.read1(65536)
+                if not chunk:
+                    break
+                to_client = True
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
                 # The read with what was kept before it: an event begun in the last read ends in this one.
                 seen = tail + chunk
                 ended = ended or any(event in seen for event in STREAM_ENDS)
                 tail = seen[-_TAIL:]
+                if streaming:
+                    # Each whole event, to see an error that ends the stream: the gateway ended it.
+                    *events, pending = (pending + chunk).replace(b"\r\n", b"\n").split(b"\n\n")
+                    exchange.cause = exchange.cause or next(filter(None, map(stream_error, events)), None)
                 # A client may close as soon as it has the last event: it then has the whole answer.
                 exchange.completed = answer.status == 200 and streaming and ended
             exchange.completed = answer.status == 200 and (ended or not streaming)
         except (OSError, http.client.HTTPException, ValueError, AttributeError):
-            # The client closed the exchange, or the gateway did: what ended it is in the record.
-            if exchange.closed_at is None and exchange.status is not None and not exchange.completed:
+            # Only a failed write is the client closing the exchange; a failed read is the gateway's doing.
+            if to_client and exchange.closed_at is None and not exchange.completed:
                 exchange.closed_at = self.clock()
         finally:
             done.set()
@@ -579,17 +612,26 @@ def hold_outcome(client: Client, kind: Kind, version: str, attempt: Attempt, req
 
 
 def refused(request: Exchange) -> bool:
-    """Whether the gateway answered the request with an error rather than holding it: a held stream
-    is answered 200 at once, a held call only when it ends or when the client gives up."""
-    return request.status is not None and request.status != HTTPStatus.OK
+    """Whether the gateway answered the request with an error rather than holding it to its answer:
+    an error status (a held stream is answered 200 at once, a held call only when it ends or when
+    the client gives up), or an error event that ended a stream, such as the end of the hold."""
+    return request.cause is not None or (request.status is not None and request.status != HTTPStatus.OK)
+
+
+def ended_by_client(request: Exchange) -> bool:
+    """Whether what became of the request is the client's doing: its whole answer reached the
+    client, or the client closed it before its end. Not so for a request the gateway refused or
+    ended, nor for one the gateway closed unanswered or before its end."""
+    return not refused(request) and (request.completed or request.closed_at is not None)
 
 
 def exercised(request: Exchange, ready_at: float | None, deadline: float) -> bool:
-    """Whether the request was held through the cold start meant: the gateway did not refuse it,
-    and the pool became ready less than `deadline` seconds after it, and no more than
-    `BAND_SECONDS` less. Another client's request may have started the pool: a refused request
-    was not held, however the pool's readiness falls."""
-    if ready_at is None or refused(request):
+    """Whether the request was held through the cold start meant: what became of it is the
+    client's doing (`ended_by_client`), and the pool became ready less than `deadline` seconds
+    after it, and no more than `BAND_SECONDS` less. Another client's request may have started the
+    pool: a request the gateway refused or ended was not held to the client's end, however the
+    pool's readiness falls."""
+    if ready_at is None or not ended_by_client(request):
         return False
     return deadline - BAND_SECONDS <= ready_at - request.sent_at < deadline
 
@@ -904,6 +946,8 @@ class Run:
                     held = "no request"
                 elif refused(request):
                     held = f"the gateway answered {request.status} {request.cause or ''}".rstrip()
+                elif not ended_by_client(request):
+                    held = "the gateway closed it"
                 elif ready_at is None:
                     held = "the pool was not ready in time"
                 else:
@@ -968,8 +1012,22 @@ def sdk_script(client: Client, kind: Kind, environ: Mapping[str, str]) -> int:
     return 0
 
 
+def build_label(environ: Mapping[str, str]) -> str:
+    """The run label of this build: `RHI_RUN_LABEL` when the owner gives one, and without it the
+    job's default label with a random suffix of this build's own. A run of S2 is posted in several
+    statuses, and a later build of one commit under the same label (a run not measured, say) would
+    replace only the first of them, leaving a mix no record can read: two builds never share a
+    label unless the owner gives them one."""
+    if common.RUN_LABEL_VARIABLE in environ:
+        return common.run_label(JOB, environ)
+    return f"{common.run_label(JOB, {})}-{secrets.token_hex(4)}"
+
+
 def main(environ: Mapping[str, str] = os.environ) -> common.Verdict:
-    """Runs the spike with the job's environment and credentials, and posts its numbers."""
+    """Runs the spike with the job's environment and credentials, and posts its numbers under a
+    label of this build's own (`build_label`)."""
+    label = build_label(environ)
+    print(f"run label: {label}")
 
     def measure() -> dict[str, int | float]:
         name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
@@ -1001,7 +1059,7 @@ def main(environ: Mapping[str, str] = os.environ) -> common.Verdict:
             deadlines = Deadlines(pool.hold_seconds, pool.hold_seconds_non_streaming)
             return Run(gateway, deadlines, start, keys, versions).measure()
 
-    return common.run_spike(SPIKE, JOB, measure, environ=environ)
+    return common.run_spike(SPIKE, JOB, measure, environ={**environ, common.RUN_LABEL_VARIABLE: label})
 
 
 if __name__ == "__main__":
