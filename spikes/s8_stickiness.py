@@ -20,17 +20,33 @@ alone moves it (section 5.1).
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
    one of them has to move. Then each student in turn sends the number of requests it is given, one
-   after another, and the job reads how many of them each instance served. A student's first
-   request counts among its requests of the phase (`with_firsts`): its sent number is one more than
-   it was given.
+   after another, continuing the conversation its first request began, and the job reads how many
+   of them each instance served. A student's first request counts among its requests of the phase
+   (`with_openings`): its sent number is one more than it was given. Both instances must still be
+   in service when the phase ends; if one has left, or is leaving, the run is not measured
+   (`Departed`), since a student moved by a departure did not leave an instance that was there.
 3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance
-   (no request for 10 minutes, and 15 since the scale-out, section 5.1), then each student sends
-   its requests again, and every one of them must have reached the instance that stayed.
+   (load that fits in one instance for 10 minutes, and 15 since the scale-out, section 5.1), then
+   each student sends its requests again, and every one of them must have reached the instance
+   that stayed.
+
+A run whose students were both, before the departure, on the instance that stayed has shown no
+student move: it would pass without asking the second half of the question, so it is not measured
+(`NotExercised`).
 
 **Which instance served** is read from the workspace: the count of the mock's time-to-first-token
 histogram, one per request, on each `instance` series (section 7.2). A student's window opens before
 its first request and closes `SETTLE_SECONDS` after its last, so the collector's scrape has carried
 the last count to the workspace.
+
+**Whose first request an instance served.** The two first requests are sent at once, so their window
+cannot say which student each instance served. The mock's cache imitation can (section 5.5, issue
+E2-75): an instance keeps, for each student, the input of the last request of that student it
+served, and a request it serves has as cached the input it shares with that one from its start. A
+student's second request repeats its first whole, so it has all of the first's input cached exactly
+when it reached the instance that served the first, as each answer's usage reports. Its first
+request is counted on the instance of its next one when it was; on another instance of the window
+when it was not, which splits its counts.
 
 **The rebalance number.** For each new rebalance number the gateway drops about one student in ten
 of its cookies (section 5.5), which would move a student for a reason that is not the one measured.
@@ -39,7 +55,9 @@ the scaler has no cause to raise it, but the job checks: it reads the pool's num
 scaler's note at the start and the end of each measured phase, and measures a phase again when it
 changed. It does the same when a student's counts do not add up to the requests it sent, which is
 another request on the pool during the window. After `ATTEMPTS` disturbed attempts it gives up, and
-the run is not measured.
+the run is not measured. The note is read with a strongly consistent read, so the reading at a
+phase's end sees a change the scaler wrote during it. Each attempt is a new conversation, so that
+an attempt's cache does not answer for the next one's.
 
 **The numbers** (`Number`): the zones of the two instances, and for each student and phase the
 requests it sent and the most any one instance served. A student stayed on one instance in a phase
@@ -66,6 +84,7 @@ one that lands after the departure on an instance other than the remaining one s
 from __future__ import annotations
 
 import asyncio
+import itertools
 import math
 import os
 import time
@@ -86,7 +105,7 @@ from rhi_common.records import NOTE_RECORD, ScalerNote
 from rhi_reporter.measure import Verdict
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 
 JOB = "s8_stickiness"
 MEASUREMENT = "S8"
@@ -232,45 +251,63 @@ def served_between(series: Sequence[common.Series], start: float, end: float) ->
     return {instance: count for instance, count in served.items() if count > 0}
 
 
-def with_firsts(firsts: Mapping[str, int], counts: PhaseCounts) -> PhaseCounts:
-    """Each student's counts with its first request, one of the requests sent at once that
-    `firsts` counts by instance, added to them.
+def with_openings(openings: Mapping[str, int], counts: PhaseCounts, kept: Mapping[int, bool]) -> PhaseCounts:
+    """Each student's counts with its first request added to them: `openings` counts the two first
+    requests, sent at once, by instance, and `kept` says for each student whether its next request
+    reached the instance that served its first (`kept_opening`).
 
-    The workspace cannot say whose first request an instance served, since both were sent at once,
-    so a student is given the first that the instance it was on afterwards served, when there is
-    one left; otherwise any other, which makes its counts split between two instances. Two students
-    found afterwards on one instance whose firsts reached two instances are thus not both on one
-    instance: one of them moved. The one case counts cannot show is two students that swapped
-    instances. A first left over is another request on the pool: it is added to the first
-    student's counts, which then do not add up, and the phase is measured again."""
-    left = dict(firsts)
-    given: dict[int, str | None] = {}
-    for student, held in counts.items():
-        stayed_on = next(iter(held.served)) if len(held.served) == 1 else None
-        if stayed_on is not None and left.get(stayed_on, 0) > 0:
-            given[student] = stayed_on
-            left[stayed_on] -= 1
-    for student in counts:
-        if student not in given:
-            other = next((instance for instance, count in left.items() if count > 0), None)
-            given[student] = other
-            if other is not None:
-                left[other] -= 1
-    spare = {instance: count for instance, count in left.items() if count > 0}
+    A student that kept it has its first counted on an instance its next requests reached; one that
+    did not, on another instance of the window, which splits its counts. A first the window cannot
+    place, and a first left over, which is another request on the pool, leave the counts not adding
+    up to the requests sent, so the phase is measured again."""
+    left = Counter({instance: count for instance, count in openings.items() if count > 0})
+    placed: dict[int, str] = {}
+    # Those that kept their first's instance first: theirs is known, another's is only "elsewhere".
+    for student in sorted(counts, key=lambda student: not kept[student]):
+        reached = counts[student].served
+        places = list(reached) if kept[student] else [instance for instance in left if instance not in reached]
+        place = next((instance for instance in places if left[instance] > 0), None)
+        if place is not None:
+            placed[student] = place
+            left[place] -= 1
     result: dict[int, Counts] = {}
     for position, (student, held) in enumerate(counts.items()):
         served = Counter(held.served)
-        first = given[student]
-        if first is not None:
-            served[first] += 1
+        if student in placed:
+            served[placed[student]] += 1
         if position == 0:
-            served.update(spare)
+            served.update(+left)
         result[student] = Counts(held.sent + 1, dict(served))
     return result
 
 
+def kept_opening(opening: loadgen.Record, following: loadgen.Record) -> bool:
+    """Whether a student's request `following`, the next after its first `opening`, reached the
+    instance that served `opening`: it had the whole input of `opening` cached."""
+    first, cached = opening.input_tokens, following.cached_input_tokens
+    return first is not None and cached is not None and 0 < first <= cached
+
+
+def moved(before: PhaseCounts, remaining: set[str]) -> bool:
+    """Whether a student was, before the departure, on an instance other than the one that stayed."""
+    return any(set(held.served) - remaining for held in before.values())
+
+
 class Disturbed(RuntimeError):
     """A phase was disturbed on every attempt: the run is not a measurement."""
+
+
+class Departed(RuntimeError):
+    """An instance left, or began to leave, while the phase before the departure was measured."""
+
+
+class NotExercised(RuntimeError):
+    """No student was on the instance that left: the run cannot show a student move."""
+
+
+class Leaving(RuntimeError):
+    """The scaler asks for fewer instances than the workspace shows: one is leaving, and the
+    workspace cannot say which."""
 
 
 def measure_undisturbed(
@@ -319,10 +356,15 @@ class Pool:
         }
 
     def present(self) -> set[str]:
-        """The instances whose collector wrote a sample in the last `FRESH_SECONDS`."""
+        """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`.
+        `Leaving` while the scaler asks for fewer: an instance being drained still writes."""
         end = time.time()
         series = self._read(f'timestamp({_RUNNING}{{pool="{self.name}"}})', end - FRESH_SECONDS, end, 15)
-        return {one.labels["instance"] for one in series if one.samples and one.samples[-1][1] >= end - FRESH_SECONDS}
+        fresh = {one.labels["instance"] for one in series if one.samples and one.samples[-1][1] >= end - FRESH_SECONDS}
+        note = self._note()
+        if note is not None and note.capacity_asked < len(fresh):
+            raise Leaving(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present")
+        return fresh
 
     def busy(self) -> float:
         """The requests running or waiting on the pool's instances, as the workspace last saw them."""
@@ -335,10 +377,15 @@ class Pool:
         """Requests each instance served from `start` to `end`."""
         return served_between(self._read(f'{_SERVED}{{pool="{self.name}"}}', start, end, end - start), start, end)
 
+    def _note(self) -> ScalerNote | None:
+        """The scaler's note, read strongly consistent: a write the scaler completed is seen."""
+        item = self.table.get_item(Key={"pool": self.name, "record": NOTE_RECORD}, ConsistentRead=True).get("Item")
+        return None if item is None else ScalerNote.from_item(item)
+
     def rebalance_number(self) -> int:
         """The pool's rebalance number, from the scaler's note: 0 while it has none."""
-        item = self.table.get_item(Key={"pool": self.name, "record": NOTE_RECORD}).get("Item")
-        return 0 if item is None else ScalerNote.from_item(item).rebalance_number
+        note = self._note()
+        return 0 if note is None else note.rebalance_number
 
 
 # The load and the students' requests.
@@ -359,6 +406,50 @@ class HeldStream:
 def _session(model: str, requests: int, seed: int) -> loadgen.SyntheticSession:
     turn = loadgen.Turn(pause_seconds=0.0, input_tokens=TURN_INPUT_TOKENS)
     return loadgen.SyntheticSession(model, START_TOKENS, (turn,) * (requests - 1), OUTPUT_TOKENS, seed)
+
+
+@dataclass
+class Opened:
+    """A session sent in two replays: its first request (`Opening`), then the others (`Rest`),
+    which continue the conversation with the first's answer."""
+
+    session: loadgen.Session
+    _steps: Generator[tuple[float, loadgen.Request], str] | None = field(default=None, init=False)
+    _answer: str = field(default="", init=False)
+
+    def opening(self) -> Generator[tuple[float, loadgen.Request], str]:
+        self._steps = self.session.requests()
+        self._answer = yield next(self._steps)
+
+    def rest(self) -> Generator[tuple[float, loadgen.Request], str]:
+        if self._steps is None:
+            raise RuntimeError("the rest of a session is sent after its first request")
+        try:
+            step = self._steps.send(self._answer)
+            while True:
+                step = self._steps.send((yield step))
+        except StopIteration:
+            return
+
+
+@dataclass(frozen=True)
+class Opening:
+    """The first request of an `Opened` session."""
+
+    opened: Opened
+
+    def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
+        return self.opened.opening()
+
+
+@dataclass(frozen=True)
+class Rest:
+    """The requests of an `Opened` session after its first."""
+
+    opened: Opened
+
+    def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
+        return self.opened.rest()
 
 
 def _first_request(model: str) -> loadgen.Request:
@@ -387,6 +478,8 @@ class Run:
     keys: Sequence[str]
     requests: int
     target_concurrency: int
+    # The seed of each new conversation: no two attempts send the same text.
+    _conversations: Iterator[int] = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
 
     async def two_instances(self) -> dict[str, str]:
         """Holds the load until two instances serve, and returns them with their zones once it has ended."""
@@ -409,7 +502,10 @@ class Run:
                 raise RuntimeError("the load ended before two instances served: a held stream was refused")
             # One observation: the instances serving now and present now, never an earlier one's.
             serving = self.pool.serving()
-            present = self.pool.present()
+            try:
+                present = self.pool.present()
+            except Leaving:
+                return False
             now = {instance: zone for instance, zone in serving.items() if instance in present}
             if len(now) < INSTANCES:
                 return False
@@ -425,34 +521,57 @@ class Run:
         await _wait(lambda: self.pool.busy() == 0, LOAD_END_WAIT_SECONDS, "the load to end")
         return found
 
-    async def student(self, number: int, seed: int) -> Counts:
-        """Sends one student's requests one after another, and reads what each instance served."""
+    async def student(self, number: int, session: loadgen.Session) -> tuple[Counts, list[loadgen.Record]]:
+        """Sends one student's requests of `session` one after another, and reads what each instance
+        served; with the records of its requests."""
         start = time.time()
-        load = loadgen.Load((_session(self.pool.name, self.requests, seed),))
-        _all_answered(await loadgen.replay(load, [self.keys[number - 1]], self.endpoint, at_once=1), self.requests)
+        records = await loadgen.replay(loadgen.Load((session,)), [self.keys[number - 1]], self.endpoint, at_once=1)
+        _all_answered(records, self.requests)
         await asyncio.sleep(SETTLE_SECONDS)
         served = await asyncio.to_thread(self.pool.served, start, time.time())
         print(f"student {number}: {self.requests} sent, served as {sorted(served.values(), reverse=True)}")
-        return Counts(self.requests, served)
+        return Counts(self.requests, served), records
 
     async def phase(self, *, first_at_once: bool) -> PhaseCounts:
         """Each student's requests in turn, after the two students' first requests at once if asked,
-        which then count among each student's requests of the phase (`with_firsts`)."""
-        firsts: dict[str, int] | None = None
-        if first_at_once:
-            start = time.time()
-            keys = [self.keys[student - 1] for student in STUDENTS]
-            load = loadgen.Load(tuple(_session(self.pool.name, 1, student) for student in STUDENTS))
-            _all_answered(await loadgen.replay(load, keys, self.endpoint, at_once=len(STUDENTS)), len(STUDENTS))
-            await asyncio.sleep(SETTLE_SECONDS)
-            firsts = await asyncio.to_thread(self.pool.served, start, time.time())
-            print(f"first requests at once: served as {sorted(firsts.values(), reverse=True)}")
-        counts = {student: await self.student(student, seed=100 * student) for student in STUDENTS}
-        return counts if firsts is None else with_firsts(firsts, counts)
+        which then count among each student's requests of the phase (`with_openings`)."""
+        size = self.requests + 1 if first_at_once else self.requests
+        sessions = {student: _session(self.pool.name, size, next(self._conversations)) for student in STUDENTS}
+        if not first_at_once:
+            return {student: (await self.student(student, sessions[student]))[0] for student in STUDENTS}
+        opened = {student: Opened(sessions[student]) for student in STUDENTS}
+        start = time.time()
+        keys = [self.keys[student - 1] for student in STUDENTS]
+        load = loadgen.Load(tuple(Opening(opened[student]) for student in STUDENTS))
+        openings = await loadgen.replay(load, keys, self.endpoint, at_once=len(STUDENTS))
+        _all_answered(openings, len(STUDENTS))
+        await asyncio.sleep(SETTLE_SECONDS)
+        window = await asyncio.to_thread(self.pool.served, start, time.time())
+        print(f"first requests at once: served as {sorted(window.values(), reverse=True)}")
+        counts: dict[int, Counts] = {}
+        kept: dict[int, bool] = {}
+        for position, student in enumerate(STUDENTS):
+            counts[student], records = await self.student(student, Rest(opened[student]))
+            kept[student] = kept_opening(openings[position], records[0])
+            print(f"student {student}: its second request {'found' if kept[student] else 'missed'} its first's cache")
+        return with_openings(window, counts, kept)
 
-    def measured(self, phase: Phase, *, first_at_once: bool) -> PhaseCounts:
+    def _in_service(self, instances: set[str], phase: Phase) -> None:
+        """`Departed` unless every one of `instances` is still in service, none of them leaving."""
+        try:
+            present = self.pool.present()
+        except Leaving as leaving:
+            raise Departed(f"an instance began to leave during the phase {phase}") from leaving
+        if not instances <= present:
+            raise Departed(f"an instance left during the phase {phase}")
+
+    def measured(self, phase: Phase, *, first_at_once: bool, in_service: set[str]) -> PhaseCounts:
+        """The phase, measured again while disturbed, with `in_service` all in service at its end."""
+
         def measure() -> PhaseCounts:
-            return asyncio.run(self.phase(first_at_once=first_at_once))
+            counts = asyncio.run(self.phase(first_at_once=first_at_once))
+            self._in_service(in_service, phase)
+            return counts
 
         return measure_undisturbed(phase, measure, self.pool.rebalance_number)
 
@@ -460,22 +579,30 @@ class Run:
         found = asyncio.run(self.two_instances())
         zones = len(set(found.values()))
         print(f"two instances in service, in {zones} zone(s)")
-        before = self.measured(Phase.BEFORE, first_at_once=True)
+        before = self.measured(Phase.BEFORE, first_at_once=True, in_service=set(found))
         remaining: set[str] = set()
 
         def departed() -> bool:
             remaining.clear()
-            remaining.update(self.pool.present())
+            try:
+                remaining.update(self.pool.present())
+            except Leaving:
+                return False
             if not remaining:
                 raise RuntimeError("the pool went to no instance before the departure was measured")
             return len(remaining) == 1
 
         asyncio.run(_wait(departed, DEPARTURE_WAIT_SECONDS, "the scaler to take the pool to one instance"))
+        if not remaining <= set(found):
+            raise RuntimeError("the instance that remains is not one of the two measured")
         print("one instance remains")
-        after = self.measured(Phase.AFTER, first_at_once=False)
+        after = self.measured(Phase.AFTER, first_at_once=False, in_service=remaining)
         if any(set(counts.served) - remaining for counts in after.values()):
             raise RuntimeError("an instance other than the remaining one served after the departure")
-        return numbers_of(zones, {Phase.BEFORE: before, Phase.AFTER: after})
+        numbers = numbers_of(zones, {Phase.BEFORE: before, Phase.AFTER: after})
+        if passes(numbers) and not moved(before, remaining):
+            raise NotExercised("both students were on the instance that stayed: none had to move")
+        return numbers
 
 
 def main(environ: Mapping[str, str] = os.environ) -> Verdict:
