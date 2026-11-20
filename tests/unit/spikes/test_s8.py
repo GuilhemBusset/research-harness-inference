@@ -5,12 +5,19 @@ names are made up.
 
 from __future__ import annotations
 
+import dataclasses
+from typing import TYPE_CHECKING
+
 import pytest
 
 import common
 import s8_stickiness as s8
 from rhi_common.keys import generate_key
+from rhi_common.records import ScalerNote
 from rhi_reporter.measure import Verdict, measurement_event
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 Counts, Phase = s8.Counts, s8.Phase
 
@@ -113,23 +120,41 @@ class _Pool:
         return 0
 
 
+def _replay(keys: list[str], kept: tuple[bool, bool], on_rest: Callable[[], None] = lambda: None) -> Callable:
+    """A replay answering every request, in which a student's second request has its first's whole
+    input cached, as the mock's cache reports it, when `kept` says it reached its first's instance."""
+
+    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int) -> list:
+        records = _answered(load)
+        if isinstance(load.sessions[0], s8.Rest):
+            on_rest()
+            if kept[keys.index(supplied[0])]:
+                records[0] = dataclasses.replace(records[0], cached_input_tokens=records[0].input_tokens)
+        return records
+
+    return replay
+
+
 @pytest.mark.parametrize(
-    ("second_student_on", "verdict"),
-    [("instance-a", Verdict.PASS), ("instance-b", Verdict.FAIL)],
+    ("second_student_on", "kept", "verdict"),
+    [
+        ("instance-a", (True, True), Verdict.PASS),
+        # Student 2 moves to instance-b while both instances are in service.
+        ("instance-b", (True, False), Verdict.FAIL),
+        # The two students swap instances: the window is the pass's, the cache tells them apart.
+        ("instance-a", (False, False), Verdict.FAIL),
+    ],
 )
 def test_the_first_requests_at_once_count_toward_the_verdict(
-    monkeypatch: pytest.MonkeyPatch, second_student_on: str, verdict: Verdict
+    monkeypatch: pytest.MonkeyPatch, second_student_on: str, kept: tuple[bool, bool], verdict: Verdict
 ) -> None:
-    # The two first requests reach two instances; student 1 is then on instance-b. Student 2 then
-    # either stays on instance-a, or moves to instance-b while both instances are in service.
-    async def replay(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
-        return _answered(load)
-
-    monkeypatch.setattr(s8.loadgen, "replay", replay)
+    # The two first requests reach two instances; student 1's next requests reach instance-b.
+    keys = [generate_key(), generate_key()]
+    monkeypatch.setattr(s8.loadgen, "replay", _replay(keys, kept))
     monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
     firsts = {"instance-a": 1, "instance-b": 1}
     pool = _Pool([firsts, {"instance-b": 3}, {second_student_on: 3}])
-    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 2, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(pool, "https://gateway.example.com", keys, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
     before = s8.asyncio.run(run.phase(first_at_once=True))
     assert all(held.sent == 4 and held.adds_up() for held in before.values())
     assert s8.SPIKE.verdict(s8.numbers_of(2, {Phase.BEFORE: before, Phase.AFTER: REMAINED})) is verdict
@@ -150,3 +175,90 @@ def test_two_instances_are_two_seen_in_service_together(monkeypatch: pytest.Monk
     # Instance-a alone, then instance-b alone, is not two instances: the load is held until both are seen at once.
     assert s8.asyncio.run(run.two_instances()) == observed[2]
     assert len(pool.seen) == 3
+
+
+class _Departing:
+    """A pool of instance-a and instance-b from which instance-b leaves once `departed` is set."""
+
+    name = "mock"
+
+    def __init__(self, served: list[dict[str, int]]) -> None:
+        self.windows, self.departed = iter(served), False
+
+    def served(self, start: float, end: float) -> dict[str, int]:
+        return next(self.windows)
+
+    def present(self) -> set[str]:
+        return {"instance-a"} if self.departed else {"instance-a", "instance-b"}
+
+    def rebalance_number(self) -> int:
+        return 0
+
+
+def _run(monkeypatch: pytest.MonkeyPatch, pool: _Departing, *, depart_during_phase: bool = False) -> s8.Run:
+    """A whole run on `pool`, both students' second requests finding their first's cache."""
+    keys = [generate_key(), generate_key()]
+
+    def on_rest() -> None:
+        pool.departed = pool.departed or depart_during_phase
+
+    async def two_instances(self: s8.Run) -> dict[str, str]:
+        return {"instance-a": "zone-1", "instance-b": "zone-2"}
+
+    async def wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
+        pool.departed = True
+        assert condition()
+
+    monkeypatch.setattr(s8.loadgen, "replay", _replay(keys, (True, True), on_rest))
+    monkeypatch.setattr(s8.Run, "two_instances", two_instances)
+    monkeypatch.setattr(s8, "_wait", wait)
+    monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
+    return s8.Run(pool, "https://gateway.example.com", keys, 2, 8)  # ty: ignore[invalid-argument-type] - a test double
+
+
+def test_a_run_passes_once_a_student_has_moved_from_the_instance_that_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Student 1 is on instance-b, which leaves, and then reaches instance-a.
+    after = [{"instance-a": 2}, {"instance-a": 2}]
+    pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-b": 2}, {"instance-a": 2}, *after])
+    assert s8.SPIKE.verdict(_run(monkeypatch, pool).measure()) is Verdict.PASS
+    # Both students on the instance that stayed: no student moved, and the run is not measured.
+    pool = _Departing([{"instance-a": 2}, {"instance-a": 2}, {"instance-a": 2}, *after])
+    with pytest.raises(s8.NotExercised):
+        _run(monkeypatch, pool).measure()
+
+
+def test_an_instance_leaving_during_the_phase_before_the_departure_is_not_measured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Instance-b leaves before student 1's next requests, which then reach instance-a.
+    pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-a": 2}, {"instance-a": 2}])
+    with pytest.raises(s8.Departed):
+        _run(monkeypatch, pool, depart_during_phase=True).measure()
+
+
+class _Table:
+    """The pool-state table, whose note asks for `asked` instances. An eventually consistent read
+    still sees the note before the scaler's last write."""
+
+    def __init__(self, asked: int, number: int) -> None:
+        self.asked, self.number = asked, number
+
+    def get_item(self, *, Key: dict, ConsistentRead: bool = False) -> dict:
+        number = self.number if ConsistentRead else 0
+        return {"Item": ScalerNote(Key["pool"], self.asked, None, 1000, number).to_item()}
+
+
+class _Workspace:
+    """A workspace in which instance-a and instance-b both wrote a sample just now."""
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        return [common.Series({"instance": one}, ((end, end),)) for one in ("instance-a", "instance-b")]
+
+
+def test_the_pool_reads_the_scaler_s_last_write() -> None:
+    pool = s8.Pool("mock", _Workspace(), _Table(2, 5))  # ty: ignore[invalid-argument-type] - a test double
+    assert pool.rebalance_number() == 5
+    assert pool.present() == {"instance-a", "instance-b"}
+    # The scaler asks for one instance while two still write: one is leaving.
+    with pytest.raises(s8.Leaving):
+        s8.Pool("mock", _Workspace(), _Table(1, 5)).present()  # ty: ignore[invalid-argument-type] - a test double
