@@ -500,9 +500,22 @@ class Run:
         return self.keys[0]
 
     async def across_deployment(self) -> bool:
-        """Holds a stream across a gateway deployment (`across_rollout`): whether it completed."""
+        """Holds a stream across a gateway deployment (`across_rollout`): whether it completed.
+
+        The rollout is checked from the gateway's tasks, which `Pool.gateway_tasks` reads. A pool
+        that does not read them gives no check: the stream is then held on the server for the whole
+        `deployment_hold_seconds`, and whether it completed is the number."""
         began = time.time()
-        before = set(await asyncio.to_thread(self.pool.gateway_tasks, began - FRESH_SECONDS, began))
+        start = time.strftime("%H:%M:%S UTC", time.gmtime(began))
+        tasks: Callable[[float, float], Mapping[str, tuple[float, float]]] | None
+        tasks = getattr(self.pool, "gateway_tasks", None)
+        if tasks is None:
+            print(f"holding a stream for {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
+            print("the gateway's tasks are not read: the release under the stream is not checked")
+            request = _request(self.pool.name)
+            hold = self.deployment_hold_seconds
+            return await slow_stream(self.endpoint, self.student, request, hold, transport=self.transport)
+        before = set(await asyncio.to_thread(tasks, began - FRESH_SECONDS, began))
         if not before:
             raise RuntimeError("no gateway task was writing when the stream was opened")
         seen: list[float] = []
@@ -511,12 +524,11 @@ class Run:
         async def rolled_out() -> bool:
             nonlocal spanned
             now = time.time()
-            at = rollout_at(before, await asyncio.to_thread(self.pool.gateway_tasks, began, now))
+            at = rollout_at(before, await asyncio.to_thread(tasks, began, now))
             seen[:] = [] if at is None else [at]
             spanned = at is not None and now >= at + ROLLOUT_MARGIN_SECONDS
             return spanned
 
-        start = time.strftime("%H:%M:%S UTC", time.gmtime(began))
         print(f"holding a stream for up to {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
         request = _request(self.pool.name)
         completed = await slow_stream(
@@ -529,7 +541,7 @@ class Run:
         )
         if not completed and not seen:
             # Cut before the job looked again: a task that first wrote while it was open is a rollout under it.
-            at = rollout_at(before, await asyncio.to_thread(self.pool.gateway_tasks, began, time.time()))
+            at = rollout_at(before, await asyncio.to_thread(tasks, began, time.time()))
             seen[:] = [] if at is None else [at]
         try:
             survived = across_rollout(completed, spanned, seen[0] if seen else None)
