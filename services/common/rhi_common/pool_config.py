@@ -7,7 +7,7 @@ dashboards all read the same entry, so its shape is decided here and nowhere els
 needs the standard library only, and knows nothing of where the configuration comes from:
 `parse_pools` takes the table as the source gave it.
 
-Only four fields have a default, the ones section 17 gives every pool: the two holds, the idle
+Four fields have a default of section 17, which gives them to every pool: the two holds, the idle
 time and the drain. `target_concurrency` and `gpu_hours_per_day` are a pool's own values, so
 every pool gives the first and every vllm pool the second. A mock pool serves canned responses
 from no model repository: it may leave out `model`, `revision` and `gpu_hours_per_day`.
@@ -22,6 +22,11 @@ when none is given.
 A pool may give `expected`, the values the inference dashboard draws beside the measured series
 (sections 4.7 and 7.3): each of speed per stream, time to first token and cache capacity is
 optional, and is a low and a high bound.
+
+A pool may set `trust_remote_code`, which lets its engine run the code its model repository
+holds (section 4.4; evidence E28). That is off for every pool that does not ask: a pool that asks
+is a reviewed exception, and records why in `trust_remote_code_reason`, without which it is
+refused. Left out, the first is false and the second is None.
 
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
@@ -42,7 +47,7 @@ from dataclasses import dataclass, fields
 ENGINES = ("mock", "vllm")
 WAKES = ("on-demand", "scheduled-only")
 
-# The defaults of section 17. No other field has one.
+# The defaults of section 17.
 DEFAULT_HOLD_SECONDS = 420
 DEFAULT_HOLD_SECONDS_NON_STREAMING = 240
 DEFAULT_IDLE_MINUTES = 20
@@ -119,6 +124,10 @@ class Pool:
     measured_start_seconds: int | None
     # None when the pool gives no estimate (the mock).
     expected: ExpectedValues | None
+    # Whether the engine may run the code the model repository holds, and why: an exception to
+    # section 4.4, recorded with the pool. A pool that sets the first gives the second.
+    trust_remote_code: bool
+    trust_remote_code_reason: str | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -223,6 +232,18 @@ def _expected(pool: str, entry: Mapping[str, object]) -> ExpectedValues | None:
     return ExpectedValues(**given)
 
 
+def _trust_remote_code(pool: str, entry: Mapping[str, object]) -> tuple[bool, str | None]:
+    """Whether the pool trusts its model repository's code, and the reason it records for it."""
+    trusted = entry.get("trust_remote_code", False)
+    if not isinstance(trusted, bool):
+        raise PoolConfigError(pool, "trust_remote_code", "must be true or false")
+    field = "trust_remote_code_reason"
+    reason = _text(pool, entry, field) if field in entry else None
+    if trusted and reason is None:
+        raise PoolConfigError(pool, field, "is missing: a pool that sets trust_remote_code says why")
+    return trusted, reason
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -249,6 +270,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     wake = _choice(name, entry, "wake", WAKES)
     if wake == "on-demand" and any(price > on_demand_price_limit for price in prices.values()):
         raise PoolConfigError(name, "wake", "must be scheduled-only: an instance type is priced above the limit")
+    trust_remote_code, trust_remote_code_reason = _trust_remote_code(name, entry)
 
     return Pool(
         name=name,
@@ -278,6 +300,8 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
             _whole(name, entry, "measured_start_seconds", least=1) if "measured_start_seconds" in entry else None
         ),
         expected=_expected(name, entry),
+        trust_remote_code=trust_remote_code,
+        trust_remote_code_reason=trust_remote_code_reason,
     )
 
 

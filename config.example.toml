@@ -86,6 +86,13 @@ retry_after_concurrency_limit_seconds = 5
 # length is the coursework pool's, so that the mock exercises the same limits; its largest output
 # is the 32,000 tokens Claude Code asks for on its main turns (evidence E15), which the body filter
 # then leaves as they are sent. It gives no expected values and has no measured start.
+#
+# A pool served by vLLM may record one exception with two more fields (section 4.4), which no pool
+# here does, since none is served by vLLM yet:
+#   trust_remote_code = true                  lets the engine run the code the model's repository
+#                                             holds. Left out, it is false.
+#   trust_remote_code_reason = "<the reason>" why this pool needs it. Left out, there is none, and
+#                                             a pool that sets trust_remote_code without it is refused.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]

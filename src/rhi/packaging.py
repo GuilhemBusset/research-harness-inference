@@ -10,8 +10,6 @@ A service imports `rhi_common`, its own package and the libraries of its depende
   nothing for a stack that the context `aws:cdk:bundling-stacks` excludes.
 - `image_context` gives a container image its build context: the two packages, the service's
   Dockerfile and the group's requirements file with hashes, which the Dockerfile installs.
-  `upstream_image_context` gives the context of an image that adds nothing of the repository to
-  the image it starts from: its Dockerfile alone.
 
 `bundle` is the layout of a function's bundle, in any directory: the release's files carry the
 lifecycle agent in it (`rhi.pools.release`).
@@ -158,19 +156,6 @@ def image_context(service: str, dockerfile: Path, *, repo: Path = REPO) -> str:
     copy_packages(service, repo, context)
     shutil.copyfile(dockerfile, context / "Dockerfile")
     (context / "requirements.txt").write_text(requirements(service, repo=repo), encoding="utf-8")
-    return str(context)
-
-
-def upstream_image_context(dockerfile: Path) -> str:
-    """A build context for an image that holds nothing of the repository: `Dockerfile` (a copy of
-    `dockerfile`) and nothing else, for the `directory` of a `DockerImageAsset`.
-
-    The image's asset hash covers that one file. The directory is a temporary one, as in
-    `image_context`.
-    """
-    context = Path(tempfile.mkdtemp(prefix="rhi-upstream-image-"))
-    atexit.register(shutil.rmtree, context, ignore_errors=True)
-    shutil.copyfile(dockerfile, context / "Dockerfile")
     return str(context)
 
 

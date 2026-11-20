@@ -8,9 +8,11 @@ SSM parameter, and the lifecycle agent compares it with what the instance holds
 (`rhi_lifecycle.release`, which fixes the parameter's keys). This module writes that parameter
 when the stack is deployed, publishes what it names, and replaces the instances when it changes.
 
-**The engine image.** Each pool's engine image is built from its engine's Dockerfile (`ENGINES`),
-in the build context `rhi.packaging` gives, as an image asset, which the pipeline's asset step
-builds and pushes to the bootstrap's repository under the hash of its sources. It is built for
+**The engine image.** Each pool's engine image is built from its engine's Dockerfile (`ENGINES`)
+as an image asset, which the pipeline's asset step builds and pushes to the bootstrap's
+repository under the hash of its sources. The mock's build context is the one `rhi.packaging`
+gives a Python service. The vLLM image holds no package of this project: its build context is its
+own folder, `services/engine/vllm/`, whole. It is built for
 the processor architecture of the pool's instance types (`architecture`); a pool whose types mix
 the two architectures is refused at synthesis. The release names the image by the registry's
 digest, which only the registry knows: a custom resource reads it for the asset's tag when the
@@ -35,8 +37,12 @@ everything but the libraries and nothing is downloaded.
 **The parameter.** `/rhi/pools/<pool>/release`, the name the launch template puts in the instance
 tag `rhi-release-parameter`. Its value is one JSON object: the compared release (`engine_image`,
 `model_revision`, `engine_flags` and `files`, with the archive's bucket, key and SHA-256), the
-measured start when the configuration gives one, and the instance's settings. The configuration
-gives a pool no engine flag yet, so the list is empty.
+measured start when the configuration gives one, and the instance's settings.
+
+**The engine flags.** The arguments the engine's container receives. A vllm pool's are what
+`rhi.pools.vllm_command` builds from its configuration, with the model at the pool's prefix of the
+model bucket of the stack's account and region; the mock takes none. They never hold the pool's
+secret.
 
 **The grants.** The pool's instance role may read that parameter and no other, read the archive's
 object and no other object of the bucket, and pull the pool's engine image. ECR's authorization
@@ -79,6 +85,7 @@ from aws_cdk import custom_resources as cr
 from constructs import Construct
 
 from rhi import packaging
+from rhi.pools import model_store, vllm_command
 from rhi.pools.group import POOL_TAG, release_parameter
 from rhi.pools.role import log_group_name
 from rhi.pools.scaler import REMOTE_WRITE_PATH, STACK_ID_TAG
@@ -107,7 +114,7 @@ PLATFORMS = {ARM64: ecr_assets.Platform.LINUX_ARM64, AMD64: ecr_assets.Platform.
 class Engine:
     """Where an engine's image is built from: its Dockerfile, under the repository, and the
     service of `rhi.packaging` whose packages and libraries the image holds, or None for an image
-    that holds nothing of the repository."""
+    that holds no package of the repository, whose build context is the Dockerfile's folder."""
 
     dockerfile: str
     service: str | None
@@ -356,7 +363,7 @@ class PoolRelease(Construct):
             self,
             "Image",
             directory=(
-                packaging.upstream_image_context(dockerfile)
+                str(dockerfile.parent)
                 if engine.service is None
                 else packaging.image_context(engine.service, dockerfile, repo=repo)
             ),
@@ -385,11 +392,20 @@ class PoolRelease(Construct):
         )
         engine_image = f"{repository.repository_uri}@{self.digest.get_response_field('imageDetails.0.imageDigest')}"
 
+        # The arguments of the engine's container. The model bucket's name holds the account and
+        # the region, which deployment resolves in the parameter and in the trigger.
+        stack = cdk.Stack.of(self)
+        engine_flags = (
+            vllm_command.arguments(pool, bucket=model_store.bucket_name(stack.account, stack.region))
+            if pool.engine == "vllm"
+            else []
+        )
+
         # What an instance must hold, compared by the agent.
         document: dict[str, object] = {
             "engine_image": engine_image,
             "model_revision": pool.revision,
-            "engine_flags": [],
+            "engine_flags": engine_flags,
             "files": {
                 "bucket": files.asset.s3_bucket_name,
                 "key": files.asset.s3_object_key,
@@ -440,7 +456,7 @@ class PoolRelease(Construct):
             "engine_image": engine_image,
             "image_tag": self.image.image_tag,
             "model_revision": pool.revision,
-            "engine_flags": [],
+            "engine_flags": engine_flags,
             "files_sha256": files.sha256,
             "machine_image": group.launch_template.image_id,
         }
