@@ -24,8 +24,9 @@ name each option in full and take its type and default from an attribute of a co
 - `--port 8000`: `FrontendArgs.port`;
 - `--allowed-media-domains media.invalid`: `--allowed-media-domains` in `EngineArgs.add_cli_args`,
   from `ModelConfig.allowed_media_domains` in `vllm/config/model.py`, a list of domains;
-- `--served-model-name <the pool's name>`: `--served-model-name` in `EngineArgs.add_cli_args`,
-  from `ModelConfig.served_model_name`. Left out, the served name would be the model's location;
+- `--served-model-name=<the pool's name>`: `--served-model-name` in `EngineArgs.add_cli_args`,
+  from `ModelConfig.served_model_name`, a list of names, so an option of one value or more. Left
+  out, the served name would be the model's location;
 - `--max-model-len <the pool's context length>`: `--max-model-len` in `EngineArgs.add_cli_args`,
   from `ModelConfig.max_model_len`, the context of a prompt and its output, in tokens;
 - `--max-num-seqs <the pool's target concurrency>`: `--max-num-seqs` in
@@ -118,7 +119,10 @@ pool's log group, so neither request logging option is ever passed.
 **The served name.** Students choose a pool by its name and the gateway forwards that name
 (section 4.2), so the engine serves the model under it. A pool's name holds only lower-case
 letters, digits and hyphens (`rhi_common.pool_config`): never a slash, which Claude Code refuses
-in a model's name (evidence E28).
+in a model's name (evidence E28). A name may start with a hyphen, and argparse reads an argument
+that starts with one as an option, not as a value: the name is written in the option's own
+argument, after `=`, where every name a pool may have is a value. `FlexibleArgumentParser`
+(`vllm/utils/argparse_utils.py`) passes an argument of that form on to argparse as it is.
 
 **The cache metrics.** With `--kv-cache-metrics` the engine samples how long a block of its cache
 sat idle before it was evicted, `vllm:kv_block_idle_before_evict_seconds` (section 7.2).
@@ -174,7 +178,8 @@ def arguments(pool: Pool, *, bucket: str) -> list[str]:
         *("--load-format", LOAD_FORMAT),
         *("--port", str(PORT)),
         *("--allowed-media-domains", MEDIA_DOMAIN),
-        *("--served-model-name", pool.name),
+        # In one argument: a pool's name may start with a hyphen, which alone would read as an option.
+        f"--served-model-name={pool.name}",
         *("--max-model-len", str(pool.context_length)),
         *("--max-num-seqs", str(pool.target_concurrency)),
         "--kv-cache-metrics",
