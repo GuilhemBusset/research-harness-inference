@@ -1,0 +1,108 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/messages?beta=true",
+    "headers": {
+      "host": "gateway.example.com",
+      "content-type": "application/json",
+      "user-agent": "rhi-capture-recorder",
+      "anthropic-version": "2023-06-01"
+    },
+    "body": "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":32000,\"system\":[{\"type\":\"text\",\"text\":\"You are a coding assistant. Answer briefly.\"}],\"tools\":[{\"name\":\"Read\",\"description\":\"Read a file of the working directory.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}},\"required\":[\"file_path\"]}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What does notes.pdf say?\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I will read it.\"},{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"Read\",\"input\":{\"file_path\":\"notes.pdf\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_01\",\"content\":[{\"type\":\"text\",\"text\":\"PDF file read: notes.pdf\"},{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBERi0xLjQKMSAwIG9iaiA8PCAvVHlwZSAvQ2F0YWxvZyA+PiBlbmRvYmoKJSVFT0YK\"}}]},{\"type\":\"text\",\"text\":\"Summarize it in one line.\"}]}]}"
+  },
+  "profile": {
+    "request_profile": [
+      "document_as_text"
+    ]
+  },
+  "forward": {
+    "model": "coursework",
+    "max_tokens": 32000,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a coding assistant. Answer briefly."
+      }
+    ],
+    "tools": [
+      {
+        "name": "Read",
+        "description": "Read a file of the working directory.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What does notes.pdf say?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "I will read it."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01",
+            "name": "Read",
+            "input": {
+              "file_path": "notes.pdf"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01",
+            "content": [
+              {
+                "type": "text",
+                "text": "PDF file read: notes.pdf"
+              },
+              {
+                "type": "text",
+                "text": "A document was attached here, but this endpoint cannot read documents: convert it to text first."
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "text": "Summarize it in one line."
+          }
+        ]
+      }
+    ]
+  },
+  "answer": {
+    "status": 200,
+    "headers": {
+      "content-length": "303",
+      "content-type": "application/json"
+    },
+    "body": "{\"id\":\"msg_5d1c0a7e3b9f4a2c8e6d1b07\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coursework\",\"content\":[{\"type\":\"text\",\"text\":\"The endpoint cannot read the PDF; convert it to text and I will summarize it.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":214,\"output_tokens\":21}}"
+  },
+  "usage": {
+    "input_tokens": 214,
+    "output_tokens": 21
+  }
+}
