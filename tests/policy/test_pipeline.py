@@ -76,7 +76,16 @@ Rules hold those two, and every action:
 - no role may both put events on the measurement bus, `rhi-measurements`, and read that secret: a
   job sends the reporter its numbers because it must not hold the credential (section 12). A
   statement reaches the bus when one of its actions matches `events:PutEvents` and one of its
-  resources may name the bus, in any partition, region and account, read as above.
+  resources may name the bus, in any partition, region and account, read as above;
+- no role of any template may write to the model bucket but the role of the step that copies the
+  weights, the project of a pipeline's CodeBuild action named `CopyWeights` (section 4.4): the
+  copy job verifies each file against its manifest before it writes it, so the bucket holds
+  verified files only for as long as it has that one writer. A statement writes to the bucket
+  when one of its actions matches the putting or the deleting of an object (`OBJECT_WRITES`) and
+  one of its resources may name an object of a bucket whose name starts as the model bucket's,
+  `rhi-models-`, in any partition, read as above. One value of the template is read for what it
+  is: a reference to a bucket of the role's own template stands for that bucket's name, and a
+  bucket with no name of its own, which CloudFormation names, is not the model bucket.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -115,7 +124,9 @@ REVIEWED: Reviewed = [
         [
             ("Check.Check", "Build/AWS/CodeBuild"),
             ("Check.Confirm", "Approval/AWS/Manual"),
-            # After the stage's deployment actions, which the list leaves out.
+            # Before the stage's deployment actions, which the list leaves out.
+            ("CopyWeights", "Build/AWS/CodeBuild"),
+            # After them.
             ("Verify", "Build/AWS/CodeBuild"),
         ],
     ),
@@ -248,6 +259,19 @@ WRITES_LOGS_ONLY = re.compile(
 )
 PUTS_EVENTS = ("events:PutEvents",)
 BUS_ARN = f"arn:{FIELD}:events:{FIELD}:{FIELD}:event-bus/{MEASUREMENT_BUS}"
+# The step that copies the weights, by its action's name; what the model bucket's name starts with,
+# before the account and the region (`src/rhi/pools/model_store.py`); what writes to a bucket, the
+# putting of an object, which an upload in parts is too, and the deleting of one; and every ARN of
+# an object of the model bucket, as a pattern.
+COPY_ACTION = "CopyWeights"
+MODEL_BUCKET = "rhi-models"
+OBJECT_WRITES = ("s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion")
+MODEL_OBJECT_ARN = f"arn:{FIELD}:s3:::{MODEL_BUCKET}-*"
+# A reference to a resource of the template, as `arn_text` writes one: by itself, which is a
+# bucket's name, or by its ARN.
+REFERENCE = re.compile(r"\$\{(\w+)(\.Arn)?\}")
+# What stands for the name of a bucket that has none of its own: no name matches it.
+UNNAMED = "\x01"
 PARTITION = r"arn:(aws[a-z-]*|\$\{AWS::Partition\})"
 HERE = r"\$\{AWS::Region\}:\$\{AWS::AccountId\}"
 # The pseudo parameters that fill one field of an ARN.
@@ -273,6 +297,7 @@ VERIFIES_MORE = (
 )
 SECRET_ELSEWHERE = "a role other than the reporter function's that may read the reporter's secret"
 MEASURES_AND_READS = "a role that may put events on the measurement bus and read the reporter's secret"
+WRITES_WEIGHTS = "a role other than the copy step's that may write to the model bucket"
 # The variable that names the reporter's topic to its function.
 REPORTER_TOPIC = "RHI_REPORTER_TOPIC"
 
@@ -601,6 +626,68 @@ def may(template: Mapping[str, Any], role: str, actions: tuple[str, ...], arn: s
     return statements is None or any(reaches(statement, actions, arn) for statement in statements)
 
 
+def copy_roles(template: Mapping[str, Any]) -> set[str]:
+    """The logical IDs of the roles of the projects that the CodeBuild actions named `CopyWeights`
+    run, in the pipelines of a template."""
+    held = template.get("Resources", {})
+    found = set()
+    for _, _, pipeline, _ in resources({"": template}, "AWS::CodePipeline::Pipeline"):
+        for _, actions in stages_of(pipeline):
+            for action in actions:
+                project = action.get("Configuration", {}).get("ProjectName")
+                if action["Name"] != COPY_ACTION or type_of(action) != CODEBUILD or not isinstance(project, dict):
+                    continue
+                role = held.get(project.get("Ref"), {}).get("Properties", {}).get("ServiceRole")
+                if isinstance(role, dict) and "Fn::GetAtt" in role:
+                    found.add(role["Fn::GetAtt"][0])
+    return found
+
+
+def with_its_buckets_named(text: str, template: Mapping[str, Any]) -> str:
+    """A resource of a statement, as `arn_text` writes it, with each reference to a bucket of the
+    template replaced by that bucket's name, or by its ARN for a reference to its ARN. A bucket
+    with no name of its own takes `UNNAMED`, and a name that cannot be read as text a wildcard."""
+    held = template.get("Resources", {})
+
+    def named(reference: re.Match[str]) -> str:
+        bucket = held.get(reference[1], {})
+        if bucket.get("Type") != "AWS::S3::Bucket":
+            return reference[0]
+        name = UNNAMED
+        if "BucketName" in bucket.get("Properties", {}):
+            name = arn_text(bucket["Properties"]["BucketName"]) or "*"
+        return f"arn:{FIELD}:s3:::{name}" if reference[2] else name
+
+    return REFERENCE.sub(named, text)
+
+
+def writes_weights(template: Mapping[str, Any], role: str) -> bool:
+    """Whether a role of the template may put or delete an object of the model bucket: one of its
+    allowed statements matches a write of an object on a resource that may name one of a bucket
+    whose name starts as the model bucket's. Read as `may` reads a role, but for a reference to a
+    bucket of the template, which stands for that bucket and no other."""
+    statements = statements_of(template, role, known=WRITES_LOGS_ONLY)
+    if statements is None:
+        return True
+    for statement in statements:
+        if "NotAction" in statement or "NotResource" in statement:
+            return True
+        if not any(
+            isinstance(action, str) and fnmatch.fnmatchcase(write.lower(), action.lower())
+            for action in as_list(statement.get("Action", []))
+            for write in OBJECT_WRITES
+        ):
+            continue
+        for resource in as_list(statement.get("Resource", [])):
+            text = arn_text(resource)
+            if text is None:
+                return True
+            text = PSEUDO_FIELD.sub(FIELD, with_its_buckets_named(text, template))
+            if overlaps(MODEL_OBJECT_ARN, re.sub(r"\$\{[^}]*\}", "*", text)):
+                return True
+    return False
+
+
 def reporter_roles(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
     """The functions of a template that its EventBridge rules invoke, as `(function, its role)`,
     the role None when the template does not hold it. A function two rules invoke is named once."""
@@ -921,6 +1008,12 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
                 found.append((path, role, SECRET_ELSEWHERE))
             if may(template, role, PUTS_EVENTS, BUS_ARN):
                 found.append((path, role, MEASURES_AND_READS))
+    # The model bucket, written by the role of the step that copies the weights and by no other.
+    for path, template in sorted(templates.items()):
+        copies = copy_roles(template)
+        for _, role, _, _ in resources({"": template}, "AWS::IAM::Role"):
+            if role not in copies and writes_weights(template, role):
+                found.append((path, role, WRITES_WEIGHTS))
     return found
 
 
@@ -1694,13 +1787,18 @@ def test_keeps_a_verification_with_the_narrow_role(cdk: ModuleType, tmp_path: Pa
             a_verification(("s3:DeleteObject", under(VERIFICATION_PREFIX), None)),
             id="another action under verification/",
         ),
-        pytest.param(a_verification(("s3:PutObject", every_resource, None)), id="every resource"),
         pytest.param(a_verification(managed=True), id="a managed policy the template does not hold"),
     ],
 )
 def test_refuses_a_verification_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
     assert refused(built(cdk, tmp_path / "kept", verification=True, change=a_verification())) == set()
     assert refused(built(cdk, tmp_path / "breached", verification=True, change=change)) == {VERIFIES_MORE}
+
+
+def test_refuses_a_verification_that_writes_to_every_resource(cdk: ModuleType, tmp_path: Path) -> None:
+    # Every resource holds the model bucket's objects too, which only the copy step's role may write.
+    change = a_verification(("s3:PutObject", every_resource, None))
+    assert refused(built(cdk, tmp_path, verification=True, change=change)) == {VERIFIES_MORE, WRITES_WEIGHTS}
 
 
 def a_role(
@@ -1767,3 +1865,100 @@ def test_refuses_a_reporter_that_also_puts_measurements(cdk: ModuleType, tmp_pat
 
     templates = built(cdk, tmp_path, change=a_reporter(("events:PutEvents", the_bus)))
     assert refused(templates) == {REPORTS_MORE, MEASURES_AND_READS}
+
+
+def the_models(objects: str | None = "*") -> Names:
+    """The objects of the model bucket of the deploying account and region that a pattern names,
+    the bucket by its fixed name; or, with no pattern, the bucket itself."""
+
+    def arn(_cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        bucket = f"{MODEL_BUCKET}-{stack.account}-{stack.region}"
+        resource = bucket if objects is None else f"{bucket}/{objects}"
+        return stack.format_arn(service="s3", region="", account="", resource=resource)
+
+    return arn
+
+
+def a_bucket_named_as_the_models(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+    """The objects of a bucket of the template that carries the model bucket's name, by a reference
+    to the bucket, as a grant of the stack that creates the model bucket would name them."""
+    bucket = cdk.aws_s3.Bucket(stack, "Models", bucket_name=f"{MODEL_BUCKET}-{stack.account}-{stack.region}")
+    return bucket.arn_for_objects("*")
+
+
+# The step that copies the weights, as `built` adds a step, and what its role holds of the model bucket.
+COPY: tuple[str, list[str]] = (COPY_ACTION, ["true"])
+COPIES: list[tuple[list[str], Names]] = [
+    (["s3:ListBucket"], the_models(None)),
+    (["s3:PutObject", "s3:DeleteObject"], the_models()),
+]
+
+
+def a_copy(then: Change | None = None) -> Change:
+    """Gives the role of the step `CopyWeights` of `built` what it holds of the model bucket, then
+    makes the change `then`, when there is one."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        (project,) = [
+            node
+            for node in stack.node.find_all()
+            if isinstance(node, cdk.aws_codebuild.Project) and f"/Rhi/{COPY_ACTION}" in node.node.path
+        ]
+        for actions, arn in COPIES:
+            statement = cdk.aws_iam.PolicyStatement(actions=actions, resources=[arn(cdk, stack, pipeline)])
+            project.role.add_to_principal_policy(statement)
+        if then is not None:
+            then(cdk, stack, pipeline)
+
+    return change
+
+
+def test_the_copy_step_s_role_is_the_one_held(templates: dict[str, dict[str, Any]]) -> None:
+    # The rule leaves out a role only once it finds it: the app's copy step is found, with a role
+    # that the rule reads as writing to the model bucket.
+    ((template, role),) = [(template, role) for template in templates.values() for role in copy_roles(template)]
+    assert writes_weights(template, role)
+    # And the bucket the rule guards is the app's: the one bucket of the stage whose name starts as
+    # the rule's, which a reference to it in its own template is read as naming.
+    ((held, bucket),) = [
+        (held, logical_id)
+        for _, logical_id, properties, held in resources(templates, "AWS::S3::Bucket")
+        if (arn_text(properties.get("BucketName")) or "").startswith(f"{MODEL_BUCKET}-")
+    ]
+    objects = PSEUDO_FIELD.sub(FIELD, with_its_buckets_named(f"${{{bucket}.Arn}}/*", held))
+    assert overlaps(MODEL_OBJECT_ARN, objects)
+
+
+def test_keeps_the_copy_step_as_the_model_bucket_s_one_writer(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path / "copies", step=COPY, change=a_copy())
+    ((template, role),) = [(template, role) for template in templates.values() for role in copy_roles(template)]
+    assert writes_weights(template, role)
+    assert breaches(templates) == []
+
+    # Another role may read the bucket's objects, as a GPU pool's instances do, and write to
+    # another bucket, one of its own template that CloudFormation names.
+    reads = a_role(reads=the_models(), action="s3:GetObject")
+    assert breaches(built(cdk, tmp_path / "reads", step=COPY, change=a_copy(reads))) == []
+    elsewhere = a_role(reads=another_bucket, action="s3:PutObject")
+    assert breaches(built(cdk, tmp_path / "elsewhere", step=COPY, change=a_copy(elsewhere))) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(a_role(reads=the_models(), action="s3:PutObject"), id="by the bucket's name"),
+        pytest.param(
+            a_role(reads=the_models("coursework/*"), action="s3:DeleteObject"), id="a deletion under one pool's prefix"
+        ),
+        pytest.param(a_role(reads=every_resource, action="s3:PutObject"), id="on every resource"),
+        pytest.param(a_role(reads=the_models(), action="s3:*"), id="by a wildcard action"),
+        pytest.param(
+            a_role(reads=a_bucket_named_as_the_models, action="s3:PutObject"),
+            id="by a reference to a bucket of the model bucket's name",
+        ),
+    ],
+)
+def test_refuses_another_role_that_writes_to_the_model_bucket(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
+    assert refused(built(cdk, tmp_path / "breached", step=COPY, change=a_copy(change))) == {WRITES_WEIGHTS}
+    # With no copy step, the bucket has no writer at all: the same role is refused.
+    assert refused(built(cdk, tmp_path / "alone", change=change)) == {WRITES_WEIGHTS}

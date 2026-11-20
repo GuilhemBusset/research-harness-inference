@@ -50,3 +50,17 @@ model into the model bucket follows:
   A file stored in LFS takes its size and SHA-256 from Hugging Face's listing; any other admitted
   file is downloaded at that revision and hashed. Moving a model to another revision is running
   the program again and committing the manifest it writes.
+
+The script of the step that copies the weights (`src/rhi/pipeline/weights.py`), which runs before
+the stage's deployment and is given the same import path as the scripts of the synth step:
+
+- `copy_weights.py` is the model bucket's only writer. It reads the configuration from SSM and, for
+  each GPU pool, copies the files of the manifest of the pool's model from Hugging Face, at the
+  pool's revision, to `<pool>/<revision>/` in the bucket `RHI_MODEL_BUCKET` names. A file is
+  downloaded, held to the manifest's size and SHA-256, and only then written. The job never reads
+  an object of the bucket: it lists the prefix, skips a file already there at the manifest's size,
+  and removes from that prefix what the manifest does not list. It leaves every other prefix
+  alone, another revision's among them. A pool whose model has no committed manifest, or whose
+  revision is not its manifest's, fails the job before anything is copied for any pool; a
+  configuration with no GPU pool copies nothing and passes. So moving a pool to another revision
+  or another build is a change of its configuration and a committed manifest.
