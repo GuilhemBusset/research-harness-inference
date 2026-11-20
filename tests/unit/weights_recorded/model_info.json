@@ -1,0 +1,51 @@
+{
+  "id": "Qwen/Qwen3.8-27B-FP8",
+  "sha": "c3a462cc3d38cf351f3b26cbd763469eeb74ef81",
+  "siblings": [
+    {
+      "rfilename": ".gitattributes",
+      "blobId": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+      "size": 1570
+    },
+    {
+      "rfilename": "README.md",
+      "blobId": "1e511f54d9bff1cbd905b8f4fcf7c15e0566bcec",
+      "size": 65249
+    },
+    {
+      "rfilename": "crc32.txt",
+      "blobId": "984de0688c1f1f2cab88be6c05ef6a4c64a16efb",
+      "size": 2426
+    },
+    {
+      "rfilename": "generation_config.json",
+      "blobId": "023756cfadf88e5bf69eefeee3e172f38c448d64",
+      "size": 202
+    },
+    {
+      "rfilename": "layers-0.safetensors",
+      "blobId": "2414184f64bda500ff7d0997c6a5e1a5bf69f84f",
+      "size": 383865448,
+      "lfs": {
+        "sha256": "07f700e293baeaf3cd4240c3df1a948c4403f16961ea7979e86c8d6a9f8fd466",
+        "size": 383865448,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "preprocessor_config.json",
+      "blobId": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+      "size": 390
+    },
+    {
+      "rfilename": "tokenizer.json",
+      "blobId": "9328ce9c41e80f6dd7bc2c66d8ae1fc93bf87440",
+      "size": 12809320,
+      "lfs": {
+        "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+        "size": 12809320,
+        "pointerSize": 133
+      }
+    }
+  ]
+}
