@@ -138,11 +138,11 @@ def _replay(keys: list[str], kept: tuple[bool, bool], on_rest: Callable[[], None
 @pytest.mark.parametrize(
     ("second_student_on", "kept", "verdict"),
     [
-        ("instance-a", (True, True), Verdict.PASS),
+        pytest.param("instance-a", (True, True), Verdict.PASS, id="instance-a-success"),
         # Student 2 moves to instance-b while both instances are in service.
-        ("instance-b", (True, False), Verdict.FAIL),
+        pytest.param("instance-b", (True, False), Verdict.FAIL, id="instance-b-failure"),
         # The two students swap instances: the window is the pass's, the cache tells them apart.
-        ("instance-a", (False, False), Verdict.FAIL),
+        pytest.param("instance-a", (False, False), Verdict.FAIL, id="swapped-failure"),
     ],
 )
 def test_the_first_requests_at_once_count_toward_the_verdict(
@@ -221,10 +221,12 @@ def test_a_run_passes_once_a_student_has_moved_from_the_instance_that_left(monke
     after = [{"instance-a": 2}, {"instance-a": 2}]
     pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-b": 2}, {"instance-a": 2}, *after])
     assert s8.SPIKE.verdict(_run(monkeypatch, pool).measure()) is Verdict.PASS
-    # Both students on the instance that stayed: no student moved, and the run is not measured.
-    pool = _Departing([{"instance-a": 2}, {"instance-a": 2}, {"instance-a": 2}, *after])
-    with pytest.raises(s8.NotExercised):
-        _run(monkeypatch, pool).measure()
+    # Both students on one instance before the departure, the one that stayed (neither moved) or the
+    # one that left (both moved): not one student moving while the other stays, so not measured.
+    for on in ("instance-a", "instance-b"):
+        pool = _Departing([{on: 2}, {on: 2}, {on: 2}, *after])
+        with pytest.raises(s8.NotExercised):
+            _run(monkeypatch, pool).measure()
 
 
 def test_an_instance_leaving_during_the_phase_before_the_departure_is_not_measured(
@@ -234,6 +236,13 @@ def test_an_instance_leaving_during_the_phase_before_the_departure_is_not_measur
     pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-a": 2}, {"instance-a": 2}])
     with pytest.raises(s8.Departed):
         _run(monkeypatch, pool, depart_during_phase=True).measure()
+    # Student 1 moves to instance-a as instance-b leaves at the end of the phase, which the workspace
+    # shows only when the job looks again: a departure, not a failure.
+    pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-b": 1, "instance-a": 1}, {"instance-a": 2}])
+    run = _run(monkeypatch, pool)
+    monkeypatch.setattr(s8.time, "sleep", lambda seconds: setattr(pool, "departed", True))
+    with pytest.raises(s8.Departed):
+        run.measure()
 
 
 class _Table:
