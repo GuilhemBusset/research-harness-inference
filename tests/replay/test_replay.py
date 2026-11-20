@@ -9,9 +9,12 @@ The captures some tests need beside the folder's are built here, and their keys 
 from __future__ import annotations
 
 import copy
+import importlib
 import itertools
 import json
 import runpy
+import sys
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ import harness
 import scrub
 from harness import Capture, Replayed, Settled
 from rhi_common.keys import generate_key
+from rhi_gateway import profile
 from rhi_gateway.budget import estimate_input_tokens
 from rhi_gateway.errors import WireFormat
 
@@ -64,8 +68,51 @@ BUILT_FORWARD: dict[str, Any] = {
 }
 
 
+# Two entries of a request profile, written by a test where the gateway looks its entries up: one
+# maps the reasoning effort a Messages request sends through the pool's mapping, the other turns
+# `xhigh` into `medium`. Applied in one order or the other, they give two bodies.
+ENTRY = """
+from rhi_gateway import routes
+from rhi_gateway.errors import WireFormat
+from rhi_gateway.profile import Entry
+
+
+def rewrite(body, pool, route):
+    effort = body.get("output_config", {{}}).get("effort")
+    if effort is None:
+        return body
+    return {{**body, "output_config": {{**body["output_config"], "effort": {effort}}}}}
+
+
+ENTRY = Entry(
+    name={name!r},
+    wire_formats=frozenset({{WireFormat.MESSAGES}}),
+    routes=frozenset({{routes.MESSAGES, routes.COUNT_TOKENS}}),
+    defect="https://example.com/engine/issues/1",
+    rewrite=rewrite,
+)
+"""
+ENTRIES = {
+    "map_effort": "(pool.reasoning_effort or {}).get(effort, effort)",
+    "cap_effort": "{'xhigh': 'medium'}.get(effort, effort)",
+}
+
+
 def built(**parts: Any) -> dict[str, Any]:
     return {**copy.deepcopy(BUILT), **parts}
+
+
+@pytest.fixture
+def entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """The two entries of `ENTRIES`, where the gateway finds its entries, for one test."""
+    monkeypatch.setattr(profile, "__path__", [*profile.__path__, str(tmp_path)])
+    for name, effort in ENTRIES.items():
+        (tmp_path / f"{name}.py").write_text(ENTRY.format(name=name, effort=effort), encoding="utf-8")
+    importlib.invalidate_caches()
+    yield
+    for name in ENTRIES:
+        sys.modules.pop(f"{profile.__name__}.{name}", None)
+        vars(profile).pop(name, None)
 
 
 def assert_whole(capture: Capture, replayed: Replayed) -> None:
@@ -161,9 +208,9 @@ def test_disconnects_are_charged() -> None:
     assert above and below
 
 
-def test_the_forwarded_body_is_checked() -> None:
-    def replay(forward: dict[str, Any]) -> Replayed:
-        capture = harness.parse("built", built(forward=forward))
+def test_the_forwarded_body_is_checked(entries: None) -> None:
+    def replay(forward: dict[str, Any], **parts: Any) -> Replayed:
+        capture = harness.parse("built", built(forward=forward, **parts))
         replayed = harness.replay(capture)
         assert_whole(capture, replayed)
         return replayed
@@ -181,6 +228,43 @@ def test_the_forwarded_body_is_checked() -> None:
     for field, forward in one_field_off.items():
         with pytest.raises(harness.ForwardedBodyDiffers, match=f"differs from the capture's in {field}$"):
             replay(forward)
+
+    # A capture that states a profile is replayed for a pool with it: its request sends effort
+    # `high`, which the profile maps to `xhigh`, and its stated body must say what the engine receives.
+    request = copy.deepcopy(BUILT["request"])
+    request["body"] = json.dumps({**json.loads(request["body"]), "output_config": {"effort": "high"}})
+
+    def effort(value: str) -> dict[str, Any]:
+        return {**BUILT_FORWARD, "output_config": {"effort": value}}
+
+    def stated(*names: str) -> dict[str, Any]:
+        return {"request_profile": list(names), "reasoning_effort": {"high": "xhigh"}}
+
+    replayed = replay(effort("xhigh"), request=request, profile=stated("map_effort"))
+    assert replayed.forwarded is not None
+    sent = {name: value for name, value in json.loads(replayed.forwarded).items() if name not in harness.LEFT_OUT}
+    assert sent == effort("xhigh")
+    # The body the gateway forwards with no profile is not what the engine receives with this one.
+    with pytest.raises(harness.ForwardedBodyDiffers, match="differs from the capture's in output_config$"):
+        replay(effort("high"), request=request, profile=stated("map_effort"))
+
+    # The entries run in the order the profile states them: high, xhigh, medium; or high, high, xhigh.
+    replay(effort("medium"), request=request, profile=stated("map_effort", "cap_effort"))
+    replay(effort("xhigh"), request=request, profile=stated("cap_effort", "map_effort"))
+    with pytest.raises(harness.ForwardedBodyDiffers, match="differs from the capture's in output_config$"):
+        replay(effort("medium"), request=request, profile=stated("cap_effort", "map_effort"))
+
+    # A capture that states a profile states the engine-side body too.
+    with pytest.raises(ValueError, match="states a profile and not the body"):
+        harness.parse("built", built(request=request, profile=stated("map_effort")))
+
+
+def test_captures_in_subdirectories_are_replayed(tmp_path: Path) -> None:
+    for place in ("one", "two/deeper"):
+        (tmp_path / place).mkdir(parents=True)
+        (tmp_path / place / "built.json").write_text(json.dumps(built()), encoding="utf-8")
+
+    assert [capture.name for capture in harness.folder(tmp_path)] == ["one/built", "two/deeper/built"]
 
 
 def test_the_scrubber_refuses() -> None:

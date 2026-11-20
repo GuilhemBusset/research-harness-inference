@@ -29,8 +29,17 @@ it with the body the upstream received, as JSON values, field by field. The requ
 cache salt are left out: the gateway writes them for each request and each student. Any other
 difference raises `ForwardedBodyDiffers`.
 
+**The request profile.** A capture may also state the request profile it is replayed with: the
+names of its entries, in order, and the reasoning-effort mapping, as a pool's configuration writes
+them. Every pool of its replay then has that profile, and the body filters run it as the gateway's
+entry point has them run it (`rhi_gateway.profile.build`, then `rhi_gateway.profile.rewrites`), so
+the forwarded body compared is the one the profile produced. A capture that states one states the
+body to forward too. A capture that states none is replayed with no profile.
+
 A replay returns what happened (`Replayed`); `tests/replay/test_replay.py` says what must have.
-The pools are those of `config.example.toml`. Nothing here reaches the network or AWS.
+The pools are those of `config.example.toml`. Every capture of `CAPTURES` is replayed, those of its
+subdirectories included, each named by its path under the folder. Nothing here reaches the network
+or AWS.
 """
 
 from __future__ import annotations
@@ -50,12 +59,12 @@ from starlette.types import Message, Scope
 
 import scrub
 from rhi_common.keys import generate_key, key_hash
-from rhi_common.pool_config import parse_pools
+from rhi_common.pool_config import Pool, parse_pools
 from rhi_common.students import StudentKey, utc_day
-from rhi_gateway import proxy, routes
+from rhi_gateway import profile, proxy, routes
 from rhi_gateway.app import Filter, Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import CACHE_SALT_FIELD, REQUEST_ID_FIELD, BodyFilter
+from rhi_gateway.body import CACHE_SALT_FIELD, REQUEST_ID_FIELD, BodyFilter, Rewrite
 from rhi_gateway.budget import InMemoryLedger, Reservation
 from rhi_gateway.errors import WireFormat
 from rhi_gateway.formats import messages, responses
@@ -77,6 +86,8 @@ SEED = 62
 
 # What the gateway writes for each request and each student: left out when two bodies are compared.
 LEFT_OUT = frozenset({REQUEST_ID_FIELD, CACHE_SALT_FIELD})
+# What a capture's `profile` may hold: a pool's two fields of its request profile, the first required.
+PROFILE_FIELDS = frozenset({"request_profile", "reasoning_effort"})
 # The headers that carry a key. A capture has neither: the replay presents a key of its own.
 KEY_HEADERS = frozenset({"authorization", "x-api-key"})
 
@@ -107,7 +118,7 @@ class Usage:
 
 @dataclass(frozen=True)
 class Capture:
-    """One capture, read: the request, the body to forward if given, the upstream's answer, the usage expected."""
+    """One capture, read: the request, the profile and the body to forward if given, the answer, the usage expected."""
 
     name: str
     method: str
@@ -115,6 +126,7 @@ class Capture:
     headers: Mapping[str, str]
     body: bytes
     forward: Mapping[str, Any] | None
+    profile: Mapping[str, Any] | None
     status: int
     answer_headers: Mapping[str, str]
     answer: bytes
@@ -153,8 +165,10 @@ def _text(value: object) -> bytes:
 def parse(name: str, value: object) -> Capture:
     """The capture a JSON value describes. The scrubber reads it first, and its refusal is raised."""
     scrub.check(value)
-    if not isinstance(value, dict) or not value.keys() <= {"request", "forward", "answer", "usage"}:
-        raise ValueError(f"the capture {name} is not an object of a request, a body to forward, an answer and a usage")
+    if not isinstance(value, dict) or not value.keys() <= {"request", "profile", "forward", "answer", "usage"}:
+        raise ValueError(
+            f"the capture {name} is not an object of a request, a profile, a body to forward, an answer and a usage"
+        )
     request, answer, usage = value["request"], value["answer"], value["usage"]
     headers = dict(request["headers"])
     if KEY_HEADERS & {header.lower() for header in headers}:
@@ -162,6 +176,15 @@ def parse(name: str, value: object) -> Capture:
     forward = value.get("forward")
     if forward is not None and not isinstance(forward, dict):
         raise ValueError(f"the body to forward of the capture {name} is not a JSON object")
+    stated = value.get("profile")
+    if stated is not None:
+        if not isinstance(stated, dict) or "request_profile" not in stated or not stated.keys() <= PROFILE_FIELDS:
+            raise ValueError(
+                f"the profile of the capture {name} is not an object of `request_profile`, `reasoning_effort`"
+            )
+        if forward is None:
+            raise ValueError(f"the capture {name} states a profile and not the body the engine must receive")
+        pools(stated)  # A profile no pool may have is refused here, by the pools' own parser.
     return Capture(
         name=name,
         method=request["method"],
@@ -169,6 +192,7 @@ def parse(name: str, value: object) -> Capture:
         headers=headers,
         body=_text(request["body"]),
         forward=forward,
+        profile=stated,
         status=answer["status"],
         answer_headers=dict(answer["headers"]),
         answer=_text(answer["body"]),
@@ -176,23 +200,42 @@ def parse(name: str, value: object) -> Capture:
     )
 
 
-def load(path: Path) -> Capture:
-    """The capture of one file, named after the file."""
-    return parse(path.stem, json.loads(path.read_text(encoding="utf-8")))
+def load(path: Path, name: str | None = None) -> Capture:
+    """The capture of one file, named after the file unless a name is given."""
+    return parse(name or path.stem, json.loads(path.read_text(encoding="utf-8")))
 
 
 def folder(path: Path = CAPTURES) -> list[Capture]:
-    """Every capture of a folder, in the order of the files' names."""
-    return [load(file) for file in sorted(path.glob("*.json"))]
+    """Every capture of a folder and of its subdirectories, named by its path under the folder, in that path's order."""
+    files = sorted(path.rglob("*.json"), key=lambda file: file.relative_to(path).as_posix())
+    return [load(file, file.relative_to(path).with_suffix("").as_posix()) for file in files]
 
 
-def filters() -> dict[routes.Route, Filter]:
-    """The body filter of each forwarded route, built as the gateway builds them (`rhi_gateway.main`)."""
+def pools(stated: Mapping[str, Any] | None = None) -> tuple[Pool, ...]:
+    """The pools of a replay: the example's, each with the stated request profile when one is stated."""
+    if stated is None:
+        return POOLS
+    return parse_pools({name: {**entry, **stated} for name, entry in _EXAMPLE["pools"].items()})
+
+
+def filters(stated: Mapping[str, Any] | None = None) -> dict[routes.Route, Filter]:
+    """The body filter of each forwarded route, built as the gateway builds them (`rhi_gateway.main`).
+
+    With a stated request profile, every pool has it and each filter runs it; with none, no filter
+    runs a profile.
+    """
+    replayed = pools(stated)
+    default_pool = next(pool for pool in replayed if pool.name == DEFAULT_POOL.name)
+    profiles = profile.build(replayed) if stated is not None else {}
+
+    def rewrites(route: routes.Route) -> dict[str, Rewrite]:
+        return profile.rewrites(profiles, route)
+
     return {
-        routes.MESSAGES: BodyFilter(messages.MESSAGES, POOLS, DEFAULT_POOL),
-        routes.COUNT_TOKENS: BodyFilter(messages.COUNT_TOKENS, POOLS, DEFAULT_POOL),
-        routes.CHAT_COMPLETIONS: ChatBodyFilter(POOLS, DEFAULT_POOL),
-        routes.RESPONSES: BodyFilter(responses.RESPONSES, POOLS, DEFAULT_POOL),
+        routes.MESSAGES: BodyFilter(messages.MESSAGES, replayed, default_pool, rewrites(routes.MESSAGES)),
+        routes.COUNT_TOKENS: BodyFilter(messages.COUNT_TOKENS, replayed, default_pool, rewrites(routes.COUNT_TOKENS)),
+        routes.CHAT_COMPLETIONS: ChatBodyFilter(replayed, default_pool, rewrites(routes.CHAT_COMPLETIONS)),
+        routes.RESPONSES: BodyFilter(responses.RESPONSES, replayed, default_pool, rewrites(routes.RESPONSES)),
     }
 
 
@@ -433,7 +476,7 @@ async def _replay(
     forwarding = Forwarding(
         authenticator=Authenticator(InMemoryKeyStore(student), wall_clock=lambda: float(NOW)),
         ledger=ledger,
-        filters=filters(),
+        filters=filters(capture.profile),
         proxy=proxy.Proxy(proxy.upstream_client(httpx.MockTransport(upstream)), "http://pools.example.com", secrets),
         # Every pool is ready: the request is forwarded at once, with no hold.
         holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
