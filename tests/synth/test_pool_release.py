@@ -503,9 +503,12 @@ def test_the_architecture_is_read_from_the_letters_after_the_generation(
     assert architecture(dataclasses.replace(MOCK, instance_types=(instance_type,))) == expected
 
 
-def test_each_engine_is_built_from_its_dockerfile_in_the_context_of_its_packaging(
-    app_module: ModuleType, mock: Release, tmp_path: Path
-) -> None:
+def files_of(folder: Path) -> dict[str, bytes]:
+    """Every file under a folder, by its path under it."""
+    return {path.relative_to(folder).as_posix(): path.read_bytes() for path in folder.rglob("*") if path.is_file()}
+
+
+def test_each_engine_has_a_dockerfile_and_the_mock_is_built_in_the_context_of_its_packaging(mock: Release) -> None:
     from rhi.pools.release import ENGINES
 
     # Every engine a pool may name has a Dockerfile, so every configured pool gets its image.
@@ -521,10 +524,58 @@ def test_each_engine_is_built_from_its_dockerfile_in_the_context_of_its_packagin
         "rhi_mock_engine",
     }
 
-    gpu = standalone(app_module, tmp_path, GPU)
-    context = (gpu.outdir / gpu.image["directory"]).resolve()
-    assert [path.name for path in context.iterdir()] == ["Dockerfile"]
-    assert (context / "Dockerfile").read_bytes() == (REPO / "services/engine/vllm/Dockerfile").read_bytes()
+
+def granted(template: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
+    """The effect and the actions of every statement of every policy of a template, sorted."""
+    statements = [
+        statement
+        for policy in of_type(template, "AWS::IAM::Policy").values()
+        for statement in policy["PolicyDocument"]["Statement"]
+    ]
+    return sorted((statement["Effect"], sorted(as_list(statement["Action"]))) for statement in statements)
+
+
+def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Release, tmp_path: Path) -> None:
+    from rhi.network.security import ENGINE_PORT
+    from rhi.pools import model_store, vllm_command
+
+    # A vllm pool as a configuration gives it, with the exception that trusts its model's code.
+    exception = {"gpu_hours_per_day": 16, "trust_remote_code": True, "trust_remote_code_reason": "its model needs it"}
+    entry = config.pool_entry(GPU) | exception
+    (pool,) = pool_config.parse_pools({"coursework": entry})
+    release = standalone(app_module, tmp_path, pool)
+
+    # The arguments the module builds, with the model bucket of the account and the region the
+    # stack is deployed to, in the parameter the agent reads and in what starts a refresh.
+    bucket = model_store.bucket_name(PSEUDO["AWS::AccountId"], REGION)
+    flags = vllm_command.arguments(pool, bucket=bucket)
+    assert flags[0] == f"s3://{bucket}/{model_store.pool_prefix('coursework')}{pool.revision}/"
+    assert flags[flags.index("--port") + 1] == str(ENGINE_PORT)
+    assert "--trust-remote-code" in flags
+    assert release.value["engine_flags"] == flags
+    assert agent_release.parse_current(sample(release.parameter["Value"])).release.engine_flags == tuple(flags)
+    assert json.loads(sample(release.trigger))["engine_flags"] == flags
+
+    # The image: built from the vLLM image's folder, whole, and from nothing else.
+    context = (release.outdir / release.image["directory"]).resolve()
+    assert files_of(context) == files_of(REPO / "services/engine/vllm")
+    assert {"Dockerfile", "entrypoint.sh"} <= set(files_of(context))
+
+    # The flags and the folder bring no role and no action: what the roles of this stack may do
+    # is what they may do in the mock pool's, action for action.
+    assert len(of_type(release.template, "AWS::IAM::Role")) == len(of_type(alone.template, "AWS::IAM::Role"))
+    assert granted(release.template) == granted(alone.template)
+
+    # The mock pool's release is as it was: no flag, and its image from its packaging's context.
+    assert alone.value["engine_flags"] == []
+    assert json.loads(sample(alone.trigger))["engine_flags"] == []
+    mock_context = (alone.outdir / alone.image["directory"]).resolve()
+    assert {path.name for path in mock_context.iterdir()} == {
+        "Dockerfile",
+        "requirements.txt",
+        "rhi_common",
+        "rhi_mock_engine",
+    }
 
 
 # The grants.

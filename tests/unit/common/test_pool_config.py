@@ -129,6 +129,18 @@ def test_optional_fields() -> None:
         # The pools are typed: a number is a whole number, not its text and not a boolean.
         pytest.param("coursework", {"max_instances": "2"}, "max_instances", id="number-as-text"),
         pytest.param("coursework", {"target_concurrency": True}, "target_concurrency", id="number-as-boolean"),
+        # Trusting a model repository's code is an exception a pool records with its reason.
+        pytest.param(
+            "coursework", {"trust_remote_code": True}, "trust_remote_code_reason", id="trust-without-a-reason"
+        ),
+        pytest.param(
+            "coursework",
+            {"trust_remote_code": True, "trust_remote_code_reason": ""},
+            "trust_remote_code_reason",
+            id="trust-with-an-empty-reason",
+        ),
+        pytest.param("coursework", {"trust_remote_code": "true"}, "trust_remote_code", id="trust-as-text"),
+        pytest.param("coursework", {"trust_remote_code": 1}, "trust_remote_code", id="trust-as-a-number"),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -212,6 +224,23 @@ def test_expected_values() -> None:
         refusal = refused("coursework", changed(COURSEWORK, {"expected": bad}))
         assert refusal.field == "expected"
         assert repr("expected") in str(refusal)
+
+
+def test_trusting_a_model_repositorys_code_is_off_unless_the_pool_records_its_exception() -> None:
+    # Left out, as in every entry written before the two fields: false, and no reason.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert pool.trust_remote_code is False
+        assert pool.trust_remote_code_reason is None
+
+    exception = {"trust_remote_code": True, "trust_remote_code_reason": "the model's repository holds its layers"}
+    (trusted,) = parse_pools({"coursework": changed(COURSEWORK, exception)})
+    assert trusted.trust_remote_code is True
+    assert trusted.trust_remote_code_reason == "the model's repository holds its layers"
+
+    (explicit,) = parse_pools({"coursework": changed(COURSEWORK, {"trust_remote_code": False})})
+    assert (explicit.trust_remote_code, explicit.trust_remote_code_reason) == (False, None)
+    # Without its reason the exception is refused, by the pool's name and the field: `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A
