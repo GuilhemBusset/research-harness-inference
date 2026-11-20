@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,6 +27,8 @@ if TYPE_CHECKING:
 
 REVISION = hashlib.sha1(b"a pinned commit", usedforsecurity=False).hexdigest()
 BUCKET = "rhi-models-123456789012-eu-west-3"
+# The engine's unit: the folders it mounts into the container are not the container's own.
+ENGINE_UNIT = Path(__file__).resolve().parents[3] / "services/engine/units/rhi-engine.service"
 
 VLLM = {
     "engine": "vllm",
@@ -81,6 +85,7 @@ SECTION_4_2: dict[str, object] = {
     "histogram_buckets": BUCKETS,
 }
 DRAFT_HEAD: dict[str, object] = {"draft_head_tokens": 3}
+DOWNLOAD: dict[str, object] = {"loader": "download"}
 # What a pool's serving settings may add. Left at their defaults, they add none of these.
 BY_SETTING = (
     "--kv-cache-dtype",
@@ -114,14 +119,18 @@ def values(arguments: list[str], option: str) -> list[str]:
     return following[: next((i for i, argument in enumerate(following) if argument.startswith("-")), len(following))]
 
 
+@pytest.mark.parametrize("loader", ["stream", "download"])
 @pytest.mark.parametrize(
     "changes",
     [{}, EXCEPTION, {**SECTION_4_2, **DRAFT_HEAD}],
     ids=["as-every-pool", "with-the-exception", "with-every-serving-setting"],
 )
-def test_every_vllm_pool_has_the_contracts_settings(changes: dict[str, object]) -> None:
-    arguments = vllm_command.arguments(pool(changes), bucket=BUCKET)
+def test_every_vllm_pool_has_the_contracts_settings(changes: dict[str, object], loader: str) -> None:
+    arguments = vllm_command.arguments(pool({**changes, "loader": loader}), bucket=BUCKET)
     assert all(isinstance(argument, str) and argument for argument in arguments)
+    assert values(arguments, "--port") == ["8000"]
+    assert values(arguments, "--served-model-name") == ["coursework"]
+    assert values(arguments, "--kv-cache-metrics") == []
 
     # Media only from inline data: the allow-list names one domain, which never resolves.
     assert values(arguments, "--allowed-media-domains") == ["media.invalid"]
@@ -148,6 +157,37 @@ def test_the_model_is_read_from_the_pools_prefix_at_its_revision_by_the_streamer
     assert [a.replace("other-model", "coursework") for a in other[1:]] == arguments[1:]
     # The model repository's name is Hugging Face's, which the engine never calls.
     assert not any("example/model" in argument for argument in arguments)
+
+
+def test_a_pool_without_a_loader_is_streamed() -> None:
+    plain = vllm_command.arguments(pool(), bucket=BUCKET)
+    assert vllm_command.arguments(pool({"loader": "stream"}), bucket=BUCKET) == plain
+    assert plain[:3] == [f"s3://{BUCKET}/coursework/{REVISION}/", "--load-format", "runai_streamer"]
+    assert not [argument for argument in plain if argument.startswith("--rhi-")]
+
+
+@pytest.mark.parametrize("changes", [{}, {**SECTION_4_2, **DRAFT_HEAD}, EXCEPTION], ids=["plain", "set", "trusted"])
+def test_a_pool_on_download_copies_its_model_to_a_local_folder_first(changes: dict[str, object]) -> None:
+    streamed = vllm_command.arguments(pool(changes), bucket=BUCKET)
+    downloaded = vllm_command.arguments(pool({**changes, **DOWNLOAD}), bucket=BUCKET)
+
+    # First the copy's argument, which names the model's location and the local folder, then that
+    # folder by position, as vLLM's model.
+    copy, folder, *rest = downloaded
+    assert copy == f"--rhi-fetch-model=s3://{BUCKET}/coursework/{REVISION}/,{folder}"
+    assert copy == vllm_command.fetch_argument(vllm_command.model_location(pool(), BUCKET), folder)
+    # vLLM's default loader: no load format, and nothing of the streamer.
+    assert "--load-format" not in options(downloaded)
+    assert not [argument for argument in downloaded if "runai" in argument]
+    # The rest is what a pool on the streamer has after its model and its load format.
+    assert rest == streamed[3:]
+
+    # The folder is the container's own, on the EBS volume where Docker keeps it: under none of the
+    # folders the engine's unit mounts into the container.
+    assert PurePosixPath(folder).is_absolute()
+    mounted = re.findall(r"--volume \S+?:(\S+)", ENGINE_UNIT.read_text(encoding="utf-8"))
+    assert mounted
+    assert not [inside for inside in mounted if PurePosixPath(folder).is_relative_to(inside)]
 
 
 def test_model_code_is_trusted_only_for_a_pool_that_records_its_exception() -> None:

@@ -55,6 +55,8 @@ include = [
     "services/reporter",
     "services/engine/lifecycle",
     "services/engine/mock",
+    # The vLLM image's copy program for the fallback loader: one file, in a folder that is no root.
+    "services/engine/vllm/fetch_model.py",
     "client",
     "admin",
     "dashboards",

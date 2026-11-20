@@ -116,6 +116,14 @@ retry_after_concurrency_limit_seconds = 5
 # The served context is the pool's context_length, the served model name is the pool's name, and
 # the most requests running at once is its target_concurrency: none has a field of its own.
 #
+# A pool served by vLLM may choose how its engine reads the model's weights (section 4.4), which
+# the pools here leave out.
+#   loader = "stream"                  streamed from S3 into the GPU with the Run:ai streamer.
+#                                      Left out, it is "stream".
+#   loader = "download"                the fallback: the model is copied out of S3 to the
+#                                      instance's EBS volume at every start, then vLLM loads it
+#                                      with its default loader. Spike S4 compares the two.
+#
 # A pool may give the gateway its request profile (sections 6.1 and 6.2), which no pool here does
 # yet: the gateway has no entry yet, and it does not start for a profile that names one it does not
 # have. Both fields are optional, and the values shown are examples, not defaults.
@@ -164,7 +172,7 @@ retry_after_concurrency_limit_seconds = 5
 # (evidence E15).
 #
 # Its serving settings are those of section 4.2: an 8-bit cache, prefix caching, 8,192 tokens for
-# each engine step, and the model's two parsers. Its weights load as every vllm pool's do, and it
+# each engine step, and the model's two parsers. Its weights are streamed, the default, and it
 # records no exception for model code. It has no measured start until spike S1 has one.
 [pools.coursework]
 engine = "vllm"

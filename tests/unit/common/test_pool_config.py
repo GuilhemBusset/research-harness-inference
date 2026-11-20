@@ -199,6 +199,11 @@ def test_optional_fields() -> None:
             pytest.param("coursework", {"cache_salt_scope": scope}, "cache_salt_scope", id=f"salt-scope-{scope!r}")
             for scope in ("team", "Class", "", True)
         ),
+        # The engine streams the weights or copies them to its disk first: one of the two words.
+        *(
+            pytest.param("coursework", {"loader": loader}, "loader", id=f"loader-{loader!r}")
+            for loader in ("disk", "Download", "", True)
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -400,6 +405,20 @@ def test_a_pools_cache_salt_scope_is_student_unless_it_says_class() -> None:
         # The entry the deployment writes for the gateway reads back the same.
         assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
     # Any other scope, such as `team`, is refused by the pool's name and the field: `test_refusals`.
+
+
+def test_a_vllm_pool_streams_its_weights_unless_it_asks_for_a_download() -> None:
+    # Left out, as in every entry written before the field: the streamer.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert pool.loader == "stream"
+
+    for loader in ("stream", "download"):
+        (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"loader": loader})})
+        assert pool.loader == loader
+        # The entry the deployment writes for the gateway reads back the same.
+        assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+    # Any other loader, such as `disk`, is refused by the pool's name and the field: `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A
