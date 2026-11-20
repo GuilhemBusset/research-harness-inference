@@ -23,13 +23,20 @@ alone moves it (section 5.1).
    after another, continuing the conversation its first request began, and the job reads how many
    of them each instance served. A student's first request counts among its requests of the phase
    (`with_openings`): its sent number is one more than it was given. Both instances must still be
-   in service when the phase ends; if one has left, or is leaving, the run is not measured
-   (`Departed`), since a student moved by a departure did not leave an instance that was there.
-   When a student's requests were split, the job looks again `SPLIT_RECHECK_SECONDS` later, so
-   that a departure that began during the phase and had not yet shown in the workspace makes the
-   run not measured rather than failed.
-3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance
-   (load that fits in one instance for 10 minutes, and 15 since the scale-out, section 5.1), then
+   in service when the phase ends, and the scaler's note must still ask for both; if one has left,
+   or is leaving, the run is not measured (`Departed`), since a student moved by a departure did
+   not leave an instance that was there. The phase ends `SETTLE_SECONDS` after the last request,
+   and the scaler asks Auto Scaling for fewer instances before it writes its note, so a scale-in
+   the scaler began while a student's requests were sent shows at the phase's end.
+   When a student's requests were split, the job looks again every `POLL_SECONDS` for
+   `SPLIT_RECHECK_SECONDS`, for a departure the scaler did not ask for (an instance that stopped
+   writing, or one the group replaced) and that had not yet shown in the workspace: that makes the
+   run not measured rather than failed. A scale-in the scaler asks for while it looks began after
+   the phase, when both instances were in service: the split stands, and the run goes on.
+3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance:
+   its note asks for one, and the workspace shows exactly one writing (load that fits in one
+   instance for 10 minutes, and 15 since the scale-out, section 5.1). A sample that has gone stale
+   while the scaler still asks for two is not a departure. Then
    each student sends its requests again, and every one of them must have reached the instance
    that stayed. The job prints, for each student, the instance it was on before the departure,
    whether that one stayed or left, and whether its requests after reached the remaining one.
@@ -49,9 +56,11 @@ cannot say which student each instance served. The mock's cache imitation can (s
 E2-75): an instance keeps, for each student, the input of the last request of that student it
 served, and a request it serves has as cached the input it shares with that one from its start. A
 student's second request repeats its first whole, so it has all of the first's input cached exactly
-when it reached the instance that served the first, as each answer's usage reports. Its first
-request is counted on the instance of its next one when it was; on another instance of the window
-when it was not, which splits its counts.
+when it reached the instance that served the first, as each answer's usage reports. The two first
+requests are then given to the two students in the one way that agrees with this: a student that
+kept its first's instance has its first on an instance its window reached; one that did not, when
+its window reached a single instance, has it on another. A student whose window reached two
+instances is split wherever its first was. Counts that no way agrees with are measured again.
 
 **The rebalance number.** For each new rebalance number the gateway drops about one student in ten
 of its cookies (section 5.5), which would move a student for a reason that is not the one measured.
@@ -61,8 +70,9 @@ scaler's note at the start and the end of each measured phase, and measures a ph
 changed. It does the same when a student's counts do not add up to the requests it sent, which is
 another request on the pool during the window. After `ATTEMPTS` disturbed attempts it gives up, and
 the run is not measured. The note is read with a strongly consistent read, so the reading at a
-phase's end sees a change the scaler wrote during it. Each attempt is a new conversation, so that
-an attempt's cache does not answer for the next one's.
+phase's end sees a change the scaler wrote during it. Each attempt is a new conversation, and each
+run draws its first conversation at random, so that neither an earlier attempt's cache nor that
+of an earlier run of the job, with the same canary students, answers for this one's.
 
 **The numbers** (`Number`): the zones of the two instances, and for each student and phase the
 requests it sent and the most any one instance served. A student stayed on one instance in a phase
@@ -92,6 +102,7 @@ import asyncio
 import itertools
 import math
 import os
+import secrets
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -139,8 +150,8 @@ POLL_SECONDS = 30
 SCALE_OUT_WAIT_SECONDS = 20 * 60
 LOAD_END_WAIT_SECONDS = 5 * 60
 DEPARTURE_WAIT_SECONDS = 40 * 60
-# Seconds. After a phase in which a student's requests were split, the job looks again this much
-# later whether an instance left: an instance that stopped writes no sample after `FRESH_SECONDS`,
+# Seconds. After a phase in which a student's requests were split, the job looks this long, every
+# `POLL_SECONDS`, whether an instance left: one that stopped writes no sample after `FRESH_SECONDS`,
 # and one the group replaces shows a third instance once its replacement serves.
 SPLIT_RECHECK_SECONDS = 5 * 60
 # How many times a phase is measured before a disturbed one stops the run.
@@ -265,20 +276,20 @@ def with_openings(openings: Mapping[str, int], counts: PhaseCounts, kept: Mappin
     requests, sent at once, by instance, and `kept` says for each student whether its next request
     reached the instance that served its first (`kept_opening`).
 
-    A student that kept it has its first counted on an instance its next requests reached; one that
-    did not, on another instance of the window, which splits its counts. A first the window cannot
-    place, and a first left over, which is another request on the pool, leave the counts not adding
-    up to the requests sent, so the phase is measured again."""
+    The firsts are given to the students in the first way that agrees with what each student's
+    window shows (`_agrees`). When none does, or the window of the firsts holds another request,
+    none is placed: the counts then do not add up to the requests sent, and the phase is measured
+    again."""
     left = Counter({instance: count for instance, count in openings.items() if count > 0})
     placed: dict[int, str] = {}
-    # Those that kept their first's instance first: theirs is known, another's is only "elsewhere".
-    for student in sorted(counts, key=lambda student: not kept[student]):
-        reached = counts[student].served
-        places = list(reached) if kept[student] else [instance for instance in left if instance not in reached]
-        place = next((instance for instance in places if left[instance] > 0), None)
-        if place is not None:
-            placed[student] = place
-            left[place] -= 1
+    if left.total() == len(counts):
+        for order in dict.fromkeys(itertools.permutations(left.elements())):
+            if all(
+                _agrees(place, counts[student], kept[student]) for student, place in zip(counts, order, strict=True)
+            ):
+                placed = dict(zip(counts, order, strict=True))
+                left.clear()
+                break
     result: dict[int, Counts] = {}
     for position, (student, held) in enumerate(counts.items()):
         served = Counter(held.served)
@@ -288,6 +299,14 @@ def with_openings(openings: Mapping[str, int], counts: PhaseCounts, kept: Mappin
             served.update(+left)
         result[student] = Counts(held.sent + 1, dict(served))
     return result
+
+
+def _agrees(place: str, held: Counts, kept: bool) -> bool:
+    """Whether a student's first request may have reached `place`: its next request, which is in its
+    window `held`, reached that instance when it `kept` it, and another one when it did not."""
+    if kept:
+        return place in held.served
+    return set(held.served) != {place}
 
 
 def kept_opening(opening: loadgen.Record, following: loadgen.Record) -> bool:
@@ -327,7 +346,16 @@ class NotExercised(RuntimeError):
 
 class Leaving(RuntimeError):
     """The scaler asks for fewer instances than the workspace shows: one is leaving, and the
-    workspace cannot say which."""
+    workspace cannot say which. `present` are the instances the workspace shows."""
+
+    def __init__(self, message: str, present: set[str]) -> None:
+        super().__init__(message)
+        self.present = present
+
+
+class Unseen(RuntimeError):
+    """The scaler asks for more instances than the workspace shows: one is starting, or one stopped
+    writing without the scaler asking for fewer."""
 
 
 def measure_undisturbed(
@@ -376,14 +404,18 @@ class Pool:
         }
 
     def present(self) -> set[str]:
-        """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`.
-        `Leaving` while the scaler asks for fewer: an instance being drained still writes."""
+        """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`,
+        as many as the scaler asks for. `Leaving` while it asks for fewer: an instance being drained
+        still writes. `Unseen` while it asks for more: a stale sample is not an instance the scaler
+        took away."""
         end = time.time()
         series = self._read(f'timestamp({_RUNNING}{{pool="{self.name}"}})', end - FRESH_SECONDS, end, 15)
         fresh = {one.labels["instance"] for one in series if one.samples and one.samples[-1][1] >= end - FRESH_SECONDS}
         note = self._note()
         if note is not None and note.capacity_asked < len(fresh):
-            raise Leaving(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present")
+            raise Leaving(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present", fresh)
+        if note is not None and note.capacity_asked > len(fresh):
+            raise Unseen(f"the scaler asks for {note.capacity_asked} instances and {len(fresh)} are present")
         return fresh
 
     def busy(self) -> float:
@@ -498,8 +530,10 @@ class Run:
     keys: Sequence[str]
     requests: int
     target_concurrency: int
-    # The seed of each new conversation: no two attempts send the same text.
-    _conversations: Iterator[int] = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
+    # The seed of each new conversation: no two attempts send the same text, and no two runs.
+    _conversations: Iterator[int] = field(
+        default_factory=lambda: itertools.count(secrets.randbits(48)), init=False, repr=False
+    )
 
     async def two_instances(self) -> dict[str, str]:
         """Holds the load until two instances serve, and returns them with their zones once it has ended."""
@@ -524,7 +558,7 @@ class Run:
             serving = self.pool.serving()
             try:
                 present = self.pool.present()
-            except Leaving:
+            except (Leaving, Unseen):
                 return False
             now = {instance: zone for instance, zone in serving.items() if instance in present}
             if len(now) < INSTANCES:
@@ -580,10 +614,29 @@ class Run:
         """`Departed` unless every one of `instances` is still in service, none of them leaving."""
         try:
             present = self.pool.present()
-        except Leaving as leaving:
-            raise Departed(f"an instance began to leave during the phase {phase}") from leaving
+        except (Leaving, Unseen) as changing:
+            raise Departed(f"an instance began to leave during the phase {phase}") from changing
         if not instances <= present:
             raise Departed(f"an instance left during the phase {phase}")
+
+    def _recheck(self, instances: set[str], phase: Phase) -> None:
+        """After a split in `phase`, at whose end `instances` were in service and the scaler asked
+        for them all: `Departed` if, in the next `SPLIT_RECHECK_SECONDS`, one of them stops writing,
+        or another appears, while the scaler asks for as many. A scale-in the scaler asks for in that
+        time began after the phase: the split stands."""
+        for _ in range(max(1, math.ceil(SPLIT_RECHECK_SECONDS / POLL_SECONDS))):
+            time.sleep(POLL_SECONDS)
+            try:
+                present = self.pool.present()
+            except Leaving as leaving:
+                if leaving.present != instances:
+                    raise Departed(f"an instance changed after the phase {phase}") from leaving
+                print(f"the scaler began to take an instance away after the phase {phase}: the split stands")
+                return
+            except Unseen as unseen:
+                raise Departed(f"an instance stopped writing after the phase {phase}") from unseen
+            if present != instances:
+                raise Departed(f"an instance changed after the phase {phase}")
 
     def measured(self, phase: Phase, *, first_at_once: bool, in_service: set[str]) -> PhaseCounts:
         """The phase, measured again while disturbed, with `in_service` all in service at its end."""
@@ -595,8 +648,7 @@ class Run:
                 # A split is a failure only if no instance was leaving: look again once a departure
                 # that began during the phase has had time to show in the workspace.
                 print(f"a student's requests were split in the phase {phase}: in service checked again")
-                time.sleep(SPLIT_RECHECK_SECONDS)
-                self._in_service(in_service, phase)
+                self._recheck(in_service, phase)
             return counts
 
         return measure_undisturbed(phase, measure, self.pool.rebalance_number)
@@ -612,7 +664,8 @@ class Run:
             remaining.clear()
             try:
                 remaining.update(self.pool.present())
-            except Leaving:
+            except (Leaving, Unseen):
+                # Still draining, or a sample gone stale while the scaler asks for two.
                 return False
             if not remaining:
                 raise RuntimeError("the pool went to no instance before the departure was measured")
@@ -635,7 +688,9 @@ class Run:
             )
         numbers = numbers_of(zones, {Phase.BEFORE: before, Phase.AFTER: after})
         if passes(numbers) and not exercised(before, remaining):
-            raise NotExercised("both students were on one instance before the departure: not one moved while one stayed")
+            raise NotExercised(
+                "both students were on one instance before the departure: not one moved while one stayed"
+            )
         return numbers
 
 
