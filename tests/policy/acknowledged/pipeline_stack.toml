@@ -27,6 +27,26 @@
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
 #   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
 #   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
+#
+# What the role of the step that copies the weights (`src/rhi/pipeline/weights.py`) may do, held
+# the same way: that module creates no resource, so the step's project and role are this file's
+# too. `tests/synth/test_weights_job.py` holds the role to it, and `tests/policy/test_pipeline.py`
+# holds every other role to writing nothing to the model bucket.
+#
+# - s3:ListBucket on the model bucket, by its fixed name, rhi-models-<account>-<region>: the job
+#   learns what a pool's prefix at a revision holds by listing it, since it may read no object.
+# - s3:PutObject on the objects of the model bucket: the files of each GPU pool's manifest, each
+#   verified before it is written, under <pool>/<revision>/. The action also covers an upload made
+#   in parts.
+# - s3:DeleteObject on the objects of the model bucket: the job removes from a pool's prefix at
+#   its revision what the manifest no longer lists.
+# - ssm:GetParametersByPath on the parameters under /rhi/config: the configuration, which names
+#   each GPU pool, its model and its pinned revision.
+# - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
+#   CDK Pipelines' grant to a project that takes an input, here the source the job runs from.
+# - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
+#   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
+#   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
 
 [nag]
 "AwsSolutions-S1" = "The pipeline's artifact bucket keeps no server access logs: only the pipeline's own roles reach it, CloudTrail records who changes it, and a bucket of access logs would add storage and its cost that nothing in the design reads."
@@ -40,12 +60,15 @@
 "AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/*]" = "The pipeline's roles read and write the artifacts of every execution, whose object keys are only known when the execution runs, in the pipeline's own artifact bucket."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineBuildSynthCdkBuildProjectEDF0E7B6>:*]" = "The synth project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineBuildSynthCdkBuildProjectEDF0E7B6>-*]" = "The synth project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/config/*]" = "The synth step reads the configuration by its path, every parameter under the configuration prefix, whose keys the configuration loader adds to, and no other parameter."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/config/*]" = "The synth step and the step that copies the weights each read the configuration by its path, every parameter under the configuration prefix, whose keys the configuration loader adds to, and no other parameter."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineRhiVerifyB6860032>:*]" = "The verification project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineRhiVerifyB6860032>-*]" = "The verification project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
 "AwsSolutions-IAM5[Resource::<CodePipelineArtifactsBucketF1E925CF.Arn>/verification/*]" = "The verification step writes, under the prefix verification/ of the pipeline's own artifact bucket and nowhere else, an object whose key holds the execution's ID, which is only known when the execution runs."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The verification step queries the workspace of the stage it verifies, whose ID is only chosen when the stage is first deployed, after this stack; the statement's condition admits only a workspace tagged with that stage's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesHeartbeats613D6AB3-*]" = "The verification step queries the heartbeats table of the stage it verifies, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineRhiCopyWeights2FCF9F70>:*]" = "The project that copies the weights writes to the streams of its own log group, whose names CodeBuild chooses for each build."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineRhiCopyWeights2FCF9F70>-*]" = "The project that copies the weights writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:s3:::rhi-models-<AWS::AccountId>-<AWS::Region>/*]" = "The step that copies the weights writes each GPU pool's files under the pool's name and its revision, which only the configuration in SSM gives, and removes what a manifest no longer lists; it is the one writer of the model bucket, and may read none of its objects."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<PipelineUpdatePipelineSelfMutationDAA41400>:*]" = "The self-update project writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<PipelineUpdatePipelineSelfMutationDAA41400>-*]" = "The self-update project writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<PipelinePipelinesSecurityCheckCDKSecurityCheck1D09275A>:*]" = "The project that checks for widened permissions writes to the streams of its own log group, whose names CodeBuild chooses for each build."

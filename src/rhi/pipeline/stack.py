@@ -1,7 +1,7 @@
 """The pipeline stack: CDK Pipelines on CodePipeline V2, in queued execution, from `main` (system
 design, section 8.2).
 
-The only thing that deploys the endpoint is this pipeline (requirement R6). It has five steps:
+The only thing that deploys the endpoint is this pipeline (requirement R6). It has six steps:
 
 - its source is this repository, on `main`, through a CodeConnections connection the stack
   creates. The connection starts pending until the owner authorizes it once (section 8.6).
@@ -12,6 +12,10 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
 - the stage, `EndpointStage`, whose deployment waits for the approval CDK Pipelines asks for
   when a change widens permissions. That approval is a tripwire for honest mistakes. It does not
   cover this stack, which updates earlier in the same run (section 8.4, control 6).
+- the copy of the weights of `rhi.pipeline.weights`, after that approval and before the stage's
+  deployment: each GPU pool's model, at its pinned revision, copied into the model bucket, so that
+  a release finds its weights when its instances start. A copy that fails fails the execution
+  before anything is deployed.
 - the verification of `rhi.pipeline.verify`, after the stage's deployment: the smoke tests against
   the deployed endpoint, with the canary's key. A failed test fails the execution. In its
   post-build phase the step writes its marks to this pipeline's artifact bucket, under
@@ -58,6 +62,7 @@ from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
 from rhi.pipeline.synth import synth_step
 from rhi.pipeline.verify import verify_step
+from rhi.pipeline.weights import copy_weights_step
 from rhi.stage import PERMISSIONS_BOUNDARY
 
 if TYPE_CHECKING:
@@ -138,7 +143,11 @@ class PipelineStack(cdk.Stack):
         # takes from the stage, as text, what names the stage's heartbeats table to its role: this
         # stack, another assembly, holds no reference to a resource of the stage.
         verify = verify_step(self, source, stage=stage, artifacts=underlying.artifact_bucket)
-        self.pipeline.add_stage(stage, pre=[check], post=[verify])
+        # Before any deployment action of the stage, and after the approval: the weights of a
+        # release that will be deployed, in the model bucket before an instance asks for them.
+        copy_weights = copy_weights_step(self, source)
+        copy_weights.add_step_dependency(check)
+        self.pipeline.add_stage(stage, pre=[check, copy_weights], post=[verify])
         self.pipeline.build_pipeline()
         self._builds_images_for_both_platforms()
 
