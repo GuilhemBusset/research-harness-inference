@@ -32,8 +32,9 @@ declares no entry, or a declaration that does not hold to the rules above raises
 which names the pool and the entry: the gateway does not start, where it would otherwise have
 failed a student's request.
 
-Nothing here reads configuration, the environment or the network. This package holds no entry
-yet: each is written with the capture that covers it.
+Nothing here reads configuration, the environment or the network. Each entry is written with the
+capture that covers it. The package holds one: `reasoning_effort`, which maps the effort a request
+sets through the pool's mapping.
 """
 
 from __future__ import annotations
