@@ -327,9 +327,11 @@ def test_the_image_is_built_from_its_build_context_with_hashes_checked(monkeypat
     [install] = [words for words in instructions(text, "RUN") if "install" in words]
     assert {"--require-hashes", "--no-deps"} <= set(install)
     assert install[install.index("--requirement") + 1] == "requirements.txt"
-    # Python is process 1, so SIGTERM reaches it.
-    [command] = arguments(text, "CMD")
-    assert json.loads(command)[:3] == ["python", "-m", "rhi_mock_engine.app"]
+    # Python is process 1, so SIGTERM reaches it. An entry point and no command: the container's
+    # arguments are added to the mock's command instead of replacing it.
+    [command] = arguments(text, "ENTRYPOINT")
+    assert json.loads(command) == ["python", "-m", "rhi_mock_engine.app"]
+    assert arguments(text, "CMD") == []
 
     # The packaging module imports the CDK, whose jsii refuses a package cache below a directory
     # another user owns, as in the implement loop's sandbox; without the cache it needs none.

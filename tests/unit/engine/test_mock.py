@@ -396,6 +396,27 @@ def test_health_answers_503_before_the_start_delay_and_200_after() -> None:
     assert engine.get("/health").status_code == 200
 
 
+def test_the_start_delay_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    served: list[Any] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: served.append(app))
+    # The application's clock, moved by the test: nothing waits.
+    now = 100.0
+    monkeypatch.setattr(mock, "create_app", lambda settings: create_app(settings, clock=lambda: now))
+    monkeypatch.setenv("RHI_POOL_SECRET", SECRET)
+    # The argument wins over the environment's start delay.
+    monkeypatch.setenv("RHI_MOCK_START_SECONDS", "30")
+
+    mock.main(["--start-delay-seconds", "2"])
+
+    [app] = served
+    engine = Engine(app)
+    assert engine.get("/health").status_code == 503
+    now = 101.9
+    assert engine.get("/health").status_code == 503
+    now = 102.0
+    assert engine.get("/health").status_code == 200
+
+
 def test_the_settings_come_from_the_environment() -> None:
     assert Settings.from_env({"RHI_POOL_SECRET": SECRET}) == Settings(secret=SECRET)
     environ = {

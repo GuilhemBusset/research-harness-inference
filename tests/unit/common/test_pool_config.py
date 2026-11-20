@@ -204,6 +204,11 @@ def test_optional_fields() -> None:
             pytest.param("coursework", {"loader": loader}, "loader", id=f"loader-{loader!r}")
             for loader in ("disk", "Download", "", True)
         ),
+        # Only a mock pool may give a start delay, even at 0.
+        *(
+            pytest.param("coursework", {"start_delay_seconds": delay}, "start_delay_seconds", id=f"vllm-delay-{delay}")
+            for delay in (400, 0)
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -419,6 +424,26 @@ def test_a_vllm_pool_streams_its_weights_unless_it_asks_for_a_download() -> None
         # The entry the deployment writes for the gateway reads back the same.
         assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
     # Any other loader, such as `disk`, is refused by the pool's name and the field: `test_refusals`.
+
+
+def test_a_mock_pools_start_delay_is_0_unless_it_gives_one() -> None:
+    # Left out, as in every entry written before the field: the mock is ready at once.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert pool.start_delay_seconds == 0
+
+    for delay in (0, 400):
+        (pool,) = parse_pools({"mock": changed(MOCK, {"start_delay_seconds": delay})})
+        assert pool.start_delay_seconds == delay
+        # The entry the deployment writes reads back the same.
+        assert parse_pools({"mock": pool_entry(pool)}) == (pool,)
+
+    # A negative value, or one that is not a whole number, is refused by the pool's name and the
+    # field; so is the field on a vllm pool (`test_refusals`).
+    for delay in (-1, 400.0, "400", True):
+        refusal = refused("mock", changed(MOCK, {"start_delay_seconds": delay}))
+        assert refusal.field == "start_delay_seconds"
+        assert repr("start_delay_seconds") in str(refusal)
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A

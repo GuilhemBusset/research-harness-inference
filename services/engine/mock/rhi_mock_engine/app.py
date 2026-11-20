@@ -73,6 +73,12 @@ label of an information metric whose value is 1, named in the mock's row beside 
 The lifecycle agent reads it there. The route answers only a client on a loopback address, where
 the node's collector scrapes it; any other gets the 404 of a route that does not exist.
 
+**The argument.** `main` takes one optional argument, `--start-delay-seconds <seconds>`, which a
+pool's release gives the engine's container when the pool sets a start delay
+(`rhi_common.pool_config`). Given, it replaces `RHI_MOCK_START_SECONDS`; every other setting still
+comes from the environment. The image adds the container's arguments to the mock's command, so a
+container started with none runs the mock as the environment says.
+
 **Shutdown.** `main` serves the application on port 8000 through `serve`. On SIGTERM the server
 accepts nothing new, lets every request already accepted run to its end, with no deadline that
 would cut a stream short, and then exits.
@@ -80,13 +86,16 @@ would cut a stream short, and then exits.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import ipaddress
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
@@ -780,10 +789,33 @@ def serve(settings: Settings, **where: Any) -> None:
     uvicorn.run(create_app(settings), **where, timeout_graceful_shutdown=None)
 
 
-def main() -> None:
-    """Serve the mock on port 8000. With no secret in the environment it raises before anything listens."""
-    serve(Settings.from_env(os.environ), host="0.0.0.0", port=PORT)
+START_DELAY_ARGUMENT = "--start-delay-seconds"
+
+
+def _arguments(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="rhi_mock_engine.app", description="The mock engine.")
+    parser.add_argument(
+        START_DELAY_ARGUMENT,
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"time after start during which /health answers 503; replaces {START_VARIABLE}",
+    )
+    return parser.parse_args(list(argv))
+
+
+def main(argv: Sequence[str] = ()) -> None:
+    """Serve the mock on port 8000. With no secret in the environment it raises before anything listens.
+
+    `argv` is the process's arguments after the command: `--start-delay-seconds` replaces the start
+    delay of the environment.
+    """
+    arguments = _arguments(argv)
+    settings = Settings.from_env(os.environ)
+    if arguments.start_delay_seconds is not None:
+        settings = dataclasses.replace(settings, start_seconds=arguments.start_delay_seconds)
+    serve(settings, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

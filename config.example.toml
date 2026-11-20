@@ -229,3 +229,7 @@ warm_instances = 1
 target_concurrency = 8
 context_length = 262144
 largest_output = 32000
+# start_delay_seconds: whole seconds after the mock starts during which its health route answers
+# 503, so that the gateway holds requests that long (spike S2, section 12). Only a mock pool may
+# give it. Left unset here: the default is 0, the mock ready at once.
+# start_delay_seconds = 420
