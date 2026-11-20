@@ -51,13 +51,14 @@ requests, each sent once the one before has completed, from while the scaler sti
 instances until the job has seen the first departure over. One canary student sends them, one at a
 time, below the load that keeps an instance in service. The job sees a departure over only
 `QUIET_SECONDS` after the instance stopped, so the streams across the scale-in are told afterwards,
-from the departure as measured (`across_scale_in`): those in flight while the instance left, whose
-inference began, its first event from the engine (`INFERENCE_EVENT`) arrived, by the time the
-instance had stopped, and whose stream ended after the scaler asked for fewer. A stream that only
-overlaps the wait for the stop to show is not one of them. The number is 1 when there is one and
-every one completed, 0 when one did not. When none was in flight while the instance left, or no
-stop was seen, no stream spanned the scale-in: the next cycle holds one again, and a run in which
-none did is not measured.
+from the departure as measured (`across_scale_in`). A stream spanned the scale-in when it was in
+flight across one of its events, the scaler asking for fewer or the instance having stopped: its
+inference began, its first event from the engine (`INFERENCE_EVENT`) arrived, by the event, and its
+stream ended after. Streams that began and ended between the two events did not span either. A
+stream that only overlaps the wait for the stop to show is not one of them. The number is 1 when
+one spanned an event and every stream in flight while the instance left completed, 0 when one of
+those did not. When none spanned an event, or no stop was seen, the next cycle holds one again,
+and a run in which none did is not measured.
 
 **When the gateway was deployed** (`rollout_under`). The gateway's collector writes the series `up`
 of its scrape, job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task
@@ -68,12 +69,15 @@ the old tasks under the stream when one of the tasks writing as the stream opene
 (silent for `QUIET_SECONDS`), by the time the stream ended, while a task new to the job had begun by
 then and still wrote when the old one stopped. The stream must also be on one of the old tasks:
 when a new task had already written as the stream opened (`replacement_at_open`), the stream may be
-on it, and no rollout replaced the task under it. A task takes requests only once the load balancer
-has seen it healthy, after its collector's first scrape, so a task that first wrote after the
-stream opened did not take it. The service starts its new tasks first and then stops the old ones
+on it, and no rollout replaced the task under it. A task that first wrote after the stream opened
+may still have taken it, its collector, which is not essential, having started late: that is told
+from the old tasks once the stream ended (below). The service starts its new tasks first and then stops the old ones
 (`min_healthy_percent` 100, `max_healthy_percent` 200) once the new ones are healthy: the one
 under the stream drains, kept running by the stream for up to the target group's
-deregistration delay, while another one stops. The stream's number is measured (`across_rollout`)
+deregistration delay, while another one stops. A completed stream was on a task being replaced
+only when, beside the stopped one, a task the job began with still ran as it ended (`held_under`):
+had it been on a replacement, which may serve before its collector first writes, nothing would
+have kept an old task running. The stream's number is measured (`across_rollout`)
 only when that was seen: 1 when it completed, 0 when it did not. A stream cut short is given
 `QUIET_SECONDS` and two scrapes after the cut for its task's stop to show. Otherwise the job saw no
 deployment under the stream, and the run is not measured.
@@ -212,6 +216,9 @@ NOTE_SECOND = 1
 # Seconds after a stream across the gateway deployment was cut during which the job looks for the
 # stop of the task that held it.
 CUT_WATCH_SECONDS = QUIET_SECONDS + 2 * SCRAPE_SECONDS
+# Seconds after a stream across the gateway deployment completed during which the job looks for
+# whether an old task still ran as it ended (`held_under`): a write that late, or the task's stop.
+HELD_WATCH_SECONDS = QUIET_SECONDS + 2 * SCRAPE_SECONDS
 GATEWAY_JOB = "gateway"
 # Seconds a wake may take beyond the pool's hold before it counts as lost.
 WAKE_MARGIN_SECONDS = 120
@@ -379,10 +386,13 @@ class Streamed:
 
 
 def across_scale_in(streams: Sequence[Streamed], departure: Departure | None) -> bool | None:
-    """The stream across a scale-in, from the streams of the relay and the departure it spanned. The
-    streams across it are those in flight while the instance left, from the scaler asking for fewer
-    to the instance having stopped: began by its stop and ended after the ask. True when there is one
-    and all completed, False when one did not, `None` when there is none, or no stop was seen.
+    """The stream across a scale-in, from the streams of the relay and the departure it spanned. A
+    stream spanned it when it was in flight across one of its two events, the scaler asking for
+    fewer (`asked_at`) or the instance having stopped (`stopped_at`): its inference began by the
+    event and its stream ended after. False when a stream in flight while the instance left, begun
+    by its stop and ended after the ask, did not complete; otherwise True when one spanned an event,
+    and `None` when none did, the streams having begun and ended between the events, or when no
+    stop was seen.
 
     A departure that does not say when it began (`asked_at`) is bounded by when it was seen over:
     the stream across it is the one whose inference began before then and ended after, every one
@@ -392,7 +402,12 @@ def across_scale_in(streams: Sequence[Streamed], departure: Departure | None) ->
             return None
         asked_at, stopped_at = departure.asked_at, departure.stopped_at
         during = [stream for stream in streams if stream.began <= stopped_at and stream.ended >= asked_at]
-        return all(stream.answer.completed for stream in during) if during else None
+        if not all(stream.answer.completed for stream in during):
+            return False
+        spanning = [
+            stream for stream in during if any(stream.began <= event <= stream.ended for event in (asked_at, stopped_at))
+        ]
+        return True if spanning else None
     for stream in streams:
         if not stream.answer.completed:
             return False
@@ -429,10 +444,8 @@ def rollout_at(before: set[str], tasks: Mapping[str, tuple[float, float]]) -> fl
 
 def replacement_at_open(before: set[str], tasks: Mapping[str, tuple[float, float]], began: float) -> bool:
     """Whether a gateway task not in `before` may have been running as a stream opened at `began`:
-    it had first written by then, and had written within a scrape before. A task takes requests
-    only once the load balancer has seen it healthy, which takes longer than its collector's first
-    scrape: one that first wrote after the stream opened was not serving when it did, so the stream
-    is on a task of `before`."""
+    it had first written by then, and had written within a scrape before. One that first wrote
+    after may still have been serving, its collector having started late: `held_under` tells that."""
     return any(
         first <= began and last + SCRAPE_SECONDS >= began for task, (first, last) in tasks.items() if task not in before
     )
@@ -460,9 +473,28 @@ def rollout_under(
     return None
 
 
+def held_under(
+    before: set[str], tasks: Mapping[str, tuple[float, float]], stop: float, ended: float, now: float
+) -> bool | None:
+    """Whether the stream that ended at `ended` was on a task the rollout replaced, as the tasks'
+    first and last writes show at `now`, the rollout having stopped a task of `before` at `stop`
+    (`rollout_under`). A task under an open stream drains, kept running by it for up to the target
+    group's deregistration delay, longer than the stream is held: so the stream was on one when a
+    task of `before`, another than the stopped one, still ran as the stream ended, having written
+    within a scrape of its end. When every other task of `before` had stopped by then, the stream
+    was on none of them, but on a replacement, which may have served before its collector first
+    wrote: False. `None` while one has neither written that late nor been silent `QUIET_SECONDS`."""
+    others = [last for task, (_, last) in tasks.items() if task in before and last > stop]
+    if any(last >= ended - SCRAPE_SECONDS for last in others):
+        return True
+    if all(last <= now - QUIET_SECONDS for last in others):
+        return False
+    return None
+
+
 def across_rollout(completed: bool, spanned: bool, rolled_out_at: float | None) -> bool:
     """The stream across a gateway deployment, as a number: completed after the rollout replaced a
-    task under it (`spanned`, `rollout_under` as the stream ended), or cut while the rollout
+    task under it (`spanned`, `rollout_under` as the stream ended and `held_under`), or cut while the rollout
     replaced one (`rolled_out_at`, `rollout_under` once the cut had time to show). ValueError
     otherwise: no deployment was seen under the stream, and the run is not measured."""
     if completed and spanned:
@@ -716,11 +748,14 @@ class Run:
         # the job was still reading them, was replaced before the stream and is no rollout under it.
         opened: list[float] = []
 
+        async def read() -> tuple[float, Mapping[str, tuple[float, float]]]:
+            now = time.time()
+            return now, await asyncio.to_thread(tasks, read_at - FRESH_SECONDS, now)
+
         async def rollout(ended: float | None = None) -> float | None:
             if not opened:
                 return None
-            now = time.time()
-            current = await asyncio.to_thread(tasks, read_at - FRESH_SECONDS, now)
+            now, current = await read()
             return rollout_under(before, current, opened[0], now if ended is None else ended, now)
 
         async def rolled_out() -> bool:
@@ -740,7 +775,17 @@ class Run:
         )
         ended = time.time()
         rolled_out_at = await rollout(ended)
-        spanned = rolled_out_at is not None
+        held: bool | None = None
+        if completed and rolled_out_at is not None:
+            # Whether the stream was on a task the rollout replaced: that task ran until it ended.
+            deadline = time.monotonic() + HELD_WATCH_SECONDS
+            while True:
+                now, current = await read()
+                held = held_under(before, current, rolled_out_at, ended, now)
+                if held is not None or time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(POLL_SECONDS)
+        spanned = held is True
         while rolled_out_at is None and not completed and time.time() < ended + CUT_WATCH_SECONDS:
             # Cut short: the stop of the task that held it shows once it has been silent long enough.
             await asyncio.sleep(POLL_SECONDS)
