@@ -271,3 +271,115 @@ def test_the_pool_reads_the_scaler_s_last_write() -> None:
     # The scaler asks for one instance while two still write: one is leaving.
     with pytest.raises(s8.Leaving):
         s8.Pool("mock", _Workspace(), _Table(1, 5)).present()  # ty: ignore[invalid-argument-type] - a test double
+
+
+def test_a_student_that_moves_and_returns_keeps_its_split() -> None:
+    # Student 1 stays on instance-a; student 2 opens on instance-b, misses its cache on instance-a,
+    # and goes back to instance-b: its first is the one left, on instance-b.
+    window = {1: Counts(2, {"instance-a": 2}), 2: Counts(2, {"instance-a": 1, "instance-b": 1})}
+    counts = s8.with_openings({"instance-a": 1, "instance-b": 1}, window, {1: True, 2: False})
+    assert counts[2] == Counts(3, {"instance-a": 1, "instance-b": 2})
+    assert all(held.adds_up() for held in counts.values())
+    assert s8.SPIKE.verdict(s8.numbers_of(2, {Phase.BEFORE: counts, Phase.AFTER: REMAINED})) is Verdict.FAIL
+
+
+def test_each_run_talks_in_conversations_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same canary students in a later run: an instance's cache of the earlier run's
+    # conversation cannot be taken for this run's first request.
+    bodies: list[bytes] = []
+
+    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int) -> list:
+        firsts = [session for session in load.sessions if isinstance(session, s8.Opening)]
+        bodies.extend(next(session.requests())[1].body for session in firsts)
+        return _answered(load)
+
+    monkeypatch.setattr(s8.loadgen, "replay", replay)
+    monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
+    keys = [generate_key(), generate_key()]
+    for _ in range(2):
+        pool = _Pool([{"instance-a": 2}, {"instance-a": 1}, {"instance-a": 1}])
+        run = s8.Run(pool, "https://gateway.example.com", keys, 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+        s8.asyncio.run(run.phase(first_at_once=True))
+    assert len(bodies) == 4
+    assert bodies[0] != bodies[2]
+
+
+class _Clock:
+    """The time of the job, which moves only as it sleeps."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _Scaling:
+    """A workspace and a pool-state table over instance-a and instance-b: instance-b writes until
+    `stops_writing`, and the scaler asks for one instance from `scales_in`."""
+
+    def __init__(self, clock: _Clock, *, stops_writing: float, scales_in: float) -> None:
+        self.clock, self.stops_writing, self.scales_in = clock, stops_writing, scales_in
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        latest = {"instance-a": end, "instance-b": min(end, self.stops_writing)}
+        return [common.Series({"instance": one}, ((end, at),)) for one, at in latest.items()]
+
+    def get_item(self, *, Key: dict, ConsistentRead: bool = False) -> dict:
+        asked = 1 if self.clock.now >= self.scales_in else 2
+        return {"Item": ScalerNote(Key["pool"], asked, None, int(self.clock.now)).to_item()}
+
+
+def _scaling_run(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock, scaling: _Scaling, before: s8.PhaseCounts, after: list[float]
+) -> s8.Run:
+    """A run on the real pool reader, whose phases give `before` and then each student on instance-a;
+    it records in `after` the time each later phase began."""
+
+    async def two_instances(self: s8.Run) -> dict[str, str]:
+        return {"instance-a": "zone-1", "instance-b": "zone-2"}
+
+    async def phase(self: s8.Run, *, first_at_once: bool) -> s8.PhaseCounts:
+        if first_at_once:
+            return before
+        after.append(clock.now)
+        return {student: Counts(2, {"instance-a": 2}) for student in s8.STUDENTS}
+
+    async def wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
+        while not condition():
+            clock.sleep(s8.POLL_SECONDS)
+
+    monkeypatch.setattr(s8.time, "time", lambda: clock.now)
+    monkeypatch.setattr(s8.time, "sleep", clock.sleep)
+    monkeypatch.setattr(s8.Run, "two_instances", two_instances)
+    monkeypatch.setattr(s8.Run, "phase", phase)
+    monkeypatch.setattr(s8, "_wait", wait)
+    pool = s8.Pool("mock", scaling, scaling)  # ty: ignore[invalid-argument-type] - a test double
+    return s8.Run(pool, "https://gateway.example.com", [generate_key(), generate_key()], 2, 8)
+
+
+def test_a_stale_sample_is_not_the_departure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Instance-b stops writing at 1000 while the scaler asks for two until 2000: the phase after
+    # the departure waits for the scaler.
+    clock, after = _Clock(1000), []
+    scaling = _Scaling(clock, stops_writing=1000, scales_in=2000)
+    stuck = {1: Counts(3, {"instance-a": 3}), 2: Counts(3, {"instance-b": 3})}
+    numbers = _scaling_run(monkeypatch, clock, scaling, stuck, after).measure()
+    assert after and after[0] >= 2000
+    assert s8.SPIKE.verdict(numbers) is Verdict.PASS
+
+
+def test_a_scale_in_after_the_phase_keeps_its_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Student 1 was split while both instances were in service; the scaler asks for one instance a
+    # minute after the phase ended.
+    clock, after = _Clock(1000), []
+    scaling = _Scaling(clock, stops_writing=1059, scales_in=1060)
+    split = {1: Counts(3, {"instance-a": 1, "instance-b": 2}), 2: Counts(3, {"instance-a": 3})}
+    numbers = _scaling_run(monkeypatch, clock, scaling, split, after).measure()
+    assert after and after[0] >= 1060
+    assert s8.SPIKE.verdict(numbers) is Verdict.FAIL
+    # Instance-b stopping writing while the scaler still asks for both: a departure, not a failure.
+    clock = _Clock(1000)
+    scaling = _Scaling(clock, stops_writing=1000, scales_in=2000)
+    with pytest.raises(s8.Departed):
+        _scaling_run(monkeypatch, clock, scaling, split, []).measure()
