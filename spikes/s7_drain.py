@@ -175,6 +175,8 @@ CYCLES = 2
 # timeout is far longer.
 TRICKLE_SECONDS = 5
 PADDING = b" "
+# The longest the stream across a scale-in is held: the first departure's longest watch.
+SCALE_IN_HOLD_SECONDS = SCALE_IN_WAIT_SECONDS + LEAVE_WAIT_SECONDS + 3 * QUIET_SECONDS
 # Seconds. The scaler's note keeps its run's time in whole seconds, its gauges in milliseconds: the
 # readings of the run that wrote a note are stamped within this second after its `written_at`.
 NOTE_SECOND = 1
@@ -323,6 +325,12 @@ def numbers_of(
 # A gateway deployment.
 
 
+def rollout_at(before: set[str], tasks: Mapping[str, tuple[float, float]]) -> float | None:
+    """When the first gateway task not in `before` first wrote, from each task's first and last
+    write: `None` when none did. A task appearing is not yet a rollout (`rollout_under`)."""
+    return min((first for task, (first, _) in tasks.items() if task not in before), default=None)
+
+
 def rollout_under(
     before: set[str], tasks: Mapping[str, tuple[float, float]], began: float, ended: float, now: float
 ) -> float | None:
@@ -330,24 +338,27 @@ def rollout_under(
     the tasks' first and last writes show at `now`: the last write of the first task of `before`,
     the tasks writing as it opened, that stopped, having written since `began`, been silent for
     `QUIET_SECONDS` and stopped by `ended` and one scrape, while a task not in `before` had begun by
-    `ended` and still wrote when it stopped. `None` when none did: a task that appeared while those
-    of `before` went on writing is no rollout."""
+    `ended` (`rollout_at`) and still wrote when it stopped. `None` when none did: a task that
+    appeared while those of `before` went on writing is no rollout."""
     latest = min(ended + SCRAPE_SECONDS, now - QUIET_SECONDS)
     stops = sorted(last for task, (_, last) in tasks.items() if task in before and began < last <= latest)
-    newcomers = [(first, last) for task, (first, last) in tasks.items() if task not in before]
-    return next(
-        (stop for stop in stops if any(first <= ended and last >= stop for first, last in newcomers)),
-        None,
-    )
+    for stop in stops:
+        successor = rollout_at(before, {task: span for task, span in tasks.items() if span[1] >= stop})
+        if successor is not None and successor <= ended:
+            return stop
+    return None
 
 
-def across_rollout(completed: bool, rolled_out_at: float | None) -> bool:
-    """The stream across a gateway deployment, as a number: whether it completed, once a rollout
-    was seen under it (`rollout_under`). ValueError otherwise: no deployment was seen under the
-    stream, and the run is not measured."""
-    if rolled_out_at is None:
-        raise ValueError("no gateway deployment was seen while the stream was held")
-    return completed
+def across_rollout(completed: bool, spanned: bool, rolled_out_at: float | None) -> bool:
+    """The stream across a gateway deployment, as a number: completed after the rollout replaced a
+    task under it (`spanned`, `rollout_under` as the stream ended), or cut while the rollout
+    replaced one (`rolled_out_at`, `rollout_under` once the cut had time to show). ValueError
+    otherwise: no deployment was seen under the stream, and the run is not measured."""
+    if completed and spanned:
+        return True
+    if not completed and rolled_out_at is not None:
+        return False
+    raise ValueError("no gateway deployment was seen while the stream was held")
 
 
 # The pool, as the workspace and the pool-state table show it.
@@ -559,12 +570,13 @@ class Run:
         )
         ended = time.time()
         rolled_out_at = await rollout(ended)
+        spanned = rolled_out_at is not None
         while rolled_out_at is None and not completed and time.time() < ended + CUT_WATCH_SECONDS:
             # Cut short: the stop of the task that held it shows once it has been silent long enough.
             await asyncio.sleep(POLL_SECONDS)
             rolled_out_at = await rollout(ended)
         try:
-            survived = across_rollout(completed, rolled_out_at)
+            survived = across_rollout(completed, spanned, rolled_out_at)
         except ValueError:
             message = "no gateway deployment was seen under the stream: release the pipeline while it is held"
             raise RuntimeError(message) from None
@@ -648,7 +660,9 @@ class Run:
     async def relay(self, over: Callable[[], bool]) -> bool:
         """The stream across a scale-in: whole streamed requests, each sent once the one before has
         completed, until `over` says the scale-in is, after one has been answered. Whether every one
-        completed; it stops at the first that did not."""
+        completed; it stops at the first that did not. RuntimeError when the scale-in is not over
+        after `SCALE_IN_HOLD_SECONDS`."""
+        deadline = time.monotonic() + SCALE_IN_HOLD_SECONDS
         sent = 0
         while True:
             request = _request(self.pool.name)
@@ -663,6 +677,8 @@ class Run:
             if over():
                 print(f"{sent} stream(s) across the scale-in, one after another, all completed")
                 return True
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"the scale-in was not over after {SCALE_IN_HOLD_SECONDS} s")
 
     async def cycle(self, *, scale_in_stream: bool) -> bool | None:
         """Two instances, then both departures. With `scale_in_stream`, the stream across a scale-in
