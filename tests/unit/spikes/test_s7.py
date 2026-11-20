@@ -243,3 +243,73 @@ def test_a_gateway_deployment_counts_only_when_seen_under_the_stream() -> None:
     run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=engine)  # ty: ignore[invalid-argument-type] - a double
     with pytest.raises(RuntimeError, match="no gateway deployment"):
         asyncio.run(run.across_deployment())
+
+
+def test_a_task_that_appears_while_the_old_ones_keep_writing_is_no_rollout() -> None:
+    began, ended, now = 1000.0, 1500.0, 1700.0
+    transient = {"task-a": (900.0, 1690.0), "task-b": (1100.0, 1200.0)}
+    assert s7.rollout_under({"task-a"}, transient, began, ended, now) is None
+    replaced = {"task-a": (900.0, 1200.0), "task-b": (1100.0, 1690.0)}
+    assert s7.rollout_under({"task-a"}, replaced, began, ended, now) == 1200.0
+    # The new task had stopped before the old one did: nothing took its place.
+    gone_first = {"task-a": (900.0, 1300.0), "task-b": (1100.0, 1200.0)}
+    assert s7.rollout_under({"task-a"}, gone_first, began, ended, now) is None
+
+
+def test_the_warm_baseline_is_the_reading_the_scaler_decided_on() -> None:
+    # The scaler writes the readings it decided on just after its note's whole second.
+    already_warm = [(940.0, 0.0), (1000.4, 1.0), (1060.0, 1.0)]
+    assert s7.warm_around(already_warm, 1000.0) == (1, 1)
+    assert s7.path_of(*s7.warm_around(already_warm, 1000.0) or (0, 0), newcomer=False) is s7.Path.TERMINATED
+    went_warm = [(940.0, 0.0), (1000.4, 0.0), (1060.2, 1.0)]
+    assert s7.warm_around(went_warm, 1000.0) == (0, 1)
+
+
+def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    key, happened = generate_key(), []
+    engine = create_app(Settings(secret=key))
+
+    async def scenario() -> bool | None:
+        answering, departed = asyncio.Event(), asyncio.Event()
+
+        async def recorded(scope: Any, receive: Any, send: Any) -> None:
+            async def sent(message: Any) -> None:
+                if message["type"] == "http.response.start":
+                    happened.append("answering")
+                    answering.set()
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    # The closing event goes only once the instance has left.
+                    await asyncio.wait_for(departed.wait(), 5)
+                    await send(message)
+                    happened.append("answered")
+                    return
+                await send(message)
+
+            await engine(scope, receive, sent)
+
+        async def nothing() -> None:
+            pass
+
+        async def departure(asked: int, wait: float, after: Any = None) -> s7.Departure:
+            if after is not None:
+                await after
+                return s7.Departure(s7.Path.WARM_POOL, 60.0, "instance-b")
+            try:
+                await asyncio.wait_for(answering.wait(), 1)
+            except TimeoutError:
+                pass
+            happened.append("scale-in")
+            departed.set()
+            return s7.Departure(s7.Path.TERMINATED, 60.0, "instance-a")
+
+        transport = httpx.ASGITransport(app=recorded)
+        pool: Any = SimpleNamespace(name="mock")
+        settings: Any = SimpleNamespace(idle_minutes=0)
+        run = s7.Run(pool, "http://gateway", [key], settings, 1, 60, transport=transport)
+        monkeypatch.setattr(run, "two_instances", nothing)
+        monkeypatch.setattr(run, "departure", departure)
+        return await run.cycle(scale_in_stream=True)
+
+    assert asyncio.run(scenario()) is True
+    # A request was being answered when the instance left, and its answer ended after.
+    assert happened[:3] == ["answering", "scale-in", "answered"]
