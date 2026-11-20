@@ -33,9 +33,10 @@ which names the pool and the entry: the gateway does not start, where it would o
 failed a student's request.
 
 Nothing here reads configuration, the environment or the network. Each entry is written with the
-capture that covers it. The package holds two: `reasoning_effort`, which maps the effort a request
-sets through the pool's mapping, and `system_in_place`, which sends a system message placed
-mid-conversation as a user message in its place.
+capture that covers it. The package holds three: `reasoning_effort`, which maps the effort a
+request sets through the pool's mapping, `system_in_place`, which sends a system message placed
+mid-conversation as a user message in its place, and `document_as_text`, which replaces a document
+block by a sentence saying that the endpoint cannot read it.
 """
 
 from __future__ import annotations
