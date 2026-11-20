@@ -64,3 +64,34 @@ the stage's deployment and is given the same import path as the scripts of the s
   revision is not its manifest's, fails the job before anything is copied for any pool; a
   configuration with no GPU pool copies nothing and passes. So moving a pool to another revision
   or another build is a change of its configuration and a committed manifest.
+
+The script of the image promotion job (`src/rhi/pipeline/image_promotion.py`), a CodeBuild project
+beside the pipeline, `rhi-promote-image`, which the owner starts by hand and nothing else starts:
+
+- `promote_image.py` promotes a GPU pool's machine image after a canary start on it passes
+  (system design, section 4.3). It finds the pool's group by its tag `rhi-pool`, and refuses the
+  pool, before it starts anything, when the candidate's release notes do not list the family of
+  each of the group's instance types, or when the candidate is not an available image. It then
+  starts one instance outside the group, from the group's launch template with the candidate in
+  place of the template's image, in one of the group's subnets, tagged `rhi-pool`,
+  `rhi-release-parameter` and `rhi-promotion=canary`, and reads its serial console for the line
+  of its lifecycle agent. It terminates the canary whatever the line says. Only after
+  `rhi-canary served ...` does it write the candidate's ID to `/rhi/images/<pool>`, and only after
+  that write does it start an execution of the pipeline that `RHI_PROMOTE_PIPELINE` names. Any
+  other end writes nothing and exits non-zero with a cause of its enumeration `Cause`. It never
+  changes a group's capacity.
+
+The owner starts a promotion with the pool, the candidate's ID and the families its release notes
+list, comma-separated (AWS's base GPU image with the open-source NVIDIA driver on Ubuntu 22.04,
+evidence E10):
+
+    aws codebuild start-build --project-name rhi-promote-image --environment-variables-override '[
+        {"name": "RHI_PROMOTE_POOL", "value": "coursework"},
+        {"name": "RHI_PROMOTE_IMAGE", "value": "ami-<candidate>"},
+        {"name": "RHI_PROMOTE_FAMILIES", "value": "G6e,G7e,P5,P5e,P5en,P6"}]'
+
+The build succeeds once the canary served, the parameter holds the candidate and the pipeline's
+execution has started; the deployment that execution makes refreshes the pool, after which the
+pool's warm instances run the new image (`aws ec2 describe-instances` on the instances tagged
+`rhi-pool=coursework` shows its ID). The pool's first image is written by hand before the pool
+enters the configuration: the job serves every later one.
