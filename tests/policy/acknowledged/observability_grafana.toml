@@ -30,15 +30,16 @@
 # cdk-nag's finding for a log group's ARN holds the log group's name, so each pool brings a finding
 # of its own, and no file of the repository names the pools of a deployed configuration. The entry
 # whose key holds `<pool>` lists that finding for each pool of the configuration, and for no other
-# name (`src/rhi/nag.py`). The example's pool, mock, keeps its own entry as well, with the same
-# reason: `tests/policy/test_nag_acknowledgements.py` holds the example's templates to the ids as
-# cdk-nag writes them.
+# name (`src/rhi/nag.py`). The example's pools, coursework and mock, keep their own entries as
+# well, with the same reason: `tests/policy/test_nag_acknowledgements.py` holds the example's
+# templates to the ids as cdk-nag writes them.
 
 [nag]
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants GetMetricData, ListMetrics and GetQueryResults, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds those actions alone."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/gateway:*]" = "Grafana queries the gateway's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/scaler:*]" = "Grafana queries the scaler's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/issuer:*]" = "Grafana queries the issuer's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/coursework:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/mock:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/<pool>:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-ECS2" = "The task definition gives Grafana the workspace's query address, the region and the domain as environment variables, which is how the image's settings and data sources read them, and none holds a secret: both data sources sign their requests with the task's role."
