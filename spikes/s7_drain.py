@@ -46,14 +46,19 @@ answer, forwarded to the pool then, comes from a task the deployment is draining
 **The stream across a scale-in** (`Run.relay`) is held on the pool, whose instance the scale-in
 removes: inference must be in flight there when it happens. It is a relay of whole streamed
 requests, each sent once the one before has completed, from while the scaler still asks for two
-instances until the first departure is over, so that at every moment of the scale-in one has been
-forwarded and is being answered, and the last is answered after the instance has stopped. One
-canary student sends them, one at a time, below the load that keeps an instance in service. The
-number is 1 when every one completed.
+instances until the job has seen the first departure over. One canary student sends them, one at a
+time, below the load that keeps an instance in service. The stream that spanned the scale-in is the
+one whose inference had begun, its first event from the engine (`INFERENCE_EVENT`) arrived, before
+the departure was seen over, and whose stream ended after. The number is 1 when it and every one
+before completed, 0 at the first that did not. When the departure was seen over between two
+requests, no stream spanned it: the next cycle holds one again, and a run in which none did is not
+measured.
 
 **When the gateway was deployed** (`rollout_under`). The gateway's collector writes the series `up`
 of its scrape, job `gateway`, labelled with the task's ID, every `SCRAPE_SECONDS` while the task
-runs. A task appearing is not a deployment: a deployment replaces tasks. The rollout has reached
+runs. A task appearing is not a deployment: a deployment replaces tasks. The job reads the tasks
+writing just before it opens the stream, and the stream is timed from when it opened, its first part
+sent. The rollout has reached
 the old tasks under the stream when one of the tasks writing as the stream opened has stopped since
 (silent for `QUIET_SECONDS`), by the time the stream ended, while a task new to the job had begun by
 then and still wrote when the old one stopped. The stream's number is measured (`across_rollout`)
@@ -80,10 +85,12 @@ the scaler wrote it (`Pool.warm_counts`), which counts an instance going back to
 its first wait state. The path is told only from the reading the decision was made on and one at or
 after the instance stopped (`warm_around`). The scaler reads the pool, decides, acts, then writes
 its readings, as they were before it acted, stamped in milliseconds within the second its note's
-`written_at` gives in whole seconds: the reading the decision was made on is the last one before
-`NOTE_SECOND` after the note. With them, the warm count rose and no instance new to
-the pool wrote, so the instance went back to the warm pool; the warm count did not rise, so it was
-terminated. Without them, or with a rise while a new instance wrote (a fresh instance launched into
+`written_at` gives in whole seconds: the reading the decision was made on is that run's
+(`decided_on`). When its push was lost, an earlier run's reading stands for it only if it read zero:
+a warm instance read then may have left the warm pool before the decision and the departing one
+refilled its place, which no later reading tells from no change. With them, the warm count rose and
+no instance new to the pool, none writing when that reading was made, wrote, so the instance went
+back to the warm pool; the warm count did not rise, so it was terminated. Without them, or with a rise while a new instance wrote (a fresh instance launched into
 the warm pool in place of a terminated one), that departure has no path, and is not a number. A
 run whose departures did not take both paths takes the pool to two instances again, up to `CYCLES`
 times, and is not measured when a path is still missing. A path seen twice keeps its longer time.
@@ -192,6 +199,9 @@ RECOVERIES = 3
 STREAMS_PER_STUDENT = DEFAULT_CONCURRENCY_LIMIT - 1
 START_TOKENS = 200
 CLOSING_EVENT = "message_stop"
+# The engine's first event of a Messages stream: the gateway writes none of its own, so its arrival
+# says the request's inference has begun on the pool.
+INFERENCE_EVENT = "message_start"
 ERROR_EVENT = "error"
 
 
@@ -279,20 +289,32 @@ def path_of(warm_before: int, warm_after: int, newcomer: bool) -> Path | None:
     return None if newcomer else Path.WARM_POOL
 
 
+def decided_on(samples: Sequence[tuple[float, float]], at: float) -> tuple[float, int] | None:
+    """The warm count the scaler decided on in its run of `at`, a note's `written_at`, and when it
+    was read. It is that run's own reading, stamped within `NOTE_SECOND` of `at`. When that run's
+    reading was not written, the last one before stands for it only if it read zero: a warm
+    instance read then may have left the warm pool before the decision and the departing one
+    taken its place, but an empty warm pool has none to lose. `None` otherwise."""
+    own = [(moment, value) for moment, value in samples if at <= moment < at + NOTE_SECOND]
+    if own:
+        return own[-1][0], round(own[-1][1])
+    earlier = [(moment, value) for moment, value in samples if moment < at]
+    if earlier and round(earlier[-1][1]) == 0:
+        return earlier[-1][0], 0
+    return None
+
+
 def warm_around(
     samples: Sequence[tuple[float, float]], at: float, through: float | None = None
 ) -> tuple[int, int] | None:
-    """The warm count the scaler decided on in its run of `at`, a note's `written_at`, and the
-    highest it read after that run. The first is the last reading before `NOTE_SECOND` after `at`:
-    that run's own, stamped in that second, or the run's before when that one was not written.
-    `None` when there is no such reading, or, `through` given, none is at or after `through`: the
-    count was not observed across the departure."""
-    run_ended = at + NOTE_SECOND
-    before = [value for moment, value in samples if moment < run_ended]
-    if not before or (through is not None and not any(moment >= through for moment, _ in samples)):
+    """The warm count the scaler decided on in its run of `at` (`decided_on`), and the highest it
+    read after that run. `None` when there is no such decision reading, or, `through` given, no
+    reading is at or after `through`: the count was not observed across the departure."""
+    decided = decided_on(samples, at)
+    if decided is None or (through is not None and not any(moment >= through for moment, _ in samples)):
         return None
-    first = round(before[-1])
-    return first, max([first, *(round(value) for moment, value in samples if moment >= run_ended)])
+    first = decided[1]
+    return first, max([first, *(round(value) for moment, value in samples if moment >= at + NOTE_SECOND)])
 
 
 @dataclass(frozen=True)
@@ -429,6 +451,50 @@ def _request(model: str) -> loadgen.Request:
     return next(session.requests())[1]
 
 
+@dataclass(frozen=True)
+class Answer:
+    """How a streamed request ended: whether it completed and, when a condition was watched,
+    whether it held as the request's inference began (its first event, `INFERENCE_EVENT`, arrived;
+    `None` when none did) and as its stream ended."""
+
+    completed: bool
+    over_as_begun: bool | None = None
+    over_as_ended: bool | None = None
+
+
+async def _answer(
+    endpoint: str,
+    key: str,
+    request: loadgen.Request,
+    content: bytes | AsyncIterator[bytes],
+    transport: httpx.AsyncBaseTransport | None,
+    over: Callable[[], bool] | None = None,
+) -> Answer:
+    """Sends `request` with `content` as its body, as the student whose key is given: whether it
+    completed, answered 200, with its closing event and no error event, and, `over` given, whether
+    it held as its inference began and as its stream ended (`Answer`). Raises httpx's errors."""
+    headers = {name: value for name, value in request.headers.items() if name.lower() != "content-length"}
+    headers["authorization"] = f"Bearer {key}"
+    reader, closed, failed = SseReader(), False, False
+    as_begun: bool | None = None
+    as_ended: bool | None = None
+    async with (
+        httpx.AsyncClient(base_url=endpoint, timeout=loadgen.TIMEOUT, transport=transport, trust_env=False) as http,
+        http.stream(request.method, request.path, headers=headers, content=content) as answer,
+    ):
+        if answer.status_code != HTTPStatus.OK:
+            return Answer(completed=False)
+        async for chunk in answer.aiter_bytes():
+            for event in reader.feed(chunk):
+                if over is not None and as_begun is None and event.name == INFERENCE_EVENT:
+                    as_begun = over()
+                closed = closed or event.name == CLOSING_EVENT
+                failed = failed or event.name == ERROR_EVENT
+        # Read as the stream's end arrives, before the connection is let go.
+        as_ended = None if over is None else over()
+    return Answer(closed and not failed, as_begun, as_ended)
+
+
 async def _completes(
     endpoint: str,
     key: str,
@@ -437,22 +503,8 @@ async def _completes(
     transport: httpx.AsyncBaseTransport | None,
 ) -> bool:
     """Sends `request` with `content` as its body, as the student whose key is given, and says
-    whether it completed: answered 200, with its closing event and no error event. Raises httpx's
-    errors."""
-    headers = {name: value for name, value in request.headers.items() if name.lower() != "content-length"}
-    headers["authorization"] = f"Bearer {key}"
-    reader, closed, failed = SseReader(), False, False
-    async with (
-        httpx.AsyncClient(base_url=endpoint, timeout=loadgen.TIMEOUT, transport=transport, trust_env=False) as http,
-        http.stream(request.method, request.path, headers=headers, content=content) as answer,
-    ):
-        if answer.status_code != HTTPStatus.OK:
-            return False
-        async for chunk in answer.aiter_bytes():
-            for event in reader.feed(chunk):
-                closed = closed or event.name == CLOSING_EVENT
-                failed = failed or event.name == ERROR_EVENT
-    return closed and not failed
+    whether it completed (`_answer`). Raises httpx's errors."""
+    return (await _answer(endpoint, key, request, content, transport)).completed
 
 
 async def slow_stream(
@@ -462,12 +514,14 @@ async def slow_stream(
     seconds: float,
     *,
     until: Callable[[], Awaitable[bool]] | None = None,
+    opened: Callable[[], None] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> bool:
     """Sends `request` as a held stream: its body but the last byte, then a byte of padding every
     `TRICKLE_SECONDS` for `seconds`, or until `until` says that the event the stream spans is over,
-    then the last byte. Says whether it completed (`_completes`)."""
+    then the last byte. `opened` is called once the stream is open, its first part sent. Says
+    whether it completed (`_completes`)."""
     body = request.body
     if not body.endswith(b"}"):
         raise ValueError("a held stream's body is a JSON object")
@@ -475,6 +529,8 @@ async def slow_stream(
 
     async def held() -> AsyncIterator[bytes]:
         yield body[:-1]
+        if opened is not None:
+            opened()
         for _ in range(steps):
             if until is not None and await until():
                 break
@@ -544,20 +600,25 @@ class Run:
         """Holds a stream across a gateway deployment (`across_rollout`): whether it completed. The
         rollout is told from the gateway's tasks, which `Pool.gateway_tasks` reads (`rollout_under`)."""
         tasks = self.pool.gateway_tasks
-        began = time.time()
-        start = time.strftime("%H:%M:%S UTC", time.gmtime(began))
-        before = set(await asyncio.to_thread(tasks, began - FRESH_SECONDS, began))
+        read_at = time.time()
+        before = set(await asyncio.to_thread(tasks, read_at - FRESH_SECONDS, read_at))
         if not before:
-            raise RuntimeError("no gateway task was writing when the stream was opened")
+            raise RuntimeError("no gateway task was writing before the stream was opened")
+        # When the stream opened, its first part sent: a task of `before` that stopped earlier, while
+        # the job was still reading them, was replaced before the stream and is no rollout under it.
+        opened: list[float] = []
 
         async def rollout(ended: float | None = None) -> float | None:
+            if not opened:
+                return None
             now = time.time()
-            current = await asyncio.to_thread(tasks, began - FRESH_SECONDS, now)
-            return rollout_under(before, current, began, now if ended is None else ended, now)
+            current = await asyncio.to_thread(tasks, read_at - FRESH_SECONDS, now)
+            return rollout_under(before, current, opened[0], now if ended is None else ended, now)
 
         async def rolled_out() -> bool:
             return await rollout() is not None
 
+        start = time.strftime("%H:%M:%S UTC", time.gmtime())
         print(f"holding a stream for up to {self.deployment_hold_seconds:.0f} s from {start}: release the pipeline")
         request = _request(self.pool.name)
         completed = await slow_stream(
@@ -566,6 +627,7 @@ class Run:
             request,
             self.deployment_hold_seconds,
             until=rolled_out,
+            opened=lambda: opened.append(time.time()),
             transport=self.transport,
         )
         ended = time.time()
@@ -648,42 +710,51 @@ class Run:
         instance = min(gone, key=gone.__getitem__)
         seconds = leave_seconds(asked_at, gone[instance])
         since = await asyncio.to_thread(self.pool.writes, asked_at, now)
-        warm = warm_around(
-            await asyncio.to_thread(self.pool.warm_counts, asked_at - FRESH_SECONDS, now),
-            asked_at,
-            gone[instance] + SCRAPE_SECONDS,
-        )
-        path = None if warm is None else path_of(*warm, newcomer=bool(set(since) - set(before)))
+        samples = await asyncio.to_thread(self.pool.warm_counts, asked_at - FRESH_SECONDS, now)
+        warm = warm_around(samples, asked_at, gone[instance] + SCRAPE_SECONDS)
+        # An instance new to the pool is one that began writing after the reading the path is told
+        # from, which may be an earlier run's (`decided_on`).
+        decided = decided_on(samples, asked_at)
+        read_at = asked_at if decided is None else min(decided[0], asked_at)
+        known = before if read_at >= asked_at else await asyncio.to_thread(self.pool.writes, asked_at - FRESH_SECONDS, read_at)
+        newcomer = bool((set(since) | set(before)) - set(known))
+        path = None if warm is None else path_of(*warm, newcomer=newcomer)
         print(f"an instance left in {seconds:.0f} s, path {path or 'not told'}, warm {warm or 'not read'}")
         return Departure(path, seconds, instance)
 
-    async def relay(self, over: Callable[[], bool]) -> bool:
+    async def relay(self, over: Callable[[], bool]) -> bool | None:
         """The stream across a scale-in: whole streamed requests, each sent once the one before has
-        completed, until `over` says the scale-in is, after one has been answered. Whether every one
-        completed; it stops at the first that did not. RuntimeError when the scale-in is not over
-        after `SCALE_IN_HOLD_SECONDS`."""
+        completed, until `over` says the scale-in is. True when one request's inference had begun
+        before it was over and its stream ended after, every one before having completed; False at
+        the first that did not complete; `None` when the scale-in was over while no request's
+        inference was in flight, between two of them: no stream spanned it, and it is not measured.
+        RuntimeError when the scale-in is not over after `SCALE_IN_HOLD_SECONDS`."""
         deadline = time.monotonic() + SCALE_IN_HOLD_SECONDS
         sent = 0
-        while True:
+        while not over():
             request = _request(self.pool.name)
             try:
-                completed = await _completes(self.endpoint, self.student, request, request.body, self.transport)
+                answer = await _answer(self.endpoint, self.student, request, request.body, self.transport, over)
             except httpx.HTTPError:
-                completed = False
+                answer = Answer(completed=False)
             sent += 1
-            if not completed:
+            if not answer.completed:
                 print(f"stream {sent} across the scale-in did not complete")
                 return False
-            if over():
-                print(f"{sent} stream(s) across the scale-in, one after another, all completed")
-                return True
+            if answer.over_as_ended:
+                if answer.over_as_begun is False:
+                    print(f"stream {sent} was answered across the end of the scale-in, and all {sent} completed")
+                    return True
+                break
             if time.monotonic() > deadline:
                 raise RuntimeError(f"the scale-in was not over after {SCALE_IN_HOLD_SECONDS} s")
+        print("the scale-in was over between two streams: the stream across it is not measured")
+        return None
 
     async def cycle(self, *, scale_in_stream: bool) -> bool | None:
         """Two instances, then both departures. With `scale_in_stream`, the stream across a scale-in
         (`relay`) runs from while the scaler asks for two until the first departure is over: whether
-        it completed."""
+        it completed, `None` when no stream spanned the scale-in or none was held."""
         await self.two_instances()
         # Both departures are watched from now, while the scaler still asks for two: each sees the
         # first note that asks for fewer.
@@ -727,12 +798,16 @@ class Run:
 
     async def measure(self) -> dict[str, int | float]:
         deployment = await self.across_deployment()
-        scale_in = await self.cycle(scale_in_stream=True)
-        print(f"the stream across the scale-in {'completed' if scale_in else 'did not complete'}")
-        for _ in range(CYCLES - 1):
-            if {departure.path for departure in self.departures} >= set(Path):
+        # A cycle again while a path is missing, or no stream spanned a scale-in.
+        scale_in: bool | None = None
+        for _ in range(CYCLES):
+            held = await self.cycle(scale_in_stream=scale_in is None)
+            scale_in = held if scale_in is None else scale_in
+            if scale_in is not None and {departure.path for departure in self.departures} >= set(Path):
                 break
-            await self.cycle(scale_in_stream=False)
+        if scale_in is None:
+            raise RuntimeError(f"no stream spanned a scale-in in {CYCLES} cycles: the run is not measured")
+        print(f"the stream across the scale-in {'completed' if scale_in else 'did not complete'}")
         streams = {
             Number.STREAM_COMPLETED_SCALE_IN: bool(scale_in),
             Number.STREAM_COMPLETED_GATEWAY_DEPLOYMENT: deployment,
