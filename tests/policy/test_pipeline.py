@@ -1724,6 +1724,11 @@ def test_keeps_a_verification_with_the_narrow_role(cdk: ModuleType, tmp_path: Pa
     assert breaches(templates) == []
 
 
+# A verification that may write to every resource: the model bucket's objects are among them, and
+# only the copy step's role may write those, so this one is refused under that rule as well.
+ON_EVERY_RESOURCE = a_verification(("s3:PutObject", every_resource, None))
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -1787,12 +1792,14 @@ def test_keeps_a_verification_with_the_narrow_role(cdk: ModuleType, tmp_path: Pa
             a_verification(("s3:DeleteObject", under(VERIFICATION_PREFIX), None)),
             id="another action under verification/",
         ),
+        pytest.param(ON_EVERY_RESOURCE, id="every resource"),
         pytest.param(a_verification(managed=True), id="a managed policy the template does not hold"),
     ],
 )
 def test_refuses_a_verification_that_may_do_more(cdk: ModuleType, tmp_path: Path, change: Change) -> None:
     assert refused(built(cdk, tmp_path / "kept", verification=True, change=a_verification())) == set()
-    assert refused(built(cdk, tmp_path / "breached", verification=True, change=change)) == {VERIFIES_MORE}
+    also = {WRITES_WEIGHTS} if change is ON_EVERY_RESOURCE else set()
+    assert refused(built(cdk, tmp_path / "breached", verification=True, change=change)) == {VERIFIES_MORE} | also
 
 
 def test_refuses_a_verification_that_writes_to_every_resource(cdk: ModuleType, tmp_path: Path) -> None:
