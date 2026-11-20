@@ -480,7 +480,8 @@ def test_a_gateway_deployment_counts_only_when_it_replaced_a_task_after_the_stre
     def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
         if end == 1000.0:
             clock[0] += query_seconds
-        found = {"task-a": (900.0, min(end, old_last))}
+        # task-c, the old task the stream is on, runs until the stream has ended.
+        found = {"task-a": (900.0, min(end, old_last)), "task-c": (900.0, end)}
         if end >= new_first:
             found["task-b"] = (new_first, end)
         return found
@@ -625,3 +626,53 @@ def test_a_gauge_older_than_the_scaler_s_note_is_not_its_last_reading(monkeypatc
     clock[0], note[0] = 1065.0, _note(0, 1060)
     pool = s7.Pool("mock", _Workspace([(940.3, 0.0), (1000.3, 1.0), (1060.3, 0.0)]), table)  # ty: ignore[invalid-argument-type] - a double
     assert pool.gauge(s7.INSTANCES_IN_SERVICE) == 0
+
+
+def test_completed_requests_between_the_ask_and_the_stop_do_not_span_the_scale_in() -> None:
+    gone = s7.Departure(s7.Path.TERMINATED, 60.0, "node-a", asked_at=1000.0, stopped_at=1060.0)
+
+    def stream(began: float, ended: float) -> s7.Streamed:
+        return s7.Streamed(began, ended, s7.Answer(completed=True, begun_at=began))
+
+    assert s7.across_scale_in([stream(1010.0, 1010.4), stream(1020.0, 1020.4)], gone) is None
+    assert s7.across_scale_in([stream(1010.0, 1010.4), stream(1059.8, 1060.3)], gone) is True
+
+
+def test_a_completed_stream_was_on_a_replaced_task_only_if_an_old_one_ran_until_it_ended() -> None:
+    before, stop, ended = {"task-a", "task-c"}, 1200.0, 1400.0
+    # task-a stopped; task-c, which the stream kept running, wrote within a scrape of its end.
+    assert s7.held_under(before, {"task-a": (900.0, 1200.0), "task-c": (900.0, 1395.0)}, stop, ended, 1400.0)
+    # Every old task had stopped well before: the stream was on a replacement.
+    on_new = {"task-a": (900.0, 1200.0), "task-c": (900.0, 1210.0), "task-b": (1030.0, 1400.0)}
+    assert s7.held_under(before, on_new, stop, ended, 1400.0) is False
+    # task-c last showed 1350: it may still write, or stop.
+    assert s7.held_under(before, {"task-a": (900.0, 1200.0), "task-c": (900.0, 1350.0)}, stop, ended, 1400.0) is None
+
+
+def test_a_stream_on_a_replacement_already_serving_does_not_prove_survival(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+
+    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
+        if end == 1000.0:
+            clock[0] = 1020.0
+        found = {"old-task": (900.0, min(end, 1200.0))}
+        if end >= 1030.0:
+            found["new-task"] = (1030.0, end)  # its collector first wrote after it took the stream
+        return found
+
+    async def gateway(scope: Any, receive: Any, send: Any) -> None:
+        async def read() -> Any:
+            message = await receive()
+            if not message.get("more_body", False):
+                clock[0] = 1400.0
+            return message
+
+        await engine(scope, read, send)
+
+    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
+    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
+    with pytest.raises(RuntimeError, match="no gateway deployment"):
+        asyncio.run(run.across_deployment())
