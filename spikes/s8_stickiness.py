@@ -445,17 +445,25 @@ class Pool:
 
     def in_service(self) -> int | None:
         """The instances in service as the scaler last read them from the group, from its gauge in
-        the workspace (`rhi_scaler.metrics`): `None` while the workspace has no recent value."""
+        the workspace (`rhi_scaler.metrics`): `None` while the workspace has no value the scaler wrote
+        in the last `FRESH_SECONDS`. A range query gives each step the last sample before it, however
+        old within Prometheus's lookback, at the step's own time: when the scaler wrote that sample
+        is read from `timestamp()`, never from the time of the step that returned it."""
         end = time.time()
-        series = self._read(f'{INSTANCES_IN_SERVICE}{{pool="{self.name}"}}', end - FRESH_SECONDS, end, 15)
-        recent = [
-            sample
-            for one in series
-            if one.labels.get("pool") == self.name
-            for sample in one.samples
-            if sample[0] >= end - FRESH_SECONDS
+        selector = f'{INSTANCES_IN_SERVICE}{{pool="{self.name}"}}'
+        written = [
+            one.samples[-1][1]
+            for one in self._read(f"timestamp({selector})", end - FRESH_SECONDS, end, 15)
+            if one.labels.get("pool") == self.name and one.samples
         ]
-        return None if not recent else round(max(recent)[1])
+        if not written or max(written) < end - FRESH_SECONDS:
+            return None
+        values = [
+            one.samples[-1][1]
+            for one in self._read(selector, end - FRESH_SECONDS, end, 15)
+            if one.labels.get("pool") == self.name and one.samples
+        ]
+        return None if not values else round(values[-1])
 
     def present(self) -> set[str]:
         """The instances in service: those whose collector wrote a sample in the last `FRESH_SECONDS`,
@@ -640,6 +648,11 @@ class Run:
             try:
                 present = self.pool.present()
             except (Leaving, Unseen):
+                return False
+            # Exactly two in service, both serving: a third in service is a third target to route to.
+            if len(present) != INSTANCES:
+                if len(present) > INSTANCES:
+                    print(f"{len(present)} instances in service: held until exactly {INSTANCES} are")
                 return False
             now = {instance: zone for instance, zone in serving.items() if instance in present}
             # The zones are those the workspace labels: an instance whose series has no zone label
