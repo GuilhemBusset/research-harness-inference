@@ -103,6 +103,19 @@ day before for its stand-ins, writes the new day with the cookies that day held,
 keeps their instance across midnight. A request that started the day before settles into that
 day's item, and its cookie stays there. A student's requests in flight at once each store theirs,
 and for one pool the last settlement's stays.
+
+**The rebalance number** (section 5.5). For each new rebalance number of a pool the gateway drops
+the cookie of a share of its students, and a number acts once on a student because the record
+keeps the last one applied (`rhi_gateway.affinity`). It is the record's `rebalance_applied`, a map
+from a pool's name to that number, and it rides on the same two writes as the cookie, by the same
+rules. The reservation's write returns the number the record holds for the request's pool
+(`Reservation.rebalance_applied`). The settlement's write stores the number the request was judged
+on, whether or not that dropped its cookie, and nothing when the request was not judged. A request
+whose cookie was dropped and that ended with none has the settlement take the pool's cookie off the
+record, in that same write: the student's next request then carries none. No other write touches
+the map, a day's first reservation starts with the numbers of the day before, and of a student's
+requests in flight at once the last settlement's number stays, with the cookie that settlement
+stored.
 """
 
 from __future__ import annotations
@@ -178,7 +191,8 @@ class Reservation:
 
     `pool` is the pool the request is for, if the reservation named one, and `cookie` the
     load balancer's cookie the record held for that pool when the reservation was written: `None`
-    if it held none.
+    if it held none. `rebalance_applied` is the last rebalance number the record had applied for
+    that pool then: `None` if it had applied none.
     """
 
     github_id: int
@@ -187,6 +201,7 @@ class Reservation:
     lease: Lease
     pool: str | None = None
     cookie: str | None = None
+    rebalance_applied: int | None = None
 
 
 class Ledger(Protocol):
@@ -209,7 +224,8 @@ class Ledger(Protocol):
         `longest_request_seconds` the gateway's setting. An ID that is empty, that holds a
         reservation already, or that reads as a stand-in (a date, then `/`) is a `ValueError`.
         `pool` is the name of the pool the request is for: the reservation returns the load
-        balancer's cookie the record holds for it. Without one, it returns none.
+        balancer's cookie the record holds for it, and the last rebalance number the record has
+        applied for it. Without one, it returns neither.
         """
         ...
 
@@ -221,6 +237,8 @@ class Ledger(Protocol):
         output_tokens: int,
         ended_cleanly: bool,
         cookie: str | None = None,
+        rebalance_number: int | None = None,
+        cookie_dropped: bool = False,
     ) -> int | None:
         """Free the slot and charge the request: the tokens charged, or `None` if nothing was.
 
@@ -229,8 +247,12 @@ class Ledger(Protocol):
         when the reservation is settled already, by an earlier call or by a reservation that
         removed it after its expiry. `cookie` is the load balancer's cookie the request ended
         with: the same write stores it for the reservation's pool. `None`, for a request that
-        ended with none, leaves the record's cookies as they are, and so does a settlement that
-        charges nothing.
+        ended with none, leaves the record's cookies as they are, unless `cookie_dropped` says
+        that the request's rebalance number dropped its cookie: the write then removes the
+        pool's cookie from the record. `rebalance_number` is the pool's rebalance number the
+        request was judged on, which the same write stores as the last one applied for the
+        reservation's pool; `None`, for a request that was not judged, leaves the record's
+        numbers as they are. A settlement that charges nothing stores and removes nothing.
         """
         ...
 
@@ -253,7 +275,8 @@ def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
 def _new_day(student: Student, day: str, before: UsageDay | None, now: int) -> UsageDay:
     """A day as its first reservation finds it: no tokens, and a stand-in for each live lease of `before`.
 
-    It starts with the load balancer's cookies `before` held, so that midnight moves no student.
+    It starts with the load balancer's cookies `before` held, and with the rebalance numbers it
+    had applied, so that midnight moves no student.
     """
     return UsageDay(
         github_id=student.github_id,
@@ -266,6 +289,7 @@ def _new_day(student: Student, day: str, before: UsageDay | None, now: int) -> U
             for request, lease in _live(before, now).items()
         },
         affinity_cookies={} if before is None else dict(before.affinity_cookies),
+        rebalance_applied={} if before is None else dict(before.rebalance_applied),
     )
 
 
@@ -363,15 +387,19 @@ def _reserve_within_the_day(
 
     `write` adds the reservation to the record of its day and returns the record as it wrote it,
     or raises the refusal; `read` reads a student's day without writing. The reservation returned
-    holds the cookie that record has for `pool`. The clock is read again when `write` returns. If
+    holds the cookie that record has for `pool`, and the rebalance number it has applied for it.
+    The clock is read again when `write` returns. If
     the day has changed and the next day was opened without this lease, `take_back` removes the
     lease and its tokens, and the request is refused.
     """
     now = int(clock())
     lease = _new_lease(body, output_limit, now + seconds)
     reservation = Reservation(student.github_id, utc_day(now), request_id, lease, pool)
-    held = write(reservation, now).affinity_cookies
-    reservation = replace(reservation, cookie=None if pool is None else held.get(pool))
+    held = write(reservation, now)
+    if pool is not None:
+        reservation = replace(
+            reservation, cookie=held.affinity_cookies.get(pool), rebalance_applied=held.rebalance_applied.get(pool)
+        )
     answered = int(clock())
     if utc_day(answered) == reservation.day or _carried(reservation, answered, read):
         return reservation
@@ -476,26 +504,48 @@ class InMemoryLedger:
         output_tokens: int,
         ended_cleanly: bool,
         cookie: str | None = None,
+        rebalance_number: int | None = None,
+        cookie_dropped: bool = False,
     ) -> int | None:
         charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
-        return charge if self._remove(reservation, charge, cookie=cookie) else None
+        stored = self._remove(
+            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+        )
+        return charge if stored else None
 
-    def _remove(self, reservation: Reservation, charge: int, *, cookie: str | None = None) -> bool:
+    def _remove(
+        self,
+        reservation: Reservation,
+        charge: int,
+        *,
+        cookie: str | None = None,
+        rebalance_number: int | None = None,
+        cookie_dropped: bool = False,
+    ) -> bool:
         """Remove the lease and replace its tokens by `charge`, if the lease is still there.
 
-        The same write stores `cookie`, if there is one, for the reservation's pool.
+        The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
+        if there is one, and removes the pool's cookie when there is none and it was dropped.
         """
         with self._lock:
             day = self._days.get((reservation.github_id, reservation.day))
             if day is None or reservation.request_id not in day.leases:
                 return False
             leases = {request: held for request, held in day.leases.items() if request != reservation.request_id}
-            cookies = day.affinity_cookies
-            if cookie is not None and reservation.pool is not None:
-                cookies = {**cookies, reservation.pool: cookie}
+            cookies, applied, pool = day.affinity_cookies, day.rebalance_applied, reservation.pool
+            if pool is not None and cookie is not None:
+                cookies = {**cookies, pool: cookie}
+            elif pool is not None and cookie_dropped:
+                cookies = {name: held for name, held in cookies.items() if name != pool}
+            if pool is not None and rebalance_number is not None:
+                applied = {**applied, pool: rebalance_number}
             self._write(
                 replace(
-                    day, tokens=day.tokens + charge - reservation.lease.tokens, leases=leases, affinity_cookies=cookies
+                    day,
+                    tokens=day.tokens + charge - reservation.lease.tokens,
+                    leases=leases,
+                    affinity_cookies=cookies,
+                    rebalance_applied=applied,
                 )
             )
         return True
@@ -515,6 +565,9 @@ _NAMES = {"#tokens": "tokens", "#leases": "leases"}
 # The attribute that holds the load balancer's cookies, by pool. A reservation that names a pool
 # writes it empty where there is none, so that the settlement has a map to store its cookie in.
 _COOKIES = "affinity_cookies"
+# The attribute that holds the last rebalance number applied, by pool: written empty in the same
+# way, for the settlement to store its number in.
+_APPLIED = "rebalance_applied"
 # The attribute of a day whose opener has not confirmed it yet (see the module's "Midnight").
 _OPENING = "opening"
 _CONDITION_FAILED = "ConditionalCheckFailedException"
@@ -567,7 +620,8 @@ class DynamoDBLedger:
     write cannot both make the map and add to it. So the write of a reservation that names a pool
     leaves an empty map where the item had none, which reads as no cookie: the map is there for
     every settlement that stores one, and each is one call whatever other requests of the student
-    are in flight.
+    are in flight. The last rebalance number applied, by pool, is carried in the same way, in a
+    map of its own.
 
     An error of DynamoDB other than a failed condition is raised as the SDK raised it. It carries
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
@@ -610,9 +664,14 @@ class DynamoDBLedger:
         output_tokens: int,
         ended_cleanly: bool,
         cookie: str | None = None,
+        rebalance_number: int | None = None,
+        cookie_dropped: bool = False,
     ) -> int | None:
         charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
-        return charge if self._remove(reservation, charge, cookie=cookie) else None
+        stored = self._remove(
+            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+        )
+        return charge if stored else None
 
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
@@ -661,24 +720,37 @@ class DynamoDBLedger:
         *,
         stand_ins: Mapping[str, Lease] | None = None,
         cookie: str | None = None,
+        rebalance_number: int | None = None,
+        cookie_dropped: bool = False,
     ) -> bool:
         """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there.
 
         `stand_ins`, given only by the opener of a day that takes its reservation back, are the
-        stand-ins it missed; the write carries them into the day and confirms the day. `cookie`,
-        given only by a settlement, is stored for the reservation's pool in the same write.
+        stand-ins it missed; the write carries them into the day and confirms the day. The others
+        are given only by a settlement, and the same write applies them to the reservation's pool:
+        it stores `cookie` and `rebalance_number`, each if there is one, and removes the pool's
+        cookie when there is none and it was dropped.
         """
         values: dict[str, object] = {":change": charge - reservation.lease.tokens}
         names, sets = _stand_in_updates(stand_ins or {}, values)
-        update = "REMOVE #leases.#request" + (", #opening" if stand_ins is not None else "") + " ADD #tokens :change"
+        removals = ["#leases.#request"]
         condition = "attribute_exists(#leases.#request)"
         if stand_ins is not None:
             names["#opening"] = _OPENING
-        if cookie is not None and reservation.pool is not None:
-            # The map is there: this request's reservation named the pool, and so left one.
+            removals.append("#opening")
+        # The two maps are there: this request's reservation named the pool, and so left them.
+        if reservation.pool is not None and cookie is not None:
             names |= {"#cookies": _COOKIES, "#pool": reservation.pool}
             sets.append("#cookies.#pool = :cookie")
             values[":cookie"] = cookie
+        elif reservation.pool is not None and cookie_dropped:
+            names |= {"#cookies": _COOKIES, "#pool": reservation.pool}
+            removals.append("#cookies.#pool")
+        if reservation.pool is not None and rebalance_number is not None:
+            names |= {"#applied": _APPLIED, "#pool": reservation.pool}
+            sets.append("#applied.#pool = :number")
+            values[":number"] = rebalance_number
+        update = "REMOVE " + ", ".join(removals) + " ADD #tokens :change"
         if sets:
             update += " SET " + ", ".join(sets)
         written, _ = self._conditional(
@@ -710,7 +782,8 @@ class DynamoDBLedger:
         both, and holds only while each of them is still in the item. The item must be a
         confirmed day, unless `carried` is given: then the write confirms the day itself, adding
         those stand-ins, which take their slots, and holds only while the day is still unconfirmed.
-        For a reservation that names a pool, it leaves an empty map of cookies where there is none.
+        For a reservation that names a pool, it leaves an empty map of cookies where there is none,
+        and an empty map of rebalance numbers.
         Returns the day as this write left it, which the write itself returns, or `None` and the
         item it found when it wrote nothing.
         """
@@ -723,8 +796,8 @@ class DynamoDBLedger:
         }
         names, sets = _stand_in_updates(carried or {}, values)
         if reservation.pool is not None:
-            names["#cookies"] = _COOKIES
-            sets.append("#cookies = if_not_exists(#cookies, :none)")
+            names |= {"#cookies": _COOKIES, "#applied": _APPLIED}
+            sets += ["#cookies = if_not_exists(#cookies, :none)", "#applied = if_not_exists(#applied, :none)"]
             values[":none"] = {}
         removed = {f"#gone{number}": request for number, request in enumerate(gone)}
         update = "SET " + ", ".join(["#leases.#request = :lease", *sets]) + " ADD #tokens :change"
@@ -758,8 +831,8 @@ class DynamoDBLedger:
 
         Returns the day it wrote, or `None` and the item that was there already. It holds a
         stand-in for each request still running from the day before, read here, and the cookies
-        that day held. The refusal is raised if the stand-ins leave no slot. Opened within
-        `OPENING_SECONDS` of midnight,
+        and rebalance numbers that day held. The refusal is raised if the stand-ins leave no slot.
+        Opened within `OPENING_SECONDS` of midnight,
         it is written unconfirmed (`opening`): until a write confirms it, no reservation takes a
         slot in it without first reading the day before again and carrying the stand-ins missing
         from it. Opened later, the read above already holds every lease of the day before that
@@ -773,8 +846,9 @@ class DynamoDBLedger:
         opening = now < _midnight(reservation.day) + OPENING_SECONDS
         item = day.to_item()
         if reservation.pool is not None:
-            # The map of cookies, empty if the day before held none: see `_add_lease`.
+            # The two maps, each empty if the day before held none: see `_add_lease`.
             item[_COOKIES] = dict(day.affinity_cookies)
+            item[_APPLIED] = dict(day.rebalance_applied)
         written, found = self._conditional(
             self._client.put_item,
             Item=_values({**item, _OPENING: True} if opening else item),
