@@ -1,14 +1,23 @@
 """A pool's instance role and its instances' log group (system design, section 4.3): the mock pool
-of the example configuration."""
+of the example configuration, and the IAM path of a GPU pool's role in a configuration that has one.
+
+The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from rhi import config
+
 if TYPE_CHECKING:
+    from types import ModuleType
+
     import aws_cdk as cdk
 
 SESSION_ACTIONS = {
@@ -122,3 +131,43 @@ def test_on_every_resource_only_the_five_session_actions(statements: list[dict[s
     # parameter, its files' object and its engine image (`tests/synth/test_pool_release.py`).
     services = {action.split(":")[0] for statement in statements for action in as_list(statement["Action"])}
     assert services == {"dynamodb", "logs", "aps", "autoscaling", "secretsmanager", "ssm", "ssmmessages", "s3", "ecr"}
+
+
+def test_a_gpu_pools_role_is_under_the_gpu_pools_path_and_the_mock_pools_is_not(
+    app_module: ModuleType, tmp_path: Path
+) -> None:
+    from rhi.pools.role import GPU_ROLE_PATH
+
+    example = config.load({"RHI_CONFIG": "example"})
+    (mock,) = example.pools
+    gpu = dataclasses.replace(
+        mock,
+        name="coursework",
+        engine="vllm",
+        model="example/model",
+        revision="a" * 40,
+        instance_types=("g7e.2xlarge",),
+        prices={"g7e.2xlarge": 3.36},
+    )
+    configured = dataclasses.replace(
+        example,
+        pools=(mock, gpu),
+        allowed_instance_types=(*mock.instance_types, *gpu.instance_types),
+    )
+    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
+    context = json.loads(cdk_json.read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app = app_module.build(configured, outdir=str(tmp_path), context=context)
+    app.synth()  # Fails on a finding of the roles that no file acknowledges.
+    stage = app.node.find_child("Rhi")
+    template = json.loads((Path(stage.outdir) / stage.pools.template_file).read_text(encoding="utf-8"))
+
+    paths = {
+        tag["Value"]: properties.get("Path", "/")
+        for properties in of_type(template, "AWS::IAM::Role").values()
+        for tag in properties.get("Tags", [])
+        if tag["Key"] == "rhi-pool"
+    }
+    assert GPU_ROLE_PATH not in ("", "/")
+    assert paths[gpu.name] == GPU_ROLE_PATH
+    assert not paths[mock.name].startswith(GPU_ROLE_PATH)
+    assert sorted(paths) == sorted([mock.name, gpu.name])

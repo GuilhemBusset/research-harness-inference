@@ -2,8 +2,8 @@
 against stand-ins for everything around it.
 
 One `World` is the instance metadata and the engine, where the agent opens a URL; Auto Scaling,
-the release parameter and the pool's secret, as SDK clients; the host module; and the heartbeats
-table. The engine is the mock engine, in process, once the host module has started its unit. The
+the release parameter and the pool's secret, as SDK clients; the host module, with the console; and
+the heartbeats table. The engine is the mock engine, in process, once the host module has started its unit. The
 state folder is the test's own, and the clock is moved only by the test: the program's sleep, the
 duties' and the transitions' all wait on it, so no test waits for a tick. The one socket is the
 agent's own metrics endpoint, on a free port of the loopback interface.
@@ -79,6 +79,8 @@ ENVIRON = {
 IN_SERVICE = "InService"
 WARM = "Warmed:Stopped"
 TERMINATED = "Terminated"
+# The instance belongs to no group: its metadata answers that it has no target lifecycle state.
+NO_STATE = ""
 CHAT = "/v1/chat/completions"
 
 
@@ -114,7 +116,9 @@ class Clock:
 class World(Host):
     """An instance prepared with the release of `VALUE`, and everything around its agent. Made
     inside the test's event loop. `calls` holds the steps of the transitions in the order they
-    happened, and each completion the engine answered; `completions` what reached Auto Scaling."""
+    happened, and each completion the engine answered; `completions` what reached Auto Scaling,
+    and `console` the lines written on the console. `target` is the target lifecycle state in the
+    metadata: `NO_STATE` when the metadata has none, None while the metadata does not answer."""
 
     def __init__(self, folder: Path, target: str | None) -> None:
         super().__init__(ecr=object())
@@ -127,6 +131,7 @@ class World(Host):
         self.served = folder / "run" / "served"
         self.calls: list[str] = []
         self.completions: list[dict[str, str]] = []
+        self.console: list[str] = []
         self.items: list[dict[str, Any]] = []
         # When the target state was read, and how many requests the agent sent the engine.
         self.readings: list[float] = []
@@ -232,6 +237,10 @@ class World(Host):
         self.calls.append("stop")
         self.app = None
 
+    def write_console(self, line: str, timeout: float | None = None) -> None:
+        self.calls.append("console")
+        self.console.append(line)
+
     # The SDK's clients, and the heartbeats table.
 
     def get_parameter(self, **request: Any) -> dict[str, Any]:
@@ -271,7 +280,9 @@ class World(Host):
             return 200, INSTANCE.encode()
         if url == f"{launch.METADATA_URL}/meta-data/autoscaling/target-lifecycle-state":
             self.readings.append(self.clock.now)
-            return (404, b"") if self.target is None else (200, self.target.encode())
+            if self.target is None:
+                return None
+            return (404, b"") if self.target == NO_STATE else (200, self.target.encode())
         assert url.startswith(launch.ENGINE_URL)
         self.asked += 1
         if self.app is None:
@@ -475,6 +486,48 @@ def test_an_instance_that_returns_to_the_warm_pool_drains_and_is_not_taken_for_a
 
         assert world.calls[launched:] == ["termination hook", "stop"]
         assert world.completions == [completion("launch"), completion("termination")]
+
+    run(scenario)
+
+
+def test_an_instance_in_no_group_is_handed_to_the_canary_and_does_nothing_of_a_groups_instance(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        world = World(tmp_path, NO_STATE)
+        async with world.running():
+            await until(lambda: world.console != [])
+            asked = world.asked
+            await world.ticks(13)
+
+        # The steps of a launch straight into service, once, then the line on the console.
+        assert world.calls == ["pull", "check", "start", "health", "completion", "console"]
+        assert world.console == [f"rhi-canary served image_digest=sha256:{'a' * 64} model_revision=none"]
+        # No hook was completed and no row written, by the canary or by a serving duty: over a
+        # minute of readings the engine was asked nothing more, and nothing says the instance served.
+        assert world.completions == []
+        assert world.items == []
+        assert world.asked == asked
+        assert not world.served.exists()
+
+    run(scenario)
+
+
+def test_a_target_state_that_comes_after_the_canary_is_acted_on_as_on_any_instance(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = World(tmp_path, NO_STATE)
+        async with world.running():
+            await until(lambda: world.console != [])
+            tried = len(world.calls)
+
+            # The instance is a group's after all: its launch into service runs, and it serves.
+            world.target = IN_SERVICE
+            await world.clock.advance(5)
+            await until(lambda: len(world.beats) == 1)
+
+        assert world.calls[tried : tried + 5] == ["check", "start", "health", "completion", "launch hook"]
+        assert world.completions == [completion("launch")]
+        assert len(world.console) == 1
 
     run(scenario)
 

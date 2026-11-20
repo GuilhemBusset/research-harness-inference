@@ -180,6 +180,19 @@ def test_a_start_still_running_at_its_time_limit_is_stopped_and_reported(nsenter
     assert (raised.value.action, raised.value.returncode) == ("start", None)
 
 
+def test_a_line_for_the_console_is_written_on_the_hosts_console_device(nsenter: Nsenter) -> None:
+    host(nsenter).write_console("rhi-canary failed stage=image")
+
+    # The line reaches the command on its standard input, as one line.
+    assert nsenter.calls() == [[*IN_THE_HOST, "tee", "/dev/console"]]
+    assert nsenter.input(0) == "rhi-canary failed stage=image\n"
+
+    nsenter.fail_on("tee")
+    with pytest.raises(HostError) as raised:
+        host(nsenter).write_console("rhi-canary failed stage=image")
+    assert (raised.value.action, raised.value.returncode) == ("console", 3)
+
+
 def test_a_command_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
     with pytest.raises(HostError) as raised:
         Host(Ecr(), nsenter=str(tmp_path / "missing")).start_engine()

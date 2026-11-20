@@ -26,6 +26,13 @@
 # Each later issue that creates a resource the instances read grants it to this role, and lists
 # it here.
 #
+# Every GPU pool's instance role is under the IAM path /rhi/gpu-pools/ (`GPU_ROLE_PATH`), and the
+# mock pool's role is outside it, under /. The path is part of a role's ARN and grants the role
+# nothing: no action above changes with it, and none is added. It is there so that the role of the
+# promotion job, which starts a canary instance with a GPU pool's instance role, may pass the roles
+# under that path and no other. That statement belongs to the job's role, which this module does
+# not create.
+#
 # cdk-nag names a finding after the resource it found, so the finding of a pool's prefix holds the
 # pool's name, and no file of the repository names the pools of a deployed configuration. The entry
 # whose key holds `<pool>` lists that finding for each pool of the configuration, and for no other

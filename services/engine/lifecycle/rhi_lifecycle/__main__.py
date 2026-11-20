@@ -18,6 +18,7 @@ one. What a reading calls for:
 | not in service | `InService` or a warm-pool state, not yet acted on | runs the launch transition (`rhi_lifecycle.launch`), once |
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
 | in service | any other | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
+| not in service | none: the metadata says the instance has no such item | runs the canary (`rhi_lifecycle.canary`), once |
 
 Any other reading calls for nothing. An instance that was never in service and whose target state
 is a terminated one is among them: no engine runs there to drain, and the program leaves it alone.
@@ -26,6 +27,15 @@ The instance is in service once a launch into service, a promotion or a launch s
 completed its hook: the serving duties start then. They run until the target state leaves service,
 and on while the termination handling waits for the engine to drain. A hook that could not be
 completed leaves the instance in service, and the next reading hands it over again.
+
+**An instance in no group.** The metadata of an instance that belongs to no Auto Scaling group has
+no target lifecycle state, and says so: that is an answer, not a reading that failed. Such an
+instance is a canary, which the promotion job started from the pool's launch template to try a
+machine image. The program hands it to `rhi_lifecycle.canary`, which starts the engine as a launch
+straight into service does and writes its outcome on the instance's console. That run completes no
+hook and writes no heartbeat, and the program starts no serving duty after it, whatever its
+outcome. It is run once in the life of the program. It decides nothing about later readings: one
+that gives a target state is acted on as on any instance.
 
 **One transition at a time, beside the readings.** A transition can take minutes, and the readings
 go on every `TICK_SECONDS` while it runs. A reading that finds a transition under way calls for
@@ -73,6 +83,7 @@ import boto3
 
 from rhi_common.engine_metrics import ENGINES, MOCK
 from rhi_lifecycle import launch, metrics, release
+from rhi_lifecycle.canary import Canary
 from rhi_lifecycle.host import Host
 from rhi_lifecycle.launch import Launch, Outcome
 from rhi_lifecycle.serving import Serving
@@ -242,6 +253,18 @@ class Agent:
             wall=wall,
         )
 
+        # Given no Auto Scaling client and no table: a canary completes no hook and writes no row.
+        self._canary = Canary(
+            environment.parameter,
+            ssm=ssm,
+            secrets=secrets,
+            host=host,
+            engine=launch.Engine(fetch),
+            held=held,
+            clock=clock,
+            sleep=wait,
+        )
+
         def serving(held_release: release.Release, instance: str) -> Serving:
             return Serving(
                 held_release,
@@ -271,6 +294,8 @@ class Agent:
         self._in_service = False
         # The target state of the last transition: the same state calls for nothing more.
         self._acted: str | None = None
+        # Whether the canary was run: it is run once.
+        self._tried = False
         # The serving duties: made once, because their metrics are registered once, and running
         # as `_duties` while the instance is in service.
         self._serving: Serving | None = None
@@ -329,7 +354,12 @@ class Agent:
         if reading is None:
             return
         target, instance = reading
-        if self._in_service:
+        if target is None:
+            # The instance belongs to no group: a canary, unless the program found it serving.
+            if not self._in_service and not self._tried:
+                self._tried = True
+                self._begin(self._try())
+        elif self._in_service:
             if target == launch.IN_SERVICE:
                 if self._duties is None:
                     self._serve(instance)
@@ -362,12 +392,17 @@ class Agent:
         finally:
             sleep.cancel()
 
-    def _read(self) -> tuple[str, str] | None:
-        """The target state and the instance, or None when the instance metadata gives neither."""
+    def _read(self) -> tuple[str | None, str] | None:
+        """The target state and the instance, or None when the reading failed. The target state is
+        None when the instance metadata says it has none: the instance belongs to no group."""
         try:
             if self._instance is None:
                 self._instance = self._metadata.instance_id()
-            return self._metadata.target_state(), self._instance
+            instance = self._instance
+            try:
+                return self._metadata.target_state(), instance
+            except launch.NoSuchItemError:
+                return None, instance
         except launch.MetadataError as error:
             _LOG.warning("the instance metadata did not give %s", error)  # the item's name
             return None
@@ -381,6 +416,10 @@ class Agent:
         if outcome is Outcome.CONTINUED and self._served.exists():
             self._in_service = True
             self._serve(instance)
+
+    async def _try(self) -> None:
+        outcome = await asyncio.to_thread(self._canary.run)
+        _LOG.info("the canary ended: %s", outcome.value)
 
     async def _leave(self, target: str, instance: str) -> None:
         outcome = await asyncio.to_thread(self._termination.drain, instance)
