@@ -1084,13 +1084,14 @@ def spike_jobs(template: Mapping[str, Any]) -> list[tuple[str, str | None, str |
 
 
 def names_a_project(value: Any, name: str) -> bool:
-    """Whether a value of a template holds text of a CodeBuild project's ARN by its name, or the
-    name alone."""
+    """Whether a value of a template holds a CodeBuild project's name anywhere in its text, as a
+    whole name: alone, in the project's ARN, or inside text such as the JSON input of a schedule's
+    universal target (`{"projectName": "<name>"}`)."""
     if isinstance(value, dict):
         return any(names_a_project(part, name) for part in value.values())
     if isinstance(value, list):
         return any(names_a_project(part, name) for part in value)
-    return isinstance(value, str) and (value == name or f"project/{name}" in value)
+    return isinstance(value, str) and re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", value) is not None
 
 
 def pool_state_tables(templates: Templates) -> list[str]:
@@ -2506,6 +2507,20 @@ def a_target(kind: str, *, elsewhere: bool = False) -> Callable[[Templates], Non
     return change
 
 
+def a_universal_target(templates: Templates) -> None:
+    """A schedule, every night, whose universal target calls CodeBuild's StartBuild with the first
+    spike job's name in its JSON input."""
+    _, _, name, _ = found_spikes(templates)[0]
+    path = min(templates)
+    target = {
+        "Arn": "arn:aws:scheduler:::aws-sdk:codebuild:startBuild",
+        "RoleArn": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/Nightly"},
+        "Input": json.dumps({"projectName": name}),
+    }
+    properties = {"ScheduleExpression": "rate(1 day)", "FlexibleTimeWindow": {"Mode": "OFF"}, "Target": target}
+    templates[path]["Resources"]["Nightly"] = {"Type": "AWS::Scheduler::Schedule", "Properties": properties}
+
+
 def an_action(templates: Templates) -> None:
     """A CodeBuild action of the pipeline, after the stage's deployment, that runs the first job."""
     path, project, _, _ = found_spikes(templates)[0]
@@ -2528,6 +2543,7 @@ def here(service: str, resource: str) -> str:
         pytest.param(a_webhook, {SPIKE_STARTED, WEBHOOK}, id="a webhook"),
         pytest.param(a_target("AWS::Events::Rule"), {SPIKE_STARTED}, id="a rule"),
         pytest.param(a_target("AWS::Scheduler::Schedule"), {SPIKE_STARTED}, id="a schedule"),
+        pytest.param(a_universal_target, {SPIKE_STARTED}, id="a schedule's universal target"),
         pytest.param(a_target("AWS::Events::Rule", elsewhere=True), {SPIKE_STARTED}, id="a rule of another stack"),
         pytest.param(an_action, {SPIKE_STARTED}, id="a pipeline's action"),
         pytest.param(
