@@ -676,3 +676,68 @@ def test_a_stream_on_a_replacement_already_serving_does_not_prove_survival(monke
     run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
     with pytest.raises(RuntimeError, match="no gateway deployment"):
         asyncio.run(run.across_deployment())
+
+
+@pytest.mark.parametrize("completes", [True, False], ids=["answers", "disconnects"])
+def test_a_stream_a_late_written_replacement_may_hold_is_unmeasured_while_an_old_task_runs_on(
+    monkeypatch: pytest.MonkeyPatch, completes: bool
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+
+    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
+        if end == 1000.0:
+            clock[0] = 1020.0  # the stream opens at 1020
+        # old-a is replaced; old-b runs on, the rollout waiting for a second replacement.
+        found = {"old-a": (900.0, min(end, 1200.0)), "old-b": (900.0, end)}
+        if end >= 1030.0:
+            found["new-a"] = (1030.0, end)  # serving from 1015, its collector first wrote at 1030
+        return found
+
+    async def gateway(scope: Any, receive: Any, send: Any) -> None:
+        async def read() -> Any:
+            message = await receive()
+            if not message.get("more_body", False):
+                clock[0] = 1400.0
+                if not completes:
+                    raise httpx.ReadError("cut")
+            return message
+
+        await engine(scope, read, send)
+
+    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
+    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
+    with pytest.raises(RuntimeError, match="no gateway deployment"):
+        asyncio.run(run.across_deployment())
+
+
+@pytest.mark.parametrize(("began", "ended"), [(999.9, 1000.2), (1019.8, 1020.3)], ids=["before-ask", "after-stop"])
+def test_a_stream_that_only_crosses_a_bound_of_a_scale_in_event_is_unmeasured(
+    monkeypatch: pytest.MonkeyPatch, began: float, ended: float
+) -> None:
+    # The run began at 1000 and asked for fewer by 1120, when the job read its note; idle-node last
+    # wrote at 1005, so it stopped between 1005 and 1020.
+    monkeypatch.setattr(s7.time, "time", lambda: 1120.0)
+
+    class Pool:
+        name = "mock"
+
+        def note(self) -> ScalerNote:
+            return _note(1, 1000)
+
+        def writes(self, start: float, end: float) -> dict[str, float]:
+            return {"idle-node": min(end, 1005.0), "serving-node": end}
+
+        def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
+            return [(1000.3, 0.0), (1060.3, 0.0)]
+
+    run = s7.Run(Pool(), "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
+    departure = asyncio.run(run.departure(2, 1))
+    assert departure.events() == [(1000.0, 1120.0), (1005.0, 1020.0)]
+    caught = s7.Streamed(began, ended, s7.Answer(completed=True, begun_at=began))
+    assert s7.across_scale_in([caught], departure) is None
+    # A stream in flight over the whole of the stop's bounds spanned it.
+    spanning = s7.Streamed(1004.0, 1021.0, s7.Answer(completed=True, begun_at=1004.0))
+    assert s7.across_scale_in([caught, spanning], departure) is True
