@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 REPO = Path(__file__).resolve().parents[2]
 BOOT = REPO / "services/engine/boot/rhi-boot.sh"
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(MOCK,) = EXAMPLE.pools
+MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 GPU = dataclasses.replace(
     MOCK,
     name="coursework",
@@ -131,6 +131,21 @@ class Release:
         ]
         return found
 
+    def tagged(self, kind: str) -> str:
+        """The logical ID of the one resource of a kind that is tagged with the pool's name: a
+        template may hold other pools, each with its own group and its own instance role."""
+        (found,) = [
+            name
+            for name, properties in of_type(self.template, kind).items()
+            if [tag["Value"] for tag in properties.get("Tags", []) if tag["Key"] == "rhi-pool"] == [self.pool]
+        ]
+        return found
+
+    @property
+    def group(self) -> str:
+        """The logical ID of the pool's group."""
+        return self.tagged("AWS::AutoScaling::AutoScalingGroup")
+
     @property
     def value(self) -> dict[str, Any]:
         """The parameter's value, with each reference replaced by a sample value."""
@@ -179,12 +194,18 @@ class Release:
         return found
 
     @property
-    def image(self) -> dict[str, Any]:
-        """The source of the pool's engine image asset: the one pushed under the tag the release
+    def image_asset(self) -> tuple[str, dict[str, Any]]:
+        """The pool's engine image asset, with its tag: the one pushed under the tag the release
         reads the digest of."""
+        (found,) = [(tag, a) for tag, a in self.assets["dockerImages"].items() if tag in self.digest_lookup[1]]
+        return found
+
+    @property
+    def image(self) -> dict[str, Any]:
+        """The source of the pool's engine image asset."""
         call = json.loads(self.digest_lookup[1])
         assert (call["service"], call["action"]) == ("ECR", "describeImages")
-        ((tag, asset),) = [(tag, a) for tag, a in self.assets["dockerImages"].items() if tag in self.digest_lookup[1]]
+        tag, asset = self.image_asset
         (destination,) = asset["destinations"].values()
         assert call["parameters"] == {
             "repositoryName": sample({"Fn::Sub": destination["repositoryName"]}),
@@ -294,7 +315,7 @@ def test_the_agent_reads_the_parameter(app: cdk.App, mock: Release) -> None:
 
     current = agent_release.parse_current(sample(mock.parameter["Value"]))
     stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    (group,) = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")
+    group = mock.group
     heartbeats = stack.resolve(stack.get_logical_id(stack.tables.heartbeats.node.default_child))
     assert current.settings == agent_release.Settings(
         pool="mock",
@@ -314,7 +335,7 @@ def test_the_agent_reads_the_parameter(app: cdk.App, mock: Release) -> None:
 
     # The compared release: the image by the registry's digest, in the repository the asset is
     # pushed to; no model and no flag for the mock; the files by the digest of the archive.
-    (destination,) = next(iter(mock.assets["dockerImages"].values()))["destinations"].values()
+    (destination,) = mock.image_asset[1]["destinations"].values()
     repository = sample({"Fn::Sub": destination["repositoryName"]})
     assert current.release == agent_release.Release(
         engine_image=f"123456789012.dkr.ecr.{REGION}.amazonaws.com/{repository}@{IMAGE_DIGEST}",
@@ -586,11 +607,8 @@ def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Rel
 
 
 def test_the_instance_role_may_fetch_its_release_and_nothing_else(mock: Release) -> None:
-    (role,) = [
-        name
-        for name, properties in of_type(mock.template, "AWS::IAM::Role").items()
-        if "ec2.amazonaws.com" in json.dumps(properties["AssumeRolePolicyDocument"])
-    ]
+    role = mock.tagged("AWS::IAM::Role")
+    assert "ec2.amazonaws.com" in json.dumps(mock.template["Resources"][role]["Properties"]["AssumeRolePolicyDocument"])
     statements = [
         statement
         for policy in of_type(mock.template, "AWS::IAM::Policy").values()
@@ -695,7 +713,9 @@ def test_the_trigger_holds_the_compared_release_and_the_machine_image_resolved_a
 
     # The machine image: the launch template's own reference, a parameter of the stack that
     # CloudFormation resolves from the pool's image parameter when the stack is deployed.
-    (launch_template,) = of_type(mock.template, "AWS::EC2::LaunchTemplate").values()
+    group = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")[mock.group]
+    specification = group["MixedInstancesPolicy"]["LaunchTemplate"]["LaunchTemplateSpecification"]
+    launch_template = mock.template["Resources"][specification["LaunchTemplateId"]["Ref"]]["Properties"]
     image = launch_template["LaunchTemplateData"]["ImageId"]["Ref"]
     assert image in references(mock.trigger)
     assert trigger["machine_image"] == f"sample-{image}"
@@ -706,8 +726,7 @@ def test_the_trigger_holds_the_compared_release_and_the_machine_image_resolved_a
 def test_the_stacks_deployment_waits_on_the_refresh(mock: Release) -> None:
     resources = mock.template["Resources"]
     refresh = mock.refresh
-    (group,) = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")
-    assert refresh["Properties"]["Group"] == {"Ref": group}
+    assert refresh["Properties"]["Group"] == {"Ref": mock.group}
     # The release is written, and the instances may fetch it, before any instance is replaced.
     depends_on = {resources[name]["Type"] for name in refresh["DependsOn"]}
     assert mock.parameter_of(refresh) == [PARAMETER]

@@ -46,15 +46,16 @@ rate_limits = { per_address = 2000, issuer = 100, grafana = 300 }
 
 # The instance types a pool may list, a hard cap (system design, section 11.3). Left out, it is the
 # types the pools below list.
-allowed_instance_types = ["t4g.small"]
+allowed_instance_types = ["t4g.small", "g7e.2xlarge"]
 
 # Dollars an hour: a pool with an instance type priced above it may only wake on schedule
 # (section 17). Left out, it is 5.
 on_demand_price_limit = 5
 
 # The pool the gateway maps `claude-*` model names to (sections 5.4 and 6.2). Left out, it is the
-# only pool when there is one; with two pools or more it must be given.
-default_pool = "mock"
+# only pool when there is one; with two pools or more it must be given. Here it is the coursework
+# pool (section 4.2).
+default_pool = "coursework"
 
 # The key issuer's reserved concurrency, and the most keys a student may be issued over one UTC
 # day (sections 6.4 and 17). Left out, each is 5.
@@ -80,15 +81,13 @@ retry_after_capacity_unavailable_seconds = 60
 retry_after_concurrency_limit_seconds = 5
 
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
-# `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last.
+# `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They
+# are in the order of their names, which is the order the configuration in SSM is read in.
 #
-# The mock pool, phase 1's only pool: the mock engine on t4g.small, woken on demand. Its context
-# length is the coursework pool's, so that the mock exercises the same limits; its largest output
-# is the 32,000 tokens Claude Code asks for on its main turns (evidence E15), which the body filter
-# then leaves as they are sent. It gives no expected values and has no measured start.
+# What any pool may give comes first, then the two pools: coursework, then mock.
 #
 # A pool served by vLLM may record one exception with two more fields (section 4.4), which no pool
-# here does, since none is served by vLLM yet:
+# here does: the coursework model needs no code from its repository (evidence E28).
 #   trust_remote_code = true                  lets the engine run the code the model's repository
 #                                             holds. Left out, it is false.
 #   trust_remote_code_reason = "<the reason>" why this pool needs it. Left out, there is none, and
@@ -96,7 +95,7 @@ retry_after_concurrency_limit_seconds = 5
 #
 # A pool served by vLLM may also give its serving settings, which its release carries into the
 # engine's flags (sections 4.2, 4.7 and 7.2). Each is optional: left out, the engine runs as vLLM
-# does by itself. The values shown are examples, not defaults.
+# does by itself. The values shown are examples, not defaults; the coursework pool gives its own.
 #   tool_call_parser = "qwen3_coder"   vLLM's parser for the model's tool calls, with automatic
 #                                      tool choice. Left out, there is none.
 #   reasoning_parser = "qwen3"         vLLM's parser for the model's reasoning. Left out, there is
@@ -117,8 +116,8 @@ retry_after_concurrency_limit_seconds = 5
 # The served context is the pool's context_length, the served model name is the pool's name, and
 # the most requests running at once is its target_concurrency: none has a field of its own.
 #
-# A pool may give the gateway its request profile (sections 6.1 and 6.2), which no pool here does:
-# the gateway has no entry yet, and it does not start for a profile that names one it does not
+# A pool may give the gateway its request profile (sections 6.1 and 6.2), which no pool here does
+# yet: the gateway has no entry yet, and it does not start for a profile that names one it does not
 # have. Both fields are optional, and the values shown are examples, not defaults.
 #   request_profile = ["first_entry", "second_entry"]
 #                                      the names of the rewrites the gateway applies to the pool's
@@ -131,7 +130,7 @@ retry_after_concurrency_limit_seconds = 5
 #                                      reasoning effort reads. Left out, there is no mapping.
 #
 # Every pool has three settings of student affinity (section 5.5), which keeps a student's turns on
-# the instance that holds their transcript. The pool here leaves them out, and the values shown are
+# the instance that holds their transcript. The pools here leave them out, and the values shown are
 # the defaults (section 17).
 #   stickiness_seconds = 3600          how long the pool's target group keeps a student on the
 #                                      instance that served their last request, renewed by every
@@ -143,8 +142,8 @@ retry_after_concurrency_limit_seconds = 5
 #   rebalance_interval_seconds = 60    the least time between two rebalance numbers, of at least 1
 #                                      second. Left out, it is 60.
 #
-# A pool may choose whose cached prefixes its requests reuse (sections 4.7 and 6.6), which the pool
-# here leaves out. The gateway gives every request a cache salt, and the engine reuses a prefix
+# A pool may choose whose cached prefixes its requests reuse (sections 4.7 and 6.6), which the pools
+# here leave out. The gateway gives every request a cache salt, and the engine reuses a prefix
 # only under the salt it was computed for.
 #   cache_salt_scope = "student"       a salt for each student: a prefix is reused only by the
 #                                      student who sent it, so no student can find out whether
@@ -153,6 +152,65 @@ retry_after_concurrency_limit_seconds = 5
 #                                      whatever part of their opening is identical, so a class that
 #                                      starts together does not queue behind its own openings. One
 #                                      student can then test whether another has sent a given text.
+
+# The coursework pool, the first GPU pool and the default pool (section 4.2): Qwen3.8-27B in its
+# publisher's 8-bit build (evidence E28), at the revision its manifest pins
+# (models/manifests/qwen--qwen3.8-27b-fp8.json), served by vLLM on g7e.2xlarge, one 96 GB GPU at
+# 3.36 dollars an hour (evidence E5), with no fallback type. Two instances at most, both kept warm.
+# The hold, the idle time and the drain are the defaults of section 17, written out. The daily
+# ceiling covers two instances through a four-hour session (section 11.3). The context is the
+# model's full 262,144 tokens, which keeps Claude Code clear of a context error it cannot recover
+# from (sections 4.2 and 6.1); the largest output is the 32,000 tokens Claude Code asks for
+# (evidence E15).
+#
+# Its serving settings are those of section 4.2: an 8-bit cache, prefix caching, 8,192 tokens for
+# each engine step, and the model's two parsers. Its weights load as every vllm pool's do, and it
+# records no exception for model code. It has no measured start until spike S1 has one.
+[pools.coursework]
+engine = "vllm"
+model = "Qwen/Qwen3.8-27B-FP8"
+revision = "c3a462cc3d38cf351f3b26cbd763469eeb74ef81"
+instance_types = ["g7e.2xlarge"]
+prices = { "g7e.2xlarge" = 3.36 }
+max_instances = 2
+warm_instances = 2
+wake = "on-demand"
+target_concurrency = 8
+hold_seconds = 420
+idle_minutes = 20
+drain_seconds = 300
+gpu_hours_per_day = 16
+context_length = 262144
+largest_output = 32000
+kv_cache_bits = 8
+prefix_caching = true
+step_budget_tokens = 8192
+tool_call_parser = "qwen3_coder"
+reasoning_parser = "qwen3"
+
+# What the pool is expected to measure, each a low and a high bound, which the inference dashboard
+# draws beside the measured series (sections 4.7 and 7.3): tokens a second per stream at eight
+# agent streams, seconds to the first token of a turn whose transcript is cached, and tokens of
+# cache. They are estimates, which the record of spike S5 replaces.
+[pools.coursework.expected]
+stream_tokens_per_second = [15, 22]
+time_to_first_token_seconds = [0.3, 1.5]
+cache_tokens = [1100000, 1800000]
+
+# The boundaries, in seconds, of the histogram of the time between two tokens (section 7.2). At 20
+# to 45 tokens a second a token takes 22 to 50 ms, which vLLM's own boundaries, 0.01, 0.025 and
+# 0.05, split into two buckets. These keep every boundary vLLM has and add one every 5 ms from 20
+# to 80 ms, then 90 and 125 ms: the floors of section 17, 15 and 10 tokens a second, are 67 and
+# 100 ms a token.
+[pools.coursework.histogram_buckets]
+inter_token_latency = [
+    0.01, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.055, 0.06, 0.065, 0.07, 0.075, 0.08, 0.09,
+    0.1, 0.125, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0,
+]
+
+# The mock pool, phase 1's pool: the mock engine on t4g.small, woken on demand. Its context length
+# is the coursework pool's, so that the mock exercises the same limits, and so is its largest
+# output. It gives no expected values and has no measured start.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]

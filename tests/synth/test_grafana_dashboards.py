@@ -97,7 +97,7 @@ def test_the_image_holds_its_folder_s_files_and_the_dashboards_of_the_configurat
     assert {path: held[path] for path in dashboards} == dashboards
 
     assert FLEET in dashboards
-    assert built.fleet_rows() == [pool.name for pool in EXAMPLE.pools] == ["mock"]
+    assert built.fleet_rows() == [pool.name for pool in EXAMPLE.pools] == ["coursework", "mock"]
 
 
 def test_the_same_configuration_gives_the_same_image(cloud_assembly: Path, tmp_path: Path) -> None:
@@ -108,10 +108,10 @@ def test_the_same_configuration_gives_the_same_image(cloud_assembly: Path, tmp_p
 
 
 def test_one_more_pool_gives_another_image_with_one_more_row(cloud_assembly: Path, tmp_path: Path) -> None:
-    (mock,) = EXAMPLE.pools
-    more = dataclasses.replace(EXAMPLE, pools=(mock, dataclasses.replace(mock, name="second")))
+    mock = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
+    more = dataclasses.replace(EXAMPLE, pools=(*EXAMPLE.pools, dataclasses.replace(mock, name="second")))
     with_more = synthesize(more, tmp_path)
-    assert with_more.fleet_rows() == ["mock", "second"]
+    assert with_more.fleet_rows() == ["coursework", "mock", "second"]
     assert with_more.hash != image(cloud_assembly).hash
 
 
@@ -121,7 +121,7 @@ def test_a_pool_of_each_engine_the_configuration_accepts_has_its_row(app_module:
     may name and that had no row would fail every synthesis of a configuration that names it."""
     from rhi.observability import grafana  # Imports the CDK: after `app_module`, as in `synthesize`.
 
-    (mock,) = EXAMPLE.pools
+    mock = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
     pools = tuple(dataclasses.replace(mock, name=f"on-{engine}", engine=engine) for engine in pool_config.ENGINES)
     context = Path(grafana.image_context(dataclasses.replace(EXAMPLE, pools=pools)))
     assert fleet_rows(context) == [f"on-{engine}" for engine in pool_config.ENGINES]

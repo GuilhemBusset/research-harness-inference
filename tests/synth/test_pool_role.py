@@ -47,8 +47,9 @@ def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any
 
 @pytest.fixture(scope="module")
 def role(pools: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """The mock pool's instance role: the one role EC2 may assume."""
-    (found,) = [
+    """The mock pool's instance role: of the roles EC2 may assume, one for each pool of the
+    example, the one tagged with its name."""
+    assumed_by_ec2 = [
         (name, properties)
         for name, properties in of_type(pools, "AWS::IAM::Role").items()
         if any(
@@ -56,6 +57,8 @@ def role(pools: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             for statement in properties["AssumeRolePolicyDocument"]["Statement"]
         )
     ]
+    assert len(assumed_by_ec2) == len(config.load({"RHI_CONFIG": "example"}).pools)
+    (found,) = [found for found in assumed_by_ec2 if {"Key": "rhi-pool", "Value": "mock"} in found[1]["Tags"]]
     return found
 
 
@@ -82,7 +85,15 @@ def test_the_role_is_the_mock_pools_and_the_launch_templates(
 ) -> None:
     name, properties = role
     assert {"Key": "rhi-pool", "Value": "mock"} in properties["Tags"]
-    (template,) = of_type(pools, "AWS::EC2::LaunchTemplate").values()
+    # The launch template whose instances are tagged with the pool's name.
+    (template,) = [
+        template
+        for template in of_type(pools, "AWS::EC2::LaunchTemplate").values()
+        if any(
+            {"Key": "rhi-pool", "Value": "mock"} in specification["Tags"]
+            for specification in template["LaunchTemplateData"]["TagSpecifications"]
+        )
+    ]
     profile = template["LaunchTemplateData"]["IamInstanceProfile"]["Arn"]["Fn::GetAtt"][0]
     assert of_type(pools, "AWS::IAM::InstanceProfile")[profile]["Roles"] == [{"Ref": name}]
 
@@ -139,7 +150,7 @@ def test_a_gpu_pools_role_is_under_the_gpu_pools_path_and_the_mock_pools_is_not(
     from rhi.pools.role import GPU_ROLE_PATH
 
     example = config.load({"RHI_CONFIG": "example"})
-    (mock,) = example.pools
+    mock = next(pool for pool in example.pools if pool.name == "mock")
     gpu = dataclasses.replace(
         mock,
         name="coursework",

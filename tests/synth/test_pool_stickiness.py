@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     import aws_cdk as cdk
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(MOCK,) = EXAMPLE.pools
+MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 
 
 def affinity(template: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -53,9 +53,9 @@ def test_every_pool_of_the_example_keeps_a_student_for_an_hour(
     stage = app.node.find_child("Rhi")
     stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
     path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
-    assert (MOCK.name, MOCK.stickiness_seconds) == ("mock", 3600)
+    assert [(pool.name, pool.stickiness_seconds) for pool in EXAMPLE.pools] == [("coursework", 3600), ("mock", 3600)]
     assert affinity(templates[path]) == [sticky_for(pool.stickiness_seconds) for pool in EXAMPLE.pools]
-    assert affinity(templates[path]) == [sticky_for(3600)]
+    assert affinity(templates[path]) == [sticky_for(3600), sticky_for(3600)]
 
 
 def test_each_pool_gets_its_own_duration(app_module: ModuleType) -> None:

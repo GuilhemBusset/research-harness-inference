@@ -114,15 +114,17 @@ def test_the_layout() -> None:
     written = StandIn()
     config.write_ssm(EXAMPLE, written)
     assert set(written.parameters) == {f"/rhi/config/{key}" for key in config.KEYS if key != "pools"} | {
-        "/rhi/config/pools/mock"
+        "/rhi/config/pools/coursework",
+        "/rhi/config/pools/mock",
     }
     assert {kind for kind, _ in written.parameters.values()} == {"String"}
     assert all(request["Name"].startswith("/rhi/config/") for _, request in written.calls)
     values = {name: value for name, (_, value) in written.parameters.items()}
     typed = example_parameters()
-    # The written entry holds every field the owner typed, and the defaults of section 17 too.
-    written_entry, typed_entry = (json.loads(each.pop("/rhi/config/pools/mock")) for each in (values, typed))
-    assert written_entry.items() >= typed_entry.items()
+    # A written entry holds every field the owner typed, and the defaults of section 17 too.
+    for pool in ("coursework", "mock"):
+        written_entry, typed_entry = (json.loads(each.pop(f"/rhi/config/pools/{pool}")) for each in (values, typed))
+        assert written_entry.items() >= typed_entry.items()
     assert values == typed
 
     # A parameter beside the prefix is never met: only the prefix is read, by path, to its last page.

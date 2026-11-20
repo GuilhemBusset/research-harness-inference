@@ -91,7 +91,7 @@ def test_one_internal_listener_on_port_80_with_a_default_404(pools: dict[str, An
 
 def test_four_post_rules_per_pool_by_its_header(pools: dict[str, Any]) -> None:
     rules = forwards(pools)
-    assert {pool.name for pool in EXAMPLE.pools} == {"mock"}
+    assert {pool.name for pool in EXAMPLE.pools} == {"coursework", "mock"}
     for pool in EXAMPLE.pools:
         mine = [rule for rule in rules if rule["pool"] == {pool.name}]
         assert len(mine) == 4
@@ -104,9 +104,12 @@ def test_four_post_rules_per_pool_by_its_header(pools: dict[str, Any]) -> None:
 
 
 def test_the_mock_pool_target_group(pools: dict[str, Any]) -> None:
-    (name, group), *others = of_type(pools, "AWS::ElasticLoadBalancingV2::TargetGroup").items()
-    assert others == []
-    assert {target["Ref"] for rule in forwards(pools) for target in rule["targets"]} == {name}
+    # One target group for each pool of the example; the mock pool's is the one its rules forward to.
+    groups = of_type(pools, "AWS::ElasticLoadBalancingV2::TargetGroup")
+    assert len(groups) == len(EXAMPLE.pools)
+    assert {target["Ref"] for rule in forwards(pools) for target in rule["targets"]} == set(groups)
+    (name,) = {target["Ref"] for rule in forwards(pools) if rule["pool"] == {"mock"} for target in rule["targets"]}
+    group = groups[name]
     assert (group["Port"], group["Protocol"], group["TargetType"]) == (8000, "HTTP", "instance")
     assert (group["HealthCheckPath"], group["HealthCheckPort"]) == ("/health", "8000")
     assert group["HealthCheckIntervalSeconds"] == 5

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-(EXAMPLE_MOCK,) = EXAMPLE.pools
+EXAMPLE_MOCK = next(pool for pool in EXAMPLE.pools if pool.name == "mock")
 MOCK = dataclasses.replace(EXAMPLE_MOCK, name="small")
 GPU_POOLS = tuple(
     dataclasses.replace(
