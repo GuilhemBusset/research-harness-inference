@@ -205,9 +205,10 @@ class Spike:
 
 
 def run_label(job: str, environ: Mapping[str, str]) -> str:
-    """The label of this run of the job `job`: `RHI_RUN_LABEL` when it is set and not empty, or else
-    the job's name with its underscores replaced by hyphens. ValueError for a label of another shape."""
-    label = environ.get(RUN_LABEL_VARIABLE) or job.replace("_", "-")
+    """The label of this run of the job `job`: `RHI_RUN_LABEL` when it is set, and only without it
+    the job's name with its underscores replaced by hyphens. ValueError for a label of another shape,
+    which an empty one is."""
+    label = environ.get(RUN_LABEL_VARIABLE, job.replace("_", "-"))
     if not _RUN_LABEL.fullmatch(label):
         raise ValueError("the run label is not lower-case letters, digits and hyphens")
     return label
