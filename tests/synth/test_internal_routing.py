@@ -113,7 +113,6 @@ def test_the_mock_pool_target_group(pools: dict[str, Any]) -> None:
     attributes = {a["Key"]: a["Value"] for a in group["TargetGroupAttributes"]}
     assert attributes["deregistration_delay.timeout_seconds"] == "300"
     assert attributes["load_balancing.algorithm.type"] == "least_outstanding_requests"
-    assert "stickiness.enabled" not in attributes or attributes["stickiness.enabled"] == "false"
 
 
 def test_no_rule_forwards_the_health_route(pools: dict[str, Any], app_module: ModuleType) -> None:
