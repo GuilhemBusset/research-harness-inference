@@ -6,6 +6,7 @@ here is a measurement; the instance names are made up.
 from __future__ import annotations
 
 import asyncio
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -500,3 +501,127 @@ def test_a_gateway_deployment_counts_only_when_it_replaced_a_task_after_the_stre
             asyncio.run(run.across_deployment())
     else:
         assert asyncio.run(run.across_deployment()) is survived
+
+
+def test_only_the_streams_in_flight_while_the_instance_left_are_across_the_scale_in() -> None:
+    gone = s7.Departure(s7.Path.TERMINATED, 20.0, "instance-a", asked_at=1000.0, stopped_at=1020.0)
+
+    def stream(began: float, ended: float, completed: bool = True) -> s7.Streamed:
+        return s7.Streamed(began, ended, s7.Answer(completed, over_as_begun=False, over_as_ended=True))
+
+    # Begun after the stop, while the job waited for the collector to stay silent: not across it.
+    assert s7.across_scale_in([stream(990.0, 999.0), stream(1115.0, 1116.0)], gone) is None
+    assert s7.across_scale_in([stream(999.0, 1001.0), stream(1115.0, 1116.0)], gone) is True
+    assert s7.across_scale_in([stream(1010.0, 1011.0, completed=False)], gone) is False
+    # No stop seen: nothing to be across.
+    assert s7.across_scale_in([stream(999.0, 1001.0)], s7.Departure(None, 900.0, asked_at=1000.0)) is None
+
+
+def test_a_stream_begun_after_the_measured_stop_does_not_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(s7.time, "time", lambda: 1115.0)
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+    pool = _TwoInstances(500.0, [(1000.3, 0.0), (1060.0, 0.0)])  # instance-a stopped by 1020
+
+    async def scenario() -> bool | None:
+        seen_over = asyncio.Event()
+
+        async def held(scope: Any, receive: Any, send: Any) -> None:
+            async def sent(message: Any) -> None:
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    await seen_over.wait()  # in flight, at 1115, when the stop is seen over
+                await send(message)
+
+            await engine(scope, receive, sent)
+
+        run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 60, transport=_Streaming(held))  # ty: ignore[invalid-argument-type] - a double
+        first = asyncio.create_task(run.departure(2, 1))
+        first.add_done_callback(lambda _: seen_over.set())
+        return await run.relay(first.done)
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_a_deployment_stream_opened_while_a_replacement_was_already_serving_is_not_measured() -> None:
+    on_new = {"task-a": (900.0, 1120.0), "task-b": (1010.0, 1400.0)}
+    assert s7.rollout_under({"task-a"}, on_new, 1020.0, 1300.0, 1400.0) is None
+    after_open = {"task-a": (900.0, 1120.0), "task-b": (1030.0, 1400.0)}
+    assert s7.rollout_under({"task-a"}, after_open, 1020.0, 1300.0, 1400.0) == 1120.0
+
+
+def _note(asked: int, at: int) -> ScalerNote:
+    return ScalerNote(pool="mock", capacity_asked=asked, no_capacity_at=None, written_at=at)
+
+
+def test_the_warm_count_of_a_departure_ends_before_the_next_decision() -> None:
+    assert s7.warm_bound(1, [_note(1, 1060), _note(1, 1120)], 1000.0) == math.inf
+    assert s7.warm_bound(1, [_note(1, 1060), _note(0, 1120), _note(0, 1180)], 1000.0) == 1060.0 + s7.NOTE_SECOND
+
+
+def test_a_warm_return_after_the_next_decision_is_not_the_earlier_departure_s(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1391.0]
+    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
+
+    class Pool(_TwoInstances):
+        def note(self) -> ScalerNote:
+            # The next decision, at 1300, came while instance-a, asked away at 1000, still drained.
+            return _note(1, 1000) if clock[0] < 1300 else _note(0, 1300)
+
+        def writes(self, start: float, end: float) -> dict[str, float]:
+            return {"instance-a": min(end, 1300.0), "instance-b": min(end, 1360.0)}
+
+    async def scenario() -> s7.Departure:
+        clock[0] = 1000.0
+        pool: Any = Pool(500.0, [(1000.4, 0.0), (1300.4, 0.0), (1360.4, 1.0)])
+        settings: Any = SimpleNamespace()
+        run = s7.Run(pool, "http://gateway", [generate_key()], settings, 1, 60)
+
+        async def wait(condition: Any, seconds: float, what: str, *arguments: Any) -> None:
+            if what == "an instance to stop":
+                clock[0] = 1391.0
+            assert condition()
+
+        monkeypatch.setattr(s7, "_wait", wait)
+        return await run.departure(2, 1)
+
+    departure = asyncio.run(scenario())
+    assert (departure.instance, departure.path) == ("instance-a", None)
+
+
+class _Workspace:
+    """A workspace whose samples of one gauge are `samples`, which become `later` once read."""
+
+    def __init__(self, samples: list[tuple[float, float]], later: list[tuple[float, float]] | None = None) -> None:
+        self.samples, self.later = samples, later
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        found, at = [], start
+        while at <= end:
+            seen = [(stamp, value) for stamp, value in self.samples if stamp <= at]
+            if seen:
+                found.append((at, seen[-1][0] if query.startswith("timestamp(") else seen[-1][1]))
+            at += step
+        if self.later is not None:
+            self.samples, self.later = self.later, None
+        return [common.Series({"pool": "mock"}, tuple(found))]
+
+
+def test_a_reading_is_its_own_value_at_its_own_time() -> None:
+    # A newer reading becomes visible between the queries: its time is not paired with the old value.
+    workspace = _Workspace([(1000.4, 0.0)], later=[(1000.4, 0.0), (1119.5, 1.0)])
+    pool = s7.Pool("mock", workspace, None)  # ty: ignore[invalid-argument-type] - a double
+    assert pool.warm_counts(880.0, 1120.0) == [(1000.4, 0.0)]
+    assert pool.warm_counts(880.0, 1120.0) == [(1000.4, 0.0), (1119.5, 1.0)]
+
+
+def test_a_gauge_older_than_the_scaler_s_note_is_not_its_last_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1001.0]
+    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
+    note = [_note(0, 1000)]
+    table = SimpleNamespace(get_item=lambda **arguments: {"Item": note[0].to_item()})
+    # Zero in service, read at 940, before a wake: the note asking for none is newer.
+    pool = s7.Pool("mock", _Workspace([(940.3, 0.0)]), table)  # ty: ignore[invalid-argument-type] - a double
+    assert pool.gauge(s7.INSTANCES_IN_SERVICE) is None
+    clock[0], note[0] = 1065.0, _note(0, 1060)
+    pool = s7.Pool("mock", _Workspace([(940.3, 0.0), (1000.3, 1.0), (1060.3, 0.0)]), table)  # ty: ignore[invalid-argument-type] - a double
+    assert pool.gauge(s7.INSTANCES_IN_SERVICE) == 0
