@@ -6,6 +6,7 @@ are local fakes; no number is a measurement.
 from __future__ import annotations
 
 import dataclasses
+import http.client
 import importlib.util
 import json
 import re
@@ -18,6 +19,7 @@ import urllib.request
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -27,8 +29,9 @@ import s2_client_hold as s2
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
 from rhi_common.spike_keys import SpikeKeys
+from rhi_gateway.errors import WireFormat, render_stream_event
 from rhi_mock_engine.app import _responses_events, _turn
-from rhi_reporter.measure import Run, Verdict, measurement_event
+from rhi_reporter.measure import BUS_VARIABLE, Run, Verdict, measurement_event, read_event
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -183,7 +186,7 @@ def test_a_client_s_outcome_is_its_request_s() -> None:
 
 
 def test_a_hold_counts_only_just_under_its_deadline() -> None:
-    request = exchange(Client.CLAUDE_CODE, Kind.STREAM, MARKER, sent_at=100.0)
+    request = exchange(Client.CLAUDE_CODE, Kind.STREAM, MARKER, sent_at=100.0, status=200, completed=True)
     assert s2.exercised(request, 100.0 + 400, 420)
     assert not s2.exercised(request, 100.0 + 420, 420)  # the gateway ended it at its deadline
     assert not s2.exercised(request, 100.0 + 300, 420)  # a pool ready too soon
@@ -349,6 +352,115 @@ def test_the_forwarder_sees_a_whole_responses_stream_end_in_one_read() -> None:
                 assert answer.read() == payload
         (whole,) = forwarder.recorded()
     assert whole.completed and whole.closed_at is None
+
+
+class RawGateway(BaseHTTPRequestHandler):
+    """Holds a stream with a keep-alive, then does what `ends` says: the gateway's own error event
+    at the end of its hold, nothing at all (the connection closed before any header), or a stream
+    the client gives up on. The forwarder's clock is `NOW`, which the gateway moves."""
+
+    ends: bytes | None = None
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers["Content-Length"]))
+        if self.ends is None:
+            return  # closed before any header
+        NOW[0] = 400.0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b": keep-alive\n\n")
+        self.wfile.flush()
+        if self.ends:
+            self.wfile.write(self.ends)
+        else:
+            time.sleep(1.0)  # a client that gives up closes first
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+NOW = [0.0]
+
+
+@pytest.mark.parametrize(
+    ("client", "ends"),
+    [
+        (Client.CLAUDE_CODE, render_stream_event(Cause.WARMING, WireFormat.MESSAGES)),
+        (Client.CODEX_PROFILE, render_stream_event(Cause.WARMING, WireFormat.RESPONSES)),
+        (Client.OPENAI_SDK, render_stream_event(Cause.WARMING, WireFormat.CHAT_COMPLETIONS)),
+        (Client.CODEX_PROFILE, None),
+        (Client.CODEX_DEFAULT, b""),
+    ],
+    ids=["messages-error", "responses-failed", "chat-error", "closed-unanswered", "client-gives-up"],
+)
+def test_only_a_request_the_client_ended_is_a_hold(client: s2.Client, ends: bytes | None) -> None:
+    NOW[0] = 0.0
+    handler = type("Handler", (RawGateway,), {"ends": ends})
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as gateway:
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        try:
+            with s2.Forwarder(f"http://127.0.0.1:{gateway.server_port}", "mock", clock=lambda: NOW[0]) as forwarder:
+                body = json.dumps({"model": "mock", "stream": True, "input": f"Reply. {MARKER}"}).encode()
+                request = urllib.request.Request(f"{forwarder.url}{s2.ROUTE_OF[client]}", data=body)
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as answer:
+                        answer.read(1 if ends == b"" else -1)
+                except (OSError, http.client.HTTPException):
+                    pass  # the gateway closed it unanswered
+                time.sleep(0.5)
+            (held,) = forwarder.recorded()
+        finally:
+            gateway.shutdown()
+    # The pool became ready just under the stream's deadline, 7 minutes after the request.
+    if ends == b"":
+        assert held.closed_at is not None
+        assert s2.exercised(held, 410.0, 420)
+        assert s2.hold_outcome(client, Kind.STREAM, "1.0.0", s2.Attempt(1, "", 500.0), held).seconds_before_giving_up
+    else:
+        assert not s2.ended_by_client(held)
+        assert not s2.exercised(held, 410.0, 420)
+        assert held.cause == (None if ends is None else Cause.WARMING)
+
+
+def test_two_builds_of_one_commit_post_apart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("record", RECORD.parents[2] / "tools" / "measurements" / "record.py")
+    assert spec is not None and spec.loader is not None
+    record = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(record)
+    statuses: list[dict[str, str]] = []
+
+    class Events:
+        def put_events(self, *, Entries: list[dict[str, str]]) -> dict[str, int]:
+            for entry in Entries:
+                for status in read_event({"detail": json.loads(entry["Detail"])}):
+                    when = f"2026-11-20T18:00:{len(statuses):02d}Z"
+                    statuses.append({"context": status.context, "state": status.state,
+                                     "description": status.description, "created_at": when})  # fmt: skip
+            return {}
+
+    pool = SimpleNamespace(name="mock", engine="mock", start_delay_seconds=380, hold_seconds=420,
+                           hold_seconds_non_streaming=240)  # fmt: skip
+    monkeypatch.setattr(s2.config, "read_ssm", lambda: SimpleNamespace(pools=[pool]))
+    monkeypatch.setattr(s2.common, "canary_keys", lambda: SpikeKeys(tuple(generate_key() for _ in Client), generate_key()))
+    monkeypatch.setattr(s2.common.boto3, "client", lambda name: Events())
+    monkeypatch.setattr(s2.harnesses, "install", lambda folder: {})
+    monkeypatch.setattr(s2.harnesses, "versions", lambda binaries: VERSIONS)
+    measured = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
+    environ = {"RHI_SPIKE_ENDPOINT": "https://example.com", BUS_VARIABLE: "bus", s2.common.COMMIT_VARIABLE: "a" * 40}
+
+    # A measured build, then one that was not measured, of the same commit and environment.
+    monkeypatch.setattr(s2.Run, "measure", lambda run: measured)
+    assert s2.main(environ) is Verdict.PASS
+    monkeypatch.setattr(s2.Run, "measure", lambda run: (_ for _ in ()).throw(s2.NotExercised("no hold")))
+    with pytest.raises(s2.NotExercised):
+        s2.main(environ)
+    runs = sorted(record.runs_of(statuses, "a" * 40), key=lambda found: found[0].verdict is Verdict.NOT_MEASURED)
+    assert [run.verdict for run, _ in runs] == [Verdict.PASS, Verdict.NOT_MEASURED]
+    assert runs[0][0].numbers == measured
+    assert runs[0][0].label != runs[1][0].label
+    # A label the owner gives is the run's.
+    assert s2.build_label({s2.common.RUN_LABEL_VARIABLE: "profile"}) == "profile"
 
 
 def test_a_client_s_home_is_what_rhi_login_writes(tmp_path: Path) -> None:
