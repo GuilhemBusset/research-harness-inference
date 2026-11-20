@@ -265,13 +265,19 @@ class _Table:
         return {"Item": ScalerNote(Key["pool"], self.asked, None, 1000, number).to_item()}
 
 
+def _scaler_wrote(query: str, end: float, in_service: int) -> tuple[tuple[float, float], ...]:
+    """The scaler's gauge of the instances in service, written at `end`: its value, or when it was
+    written for a query of its `timestamp()`."""
+    return ((end, end),) if query.startswith("timestamp(") else ((end, in_service),)
+
+
 class _Workspace:
     """A workspace in which instance-a and instance-b both wrote a sample just now, and the scaler
     read both in service."""
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
         if s8.INSTANCES_IN_SERVICE in query:
-            return [common.Series({"pool": "mock"}, ((end, 2),))]
+            return [common.Series({"pool": "mock"}, _scaler_wrote(query, end, 2))]
         return [common.Series({"instance": one}, ((end, end),)) for one in ("instance-a", "instance-b")]
 
 
@@ -334,7 +340,7 @@ class _Scaling:
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
         if s8.INSTANCES_IN_SERVICE in query:
-            return [common.Series({"pool": "mock"}, ((end, 1 if self.clock.now >= self.scales_in else 2),))]
+            return [common.Series({"pool": "mock"}, _scaler_wrote(query, end, 1 if self.clock.now >= self.scales_in else 2))]
         latest = {"instance-a": end, "instance-b": min(end, self.stops_writing)}
         return [common.Series({"instance": one}, ((end, at),)) for one, at in latest.items()]
 
@@ -408,7 +414,7 @@ class _Launching:
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
         if s8.INSTANCES_IN_SERVICE in query:
-            return [common.Series({"pool": "mock"}, ((end, 2 if self.clock.now >= self.in_service_at else 1),))]
+            return [common.Series({"pool": "mock"}, _scaler_wrote(query, end, 2 if self.clock.now >= self.in_service_at else 1))]
         if query.startswith("sum("):
             return [common.Series({}, ((end, 0.0),))]
         samples = ((end, end),) if query.startswith("timestamp(") else ((start, 0.0), (end, 20.0))
@@ -529,7 +535,7 @@ class _Draining(_Scaling):
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
         if s8.INSTANCES_IN_SERVICE in query:
-            return [common.Series({"pool": "mock"}, ((end, 1 if self.clock.now >= self.leaves else 2),))]
+            return [common.Series({"pool": "mock"}, _scaler_wrote(query, end, 1 if self.clock.now >= self.leaves else 2))]
         return super().read_series(query, start=start, end=end, step=step)
 
 
@@ -611,3 +617,64 @@ def test_a_miscounted_window_is_never_made_up_by_another() -> None:
     counts = s8.with_openings({"instance-b": 1}, windows, dict.fromkeys(s8.STUDENTS, False))
     with pytest.raises(s8.Disturbed):
         s8.measure_undisturbed(Phase.BEFORE, lambda: counts, lambda: 0, attempts=1, log=lambda _: None)
+
+
+def test_scale_out_requires_a_current_in_service_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1000.0
+    written = now - s8.FRESH_SECONDS - 15
+    monkeypatch.setattr(s8.time, "time", lambda: now)
+
+    class Lookback:
+        """Both collectors write; a range query still returns the scaler's last gauge, at each step's
+        own time, from before the freshness window."""
+
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if s8.INSTANCES_IN_SERVICE not in query:
+                return [common.Series({"instance": one}, ((end, now),)) for one in ("instance-a", "instance-b")]
+            if query.startswith("timestamp("):
+                return [common.Series({"pool": "mock"}, ((end, written),))]
+            return [common.Series({"pool": "mock"}, ((start, 2.0), (end, 2.0)))]
+
+    pool = s8.Pool("mock", Lookback(), _Table(2, 0))  # ty: ignore[invalid-argument-type] - a test double
+    with pytest.raises(s8.Unseen):
+        pool.present()
+    written = now
+    assert pool.present() == {"instance-a", "instance-b"}
+
+
+def test_scale_out_ends_only_with_exactly_two_in_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    poll, stopped_at = 0, []
+
+    class Three:
+        """Three instances in service at the first look, two after; only two streamed."""
+
+        name = "mock"
+
+        def present(self) -> set[str]:
+            return {"instance-a", "instance-b", "instance-c"} if poll == 1 else {"instance-a", "instance-b"}
+
+        def serving(self) -> dict[str, str]:
+            return {"instance-a": "zone-1", "instance-b": "zone-2"}
+
+        def busy(self) -> int:
+            return 0
+
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+        await load.sessions[0].stop.wait()  # ty: ignore[unresolved-attribute] - the load's held streams
+        stopped_at.append(poll)
+        return []
+
+    async def wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
+        nonlocal poll
+        for _ in range(3):
+            poll += 1
+            await asyncio.sleep(0)
+            if condition():
+                return
+        raise TimeoutError(what)
+
+    monkeypatch.setattr(s8.loadgen, "replay", held)
+    monkeypatch.setattr(s8, "_wait", wait)
+    run = s8.Run(Three(), "https://gateway.example.com", [generate_key()] * 8, 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+    assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
+    assert stopped_at == [2]
