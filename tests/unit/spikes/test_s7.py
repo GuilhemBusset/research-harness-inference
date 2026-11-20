@@ -265,12 +265,66 @@ def test_the_warm_baseline_is_the_reading_the_scaler_decided_on() -> None:
     assert s7.warm_around(went_warm, 1000.0) == (0, 1)
 
 
+class _Streaming(httpx.AsyncBaseTransport):
+    """An ASGI transport that hands the client each part of an answer as the app sends it, as a
+    connection does: httpx's own hands over the whole answer once the app has returned. `read` is
+    set once the client has a part of the answer."""
+
+    def __init__(self, app: Any) -> None:
+        self.app, self.read = app, asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = b"".join([part async for part in request.stream])  # ty: ignore[not-iterable] - an async stream
+        parts: asyncio.Queue[bytes | None] = asyncio.Queue()
+        started: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": request.method,
+            "headers": [(name.lower(), value) for name, value in request.headers.raw], "scheme": "http",
+            "path": request.url.path, "raw_path": request.url.raw_path, "query_string": request.url.query,
+            "server": ("gateway", 80), "client": ("127.0.0.1", 1), "root_path": "",
+        }  # fmt: skip
+        received = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal received
+            if not received:
+                received = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await asyncio.Event().wait()  # the client stays until the answer ends
+            return {"type": "http.disconnect"}
+
+        async def send(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                started.set_result(message)
+            elif message["type"] == "http.response.body":
+                parts.put_nowait(message.get("body", b""))
+                if not message.get("more_body", False):
+                    parts.put_nowait(None)
+
+        app = asyncio.ensure_future(self.app(scope, receive, send))
+        start = await started
+        transport = self
+
+        class Parts(httpx.AsyncByteStream):
+            async def __aiter__(self) -> Any:
+                while (part := await parts.get()) is not None:
+                    if part:
+                        transport.read.set()
+                        yield part
+
+            async def aclose(self) -> None:
+                app.cancel()
+
+        return httpx.Response(start["status"], headers=start.get("headers", []), stream=Parts())
+
+
 def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatch: pytest.MonkeyPatch) -> None:
     key, happened = generate_key(), []
     engine = create_app(Settings(secret=key))
 
     async def scenario() -> bool | None:
         answering, departed = asyncio.Event(), asyncio.Event()
+        transport = _Streaming(None)
 
         async def recorded(scope: Any, receive: Any, send: Any) -> None:
             async def sent(message: Any) -> None:
@@ -295,14 +349,15 @@ def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatc
                 await after
                 return s7.Departure(s7.Path.WARM_POOL, 60.0, "instance-b")
             try:
-                await asyncio.wait_for(answering.wait(), 1)
+                # The client has the first part of the answer: its inference has begun.
+                await asyncio.wait_for(transport.read.wait(), 1)
             except TimeoutError:
                 pass
             happened.append("scale-in")
             departed.set()
             return s7.Departure(s7.Path.TERMINATED, 60.0, "instance-a")
 
-        transport = httpx.ASGITransport(app=recorded)
+        transport.app = recorded
         pool: Any = SimpleNamespace(name="mock")
         settings: Any = SimpleNamespace(idle_minutes=0)
         run = s7.Run(pool, "http://gateway", [key], settings, 1, 60, transport=transport)
@@ -313,3 +368,135 @@ def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatc
     assert asyncio.run(scenario()) is True
     # A request was being answered when the instance left, and its answer ended after.
     assert happened[:3] == ["answering", "scale-in", "answered"]
+
+
+def test_a_scale_in_seen_over_between_two_streams_is_not_a_stream_across_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+
+    async def scenario() -> tuple[bool | None, int]:
+        answered, departed = asyncio.Event(), asyncio.Event()
+        streams = 0
+
+        async def gateway(scope: Any, receive: Any, send: Any) -> None:
+            nonlocal streams
+            streams += 1
+            if answered.is_set():
+                # The next stream is held at the gateway until the instance has left.
+                await departed.wait()
+
+            async def sent(message: Any) -> None:
+                await send(message)
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    answered.set()
+
+            await engine(scope, receive, sent)
+
+        async def nothing() -> None:
+            pass
+
+        async def departure(asked: int, wait: float, after: Any = None) -> s7.Departure:
+            if after is not None:
+                await after
+                return s7.Departure(s7.Path.WARM_POOL, 60.0, "instance-b")
+            await asyncio.wait_for(answered.wait(), 1)
+            departed.set()
+            return s7.Departure(s7.Path.TERMINATED, 60.0, "instance-a")
+
+        pool: Any = SimpleNamespace(name="mock")
+        settings: Any = SimpleNamespace(idle_minutes=0)
+        run = s7.Run(pool, "http://gateway", [key], settings, 1, 60, transport=_Streaming(gateway))
+        monkeypatch.setattr(run, "two_instances", nothing)
+        monkeypatch.setattr(run, "departure", departure)
+        return await run.cycle(scale_in_stream=True), streams
+
+    # The first stream ended before the scale-in, the second began after: neither spanned it.
+    assert asyncio.run(scenario()) == (None, 2)
+
+
+class _TwoInstances:
+    """A pool where instance-a, writing when the scaler asked for fewer at 1000, last wrote at
+    1005, and instance-b writes from `b_from` on, and whose warm count the scaler read as `warm`."""
+
+    name = "mock"
+
+    def __init__(self, b_from: float, warm: list[tuple[float, float]]) -> None:
+        self.b_from, self.warm = b_from, warm
+
+    def note(self) -> ScalerNote:
+        return ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=1000)
+
+    def writes(self, start: float, end: float) -> dict[str, float]:
+        found = {"instance-a": min(end, 1005.0)}
+        if end >= self.b_from:
+            found["instance-b"] = min(end, 1115.0)
+        return found
+
+    def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
+        return self.warm
+
+
+@pytest.mark.parametrize(
+    ("b_from", "warm", "path"),
+    [
+        # The decision run's own reading is the baseline.
+        (500.0, [(940.0, 1.0), (1000.3, 1.0), (1060.0, 1.0)], s7.Path.TERMINATED),
+        (500.0, [(940.0, 1.0), (1000.3, 1.0), (1060.0, 2.0)], s7.Path.WARM_POOL),
+        # Its push was lost: one warm instance read before may have left and been replaced.
+        (500.0, [(940.0, 1.0), (1060.0, 1.0)], None),
+        # An empty warm pool read before has none to lose.
+        (500.0, [(940.0, 0.0), (1060.0, 1.0)], s7.Path.WARM_POOL),
+        # Unless an instance new since that reading may have filled it.
+        (980.0, [(940.0, 0.0), (1060.0, 1.0)], None),
+    ],
+)
+def test_the_path_is_told_only_from_the_warm_count_the_decision_was_made_on(
+    monkeypatch: pytest.MonkeyPatch, b_from: float, warm: list[tuple[float, float]], path: s7.Path | None
+) -> None:
+    monkeypatch.setattr(s7.time, "time", lambda: 1120.0)
+    run = s7.Run(_TwoInstances(b_from, warm), "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
+    departure = asyncio.run(run.departure(2, 1))
+    assert (departure.instance, departure.path) == ("instance-a", path)
+
+
+@pytest.mark.parametrize(
+    ("old_last", "new_first", "query_seconds", "survived"),
+    [
+        # The old task was replaced while the job read the tasks, before the stream opened.
+        (1005.0, 1010.0, 25.0, None),
+        # It was replaced while the stream was held.
+        (1200.0, 1100.0, 0.0, True),
+    ],
+)
+def test_a_gateway_deployment_counts_only_when_it_replaced_a_task_after_the_stream_opened(
+    monkeypatch: pytest.MonkeyPatch, old_last: float, new_first: float, query_seconds: float, survived: bool | None
+) -> None:
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+    clock = [1000.0]
+    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
+
+    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
+        if end == 1000.0:
+            clock[0] += query_seconds
+        found = {"task-a": (900.0, min(end, old_last))}
+        if end >= new_first:
+            found["task-b"] = (new_first, end)
+        return found
+
+    async def gateway(scope: Any, receive: Any, send: Any) -> None:
+        async def held() -> Any:
+            message = await receive()
+            if not message.get("more_body", False):
+                clock[0] = 1400.0  # the stream is let go, long after
+            return message
+
+        await engine(scope, held, send)
+
+    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
+    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
+    if survived is None:
+        with pytest.raises(RuntimeError, match="no gateway deployment"):
+            asyncio.run(run.across_deployment())
+    else:
+        assert asyncio.run(run.across_deployment()) is survived
