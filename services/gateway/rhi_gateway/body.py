@@ -17,7 +17,9 @@ rewrites a few fields and sends its own serialization of the result. The order i
 6. **Write the gateway's own fields**, whatever the client sent and whatever the allow-list
    names: `model` is the pool's name, the name the engine serves the model under (section 4.2);
    `request_id` is the gateway's ID for the request; `cache_salt` is derived from the student, so
-   that one student's cached prefixes cannot be probed by another (section 6.6).
+   that one student's cached prefixes cannot be probed by another (section 6.6). A pool whose
+   `cache_salt_scope` is `class` asked for the other side of that trade (section 4.7): its salt is
+   derived from the pool's name alone, so that its students share the prefixes they have in common.
 7. **Apply the pool's request profile**: the rewrite given under the pool's name gets the
    filtered body and returns the body to send. It is the pool's profile on this filter's route
    (`rhi_gateway.profile`): the entries the pool's configuration names, in that order, built when
@@ -87,6 +89,8 @@ _STORED_FILE_FIELD = "file_id"
 _INLINE_SCHEME = "data:"
 # Separates this use of SHA-256 from any other use of a student's identifier.
 _SALT_LABEL = b"rhi-gateway cache salt v1\x00"
+# Another label, which is no start of the first: no student's identifier gives a class's salt.
+_CLASS_SALT_LABEL = b"rhi-gateway class cache salt v1\x00"
 
 
 class Limit(StrEnum):
@@ -246,6 +250,21 @@ def cache_salt(student: str) -> str:
     return hashlib.sha256(_SALT_LABEL + student.encode("utf-8")).hexdigest()
 
 
+def class_cache_salt(pool_name: str) -> str:
+    """The cache salt of a pool's class: one value for every student of the pool.
+
+    It is derived from the pool's name and from nothing else: no student, no request, and nothing
+    of the process that computes it. Every gateway task therefore writes the same salt, and the
+    salt says nothing about any student. Another pool has another.
+    """
+    return hashlib.sha256(_CLASS_SALT_LABEL + pool_name.encode("utf-8")).hexdigest()
+
+
+def _salt(pool: Pool, student: str) -> str:
+    """The salt of a request: the pool's own when its scope is the class, the student's otherwise."""
+    return class_cache_salt(pool.name) if pool.cache_salt_scope == "class" else cache_salt(student)
+
+
 def _clamp(value: Any, limit: int) -> Any:
     if value is None:
         return None
@@ -366,7 +385,7 @@ class BodyFilter:
         try:
             kept = _keep(body, self.allow_list, pool)
             _refuse_references(kept, self.allow_list)
-            own = {MODEL_FIELD: pool.name, REQUEST_ID_FIELD: request_id, CACHE_SALT_FIELD: cache_salt(student)}
+            own = {MODEL_FIELD: pool.name, REQUEST_ID_FIELD: request_id, CACHE_SALT_FIELD: _salt(pool, student)}
             kept.update(own)
             profile = self.profiles.get(pool.name)
             if profile is not None:

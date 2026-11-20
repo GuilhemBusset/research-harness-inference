@@ -140,6 +140,8 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
         # The pool's request profile and its effort mapping reach the gateway with the rest.
         "request_profile": ["second_entry", "first_entry"],
         "reasoning_effort": {"medium": "medium", "high": "xhigh"},
+        # And so does the scope of its cache salt.
+        "cache_salt_scope": "class",
     }
     loaded = parse_pools({"mock": MOCK, "coursework": vllm}, on_demand_price_limit=10)
     written = json.dumps({pool.name: config.pool_entry(pool) for pool in loaded})
@@ -156,6 +158,7 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
     assert settings.pools[1].request_profile == ("second_entry", "first_entry")
     assert settings.pools[1].reasoning_effort == {"medium": "medium", "high": "xhigh"}
     assert (settings.pools[0].request_profile, settings.pools[0].reasoning_effort) == ((), None)
+    assert [pool.cache_salt_scope for pool in settings.pools] == ["student", "class"]
 
 
 def test_an_environment_with_no_pool_gives_settings_with_no_pool_and_no_default_pool() -> None:
