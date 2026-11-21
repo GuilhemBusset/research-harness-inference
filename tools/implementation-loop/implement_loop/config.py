@@ -12,9 +12,6 @@ SHARED_FILES = frozenset({
 })
 SHARED_PREFIXES = (".github/workflows/", ".githooks/")
 
-# Files that can change how tests run without touching a test file.
-TEST_CONFIG_NAMES = frozenset({"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"})
-
 # Paths a builder changes only with the examiner's approval (a `protected_change` request),
 # unless the issue's own text names them: the loop's machinery, the repository's gates, the
 # invariants written as tests (ADR 0001, decision 10), and the agents' own configuration: a hook

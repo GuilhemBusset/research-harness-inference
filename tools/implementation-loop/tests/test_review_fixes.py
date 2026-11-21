@@ -18,7 +18,7 @@ from unittest import mock
 
 from helpers import HAS_PYTEST, SHIP, git, issue_body, present
 from implement_loop import VERSION, gate, verify
-from implement_loop.agents import Decision, FakeAgents, Objection, Probe, Request, Script
+from implement_loop.agents import FakeAgents, Objection, Probe, Request, Script
 from implement_loop.config import Caps, Config
 from implement_loop.engine import Engine
 from implement_loop.graph import build_plan
@@ -62,14 +62,6 @@ class Agents(FakeAgents):
             return super().decide(vendor, req, worktree, requests)
         self.calls.append(("decide", vendor, req.issue.number, tuple(r["id"] for r in requests)))
         return self._metered(req.issue.number, "decide", vendor, lambda: self.hooks["decide"](requests))
-
-
-def with_zone(path):
-    """A plan hook: the plan also claims `path`."""
-    def hook(result, req):
-        result.zones = sorted(set(result.zones) | {path})
-        return result
-    return hook
 
 
 def is_revert(req) -> bool:
@@ -230,96 +222,44 @@ class Finding02RevertGates(FixCase):
         self.assertFalse(self.revert_prs()[0]["merged"])
 
 
-class Finding03DeltaAfterAdoption(FixCase):
-    def test_3_the_lock_commit_makes_a_new_head_that_a_delta_examination_certifies(self):
+class Finding03CertifiedHeadLands(FixCase):
+    def test_3_the_examined_head_is_certified_and_lands_with_no_lock_commit(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        certified = []
-        real = Engine._set_phase
-
-        def watch(engine, n, phase, **changes):
-            result = real(engine, n, phase, **changes)
-            sha = engine.store.issue(n).certified_sha
-            if sha and sha not in certified:
-                certified.append(sha)
-            return result
-        with mock.patch.object(Engine, "_set_phase", watch):
-            self.run_engine()
+        self.run_engine()
         self.assertEqual(self.phase(2), Phase.DONE)
-        examined = self.events("examined", 2)
-        locked = self.events("tests_locked", 2)[0]["sha"]
-        self.assertEqual(examined[1]["head"], locked, "the head the lock commit made was examined itself")
-        self.assertEqual([c[3] for c in self.agents.calls if c[0] == "examine"], [False, True], "a delta examination")
-        self.assertTrue(certified)
-        self.assertTrue(set(certified) <= {e["head"] for e in examined}, "certified_sha only ever equals an examined head")
-        self.assertEqual(self.events("merged", 2)[0]["head"], locked)
+        [examined] = self.events("examined", 2)
+        self.assertEqual(self.events("merged", 2)[0]["head"], examined["head"], "one examination, of the head that lands")
+        bodies = git("log", "--format=%B", "origin/feat/issue-2", cwd=self.repo.work)
+        self.assertNotIn("acceptance-checks", bodies, "nothing is locked")
 
 
-class Finding04TestsOutsideZones(FixCase):
-    def test_4_a_test_the_builder_lists_outside_its_zones_is_a_zone_problem(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.epic(2)
-        stray = "elsewhere/check_2.sh"
-
-        def list_a_stray_test(result, req, worktree, k):
-            if k == 0:
-                (worktree / "elsewhere").mkdir(exist_ok=True)
-                (worktree / stray).write_text("#!/usr/bin/env bash\ntrue\n")
-                result.tests = result.tests + [stray]
-            elif (worktree / stray).exists():
-                (worktree / stray).unlink()   # the builder takes it back after the zone problem
-            return result
-        self.run_engine(agents=Agents(self.scripts, build=list_a_stray_test))
-        first = self.events("verified", 2)[0]
-        self.assertFalse(first["ok"])
-        self.assertTrue(any("outside the plan's zones" in p and stray in p for p in first["problems"]), first["problems"])
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertIsNone(self.repo.main_file(stray))
-
-
-class Finding05UnlistedCommandTests(FixCase):
-    def test_5_a_test_a_command_runs_is_locked_even_when_the_builder_does_not_list_it(self):
-        extra = "checks/extra_2.sh"
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-
-        def run_an_unlisted_test(result, req, worktree, k):
-            (worktree / extra).write_text("#!/usr/bin/env bash\ntest -s docs/a.txt\n"
-                                          if k == 0 else "#!/usr/bin/env bash\nexit 0\n")   # then it weakens it
-            result.commands = [CheckSpec(c.criterion, command=c.command + f" && bash {extra}") for c in result.commands]
-            self.assertNotIn(extra, result.tests)
-            return result
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(extra), build=run_an_unlisted_test))
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertIn(extra, self.events("tests_locked", 2)[0]["locked"])
-        self.assertIn(extra, self.store.issue(2).tests)
-        self.assertIn(f"Loop-Locks: {extra}", git("log", "--format=%B", "origin/feat/issue-2", cwd=self.repo.work))
-        self.assertTrue(any(extra in e["files"] for e in self.events("locked_changes_reverted", 2)))
-        self.assertIn("test -s docs/a.txt", present(self.repo.main_file(extra)), "the weakened test never landed")
-
-
-class Finding06CommandCwd(FixCase):
-    def test_6_changing_a_locked_commands_cwd_is_a_request_the_other_vendor_decides(self):
+class Finding06CommandsChangeDirectly(FixCase):
+    def test_6_a_changed_command_runs_from_the_next_verification_with_no_request(self):
         self.add_work(2, "docs/a.txt", "alpha", findings=1)
         self.epic(2)
 
         def move_the_command(result, req, worktree, k):
-            if k >= 1:   # after the first examination locked the command
-                result.commands = [CheckSpec(c.criterion, command=c.command, cwd="docs") if c.criterion == "D1" else c
-                                   for c in result.commands]
+            if k >= 1:   # after the first examination
+                result.commands = [CheckSpec(c.criterion, command="cd .. && bash checks/issue_2.sh", cwd="docs")
+                                   if c.criterion == "D1" else c for c in result.commands]
             return result
-        agents = Agents(self.scripts, build=move_the_command,
-                        decide=lambda requests: [Decision(r["id"], False, "the test reads repo-relative paths")
-                                                 for r in requests])
+        agents = Agents(self.scripts, build=move_the_command)
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         st = self.store.issue(2)
-        change = [r for r in st.requests if r["kind"] == "command_change"]
-        self.assertEqual(len(change), 1)
-        self.assertEqual((change[0]["item"], change[0]["commands"][0]["cwd"], change[0]["status"]), ("D1", "docs", "refused"))
-        self.assertIn(change[0]["id"], [i for c in agents.calls if c[0] == "decide" for i in c[3]])
+        self.assertEqual(st.requests, [])
+        self.assertFalse([c for c in agents.calls if c[0] == "decide"])
         d1 = [c for c in st.commands if c["criterion"] == "D1" and c.get("author") == "builder"]
-        self.assertEqual([c["cwd"] for c in d1], ["."], "the locked command kept its directory")
+        self.assertEqual([(c["command"], c["cwd"]) for c in d1], [("cd .. && bash checks/issue_2.sh", "docs")])
+
+    def test_6_a_request_an_earlier_engine_kept_is_refused_with_its_reason(self):
+        self.add_work(2, "docs/a.txt", "alpha")
+        self.epic(2)
+        engine = self.make_engine()
+        st = engine.store.issue(2)
+        for kind in ("paths", "command_change", "test_change"):
+            self.assertIn(f"no longer takes `{kind}` requests", engine._engine_refusal(st, {"kind": kind}) or "")
 
 
 class Finding07InRunPrerequisite(FixCase):
@@ -444,7 +384,7 @@ class Finding10OwnerAgentPart(FixCase):
             return result
         self.run_engine(agents=Agents(self.scripts, examine=no_verdict_on_d2))
         self.assertEqual(self.phase(2), Phase.DELIVERED)
-        self.assertEqual([e["missing"] for e in self.events("examined", 2)], [[], []])
+        self.assertEqual([e["missing"] for e in self.events("examined", 2)], [[]])
         self.assertFalse(self.events("examination_incomplete", 2) or self.events("round_failed", 2))
         self.assertEqual([o["item"] for o in self.store.issue(2).obligations], ["D2"])
 
@@ -462,71 +402,6 @@ class Finding10OwnerAgentPart(FixCase):
         self.assertEqual(self.phase(2), Phase.DELIVERED)
         self.assertFalse(self.events("examination_incomplete", 2))
         self.assertTrue(any(e["criterion"] == "D2" and e["passed"] for e in self.store.issue(2).evidence))
-
-
-class Finding11EarlyConftest(FixCase):
-    def test_11_a_conftest_added_before_the_first_examination_is_not_new_test_configuration(self):
-        conftest = "checks/conftest.py"
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.epic(2)
-
-        def add_a_conftest(result, req, worktree, k):
-            (worktree / conftest).write_text("# shared fixtures\n")
-            return result
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(conftest), build=add_a_conftest))
-        problems = [p for e in self.events("verified", 2) for p in e["problems"]]
-        self.assertFalse([p for p in problems if "new test configuration" in p], problems)
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertIn(conftest, self.store.issue(2).locked, "it locks with the tests at the first examination")
-
-
-def python_test_builder(path, versions, request_at=None):
-    """A build hook writing `path` with the test functions `versions[k]` (the last one after
-    that), run by A1's command; at round `request_at` it asks to change the locked file."""
-    def hook(result, req, worktree, k):
-        names = versions[min(k, len(versions) - 1)]
-        (worktree / path).parent.mkdir(parents=True, exist_ok=True)
-        (worktree / path).write_text("".join(f"def {name}():\n    assert open('docs/a.txt').read().strip() == 'alpha'\n\n"
-                                             for name in names))
-        result.tests = result.tests + [path]
-        result.commands = [CheckSpec("A1", command=f"{sys.executable} -m pytest -q -p no:cacheprovider {path}")
-                           if c.criterion == "A1" else c for c in result.commands]
-        if k == request_at:
-            result.requests = [Request("test_change", "the item needs this change to the locked test", paths=[path])]
-        return result
-    return hook
-
-
-@unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's per-test accounting")
-class Finding12And15Manifest(FixCase):
-    def test_12_the_manifest_grows_with_tests_that_ran_in_locked_files(self):
-        path = "tests/test_grow_2.py"
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-        hook = python_test_builder(path, [["test_one"], ["test_one", "test_two"]], request_at=1)
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(path), build=hook))
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(self.events("locked_tests_changed", 2)[0]["files"], [path])
-        manifest = self.store.issue(2).manifest
-        self.assertIn(f"{path}::test_one", manifest["*"])
-        self.assertIn(f"{path}::test_two", manifest["*"], "a test that ran in a locked file must keep running")
-
-    def test_15_an_approved_test_change_with_a_disposition_retires_that_test_from_the_manifest(self):
-        path = "tests/test_retire_2.py"
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-        hook = python_test_builder(path, [["test_one", "test_two"], ["test_one"]], request_at=1)
-        retired = f"{path}::test_two"
-        agents = Agents(self.scripts, plan=with_zone(path), build=hook, decide=lambda requests: [
-            Decision(r["id"], True, "the item no longer asks for it", dispositions={retired: "excluded: no longer asked"})
-            for r in requests])
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
-        st = self.store.issue(2)
-        self.assertNotIn(retired, [i for ids in st.manifest.values() for i in ids])
-        self.assertIn(f"{path}::test_one", st.manifest["*"])
-        self.assertEqual(st.dispositions[retired], "excluded: no longer asked")
-        self.assertFalse([p for e in self.events("verified", 2) for p in e["problems"] if "did not run" in p])
 
 
 class Finding13ProbesOnlyForFindings(FixCase):
@@ -577,7 +452,7 @@ class Finding14Budget(FixCase):
         self.assertEqual((b["calls"], b["infra"], b["pending"]), (1, 1, 0))
 
     def test_14_every_answered_call_of_a_run_is_charged(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1, blocked_once=True, extra_path="docs/registry.txt")
+        self.add_work(2, "docs/a.txt", "alpha", findings=1, blocked_once=True, extra_path=".github/registry.txt")
         self.epic(2)
         self.run_engine()
         self.assertEqual(self.phase(2), Phase.DONE)
@@ -760,62 +635,6 @@ class Finding02RevertFindings(FixCase):
         self.assertTrue(self.revert_prs()[0]["merged"])
 
 
-class Finding05LateLock(FixCase):
-    def test_5_a_test_file_first_run_after_the_first_examination_locks_at_that_verify(self):
-        late = ["checks/late_2a.sh", "checks/late_2b.sh"]
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-
-        def zones(result, req):
-            result.zones = sorted(set(result.zones) | set(late))
-            return result
-
-        def add_late_tests(result, req, worktree, k):
-            if k >= 1:   # after the first examination: new test files, run through a glob
-                for f in late:
-                    (worktree / f).write_text("#!/usr/bin/env bash\ntest -s docs/a.txt\n")
-                result.commands = [CheckSpec(c.criterion, command=c.command + " && ls checks/late_2*.sh | xargs -n1 bash")
-                                   if c.criterion == "D1" else c for c in result.commands]
-            return result
-        self.run_engine(agents=Agents(self.scripts, plan=zones, build=add_late_tests))
-        self.assertEqual(self.phase(2), Phase.DONE)
-        locked = [e for e in self.events("tests_locked", 2) if e.get("late")]
-        self.assertEqual([e["locked"] for e in locked], [late])
-        reverified = [e for e in self.events("verified", 2) if e["seq"] > locked[0]["seq"]][0]
-        self.assertTrue(reverified["ok"])
-        self.assertTrue(git("log", "-1", "--format=%s", reverified["head"], cwd=self.repo.work)
-                        .startswith("Lock newly run tests for #2"), "the new head is verified again")
-        self.assertTrue(set(late) <= set(self.store.issue(2).locked))
-        bodies = git("log", "--format=%B", "origin/feat/issue-2", cwd=self.repo.work)
-        self.assertIn("Lock newly run tests for #2", bodies)
-        for f in late:
-            self.assertIn(f"Loop-Locks: {f}", bodies)
-
-
-@unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's per-test accounting")
-class Finding12ManifestFromEmpty(FixCase):
-    def test_12_an_empty_manifest_grows_with_a_python_test_first_run_later(self):
-        path = "tests/test_late_2.py"
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-
-        def add_a_python_test(result, req, worktree, k):
-            if k >= 1:
-                (worktree / "tests").mkdir(exist_ok=True)
-                (worktree / path).write_text("def test_late():\n    assert open('docs/a.txt').read().strip() == 'alpha'\n")
-                result.tests = result.tests + [path]
-                result.commands = [CheckSpec("A1", command=f"{sys.executable} -m pytest -q -p no:cacheprovider {path}")
-                                   if c.criterion == "A1" else c for c in result.commands]
-                st = self.engine.store.issue(2)
-                st.manifest = {}   # as an earlier engine left it: nothing selected yet
-                self.engine.store.put(st)
-            return result
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(path), build=add_a_python_test))
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertTrue([e for e in self.events("tests_locked", 2) if e.get("late") and path in e["locked"]])
-        self.assertIn(f"{path}::test_late", self.store.issue(2).manifest.get("*", []))
-
-
 @unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's per-test accounting")
 class Fault90SeveralCommandsPerItem(FixCase):
     """#41 (engine 1.0.0) gave four commands for one item; only the last was kept, so the tests
@@ -841,23 +660,10 @@ class Fault90SeveralCommandsPerItem(FixCase):
     def test_fault_90_every_command_for_an_item_is_kept_and_run(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(self.path), build=self.builder()))
+        self.run_engine(agents=Agents(self.scripts, build=self.builder()))
         self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
         self.assertEqual(len(self.a1()), 2)
         self.assertFalse([p for e in self.events("verified", 2) for p in e["problems"] if "no command selects" in p])
-
-    def test_fault_90_a_changed_list_for_a_locked_item_is_one_request_applied_whole(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-        agents = Agents(self.scripts, plan=with_zone(self.path), build=self.builder(later=" && true"),
-                        decide=lambda requests: [Decision(r["id"], True, "same proof") for r in requests])
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
-        change = [r for r in self.store.issue(2).requests if r["kind"] == "command_change"]
-        self.assertEqual([(r["item"], len(r["commands"]), r["status"]) for r in change], [("A1", 2, "approved")])
-        self.assertEqual(len(self.a1()), 2)
-        self.assertTrue(self.a1()[1].endswith(" && true"))
-
 
 @unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's per-test accounting")
 class Fault94CriterionNamesTheItem(FixCase):
@@ -880,7 +686,7 @@ class Fault94CriterionNamesTheItem(FixCase):
     def test_fault_94_a_criterion_leading_with_an_item_id_is_kept_and_run(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone(self.path), build=self.builder()))
+        self.run_engine(agents=Agents(self.scripts, build=self.builder()))
         self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
         builder = [c for c in self.store.issue(2).commands if c.get("author") == "builder"]
         self.assertLessEqual({c["criterion"] for c in builder}, {"A1", "D1"})
@@ -892,51 +698,12 @@ class Fault94CriterionNamesTheItem(FixCase):
         self.add_work(2, "docs/a.txt", "alpha", wrong_attempts=1)
         self.epic(2)
         stray = CheckSpec("Regression: the whole suite", command="true")
-        agents = Agents(self.scripts, plan=with_zone(self.path), build=self.builder([stray]))
+        agents = Agents(self.scripts, build=self.builder([stray]))
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
         self.assertTrue(self.events("commands_dropped", 2))
         feedback = [f for c in agents.calls if c[0] == "build" and c[2] == 2 for f in c[3]]
         self.assertTrue([f for f in feedback if "were not kept" in f and "Regression: the whole suite" in f], feedback)
-
-
-@unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's per-test accounting")
-class Fault95TypedCommandChangeAdds(FixCase):
-    """#37 (engine 1.0.0) had two approved `command_change` requests for one item, each with one
-    command; the second replaced every command of the item, so the whole-file pytest command was
-    gone, its locked tests never ran and every round failed the same way (no_progress)."""
-    path = "tests/test_typed_2.py"
-
-    def test_fault_95_typed_single_commands_add_to_the_item_and_show_what_they_replace(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-        pytest = f"{sys.executable} -m pytest -q -p no:cacheprovider"
-        added = [f"{pytest} {self.path}::test_one", f"{pytest} {self.path}::test_two"]
-
-        def hook(result, req, worktree, k):
-            (worktree / "tests").mkdir(exist_ok=True)
-            (worktree / self.path).write_text("def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n")
-            result.tests = result.tests + [self.path]
-            result.commands = result.commands + [CheckSpec("A1", command=f"{pytest} {self.path}")] + [
-                CheckSpec("A1", command=c) for c in (added if k >= 2 else [])]
-            if k == 1:
-                result.requests = [Request("command_change", f"also run {c.split('::')[1]} alone", item="A1",
-                                           command={"criterion": "A1", "command": c, "cwd": ".", "timeout_s": None,
-                                                    "author": "builder"}) for c in added]   # as live.py gives it
-            return result
-        seen = []
-        agents = Agents(self.scripts, plan=with_zone(self.path), build=hook,
-                        decide=lambda requests: seen.extend(requests) or [Decision(r["id"], True, "fine") for r in requests])
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.DONE, self.events("round_failed", 2))
-        self.assertFalse([p for e in self.events("verified", 2) for p in e["problems"] if "did not run" in p])
-        a1 = [c["command"] for c in self.store.issue(2).commands if c["criterion"] == "A1" and c.get("author") == "builder"]
-        self.assertIn(f"{pytest} {self.path}", a1)
-        self.assertLessEqual(set(added), set(a1))
-        typed = [r for r in seen if r.get("command")]
-        self.assertEqual(len(typed), 2)
-        for r in typed:
-            self.assertIn({"command": f"{pytest} {self.path}", "cwd": "."}, r["replaces"])
 
 
 class FindingNew1OwnerFindings(unittest.TestCase):
@@ -978,7 +745,7 @@ class FindingNew1OwnerFindingsInARun(FixCase):
                     id="", title="the timing is never measured", item="D2", quote=quote, observed="no timing",
                     expected="a timing of the page", reproduction="test -f edge_2.txt")]
             return result
-        self.run_engine(agents=Agents(self.scripts, plan=with_zone("edge_2.txt"), examine=report))
+        self.run_engine(agents=Agents(self.scripts, examine=report))
 
     def test_new_1_a_finding_on_the_agent_part_blocks_until_fixed(self):
         self.owner_issue_with("time it on this host")   # the fake plan's agent part
@@ -992,22 +759,6 @@ class FindingNew1OwnerFindingsInARun(FixCase):
         self.assertEqual(self.phase(2), Phase.DELIVERED)
         self.assertFalse([f for f in self.store.issue(2).findings if f["blocking"]])
         self.assertEqual(len(self.builds()), 1)
-
-
-class FindingNew2Dispositions(FixCase):
-    def test_new_2_dispositions_retire_exact_node_ids_and_a_bare_function_retires_its_cases(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.epic(2)
-        engine = self.make_engine()
-        st = engine.store.issue(2)
-        st.manifest = {"*": ["t.py::test_p[1]", "t.py::test_p[2]", "t.py::test_q[1]", "t.py::test_q[2]", "t.py::test_r"]}
-        st.commands = [{"criterion": "D1", "command": "pytest t.py", "cwd": ".", "author": "builder"}]
-        request = {"id": "R2-1", "kind": "command_change", "item": "D1", "detail": "select fewer cases", "reason": "fine",
-                   "command": {"criterion": "D1", "command": "pytest t.py -k 'not p'", "cwd": ".", "author": "builder"}}
-        engine._apply_request(2, st, self.repo.work, request, {"t.py::test_p": "excluded: obsolete",
-                                                               "t.py::test_q[1]": "excluded: flaky upstream"})
-        self.assertEqual(st.manifest, {"*": ["t.py::test_q[2]", "t.py::test_r"]})
-        self.assertEqual(st.commands[-1]["command"], "pytest t.py -k 'not p'")
 
 
 class FindingNew3Stopping(FixCase):

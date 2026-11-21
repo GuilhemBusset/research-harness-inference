@@ -19,7 +19,7 @@ FINDING = f"blocking finding E{ISSUE}-1-1"   # the engine numbers it by round
 
 
 class Agents(L.agents.FakeAgents):
-    """The first build asks for a path outside its zones, refused with `REFUSAL`; the first
+    """The first build asks for a protected path the issue does not name, refused with `REFUSAL`; the first
     examination leaves a blocking finding. While `refusing`, every build after that examination
     fails as #85's did, before any answer."""
 
@@ -33,7 +33,8 @@ class Agents(L.agents.FakeAgents):
             return self._metered(ISSUE, "build", vendor, None, fail="timeout")
         result = super().build(vendor, req, plan, worktree, feedback)
         if self._built[ISSUE] == 1:
-            result.requests.append(L.agents.Request("paths", "docs/b.txt as well", paths=["docs/b.txt"]))
+            result.requests.append(L.agents.Request("protected_change", ".github/b.txt as well",
+                                                    paths=[".github/b.txt"]))
         return result
 
     def decide(self, vendor, req, worktree, requests):
@@ -66,8 +67,6 @@ def test_85_revived_after_its_ceiling_keeps_what_the_failed_round_told_it(loop, 
         old.setattr(L.engine, "VERSION", "1.2.4")
         st = loop.run(agents)
     assert (st.phase, st.fail["cause"], st.fail["version"]) == (Phase.FAILED, "ceiling", "1.2.4")
-    locked = dict(st.locked)
-    assert locked, "the first examination locked the tests"
 
     agents.refusing = False
     calls = len(agents.calls)
@@ -79,5 +78,4 @@ def test_85_revived_after_its_ceiling_keeps_what_the_failed_round_told_it(loop, 
     assert REFUSAL in told, "the decision on the last answered build's request"
     assert FINDING in told, "the examination that failed the round"
     assert [e for e in loop.store.events() if e["kind"] == "revived"]
-    assert set(locked) <= set(st.locked), "the locks survive the revival"
     assert st.phase == Phase.DONE, loop.failures()

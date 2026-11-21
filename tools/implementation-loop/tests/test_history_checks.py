@@ -170,7 +170,7 @@ class EngineHistoryTests(HistoryCase):
                         refused["findings"])
         self.assertEqual((st.branch, st.round, st.restarts, st.worktree, st.pr), ("feat/issue-2-r2", 2, 1, None, None))
         self.assertTrue(st.plan, "the plan is kept")
-        self.assertEqual((st.locked, st.tests, st.probes, st.verified_sha, st.certified_sha), ({}, [], [], None, None))
+        self.assertEqual((st.probes, st.verified_sha, st.certified_sha), ([], None, None))
         detail = (st.fail or {}).get("detail", "")
         self.assertIn("the commits of `feat/issue-2` carry what the history scan refuses", detail)
         self.assertIn("builds on a new branch from main, `feat/issue-2-r2`", detail)

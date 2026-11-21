@@ -20,12 +20,6 @@ class Builder(FakeAgents):
         self.python_test = python_test
         self.ignore = ignore_feedback_rounds
 
-    def plan(self, vendor, req, worktree):
-        result = super().plan(vendor, req, worktree)
-        if self.python_test and req.issue.number == self.python_test["issue"]:   # its test is in its zones
-            result.zones = sorted(set(result.zones) | {self.python_test["file"]})
-        return result
-
     def build(self, vendor, req, plan, worktree, feedback):
         n = req.issue.number
         k = self._built.get(n, 0)
@@ -40,8 +34,6 @@ class Builder(FakeAgents):
             path.write_text(self.python_test["content"])
             result.tests = result.tests + [self.python_test["file"]]
             result.commands = result.commands + [CheckSpec(criterion="A1", command=self.python_test["command"])]
-            if k >= 1 or self.python_test.get("disposition_first"):
-                result.dispositions = dict(self.python_test.get("dispositions", {}))
         return result
 
 
@@ -72,20 +64,19 @@ class RecordedParks(EngineCase):
         ob = self.store.issue(2).obligations
         self.assertEqual((ob[0]["kind"], ob[0]["issue"]), ("deferred", 47))
 
-    def test_42_78_a_replan_keeps_locked_tests_and_earlier_grants(self):
-        """#24, #30, #40, #41, #42: a redesign deleted locked tests its commands still ran; #42 and
-        #78: its file list dropped work the branch had kept. A replan does neither."""
+    def test_42_78_a_replan_keeps_the_branchs_tests(self):
+        """#24, #30, #40, #41, #42: a redesign deleted tests its commands still ran; #42 and #78:
+        its file list dropped work the branch had kept. A replan does neither."""
         self.add_work(2, "docs/a.txt", "alpha", findings=1)
         self.epic(2)
         self.run_engine(agents=Builder(self.scripts, ignore_feedback_rounds=3))
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertTrue(self.events("replan", 2), "the stalled rounds brought a replan")
         self.assertEqual(present(self.repo.main_file("checks/issue_2.sh")).splitlines()[0], "#!/usr/bin/env bash",
-                         "the locked test survived the replan")
-        self.assertTrue(any(g["source"] == "earlier plan" for g in self.store.issue(2).grants))
+                         "the test survived the replan")
 
     @unittest.skipUnless(HAS_PYTEST, "pytest is needed for the verifier's accounting")
-    def test_37_a_test_only_the_owner_runs_needs_a_disposition_not_a_park(self):
+    def test_37_a_test_only_the_owner_runs_is_left_out_by_its_command_not_a_park(self):
         """#37 parked: a laptop benchmark in a check file that no command ran was 'expected'."""
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
@@ -93,11 +84,9 @@ class RecordedParks(EngineCase):
                    "def test_laptop_benchmark():\n    assert False, 'run on a 2020 laptop'\n")
         agents = Builder(self.scripts, python_test={
             "issue": 2, "file": "tests/test_alpha.py", "content": content,
-            "command": f"{sys.executable} -m pytest -q tests/test_alpha.py -k 'not laptop'",
-            "dispositions": {"tests/test_alpha.py::test_laptop_benchmark": "owner-run"}})
+            "command": f"{sys.executable} -m pytest -q tests/test_alpha.py -k 'not laptop'"})
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(self.store.issue(2).dispositions, {"tests/test_alpha.py::test_laptop_benchmark": "owner-run"})
 
 
 if __name__ == "__main__":
@@ -138,8 +127,8 @@ class IsolationOfChecks(EngineCase):
         self.assertTrue(git("branch", "--list", "feat/other-run", cwd=self.repo.work),
                         "another run's branch survives a check that deletes it")
 
-    def test_a_test_path_that_leaves_the_worktree_is_refused(self):
-        """A test file symlinked out of the worktree never becomes a locked test the engine writes."""
+    def test_a_test_path_that_leaves_the_worktree_is_never_written_through(self):
+        """A test file symlinked out of the worktree: the engine writes nothing through it."""
         outside = self.repo.tmp / "outside.txt"
         outside.write_text("keep\n")
         self.add_work(2, "docs/a.txt", "alpha")
@@ -156,9 +145,6 @@ class IsolationOfChecks(EngineCase):
                 return result
         self.run_engine(agents=Linker(self.scripts))
         self.assertEqual(outside.read_text(), "keep\n")
-        refused = [p for e in self.events("test_paths_refused", 2) for p in e["paths"]]
-        self.assertIn("checks/escape.sh", refused)
-        self.assertNotIn("checks/escape.sh", self.store.issue(2).tests)
 
 
 class FileHardeningTests(unittest.TestCase):

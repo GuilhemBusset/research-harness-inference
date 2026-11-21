@@ -33,15 +33,15 @@ class StateTests(unittest.TestCase):
         self.store = RunStore(self.tmp / "run")
 
     def test_state_round_trips_and_events_are_sequenced(self):
-        st = IssueState(number=7, phase=Phase.WAITING, calls=2, infra=1, locked={"a": "b"},
-                        manifest={"D1": ["t::x"]}, wait={"kind": "outage", "resume": "examine", "vendor": "codex"},
+        st = IssueState(number=7, phase=Phase.WAITING, calls=2, infra=1, grants=[{"path": "a", "protected": True}],
+                        wait={"kind": "outage", "resume": "examine", "vendor": "codex"},
                         obligations=[{"item": "D2", "kind": "deferred", "detail": "#9", "issue": 9}])
         self.store.put(st)
         self.store.event("one", issue=7)
         self.store.event("two")
         again = RunStore(self.tmp / "run")
         self.assertEqual(again.issue(7).phase, Phase.WAITING)
-        self.assertEqual(again.issue(7).locked, {"a": "b"})
+        self.assertEqual(again.issue(7).grants, [{"path": "a", "protected": True}])
         self.assertEqual((again.issue(7).calls, again.issue(7).infra), (2, 1), "budgets persist across runs")
         self.assertEqual(again.issue(7).to_dict(), st.to_dict())
         self.assertEqual([e["seq"] for e in again.events()], [1, 2])
@@ -117,11 +117,24 @@ class LegacyStateTests(unittest.TestCase):
                          ("legacy", design, {"checks/old.sh": "digest"}))
         self.assertEqual(st.to_dict()["wait"]["design"], design, "it survives a save until the engine migrates it")
 
+    def test_state_with_the_locks_zones_and_requests_of_an_earlier_engine_still_reads(self):
+        st = IssueState.from_dict({"number": 25, "phase": "verify", "tests": ["tests/test_a.py"],
+                                   "locked": {"tests/test_a.py": "digest"}, "manifest": {"*": ["tests/test_a.py::t"]},
+                                   "dispositions": {"tests/test_a.py::u": "owner-run"}, "reverted": ["tests/test_a.py"],
+                                   "last_ran": {"*": ["tests/test_a.py::t"]},
+                                   "plan": {"items": [], "zones": ["docs/"], "notes": ""},
+                                   "grants": [{"path": "docs/", "source": "plan", "protected": False}],
+                                   "requests": [{"id": "R25-1", "kind": "test_change", "status": "pending"}]})
+        self.assertEqual((st.phase, st.wait, st.plan, st.grants[0]["path"], st.requests[0]["kind"]),
+                         (Phase.VERIFY, None, {"items": [], "zones": ["docs/"], "notes": ""}, "docs/", "test_change"))
+        for gone in ("tests", "locked", "manifest", "dispositions", "reverted", "last_ran"):
+            self.assertNotIn(gone, st.to_dict())
+
 
 class MigrationTests(unittest.TestCase):
     """`Engine._migrate`: what an earlier engine left becomes the starting point of a plan."""
 
-    def test_a_parked_design_becomes_the_builders_tests_grants_and_feedback(self):
+    def test_a_parked_design_becomes_the_builders_tests_and_feedback(self):
         from helpers import SHIP, issue_body
         from implement_loop.agents import FakeAgents, Script
         from implement_loop.config import Caps, Config
@@ -146,13 +159,9 @@ class MigrationTests(unittest.TestCase):
                         repo_root=repo.work, log=lambda m: None, sleep=lambda s: None)
         engine._reconcile()
         st = store.issue(2)
-        self.assertEqual((st.phase, st.wait, st.locked), (Phase.PENDING, None, {}))
-        self.assertEqual(st.tests, ["checks/conftest.py", "checks/old_2.py"])
-        self.assertIn({"path": "docs/a.txt", "source": "earlier design", "protected": False}, st.grants)
-        unlock = [r for r in st.requests if r["kind"] == "legacy_unlock"]
-        self.assertEqual((len(unlock), unlock[0]["status"], unlock[0]["paths"]),
-                         (1, "pending", ["checks/conftest.py", "checks/old_2.py"]))
-        self.assertTrue(any("checks/old_2.py" in f for f in st.feedback))
+        self.assertEqual((st.phase, st.wait, st.grants, st.requests), (Phase.PENDING, None, [], []))
+        self.assertTrue(any("checks/conftest.py, checks/old_2.py" in f and "They are yours now" in f
+                            for f in st.feedback), "the builder takes over the checks it locked")
         self.assertTrue(any("the design was impossible" in f for f in st.feedback))
         self.assertEqual([e["park_kind"] for e in store.events() if e["kind"] == "migrated"], ["exhausted"])
 
@@ -230,66 +239,6 @@ class VerifyTests(unittest.TestCase):
         self.assertFalse(ev.passed)
         self.assertIn("does not exist", ev.output_tail)
 
-    def test_tamper_report_catches_changes_deletions_and_new_config(self):
-        locked = verify.lock(self.root, ["checks/c.sh"], ["."])
-        self.assertEqual(verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."]), [])
-        (self.root / "checks" / "c.sh").write_text("exit 0\n")
-        (self.root / "checks" / "conftest.py").write_text("")
-        problems = verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."])
-        self.assertIn("locked file changed: checks/c.sh", problems)
-        self.assertIn("new test configuration file: checks/conftest.py", problems)
-
-    def test_pyproject_locks_only_the_pytest_section(self):
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n\n[tool.pytest.ini_options]\naddopts='-q'\n")
-        locked = verify.lock(self.root, ["checks/c.sh"], ["."])
-        self.assertIn("pyproject.toml", locked)
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\ndependencies=['numpy']\n\n[tool.pytest.ini_options]\naddopts='-q'\n")
-        self.assertEqual(verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."]), [])
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n\n[tool.pytest.ini_options]\naddopts='-q -k nothing'\n")
-        self.assertEqual(verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."]), ["locked file changed: pyproject.toml"])
-
-    def test_a_new_pyproject_without_pytest_settings_is_fine(self):
-        locked = verify.lock(self.root, ["checks/c.sh"], ["."])
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n")
-        self.assertEqual(verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."]), [])
-
-    def test_a_commented_pytest_header_in_pyproject_is_still_locked(self):
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n")
-        locked = verify.lock(self.root, ["checks/c.sh"], ["."])
-        (self.root / "pyproject.toml").write_text("[project]\nname='x'\n\n[tool.pytest.ini_options] # test configuration\naddopts='-k nothing'\n")
-        self.assertEqual(verify.tamper_report(self.root, locked, ["checks/c.sh"], ["."]), ["locked file changed: pyproject.toml"])
-
-    def test_tests_run_without_result_accounting_fail(self):
-        (self.root / "checks" / "test_u.py").write_text("import unittest\n\nclass T(unittest.TestCase):\n    @unittest.skip('later')\n    def test_a(self):\n        pass\n")
-        files = ["checks/test_u.py"]
-        locked = verify.lock(self.root, files, ["."])
-        manifest = {"A1": verify.defined_tests(self.root, files)}
-        spec = CheckSpec("A1", "command", f"{sys.executable} -m unittest discover -s checks -p 'test_u.py'")
-        ok, _, problems, ran = verify.verify(self.root, [spec], "sha", self.work, locked, files, manifest)
-        self.assertFalse(ok)
-        self.assertEqual(ran, [])
-        self.assertTrue(any(p.startswith("locked tests did not run: ['checks/test_u.py::T::test_a']")
-                            and "no check command ran pytest" in p for p in problems), problems)
-
-    def test_conditionally_defined_tests_are_still_defined(self):
-        (self.root / "checks" / "test_c.py").write_text("def test_good():\n    pass\n\nif True:\n    def test_required():\n        pass\n\ntry:\n    import json\nexcept ImportError:\n    pass\nelse:\n    class TestX:\n        def test_inner(self):\n            def test_nested_helper():\n                pass\n")
-        self.assertEqual(verify.defined_tests(self.root, ["checks/test_c.py"]),
-                         ["checks/test_c.py::TestX::test_inner", "checks/test_c.py::test_good", "checks/test_c.py::test_required"])
-
-    def test_one_run_test_satisfies_only_its_own_manifest_entry(self):
-        manifest = {"A1": ["a/test_contract.py::test_contract", "b/test_contract.py::test_contract"]}
-        self.assertEqual(verify.not_run(manifest, ["a/test_contract.py::test_contract"]), ["b/test_contract.py::test_contract"])
-        self.assertEqual(verify.not_run(manifest, ["a/test_contract.py::test_contract", "b/test_contract.py::test_contract"]), [])
-        self.assertEqual(verify.not_run({"A1": ["t/test_p.py::test_p"]}, ["t/test_p.py::test_p[1]", "t/test_p.py::test_p[2]"]), [])
-
-    def test_defined_tests_are_read_from_locked_files(self):
-        (self.root / "checks" / "test_a.py").write_text("def test_one():\n    pass\n\nasync def test_two():\n    pass\n\ndef helper():\n    pass\n")
-        self.assertEqual(verify.defined_tests(self.root, ["checks/test_a.py", "checks/c.sh"]),
-                         ["checks/test_a.py::test_one", "checks/test_a.py::test_two"])
-        (self.root / "checks" / "test_b.py").write_text("class TestGood:\n    def test_contract(self):\n        pass\n\nclass TestBad:\n    def test_contract(self):\n        pass\n")
-        self.assertEqual(verify.defined_tests(self.root, ["checks/test_b.py"]),
-                         ["checks/test_b.py::TestBad::test_contract", "checks/test_b.py::TestGood::test_contract"])
-
 
 @unittest.skipUnless(HAS_PYTEST, "pytest is not installed")
 class PytestVerifyTests(unittest.TestCase):
@@ -297,28 +246,13 @@ class PytestVerifyTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         (self.root / "tests").mkdir()
         self.test_file = self.root / "tests" / "test_x.py"
-        self.cmd = f"{sys.executable} -m pytest -q tests/test_x.py"
-
-    def manifest(self):
-        """Every test the file defines, which is what the engine locks for now."""
-        return {"A1": verify.defined_tests(self.root, ["tests/test_x.py"])}
 
     def test_pytest_wrapped_in_a_script_is_still_accounted(self):
         (self.root / "run.sh").write_text(f"{sys.executable} -m pytest -q tests/test_x.py\n")
         self.test_file.write_text("import pytest\n\ndef test_a():\n    pytest.skip('later')\n")
-        locked = verify.lock(self.root, ["tests/test_x.py"], ["."])
-        ok, _, problems, _ = verify.verify(self.root, [CheckSpec("A1", "command", "bash run.sh")], "sha", self.root / ".w",
-                                           locked, ["tests/test_x.py"], self.manifest())
+        ok, _, problems = verify.verify(self.root, [CheckSpec("A1", "command", "bash run.sh")], "sha", self.root / ".w")
         self.assertFalse(ok)
         self.assertTrue(any("unexpected skip" in p for p in problems), problems)
-
-    def test_same_name_in_two_classes_counts_as_two_tests(self):
-        self.test_file.write_text("class TestGood:\n    def test_contract(self):\n        assert True\n\nclass TestBad:\n    def test_contract(self):\n        assert False\n")
-        locked = verify.lock(self.root, ["tests/test_x.py"], ["."])
-        spec = CheckSpec("A1", "command", f"{self.cmd} -k TestGood")
-        ok, _, problems, _ = verify.verify(self.root, [spec], "sha", self.root / ".w", locked, ["tests/test_x.py"], self.manifest())
-        self.assertFalse(ok)
-        self.assertIn("locked tests did not run: ['tests/test_x.py::TestBad::test_contract']", problems)
 
 
 if __name__ == "__main__":

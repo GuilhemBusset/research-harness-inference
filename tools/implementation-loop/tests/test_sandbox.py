@@ -546,7 +546,7 @@ class LaunchSiteTests(SandboxCase):
     def test_the_standing_checks_are_sandboxed(self):
         root = self.tmp / "tree"
         root.mkdir()
-        verify.verify(root, [], "a" * 40, self.tmp / "work", {}, [], None, standing=(("hygiene", "true"),))
+        verify.verify(root, [], "a" * 40, self.tmp / "work", standing=(("hygiene", "true"),))
         self.assertEqual([(l.vendor, l.argv) for l in self.recorder.launches], [(None, ["bash", "-c", "true"])])
 
     def test_the_engines_checks_see_the_tree_its_private_git_directory_and_the_objects(self):
@@ -593,7 +593,7 @@ class RefusalTests(SandboxCase):
         with self.assertRaises(sandbox.SandboxUnavailable):
             verify.run_check(root, spec, "a" * 40, self.tmp / "work")
         with self.assertRaises(sandbox.SandboxUnavailable):
-            verify.verify(root, [spec], "a" * 40, self.tmp / "work", {}, [], None)
+            verify.verify(root, [spec], "a" * 40, self.tmp / "work")
         with self.assertRaises(sandbox.SandboxUnavailable):
             verify.standing_checks(root, (("hygiene", f"touch {self.ran}"),), "a" * 40, self.tmp / "work")
         self.assertFalse(self.ran.exists())
