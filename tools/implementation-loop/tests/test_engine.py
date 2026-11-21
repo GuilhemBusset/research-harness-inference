@@ -1,12 +1,13 @@
 """End-to-end runs of the builder/examiner engine (ADR 0012): real git, the real ship.sh, the real
 verifier and real squash merges into a local bare remote. Only the agents and GitHub are fakes."""
 
+import re
 import unittest
 from unittest import mock
 
 from helpers import SHIP, TempRepo, issue_body, present
 from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import Caps, Config
+from implement_loop.config import Caps, Config, Deploy
 from implement_loop.engine import Engine
 from implement_loop.github import FakeGitHub
 from implement_loop.graph import build_plan
@@ -36,6 +37,21 @@ class EngineCase(unittest.TestCase):
 
     def epic(self, *children):
         self.gh.add_issue(EPIC, "Epic", "An epic.\n", subs=children)
+
+    def failing_deployments(self, n, context="deploy/test"):
+        """The pipeline's verdict on each merge commit: the deployment of a merge of issue `n` fails,
+        every other one (a revert's included) succeeds. A merge of `n` then takes the broken-`main`
+        path: one fix-forward, then a revert."""
+        merge = self.gh.on_merge
+        assert merge is not None
+
+        def deployed(branch, sha):
+            commit = merge(branch, sha)
+            broke = re.search(rf"issue-{n}(-r\d+)?$", branch) is not None
+            self.gh.set_status(commit, context, "failure" if broke else "success")
+            return commit
+        self.gh.on_merge = deployed
+        self.policy = {**self.policy, "deploy": Deploy(contexts=(context,))}
 
     def run_engine(self, agents=None, caps=None, fresh=False, policy=None):
         plan = build_plan(self.gh, EPIC, self.repo.work)

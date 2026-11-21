@@ -1,8 +1,6 @@
 """Files and tests main deletes or renames on purpose (the examiner's probes an earlier engine
-committed, a test a reviewed merge replaced) are no regression of the next merge, and no change
-of a branch to a locked test."""
+committed, a test a reviewed merge replaced) are no change of a branch to a locked test."""
 
-import contextlib
 import shutil
 import tempfile
 import unittest
@@ -14,7 +12,7 @@ import helpers  # noqa: F401 - puts the engine on sys.path
 from implement_loop import engine as engine_module
 from implement_loop import verify
 from implement_loop.config import Caps
-from implement_loop.engine import CommittedFile, Engine, in_tree, named_nodes, named_tests
+from implement_loop.engine import CommittedFile, Engine, in_tree
 from implement_loop.model import IssueState
 from implement_loop.state import RunStore
 
@@ -25,106 +23,6 @@ class DeletedOnMainTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.engine = Engine.__new__(Engine)
         self.engine.store = RunStore(self.tmp / "run")
-
-    def test_a_check_names_its_test_files(self):
-        self.assertEqual(named_tests({"command": "uv run --locked pytest -q tests/unit/test_a.py::test_x -k b"}),
-                         ["tests/unit/test_a.py"])
-        self.assertEqual(named_tests({"command": "bash checks/probe_2.sh", "cwd": "sub"}), ["sub/checks/probe_2.sh"])
-        self.assertEqual(named_tests({"command": "uv run --locked pytest tests/", "cwd": "."}), [])
-        self.assertEqual(named_tests({"command": "uv run --no-project --python 3.12 --with pytest==8.3.5 python -m pytest -q "
-                                                 "examiner_probe_costs_cli.py", "cwd": "."}),
-                         ["examiner_probe_costs_cli.py"], "a probe an earlier engine committed at the root")
-        self.assertEqual(named_nodes({"command": "pytest -q tests/test_a.py::Case::test_x tests/test_b.py", "cwd": "."}),
-                         ["tests/test_a.py::Case::test_x"])
-
-    def regressions(self, coord, checks, manifest):
-        """The checks and manifest `_regressions` re-runs for an earlier issue #5, and those it skips."""
-        self.engine.store.put_section("accepted_checks", "5", {"checks": checks, "check_files": [],
-                                                               "manifest": manifest})
-        ran = []
-
-        def recorded(root, checks, head, work_dir, locked, files, manifest, *args, **kwargs):
-            ran.append(([c.command for c in checks], manifest))
-            return True, [], [], []
-        self.engine.ws = SimpleNamespace(disposable=contextlib.nullcontext)  # ty: ignore[invalid-assignment]  # test double
-        self.engine.caps, self.engine.check_env = Caps(), {}
-        self.engine._mounts = lambda scratch: None  # ty: ignore[invalid-assignment]  # test double
-        with mock.patch.object(engine_module.verify, "verify", recorded):
-            self.assertEqual(self.engine._regressions(6, coord, "abc123"), [])
-        [skipped] = [e for e in self.engine.store.events() if e["kind"] == "regression_check_skipped"]
-        return ran, skipped["checks"]
-
-    def test_regressions_skip_examiner_checks_and_checks_of_deleted_files(self):
-        coord = self.tmp / "coord"
-        (coord / "tests").mkdir(parents=True)
-        (coord / "tests/test_kept.py").write_text("def test_a():\n    pass\n")
-        ran, skipped = self.regressions(coord, [
-            {"criterion": "D1", "command": "pytest tests/test_kept.py", "cwd": ".", "author": "builder"},
-            {"criterion": "D2", "command": "pytest tests/test_gone.py", "cwd": ".", "author": "builder"},
-            {"criterion": "A1", "command": "bash checks/probe_5.sh", "cwd": ".", "author": "examiner"}],
-            {"*": ["tests/test_kept.py::test_a", "tests/test_gone.py::test_b"]})
-        self.assertEqual(ran, [(["pytest tests/test_kept.py"], {"*": ["tests/test_kept.py::test_a"]})])
-        self.assertEqual(skipped, ["pytest tests/test_gone.py", "bash checks/probe_5.sh"])
-
-    def test_regressions_skip_checks_of_tests_main_removed_from_a_kept_file(self):
-        coord = self.tmp / "coord"
-        (coord / "tests").mkdir(parents=True)
-        (coord / "tests/test_kept.py").write_text("class Case:\n    def test_a(self):\n        pass\n")
-        (coord / "tests/test_other.py").write_text("def test_c():\n    pass\n")
-        (coord / "tests/unit").mkdir()
-        (coord / "tests/unit/test_d.py").write_text("def test_d():\n    pass\n")
-        ran, skipped = self.regressions(coord, [
-            {"criterion": "D1", "command": "pytest tests/test_kept.py::Case::test_a", "cwd": ".", "author": "builder"},
-            {"criterion": "D2", "command": "pytest tests/test_kept.py::Case::test_renamed", "cwd": ".",
-             "author": "builder"},
-            {"criterion": "D3", "command": "pytest tests/test_other.py tests/test_gone.py", "cwd": ".",
-             "author": "builder"},
-            {"criterion": "A1", "command": "pytest tests/", "cwd": ".", "author": "builder"}],
-            {"*": ["tests/test_kept.py::Case::test_a", "tests/test_kept.py::Case::test_renamed[x]",
-                   "tests/test_other.py::test_c", "tests/unit/test_d.py::test_d"]})
-        self.assertEqual(ran, [(["pytest tests/test_kept.py::Case::test_a", "pytest tests/"],
-                                {"*": ["tests/unit/test_d.py::test_d"]})],
-                         "the tests of the files the skipped checks name are no longer required")
-        self.assertEqual(skipped, ["pytest tests/test_kept.py::Case::test_renamed",
-                                   "pytest tests/test_other.py tests/test_gone.py"])
-
-    def test_the_check_on_main_after_a_merge_is_behaviour_only(self):
-        # #69 waited, a later reviewed merge changed its locked test on main, and the tamper check
-        # read that as a broken main (2026-11-17)
-        self.engine.store.put(IssueState(number=9, locked={"tests/test_a.py": "digest"}))
-        asked = []
-        self.engine._requirements_current = lambda n: True  # ty: ignore[invalid-assignment]  # test double
-        self.engine.ws = SimpleNamespace(coord=lambda: self.tmp, head=lambda root: "abc123",  # ty: ignore[invalid-assignment]  # test double
-                                         disposable=contextlib.nullcontext)
-        self.engine._specs = lambda st: []  # ty: ignore[invalid-assignment]  # test double
-        self.engine.caps, self.engine.check_env = Caps(), {}
-        self.engine._mounts = lambda root: None  # ty: ignore[invalid-assignment]  # test double
-        self.engine._fix_forward = lambda n, feedback: asked.append(feedback)  # ty: ignore[invalid-assignment]  # test double
-        with mock.patch.object(engine_module.verify, "verify",
-                               lambda *a, **k: asked.append(k["check_tamper"]) or (False, [], ["A1 failed"], [])):
-            self.engine._accept(9)
-        self.assertEqual(asked[0], False, "a locked file main changed since is no tampering")
-
-    def test_a_check_that_fails_once_is_checked_again_and_fails_only_twice(self):
-        coord = self.tmp / "coord"
-        (coord / "scripts").mkdir(parents=True)
-        (coord / "scripts/check.sh").write_text("#!/usr/bin/env bash\n")
-        self.engine.store.put_section("accepted_checks", "5", {"checks": [
-            {"criterion": "A1", "command": "scripts/check.sh engine-tests", "cwd": ".", "author": "builder"}],
-            "check_files": [], "manifest": {}})
-        self.engine.ws = SimpleNamespace(disposable=contextlib.nullcontext)  # ty: ignore[invalid-assignment]  # test double
-        self.engine.caps, self.engine.check_env = Caps(), {}
-        self.engine._mounts = lambda scratch: None  # ty: ignore[invalid-assignment]  # test double
-        for outcomes, failed in (([False, True], False), ([False, False], True), ([True], False)):
-            results = iter(outcomes)
-
-            def verified(*args, results=results, **kwargs):
-                ok = next(results)
-                return ok, [], [] if ok else ["A1 failed: failed tests: ['test_x']"], []
-            with mock.patch.object(engine_module.verify, "verify", verified):
-                found = self.engine._regressions(6, coord, "abc123")
-            self.assertEqual(bool(found), failed, outcomes)
-            self.assertEqual(next(results, None), None, "each outcome was asked for, and no more")
 
     def test_tests_that_ran_in_a_copy_outside_the_tree_are_never_required(self):
         # a command that copies the tree to a fresh `mktemp -d` and runs pytest there: the plugin

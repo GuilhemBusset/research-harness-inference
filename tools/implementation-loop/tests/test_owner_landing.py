@@ -206,7 +206,8 @@ def test_the_engine_opens_but_never_merges():
         assert st.phase == Phase.DONE and st.owner_landing is None
         assert not run.calls("merge_pr"), "the owner merged it: the engine never asked GitHub to"
         assert len(run.pulls()) == 1 and len(run.handed_over()) == 1
-        assert run.events("post_merge_verify")[-1]["ok"], "the post-merge verification ran, as for any issue"
+        assert {e["head_sha"] for e in st.evidence if e["kind"] == "command"} == {pr["head"]["sha"]}, \
+            "the evidence is the verifier's, on the head the owner merged, as for any issue"
         assert [e["head_sha"] for e in st.evidence if e["kind"] == "deployment"] == [commit], "and so did the verdict"
         assert run.fake.issues[ISSUE]["state"] == "closed" and "- [ ]" not in run.fake.issues[ISSUE]["body"]
         assert run.repo.main_file(WORKFLOW) == "jobs: new"

@@ -330,7 +330,7 @@ class FakeAgents:
             if not test.exists() or not any("locked" in f for f in feedback):
                 test.parent.mkdir(parents=True, exist_ok=True)
                 test.write_text(self._test_script(n))
-            if any("edge" in f for f in feedback):   # a blocking finding asked for the edge case
+            if any(re.search(r"\bedge", f) for f in feedback):   # a blocking finding asked for the edge case
                 (worktree / f"edge_{n}.txt").write_text("handled\n")
             for corner in sorted(set(re.findall(rf"corners_{n}/\w+\.txt", " ".join(feedback)))):   # each one it was shown
                 (worktree / corner).parent.mkdir(parents=True, exist_ok=True)

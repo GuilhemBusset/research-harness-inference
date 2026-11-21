@@ -273,7 +273,7 @@ class Engine:
         self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
         self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
         self.repair = bool(policy.get("repair", False))
-        self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
+        self._accept_lock = threading.Lock()   # one evidence step at a time
         self._meter_lock = threading.Lock()
         self._push_lock = threading.Lock()     # one push at a time in this run; across runs, `_hooks_held`
         self._polling: dict[int, float] = {}
@@ -3098,25 +3098,12 @@ class Engine:
         edited = ["the issue was edited after its work was merged; deliver the edited version"]
         if not self._requirements_current(n):
             return self._owner_round(n, edited)
-        coord = self.ws.coord()
-        head = self.ws.head(coord)
-        with self.ws.disposable(coord) as scratch:
-            # behaviour only: a later reviewed merge may change this issue's locked tests on main
-            ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
-                                                      sorted(set(st.tests) | set(st.probes)), in_tree(st.manifest) or None,
-                                                      self.caps.check_timeout_s, extra_env=self.check_env,
-                                                      check_tamper=False, standing=standing_checks(),
-                                                      mounts=self._mounts(scratch))
-        self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
-        if not ok:
-            env = environment_problem(evidence)
-            if env:
-                return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}",
-                                  resume=Phase.MERGED)
-            return self._fix_forward(n, ["verification failed on main after the merge: " + "; ".join(problems)[:600]])
-        regressions = self._regressions(n, coord, head)
-        if regressions:
-            return self._fix_forward(n, regressions)
+        self.ws.coord()   # the worktree read-only agents work in follows `main`
+        # The evidence is the trusted verifier's, on the head that landed (the land step merges only
+        # a verified and certified head). Nothing runs again on `main`: CI runs every test there.
+        # Only the verifier's own records: a second pass of this step finds the ones added below.
+        evidence = [e for e in st.evidence if e.get("kind") == "command"]
+        head = st.verified_sha or next((e["head_sha"] for e in evidence), "")
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
         checked = self._ci_discharged(n, st)       # owner items a CI job proved on the head that was merged
@@ -3135,7 +3122,7 @@ class Engine:
         exempt = owed - self._agent_part_items(st)       # an owner item's agent part must still be proven
         unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
         if unproven:
-            return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
+            return self._fix_forward(n, [f"ledger items without evidence on the head that landed: {unproven}"])
         links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in checked.items()}
         ticked = issue_parser.tick(issue.get("body") or "", links)
         if ticked != (issue.get("body") or ""):
@@ -3160,9 +3147,6 @@ class Engine:
         if verified:
             self.store.event("obligations_discharged", issue=n, head=next(iter(verified.values()))["head_sha"],
                              items={i: e["context"] for i, e in verified.items()})
-        self.store.put_section("accepted_checks", str(n), {
-            "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
-            "manifest": st.manifest})
         self._announce(n, st, Phase.DELIVERED if st.obligations else Phase.DONE)
         if st.worktree:
             self.ws.remove(Path(st.worktree))
@@ -3309,8 +3293,8 @@ class Engine:
         self._set_phase(n, Phase.PENDING)
 
     def _fix_forward(self, n: int, feedback: list[str]) -> None:
-        """A merged change broke `main`: one fix-forward round, then a revert PR through the same
-        gates; `main` is never left red."""
+        """A merged change broke `main` (its deployment failed, or a ledger item has no evidence):
+        one fix-forward round, then a revert PR through the same gates; `main` is never left red."""
         st = self.store.issue(n)
         if st.fix_forwards >= self.caps.fix_forwards:
             return self._revert(n, feedback)
@@ -3340,9 +3324,9 @@ class Engine:
         if st.worktree:   # the revert's worktree takes the issue worktree's place, as the next round does
             self.ws.remove(Path(st.worktree))
             st.worktree = None
-        # A revert lands through the same gates as any change: the merge queue, the trusted
-        # verifier (every earlier issue's checks on the reverted tree), the other vendor's
-        # certificate for the exact head, and the required check on it.
+        # A revert lands through the same gates as any change: the merge queue, the standing and
+        # history checks, the other vendor's certificate for the exact head, and the required check
+        # on it.
         waited = 0
         while not self._take_queue(n):
             if waited >= self.caps.queue_wait_s or self._unreleasable_hold(n):
@@ -3360,10 +3344,6 @@ class Engine:
             self.ws.git("reset", "--hard", "--quiet", main_sha, cwd=wt)
             self.ws.git("revert", "--no-edit", *[pr["merge_commit_sha"] for pr in merged], cwd=wt)
             head = self.ws.head(wt)
-            regressions = self._regressions(n, wt, head)
-            if regressions:
-                return self._fail(n, "main_broken", "reverting it still leaves earlier issues' checks failing: "
-                                                    + "; ".join(regressions)[:500])
             with self.ws.disposable(wt) as scratch:   # like any head that is pushed: the standing checks first
                 _, standing = verify.standing_checks(scratch, standing_checks(), head, self.store.issue_dir(n) / "revert",
                                                      self.caps.check_timeout_s, self.check_env, self._mounts(scratch))
@@ -3427,8 +3407,8 @@ class Engine:
         """Open the pull request of a revert of the pull requests `of`, from `branch`."""
         prs = ", ".join(f"#{number}" for number in of)
         body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
-                f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
-                f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
+                f"did not repair it. Scanned and certified by {self.other} on this exact head.\n\n"
+                + "\n".join(f"- {f}" for f in feedback)[:3000])
         return self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
 
     def _reverted(self, n: int, pr: int, feedback: list[str]) -> None:
@@ -3494,46 +3474,6 @@ class Engine:
         detail = self._owner_pull(n, record, lambda: self._revert_pull(n, branch, of, feedback))
         self.store.put(st)
         self._wait(n, WAIT_OWNER_LANDING, f"a revert: {detail}", resume=Phase.MERGED)
-
-    def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
-        """Re-run the commands of the run's earlier issues on `main` after a merge; an issue whose
-        checks fail is checked once more, and fails only if they fail twice. Not re-run: an
-        examiner's check (a probe an earlier engine committed), and a check that names a test file
-        or a test main no longer holds; nor are the locked tests of the files a skipped check
-        names, or a locked test main no longer defines, required to run. A reviewed merge removed
-        or renamed them on purpose."""
-        out = []
-        fields = CheckSpec.__dataclass_fields__
-        for key, entry in sorted(self.store.state.get("accepted_checks", {}).items()):
-            m = int(key)
-            if m == n:
-                continue
-            commands = [c for c in entry["checks"] if c.get("kind", "command") == "command"]
-            skipped = [c for c in commands if c.get("author") == "examiner"
-                       or any(not (coord / f).exists() for f in named_tests(c))
-                       or any(not defines_test(coord, node) for node in named_nodes(c))]
-            if skipped:
-                self.store.event("regression_check_skipped", issue=n, of=m,
-                                 checks=[(c.get("command") or "")[:160] for c in skipped])
-            gone = {f for c in skipped for f in named_tests(c)}   # no check left runs their tests
-            manifest = {k: [i for i in v if i.split("::")[0] not in gone and defines_test(coord, i)]
-                        for k, v in (entry.get("manifest") or {}).items()}
-            checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in commands if c not in skipped]
-            if not checks:
-                continue
-            for attempt in (1, 2):   # a failure is checked once more: a test that fails under load
-                with self.ws.disposable(coord) as scratch:   # once is no regression (#22, 2026-11-16)
-                    ok, evidence, problems, _ = verify.verify(
-                        scratch, checks, head, self.store.issue_dir(m) / "regression", {},
-                        entry.get("check_files", []), manifest or None, self.caps.check_timeout_s,
-                        extra_env=self.check_env, check_tamper=False, mounts=self._mounts(scratch))
-                self.store.event("regression_check", issue=n, of=m, head=head, ok=ok, problems=problems,
-                                 attempt=attempt)
-                if ok or environment_problem(evidence):
-                    break
-            if not ok and not environment_problem(evidence):
-                out.append(f"after #{n} merged, #{m}'s checks fail on main: " + "; ".join(problems)[:400])
-        return out
 
     def _reconcile_delivered(self) -> None:
         """A delivered issue whose owner has since ticked every remaining box is done. A deferred
@@ -3672,59 +3612,6 @@ def in_tree(manifest: dict | None) -> dict:
     absolute (a copy of the tree a command made under `/tmp`). Their path changes on every run, so
     they can never be required."""
     return {k: [i for i in v if not i.startswith("/")] for k, v in (manifest or {}).items()}
-
-
-def named_tests(check: dict) -> list[str]:
-    """The test files a check's command names, from the repository's root, whether they exist or
-    not: a path word named as a test is (`test_*.py`, `*_test.py`, `*.test.js`...), one with a
-    suffix under a `tests/` or `checks/` folder, or any source file (`.py`, `.sh`, `.js`, `.mjs`,
-    `.ts`): an earlier engine committed probes at the root (`examiner_probe_x.py`). A glob
-    pattern or an option names none."""
-    return [path for path, _ in _named(check)]
-
-
-def named_nodes(check: dict) -> list[str]:
-    """The tests a check's command names by node id (`tests/test_a.py::Case::test_x`), from the
-    repository's root."""
-    return [f"{path}::{names}" for path, names in _named(check) if names]
-
-
-def _named(check: dict) -> list[tuple[str, str]]:
-    import shlex
-    try:
-        words = shlex.split(check.get("command") or "")
-    except ValueError:
-        return []
-    out = []
-    for word in words:
-        word, _, names = word.partition("::")
-        if not word or word.startswith("-") or any(ch in word for ch in "*?["):
-            continue
-        path = posixpath.normpath(posixpath.join(check.get("cwd") or ".", word))
-        parts = path.split("/")
-        if path.startswith(("/", "..")) or "." not in parts[-1]:
-            continue
-        if (parts[-1].startswith("test_") or parts[-1].endswith((".py", ".sh", ".js", ".mjs", ".ts"))
-                or any(part in ("tests", "checks") for part in parts[:-1])):
-            out.append((path, names))
-    return out
-
-
-def defines_test(root: Path, node: str) -> bool:
-    """Whether the tree at `root` still holds the test a node id names: its file exists and, in a
-    Python file, each name after the path (a class, then a function; a parameter set dropped) is
-    defined in it. Read from the text, not collected: a test inherited from another module reads
-    as gone."""
-    path, *names = node.split("::")
-    try:
-        text = (root / path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    if not path.endswith(".py"):
-        return True
-    return all(re.search(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(name.split('[')[0])}\b", text,
-                         re.MULTILINE)
-               for name in names)
 
 
 def _names_probe(command: dict, probe: str) -> bool:

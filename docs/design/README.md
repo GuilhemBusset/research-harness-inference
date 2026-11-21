@@ -7,7 +7,7 @@ The design of the inference endpoint for the coding-agent cursus.
 | [`system-design.md`](system-design.md) | The design: AWS services, how the system works, why it should work, what it should serve, cost, risks, rollout, and the decisions that need the owner. Start here. |
 | [`evidence.md`](evidence.md) | The source behind every `[E n]` reference in the design, and how far each claim was verified. |
 
-**Status:** accepted on 2026-11-14 ([ADR 0002](../adr/0002-accept-the-system-design.md)). Where section 15 recommends an answer, the recommendation stands until the owner decides otherwise; the values it asks for are given when the work needs them.
+**Status:** accepted on 2026-11-14 ([ADR 0002](../adr/0002-accept-the-system-design.md)), amended on 2026-11-21 ([ADR 0003](../adr/0003-sessions-only-and-usage-logged.md)). Where section 15 recommends an answer, the recommendation stands until the owner decides otherwise; the values it asks for are given when the work needs them.
 
 Reading order for a decision: section 0 of the design (summary and decisions at a glance), then section 15 (decisions for the owner), then sections 4.2 and 4.7 (which model, and what it should serve), then section 12 (what is evidence and what is still an assumption).
 
