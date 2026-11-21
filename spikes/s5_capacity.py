@@ -502,11 +502,25 @@ def _where(one: common.Series) -> tuple[str, str]:
     return one.labels.get("instance", ""), one.labels.get("le", "")
 
 
+def _identity(one: common.Series) -> frozenset[tuple[str, str]]:
+    """Which raw series `one` is: all its labels but the name, which `last_over_time` drops. An
+    instance's engines are series of their own (vLLM labels each with its engine index)."""
+    return frozenset((label, value) for label, value in one.labels.items() if label != "__name__")
+
+
+def _held(one: common.Series, there: Sequence[frozenset[tuple[str, str]]]) -> bool:
+    """Whether the start held raw series `one`: a series at the start whose labels are all `one`'s,
+    which is `one` itself, its name aside, as `last_over_time` answers."""
+    labels = _identity(one)
+    return any(held <= labels for held in there)
+
+
 def counted_of(
     increases: Sequence[common.Series], raw: Sequence[common.Series], at_start: Sequence[common.Series]
 ) -> dict[tuple[str, str], float]:
     """Each instance's increase, by bucket (`le`, empty for none): the anchored increases, plus, for
-    each series of `raw` (read over the window) whose instance and bucket `at_start` does not hold,
+    each series of `raw` (read over the window) that `at_start` does not hold, matched on all its
+    labels but the name (one engine's series is not anchored on another's of the same instance),
     its first value. `at_start` is the selector's last sample within the lookback, read at the
     window's start, as `anchored` looks for the sample it starts from; a stale marker does not hide
     it. A series without one began at zero with its engine, and with nothing to anchor on, its
@@ -516,7 +530,7 @@ def counted_of(
     the times they were evaluated at, not the times of the samples, so whether a series was there
     at the start is read at the start, never from the time of its first point."""
     totals: dict[tuple[str, str], float] = {}
-    there = {_where(one) for one in at_start if one.samples}
+    there = [_identity(one) for one in at_start if one.samples and one.labels.get("instance")]
 
     def add(one: common.Series, value: float) -> None:
         where = _where(one)
@@ -527,7 +541,7 @@ def counted_of(
         if one.samples:
             add(one, one.samples[-1][1])
     for one in raw:
-        if one.samples and _where(one) not in there:
+        if one.samples and not _held(one, there):
             add(one, min(one.samples)[1])
     return totals
 
