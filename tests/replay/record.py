@@ -10,15 +10,22 @@ back unchanged. It saves each exchange in the order it arrived, as a capture num
 order (`Session`):
 
 - `<n>.json` for an exchange that the replay harness replays: an engine's answer (status 200) on a
-  forwarded route of the gateway;
+  forwarded route of the gateway, which a replay gives back byte for byte and settles to the usage
+  the answer reports;
+- `<n>.unreplayed` for an engine's answer that a replay would not give back as it was recorded,
+  such as a Chat Completions stream whose client did not ask for the usage chunk;
 - `<n>.gateway` for every other exchange, in the same format: a route the gateway answers itself
   (`GET /v1/models`, ...), a path outside its table, or a refusal. The replay harness only reads
-  `*.json` files, so it leaves these out.
+  `*.json` files, so it leaves these and the unreplayed ones out.
+
+A session is written to a folder of its own: the recorder refuses a folder that already holds a file,
+and never writes over one.
 
 Before a capture is written, every text of it is made neutral (`Neutral`): the endpoint's host and
 the recorder's own address become `EXAMPLE_HOST`, the student key becomes `KEY_PLACEHOLDER`, the
 recording machine's home directory becomes `NEUTRAL_HOME` and its user name becomes `NEUTRAL_USER`,
-wherever any of them appears in a request or an answer. The headers that carry the key are dropped.
+wherever any of them appears in a request or an answer, percent-encoded as in a URL as well. The
+headers that carry the key are dropped.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
 engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
@@ -296,32 +303,54 @@ _HOP_BY_HOP = frozenset(
     }
 )
 _DATA = re.compile(r"data: ?")
+# A name of a JSON object that is an identifier is a field of a wire format or of a tool's schema
+# (`max_tokens`, `maxLength`): the harness's makers wrote it, not the machine. The user name is not
+# looked for in it, so that a short one (`max`) does not rename a field.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A key in the format of `rhi_common.keys`, its underscore percent-encoded or not.
+_ANY_KEY = KEY_PATTERN.replace("_", "(?:_|%5[Ff])", 1)
+
+
+def _spelled(value: str) -> str:
+    """A pattern of a literal value, each of its characters written as itself or percent-encoded."""
+
+    def hexed(byte: int) -> str:
+        return "%" + "".join(f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in f"{byte:02X}")
+
+    return "".join(f"(?:{re.escape(char)}|{''.join(hexed(byte) for byte in char.encode('utf-8'))})" for char in value)
 
 
 class Neutral:
     """What a recorded text has in place of the endpoint's host, the key, the home directory and the user name.
 
-    Each value is replaced wherever it appears, inside a longer word as well, in one pass: what a
-    replacement writes is not read again. A host and the user name match in any letter case. A
-    body's JSON is rewritten string by string and name by name, so that no replacement falls on
-    JSON's own syntax or escapes. A body that needs no replacement keeps its bytes.
+    Each value is replaced wherever it appears, inside a longer word as well, and with any of its
+    characters percent-encoded as in a URL, in one pass: what a replacement writes is not read
+    again. A host and the user name match in any letter case. A body's JSON is rewritten string by
+    string and name by name, so that no replacement falls on JSON's own syntax or escapes; a name
+    that is an identifier is a field of the format, and only the user name is not looked for in it.
+    A body that needs no replacement keeps its bytes.
     """
 
     def __init__(self, *, hosts: Sequence[str], home: str, user: str, keys: Sequence[str] = ()) -> None:
         def literal(values: Sequence[str]) -> str:
             # The longest first, so that a host with its port wins over the host alone. An empty one matches nothing.
             written = sorted({value for value in values if value}, key=len, reverse=True)
-            return "|".join(re.escape(value) for value in written) or "(?!)"
+            return "|".join(_spelled(value) for value in written) or "(?!)"
 
         # The root of the file system is no home directory: replacing every `/` would write nonsense.
         homes = [home] if home.strip("/") else []
-        self._pattern = re.compile(
-            f"(?P<host>(?i:{literal(hosts)}))|(?P<key>{literal(keys)}|{KEY_PATTERN})"
-            f"|(?P<home>{literal(homes)})|(?P<user>(?i:{literal([user])}))"
-        )
+        common = f"(?P<host>(?i:{literal(hosts)}))|(?P<key>{literal(keys)}|{_ANY_KEY})|(?P<home>{literal(homes)})"
+        self._pattern = re.compile(f"{common}|(?P<user>(?i:{literal([user])}))")
+        self._field_pattern = re.compile(common)
 
     def text(self, text: str) -> str:
         return self._pattern.sub(self._replacement, text)
+
+    def name(self, name: str) -> str:
+        """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
+        if _IDENTIFIER.fullmatch(name):
+            return self._field_pattern.sub(self._replacement, name)
+        return self.text(name)
 
     @staticmethod
     def _replacement(found: re.Match[str]) -> str:
@@ -332,7 +361,7 @@ class Neutral:
     def value(self, value: Any) -> Any:
         """A JSON value, each of its names and strings made neutral."""
         if isinstance(value, dict):
-            return {self.text(name): self.value(inner) for name, inner in value.items()}
+            return {self.name(name): self.value(inner) for name, inner in value.items()}
         if isinstance(value, list):
             return [self.value(inner) for inner in value]
         return self.text(value) if isinstance(value, str) else value
@@ -426,7 +455,9 @@ async def capture_of(
     request_body = neutral.body(exchange.body.decode("utf-8"))
     answer_body = neutral.body(answer.decode("utf-8"))
     headers = {"host": EXAMPLE_HOST} | {
-        name.lower(): neutral.text(value) for name, value in exchange.headers if name.lower() not in _UNRECORDED
+        neutral.text(name.lower()): neutral.text(value)
+        for name, value in exchange.headers
+        if name.lower() not in _UNRECORDED
     }
     capture: dict[str, Any] = {
         "request": {
@@ -458,7 +489,24 @@ async def capture_of(
     }
     capture["usage"] = _usage(route, answer_body.encode("utf-8"))
     scrub.check(capture)
+    if replayable:
+        # The replay runs a gateway in an event loop of its own, so in a thread of its own.
+        replayable = await asyncio.to_thread(_replays, capture)
     return replayable, capture
+
+
+def _replays(capture: Mapping[str, Any]) -> bool:
+    """Whether a replay gives the client the recorded answer and settles once to the usage it reports."""
+    read = harness.parse("recorded", capture)
+    usage = read.usage
+    if usage.total == 0:  # An answer that reports no usage: the gateway would answer with an error.
+        return False
+    try:
+        replayed = harness.replay(read)
+    except Exception:  # noqa: BLE001 - whatever stops a replay, the capture is not one the replay tests can replay.
+        return False
+    settled = (harness.Settled(usage.input_tokens, usage.output_tokens, True, usage.total),)
+    return (replayed.status, replayed.received, replayed.settled) == (read.status, read.answer, settled)
 
 
 def _key_presented(headers: Sequence[tuple[str, str]]) -> list[str]:
@@ -477,7 +525,8 @@ class Session:
 
     Every request is forwarded to `upstream` and its answer streamed back as it comes. Each exchange
     is numbered in the order its request arrived and written to `out` once its answer has ended:
-    `<n>.json` when the replay harness replays it, `<n>.gateway` when not (see the module's text).
+    `<n>.json` when the replay harness replays it, `<n>.unreplayed` or `<n>.gateway` when not (see
+    the module's text). `out` is a new folder or an empty one: a session never writes over another.
     `pool` sends the forwarded requests to that pool of the endpoint; `profile` states the request
     profile of that pool of `config.example.toml` in each replayable capture. The home directory and
     the user name replaced are the machine's own unless given.
@@ -497,6 +546,8 @@ class Session:
         parts = urlsplit(upstream)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError("the upstream is an http or https URL with a host")
+        if out.exists() and any(out.iterdir()):
+            raise FileExistsError(f"{out} already holds files: a session is recorded into a folder of its own")
         self._upstream = upstream.rstrip("/")
         self._hosts = (parts.netloc, parts.hostname)
         self._out = out
@@ -579,6 +630,8 @@ class Session:
         neutral = Neutral(
             hosts=[*self._hosts, *own_host], home=self._home, user=self._user, keys=_key_presented(exchange.headers)
         )
+        route = routes.match(exchange.method, exchange.target)
+        engine_answered = route is not None and route.wire_format is not None and exchange.status == 200
         try:
             replayable, capture = await capture_of(exchange, neutral, self._stated)
         except scrub.Refused as refused:  # Its message names the rule and the place, never the value.
@@ -588,8 +641,12 @@ class Session:
             print(f"{name}: not written: {type(error).__name__}", file=sys.stderr)
             return
         self._out.mkdir(parents=True, exist_ok=True)
-        path = self._out / f"{name}{'.json' if replayable else '.gateway'}"
-        path.write_text(json.dumps(capture, indent=2) + "\n", encoding="utf-8")
+        suffix = ".json" if replayable else ".unreplayed" if engine_answered else ".gateway"
+        path = self._out / f"{name}{suffix}"
+        if suffix == ".unreplayed":
+            print(f"{name}: a replay would not give this answer back as recorded", file=sys.stderr)
+        with path.open("x", encoding="utf-8") as written:  # Never over a file already there.
+            written.write(json.dumps(capture, indent=2) + "\n")
         self.written.append(path)
         print(path)
 

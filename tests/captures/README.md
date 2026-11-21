@@ -101,15 +101,26 @@ arrived, numbered from `001`:
 
 - `<n>.json` is a capture the replay tests replay: an engine's answer, status 200, on a forwarded
   route of the gateway. Its usage is what the answer reports, read the way its route writes it: a
-  usage object, or the top-level `input_tokens` of a token count.
+  usage object, or the top-level `input_tokens` of a token count. The recorder replays it once
+  before it gives it this name: the client must receive the recorded answer, and the request must
+  settle to that usage.
+- `<n>.unreplayed` holds an engine's answer that a replay would not give back as it was recorded,
+  in the same format. The usual one is a streamed Chat Completions answer to a client that did not
+  ask for the usage chunk: the answer reports no usage. The recorder says so when it writes one.
 - `<n>.gateway` holds every other exchange in the same format: a route the gateway answers itself
   (`GET /v1/models`, ...), a path outside its table, or a refusal. Only the gateway took part in
-  these, so there is nothing to replay. The replay tests read `*.json` only, and leave these out.
+  these, so there is nothing to replay. The replay tests read `*.json` only, and leave these and
+  the unreplayed ones out.
+
+Each session goes into a folder of its own: the recorder refuses an `--out` folder that already
+holds a file, and never writes over one.
 
 Before it writes a capture, the recorder replaces each of these wherever it appears in a request
 or an answer: the endpoint's host and its own address become `gateway.example.com`, the student
 key becomes `the-student-key`, the recording machine's home directory becomes `/home/user`, and its
-user name becomes `user`, inside longer words too. It drops the headers that carry the key and the
+user name becomes `user`, inside longer words too, and percent-encoded as in a URL as well. A
+name of a JSON object that is an identifier, such as `max_tokens`, is a field of the format: a
+short user name such as `max` is not replaced in it. It drops the headers that carry the key and the
 cookie. While a cold pool held a stream, the gateway wrote keep-alives that the engine never sent,
 and the recorder leaves them out of the answer. The scrubber then reads the capture. If it refuses
 the capture, the recorder does not write it and prints the rule and the place.
