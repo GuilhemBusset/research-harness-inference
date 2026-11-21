@@ -212,14 +212,6 @@ class WaitAndFailTests(EngineCase):
         self.assertEqual(present(self.store.issue(2).fail)["cause"], "ceiling")
         self.assertEqual(self.store.issue(2).infra, 3)
 
-    def test_a_flaky_required_check_is_rerun_once(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.epic(2)
-        self.gh.check_script = ["failure", "success"]
-        self.run_engine()
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(len(self.gh.reruns), 1)
-
     def test_a_check_with_no_verdict_waits(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)

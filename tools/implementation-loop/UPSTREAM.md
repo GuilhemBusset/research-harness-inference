@@ -25,6 +25,29 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21)
+
+A local patch, not in upstream (ADR 0001, amendment 10). A deadline stops a supervision in the
+middle of an epic, while its runs bound and the per-issue ceilings already keep it finite; what
+sequences supervisions runs outside the engine and may still give one. A stall (`ceiling`,
+`no_progress` and the like) is no engine defect and never got a repair run, so its fault issue
+only waited for the operator to close it. The re-run of a failed `required` check needed write
+access to Actions, which the factory's GitHub App does not have, and a red check goes to the
+builder with its log anyway. The engine's version stays 1.2.21: nothing here repairs a failed
+issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/supervisor.py` | `MAX_HOURS` is gone. `max_hours` is optional (default `None`): with none there is no deadline, `_run_engine` waits for the run however long it takes, and no backoff is cut short. A deadline given by the caller works as before (one for repair and root runs, the run asked to stop, then signalled). The 10-run bound is unchanged. `_stall` stays, for the stall entries `faults.json` still holds. |
+| `implement_loop/cli.py` | `supervise --max-hours` defaults to none, and `--detach` passes it on only when given. |
+| `implement_loop/engine.py` | `_fail` records no fault (the `stall:` fingerprint and its issue body are gone); the event `failed` keeps the cause and the detail. The label `loop:failed` no longer says "filed as a loop fault". The land step no longer re-runs a failed required check (`ci_rerun_heads`, the event `ci_rerun`): its conclusion goes to `_ci_failed` at once. `_wait_required` returns the conclusion only, and its `after` parameter is gone. The builder's feedback no longer says "also after one re-run". |
+| `implement_loop/github.py` | `rerun_failed` is gone from the client's protocol, `GhCli` and `FakeGitHub` (with its `reruns`). |
+| `implement_loop/model.py` | `IssueState.ci_rerun_heads` is gone; a state file that still carries it loads (`from_dict` drops unknown keys). |
+| `implement_loop/report.py` | The progress comment of a failed issue, the run summary and the plan's preview no longer say that a failed issue is filed as a loop fault. |
+| `tests/test_supervisor.py`, `tests/test_review_fixes.py`, `tests/test_sandbox.py` | No deadline without `max_hours`; the CLI passes `--max-hours` on only when given; a stall fault from an earlier engine still gets no repair run; `_fail` files no fault and journals `failed`. |
+| `tests/test_engine.py`, `tests/test_engine_recovery.py`, `tests/test_github.py`, `tests/test_scheduler_state_verify.py` | The re-run tests are gone; a red check goes straight to the builder; a cancelled check waits until it is run again; an old state with `ci_rerun_heads` loads; a failed issue files no fault. |
+| `tests/test_history_checks.py`, `tests/test_redaction.py` | A failed issue's place and rule are read from its progress comment, which is what reaches GitHub, and no `loop:engine-bug` issue is filed. |
+
 ## A root takes over the deliveries of another root's run (2026-11-19)
 
 A local patch, not in upstream. A delivered issue stays open on GitHub while it still has owner
