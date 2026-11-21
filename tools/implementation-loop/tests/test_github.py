@@ -151,14 +151,6 @@ class GhCliRetryTests(unittest.TestCase):
                     self.assertEqual((len(fake.calls), slept), (1, []))
                     self.assertIn("may have taken effect", str(raised.exception))
 
-    def test_a_rerun_that_may_have_started_is_not_repeated(self):
-        runs = ok({"workflow_runs": [{"id": 5, "conclusion": "failure"}]})
-        gh, fake, slept = self.client(fail(BAD_GATEWAY), runs, fail(BAD_GATEWAY))
-        with self.assertRaises(GitHubUnavailable):
-            gh.rerun_failed("abc123")
-        self.assertEqual(fake.methods(), ["GET", "GET", "POST"], "the listing is retried, the re-run is not")
-        self.assertEqual(slept, [5])
-
     def test_a_creating_post_still_refused_after_the_retries_is_an_outage(self):
         gh, fake, slept = self.client(*[fail(REFUSED)] * 4)
         with self.assertRaises(GitHubUnavailable):

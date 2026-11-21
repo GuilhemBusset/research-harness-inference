@@ -67,9 +67,9 @@ scripts/implement.sh supervise <issue> --operator claude --yes --detach   # run 
 - `--detach` keeps the supervisor running after the terminal closes. It prints its process id
   and the path of its log.
 
-A supervision is bounded: at most 10 engine runs and 24 hours. `--max-runs` and `--max-hours`
-can lower the bounds, never raise them. Supervising the same issue again resumes where it
-stopped.
+A supervision is bounded at 10 engine runs. `--max-runs` can lower the bound, never raise it.
+It has no deadline of its own: `--max-hours` gives it one, and past it the run in progress is
+asked to stop at its next safe point. Supervising the same issue again resumes where it stopped.
 
 `scripts/implement.sh run <issue> --operator claude --yes` is one engine run without the
 supervisor. It resumes an existing run too; nothing restarts it when it ends with issues waiting.
@@ -136,15 +136,15 @@ Two other ways to get an issue moving again:
 | `done` | Merged, verified again on `main`, every ledger item has evidence. The issue is closed with its checkboxes ticked. | Nothing. |
 | `delivered` | Merged, and every item agents can prove is proven. Typed obligations remain, written on the issue: an `owner` item (it needs something this host lacks, listed in `loop.toml [host] lacks`), or an item deferred to another open issue. The issue stays open with the `loop:delivered` label. | The owner discharges owner items. A deferred item reopens by itself when its issue lands. |
 | `waiting` | Not an end state. The issue waits for something that clears by itself. | The supervisor resumes it. `retry` resumes it at once. |
-| `failed` | Not delivered, and nothing partial was merged. `status` shows the cause, one of the four below. It is filed as a loop fault (`loop:engine-bug`). | No repair run: the fault stays filed for the operator. A new engine version revives the issue once. `retry` gives it fresh ceilings. |
+| `failed` | Not delivered, and nothing partial was merged. `status` shows the cause, one of the four below, and so does the issue's progress comment. No fault issue is filed: the run's `events.jsonl` keeps it (event `failed`, with the cause and the detail). | No repair run: the operator reads it. A new engine version revives the issue once. `retry` gives it fresh ceilings. |
 
 Why an issue `failed`, and what the operator does about it:
 
 | Cause | What happened | What to do |
 | --- | --- | --- |
-| `ceiling` | The issue spent its call ceiling, its dollar ceiling, or its budget of attempts that timed out or crashed. The detail says which. | Read the fault issue and the last rounds in `events.jsonl`. If the issue is too large, split it or correct its size label: an edited issue starts with fresh budgets. Otherwise `retry`. |
+| `ceiling` | The issue spent its call ceiling, its dollar ceiling, or its budget of attempts that timed out or crashed. The detail says which. | Read the detail and the last rounds in `events.jsonl`. If the issue is too large, split it or correct its size label: an edited issue starts with fresh budgets. Otherwise `retry`. |
 | `no_progress` | Two rounds, a replan, and two more rounds ended on the same failure. The detail quotes it. | Usually the issue asks for something that cannot be shown here, or says it ambiguously: edit the issue. If the failure is a red `required` check, fix its cause first. Then `retry`, or let the edit resume it. |
-| `history` | The branch's own commits carry something the public-repository scan refuses: a value that reached a commit (even one a later commit removed), a commit message, or an author's address. No later commit can take that back, so the engine did not ask the builder to: it abandoned the branch **unpushed**. The commits that carry the finding never reached GitHub. | The fault issue names the file, the line and the rule, never the value. To see it, read the abandoned branch locally (`git log -p <branch>`), then delete it (`git branch -D <branch>`), and close its pull request if an earlier, clean state of it had been pushed. `retry` builds the issue again on a new branch from `main`. If the finding is an author's address, fix the git identity first (the doctor's `commit identity` line). |
+| `history` | The branch's own commits carry something the public-repository scan refuses: a value that reached a commit (even one a later commit removed), a commit message, or an author's address. No later commit can take that back, so the engine did not ask the builder to: it abandoned the branch **unpushed**. The commits that carry the finding never reached GitHub. | The detail names the file, the line and the rule, never the value. To see it, read the abandoned branch locally (`git log -p <branch>`), then delete it (`git branch -D <branch>`), and close its pull request if an earlier, clean state of it had been pushed. `retry` builds the issue again on a new branch from `main`. If the finding is an author's address, fix the git identity first (the doctor's `commit identity` line). |
 | `main_broken` | A merged change broke `main`, one fix-forward did not repair it, and the revert could not be made, verified, certified or merged; or the issue broke `main` twice and was reverted twice. The detail says which. | Look at `main` first: unless the detail says the revert landed, it is still broken and needs a pull request by hand. Then edit the issue or `retry`. |
 
 What a `waiting` issue waits for (`status` shows the kind):
@@ -154,11 +154,11 @@ What a `waiting` issue waits for (`status` shows the kind):
 | `merge_queue` | Another run is landing; this one lands next. |
 | `claim` | Another run is working on this issue. |
 | `prerequisite` | A prerequisite in this run is not delivered yet. |
-| `ci` | The `required` check gave no verdict in time. |
+| `ci` | The `required` check gave no verdict in time, or none at all (cancelled, or its workflow did not start). The engine never runs a check again: a red check goes to the builder with the failed job's log, and a cancelled one stays cancelled until it is run again on GitHub or the branch gets a new head. |
 | `outage` | A vendor CLI could not reach its service, or a Claude model refused the call (usage or rate limit) and its fallback refused too. The supervisor resumes once the vendor answers a smoke call. |
 | `github` | GitHub kept failing after retries. |
 | `environment` | The host cannot run the issue's checks (a missing tool, for example). It resumes when the doctor's probes change. |
-| `engine` | The engine itself faulted; a `loop:engine-bug` issue was filed, and the supervisor gives it one repair run (never on the safety surface). It resumes on a new engine version. |
+| `engine` | The engine itself faulted (an exception in a step); a `loop:engine-bug` issue was filed, and the supervisor gives it one repair run (never on the safety surface). It resumes on a new engine version. |
 | `run_ceiling` | The run's own call ceiling stopped new calls. The next run continues. |
 
 "Merged" means the gates passed on the pull request. It does not mean the change works in AWS.

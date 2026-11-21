@@ -114,7 +114,10 @@ class RoundRegressions(RecoveryCase):
         self.assertIn({"name": "loop:waiting"}, self.gh.issues[3]["labels"])
         self.assertEqual(self.gh.issues[2]["state"], "open")
         self.assertFalse([pr for pr in self.gh.prs.values() if pr["head"]["ref"] == "feat/issue-2"])
-        self.assertEqual(len(self.faults()), 1, "the non-delivery is filed as a loop fault")
+        self.assertEqual(self.faults(), [], "a non-delivery is no loop fault")
+        [failed] = self.events("failed", 2)
+        self.assertEqual(failed["cause"], "no_progress", "the run's journal keeps it")
+        self.assertTrue(failed["detail"])
 
     def test_an_edit_to_a_locked_test_never_reaches_a_commit(self):
         self.add_work(2, "docs/a.txt", "alpha", findings=1, tamper=True)
@@ -182,7 +185,7 @@ class RoundRegressions(RecoveryCase):
     def test_a_red_required_check_goes_back_to_the_builder_with_the_log(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        self.gh.check_script = ["failure", "failure"]   # red, red again after the re-run, then green
+        self.gh.check_script = ["failure"]   # red, then green on the builder's next head
         agents = FakeAgents(self.scripts)
         original = agents.build
 
@@ -194,7 +197,8 @@ class RoundRegressions(RecoveryCase):
         agents.build = fix_round  # ty: ignore[invalid-assignment]  # test double
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(len(self.gh.reruns), 1)
+        self.assertFalse(self.events("ci_rerun"), "a failed check is never run again")
+        self.assertEqual(len(self.builds()), 2, "the first red check went straight to the builder")
         feedback = self.builds()[1][3]
         self.assertTrue(any("fake CI failure" in f for f in feedback))
 
@@ -218,7 +222,9 @@ class RoundRegressions(RecoveryCase):
         st = self.store.issue(2)
         assert st.wait is not None
         self.assertEqual((st.phase, st.wait["kind"], st.wait["resume"]), (Phase.WAITING, "ci", "land"))
+        self.assertFalse(self.events("ci_rerun"), "the engine never runs a check again")
         self.gh.default_check = "success"
+        self.gh._check_seen.clear()   # the check is run again on GitHub, by its own trigger or by a person
         self.run_engine(agents=self.agents)
         self.assertEqual(self.phase(2), Phase.DONE)
 

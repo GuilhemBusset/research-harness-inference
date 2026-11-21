@@ -330,6 +330,16 @@ are recorded here as proposed and are part of what the owner approves.
    An item that ends with `(needs <capability>)` for a capability no CI job provides gets no
    verdict demand; it is the owner's obligation. The supervisor gives a repair run only to an
    engine exception, never to an issue that stalled (`ceiling`, `no_progress`).
+10. **No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21).** A
+    supervision is bounded by its 10 engine runs and the per-issue ceilings, which keep it
+    finite; it has no deadline of its own, and what sequences supervisions over time runs
+    outside the engine (a caller may still give one with `--max-hours`). An issue that stalls
+    (`ceiling`, `no_progress`, `history`, `main_broken`) is no engine defect and gets no repair
+    run, so it files no `loop:engine-bug` issue: it ends `failed`, its progress comment says why,
+    and the run's `events.jsonl` keeps the cause and the detail. Only an engine exception is
+    filed. A red `required` check is not run again: it goes back to the builder with the failed
+    job's log, as any failed check does, so the factory's GitHub App needs no write access to
+    Actions.
 
 ## Verified and taken on trust
 

@@ -93,6 +93,12 @@ class LegacyStateTests(unittest.TestCase):
                 self.assertEqual((st.phase, st.wait), (new, None))
                 self.assertFalse(hasattr(st, "attempts"))
 
+    def test_state_that_recorded_a_ci_rerun_still_loads(self):
+        """Engines that re-ran a failed required check kept the heads re-run; the field is gone."""
+        st = IssueState.from_dict({"number": 6, "phase": "land", "head_sha": "abc", "ci_rerun_heads": ["abc"]})
+        self.assertEqual((st.phase, st.head_sha), (Phase.LAND, "abc"))
+        self.assertNotIn("ci_rerun_heads", st.to_dict())
+
     def test_a_parked_issue_keeps_why_and_where_for_the_migration(self):
         st = IssueState.from_dict({"number": 23, "phase": "parked", "park_kind": "engine_error",
                                    "resume_phase": "review", "reason": "a KeyError", "parked_version": "0.3.0",

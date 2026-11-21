@@ -181,12 +181,14 @@ class EngineHistoryTests(HistoryCase):
         self.assertNotIn(ACCOUNT, self.published())
         self.assertTrue(git("branch", "--list", "feat/issue-2", cwd=self.repo.work), "the abandoned branch stays, locally")
         self.assertFalse(self.events("step_crashed"), "not an engine fault")
-        [fault] = [i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]]
+        self.assertFalse([i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]],
+                         "a stall files no fault issue")
         everything = json.dumps([self.store.events(), st.to_dict(), self.gh.issues, self.gh.comments])
         self.assertNotIn(ACCOUNT, everything, "the scanner's excerpts are redacted, and what is published has none")
-        self.assertIn("**history**", fault["body"])
-        self.assertIn("docs/a.txt@", fault["body"])
-        self.assertNotIn("[redacted", fault["body"], "the place and the rule, not the line around the value")
+        progress = [c["body"] for c in self.gh.comments.get(2, []) if c["body"].startswith(L.report.PROGRESS_MARKER)]
+        self.assertIn("**Not delivered (history):**", progress[-1])
+        self.assertIn("docs/a.txt@", progress[-1])
+        self.assertNotIn("[redacted", progress[-1], "the place and the rule, not the line around the value")
 
     def test_a_value_committed_and_then_removed_is_stopped_before_the_push(self):
         # The head's tree is clean and an examiner certified it: only its history carries the value.
@@ -524,10 +526,12 @@ class OwnersListTests(OwnersListCase):
         self.assertNotIn(VALUE, self.published())
         self.assertEqual((st.branch, st.round, st.worktree), ("feat/issue-2-r2", 2, None))
         self.assertTrue(git("branch", "--list", "feat/issue-2", cwd=self.repo.work), "the abandoned branch stays, locally")
-        [fault] = [i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]]
+        self.assertFalse([i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]],
+                         "a stall files no fault issue")
+        progress = [c["body"] for c in self.gh.comments.get(2, []) if c["body"].startswith(L.report.PROGRESS_MARKER)]
         detail = (st.fail or {}).get("detail", "")
         self.assertIn("the scan with the owner's local values", detail)
-        for text in (detail, fault["body"], st.feedback[0]):
+        for text in (detail, progress[-1], st.feedback[0]):
             self.assertIn(NOTED, text)
         for secret in SECRET:
             self.assertNotIn(secret, self.kept())
