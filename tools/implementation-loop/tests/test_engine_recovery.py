@@ -14,7 +14,8 @@ from unittest import mock
 
 from helpers import REPO_ROOT, SHIP, git, issue_body, present
 from implement_loop import engine as engine_mod
-from implement_loop.agents import AgentFailure, Decision, FakeAgents, Request, Script
+from implement_loop import report
+from implement_loop.agents import AgentFailure, FakeAgents, Script
 from implement_loop.config import Caps
 from implement_loop.engine import Engine
 from implement_loop.github import GitHubError
@@ -115,18 +116,6 @@ class RoundRegressions(RecoveryCase):
         self.assertEqual(self.gh.issues[2]["state"], "open")
         self.assertFalse([pr for pr in self.gh.prs.values() if pr["head"]["ref"] == "feat/issue-2"])
         self.assertEqual(len(self.faults()), 1, "the non-delivery is filed as a loop fault")
-
-    def test_an_edit_to_a_locked_test_never_reaches_a_commit(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1, tamper=True)
-        self.epic(2)
-        summary = self.run_engine()
-        self.assertEqual(summary["phases"], {"done": 1})
-        self.assertEqual(self.events("locked_changes_reverted", 2)[0]["files"], ["checks/issue_2.sh"])
-        self.assertNotIn("exit 0", present(self.repo.main_file("checks/issue_2.sh")), "the edit never reaches a commit")
-        touched = git("log", "--format=%s", "origin/main", "--", "checks/issue_2.sh", cwd=self.repo.work)
-        self.assertEqual(len(touched.splitlines()), 1, "only the squash merge touches the locked test")
-        guard = self.guard()
-        self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
 
     def test_a_builder_that_is_always_blocked_fails_after_a_replan(self):
         self.add_work(2, "docs/a.txt", "alpha", impossible=True)
@@ -299,21 +288,21 @@ class RequirementRegressions(RecoveryCase):
                          "the second round changed nothing, so there was nothing to merge")
         self.assertTrue(self.events("nothing_to_land", 2))
 
-    def test_criteria_edited_during_post_merge_verification_are_not_ticked(self):
+    def test_criteria_edited_during_the_evidence_step_are_not_ticked(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        real_verify = engine_mod.verify.verify
+        real_upsert = Engine._upsert_comment
         ticked = []
 
-        def verify_then_edit(root, *args, **kwargs):
-            result = real_verify(root, *args, **kwargs)
-            # post-merge verification: it runs while the issue is merged (in a copy of the coord worktree)
-            if RunStore.for_root(self.repo.work, EPIC).issue(2).phase == Phase.MERGED:
+        def upsert_then_edit(engine, n, marker, body):
+            result = real_upsert(engine, n, marker, body)
+            # the evidence comment of the evidence step: it is written while the issue is merged
+            if marker == report.EVIDENCE_MARKER and engine.store.issue(2).phase == Phase.MERGED:
                 ticked.append("- [x] The test passes on main." in self.gh.issues[2]["body"])
                 self.gh.issues[2]["body"] = self.gh.issues[2]["body"].replace("The test passes on main.",
                                                                              "Something else entirely.")
             return result
-        with mock.patch.object(engine_mod.verify, "verify", verify_then_edit):
+        with mock.patch.object(Engine, "_upsert_comment", upsert_then_edit):
             self.run_engine()
         self.assertEqual(self.store.issue(2).round, 2)
         self.assertTrue(self.events("new_round", 2))
@@ -385,86 +374,47 @@ class AgentGitRegressions(RecoveryCase):
         self.assertEqual(self.repo.main_file("docs/a.txt"), "alpha", "only verified content may reach main")
 
 
-class LockedTestRegressions(RecoveryCase):
-    """A locked test changes only with the agreement of both vendors (ADR 0012, Q2)."""
+class TestEditRegressions(RecoveryCase):
+    """Nothing locks a test: the builder may change any, and the examiner reviews it in the diff."""
 
-    def test_a_locked_test_changes_only_through_an_approved_request(self):
-        # #21: a locked chart test waited for "no SVG in any chart"; it cost a full redesign
-        self.add_work(2, "docs/a.txt", "alpha", findings=1, test_change=True)
+    def test_an_earlier_engines_lock_is_released_before_the_builder_edits_the_test(self):
+        # a branch an earlier engine worked on: its acceptance-checks commit locked the test, and CI's
+        # loop guard refuses any later commit that changes it unless a later one releases it
+        git("fetch", "-q", "origin", cwd=self.repo.merger)
+        git("checkout", "-q", "-B", "feat/issue-2", "origin/main", cwd=self.repo.merger)
+        (self.repo.merger / "checks").mkdir(exist_ok=True)
+        (self.repo.merger / "checks" / "issue_2.sh").write_text("#!/usr/bin/env bash\ntest -f docs/a.txt\n")
+        git("add", "-A", cwd=self.repo.merger)
+        git("commit", "-qm", "Lock the tests for #2\n\nRefs #2\n\nLoop-Phase: acceptance-checks\n", cwd=self.repo.merger)
+        git("push", "-q", "origin", "feat/issue-2", cwd=self.repo.merger)
+        self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
         self.run_engine()
         self.assertEqual(self.phase(2), Phase.DONE)
-        st = self.store.issue(2)
-        self.assertEqual(self.events("requests_decided", 2)[0]["decided"], {"R2-1": "approved"})
-        self.assertEqual(self.roles("decide"), {"codex"}, "the other vendor agrees to the change")
-        self.assertEqual(self.events("locked_tests_changed", 2)[0]["files"], ["checks/issue_2.sh"])
-        self.assertEqual(st.replans, 0, "changed, not replanned")
-        self.assertIn("# amended through an approved request", present(self.repo.main_file("checks/issue_2.sh")))
-        bodies = git("log", "--format=%B", "origin/feat/issue-2", cwd=self.repo.work)
-        self.assertIn("Loop-Approved: R2-1 by codex", bodies)
+        self.assertEqual([e["files"] for e in self.events("locks_released", 2)], [["checks/issue_2.sh"]])
+        self.assertIn('test "$(cat docs/a.txt)" = "alpha"', present(self.repo.main_file("checks/issue_2.sh")),
+                      "the builder's own version of the test landed")
         guard = self.guard()
         self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
 
-    def test_a_refused_test_change_leaves_the_locked_test_as_it_was(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1, test_change=True)
-        self.epic(2)
-        agents = FakeAgents(self.scripts)
-        agents.decide = lambda vendor, req, wt, requests: agents._metered(  # ty: ignore[invalid-assignment]  # test double
-            2, "decide", vendor, lambda: [Decision(r["id"], False, "the item never asks for it") for r in requests])
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(self.events("requests_decided", 2)[0]["decided"], {"R2-1": "refused"})
-        self.assertFalse(self.events("locked_tests_changed", 2))
-        self.assertTrue(any("checks/issue_2.sh" in e["files"] for e in self.events("locked_changes_reverted", 2)))
-        self.assertNotIn("amended", present(self.repo.main_file("checks/issue_2.sh")))
-
-    def test_a_test_change_request_must_carry_an_edit_to_a_locked_test(self):
+    def test_a_builder_may_change_its_tests_in_any_round(self):
         self.add_work(2, "docs/a.txt", "alpha", findings=1)
         self.epic(2)
         agents = FakeAgents(self.scripts)
         original = agents.build
 
-        def ask_without_editing(vendor, req, plan, worktree, feedback):
+        def amend_the_test(vendor, req, plan, worktree, feedback):
             result = original(vendor, req, plan, worktree, feedback)
-            if len([c for c in agents.calls if c[0] == "build"]) == 2:
-                result.requests.append(Request("test_change", "this test is wrong", paths=["docs/a.txt"]))
+            if len([c for c in agents.calls if c[0] == "build"]) == 2:   # after the first examination
+                with (worktree / "checks" / "issue_2.sh").open("a") as test:
+                    test.write("# amended after the first examination\n")
             return result
-        agents.build = ask_without_editing  # ty: ignore[invalid-assignment]  # test double
+        agents.build = amend_the_test  # ty: ignore[invalid-assignment]  # test double
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
-        request = self.store.issue(2).requests[0]
-        self.assertEqual(request["status"], "refused")
-        self.assertIn("needs the proposed content", request["reason"])
+        self.assertIn("# amended after the first examination", present(self.repo.main_file("checks/issue_2.sh")))
         self.assertFalse([c for c in agents.calls if c[0] == "decide"], "nothing for the other vendor to decide")
-        self.assertFalse(self.events("locked_tests_changed", 2))
-        self.assertEqual(self.repo.main_file("docs/a.txt"), "alpha", "a request never deletes what it names")
-
-    def test_an_interrupted_build_never_lands_an_edit_to_a_locked_test(self):
-        self.add_work(2, "docs/a.txt", "alpha", findings=1)
-        self.epic(2)
-        agents = FakeAgents(self.scripts)
-        original = agents.build
-        store_dir = self.store_dir()
-        interrupted = []
-
-        def half_written(vendor, req, plan, worktree, feedback):
-            if self.engine.store.issue(2).locked and not interrupted:   # the round after the first examination
-                interrupted.append(True)
-                (worktree / "checks" / "issue_2.sh").write_text("#!/usr/bin/env bash\n# half-written edit\n")
-                (store_dir / "STOP").write_text("stop\n")
-                raise type("AgentStopped", (RuntimeError,), {})("stopped mid-build")
-            return original(vendor, req, plan, worktree, feedback)
-        agents.build = half_written  # ty: ignore[invalid-assignment]  # test double
-        self.run_engine(agents=agents)
-        self.assertEqual(self.phase(2), Phase.BUILD)
-        self.assertTrue(self.events("step_interrupted", 2))
-        # main moves on, so the next round first checkpoints what the interrupted build left
-        self.move_main({"docs/elsewhere.txt": "main moved\n"})
-        self.run_engine(agents=agents)   # the stop belonged to the earlier invocation
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertTrue(self.events("checkpoint_before_update", 2))
-        self.assertTrue(any("checks/issue_2.sh" in e["files"] for e in self.events("locked_changes_reverted", 2)))
-        self.assertNotIn("half-written", present(self.repo.main_file("checks/issue_2.sh")))
+        self.assertFalse(self.events("locks_released", 2), "nothing was ever locked")
         guard = self.guard()
         self.assertEqual(guard.returncode, 0, guard.stdout + guard.stderr)
 
@@ -708,24 +658,6 @@ class CrossVendorRegressions(RecoveryCase):
         self.assertFalse(summary["stopped"])
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertTrue(self.events("stale_stop_cleared"))
-
-    def test_earlier_issues_are_regression_checked_after_a_restart(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))
-        self.epic(2, 3)
-        original = Engine._step_plan
-
-        def stop_before_3(engine, n):
-            if n == 3:
-                (engine.store.dir / "STOP").write_text("stop\n")
-                raise type("AgentStopped", (RuntimeError,), {})("stopped")
-            return original(engine, n)
-        with mock.patch.object(Engine, "_step_plan", stop_before_3):
-            self.run_engine()
-        self.assertEqual(self.gh.issues[2]["state"], "closed", "#2 is done and leaves the next plan's work")
-        self.run_engine(agents=FakeAgents(self.scripts))
-        checked = [e for e in self.events("regression_check") if e["issue"] == 3]
-        self.assertTrue(checked and checked[0]["of"] == 2 and not checked[0]["ok"])
 
     def test_published_fault_reports_carry_no_exception_message(self):
         self.add_work(2, "docs/a.txt", "alpha")

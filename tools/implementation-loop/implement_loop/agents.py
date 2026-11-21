@@ -13,6 +13,7 @@ after every attempt, so the engine can charge calls to the issue's ceilings.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,7 +86,7 @@ class Objection:
 
 @dataclass
 class Request:
-    kind: str     # paths | protected_change | command_change | test_change | reclassify | depends | dispute
+    kind: str     # protected_change | reclassify | depends | dispute
     detail: str
     paths: list[str] = field(default_factory=list)
     item: str | None = None
@@ -93,7 +94,7 @@ class Request:
     capability: str | None = None
     depends_on: int | None = None
     depends_quote: str | None = None
-    command: dict | None = None        # command_change: the new command for `item`
+    command: dict | None = None        # unused: what an earlier engine's command_change gave
     id: str = ""
 
 
@@ -155,8 +156,6 @@ class Agents(Protocol):
     def plan(self, vendor: str, req: IssueRequest, worktree: Path | None) -> PlanResult: ...
     def triage(self, vendor: str, req: IssueRequest, plan: dict) -> list[Objection]: ...
     def build(self, vendor: str, req: IssueRequest, plan: dict, worktree: Path, feedback: list[str]) -> BuildResult: ...
-    def resolve_locked(self, vendor: str, req: IssueRequest, worktree: Path, files: list[str], feedback: list[str]) -> None:
-        """Resolve main's conflict markers in locked tests (never the builder's vendor)."""
     def examine(self, vendor: str, req: IssueRequest, plan: dict, worktree: Path, base_sha: str, head_sha: str,
                 evidence: list[dict], memory: list[dict], requests: list[dict], since: str | None) -> ExamResult: ...
     def decide(self, vendor: str, req: IssueRequest, worktree: Path, requests: list[dict]) -> list[Decision]: ...
@@ -178,12 +177,10 @@ class Script:
     findings: int = 0                             # the first N examinations report a blocking, reproduced defect
     unquoted_findings: int = 0                    # ... a reproduced defect tied to no item (a follow-up)
     probe: str = "pass"                           # the examiner's probe: pass | unconditional | none
-    blocked_once: bool = False                    # the first build needs a path outside its zones
+    blocked_once: bool = False                    # the first build needs a protected path, with a request
     extra_path: str = ""                          # ... this one
-    tamper: bool = False                          # a build after locking edits the locked test
     deferred: tuple[tuple[str, int], ...] = ()    # (item, issue) the plan defers
     lines: dict[str, str] = field(default_factory=dict)   # shared list file -> the line this issue adds
-    conflict_tamper: bool = False                 # resolving a conflict, also edits the locked test
     commits: bool = False                         # the builder commits its work (it should not)
     tags: bool = False
     branches: bool = False
@@ -192,7 +189,6 @@ class Script:
     no_certify: int = 0                           # the first N examinations withhold the certificate
     impossible: bool = False                      # every build answers blocked, with no typed request
     advisory_findings: int = 0                    # the first N examinations report a finding with no reproduction
-    test_change: bool = False                     # the second build amends its (locked) test, with a request
 
 
 MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
@@ -208,11 +204,6 @@ def resolve_union(text: str) -> str:
         if not (inside and line in out):
             out.append(line)
     return "\n".join(out) + "\n" if out else ""
-
-
-def merging(worktree: Path) -> bool:
-    return subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=worktree,
-                          capture_output=True, check=False).returncode == 0
 
 
 class FakeAgents:
@@ -286,8 +277,7 @@ class FakeAgents:
                 items.append(ItemPlan(item.id, "judged by the examiner", words, "review"))
             else:
                 items.append(ItemPlan(item.id, "proven by the test", words, "test"))
-        zones = sorted(set(s.files) | set(s.lines) | {self.test_file(n)} | ({f"edge_{n}.txt"} if s.findings else set()))
-        result = PlanResult(items=items, zones=zones,
+        result = PlanResult(items=items, zones=[],
                             decisions=[{"id": "approach", "choice": "the simplest variant", "rationale": "fake"}])
         return self._metered(n, "plan", vendor, lambda: result)
 
@@ -310,7 +300,6 @@ class FakeAgents:
         def run():
             if s.impossible:
                 return BuildResult("blocked", "the criteria contradict each other")
-            resolving = merging(worktree)
             for path, line in s.lines.items():
                 target = worktree / path
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -323,20 +312,10 @@ class FakeAgents:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text((content if k >= s.wrong_attempts else "wrong") + "\n")
             test = worktree / self.test_file(n)
-            if not test.exists() or not any("locked" in f for f in feedback):
-                test.parent.mkdir(parents=True, exist_ok=True)
-                test.write_text(self._test_script(n))
-            if any("edge" in f for f in feedback):   # a blocking finding asked for the edge case
+            test.parent.mkdir(parents=True, exist_ok=True)
+            test.write_text(self._test_script(n))
+            if any(re.search(r"\bedge", f) for f in feedback):   # a blocking finding asked for the edge case
                 (worktree / f"edge_{n}.txt").write_text("handled\n")
-            if s.tamper and k >= 1:
-                test.write_text("#!/usr/bin/env bash\nexit 0\n")
-            if s.conflict_tamper and resolving:
-                test.write_text("#!/usr/bin/env bash\nexit 0\n")
-            requests = []
-            if s.test_change and k == 1:
-                test.write_text(self._test_script(n) + "# amended through an approved request\n")
-                requests.append(Request("test_change", "the locked test misses a comment the item needs",
-                                        paths=[self.test_file(n)]))
             if s.commits:
                 subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
                 subprocess.run(["git", "commit", "-qm", "agent commit"], cwd=worktree, check=True)
@@ -345,25 +324,14 @@ class FakeAgents:
             if s.branches and k == 0:
                 subprocess.run(["git", "branch", f"agent-branch-{n}"], cwd=worktree, check=True)
             if s.blocked_once and k == 0:
-                return BuildResult("blocked", "the registry lives outside my zones",
-                                   requests=[Request("paths", "register the suite", paths=[s.extra_path])])
+                return BuildResult("blocked", "the registry is a protected path the issue does not name",
+                                   requests=[Request("protected_change", "register the suite", paths=[s.extra_path])])
             if s.extra_path and (worktree / s.extra_path).parent.exists() and k >= 1 and s.blocked_once:
                 (worktree / s.extra_path).write_text(f"suite {n}\n")
             commands = [CheckSpec(criterion=i["id"], command=f"bash {self.test_file(n)}")
                         for i in plan["items"] if i["proof"] in ("test", "command")]
-            return BuildResult("done", "built", tests=[self.test_file(n)], commands=commands, requests=requests)
+            return BuildResult("done", "built", tests=[self.test_file(n)], commands=commands)
         return self._metered(n, "build", vendor, run)
-
-    def resolve_locked(self, vendor, req, worktree, files, feedback):
-        n = req.issue.number
-        self.calls.append(("resolve_locked", vendor, n, tuple(files)))
-
-        def run():
-            for f in files:
-                p = worktree / f
-                if p.is_file():
-                    p.write_text(resolve_union(p.read_text()))
-        return self._metered(n, "resolve_locked", vendor, run)
 
     def examine(self, vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since):
         n = req.issue.number

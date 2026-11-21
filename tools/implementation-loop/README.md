@@ -80,7 +80,6 @@ examiner role on Codex with its default model (ADR 0001, decision 2).
 | --- | --- | --- |
 | explore, plan, triage, arbitrate | builder (explore, plan) / examiner (triage, arbitrate) | read-only tools (Claude) / read-only sandbox (Codex) |
 | build | builder | edits the issue worktree, runs anything, network; Claude's commit, push, `gh`, `aws` and `cdk deploy` commands are denied |
-| resolve_locked | examiner | resolves main's conflicts in locked tests, in the issue worktree |
 | examine, decide | examiner | anything, network, in a disposable worktree deleted afterwards |
 
 Both vendors' working roles have the same access: Codex runs them with `--sandbox
@@ -94,7 +93,7 @@ finds no AWS material and no GitHub login, in files or in its environment. Beyon
 commits never reach the repository (the engine commits its changes itself), and only verified,
 reviewed heads are merged. Codex calls start with no MCP servers.
 
-Every agent that can write (`build`, `resolve_locked`, and `examine` and `decide` in their
+Every agent that can write (`build`, and `examine` and `decide` in their
 disposable worktree) works against a private git directory of its run's own, at
 `<repo parent>/<repo name>.loop/issue-<root>/agent-git/<id>/`. For the call, the worktree's `.git`
 file names that directory instead of the worktree's own one in the shared repository. The
@@ -168,7 +167,7 @@ Two lists in `config.py`, run by the verifier inside the sandbox, whatever an is
 - `STANDING_CHECKS`: `python3 tools/hygiene/scan.py`, the public-repository scan of the tree.
   It runs on the builder's working tree before the engine commits a round, on an examiner's
   probes before they are run or adopted, on every head that is verified (before the issue's own
-  commands, on `main` after a merge too), and on a revert before it is pushed. A finding goes
+  commands), and on a revert before it is pushed. A finding goes
   back to its author with the scanner's redacted output: a builder's round is not committed
   (`build_not_committed`), a probe is not kept and the examiner is told why. A tree without the
   scanner fails closed.
@@ -183,7 +182,7 @@ Two lists in `config.py`, run by the verifier inside the sandbox, whatever an is
   like any other, and that head is not pushed.
 
 Both are the scanner of the tree under judgement, which is a protected path: a head that changed
-it without approval fails the zone gate. What they publish (a fault issue, feedback) names the
+it without approval fails the protected-path gate. What they publish (a fault issue, feedback) names the
 place and the rule, never the line around a value.
 
 ## How an issue moves
@@ -193,13 +192,13 @@ place and the rule, never the line around a value.
 
 | Phase | Who | What happens |
 | --- | --- | --- |
-| plan | builder, then engine, then examiner | The builder reads the repo and the issue's branch and gives every ledger item a quoted reading and a proof kind (`test`, `command`, `review`, `owner` for a capability the host lacks, `deferred` to another open issue), plus its zones. The engine lints it (one free retry, then it repairs it and publishes why). The examiner may only object to a misreading, a classification or a dependency, each with a quote; a classification dispute goes to the arbiter. A protected path among the plan's zones is granted only when the issue's deliverables name it (that path, or a protected directory above it; naming `scripts/` does not name `scripts/check.sh`). Any other is withheld, with a published decision: triage has no objection kind for a zone, so its silence approves nothing, and the builder asks with a `protected_change` request. |
-| planned | engine | Waits until its zones don't overlap any issue being built, and no shared file is held. |
-| build | builder, then engine | Before anything is committed the engine runs the standing checks on the working tree: a round they refuse is not committed and goes back with their output. The builder writes the code, its own tests, the registrations and one or more commands per item (all of them run; each names exactly one item id as its criterion, and one that names no item is reported back, not kept; after the first examination a changed list for an item is one `command_change` request, and a typed `command_change` with one command adds it to the item's commands; the decider sees the commands it `replaces`). Never commits. Asks for anything outside its lane with a typed request (`paths`, `protected_change`, `command_change`, `test_change`, `reclassify`, `depends`, `dispute`), decided by a fresh call of the other vendor (disputes: the arbiter). Edits to locked tests without an approved request are reverted. |
-| verify | engine | Runs the standing checks and the history checks, then every command and adopted probe from its own code: locked files unchanged, tests that ran before still run, no skips, per-process pytest reports, unselected tests need a disposition, changed files within the zones and approved grants, open findings re-run. |
-| examine | examiner | In a disposable copy of the exact head: verdicts on review items, every finding at once (with memory of earlier rounds), probes, and a certificate. A probe only witnesses a finding and is never committed: the finding keeps it, and the verifier writes it into its copy of each head. A finding blocks only if the engine reproduces it and it quotes the item or names a safety invariant; others become a follow-up issue. At the first examination the tests, their configuration and the selection manifest lock. |
+| plan | builder, then engine, then examiner | The builder reads the repo and the issue's branch and gives every ledger item a quoted reading and a proof kind (`test`, `command`, `review`, `owner` for a capability the host lacks, `deferred` to another open issue). The engine lints it (one free retry, then it repairs it and publishes why). The examiner may only object to a misreading, a classification or a dependency, each with a quote; a classification dispute goes to the arbiter. A protected path is granted when the issue's deliverables name it (that path, or a protected directory above it; naming `scripts/` does not name `scripts/check.sh`), with a published decision; any other needs a `protected_change` request. Nothing else restricts what the builder may change. |
+| planned | engine | Waits until the paths its issue names don't overlap any issue being built, and no shared file is held. |
+| build | builder, then engine | Before anything is committed the engine runs the standing checks on the working tree: a round they refuse is not committed and goes back with their output. The builder writes the code, its tests, the registrations and one or more commands per item (all of them run; each names exactly one item id as its criterion, and one that names no item is reported back, not kept; an item it gives commands for runs those from then on). It may change any file, tests included, except a protected path it was not granted. Never commits. Asks with a typed request (`protected_change`, `reclassify`, `depends`, `dispute`), decided by a fresh call of the other vendor (disputes: the arbiter). A branch an earlier engine locked tests on gets one commit that releases them in CI's loop guard (`locks_released`). |
+| verify | engine | Runs the standing checks and the history checks, then every command and adopted probe from its own code (a command that several items name runs once, and its result counts for each): no skips, per-process pytest reports, protected paths changed only with a grant, open findings re-run. |
+| examine | examiner | In a disposable copy of the exact head: verdicts on review items, every finding at once (with memory of earlier rounds), probes, and a certificate. A probe only witnesses a finding and is never committed: the finding keeps it, and the verifier writes it into its copy of each head. A finding blocks only if the engine reproduces it and it quotes the item or names a safety invariant; others become a follow-up issue. A change that weakens a test is a finding under "check or gate bypass": nothing locks a test, the examiner reviews it in the diff. The certified head is the one that lands. |
 | land | engine | One at a time across runs (a run that finds the queue held waits): the history checks once more on the exact head, then push without force, PR with `Refs #N`, evidence comment, the `required` check on the exact certified head, merge with that head SHA. Main moving means verify and a delta examination again. |
-| merged → delivered/done | engine | Re-verifies on `main`, re-runs the run's earlier issues' checks there, ticks the checkboxes with evidence links, files the follow-up issue, and closes the issue, or keeps it open as delivered with its owner and deferred obligations. A broken `main` gets one fix-forward, then a revert PR. |
+| merged → delivered/done | engine | Takes the verifier's evidence of the head that landed (nothing runs again on `main`, where CI runs every test), ticks the checkboxes with evidence links, files the follow-up issue, and closes the issue, or keeps it open as delivered with its owner and deferred obligations. A failed deployment, or a ledger item without evidence, gets one fix-forward, then a revert PR. |
 
 Budgets: a persistent per-issue call ceiling (S 20, M 30, L 45; infra ×1.5), a per-issue dollar
 ceiling over what the vendors report (S $40, M $70, L $120; infra ×1.5; `config.USD_CEILINGS`), an
@@ -209,7 +208,7 @@ round. Each Claude call also carries `--max-budget-usd` from its role (`loop.tom
 plan 8, build 25); a call that stops there is charged and not tried again. Codex reports tokens,
 not dollars, so its side is bounded by calls. The dollar figures are provisional until the first
 epic's cost is read from `agents.jsonl` (ADR 0001, decision 8); `status` shows what each issue
-cost. A `failed` issue (a ceiling spent, no progress, a broken `main` that could not be reverted,
+cost. A `failed` issue (a ceiling spent, no progress, a failed deployment that could not be reverted,
 a refused history) is filed as a loop fault and revived once, with fresh ceilings, by the next
 engine version. `scripts/implement.sh supervise` keeps running the engine (at most 10 runs and 24
 hours), waits out outages, runs one repair run per engine exception (never on the safety surface listed
@@ -224,19 +223,14 @@ commits), at two points:
 - **Before each build round.** A clean merge is committed and recorded as
   `updated_from_main`. On a conflict the merge stays in progress for that round: the builder
   gets the conflict markers and feedback naming the files, and may change them that round.
-  Conflicts in locked tests go to the other vendor (`resolve_locked`) first. The engine then
-  concludes the merge, or aborts it if markers remain (`conflict_unresolved`) and the next round
+  The engine then concludes the merge, or aborts it if markers remain (`conflict_unresolved`) and the next round
   tries again.
 - **At land, before pushing.** A clean merge makes a new head, so the issue is verified and
   certified again (a delta examination) before it may land. A conflict, there or in
   `scripts/ship.sh`, is aborted and sends the issue back to build (`conflict`).
 
 A conflict is work for the builder, never an engine fault, and costs no round: main moving is
-nobody's design fault (ADR 0012); the conflicted files join the issue's grants.
-Locked files that `main`'s merge changed are locked again at their merged digests
-(`checks_relocked`). Only a change from the branch's own pre-merge tree counts, and only where
-that tree still matched the lock: a check or test configuration the branch had already changed
-keeps its old lock, so verification still reports the tampering (`checks_not_relocked`). No worktree keeps an unfinished rebase or merge between steps, and when a
+nobody's design fault (ADR 0012). No worktree keeps an unfinished rebase or merge between steps, and when a
 run starts it aborts any that an earlier failure left behind (`worktree_recovered`). The branch
 keeps every commit.
 
