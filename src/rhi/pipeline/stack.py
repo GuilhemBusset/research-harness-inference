@@ -40,7 +40,9 @@ the pipeline.
 
 Beside the pipeline too, the spike jobs of `rhi.pipeline.spikes`, one CodeBuild project for each
 entry of its list, which the owner starts on a commit of `main` and nothing else starts (sections
-8.4 and 12); and the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
+8.4 and 12); the weekly GPU canary of `rhi.pipeline.canary`, a job that runs the coursework pool's
+smoke tests against what is deployed and that its schedule alone starts, on Sundays at 04:00 UTC
+(sections 8.2, step 6, and 14); and the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
 machine image after a canary start on it passes, writes the pool's image parameter and then starts
 an execution of the pipeline (section 4.3). The owner starts it by hand, and nothing else starts it.
 
@@ -67,6 +69,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
+from rhi.pipeline.canary import GpuCanary
 from rhi.pipeline.image_promotion import ImagePromotion
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
@@ -207,13 +210,23 @@ class PipelineStack(cdk.Stack):
         self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
         # CodeBuild validates GitHub source credentials at project creation. The first deploy
         # creates a pending connection. Once the owner authorizes it, self-update adds the jobs.
+        first_deploy = self.node.try_get_context("pipeline-first-deploy") == "true"
+        repository = f"{config.github_owner}/{config.github_repo}"
         self.spikes = SpikeJobs(
             self,
             "Spikes",
-            jobs=() if self.node.try_get_context("pipeline-first-deploy") == "true" else spike_jobs,
+            jobs=() if first_deploy else spike_jobs,
             connection_arn=connection.attr_connection_arn,
-            repository=f"{config.github_owner}/{config.github_repo}",
+            repository=repository,
             stage=stage,
+        )
+        # Started by its weekly schedule alone; it reads the repository through the connection too.
+        self.canary = (
+            None
+            if first_deploy
+            else GpuCanary(
+                self, "Canary", connection_arn=connection.attr_connection_arn, repository=repository, stage=stage
+            )
         )
         self._as_cfn_lint_reads_it(underlying)
 

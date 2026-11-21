@@ -119,7 +119,18 @@ Rules hold those two, and every action:
   its own template; write to the log group its project names and use the key its project is
   encrypted with. So no action of Auto Scaling, EC2 or IAM, and no other secret. A wildcard
   action, `NotAction`, `NotResource` and a managed policy the template does not hold are taken as
-  reaching more.
+  reaching more;
+- the weekly GPU canary, the CodeBuild project named `rhi-gpu-canary` (sections 8.2, step 6, and
+  14), is started by its schedule, and its schedule starts it and nothing else. The schedule is
+  the EventBridge rule or schedule named `rhi-gpu-canary`, known by that name and not by its
+  target: a template that holds the canary's project holds exactly one, and each has one target,
+  the canary's project of its own template, by a reference to its ARN. The role it gives that
+  target may start a build of that project, `codebuild:StartBuild` on its ARN, and nothing else:
+  a wildcard action or resource, `NotAction`, `NotResource` and a managed policy the template does
+  not hold are taken as reaching more;
+- the canary's job tests what is deployed and starts no deployment: its project's role may not
+  start an execution of any pipeline, `codepipeline:StartPipelineExecution` on any CodePipeline
+  ARN, read as above. A role its template does not hold is taken as one that may.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -372,6 +383,15 @@ SPIKES_MAY = {
     "kms:GenerateDataKey": "key",
 }
 SPIKE_STARTED = "a spike job that something other than the owner may start"
+# The weekly GPU canary: its project's and its schedule's one name, what starts its build, and
+# what starts a pipeline's execution, on every ARN of a pipeline.
+CANARY = "rhi-gpu-canary"
+STARTS_THE_CANARY = "codebuild:StartBuild"
+PIPELINE_STARTS = ("codepipeline:StartPipelineExecution",)
+PIPELINE_ARN = f"arn:{FIELD}:codepipeline:{FIELD}:{FIELD}:*"
+CANARY_STARTS_MORE = "a canary's schedule that starts anything but the canary's job"
+CANARY_UNSCHEDULED = "a canary's job without its one schedule"
+CANARY_STARTS_PIPELINES = "a canary's job whose role may start a pipeline's execution"
 SPIKES_MORE = (
     "a spike job's role that may do more than read the configuration, the pool-state records and the spikes'"
     " secret, query its stage's workspace, send a measurement, read the repository and write its logs"
@@ -1221,6 +1241,80 @@ def spike_breaches(templates: Templates) -> list[tuple[str, str, str]]:
     return found
 
 
+def canaries(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
+    """The canary's projects of a template, those named `CANARY`, each as `(its logical ID, its
+    role)`, the role None when the template does not hold it."""
+    held = template.get("Resources", {})
+    found: list[tuple[str, str | None]] = []
+    for _, logical_id, project, _ in resources({"": template}, "AWS::CodeBuild::Project"):
+        if project.get("Name") != CANARY:
+            continue
+        role = project.get("ServiceRole")
+        role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+        found.append((logical_id, role_id if isinstance(role_id, str) and role_id in held else None))
+    return found
+
+
+def canary_schedules(template: Mapping[str, Any]) -> list[tuple[str, list[Any]]]:
+    """The canary's schedules of a template, the rules and schedules named `CANARY` whatever they
+    target, each as `(its logical ID, its targets)`."""
+    found = []
+    for kind, key in (("AWS::Events::Rule", "Targets"), ("AWS::Scheduler::Schedule", "Target")):
+        for _, logical_id, properties, _ in resources({"": template}, kind):
+            if properties.get("Name") == CANARY:
+                found.append((logical_id, as_list(properties.get(key, []))))
+    return found
+
+
+def starts_more_than(template: Mapping[str, Any], role: Any, project: str) -> bool:
+    """Whether the role a target names, by a reference to its ARN, may do more than start a build
+    of the project `project` of the template. A role named any other way, or the template does not
+    hold, is taken as one that may."""
+    if role is None:
+        return False
+    role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+    if not isinstance(role_id, str) or role_id not in template.get("Resources", {}):
+        return True
+    statements = statements_of(template, role_id)
+    if statements is None:
+        return True
+    for statement in statements:
+        if "NotAction" in statement or "NotResource" in statement:
+            return True
+        if any(action != STARTS_THE_CANARY for action in as_list(statement.get("Action", []))):
+            return True
+        if any(arn_text(resource) != f"${{{project}.Arn}}" for resource in as_list(statement.get("Resource", []))):
+            return True
+    return False
+
+
+def canary_breaches(templates: Templates) -> list[tuple[str, str, str]]:
+    """What the rules on the canary refuse: a schedule that starts anything but the canary's job, a
+    job without its one schedule, and a job whose role may start a pipeline's execution."""
+    found = []
+    for path, template in sorted(templates.items()):
+        projects = canaries(template)
+        schedules = canary_schedules(template)
+        for project, role in projects:
+            if len(schedules) != 1:
+                found.append((path, project, CANARY_UNSCHEDULED))
+            if role is None or may(template, role, PIPELINE_STARTS, PIPELINE_ARN):
+                found.append((path, role or project, CANARY_STARTS_PIPELINES))
+        for schedule, targets in schedules:
+            starts_the_canary = len(projects) == 1 and len(targets) == 1
+            if starts_the_canary:
+                ((project, _),) = projects
+                (target,) = targets
+                starts_the_canary = (
+                    isinstance(target, dict)
+                    and target.get("Arn") == {"Fn::GetAtt": [project, "Arn"]}
+                    and not starts_more_than(template, target.get("RoleArn"), project)
+                )
+            if not starts_the_canary:
+                found.append((path, schedule, CANARY_STARTS_MORE))
+    return found
+
+
 def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """Everything of the templates that a rule refuses, as `(template path, what it is named,
     what is refused)`: an action by its stage and name, a resource by its logical ID."""
@@ -1311,6 +1405,7 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
                 found.append((path, role, WRITES_WEIGHTS))
     found += promotion_breaches(templates)
     found += spike_breaches(templates)
+    found += canary_breaches(templates)
     return found
 
 
@@ -2650,3 +2745,128 @@ def test_a_spike_role_with_a_managed_policy_may_do_more(two_spikes: dict[str, di
     changed = json.loads(json.dumps(two_spikes))
     a_managed_policy(changed)
     assert SPIKES_MORE in refused(changed)
+
+
+def the_canary(templates: Templates) -> tuple[Mapping[str, Any], str, str | None, str, dict[str, Any]]:
+    """The template of the canary, its project, its project's role, its schedule and the schedule's
+    one target."""
+    (template,) = [template for template in templates.values() if canaries(template)]
+    ((project, role),) = canaries(template)
+    ((schedule, (target,)),) = canary_schedules(template)
+    return template, project, role, schedule, target
+
+
+def test_the_canary_is_held_by_its_rules(templates: dict[str, dict[str, Any]]) -> None:
+    # The rules find the app's canary, its role and its one schedule, which starts it alone.
+    template, project, role, _, target = the_canary(templates)
+    assert role is not None
+    assert target["Arn"] == {"Fn::GetAtt": [project, "Arn"]}
+    assert not starts_more_than(template, target["RoleArn"], project)
+    # Its role sends measurement events, and starts no pipeline's execution.
+    assert may(template, role, PUTS_EVENTS, BUS_ARN)
+    assert not may(template, role, PIPELINE_STARTS, PIPELINE_ARN)
+    assert canary_breaches(templates) == []
+
+
+def a_second_target(templates: Templates) -> None:
+    template, _, _, schedule, _ = the_canary(templates)
+    other = {"Fn::Sub": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/another-job"}
+    template["Resources"][schedule]["Properties"]["Targets"].append({"Arn": other, "Id": "Another"})
+
+
+def another_job(templates: Templates) -> None:
+    """The schedule's one target, replaced by another job: the schedule still has its name."""
+    _, _, _, _, target = the_canary(templates)
+    target["Arn"] = {"Fn::Sub": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/another-job"}
+
+
+def the_pipeline_as_target(templates: Templates) -> None:
+    template, _, _, _, target = the_canary(templates)
+    ((_, pipeline, _, _),) = resources({"": template}, "AWS::CodePipeline::Pipeline")
+    target["Arn"] = {
+        "Fn::Sub": "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${" + pipeline + "}"
+    }
+
+
+def a_renamed_schedule(templates: Templates) -> None:
+    template, _, _, schedule, _ = the_canary(templates)
+    template["Resources"][schedule]["Properties"]["Name"] = "rhi-nightly"
+
+
+def a_second_schedule(templates: Templates) -> None:
+    template, _, _, schedule, _ = the_canary(templates)
+    template["Resources"]["Nightly"] = json.loads(json.dumps(template["Resources"][schedule]))
+
+
+def a_schedule_statement(action: str, resource: Any) -> Callable[[Templates], None]:
+    """Allows the schedule's role one more action on one resource."""
+
+    def change(templates: Templates) -> None:
+        template, _, _, _, target = the_canary(templates)
+        role = target["RoleArn"]["Fn::GetAtt"][0]
+        (policy,) = [p for _, _, p, _ in resources({"": template}, "AWS::IAM::Policy") if {"Ref": role} in p["Roles"]]
+        statement = {"Effect": "Allow", "Action": action, "Resource": resource}
+        policy["PolicyDocument"]["Statement"].append(statement)
+
+    return change
+
+
+def a_job_statement(action: str, resource: Any) -> Callable[[Templates], None]:
+    """Allows the canary's job role one more action on one resource."""
+
+    def change(templates: Templates) -> None:
+        template, _, role, _, _ = the_canary(templates)
+        (policy,) = [p for _, _, p, _ in resources({"": template}, "AWS::IAM::Policy") if {"Ref": role} in p["Roles"]]
+        policy["PolicyDocument"]["Statement"].append({"Effect": "Allow", "Action": action, "Resource": resource})
+
+    return change
+
+
+def a_managed_job_policy(templates: Templates) -> None:
+    template, _, role, _, _ = the_canary(templates)
+    arn = {"Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSCodePipeline_FullAccess"}
+    template["Resources"][role]["Properties"]["ManagedPolicyArns"] = [arn]
+
+
+EVERY_PROJECT = {"Fn::Sub": here("codebuild", "project/*")}
+EVERY_PIPELINE = {"Fn::Sub": here("codepipeline", "*")}
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(a_second_target, {CANARY_STARTS_MORE}, id="a second target"),
+        pytest.param(another_job, {CANARY_STARTS_MORE}, id="another job in place of the canary"),
+        pytest.param(the_pipeline_as_target, {CANARY_STARTS_MORE, ANOTHER_TRIGGER}, id="the pipeline as target"),
+        pytest.param(a_renamed_schedule, {CANARY_UNSCHEDULED}, id="a schedule under another name"),
+        pytest.param(a_second_schedule, {CANARY_UNSCHEDULED}, id="two schedules"),
+        pytest.param(
+            a_schedule_statement("codebuild:StartBuild", EVERY_PROJECT), {CANARY_STARTS_MORE}, id="every project"
+        ),
+        pytest.param(
+            a_schedule_statement("codepipeline:StartPipelineExecution", EVERY_PIPELINE),
+            {CANARY_STARTS_MORE},
+            id="a schedule's role that starts a pipeline",
+        ),
+        pytest.param(
+            a_job_statement("codepipeline:StartPipelineExecution", EVERY_PIPELINE),
+            {CANARY_STARTS_PIPELINES},
+            id="a job's role that starts a pipeline",
+        ),
+        pytest.param(
+            a_job_statement("codepipeline:*", "*"), {CANARY_STARTS_PIPELINES}, id="every action of CodePipeline"
+        ),
+    ],
+)
+def test_each_rule_on_the_canary_refuses_its_breach(
+    templates: dict[str, dict[str, Any]], change: Callable[[Templates], None], expected: set[str]
+) -> None:
+    changed = json.loads(json.dumps(templates))
+    change(changed)
+    assert refused(changed) == expected
+
+
+def test_a_canary_role_with_a_managed_policy_may_start_a_pipeline(templates: dict[str, dict[str, Any]]) -> None:
+    changed = json.loads(json.dumps(templates))
+    a_managed_job_policy(changed)
+    assert CANARY_STARTS_PIPELINES in refused(changed)
