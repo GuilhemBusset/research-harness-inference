@@ -164,7 +164,7 @@ What a `waiting` issue waits for (`status` shows the kind):
 | `claim` | Another run is working on this issue. |
 | `prerequisite` | A prerequisite in this run is not delivered yet. |
 | `ci` | The `required` check gave no verdict in time, or none at all (cancelled, or its workflow did not start). The engine never runs a check again: a red check goes to the builder with the failed job's log, and a cancelled one stays cancelled until it is run again on GitHub or the branch gets a new head. |
-| `outage` | A vendor CLI could not reach its service, or a Claude model refused the call (usage or rate limit) and its fallback refused too. The supervisor resumes once the vendor answers a smoke call. |
+| `outage` | A vendor CLI could not reach its service, or a model refused the call (usage or rate limit) and its fallback refused too, or it has none. The supervisor resumes once the vendor answers a smoke call. |
 | `github` | GitHub kept failing after retries. |
 | `environment` | The host cannot run the issue's checks (a missing tool, for example). It resumes when the doctor's probes change. |
 | `engine` | The engine itself faulted (an exception in a step); a `loop:engine-bug` issue was filed, and the supervisor gives it one repair run (never on the safety surface). It resumes on a new engine version. |
@@ -182,10 +182,18 @@ Budgets, per issue and kept across runs:
 - one and a half times both for an issue that touches the factory's own tooling or carries
   `loop:infra`;
 - a separate budget of 10 attempts that timed out or crashed. A vendor outage is charged to
-  none of them, and neither is a call a Claude model refused because the account's usage limit
-  for it is reached: `plan` and `build` then run on Claude Opus (`loop.toml`,
-  `claude_fallback_model`) and go back to Fable 30 minutes later. `agents.jsonl` names the
-  model of every Claude attempt.
+  none of them, and neither is a call a model refused because the account's usage limit for it
+  is reached: `plan` and `build` then run on Claude Opus (`loop.toml`, `claude_fallback_model`)
+  and go back to Fable 30 minutes later, and an escalated Codex call (below) runs on
+  `gpt-6.2-sol` and goes back to `gpt-6.2-astra` 30 minutes later (`codex_fallback_model`).
+  `agents.jsonl` names the model of every attempt that asked for one, and marks the escalated
+  ones.
+
+Codex calls run on the host's default Codex model, except the steps that decide about a
+protected path (`PROTECTED_*` in `config.py`), which are escalated to `gpt-6.2-astra`
+(`loop.toml`, `codex_escalated_model`; ADR 0001, amendment 13): deciding requests among which is
+a `protected_change`, every arbitration, and examining a commit whose change against its base
+adds, changes or removes a protected path.
 
 Each Claude call also stops at a budget of its own, by role (`loop.toml`: explore $2, plan $8,
 build $25); a call that stops there is charged and not tried again. The dollar figures are
