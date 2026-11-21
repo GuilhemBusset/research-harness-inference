@@ -14,6 +14,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -174,3 +175,53 @@ def test_the_home_directory_is_replaced(stack: tuple[str, str], tmp_path: Path) 
     neutral = record.Neutral(hosts=[], home=home, user=user)
     event = "data: " + json.dumps({"text": f"{notes} of {user.upper()}"})
     assert neutral.body(f"{event}\n\n") == 'data: {"text":"/home/user/project/notes_user.md of user"}\n\n'
+
+
+def test_the_key_is_removed_from_the_request_target_when_encoded(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    encoded = key.replace("_", "%5F")
+    with recording(address, tmp_path, user=login) as (session, client):
+        target = f"/v1/messages?beta=true&note={encoded}&by=%{ord(login[0]):02x}{login[1:]}"
+        assert client.post(target, headers=anthropic(key), json=messages()).status_code == 200
+    (path,) = session.written
+    saved = unquote(harness.load(path).target)
+    assert key not in saved and login not in saved and record.KEY_PLACEHOLDER in saved
+
+
+def test_a_short_user_name_renames_no_field_of_the_format(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    home = str(Path("/home") / "max")
+    system = f"Working directory: {home}/project. Signed in as max."
+    headers = {**anthropic(key), "x-session-max": "present"}
+    with recording(address, tmp_path, home=home, user="max", profile="coursework") as (session, client):
+        assert client.post("/v1/messages", headers=headers, json=messages(system=system)).status_code == 200
+    (path,) = session.written
+    capture = harness.load(path)
+    sent = json.loads(capture.body)
+    assert sent["max_tokens"] == 64 and sent["system"] == "Working directory: /home/user/project. Signed in as user."
+    assert "x-session-user" in capture.headers and not any("max" in name for name in capture.headers)
+    assert_replays(capture)
+
+
+def test_a_session_never_writes_over_another(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    with recording(address, tmp_path) as (session, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages()).status_code == 200
+    (path,) = session.written
+    kept = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        record.Session(address, tmp_path)
+    assert path.read_bytes() == kept
+
+
+def test_an_answer_a_replay_would_not_give_back_is_not_replayed(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    body = {"model": smoke.MOCK_POOL, "stream": True, "messages": [{"role": "user", "content": "Hello."}]}
+    with recording(address, tmp_path) as (session, client):
+        # No usage chunk asked for: the gateway hides it from the client, so the answer reports no usage.
+        answer = client.post("/v1/chat/completions", headers={"authorization": f"Bearer {key}"}, json=body)
+    assert answer.status_code == 200 and answer.content.endswith(b"data: [DONE]\n\n")
+    assert [path.name for path in session.written] == ["001.unreplayed"]
+    assert harness.load(session.written[0]).answer == answer.content
+    assert harness.folder(tmp_path) == []
