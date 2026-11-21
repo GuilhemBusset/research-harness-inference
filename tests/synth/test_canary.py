@@ -1,8 +1,8 @@
 """The weekly GPU canary of `src/rhi/pipeline/canary.py` (system design, sections 8.2, step 6, and
 14): a job of the pipeline's stack that runs the coursework pool's smoke tests against the deployed
 endpoint, a schedule on Sundays at 04:00 UTC whose only target is that job, and a role that reads
-the canary's secret, queries the workspace, reads the pools' release parameters and sends the
-measurement event, and nothing else.
+the canary's secret, queries the workspace, reads the pools' release parameters, queries the
+heartbeats table the verification queries, and sends the measurement event, and nothing else.
 
 The tests read the app's own pipeline, built from the example configuration.
 """
@@ -10,6 +10,7 @@ The tests read the app's own pipeline, built from the example configuration.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -22,10 +23,9 @@ WEEKLY = "cron(0 4 ? * SUN *)"
 # Every action the job's role is allowed, and nothing else.
 JOB_ACTIONS = {
     "secretsmanager:GetSecretValue",
-    "aps:DescribeWorkspace",
     "aps:QueryMetrics",
-    "aps:ListWorkspaces",
     "ssm:GetParameter",
+    "dynamodb:Query",
     "events:PutEvents",
     "codeconnections:GetConnection",
     "codeconnections:GetConnectionToken",
@@ -96,7 +96,7 @@ def test_the_job_runs_the_canary_script_on_main_with_no_webhook(project: tuple[s
     assert not any("codepipeline" in command for command in commands)
 
 
-def test_the_job_is_told_the_endpoint_the_release_parameters_and_the_stage(
+def test_the_job_is_told_the_endpoint_and_the_release_parameters(
     project: tuple[str, dict[str, Any]],
 ) -> None:
     example = config.load({"RHI_CONFIG": "example"})
@@ -105,7 +105,6 @@ def test_the_job_is_told_the_endpoint_the_release_parameters_and_the_stage(
     assert told["RHI_SMOKE_ENDPOINT"] == (example.domain if example.https_listener else "none")
     pools = {pool.name: f"/rhi/pools/{pool.name}/release" for pool in example.pools}
     assert json.loads(told["RHI_SMOKE_RELEASE_PARAMETERS"]) == pools
-    assert told["RHI_CANARY_STAGE"] == "Rhi"
     assert told["RHI_MEASUREMENT_BUS"] == "rhi-measurements"
 
 
@@ -154,7 +153,26 @@ def test_the_job_s_role_reads_the_canary_s_inputs_and_sends_the_measurement_only
         f"arn:<>:ssm:<>:<>:parameter/rhi/pools/{pool.name}/release" for pool in example.pools
     }
     assert resources_of("events:PutEvents") == {"arn:<>:events:<>:<>:event-bus/rhi-measurements"}
-    assert resources_of("aps:ListWorkspaces") == {"*"}
+    # The workspace is queried, by the stage's tag, never listed or described: its address is in
+    # the coursework pool's release parameter.
     (query,) = [statement for statement in allowed if "aps:QueryMetrics" in as_list(statement["Action"])]
+    assert as_list(query["Action"]) == ["aps:QueryMetrics"]
     assert text(query["Resource"]) == "arn:<>:aps:<>:<>:workspace/*"
     assert query["Condition"] == {"StringEquals": {"aws:ResourceTag/rhi-stage": "Rhi"}}
+    # The one table the verification's role queries too, the stage's heartbeats table, by the pools
+    # stack's name and the table's logical ID.
+    (table,) = resources_of("dynamodb:Query")
+    assert re.fullmatch(r"arn:<>:dynamodb:<>:<>:table/Rhi-Pools-TablesHeartbeats[0-9A-F]{8}-\*", table)
+    assert table in queried_by_others(pipeline, role)
+
+
+def queried_by_others(pipeline: dict[str, Any], role: str) -> set[str]:
+    """Every table a policy of the pipeline's stack not attached to `role` may query."""
+    return {
+        text(resource)
+        for policy in of_type(pipeline, "AWS::IAM::Policy").values()
+        if {"Ref": role} not in policy["Roles"]
+        for statement in policy["PolicyDocument"]["Statement"]
+        if "dynamodb:Query" in as_list(statement["Action"])
+        for resource in as_list(statement["Resource"])
+    }

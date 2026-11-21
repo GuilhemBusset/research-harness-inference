@@ -4,14 +4,16 @@ canary's job runs it, on the commit of `main` its schedule started it on
 (`src/rhi/pipeline/canary.py`).
 
 **The run.** The script reads the canary's key from the secret `rhi/canary-key`, as the
-verification does (`verify.canary_key`), finds the query address of the stage's Prometheus
-workspace, the one whose tag `rhi-stage` holds `RHI_CANARY_STAGE`, and runs the smoke tests of
-`tests/smoke` once, with `RHI_SMOKE_POOL` naming the coursework pool, through the verification's
-own runner (`verify.run_tests`): in a process of their own, the key in its environment and nowhere
-else, what they print in the log without the key, and the tests that must reach the internal load
-balancer left out. This file is a plugin of that run as well, which leaves out `CANARY_DESELECTED`
-too: `release-heartbeat` reads the stage's heartbeats table, which the canary's role may not read.
-The run records its results as JUnit XML, which the script reads back.
+verification does (`verify.canary_key`), and the coursework pool's release parameter, whose
+settings name the stage's Prometheus workspace, by its remote-write address, and the stage's
+heartbeats table (`rhi_lifecycle.release`). It runs the smoke tests of `tests/smoke` once, with
+`RHI_SMOKE_POOL` naming the coursework pool, through the verification's own runner
+(`verify.run_tests`): in a process of their own, the key in its environment and nowhere else, what
+they print in the log without the key, and the tests that must reach the internal load balancer left
+out. These are the tests the verification runs on the coursework pool after a refresh, every one of
+them: the workspace's query address and the heartbeats table are given as the verification gives
+them, `RHI_SMOKE_WORKSPACE_URL` and `RHI_VERIFY_HEARTBEATS_TABLE`. The run records its results as
+JUnit XML, which the script reads back.
 
 **The wake.** While the tests run, a thread of this process reads the coursework pool's state from
 `GET /status` every `POLL_SECONDS` (a status read is not demand: it wakes nothing). The wake is the
@@ -24,18 +26,23 @@ A pool that never reads `ready` has no wake measured, and the number is left out
 `CODEBUILD_RESOLVED_SOURCE_VERSION`, with the UTC date the run began, YYYY-MM-DD, as its run label:
 a record keeps one run per label, so each week's run keeps its own. Its verdict is
 
-- pass when at least one smoke test passed and none failed;
 - fail when a smoke test failed, in its set-up, its call or its teardown;
 - error, not measured, when no test ran: the endpoint has no HTTPS listener (`RHI_SMOKE_ENDPOINT`
-  reads `none`), the canary's secret is missing or holds no key, or the run left no result.
+  reads `none`), the canary's secret is missing or holds no key, or the run left no result; and
+  when the run did not end (pytest was interrupted, or ended with an exit code other than its two
+  of a finished run, `FINISHED`), or no wake was measured;
+- pass otherwise: the run ended, at least one smoke test passed, none failed, and the wake was
+  measured.
 
 and its numbers, `Number`, are the seconds the wake took and the numbers of smoke tests passed and
-failed. It is sent through the measurement event (`rhi_reporter.measure.measurement_event`) on the
+failed. Only the tests that ended count: a case the JUnit XML records without its name is one
+pytest did not finish. It is sent through the measurement event (`rhi_reporter.measure.measurement_event`) on the
 bus `RHI_MEASUREMENT_BUS` names. An event the bus does not take fails the script: EventBridge
 answers a refused entry with a count of failed entries, not with an error.
 
-The script exits with the tests' exit code once the event is sent, so a failed canary is a failed
-build as well.
+The script exits with the tests' exit code once the event is sent, and with 1 when that code is 0
+and the verdict still is not pass, so a canary that is not green after a run is a failed build as
+well.
 
 Run by the canary's job, from the checkout:
 
@@ -44,12 +51,13 @@ Run by the canary's job, from the checkout:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -65,22 +73,17 @@ from rhi_reporter.measure import BUS_VARIABLE, Verdict, measurement_event
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    import pytest
-
 NAME = "canary_result"
 MEASUREMENT = "gpu-canary"
 POOL = "coursework"
 
 COMMIT_VARIABLE = "CODEBUILD_RESOLVED_SOURCE_VERSION"
-STAGE_VARIABLE = "RHI_CANARY_STAGE"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
-# The tag that names the stage of a workspace (`rhi.observability.stack`).
-STAGE_TAG = "rhi-stage"
-# At most this many pages of the workspaces are read.
-WORKSPACE_PAGES = 10
-
-# The tests the canary's run leaves out beside those the verification does, by their IDs.
-CANARY_DESELECTED: tuple[str, ...] = ("release-heartbeat",)
+# What follows the workspace's own address in the remote-write address of a release's settings
+# (`rhi.pools.release`).
+REMOTE_WRITE_PATH = "api/v1/remote_write"
+# The exit codes of a run of pytest that ended: every test passed, or some failed.
+FINISHED = (0, 1)
 
 # The pool's states as `GET /status` gives them (section 5.3).
 COLD = "cold"
@@ -103,40 +106,40 @@ class Number(StrEnum):
 NAMES: tuple[str, ...] = tuple(Number)
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of
-    `CANARY_DESELECTED`."""
-    left_out = [
-        item
-        for item in items
-        if any(set(marker.args) & set(CANARY_DESELECTED) for marker in item.iter_markers(verify.ID_MARKER))
-    ]
-    if left_out:
-        config.hook.pytest_deselected(items=left_out)
-        items[:] = [item for item in items if item not in left_out]
-
-
 @dataclass(frozen=True)
 class Results:
-    """How many smoke tests passed and how many failed."""
+    """How many smoke tests passed and how many failed, and whether the run ended."""
 
     passed: int
     failed: int
+    finished: bool = True
 
 
 def read_results(junit_xml: str) -> Results:
     """The results a run recorded as JUnit XML: a test case with a failure or an error, in any
     phase, failed; one that was skipped is neither; any other passed. A test pytest reports twice,
-    a failed teardown after its call, counts once."""
+    a failed teardown after its call, counts once. A case without its name is a test pytest did not
+    finish, interrupted: it counts as neither, and the run as one that did not end."""
     outcomes: dict[tuple[str, str], bool] = {}
+    finished = True
     for case in ElementTree.fromstring(junit_xml).iter("testcase"):
         test = (case.get("classname", ""), case.get("name", ""))
-        if case.find("failure") is not None or case.find("error") is not None:
+        if not test[1]:
+            finished = False
+        elif case.find("failure") is not None or case.find("error") is not None:
             outcomes[test] = True
         elif case.find("skipped") is None:
             outcomes.setdefault(test, False)
     failed = sum(outcomes.values())
-    return Results(passed=len(outcomes) - failed, failed=failed)
+    return Results(passed=len(outcomes) - failed, failed=failed, finished=finished)
+
+
+def ended(results: Results | None, exit_code: int) -> Results | None:
+    """The results of a run whose pytest exited with `exit_code`: one that did not exit as a
+    finished run does, `FINISHED`, did not end, whatever its XML holds."""
+    if results is None or exit_code in FINISHED:
+        return results
+    return replace(results, finished=False)
 
 
 def wake_seconds(readings: Sequence[tuple[float, str | None]]) -> float | None:
@@ -155,11 +158,16 @@ def wake_seconds(readings: Sequence[tuple[float, str | None]]) -> float | None:
     return None
 
 
-def verdict_of(results: Results | None) -> Verdict:
-    """The run's verdict: not measured when no test ran, fail when one failed, pass otherwise."""
+def verdict_of(results: Results | None, wake: float | None) -> Verdict:
+    """The run's verdict: fail when a test failed; not measured when no test ended, when the run
+    did not end or when no wake was measured; pass otherwise."""
     if results is None or results.passed + results.failed == 0:
         return Verdict.NOT_MEASURED
-    return Verdict.FAIL if results.failed else Verdict.PASS
+    if results.failed:
+        return Verdict.FAIL
+    if not results.finished or wake is None:
+        return Verdict.NOT_MEASURED
+    return Verdict.PASS
 
 
 def numbers_of(results: Results | None, wake: float | None) -> dict[str, int | float]:
@@ -186,7 +194,7 @@ def measurement(results: Results | None, wake: float | None, *, commit: str, bus
     return measurement_event(
         MEASUREMENT,
         run_label(now),
-        verdict_of(results),
+        verdict_of(results, wake),
         numbers_of(results, wake),
         names=NAMES,
         commit=commit,
@@ -202,27 +210,27 @@ def send(entry: Mapping[str, str], client: Any) -> None:
         raise RuntimeError("the measurement bus did not take the canary's event")
 
 
-def workspace_url(client: Any, stage: str) -> str | None:
-    """The query address of the one workspace tagged with `stage`, read with `client`, a Managed
-    Prometheus client of the AWS SDK. None when there is no such workspace, or more than one."""
-    if not stage:
-        return None
-    found: list[str] = []
-    request: dict[str, str] = {}
-    for _ in range(WORKSPACE_PAGES):
-        answer = client.list_workspaces(**request)
-        found += [
-            summary["workspaceId"]
-            for summary in answer.get("workspaces", [])
-            if (summary.get("tags") or {}).get(STAGE_TAG) == stage
-        ]
-        if not answer.get("nextToken"):
-            break
-        request = {"nextToken": answer["nextToken"]}
-    if len(found) != 1:
-        return None
-    address = client.describe_workspace(workspaceId=found[0])["workspace"].get("prometheusEndpoint")
-    return address if isinstance(address, str) and address else None
+def stage_settings(client: Any, env: Mapping[str, str]) -> dict[str, str]:
+    """What the smoke tests are told of the stage, from the settings of the coursework pool's
+    release parameter, read with `client`, an SSM client of the AWS SDK: the workspace's query
+    address, its remote-write address without `REMOTE_WRITE_PATH`, and the heartbeats table. Nothing
+    when the parameter cannot be read or holds no release: the tests that need them then fail by
+    the variable's name."""
+    # Imported here: the script's own folder and the reporter's are all its import needs elsewhere.
+    from rhi_lifecycle.release import read_current
+
+    try:
+        name = json.loads(env.get(verify.SMOKE_RELEASE_PARAMETERS_VARIABLE, "")).get(POOL)
+    except (ValueError, AttributeError):
+        name = None
+    current = read_current(client, name) if isinstance(name, str) and name else None
+    if current is None:
+        print(f"{NAME}: the coursework pool's release parameter was not read", file=sys.stderr)
+        return {}
+    return {
+        WORKSPACE_URL_VARIABLE: current.settings.workspace_url.removesuffix(REMOTE_WRITE_PATH),
+        verify.HEARTBEATS_TABLE_VARIABLE: current.settings.heartbeat_table,
+    }
 
 
 def status_reader(endpoint: str, key: str, transport: httpx.BaseTransport | None = None) -> Callable[[], str | None]:
@@ -280,12 +288,13 @@ def run_canary(
     env: Mapping[str, str],
     *,
     secrets: Any,
-    aps: Any,
+    ssm: Any,
     run: Callable[[Mapping[str, str], Sequence[str]], int],
     watch: Callable[[str, str], WakeWatch],
 ) -> tuple[Results | None, float | None, int]:
     """Runs the smoke tests on the coursework pool: their results, the wake's seconds and the run's
-    exit code. No result when no test could run."""
+    exit code. No result when no test could run. A client that is None is made, from the build's
+    own credentials and region, only once it is needed."""
     endpoint = env.get(verify.ENDPOINT_VARIABLE)
     if not endpoint:
         print(f"{NAME}: {verify.ENDPOINT_VARIABLE} is not set: no test was run", file=sys.stderr)
@@ -293,22 +302,16 @@ def run_canary(
     if endpoint == verify.NO_ENDPOINT:
         print(f"{NAME}: no test was run: {verify.LISTENER_OFF}")
         return None, None, 0
-    key = verify.canary_key(secrets)
+    key = verify.canary_key(_client("secretsmanager") if secrets is None else secrets)
     if key is None:
         print(f"{NAME}: no test was run: {verify.CANARY_MISSING}")
         return None, None, 0
-    given = {**env, verify.KEY_VARIABLE: key, verify.POOL_VARIABLE: POOL}
-    try:
-        url = workspace_url(aps, env.get(STAGE_VARIABLE, ""))
-    except (BotoCoreError, ClientError) as error:
-        print(f"{NAME}: the stage's workspace was not found ({type(error).__name__})", file=sys.stderr)
-        url = None
-    if url is not None:
-        given[WORKSPACE_URL_VARIABLE] = url
+    stage = stage_settings(_client("ssm") if ssm is None else ssm, env)
+    given = {**env, **stage, verify.KEY_VARIABLE: key, verify.POOL_VARIABLE: POOL}
     with tempfile.TemporaryDirectory() as folder:
         report = Path(folder) / "results.xml"
         with watch(endpoint, key) as watching:
-            exit_code = run(given, ("-p", NAME, f"--junitxml={report}", verify.SMOKE_TESTS))
+            exit_code = run(given, (f"--junitxml={report}", verify.SMOKE_TESTS))
         results = read_results(report.read_text(encoding="utf-8")) if report.is_file() else None
     return results, wake_seconds(watching.readings), exit_code
 
@@ -322,13 +325,14 @@ def main(
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     secrets: Any = None,
-    aps: Any = None,
+    ssm: Any = None,
     events: Any = None,
     run: Callable[[Mapping[str, str], Sequence[str]], int] = verify.run_tests,
     watch: Callable[[str, str], WakeWatch] = _watch,
 ) -> int:
-    """Runs the canary and sends its measurement; the tests' exit code once it is sent. Without a
-    client, the build's own credentials and region make it."""
+    """Runs the canary and sends its measurement; the tests' exit code once it is sent, or 1 for a
+    run that exited 0 and is not green. Without a client, the build's own credentials and region
+    make it, when it is needed."""
     env = os.environ if environ is None else environ
     began = clock()
     commit, bus = env.get(COMMIT_VARIABLE), env.get(BUS_VARIABLE)
@@ -336,21 +340,19 @@ def main(
         print(f"{NAME}: {COMMIT_VARIABLE} and {BUS_VARIABLE} name the commit and the bus", file=sys.stderr)
         return 1
     try:
-        results, wake, exit_code = run_canary(
-            env,
-            secrets=_client("secretsmanager") if secrets is None else secrets,
-            aps=_client("amp") if aps is None else aps,
-            run=run,
-            watch=watch,
-        )
+        results, wake, exit_code = run_canary(env, secrets=secrets, ssm=ssm, run=run, watch=watch)
     except (BotoCoreError, ClientError) as error:
         # The canary could not measure: it says so, as not measured, rather than sending nothing.
         print(f"{NAME}: the canary did not run ({type(error).__name__})", file=sys.stderr)
         results, wake, exit_code = None, None, 1
+    results = ended(results, exit_code)
     entry = measurement(results, wake, commit=commit, bus=bus, now=began)
     send(entry, _client("events") if events is None else events)
-    print(f"{NAME}: {MEASUREMENT} {verdict_of(results).name.lower()} sent for {run_label(began)}")
-    return exit_code
+    verdict = verdict_of(results, wake)
+    print(f"{NAME}: {MEASUREMENT} {verdict.name.lower()} sent for {run_label(began)}")
+    if results is None or verdict is Verdict.PASS:
+        return exit_code
+    return exit_code or 1
 
 
 if __name__ == "__main__":

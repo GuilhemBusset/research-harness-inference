@@ -8,7 +8,10 @@ Stand-ins replace AWS and the run of the tests: no account, no credentials, no n
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,8 +30,10 @@ if TYPE_CHECKING:
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 BUS = "rhi-measurements"
-STAGE = "Rhi"
 WORKSPACE = "https://aps-workspaces.us-east-1.example.com/workspaces/ws-example/"
+HEARTBEATS = "Rhi-Pools-TablesHeartbeatsEXAMPLE-SUFFIX"
+PARAMETER = "/rhi/pools/coursework/release"
+REPO = Path(__file__).resolve().parents[2]
 NAME = re.compile(r"[a-z0-9_]+")
 SUNDAY = datetime(2026, 11, 22, 4, 0, 7, tzinfo=UTC)
 
@@ -46,6 +51,12 @@ ONE_FAILED = """<?xml version="1.0" encoding="utf-8"?>
 <testcase classname="tests.smoke.test_smoke" name="test_the_first_stream_wakes_a_cold_pool" time="412.5">
 <failure message="assert 503 == 200">the pool did not answer</failure></testcase>
 <testcase classname="tests.smoke.test_smoke" name="test_a_stream_completes_with_its_usage[/v1/messages]" time="3.2" />
+</testsuite></testsuites>"""
+# A run pytest did not finish: one test ended, and the one that was running is recorded unnamed.
+INTERRUPTED = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1">
+<testcase classname="tests.smoke.test_smoke" name="test_the_hello_route_answers" time="0.120" />
+<testcase time="0.000" />
 </testsuite></testsuites>"""
 # The pool read cold until the first stream, warming through its start, then ready.
 WOKEN = [(10.0, "cold"), (12.0, "cold"), (14.0, "warming"), (16.0, None), (318.0, "warming"), (320.5, "ready")]
@@ -113,6 +124,34 @@ def test_a_pool_already_serving_had_no_wake_and_one_never_ready_has_none_measure
     assert "wake_seconds" not in found["numbers"]
 
 
+def test_a_pass_always_carries_the_wake_s_seconds() -> None:
+    results = canary_result.read_results(ALL_PASSED)
+    already_serving = detail(canary_result.measurement(results, 0.0, commit=COMMIT, bus=BUS, now=SUNDAY))
+    assert (already_serving["verdict"], already_serving["numbers"]["wake_seconds"]) == ("pass", 0.0)
+    # Every test passed, but no reading of the pool's state gave a wake: not measured.
+    unmeasured = canary_result.wake_seconds([(0.0, None), (2.0, None)])
+    found = detail(canary_result.measurement(results, unmeasured, commit=COMMIT, bus=BUS, now=SUNDAY))
+    assert found["verdict"] == "error"
+    assert "wake_seconds" not in found["numbers"]
+
+
+def test_a_run_pytest_did_not_finish_is_not_a_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    partial = canary_result.read_results(INTERRUPTED)
+    # The unfinished case counts as neither passed nor failed.
+    assert (partial.passed, partial.failed, partial.finished) == (1, 0, False)
+    # Whatever the XML holds, a run pytest ended as interrupted (2) did not end.
+    whole = canary_result.read_results(ALL_PASSED)
+    monkeypatch.setattr(canary_result, "run_canary", lambda *_args, **_kwargs: (whole, 3.0, 2))
+    sent: list[dict[str, Any]] = []
+    assert canary_result.main(environ(), clock=lambda: SUNDAY, events=Events(sent)) == 2
+    (entry,) = sent
+    assert detail(entry)["verdict"] == "error"
+    assert detail(entry)["numbers"]["smoke_tests_passed"] == 3
+    # A run that exited 0 and is still not green fails the build.
+    monkeypatch.setattr(canary_result, "run_canary", lambda *_args, **_kwargs: (whole, None, 0))
+    assert canary_result.main(environ(), clock=lambda: SUNDAY, events=Events([])) == 1
+
+
 class Events:
     """An EventBridge client as far as the script uses one: it keeps each entry, and refuses them
     when `failed` is set, as EventBridge does, with HTTP 200 and a count."""
@@ -137,17 +176,30 @@ class Secrets:
         return {"SecretString": self.held}
 
 
-class Workspaces:
-    """A Managed Prometheus client: two pages of workspaces, the stage's on the second."""
+class Parameters:
+    """An SSM client that holds the coursework pool's release parameter, as the pools stack writes
+    it (`rhi.pools.release`)."""
 
-    def list_workspaces(self, **request: Any) -> dict[str, Any]:
-        if "nextToken" not in request:
-            return {"workspaces": [{"workspaceId": "ws-other", "tags": {"rhi-stage": "Other"}}], "nextToken": "2"}
-        return {"workspaces": [{"workspaceId": "ws-example", "tags": {"rhi-stage": STAGE}}]}
-
-    def describe_workspace(self, *, workspaceId: str) -> dict[str, Any]:
-        assert workspaceId == "ws-example"
-        return {"workspace": {"workspaceId": workspaceId, "prometheusEndpoint": WORKSPACE}}
+    def get_parameter(self, *, Name: str) -> dict[str, Any]:
+        assert Name == PARAMETER
+        settings = {
+            "pool": "coursework",
+            "group": "rhi-coursework",
+            "launch_hook": "launch",
+            "termination_hook": "termination",
+            "log_group": "/rhi/pools/coursework",
+            "workspace_url": f"{WORKSPACE}api/v1/remote_write",
+            "heartbeat_table": HEARTBEATS,
+            "secret_id": "rhi/pools/coursework",
+        }
+        release = {
+            "engine_image": f"registry.example.com/engine@sha256:{'1' * 64}",
+            "model_revision": "2" * 40,
+            "engine_flags": [],
+            "files": {"bucket": "files", "key": "release.tar", "sha256": "3" * 64},
+            "settings": settings,
+        }
+        return {"Parameter": {"Name": Name, "Value": json.dumps(release)}}
 
 
 def readings(watched: Sequence[tuple[float, str | None]]) -> Any:
@@ -173,8 +225,7 @@ def environ() -> dict[str, str]:
         "CODEBUILD_RESOLVED_SOURCE_VERSION": COMMIT,
         "RHI_MEASUREMENT_BUS": BUS,
         "RHI_SMOKE_ENDPOINT": "canary.example.com",
-        "RHI_SMOKE_RELEASE_PARAMETERS": json.dumps({"coursework": "/rhi/pools/coursework/release"}),
-        "RHI_CANARY_STAGE": STAGE,
+        "RHI_SMOKE_RELEASE_PARAMETERS": json.dumps({"coursework": PARAMETER}),
     }
 
 
@@ -193,7 +244,7 @@ def test_the_job_runs_the_coursework_pool_s_smoke_tests_and_sends_their_result()
         environ(),
         clock=lambda: SUNDAY,
         secrets=Secrets(key),
-        aps=Workspaces(),
+        ssm=Parameters(),
         events=Events(sent),
         run=run,
         watch=readings(WOKEN),
@@ -202,10 +253,12 @@ def test_the_job_runs_the_coursework_pool_s_smoke_tests_and_sends_their_result()
     ((env, arguments),) = given
     assert env["RHI_SMOKE_POOL"] == "coursework"
     assert env["RHI_SMOKE_KEY"] == key
-    # The workspace's own query address, under which the tests ask for api/v1/query.
+    # The workspace's own query address, under which the tests ask for api/v1/query, and the
+    # heartbeats table, both from the release parameter's settings.
     assert env["RHI_SMOKE_WORKSPACE_URL"] == WORKSPACE
-    assert json.loads(env["RHI_SMOKE_RELEASE_PARAMETERS"]) == {"coursework": "/rhi/pools/coursework/release"}
-    assert arguments[:2] == ["-p", "canary_result"] and arguments[-1] == "tests/smoke"
+    assert env["RHI_VERIFY_HEARTBEATS_TABLE"] == HEARTBEATS
+    assert json.loads(env["RHI_SMOKE_RELEASE_PARAMETERS"]) == {"coursework": PARAMETER}
+    assert arguments[-1] == "tests/smoke"
     (entry,) = sent
     found = detail(entry)
     assert (found["verdict"], found["label"], found["commit"]) == ("fail", "2026-11-22", COMMIT)
@@ -226,7 +279,7 @@ def test_no_test_run_is_sent_as_not_measured(endpoint: str, held: str | None) ->
         environ() | {"RHI_SMOKE_ENDPOINT": endpoint},
         clock=lambda: SUNDAY,
         secrets=Secrets(held),
-        aps=Workspaces(),
+        ssm=Parameters(),
         events=Events(sent),
         run=run,
         watch=readings([]),
@@ -243,16 +296,37 @@ def test_an_event_the_bus_refuses_fails_the_script() -> None:
         )
 
 
-def test_the_run_leaves_out_the_heartbeat_test_its_role_cannot_read() -> None:
-    def item(test_id: str) -> Any:
-        return SimpleNamespace(test_id=test_id, iter_markers=lambda _name: [SimpleNamespace(args=(test_id,))])
+def collected(env: Mapping[str, str], arguments: Sequence[str]) -> set[str]:
+    """The smoke tests a run of the verification's runner would make, by their node IDs."""
+    command = [sys.executable, "-m", "pytest", "-q", "--collect-only", "-p", "verify", *arguments]
+    folders = os.pathsep.join(["scripts/pipeline", *filter(None, [os.environ.get("PYTHONPATH")])])
+    answer = subprocess.run(
+        command, cwd=REPO, env={**os.environ, **env, "PYTHONPATH": folders}, capture_output=True, text=True, check=True
+    )
+    return {line for line in answer.stdout.splitlines() if line.startswith("tests/smoke/") and "::" in line}
 
-    deselected: list[Any] = []
-    config = SimpleNamespace(hook=SimpleNamespace(pytest_deselected=lambda items: deselected.extend(items)))
-    items = [item("first-stream-wake"), item("release-heartbeat"), item("gpu-release-served")]
-    canary_result.pytest_collection_modifyitems(config, items)  # ty: ignore[invalid-argument-type] - test doubles
-    assert [found.test_id for found in items] == ["first-stream-wake", "gpu-release-served"]
-    assert [found.test_id for found in deselected] == ["release-heartbeat"]
+
+def test_the_run_makes_every_test_the_verification_makes_on_the_coursework_pool() -> None:
+    given: list[tuple[dict[str, str], list[str]]] = []
+
+    def run(env: Mapping[str, str], arguments: Sequence[str]) -> int:
+        given.append((dict(env), [argument for argument in arguments if not argument.startswith("--junitxml=")]))
+        return 5
+
+    canary_result.main(
+        environ(),
+        clock=lambda: SUNDAY,
+        secrets=Secrets("a-key-drawn-for-this-test"),
+        ssm=Parameters(),
+        events=Events([]),
+        run=run,
+        watch=readings([]),
+    )
+    ((env, arguments),) = given
+    endpoint = {"RHI_SMOKE_ENDPOINT": env["RHI_SMOKE_ENDPOINT"], "RHI_SMOKE_POOL": env["RHI_SMOKE_POOL"]}
+    after_a_refresh = collected(endpoint | {"RHI_SMOKE_POOL": "coursework"}, ["tests/smoke"])
+    assert any("release_heartbeats" in test for test in after_a_refresh)
+    assert collected(endpoint, arguments) == after_a_refresh
 
 
 def test_the_watch_reads_the_coursework_pool_s_state_until_it_is_ready() -> None:

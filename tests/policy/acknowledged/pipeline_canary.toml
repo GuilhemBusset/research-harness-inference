@@ -7,16 +7,16 @@
 # statements:
 # - secretsmanager:GetSecretValue on the secret rhi/canary-key-?????? only: the canary's key, with
 #   which the smoke tests reach the coursework pool through the gateway. No other secret.
-# - aps:DescribeWorkspace and aps:QueryMetrics on workspace/* of the deploying account and region,
-#   under the condition that the workspace carries the tag rhi-stage with the stage's name: the
-#   workspace's query address, then the queries of the smoke tests that read the pool's metrics
-#   and the release its instances report.
-# - aps:ListWorkspaces on every resource, which is the only resource AWS grants it on: the job finds
-#   the ID of its stage's workspace among the workspaces' tags, since the stage's output that holds
-#   the query address cannot reach a job outside the pipeline's actions.
+# - aps:QueryMetrics on workspace/* of the deploying account and region, under the condition that
+#   the workspace carries the tag rhi-stage with the stage's name: the queries of the smoke tests
+#   that read the pool's metrics and the release its instances report. The workspace's address is
+#   in the settings of the coursework pool's release parameter, so nothing lists or describes it.
 # - ssm:GetParameter on the release parameter of each pool the stage deploys,
 #   parameter/rhi/pools/<pool>/release, each by its name: the release the smoke tests compare with
-#   the one the pool serves.
+#   the one the pool serves, and, in its settings, the stage's workspace and heartbeats table.
+# - dynamodb:Query on the heartbeats table of the stage only, by the pools stack's name and the
+#   table's logical ID, as the verification step names it: the smoke test release-heartbeat reads
+#   the release each instance of the coursework pool reports there. No other action of DynamoDB.
 # - events:PutEvents on event-bus/rhi-measurements only, through `measuring_job`: the measurement
 #   gpu-canary, handed to the reporter, since a job holds no GitHub credential.
 # - codeconnections:GetConnection and codeconnections:GetConnectionToken on the pipeline's
@@ -24,7 +24,7 @@
 #   project's role.
 # - logs:CreateLogStream and logs:PutLogEvents on the job's log group, /aws/codebuild/rhi-gpu-canary,
 #   only: the job's logs.
-# Nothing of CodePipeline, DynamoDB, Auto Scaling, EC2 or IAM, and no report group: the project
+# Nothing of CodePipeline, Auto Scaling, EC2 or IAM, and no report group: the project
 # declares none.
 #
 # The schedule's role, which EventBridge assumes to start the job:
@@ -36,8 +36,5 @@
 
 [nag]
 "AwsSolutions-CB4" = "The canary's project keeps no artifact and encrypts what CodeBuild stores with the key AWS manages, the default; a customer managed key would add a monthly cost and a key policy to keep for a build that holds nothing but this public repository."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The canary describes and queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
-"AwsSolutions-IAM5[Resource::*]" = "The canary lists the workspaces to find its stage's by its tag, which AWS grants only on every resource; the action is listed with its reason in the wildcard_actions table of this module."
-
-[wildcard_actions]
-"aps:ListWorkspaces" = "The canary finds the ID of its stage's workspace by the workspace's tag, and Managed Prometheus grants listing workspaces only on every resource."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The canary queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesHeartbeats613D6AB3-*]" = "The canary queries the heartbeats table of the stage it tests, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID, as the verification step does; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."

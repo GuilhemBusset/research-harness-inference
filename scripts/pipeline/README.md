@@ -46,15 +46,16 @@ deployment and needs no import path:
 The script of the weekly GPU canary (`src/rhi/pipeline/canary.py`), a job its schedule starts on
 Sundays at 04:00 UTC, with the repository's package roots in `PYTHONPATH`:
 
-- `canary_result.py` reads the canary's key as `verify.py` does, finds the query address of the
-  stage's workspace by its tag `rhi-stage`, and runs the smoke tests of `tests/smoke` once against
-  the deployed endpoint, on the coursework pool, through `verify.py`'s runner, leaving out
-  `release-heartbeat` too, since the canary's role may not read the heartbeats table. While they
+- `canary_result.py` reads the canary's key as `verify.py` does, and the stage's workspace and
+  heartbeats table from the settings of the coursework pool's release parameter, and runs the smoke
+  tests of `tests/smoke` once against the deployed endpoint, on the coursework pool, through
+  `verify.py`'s runner: the tests the verification runs on that pool after a refresh. While they
   run, it reads the pool's state from `GET /status` to time the wake, from the pool's last `cold`
   to its first `ready`. It then sends the measurement `gpu-canary` (the verdict, `wake_seconds`,
   `smoke_tests_passed`, `smoke_tests_failed`) on the measurement bus, on the commit the job ran
-  from, with the run's UTC date, YYYY-MM-DD, as its run label. No test run is sent as not
-  measured, and an event the bus refuses fails the job.
+  from, with the run's UTC date, YYYY-MM-DD, as its run label. It passes only when the run ended,
+  no test failed and the wake was measured; no test run, a run pytest did not finish, or no wake
+  is sent as not measured, and an event the bus refuses fails the job.
 
 The rule for model weights (system design, section 4.4), which the job that copies each pool's
 model into the model bucket follows:
