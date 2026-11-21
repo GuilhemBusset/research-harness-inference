@@ -137,3 +137,80 @@ def test_a_wrong_release_reported_after_the_wake_fails_once_its_series_has_aged_
     after the wake, then stopped reporting, while a partner reports the deployed one."""
     with pytest.raises(AssertionError, match="another release"):
         run_check(monkeypatch, served=OTHER, woken_scrapes=(-10.0, 5.0, 20.0), partner=True)
+
+
+def run_against_samples(
+    monkeypatch: pytest.MonkeyPatch, samples: Sequence[tuple[str, tuple[str, str], float, float]]
+) -> None:
+    """The smoke test against a workspace that, like Prometheus, evaluates a query at its `time`:
+    it returns each series whose latest sample at or before that time, among those that have
+    arrived, is at most STALE old. Each sample is (instance, release, taken, arrived), in seconds
+    from the request, which the pool completes after a hold of 60 seconds."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pytest.PytestUnknownMarkWarning)
+        smoke = runpy.run_path(str(DEPLOYED / "test_gpu_release.py"))
+    check = smoke["test_the_woken_pool_completes_a_stream_and_serves_the_deployed_release"]
+    workspace_type = runpy.run_path(str(DEPLOYED / "conftest.py"))["Workspace"]
+    clock = Clock()
+    sent = clock.now
+    for namespace in (check.__globals__, workspace_type.series.__globals__):
+        monkeypatch.setitem(namespace, "time", clock)
+    monkeypatch.setitem(
+        workspace_type.series.__globals__, "SigV4Auth", lambda *_: SimpleNamespace(add_auth=lambda _: None)
+    )
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        form = parse_qs(request.content.decode())
+        evaluated = float(form["time"][0]) if "time" in form else clock.now
+        latest: dict[tuple[str, tuple[str, str]], float] = {}
+        for instance, served, taken, arrived in samples:
+            if sent + taken <= evaluated and sent + arrived <= clock.now:
+                latest[(instance, served)] = max(latest.get((instance, served), -math.inf), sent + taken)
+        result = [
+            {
+                "metric": {"instance": instance, "image_digest": served[0], "model_revision": served[1]},
+                "value": [evaluated, "1"],
+            }
+            for (instance, served), taken in latest.items()
+            if evaluated - taken <= STALE
+        ]
+        return httpx.Response(200, json={"status": "success", "data": {"resultType": "vector", "result": result}})
+
+    class Stack:
+        pool = "coursework"
+
+        def stream(self, path: str, body: dict[str, Any]) -> Any:
+            clock.sleep(60.0)
+            return SimpleNamespace(status=200, events=(SseEvent(name="message_stop", data="{}", comment=False),))
+
+    session = SimpleNamespace(get_credentials=lambda: None, region_name="us-east-1")
+    http = httpx.Client(transport=httpx.MockTransport(answer))
+    check(
+        stack=Stack(),
+        workspace=workspace_type(url="https://workspace.example.com", http=http, session=session),
+        deployed_release=RELEASE,
+    )
+
+
+def every_scrape(
+    instance: str, served: tuple[str, str], *, lag: float = 0.0
+) -> list[tuple[str, tuple[str, str], float, float]]:
+    """`instance` reporting `served` on every scrape from the stream's end, each arriving `lag` later."""
+    return [(instance, served, taken, taken + lag) for taken in range(75, 1500, 15)]
+
+
+def test_a_wrong_release_reported_just_after_the_request_fails_however_soon_it_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A series visible before the request reports another release 1 second after it, and never again."""
+    samples = [("server", OTHER, -5.0, -5.0), ("server", OTHER, 1.0, 1.0), *every_scrape("partner", RELEASE)]
+    with pytest.raises(AssertionError, match="another release"):
+        run_against_samples(monkeypatch, samples)
+
+
+def test_a_report_taken_before_the_request_does_not_count_even_when_it_arrives_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replaced instance's report from before the request reaches the workspace after the wake."""
+    samples = [("replaced", OTHER, -1.0, 200.0), *every_scrape("woken", RELEASE, lag=20.0)]
+    run_against_samples(monkeypatch, samples)
