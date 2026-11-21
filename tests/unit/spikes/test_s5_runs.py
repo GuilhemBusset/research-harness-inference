@@ -308,7 +308,9 @@ class Scraped:
                 anchor = [value for at, value in samples if at <= left][-1:] or inside[:1]
                 if inside:
                     value = inside[-1] - anchor[0] if "anchored" in query else inside[-1]
-                    by.setdefault((("instance", labels["instance"]),), []).append((end, value))
+                    # `sum by (instance)` keeps the instance; `last_over_time` each series' labels.
+                    kept = (("instance", labels["instance"]),) if "anchored" in query else tuple(labels.items())
+                    by.setdefault(kept, []).append((end, value))
             return [common.Series(dict(k), ((end, sum(v for _, v in s)),)) for k, s in by.items()]
         points = [start + n * step for n in range(int((end - start) / step) + 1)]
         for labels, samples in held:
@@ -483,6 +485,21 @@ def test_each_engine_counter_uses_its_own_baseline_before_the_instance_sum() -> 
     raw = [
         common.Series(resident, ((1000.0, 1000.0), (1015.0, 1200.0), (1030.0, 1200.0))),
         common.Series(joined, ((1015.0, 500.0), (1030.0, 550.0))),
+    ]
+    increases = [common.Series({"instance": "worker"}, ((1045.0, 250.0),))]
+    assert s5.counted_of(increases, raw, at_start)[("worker", "")] == 750.0
+
+
+def test_an_extra_label_makes_a_counter_series_with_its_own_baseline() -> None:
+    labels = {"instance": "worker", "engine": "0"}
+    original = {**labels, "__name__": "vllm:generation_tokens_total"}
+    # A series with one label more is another series: it adds its first 500 tokens to the 200 the
+    # series held at the start added, and is not anchored on that series' baseline.
+    added = {**original, "zone": "example-zone"}
+    at_start = [common.Series(labels, ((1000.0, 1000.0),))]
+    raw = [
+        common.Series(original, ((1000.0, 1000.0), (1015.0, 1200.0))),
+        common.Series(added, ((1015.0, 500.0), (1030.0, 550.0))),
     ]
     increases = [common.Series({"instance": "worker"}, ((1045.0, 250.0),))]
     assert s5.counted_of(increases, raw, at_start)[("worker", "")] == 750.0
