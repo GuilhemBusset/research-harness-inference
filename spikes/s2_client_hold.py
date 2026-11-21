@@ -130,7 +130,7 @@ from rhi_cli import store
 from rhi_common.causes import Cause
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from rhi_common.spike_keys import SpikeKeys
 
@@ -335,6 +335,8 @@ class Exchange:
     completed: bool = False
     closed_at: float | None = None
     ended_at: float | None = None
+    # The request's headers as the client sent them, without its key and its cookies (`replayable`).
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def route(self) -> str:
@@ -459,6 +461,15 @@ def whole_json(body: bytes) -> bool:
     return True
 
 
+# The headers an exchange does not keep: the key and the cookies, which a recorded session never holds.
+_NOT_KEPT = frozenset({"authorization", "x-api-key", "cookie", "proxy-authorization"})
+
+
+def replayable(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """A request's headers without its key, its cookies and the hop's own: what a replay of it may send."""
+    return {name: value for name, value in headers if name.lower() not in _NOT_KEPT | _HOP_BY_HOP}
+
+
 def directed(body: bytes, model: str) -> bytes:
     """The body with `model` as its model, when it is a JSON object that names one; otherwise as it is."""
     try:
@@ -532,7 +543,7 @@ class Forwarder:
         handler.close_connection = True
         length = int(handler.headers.get("Content-Length") or 0)
         body = directed(handler.rfile.read(length), self.model) if length else b""
-        exchange = Exchange(handler.command, handler.path, body, self.clock())
+        exchange = Exchange(handler.command, handler.path, body, self.clock(), headers=replayable(handler.headers.items()))
         with self._lock:
             self.exchanges.append(exchange)
         headers = {name: value for name, value in handler.headers.items() if name.lower() not in _HOP_BY_HOP}

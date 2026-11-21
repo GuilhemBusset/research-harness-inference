@@ -124,6 +124,7 @@ JOBS: tuple[SpikeJob, ...] = (
     # Twenty starts, each until the pool falls idle and the scaler returns its instance.
     SpikeJob("s1_cold_start", "s1_cold_start.py", timeout_hours=24),
     SpikeJob("s5_capacity", "s5_capacity.py"),
+    SpikeJob("s3_harness_task", "s3_harness_task.py"),
 )
 
 
