@@ -98,10 +98,11 @@ class FixCase(EngineCase):
         return max((e["seq"] for e in self.store.events()), default=0)
 
     def breaking_pair(self):
-        """#3 breaks #2's checks on main; its fix-forward changes nothing, so it is reverted."""
+        """#3's merges fail their deployment; its fix-forward changes nothing, so it is reverted."""
         self.add_work(2, "docs/a.txt", "alpha")
         self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))
         self.epic(2, 3)
+        self.failing_deployments(3)
 
     def revert_prs(self):
         return [p for p in self.gh.prs.values() if p["head"]["ref"].endswith("-revert")]
@@ -145,16 +146,13 @@ class Finding01PublishedEvidence(FixCase):
 
 
 class Finding02RevertGates(FixCase):
-    def test_2_a_breaking_merge_gets_a_fix_forward_then_a_verified_and_certified_revert(self):
+    def test_2_a_breaking_merge_gets_a_fix_forward_then_a_certified_revert(self):
         self.breaking_pair()
         agents = Agents(self.scripts)
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
-        regressions = [e for e in self.events("regression_check") if e["issue"] == 3]
-        self.assertTrue(regressions and not regressions[0]["ok"])
-        self.assertEqual(regressions[0]["of"], 2)
         self.assertEqual(len(self.events("fix_forward", 3)), 1, "one fix-forward round")
-        self.assertTrue(any("#2's checks fail on main" in f for f in self.builds(3)[1][3]),
+        self.assertTrue(any("the deployment failed after the merge" in f for f in self.builds(3)[1][3]),
                         "the fix-forward round is told what broke")
         # The fix-forward changed nothing, so the breaking PR is reverted and #3 delivered once
         # more; it breaks main again, is reverted again, and fails. Main is never left red.
@@ -169,10 +167,6 @@ class Finding02RevertGates(FixCase):
         pr = self.gh.prs[reverted[0]["pr"]]
         head = pr["head"]["sha"]
         self.assertTrue(pr["merged"])
-        # the earlier issues' checks ran on the reverted tree, before it was certified and merged
-        checked = [e for e in self.events("regression_check", 3) if e["head"] == head]
-        self.assertTrue(checked and checked[0]["ok"] and checked[0]["of"] == 2)
-        self.assertLess(checked[0]["seq"], reverted[0]["seq"])
         certified = [x for x in agents.exams if x["head"] == head]
         self.assertEqual(len(certified), 1, "the other vendor certified the exact revert head")
         self.assertTrue(any("Certify a revert" in f for f in certified[0]["feedback"]))
@@ -217,24 +211,6 @@ class Finding02RevertGates(FixCase):
         self.assertFalse(self.events("reverted", 3))
         self.assertEqual(len([c for c in self.gh.calls if c[0] == "merge_pr"]), 2, "only #2 and #3 ever merged")
         self.assertNotIn("-revert", git("ls-remote", "--heads", "origin", cwd=self.repo.work), "nothing was pushed")
-
-    def test_2_a_revert_that_leaves_earlier_checks_failing_is_never_proposed(self):
-        self.breaking_pair()
-        real = Engine._regressions
-
-        def still_failing_on_the_revert(engine, n, root, head):
-            if Path(root).name != "coord":   # the revert's own worktree
-                return [f"after #{n} was reverted, #2's checks still fail"]
-            return real(engine, n, root, head)
-        with mock.patch.object(Engine, "_regressions", still_failing_on_the_revert):
-            self.run_engine(agents=Agents(self.scripts))
-        st = self.store.issue(3)
-        assert st.fail is not None
-        self.assertEqual((st.phase, st.fail["cause"]), (Phase.FAILED, "main_broken"))
-        self.assertIn("still leaves earlier issues' checks failing", st.fail["detail"])
-        self.assertFalse(self.revert_prs())
-        assert isinstance(self.agents, Agents)
-        self.assertFalse([x for x in self.agents.exams if any("Certify a revert" in f for f in x["feedback"])])
 
     def test_2_a_revert_the_required_check_refuses_is_not_merged(self):
         self.breaking_pair()

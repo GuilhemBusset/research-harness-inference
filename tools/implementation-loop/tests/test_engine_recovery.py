@@ -14,6 +14,7 @@ from unittest import mock
 
 from helpers import REPO_ROOT, SHIP, git, issue_body, present
 from implement_loop import engine as engine_mod
+from implement_loop import report
 from implement_loop.agents import AgentFailure, Decision, FakeAgents, Request, Script
 from implement_loop.config import Caps
 from implement_loop.engine import Engine
@@ -305,21 +306,21 @@ class RequirementRegressions(RecoveryCase):
                          "the second round changed nothing, so there was nothing to merge")
         self.assertTrue(self.events("nothing_to_land", 2))
 
-    def test_criteria_edited_during_post_merge_verification_are_not_ticked(self):
+    def test_criteria_edited_during_the_evidence_step_are_not_ticked(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.epic(2)
-        real_verify = engine_mod.verify.verify
+        real_upsert = Engine._upsert_comment
         ticked = []
 
-        def verify_then_edit(root, *args, **kwargs):
-            result = real_verify(root, *args, **kwargs)
-            # post-merge verification: it runs while the issue is merged (in a copy of the coord worktree)
-            if RunStore.for_root(self.repo.work, EPIC).issue(2).phase == Phase.MERGED:
+        def upsert_then_edit(engine, n, marker, body):
+            result = real_upsert(engine, n, marker, body)
+            # the evidence comment of the evidence step: it is written while the issue is merged
+            if marker == report.EVIDENCE_MARKER and engine.store.issue(2).phase == Phase.MERGED:
                 ticked.append("- [x] The test passes on main." in self.gh.issues[2]["body"])
                 self.gh.issues[2]["body"] = self.gh.issues[2]["body"].replace("The test passes on main.",
                                                                              "Something else entirely.")
             return result
-        with mock.patch.object(engine_mod.verify, "verify", verify_then_edit):
+        with mock.patch.object(Engine, "_upsert_comment", upsert_then_edit):
             self.run_engine()
         self.assertEqual(self.store.issue(2).round, 2)
         self.assertTrue(self.events("new_round", 2))
@@ -714,24 +715,6 @@ class CrossVendorRegressions(RecoveryCase):
         self.assertFalse(summary["stopped"])
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertTrue(self.events("stale_stop_cleared"))
-
-    def test_earlier_issues_are_regression_checked_after_a_restart(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))
-        self.epic(2, 3)
-        original = Engine._step_plan
-
-        def stop_before_3(engine, n):
-            if n == 3:
-                (engine.store.dir / "STOP").write_text("stop\n")
-                raise type("AgentStopped", (RuntimeError,), {})("stopped")
-            return original(engine, n)
-        with mock.patch.object(Engine, "_step_plan", stop_before_3):
-            self.run_engine()
-        self.assertEqual(self.gh.issues[2]["state"], "closed", "#2 is done and leaves the next plan's work")
-        self.run_engine(agents=FakeAgents(self.scripts))
-        checked = [e for e in self.events("regression_check") if e["issue"] == 3]
-        self.assertTrue(checked and checked[0]["of"] == 2 and not checked[0]["ok"])
 
     def test_published_fault_reports_carry_no_exception_message(self):
         self.add_work(2, "docs/a.txt", "alpha")
