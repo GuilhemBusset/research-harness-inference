@@ -243,6 +243,41 @@ def test_the_runs_follow_the_inputs() -> None:
     assert all(one.cost_per_million_output_tokens is not None for one in measured)
 
 
+def test_output_before_the_first_scrape_in_a_run_counts_toward_its_throughput() -> None:
+    # Scrapes every 15 seconds from END; the run lasts from END + 5 to END + 35, and its one answer,
+    # 500 tokens, is in the first scrape within it. The scrape before the run holds the baseline.
+    counter = [(END + at, 500.0 if at else 0.0) for at in (0, 15, 30, 45)]
+    clock = Clock()
+    clock.now = END + 5
+
+    class Counting(Workspace):
+        """Answers the release query, and the output tokens' increase over a range as Prometheus
+        does with `anchored`: from the last sample at or before the range's start."""
+
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if "vllm:generation_tokens_total" not in query:
+                return super().read_series(query, start=start, end=end, step=step)
+            if "anchored" not in query:
+                return []
+            left = end - float(query.split("[")[1].split("s]")[0])
+            seen = [sample for sample in counter if sample[0] <= end]
+            before = [sample for sample in seen if sample[0] <= left][-1:]
+            first = (before or seen)[0][1]
+            return [common.Series({"instance": "instance-a"}, ((end, seen[-1][1] - first),))]
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        clock.now = END + 35
+        return [record(True, 1.0)]
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=30, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=Counting(), replay=replay, wall=clock, sleep=lambda _: None,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert run.instances["instance-a"].engine.output_tokens_per_second == pytest.approx(500 / 30)
+
+
 def test_a_pool_serving_two_builds_in_a_run_is_refused() -> None:
     def served(instance: str, build: str) -> common.Series:
         labels = {"instance": instance, "instance_type": "g7e.2xlarge", "model_revision": build}
