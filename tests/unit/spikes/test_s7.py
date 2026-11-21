@@ -251,13 +251,14 @@ def test_the_scale_in_step_records_both_paths_and_one_stream_in_flight_as_the_in
     for line in departures:
         assert line["asked_at"] <= line["asked_read_at"] <= line["out_of_service_read_at"] <= line["gone_read_at"]
 
-    # One stream, held from the load's end, sent whole as the job read the scaler ask for fewer:
-    # the request was in flight before the departing instance's last write, and read to its end.
+    # One stream, sent whole as the load stopped, before the scaler asked for fewer, so that the
+    # gateway could forward it to the instance that left; its answer was read through the departure.
     (stream,) = of(lines, "stream")
     assert (stream["stream"], stream["decision"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
-    assert stream["sent_at"] < asked[0]["read_at"] <= stream["body_sent_at"] < gone[0]["last_write_at"]
+    assert stream["sent_at"] == stream["body_sent_at"] < asked[0]["written_at"]
     assert gone[0]["last_write_at"] <= stream["first_event_at"] <= stream["last_event_at"]
-    assert len(gateway.received) == 1
+    ((received, _),) = gateway.received
+    assert received < first
 
 
 def test_two_instances_leaving_on_one_idle_note_are_each_recorded() -> None:
@@ -318,6 +319,80 @@ def test_a_gap_in_the_workspace_loses_no_observation_it_can_still_read(gap: str)
     assert [line["last_write_at"] for line in of(lines, "gone")] == [s7.utc(first + 30), s7.utc(second + 30)]
     assert [line["in_service"] for line in of(lines, "out_of_service")] == [1, 0]
     assert [line["path"] for line in of(lines, "scale_in")] == ["warm_pool", "terminated"]
+
+
+def test_a_return_to_the_warm_pool_counted_late_is_still_its_departures() -> None:
+    clock = FakeClock()
+    first, second = T0 + 120, T0 + 1200
+    early, late = instance_id(), instance_id()
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < first else int(run < second),
+        in_service=lambda run: 2 if run <= first else int(run <= second),
+        # The warm count rises six minutes after the last decision, more than five past the stop.
+        warm=lambda run: int(run >= second + 360),
+        instances={early: (T0 - 600, first + 30), late: (T0 - 600, second + 45)},
+    )
+    run, _, out = a_run(scaler)
+    asyncio.run(run.cycle())
+    assert [line["path"] for line in of(parsed(out, early, late), "scale_in")] == ["terminated", "warm_pool"]
+
+
+def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be() -> None:
+    clock = FakeClock()
+    first, second = T0 + 240, T0 + 1200
+    terminates, returns = instance_id(), instance_id()
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < first else int(run < second),
+        in_service=lambda run: 2 if run <= first else int(run <= second),
+        warm=lambda run: int(run > second),
+        instances={terminates: (T0 - 600, first + 30), returns: (T0 - 600, second + 30)},
+    )
+    read = scaler.read_series
+
+    def delayed(query: str, **window: float) -> list[common.Series]:
+        # Until a minute after the first decision, the workspace shows one collector's writes only
+        # up to T0 + 45: it seems to stop while it serves.
+        if query.startswith("max by (instance)") and T0 + 45 < clock.now() < first + 60:
+            kept = scaler.instances[returns]
+            scaler.instances[returns] = (kept[0], T0 + 45)
+            try:
+                return read(query, **window)
+            finally:
+                scaler.instances[returns] = kept
+        return read(query, **window)
+
+    scaler.read_series = delayed  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    run, _, out = a_run(scaler)
+    asyncio.run(run.cycle())
+
+    lines = parsed(out, terminates, returns)
+    (withdrawn,) = of(lines, "gone_withdrawn")
+    assert withdrawn["last_write_at"] == s7.utc(T0 + 45)
+    departures = [(line["decision"], line["last_write_at"], line["path"]) for line in of(lines, "scale_in")]
+    assert departures == [(1, s7.utc(first + 30), "terminated"), (2, s7.utc(second + 30), "warm_pool")]
+
+
+def test_an_instance_is_named_by_the_order_the_job_first_reads_it() -> None:
+    clock = FakeClock()
+    first, second = T0 + 240, T0 + 1200
+    earlier, later = instance_id(), instance_id()
+    # The instance that appears first stops last.
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < first else int(run < second),
+        in_service=lambda run: 2 if run <= first else int(run <= second),
+        warm=lambda run: int(run > second),
+        instances={earlier: (T0 + 37, second + 37), later: (T0 + 80, first + 20)},
+    )
+    run, _, out = a_run(scaler)
+    asyncio.run(run.cycle())
+    gone = of(parsed(out, earlier, later), "gone")
+    assert [(line["last_write_at"], line["instance"]) for line in gone] == [
+        (s7.utc(first + 20), "instance-2"),
+        (s7.utc(second + 37), "instance-1"),
+    ]
 
 
 def test_an_instance_back_from_the_warm_pool_is_recorded_leaving_again() -> None:
