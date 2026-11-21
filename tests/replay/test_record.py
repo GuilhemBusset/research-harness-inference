@@ -614,3 +614,83 @@ def test_schema_dependencies_follow_the_neutral_property_names(stack: tuple[str,
     saved = json.loads(capture.body)["tools"][0]["input_schema"]
     (renamed,) = [name for name, value in saved["properties"].items() if value == {"type": "integer"}]
     assert saved["dependentRequired"] == {renamed: ["note"], "note": [renamed]} and renamed != "operator"
+
+
+def _restreamed(delta_type: str, field: str, pieces: list[str]) -> bytes:
+    """The mock's streamed Messages answer, its deltas of one type writing these pieces, then nothing."""
+    original = harness.load(harness.CAPTURES / "mock-messages-stream.json")
+    given = iter(pieces)
+    lines = []
+    for line in original.answer.decode().splitlines(keepends=True):
+        event = json.loads(line[6:]) if line.startswith("data: ") else {}
+        if event.get("delta", {}).get("type") == delta_type:
+            event["delta"][field] = next(given, "")
+            line = "data: " + json.dumps(event) + "\n"
+        lines.append(line)
+    assert next(given, None) is None
+    return "".join(lines).encode()
+
+
+def _capture_of(name: str, answer: bytes, neutral: Any) -> dict[str, Any]:
+    original = harness.load(harness.CAPTURES / f"{name}.json")
+    exchange = record.Exchange(
+        "POST", original.target.encode(), list(original.headers.items()), original.body, 200, (), answer
+    )
+    return asyncio.run(record.capture_of(exchange, neutral))[1]
+
+
+def test_a_key_in_the_arguments_of_calls_made_side_by_side_is_not_saved() -> None:
+    key = generate_key()
+    half = len(key) // 2
+
+    def chunk(calls: list[dict[str, Any]]) -> str:
+        choice = {"index": 0, "delta": {"tool_calls": calls}, "finish_reason": None}
+        return "data: " + json.dumps({"id": "c1", "object": "chat.completion.chunk", "choices": [choice]}) + "\n\n"
+
+    first = ('{"value":"' + key[:half], '{"value":"plain')
+    calls = [
+        {"index": i, "id": f"c{i}", "type": "function", "function": {"name": "Lookup", "arguments": piece}}
+        for i, piece in enumerate(first)
+    ]
+    rest = [{"index": i, "function": {"arguments": piece}} for i, piece in enumerate((key[half:] + '"}', ' text"}'))]
+    answer = (chunk(calls) + chunk(rest) + "data: [DONE]\n\n").encode()
+    with pytest.raises(scrub.Refused, match=scrub.KEY):
+        _capture_of("mock-chat-completions-stream", answer, record.Neutral(hosts=(), home="", user="", keys=(key,)))
+
+
+def test_a_json_escaped_key_a_tool_input_streams_in_pieces_is_not_saved() -> None:
+    key = generate_key()
+    escaped = f"\\u{ord(key[0]):04x}" + key[1:]
+    pieces = ['{"value":"' + escaped[:20], escaped[20:] + '"}']
+    answer = _restreamed("input_json_delta", "partial_json", pieces + [""] * 3)
+    with pytest.raises(scrub.Refused, match=scrub.KEY):
+        _capture_of("mock-messages-stream", answer, record.Neutral(hosts=(), home="", user="", keys=(key,)))
+
+
+def test_a_url_a_stream_writes_in_pieces_does_not_keep_the_endpoint_host() -> None:
+    host = f"origin-{secrets.token_hex(4)}.example.com"
+    answer = _restreamed("thinking_delta", "thinking", ["See https://", host[:9], host[9:] + "/help now."])
+    with pytest.raises(scrub.Refused, match=scrub.HOST):
+        _capture_of("mock-messages-stream", answer, record.Neutral(hosts=(host,), home="", user=""))
+
+
+def test_subschemas_of_the_same_instance_follow_the_neutral_property_names(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    schema = {
+        "type": "object",
+        "properties": {"operator": {"type": "integer"}, "user": {"type": "string"}},
+        "dependentSchemas": {"user": {"required": ["operator"]}},
+        "allOf": [{"required": ["operator"]}],
+    }
+    with recording(address, tmp_path, user="operator", profile="coursework") as (_, client):
+        tools = [{"name": "Lookup", "input_schema": schema}]
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(tools=tools)).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["tools"][0]["input_schema"]
+    (renamed,) = [name for name, value in saved["properties"].items() if value == {"type": "integer"}]
+    assert renamed != "operator" and saved["properties"]["user"] == {"type": "string"}
+    assert saved["dependentSchemas"] == {"user": {"required": [renamed]}} and saved["allOf"] == [
+        {"required": [renamed]}
+    ]
