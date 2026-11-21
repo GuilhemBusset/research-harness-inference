@@ -41,12 +41,14 @@ keeps (`Lines`). Every line has `at`, its UTC time, and `kind`:
 | `compaction` | Whether a Claude Code session driven past its window compacted, and whether it completed its next turn |
 | `replay` | The replay of the recorded Claude Code session: its times and its requests |
 | `engine_counters` | The engine's input and cached input token counters, at the replay's start and at its end |
-| `step_failed` | A step that raised: its name and the type of the error |
+| `step_failed` | A step that raised, or a reading of the workspace that failed: its name and the type of the error |
+| `job_failed` | An error that stopped the job: the type of the error |
 
 **The turns.** Claude Code's are the turns its own result counts (`num_turns`): its main loop, with
-its side queries and token counts left out. Codex and the SDK script send no side query, so theirs
-are the requests on their inference route that carry the run's marker, the random word of the
-prompt.
+its side queries and token counts left out; when it gave no result, because it was stopped, the
+turns of its main loop it printed. Codex and the SDK script send no side query, so theirs are the
+requests on their inference route that carry the run's marker, the random word of the prompt, a
+request sent again with the same body (a retry) counted once.
 
 **A refused request** is one the forwarder saw answered with a status other than 200, or with a
 stream that an error event ended (`s2_client_hold.refused`): the gateway answers a held stream 200
@@ -55,29 +57,40 @@ nothing shows that either refused it. Its cause is what the error names, when th
 
 **The image step.** In the folder Claude Code left, the job writes `figure.png`, an image filled
 with one colour it picks at random, and asks Claude Code to open it with its tools and say which
-colour fills it. The request that carries the image inside a tool result is the one recorded.
+colour fills it. The request that carries the image inside a tool result is the one recorded: the
+first such request that was accepted (a retry of a refused one among them), or the first sent when
+none was. Claude Code named the colour when its answer names it, as a word, and no other colour.
 
-**Compaction.** In a folder of its own, the job writes `FILLER_FILES` files of text, more than
-Claude Code's default window holds, and asks Claude Code to read them all, one at a time, then give
-the last word of the last. Claude Code says in its own output that it compacted (an event
-`compact_boundary`), and gives every turn of its main loop as an `assistant` event once whole: the
-session completed its next turn when such an event came after the compaction.
+**Compaction.** In a folder of its own, the job writes `FILLER_FILES` files of text, a quarter more
+than the window the pinned Claude Code reports it works with (`CLIENT_WINDOW`), and asks Claude
+Code to read them all, one at a time, then give the last word of the last. Claude Code says in its
+own output that it compacted (an event `compact_boundary`), and gives every turn of its main loop
+as an `assistant` event: the session completed its next turn when the first such event after the
+compaction is no error, and the session went on after it or did not end in an error. The line also
+holds what shows whether the window was reached at all: the window Claude Code reported, the
+largest input it reported, and the turns the gateway or the engine refused as the session grew.
+When it neither compacted nor had a turn refused, the experiment ended before the window.
 
 **The replay.** The Claude Code session of the task, every request the forwarder saw answered,
-side queries included, with the pauses between them, is replayed through the gateway with the load
+side queries and token counts included, with the pauses between them, is replayed through the gateway with the load
 generator (`loadgen.replay`) as a canary student that has sent nothing in the job, so its cache
 starts empty. The engine's input and cached input token counters, by the names of the per-engine
-table (`rhi_common.engine_metrics`), are read for the moment just before the replay and for a
-scrape after its end, once the workspace holds that scrape, so that the counters hold the replay's
-last answers. Each instance is named by its order of appearance in the job, never by its own name.
+table (`rhi_common.engine_metrics`), are read for a scrape after the job's earlier traffic, once
+the workspace holds it, and the replay starts only then, so that the start holds none of the
+replay and all of what came before it; the end is read for a scrape after the replay's end, once
+the workspace holds that scrape, so that the counters hold the replay's last answers. Each instance is named by its order of appearance in the job, never by its own name.
 
 **The build** is the one the pool's lifecycle agents report (`rhi_lifecycle.serving.RELEASE_METRIC`)
 over the run, read once the workspace holds the scrape after it (`s5_capacity.in_service_of`); it is
-`null` when they reported none, or two.
+`null` when they reported none, or two, or when the workspace could not be read: the run's line is
+written all the same, and a line `step_failed` names the reading that failed.
 
 **No key and no text from AWS.** Every line goes through `Lines`, which refuses one that holds a
 key of the job. An error is recorded by the type's name, never its message, and a cause only when
-it is a name. The answers of the harnesses are read for what they hold, never copied.
+it is one of the names the gateway and the engines publish (`KNOWN_CAUSES`). An error that stops
+the job, before or between its steps, is a line `job_failed` with its type's name, and the job
+exits 1: no traceback reaches the log. The task's check, which runs the model a harness wrote,
+runs with none of the job's credentials, nor the variables that say where CodeBuild keeps them. The answers of the harnesses are read for what they hold, never copied.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s3_harness_task`):
 
@@ -95,12 +108,15 @@ pool serves is the owner's to set (the 8-bit, then the 4-bit build) before start
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import math
 import os
 import random
 import re
 import secrets
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -126,6 +142,7 @@ import s4_weights
 import s5_capacity as s5
 from rhi import config
 from rhi_cli import harness as login_files
+from rhi_common.causes import Cause
 from rhi_common.engine_metrics import Kind as MetricKind
 from rhi_common.engine_metrics import Name, Quantity, metric_names
 
@@ -155,6 +172,8 @@ ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 # Seconds a harness may run before it is stopped, and the check.
 HARNESS_LIMIT_SECONDS = 60 * 60
 CHECK_LIMIT_SECONDS = 10 * 60
+# Seconds the job waits for what a harness left running to be gone, once it is killed.
+GROUP_STOP_SECONDS = 5
 # The most model calls the SDK script makes, and the seconds one of its Python runs may take.
 SDK_TURNS = 60
 SDK_RUN_SECONDS = 5 * 60
@@ -177,18 +196,49 @@ COLOURS: dict[str, tuple[int, int, int]] = {
     "yellow": (240, 220, 30),
 }
 
-# Compaction: files of text, each well inside what Claude Code reads at once, together more than
-# its default window of 200,000 tokens.
-FILLER_FILES = 24
+# Compaction: files of text, each well inside what Claude Code reads at once, together a quarter
+# more than the window the pinned Claude Code works with by default against the gateway, which it
+# reports in its result (`modelUsage`, `contextWindow`). A line of 12 words is some 16 tokens, at
+# most. The engine's own window is smaller: a session that does not compact first meets the
+# engine's refusal as it grows, which is recorded as well.
+CLIENT_WINDOW = 1_000_000
 FILLER_LINES = 800
 FILLER_WORDS_A_LINE = 12
+FILLER_FILES = math.ceil(1.25 * CLIENT_WINDOW / (FILLER_LINES * (FILLER_WORDS_A_LINE + 4)))
 _FILLER = (
     "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was",
     "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now", "old",
 )  # fmt: skip
 
-_CAUSE = re.compile(r"[A-Za-z][A-Za-z0-9_.]{0,63}")
+# The causes a refusal may name in a line, as they are published: the gateway's own (section 6.2,
+# step 8), and the error types of the Messages and OpenAI formats an engine answers with. Any other
+# is `other`: what an error names beyond these may be text the service made.
+KNOWN_CAUSES = frozenset(
+    {
+        *(cause.value for cause in Cause),
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+        "timeout_error",
+        "BadRequestError",
+        "NotFoundError",
+        "InternalServerError",
+        "ServiceUnavailableError",
+        "context_length_exceeded",
+        "rate_limit_exceeded",
+        "server_error",
+    }
+)
 MESSAGES_ROUTE = "/v1/messages"
+# The Messages routes a recorded session replays: the turns and the token counts.
+REPLAYED_ROUTES = (MESSAGES_ROUTE, "/v1/messages/count_tokens")
+# The variables the task's check runs with: none of the job's credentials, nor where to find them.
+CHECK_VARIABLES = ("LANG", "LC_ALL", "TZ")
 
 
 class Line(StrEnum):
@@ -203,6 +253,7 @@ class Line(StrEnum):
     REPLAY = "replay"
     ENGINE_COUNTERS = "engine_counters"
     STEP_FAILED = "step_failed"
+    JOB_FAILED = "job_failed"
 
 
 class Harness(StrEnum):
@@ -272,10 +323,10 @@ class Lines:
 
 
 def safe_cause(cause: str | None) -> str | None:
-    """A refusal's cause when it is a name, as the gateway's and the engine's are; `other` otherwise."""
+    """A refusal's cause when it is one of `KNOWN_CAUSES`; `other` for any other."""
     if cause is None:
         return None
-    return cause if _CAUSE.fullmatch(cause) else "other"
+    return cause if cause in KNOWN_CAUSES else "other"
 
 
 # The harnesses, as processes.
@@ -307,8 +358,27 @@ class Ran:
 type Launch = Callable[[Command], Ran]
 
 
+def stop_group(process: subprocess.Popen[str]) -> None:
+    """Kills every process left in the process group `process` leads, reaps `process`, and waits, a
+    while, until no other is left."""
+    group = process.pid
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(group, signal.SIGKILL)
+    process.wait()
+    deadline = time.monotonic() + GROUP_STOP_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+
+
 def launch_process(command: Command, wall: Callable[[], float] = time.time) -> Ran:
-    """Runs the harness as a process, its output read line by line as it comes; stops it at its limit."""
+    """Runs the harness as a process, its output read line by line as it comes; stops it at its limit.
+    The harness runs in a process group of its own, and whatever it left running in it, the tools
+    it started among them, is stopped once it has ended or been stopped: nothing changes the
+    folder after the run's end."""
     process = subprocess.Popen(
         command.argv,
         env=command.environment,
@@ -318,6 +388,7 @@ def launch_process(command: Command, wall: Callable[[], float] = time.time) -> R
         stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
+        start_new_session=True,
     )
     lines: list[tuple[float, str]] = []
 
@@ -332,9 +403,8 @@ def launch_process(command: Command, wall: Callable[[], float] = time.time) -> R
     try:
         process.wait(timeout=command.limit)
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
         stopped = True
+    stop_group(process)
     reader.join(timeout=10)
     return Ran(None if stopped else process.returncode, list(lines), stopped)
 
@@ -438,14 +508,48 @@ def carries(exchange: s2.Exchange, marker: str) -> bool:
     return marker.encode() in exchange.body
 
 
+def _same(body: dict[str, Any] | None, raw: bytes) -> object:
+    # What differs between two sends of one request is not the request: an SDK's metadata.
+    if body is None:
+        return raw
+    return json.dumps({key: value for key, value in body.items() if key != "metadata"}, sort_keys=True)
+
+
+def main_turns(session: Session) -> int:
+    """The turns of Claude Code's main loop it printed whole: its `assistant` events outside a
+    subagent, one a message, an error left out."""
+    seen = set()
+    for _, event in session.events():
+        message = event.get("message")
+        if (
+            event.get("type") != "assistant"
+            or event.get("parent_tool_use_id") is not None
+            or event.get("error")
+            or not isinstance(message, dict)
+        ):
+            continue
+        seen.add(message.get("id") or len(seen))
+    return len(seen)
+
+
 def turns_of(session: Session, marker: str) -> int | None:
-    """The turns the harness took: Claude Code's own count of its main loop's turns; for the others,
-    their requests on their inference route that carry the run's marker."""
+    """The turns the harness took: Claude Code's own count of its main loop's turns, or, when it
+    gave no result (it was stopped), the turns of its main loop it printed whole; for the others,
+    their requests on their inference route that carry the run's marker, a request sent again
+    (a retry) counted once."""
     if session.harness is Harness.CLAUDE_CODE:
         turns = session.result().get("num_turns")
-        return turns if isinstance(turns, int) and not isinstance(turns, bool) else None
+        if isinstance(turns, int) and not isinstance(turns, bool):
+            return turns
+        return main_turns(session)
     route = ROUTE_OF[session.harness]
-    return sum(1 for one in session.exchanges if one.method == "POST" and one.route == route and carries(one, marker))
+    return len(
+        {
+            _same(one.json(), one.body)
+            for one in session.exchanges
+            if one.method == "POST" and one.route == route and carries(one, marker)
+        }
+    )
 
 
 def refusals_of(session: Session) -> list[dict[str, Any]]:
@@ -486,26 +590,85 @@ def image_in_tool_result(exchange: s2.Exchange) -> bool:
     return False
 
 
+def accepted(exchange: s2.Exchange) -> bool:
+    """Whether the request was answered whole, with no refusal."""
+    return exchange.status == 200 and exchange.completed and not s2.refused(exchange)
+
+
+def colours_named(answer: object) -> set[str]:
+    """The colours of `COLOURS` an answer names, each as a word of its own."""
+    if not isinstance(answer, str):
+        return set()
+    words = set(re.findall(r"[a-z]+", answer.lower()))
+    return {colour for colour in COLOURS if colour in words}
+
+
 def image_step_of(session: Session, colour: str) -> dict[str, Any]:
-    """What became of the image: the first request that carried it inside a tool result, how it was
-    answered, and whether Claude Code's answer names the colour."""
+    """What became of the image: the request that carried it inside a tool result (the first that
+    was accepted, a retry among them; the first sent when none was), how it was answered, and
+    whether Claude Code's answer names the colour, and no other."""
     carrying = [one for one in session.exchanges if one.route == MESSAGES_ROUTE and image_in_tool_result(one)]
-    first = carrying[0] if carrying else None
-    answer = session.result().get("result")
+    chosen = next((one for one in carrying if accepted(one)), carrying[0] if carrying else None)
     return {
         "colour": colour,
-        "image_in_tool_result": first is not None,
-        "sent_at": None if first is None else utc(first.sent_at),
-        "status": None if first is None else first.status,
-        "cause": None if first is None else safe_cause(first.cause),
-        "accepted": first is not None and first.completed and not s2.refused(first),
-        "named": isinstance(answer, str) and colour in answer.lower(),
+        "image_in_tool_result": chosen is not None,
+        "requests_carrying_image": len(carrying),
+        "sent_at": None if chosen is None else utc(chosen.sent_at),
+        "status": None if chosen is None else chosen.status,
+        "cause": None if chosen is None else safe_cause(chosen.cause),
+        "accepted": chosen is not None and accepted(chosen),
+        "named": colours_named(session.result().get("result")) == {colour},
     }
 
 
+def _main_assistant(event: dict[str, Any]) -> bool:
+    return event.get("type") == "assistant" and event.get("parent_tool_use_id") is None
+
+
+def _count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def client_window(session: Session) -> int | None:
+    """The window Claude Code says it worked with, in its result: the largest of its models'."""
+    usage = session.result().get("modelUsage")
+    windows = [
+        window
+        for model in (usage.values() if isinstance(usage, dict) else [])
+        if isinstance(model, dict) and (window := _count(model.get("contextWindow"))) is not None
+    ]
+    return max(windows, default=None)
+
+
+def largest_input(session: Session) -> int | None:
+    """The largest input a turn of Claude Code's main loop reported, cached or not."""
+    found = []
+    for _, event in session.events():
+        message = event.get("message")
+        usage = message.get("usage") if _main_assistant(event) and isinstance(message, dict) else None
+        if isinstance(usage, dict):
+            parts = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            found.append(sum(_count(usage.get(part)) or 0 for part in parts))
+    return max(found, default=None)
+
+
+def next_turn_completed(events: Sequence[tuple[float, dict[str, Any]]]) -> float | None:
+    """When the first turn of the main loop among `events` completed; `None` when it did not: there
+    was none, it was an error, or the session ended in an error with nothing after that turn."""
+    turn = next((index for index, (_, event) in enumerate(events) if _main_assistant(event)), None)
+    if turn is None or events[turn][1].get("error"):
+        return None
+    rest = [event for _, event in events[turn + 1 :]]
+    continued = any(event.get("type") == "user" or _main_assistant(event) for event in rest)
+    failed = any(event.get("type") == "result" and event.get("is_error") is not False for event in rest)
+    return events[turn][0] if continued or not failed else None
+
+
 def compaction_of(session: Session, word: str) -> dict[str, Any]:
-    """Whether the session compacted, by Claude Code's own event, and whether a whole turn of its main
-    loop followed it in the same session; and whether its answer was the word asked for."""
+    """Whether the session compacted, by Claude Code's own event, and whether the turn of its main
+    loop after it completed; whether its answer was the word asked for; and what shows whether the
+    window was reached at all: the window Claude Code worked with, the largest input it reported,
+    and the requests of its main loop the gateway or the engine refused."""
     events = session.events()
     index = next(
         (
@@ -521,28 +684,34 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         boundary, event = events[index]
         held = event.get("compact_metadata")
         metadata = held if isinstance(held, dict) else {}
-        after = next((at for at, later in events[index + 1 :] if later.get("type") == "assistant"), None)
+        after = next_turn_completed(events[index + 1 :])
     trigger = metadata.get("trigger")
-    pre_tokens = metadata.get("pre_tokens")
     answer = session.result().get("result")
+    refused_turns = sum(1 for one in session.exchanges if s2.refused(one) and bool((one.json() or {}).get("tools")))
     return {
         "compacted": boundary is not None,
         "compacted_at": utc_or_none(boundary),
         "trigger": trigger if trigger in ("auto", "manual") else None,
-        "tokens_before": pre_tokens if isinstance(pre_tokens, int) and not isinstance(pre_tokens, bool) else None,
+        "tokens_before": _count(metadata.get("pre_tokens")),
         "next_turn_completed": after is not None,
         "next_turn_at": utc_or_none(after),
-        "answered": isinstance(answer, str) and word in answer,
+        "answered": isinstance(answer, str) and word in re.findall(r"[a-z0-9]+", answer.lower()),
+        "client_window": client_window(session),
+        "largest_input_tokens": largest_input(session),
+        "refused_turns": refused_turns,
+        # Whether the session met its window: it compacted, or a turn was refused as it grew. When
+        # neither, the experiment ended before the window was exercised.
+        "window_exercised": boundary is not None or refused_turns > 0,
     }
 
 
 def recorded_session(exchanges: Sequence[s2.Exchange]) -> loadgen.RecordedSession:
-    """The Claude Code session as it was sent: every Messages request answered whole, side queries
-    included, in order, each with the pause from the end of the one before."""
+    """The Claude Code session as it was sent: every Messages request answered, side queries and token
+    counts included, in order, each with the pause from the end of the one before."""
     kept = [
         one
         for one in exchanges
-        if one.method == "POST" and one.route == MESSAGES_ROUTE and one.status == 200 and not s2.refused(one)
+        if one.method == "POST" and one.route in REPLAYED_ROUTES and one.status == 200 and not s2.refused(one)
     ]
     found, before = [], None
     for one in kept:
@@ -567,7 +736,7 @@ def png(colour: tuple[int, int, int], side: int = IMAGE_SIDE) -> bytes:
 
 
 def filler_name(number: int) -> str:
-    return f"part-{number:02d}.txt"
+    return f"part-{number:03d}.txt"
 
 
 def write_filler(folder: Path, word: str, rng: random.Random) -> None:
@@ -599,11 +768,27 @@ def compaction_prompt(marker: str) -> str:
     )
 
 
+def check_environment(folder: Path) -> dict[str, str]:
+    """What the task's check runs with: the job's Python first on its `PATH`, the folder as its home,
+    and nothing of the job's own environment beyond `CHECK_VARIABLES`: no credential of the build's
+    role, nor where to find one."""
+    environment = {name: os.environ[name] for name in CHECK_VARIABLES if name in os.environ}
+    return environment | {
+        "PATH": os.pathsep.join([str(Path(sys.executable).parent), "/usr/bin", "/bin"]),
+        "HOME": str(folder),
+    }
+
+
 def run_check(folder: Path) -> int | None:
     """The task's check, run in `folder` with the job's Python: its exit status, `None` when it ran too long."""
     try:
         return subprocess.run(
-            [sys.executable, CHECK], cwd=folder, capture_output=True, timeout=CHECK_LIMIT_SECONDS, check=False
+            [sys.executable, CHECK],
+            cwd=folder,
+            env=check_environment(folder),
+            capture_output=True,
+            timeout=CHECK_LIMIT_SECONDS,
+            check=False,
         ).returncode
     except subprocess.TimeoutExpired:
         return None
@@ -759,7 +944,14 @@ class Job:
         session = self.session(harness, Step.TASK, folder, task_prompt(marker))
         changed = restore(folder)
         checked = self.check(folder)
-        build = self.build_in(session.started_at, session.ended_at)
+        if harness is Harness.CLAUDE_CODE:
+            self._refusals(session)
+        try:
+            build = self.build_in(session.started_at, session.ended_at)
+        except Exception as error:  # noqa: BLE001 - the run's observations are kept, the failure recorded
+            build = None
+            self.failures += 1
+            self.lines.write(Line.STEP_FAILED, step=f"build_{harness}", error=type(error).__name__)
         self.lines.write(
             Line.HARNESS_RUN,
             harness=harness.value,
@@ -775,8 +967,6 @@ class Job:
             changed=changed,
             requests=len(session.exchanges),
         )
-        if harness is Harness.CLAUDE_CODE:
-            self._refusals(session)
         return session
 
     def image_step(self, folder: Path) -> None:
@@ -831,8 +1021,12 @@ class Job:
         """The task's Claude Code session replayed through the pool as a student that has sent nothing
         yet, with the engine's counters for the moment before it and for the scrape after its end."""
         session = recorded_session(task.exchanges)
+        # The start: a scrape after all the job sent before, read once the workspace holds it; the
+        # replay sends nothing before then.
+        baseline = self.wall() + SCRAPE_SECONDS
+        self._wait_until(baseline + SETTLE_SECONDS)
+        self.counters("start", baseline)
         start = self.wall()
-        self.counters("start", start)
         records = asyncio.run(self._send(session))
         end = self.wall()
         self.lines.write(
@@ -973,8 +1167,19 @@ def sdk_script(environ: Mapping[str, str], folder: Path) -> int:
     return 1
 
 
-def main(environ: Mapping[str, str] = os.environ) -> int:
-    """Runs the job with its environment and credentials; exits 1 when a step failed."""
+def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = print) -> int:
+    """Runs the job with its environment and credentials; exits 1 when a step failed, or when an
+    error stopped the job: that error is a line `job_failed` with its type's name, never its text,
+    which may be what AWS returned."""
+    try:
+        return run_job(environ, out)
+    except Exception as error:  # noqa: BLE001 - the job's boundary: no traceback reaches the log
+        Lines((), out=out).write(Line.JOB_FAILED, error=type(error).__name__)
+        return 1
+
+
+def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
+    """The job, from its environment and credentials; 1 when a step failed."""
     endpoint = s4_weights.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
     pools = [pool for pool in config.read_ssm().pools if pool.name == name]
@@ -984,7 +1189,7 @@ def main(environ: Mapping[str, str] = os.environ) -> int:
     keys = common.canary_keys()
     session = boto3.Session()
     workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
-    lines = Lines((*keys.students, keys.spent))
+    lines = Lines((*keys.students, keys.spent), out=out)
     with tempfile.TemporaryDirectory(prefix="rhi-s3-") as work:
         failures = Job(
             pool=name,
