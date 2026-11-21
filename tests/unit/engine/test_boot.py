@@ -109,7 +109,8 @@ SYSTEMCTL = """#!/bin/bash
 # systemctl: it records each call and, at a start, what is installed by then.
 printf '%s\\n' "$*" >>"$RHI_TEST_STATE/systemctl.log"
 case " $* " in
-  *" start "*) ls "$RHI_BOOT_ROOT/run/systemd/system" "$RHI_BOOT_ROOT/run/rhi" >"$RHI_TEST_STATE/at-start" 2>&1 ;;
+  *" start "*) ls "$RHI_BOOT_ROOT/run/systemd/system" "$RHI_BOOT_ROOT/run/rhi" \
+    "$RHI_BOOT_ROOT/var/lib/rhi" >"$RHI_TEST_STATE/at-start" 2>&1 ;;
 esac
 exit 0
 """
@@ -314,6 +315,7 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
     assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
     # The settings are the ones the lifecycle agent reads from the same value.
     current = release.parse_current(text)
+    assert release.read_held(instance.root / "var/lib/rhi/release.json") == current.release
     settings = {f"RHI_{name.upper()}": value for name, value in vars(current.settings).items()}
     expected = settings | {
         "RHI_REGION": REGION,
@@ -336,13 +338,17 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
     commands = [call[0] for call in instance.calls()]
     assert commands.index("daemon-reload") < commands.index("start")
     at_start = set((instance.state / "at-start").read_text(encoding="utf-8").split())
-    assert {*TOP_UNITS, "release.env", "engine-flags"} <= at_start
+    assert {*TOP_UNITS, "release.env", "engine-flags", "release.json"} <= at_start
 
 
 def test_the_mock_pool_gets_no_gpu_unit(instance: Instance) -> None:
     # A mock pool's instance: its PCI bus lists a network adapter, and no device of NVIDIA's.
+    instance.value["model_revision"] = None
+    instance.publish(json.dumps(instance.value), instance.files)
     instance.pci_device("0000:00:05.0", AMAZON)
     assert instance.run(PROGRAM).returncode == 0
+    held = release.read_held(instance.root / "var/lib/rhi/release.json")
+    assert held is not None and held.model_revision is None
     assert instance.files_under("run/systemd/system") == TOP_UNITS
     assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
 
@@ -457,6 +463,7 @@ def test_a_start_that_fails_starts_no_unit(instance: Instance, fails: Callable[[
     assert instance.calls() == []
     assert not (instance.root / "run/systemd/system").exists()
     assert instance.files_under("opt/rhi") == set()
+    assert instance.files_under("var/lib/rhi") == set()
 
 
 def boot_unit() -> configparser.ConfigParser:

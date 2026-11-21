@@ -460,7 +460,7 @@ class PoolRelease(Construct):
 
         # What a change must bring to every instance: the compared release (the image by its digest
         # and by the tag it was pushed under, the model revision, the flags and the files' digest)
-        # and the machine image ID the launch template resolves at deployment.
+        # and the machine image ID and version of the launch template, which carries the boot program.
         trigger = {
             "engine_image": engine_image,
             "image_tag": self.image.image_tag,
@@ -468,6 +468,7 @@ class PoolRelease(Construct):
             "engine_flags": engine_flags,
             "files_sha256": files.sha256,
             "machine_image": group.launch_template.image_id,
+            "launch_template_version": group.launch_template.latest_version_number,
         }
         self.refresh = cdk.CustomResource(
             self,

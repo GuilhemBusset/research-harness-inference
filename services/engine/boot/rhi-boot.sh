@@ -15,6 +15,8 @@
 #
 # Nothing of the archive is unpacked, installed or started unless its bytes have the digest the
 # parameter names. Whatever fails, the program ends with a failure before it starts a unit.
+# The lifecycle agent reads the recorded release from /var/lib/rhi/release.json. The boot
+# program publishes that record after installing the checked release and before starting the agent.
 #
 # It runs before any container, on both machine images, so it uses only bash, coreutils, tar,
 # curl, the AWS CLI and the image's python3 with its standard library.
@@ -30,6 +32,7 @@ release="$root/opt/rhi/release"
 units="$root/run/systemd/system"
 settings="$root/run/rhi/release.env"
 flags="$root/run/rhi/engine-flags"
+state="$root/var/lib/rhi"
 
 fail() {
   echo "rhi-boot: $1" >&2
@@ -42,10 +45,13 @@ fetch() {   # fetch <curl arguments>: one answer of the instance metadata, which
 
 # The release of an earlier start goes first: a start that fails leaves none behind. The work
 # folder is on the release's own volume, so the checked release moves into place in one step.
-mkdir -p "$root/opt/rhi"
+mkdir -p "$root/opt/rhi" "$state"
+rm -f "$state/release.json"
 rm -rf "$release" "$root/opt/rhi"/boot.*
 work="$(mktemp -d "$root/opt/rhi/boot.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+record=""
+trap 'rm -rf "$work"; if [ -n "$record" ]; then rm -f "$record"; fi' EXIT
+record="$(mktemp "$state/.release.XXXXXX")"
 
 token="$(fetch --request PUT --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$metadata/latest/api/token")" \
   || fail "the instance metadata gives no session token"
@@ -60,13 +66,13 @@ aws ssm get-parameter --region "$region" --name "$parameter" --output json >"$wo
 
 # The parameter's value is JSON (services/engine/lifecycle/rhi_lifecycle/release.py gives its
 # keys). This writes the settings, one NAME=value line each, the engine's flags, an argument on
-# each line, and where the archive is.
-python3 -I - "$work" "$region" "$parameter" <<'PY' || fail "the release parameter does not hold a release"
+# each line, where the archive is, and the record for the lifecycle agent.
+python3 -I - "$work" "$region" "$parameter" "$record" <<'PY' || fail "the release parameter does not hold a release"
 import json
 import os
 import sys
 
-work, region, parameter = sys.argv[1:]
+work, region, parameter, record = sys.argv[1:]
 SETTINGS = (
     "group", "launch_hook", "termination_hook", "log_group", "workspace_url", "heartbeat_table", "secret_id",
 )
@@ -83,11 +89,13 @@ try:
     with open(os.path.join(work, "parameter.json"), encoding="utf-8") as stream:
         release = json.loads(json.load(stream)["Parameter"]["Value"])
     files, settings = release["files"], release["settings"]
+    image = text(release["engine_image"], "engine_image")
+    revision = release["model_revision"]
     variables = [
         ("RHI_POOL", text(settings["pool"], "settings.pool")),
         ("RHI_REGION", text(region, "the region")),
         ("RHI_RELEASE_PARAMETER", text(parameter, "the tag")),
-        ("RHI_ENGINE_IMAGE", text(release["engine_image"], "engine_image")),
+        ("RHI_ENGINE_IMAGE", image),
     ]
     variables += [("RHI_" + name.upper(), text(settings[name], "settings." + name)) for name in SETTINGS]
     measured = release.get("measured_start_seconds")
@@ -110,6 +118,9 @@ with open(os.path.join(work, "engine-flags"), "w", encoding="utf-8") as stream:
     stream.writelines(flag + "\n" for flag in flags)
 with open(os.path.join(work, "archive"), "w", encoding="utf-8") as stream:
     stream.writelines(line + "\n" for line in archive)
+with open(record, "w", encoding="utf-8") as stream:
+    json.dump({"engine_image": image, "model_revision": revision, "engine_flags": flags,
+               "files": {"sha256": archive[2]}}, stream)
 PY
 mapfile -t archive <"$work/archive"
 
@@ -145,5 +156,6 @@ for vendor in "$root/sys/bus/pci/devices"/*/vendor; do
 done
 
 systemctl daemon-reload
+mv -f "$record" "$state/release.json"
 # Without waiting for them: a unit ordered after this one would otherwise never start.
 systemctl start --no-block rhi-collector.service rhi-lifecycle.service
