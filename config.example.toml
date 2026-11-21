@@ -135,10 +135,11 @@ cached_share_flag_percent = 85
 #                                      instance's EBS volume at every start, then vLLM loads it
 #                                      with its default loader. Spike S4 compares the two.
 #
-# A pool may give the gateway its request profile (sections 6.1 and 6.2), which no pool here does
-# yet: the gateway has no entry yet, and it does not start for a profile that names one it does not
-# have. Both fields are optional, and the values shown are examples, not defaults.
-#   request_profile = ["first_entry", "second_entry"]
+# A pool may give the gateway its request profile (sections 6.1 and 6.2), which the coursework pool
+# does. The gateway does not start for a profile that names an entry it does not have; its entries
+# are the modules of services/gateway/rhi_gateway/profile/. Both fields are optional, and the
+# values shown are examples, not defaults.
+#   request_profile = ["reasoning_effort", "document_as_text"]
 #                                      the names of the rewrites the gateway applies to the pool's
 #                                      requests after its body filter, in the order they apply.
 #                                      Left out, the profile is empty: the filtered body is
@@ -185,6 +186,13 @@ cached_share_flag_percent = 85
 # Its serving settings are those of section 4.2: an 8-bit cache, prefix caching, 8,192 tokens for
 # each engine step, and the model's two parsers. Its weights are streamed, the default, and it
 # records no exception for model code. It has no measured start until spike S1 has one.
+#
+# Its request profile is that of section 6.2, step 4, for the model's defects in vLLM (evidence
+# E28): the reasoning effort mapped to a value the model's template accepts, a system message
+# placed mid-conversation sent as user content in its place, and a document block replaced by a
+# line of text. The effort mapping is section 17's: low and medium unchanged; high, xhigh and max
+# as xhigh. The upgrade pool of phase 4 shares the model's template and parsers, and so this
+# profile (section 6.1).
 [pools.coursework]
 engine = "vllm"
 model = "Qwen/Qwen3.8-27B-FP8"
@@ -206,6 +214,8 @@ prefix_caching = true
 step_budget_tokens = 8192
 tool_call_parser = "qwen3_coder"
 reasoning_parser = "qwen3"
+request_profile = ["reasoning_effort", "system_in_place", "document_as_text"]
+reasoning_effort = { low = "low", medium = "medium", high = "xhigh", xhigh = "xhigh", max = "xhigh" }
 
 # What the pool is expected to measure, each a low and a high bound, which the inference dashboard
 # draws beside the measured series (sections 4.7 and 7.3): tokens a second per stream at eight
