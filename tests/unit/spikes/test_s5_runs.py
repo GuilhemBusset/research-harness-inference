@@ -472,3 +472,17 @@ def test_a_counter_that_went_stale_before_the_run_and_resumed_in_it_counts_only_
     )  # fmt: skip
     run = job.run(job.runs[0])
     assert run.instances["instance-a"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
+
+
+def test_each_engine_counter_uses_its_own_baseline_before_the_instance_sum() -> None:
+    resident = {"__name__": "vllm:generation_tokens_total", "instance": "worker", "engine": "0"}
+    joined = {**resident, "engine": "1"}
+    # Engine 0 held 1,000 tokens at the start and added 200. Engine 1 emitted its first 500 tokens
+    # before its first scrape and added 50 after it.
+    at_start = [common.Series({"instance": "worker", "engine": "0"}, ((1000.0, 1000.0),))]
+    raw = [
+        common.Series(resident, ((1000.0, 1000.0), (1015.0, 1200.0), (1030.0, 1200.0))),
+        common.Series(joined, ((1015.0, 500.0), (1030.0, 550.0))),
+    ]
+    increases = [common.Series({"instance": "worker"}, ((1045.0, 250.0),))]
+    assert s5.counted_of(increases, raw, at_start)[("worker", "")] == 750.0
