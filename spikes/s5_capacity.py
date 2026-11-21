@@ -134,6 +134,7 @@ from rhi_lifecycle.serving import RELEASE_METRIC
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+    from collections.abc import Set as AbstractSet
 
 JOB = "s5_capacity"
 
@@ -508,11 +509,11 @@ def _identity(one: common.Series) -> frozenset[tuple[str, str]]:
     return frozenset((label, value) for label, value in one.labels.items() if label != "__name__")
 
 
-def _held(one: common.Series, there: Sequence[frozenset[tuple[str, str]]]) -> bool:
-    """Whether the start held raw series `one`: a series at the start whose labels are all `one`'s,
-    which is `one` itself, its name aside, as `last_over_time` answers."""
-    labels = _identity(one)
-    return any(held <= labels for held in there)
+def _held(one: common.Series, there: AbstractSet[frozenset[tuple[str, str]]]) -> bool:
+    """Whether the start held raw series `one`: a series at the start with exactly `one`'s labels,
+    its name aside, as `last_over_time` answers. A series with one label more or less is another
+    series, with a baseline of its own."""
+    return _identity(one) in there
 
 
 def counted_of(
@@ -530,7 +531,7 @@ def counted_of(
     the times they were evaluated at, not the times of the samples, so whether a series was there
     at the start is read at the start, never from the time of its first point."""
     totals: dict[tuple[str, str], float] = {}
-    there = [_identity(one) for one in at_start if one.samples and one.labels.get("instance")]
+    there = {_identity(one) for one in at_start if one.samples and one.labels.get("instance")}
 
     def add(one: common.Series, value: float) -> None:
         where = _where(one)
