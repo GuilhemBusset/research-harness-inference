@@ -15,8 +15,10 @@
 #   parameter/rhi/pools/<pool>/release, each by its name: the release the smoke tests compare with
 #   the one the pool serves, and, in its settings, the stage's workspace and heartbeats table.
 # - dynamodb:Query on the heartbeats table of the stage only, by the pools stack's name and the
-#   table's logical ID, as the verification step names it: the smoke test release-heartbeat reads
-#   the release each instance of the coursework pool reports there. No other action of DynamoDB.
+#   table's logical ID, as the verification step names it, under the condition that every
+#   partition key read is coursework (dynamodb:LeadingKeys): the smoke test release-heartbeat reads
+#   the release each instance of the coursework pool reports there. No other action of DynamoDB,
+#   and no other pool's rows.
 # - events:PutEvents on event-bus/rhi-measurements only, through `measuring_job`: the measurement
 #   gpu-canary, handed to the reporter, since a job holds no GitHub credential.
 # - codeconnections:GetConnection and codeconnections:GetConnectionToken on the pipeline's

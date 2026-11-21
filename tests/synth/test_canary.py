@@ -160,10 +160,13 @@ def test_the_job_s_role_reads_the_canary_s_inputs_and_sends_the_measurement_only
     assert text(query["Resource"]) == "arn:<>:aps:<>:<>:workspace/*"
     assert query["Condition"] == {"StringEquals": {"aws:ResourceTag/rhi-stage": "Rhi"}}
     # The one table the verification's role queries too, the stage's heartbeats table, by the pools
-    # stack's name and the table's logical ID.
+    # stack's name and the table's logical ID, and in it the coursework pool's rows only.
+    (heartbeats,) = [statement for statement in allowed if "dynamodb:Query" in as_list(statement["Action"])]
+    assert as_list(heartbeats["Action"]) == ["dynamodb:Query"]
     (table,) = resources_of("dynamodb:Query")
     assert re.fullmatch(r"arn:<>:dynamodb:<>:<>:table/Rhi-Pools-TablesHeartbeats[0-9A-F]{8}-\*", table)
     assert table in queried_by_others(pipeline, role)
+    assert heartbeats["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["coursework"]}}
 
 
 def queried_by_others(pipeline: dict[str, Any], role: str) -> set[str]:
