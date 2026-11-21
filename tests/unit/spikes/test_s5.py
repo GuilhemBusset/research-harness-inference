@@ -145,7 +145,8 @@ def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch) -> 
 def test_the_names_are_declared_one_per_quantity_and_condition() -> None:
     names = [number.value for number in s5.Number]
     conditions = len(s5.Shape) * (len(s5.DECLARED_STREAMS) + 1)
-    assert len(set(names)) == len(names) == len(s5.Figure) * conditions + 1
+    # And two of the job: the class's size, and how many numbers the posting holds.
+    assert len(set(names)) == len(names) == len(s5.Figure) * conditions + 2
     assert all(re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in names)
     # What each run measured is posted, the engine's quantities among them.
     numbers = s5.numbers_of(job(), 20)
@@ -236,4 +237,8 @@ def test_the_record_holds_the_matrix(tmp_path: Path) -> None:
         for streams in ("1", "8", "class")
     } | {("8bit", "hands-on", "16"), ("4bit", "hands-on", "16")}
     assert {labels["lever"] for labels in medians} == {"baseline"}
-    assert {row["name"] for row in held["rows"]} == {*(figure.value for figure in s5.Figure), "class_size"}
+    assert {row["name"] for row in held["rows"]} == {
+        *(figure.value for figure in s5.Figure),
+        "class_size",
+        "numbers_posted",
+    }
