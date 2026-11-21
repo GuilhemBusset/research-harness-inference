@@ -7,6 +7,7 @@ keys are generated.
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -285,3 +286,75 @@ def test_a_pool_serving_two_builds_in_a_run_is_refused() -> None:
 
     with pytest.raises(ValueError, match="2 builds"):
         s5.build_of(s5.in_service_of([served("instance-a", "8bit"), served("instance-b", "4bit")], END - 60, END))
+
+
+class Scraped:
+    """A workspace holding raw scrapes, which answers the job's queries as Prometheus would: a range
+    query at each point of its grid, from the last sample at or before it; `increase` with `anchored`
+    from the last sample at or before its range, else its first in it; `last_over_time` from the last
+    in its range."""
+
+    def __init__(self, *series: tuple[str, dict[str, str], dict[float, float]]) -> None:
+        self.series = series
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        held = [(labels, sorted(samples.items())) for name, labels, samples in self.series if f"{name}{{" in query]
+        by: dict[tuple[tuple[str, str], ...], list[tuple[float, float]]] = {}
+        if "anchored" in query or "last_over_time" in query:
+            left = end - float(re.findall(r"\[(\d+)s\]", query)[0])
+            for labels, samples in held:
+                inside = [value for at, value in samples if left < at <= end]
+                anchor = [value for at, value in samples if at <= left][-1:] or inside[:1]
+                if inside:
+                    value = inside[-1] - anchor[0] if "anchored" in query else inside[-1]
+                    by.setdefault((("instance", labels["instance"]),), []).append((end, value))
+            return [common.Series(dict(k), ((end, sum(v for _, v in s)),)) for k, s in by.items()]
+        points = [start + n * step for n in range(int((end - start) / step) + 1)]
+        for labels, samples in held:
+            for point in points:
+                seen = [(at, value) for at, value in samples if point - 300 < at <= point][-1:]
+                for at, value in seen:
+                    kept = {"instance": labels["instance"]} if "sum by" in query else labels
+                    by.setdefault(tuple(kept.items()), []).append((point, at if "timestamp(" in query else value))
+        return [common.Series(dict(k), tuple(sorted(s))) for k, s in by.items()]
+
+
+def test_a_short_run_reads_every_instance_scraped_during_it_and_the_scrape_after() -> None:
+    # The run lasts from 1000 to 1004. The resident instance is scraped at 987, 1002 and 1017; one
+    # that joined is first scraped at 1016, all it generated already counted; one of another build
+    # is first scraped a whole scrape after the run's end, and served none of it.
+    resident = {"instance": "resident", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    joined = {**resident, "instance": "joined"}
+    later = {**resident, "instance": "later", "model_revision": "other-build"}
+    scraped = Scraped(
+        ("rhi_lifecycle_release_info", resident, {987.0: 1, 1002.0: 1, 1017.0: 1}),
+        ("rhi_lifecycle_release_info", joined, {1016.0: 1}),
+        ("rhi_lifecycle_release_info", later, {1019.0: 1}),
+        ("rhi_lifecycle_engine_cache_capacity_tokens", resident, {987.0: 1_400_000, 1017.0: 1_400_000}),
+        ("rhi_lifecycle_engine_cache_capacity_tokens", joined, {1016.0: 1_200_000}),
+        ("vllm:generation_tokens_total", resident, {987.0: 100, 1002.0: 300, 1017.0: 300}),
+        ("vllm:generation_tokens_total", joined, {1016.0: 500}),
+        ("vllm:num_requests_running", resident, {987.0: 0, 1002.0: 2, 1017.0: 0}),
+    )
+    clock = Clock()
+    clock.now = 1000.0
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        clock.now = 1004.0
+        return [record(True, 1.0, output=700)]
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=4, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=scraped, replay=replay, wall=clock, sleep=lambda _: None,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert run.label.build == "build"
+    assert sorted(run.instances) == ["joined", "resident"]
+    there, new = run.instances["resident"], run.instances["joined"]
+    assert (there.seconds_in_service, new.seconds_in_service) == (4.0, 3.0)
+    assert run.cost_per_million_output_tokens == pytest.approx(3.36 * 7 / 3600 / 700 * 1_000_000)
+    assert (there.engine.cache_capacity_tokens, new.engine.cache_capacity_tokens) == (1_400_000, 1_200_000)
+    assert there.engine.output_tokens_per_second == pytest.approx(200 / 4)
+    assert new.engine.output_tokens_per_second == pytest.approx(500 / 4)
+    assert there.engine.running_requests_peak == 2
