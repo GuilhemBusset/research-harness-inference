@@ -57,10 +57,10 @@ read one scrape after the run's end, from the run's start to then, with Promethe
 range modifier, over a range to the millisecond that starts at the run's start: the increase starts
 from the last sample at or before the run's start, what each counter held when the run began, so
 what the run added before its first scrape is counted, nothing from before the run is, and it is
-not extended past the samples it saw. A series with no sample at or before the run's start (read on
-a grid whose first point is at the start or before it), an instance that joined during it, began
-at zero with its engine: its first sample is added to its
-increase, which `anchored` takes from that sample (`counted_of`). The quantiles are computed from
+not extended past the samples it saw. A series with no sample at or before the run's start (read at
+the start itself), an instance that joined during it, began at zero with its engine: its first
+sample is added to its increase, which `anchored` takes from that sample (`counted_of`); a series
+with one is not, whatever time its first point in the window carries. The quantiles are computed from
 the buckets so counted (`quantile_of`), as `histogram_quantile` would. The scrape after the run's
 end holds the tokens of the last answers, which the workspace sees only then; nothing else is sent
 to the pool in it. The gauges are read over the run alone, on a grid of a second (`fine_step`) that
@@ -78,8 +78,8 @@ scrape past the window's end, so that an instance in service at the end is seen 
 shorter than a scrape, whose instances are first scraped after it ends, is still labelled. An
 instance whose last sample is older than a scrape before the window, which the workspace still
 returns for some minutes, or whose first is a whole scrape after it, did not serve in it and is
-left out. A pool whose instances report two builds in one window is refused: the run is no one
-build's.
+left out, as is a release an instance reported only that far from the window. A pool whose
+instances report two builds in one window is refused: the run is no one build's.
 
 **What the students got**, from the load generator's records (`experience_of`): the time to first
 token at the median and the 95th percentile, for later turns and for first turns apart; the speed
@@ -297,38 +297,40 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
     (`release_query`, read to a scrape past `end`): in service within a scrape of each sample, since
     a sample shows the instance in service at some time in the scrape before it, so from a scrape
     before its first sample to a scrape after its last, inside the window, but not across a gap in
-    its samples longer than two scrapes, a warm instance stopped and started again. An instance with
-    no sample from a scrape before `start` to a scrape after `end` did not serve in the window and
-    is not in the answer, nor is one whose seconds in it come to none; one first scraped after a
-    short window ended still labels it. ValueError for an instance whose samples carry no instance
-    type or two releases."""
-    times: dict[str, list[float]] = {}
-    kinds: dict[str, set[tuple[str, str]]] = {}
+    its samples longer than two scrapes, a warm instance stopped and started again. Only the
+    releases whose samples so give some seconds in the window count: an instance with none did not
+    serve in the window and is not in the answer, and a release it reported only a whole scrape
+    before or after the window, one it served outside the run, labels nothing; one first scraped
+    after a short window ended still labels it. ValueError for an instance whose releases in the
+    window carry no instance type, or are two."""
+    times: dict[str, dict[tuple[str, str], list[float]]] = {}
     for one in release:
         instance = one.labels.get("instance", "")
-        taken_in = (start - SCRAPE_SECONDS < taken <= end + SCRAPE_SECONDS for taken in one.values())
-        if not instance or not any(taken_in):
-            continue
-        times.setdefault(instance, []).extend(one.values())
-        kinds.setdefault(instance, set()).add(
-            (one.labels.get("instance_type", ""), one.labels.get("model_revision", ""))
-        )
+        if instance:
+            kind = (one.labels.get("instance_type", ""), one.labels.get("model_revision", ""))
+            times.setdefault(instance, {}).setdefault(kind, []).extend(one.values())
     found = {}
-    for instance, taken in times.items():
-        if len(kinds[instance]) != 1 or not all(next(iter(kinds[instance]))):
+    for instance, by_kind in times.items():
+        served = {kind: _covered(taken, start, end) for kind, taken in by_kind.items()}
+        served = {kind: seconds for kind, seconds in served.items() if seconds > 0}
+        if not served:
+            continue
+        if len(served) != 1 or not all(next(iter(served))):
             raise ValueError("an instance reported no instance type, no build, or two of either in the window")
-        ((kind, build),) = kinds[instance]
-        # The union, inside the window, of a scrape either side of each sample.
-        seconds, covered = 0.0, start
-        for at in sorted(set(taken)):
-            low, high = max(covered, at - SCRAPE_SECONDS), min(end, at + SCRAPE_SECONDS)
-            if high > low:
-                seconds, covered = seconds + high - low, high
-        # An instance first scraped a whole scrape after the window, or last a whole scrape before
-        # it, was in service for none of it, and labels nothing.
-        if seconds > 0:
-            found[instance] = InService(kind, build, seconds)
+        (((kind, build), seconds),) = served.items()
+        found[instance] = InService(kind, build, seconds)
     return found
+
+
+def _covered(taken: Sequence[float], start: float, end: float) -> float:
+    """The seconds from `start` to `end` within a scrape either side of a time of `taken`: their
+    union, inside the window."""
+    seconds, covered = 0.0, start
+    for at in sorted(set(taken)):
+        low, high = max(covered, at - SCRAPE_SECONDS), min(end, at + SCRAPE_SECONDS)
+        if high > low:
+            seconds, covered = seconds + high - low, high
+    return seconds
 
 
 def build_of(in_service: Mapping[str, InService]) -> str:
@@ -491,14 +493,23 @@ def queries(pool: str, engine: str, window_seconds: float, counted_seconds: floa
     return {key: one.query for key, one in reads(pool, engine, window_seconds, counted_seconds).items()}
 
 
+def _identity(one: common.Series) -> frozenset[tuple[str, str]]:
+    return frozenset(one.labels.items())
+
+
 def counted_of(
-    increases: Sequence[common.Series], raw: Sequence[common.Series], start: float
+    increases: Sequence[common.Series], raw: Sequence[common.Series], at_start: Sequence[common.Series]
 ) -> dict[tuple[str, str], float]:
     """Each instance's increase, by bucket (`le`, empty for none): the anchored increases, plus, for
-    each series of `raw` born after `start`, its first sample. Such a series began at zero with its
-    engine, and with nothing at or before the range's start to anchor on, its increase is taken from
-    its first sample, which would leave out what the engine counted before it was first scraped."""
+    each series of `raw` (read over the window) that `at_start` (the same selector read at the
+    window's start) does not hold, its first value. Such a series had no sample at or before the
+    start: it began at zero with its engine, and with nothing to anchor on, its increase is taken
+    from its first sample, which would leave out what the engine counted before it was first
+    scraped. A series `at_start` holds is anchored on the value it held then, which is counted once.
+    The answers carry the times they were evaluated at, not the times of the samples, so whether a
+    series was there at the start is read at the start, never from the time of its first point."""
     totals: dict[tuple[str, str], float] = {}
+    there = {_identity(one) for one in at_start if one.samples}
 
     def add(one: common.Series, value: float) -> None:
         where = (one.labels.get("instance", ""), one.labels.get("le", ""))
@@ -509,10 +520,8 @@ def counted_of(
         if one.samples:
             add(one, one.samples[-1][1])
     for one in raw:
-        if one.samples:
-            first_at, first = min(one.samples)
-            if first_at > start:
-                add(one, first)
+        if one.samples and _identity(one) not in there:
+            add(one, min(one.samples)[1])
     return totals
 
 
@@ -804,8 +813,9 @@ class Job:
                 answers[key] = [one(instance, end, summary(values)) for instance, values in points.items()]
             else:
                 step = read_at[after]
-                born = read(how.raw, grid_before(start, after, step), after, step)
-                counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), born, start)
+                raw = read(how.raw, grid_before(start, after, step), after, step)
+                there = read(how.raw, start, start, step)
+                counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), raw, there)
                 if how.how is How.SUM:
                     answers[key] = [one(instance, after, value, le) for (instance, le), value in counted.items()]
                     continue
