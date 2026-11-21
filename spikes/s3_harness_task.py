@@ -68,10 +68,12 @@ own output that it compacted (an event `compact_boundary`), and gives every turn
 as an `assistant` event: the session completed its next turn when the first such event after the
 compaction is no error, and the session went on after it or did not end in an error. The line also
 holds what shows whether the window was reached at all: the window Claude Code reported, the
-largest input it reported, the turns the gateway or the engine refused, and among them those
-refused as a body too long once the session had grown (`window_refusals_of`). When it neither
+largest input it reported, the turns of its main loop the gateway or the engine refused (a token
+count or a side query is in the per-request lines, not here), and among them those refused with a
+cause that names a length once the session had grown (`window_refusals_of`). When it neither
 compacted nor had such a turn refused, the window was not shown to be reached: a refusal of another
 kind, a budget's on the first request among them, shows nothing of the window. The gateway answers
+`request_refused` for a body above its limits and for any other body its filter refuses, and
 `engine_error` both for an engine that refused a prompt too long and for one it lost, so a grown
 turn refused so is counted apart (`undetermined_refusals`), with the status of every refused turn.
 
@@ -238,24 +240,20 @@ KNOWN_CAUSES = frozenset(
         "server_error",
     }
 )
-LENGTH_CAUSES = frozenset(
-    {
-        # The gateway's: a body over the pool's limits.
-        Cause.REQUEST_REFUSED.value,
-        # The formats' own, should the engine's error pass through.
-        "invalid_request_error",
-        "request_too_large",
-        "BadRequestError",
-        "context_length_exceeded",
-    }
+# The causes that name a length and nothing else, should the engine's error pass through.
+LENGTH_CAUSES = frozenset({"request_too_large", "context_length_exceeded"})
+# The status such a refusal comes with when it names no cause.
+LENGTH_STATUSES = frozenset({413})
+# A refusal whose cause a length may explain, among other things, so that it leaves undetermined
+# whether the window was reached: the gateway answers `request_refused` (400) for a body above its
+# limits and for every other body its filter refuses (a media reference that is not inline data, a
+# field outside its allow-list); `engine_error` (502) both for an engine that refused a prompt
+# longer than its context and for an engine it lost the connection to; and the formats' own
+# validation errors name no more than a request that was not valid.
+UNDETERMINED_CAUSES = frozenset(
+    {Cause.REQUEST_REFUSED.value, Cause.ENGINE_ERROR.value, "invalid_request_error", "BadRequestError"}
 )
-# The statuses such a refusal comes with when it names no cause.
-LENGTH_STATUSES = frozenset({400, 413})
-# A refusal whose cause no length decides: the gateway answers `engine_error` (502) both for an
-# engine that refused a prompt longer than its context and for an engine it lost the connection to,
-# so such a refusal of a grown turn leaves undetermined whether the window was reached.
-UNDETERMINED_CAUSES = frozenset({Cause.ENGINE_ERROR.value})
-UNDETERMINED_STATUSES = frozenset({502})
+UNDETERMINED_STATUSES = frozenset({400, 502})
 MESSAGES_ROUTE = "/v1/messages"
 # The Messages routes a recorded session replays: the turns and the token counts.
 REPLAYED_ROUTES = (MESSAGES_ROUTE, "/v1/messages/count_tokens")
@@ -709,7 +707,7 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         after = next_turn_completed(events[index + 1 :])
     trigger = metadata.get("trigger")
     answer = session.result().get("result")
-    refused = [one for one in session.exchanges if s2.refused(one) and bool((one.json() or {}).get("tools"))]
+    refused = [one for one in session.exchanges if main_turn(one) and s2.refused(one)]
     window_refusals = len(window_refusals_of(session))
     undetermined = len(window_refusals_of(session, _refused_undetermined))
     return {
@@ -725,11 +723,12 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         "refused_turns": len(refused),
         "refused_turn_statuses": [one.status for one in refused],
         "window_refusals": window_refusals,
-        # Grown turns refused with a cause that may be the window or a failure of the engine.
+        # Grown turns refused with a cause that may be the window or something else: a body the
+        # gateway's filter refused, a request the engine found invalid, a failure of the engine.
         "undetermined_refusals": undetermined,
-        # Whether the session met its window: it compacted, or a turn was refused as a body too long
-        # once the session had grown. A refusal of another kind (a budget, a limit, a cold pool, an
-        # engine error that may be a lost connection) shows neither.
+        # Whether the session met its window: it compacted, or a turn was refused with a cause that
+        # names a length once the session had grown. A refusal of another kind (a budget, a limit, a
+        # cold pool, a generic refusal that may be a validation error or a lost engine) shows neither.
         "window_exercised": boundary is not None or window_refusals > 0,
     }
 
@@ -743,13 +742,19 @@ def window_refusals_of(
     a cold pool, an engine error), is not one."""
     found, largest = [], None
     for one in session.exchanges:
-        if one.route != MESSAGES_ROUTE or not (one.json() or {}).get("tools"):
+        if not main_turn(one):
             continue
         if not s2.refused(one):
             largest = max(largest or 0, len(one.body))
         elif largest is not None and len(one.body) > largest and (kind or _refused_as_too_long)(one):
             found.append(one)
     return found
+
+
+def main_turn(exchange: s2.Exchange) -> bool:
+    """Whether a request is a turn of the main loop: a Messages request that declares tools, never
+    a token count or a side query."""
+    return exchange.route == MESSAGES_ROUTE and bool((exchange.json() or {}).get("tools"))
 
 
 def _refused_as_too_long(exchange: s2.Exchange) -> bool:

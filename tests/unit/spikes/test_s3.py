@@ -409,9 +409,12 @@ def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
         ([exchange("/v1/messages", short, 1.0, 402, cause="budget_reached")], False),
         # A grown turn refused for a budget or a limit: still none.
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 429, cause="concurrency_limit")], False),
-        # A grown turn refused as a body the pool could not take.
-        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="request_refused")], True),
-        # A grown turn the gateway answered `engine_error`, as it does for a lost connection: undetermined.
+        # A grown turn refused with a cause that names a length.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="context_length_exceeded")], True),
+        # A grown turn the gateway's filter refused, as it does for a body over its limits and for an
+        # image that is not inline data; one the gateway answered `engine_error`, as it does for a lost
+        # connection: undetermined.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="request_refused")], False),
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502, cause="engine_error")], False),
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502)], False),
     ]  # fmt: skip
@@ -419,7 +422,16 @@ def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
         row = s3.compaction_of(claude_session(s3.Step.COMPACTION, [], exchanges), "rhiabc123")
         assert (row["window_exercised"], row["compacted"]) == (exercised, False)
         assert (row["refused_turns"], row["refused_turn_statuses"]) == (1, [exchanges[-1].status])
-        assert row["undetermined_refusals"] == (exchanges[-1].status == 502)
+        assert row["undetermined_refusals"] == (exchanges[-1].status in (400, 502) and not exercised)
+
+
+def test_a_refused_token_count_is_no_refused_turn() -> None:
+    body = {"tools": [{"name": "Read"}], "messages": [{"role": "user", "content": "Read the file."}]}
+    count = exchange("/v1/messages/count_tokens", body, 2.0, 429, cause="concurrency_limit")
+    run = claude_session(s3.Step.COMPACTION, [], [exchange("/v1/messages", body, 1.0, completed=True), count])
+    row = s3.compaction_of(run, "rhiabc123")
+    assert (row["refused_turns"], row["refused_turn_statuses"]) == (0, [])
+    assert [line["route"] for line in s3.refusals_of(run)] == ["/v1/messages/count_tokens"]
 
 
 def test_the_recorded_session_keeps_the_token_counts_in_order() -> None:
