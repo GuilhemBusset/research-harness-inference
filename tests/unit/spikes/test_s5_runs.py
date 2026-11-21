@@ -397,3 +397,41 @@ def test_a_warm_instance_is_not_charged_while_stopped_between_two_periods_of_ser
     assert in_service["worker"].seconds == 120.0
     cost = s5.cost_per_million(in_service, {"g7e.2xlarge": 3.36}, 500)
     assert cost == pytest.approx(3.36 * 120 / 3600 / 500 * 1_000_000)
+
+
+def test_a_counter_first_scraped_just_before_the_run_is_its_baseline() -> None:
+    # The worker's first scrape, at 1000, is a quarter second before the run starts: what its
+    # counter held then is the baseline, not output of the run, which generates 500 tokens.
+    labels = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    at = (1000.0, 1015.0, 1030.0, 1045.0)
+    scraped = Scraped(
+        ("rhi_lifecycle_release_info", labels, dict.fromkeys(at, 1.0)),
+        ("vllm:generation_tokens_total", labels, dict(zip(at, (100.0, 600.0, 600.0, 600.0), strict=True))),
+    )
+    clock = Clock()
+    clock.now = 1000.25
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        clock.now = 1030.75
+        return [record(True, 1.0)]
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=30, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=scraped, replay=replay, wall=clock, sleep=lambda _: None,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert run.instances["worker"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
+
+
+def test_a_release_reported_only_after_the_run_does_not_label_it() -> None:
+    # The worker serves build A throughout; its first sample of build B is a whole scrape after the
+    # run's end.
+    serving = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build-a"}
+    series = [
+        common.Series(serving, ((1000.0, 1000.0), (1015.0, 1015.0), (1030.0, 1030.0))),
+        common.Series({**serving, "model_revision": "build-b"}, ((1045.0, 1045.0),)),
+    ]
+    in_service = s5.in_service_of(series, 1000.0, 1030.0)
+    assert s5.build_of(in_service) == "build-a"
+    assert in_service["worker"].seconds == 30.0
