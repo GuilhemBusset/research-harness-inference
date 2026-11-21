@@ -40,7 +40,8 @@ deployment and needs no import path:
   and what the tests print reaches the build's log with `[canary key]` in place of the key and of
   any piece of it. When the decision's file names a pool, it then runs the same smoke tests once
   more with `RHI_SMOKE_POOL` naming that pool, `gpu-release-served` among them, which the mock
-  pool's run leaves out.
+  pool's run leaves out, and `release-heartbeat`, which compares the release the pool's instances
+  write in their heartbeat rows with the deployed one.
 
 The rule for model weights (system design, section 4.4), which the job that copies each pool's
 model into the model bucket follows:

@@ -27,7 +27,8 @@ which waits for the instance refresh a GPU pool's release started and leaves, in
 this execution deployed a GPU pool's release, nothing otherwise. After the run on the mock pool,
 the script runs the same smoke tests once more for each pool of that file, with `RHI_SMOKE_POOL`
 naming it: the first stream's wake and hold, the streams of each format, the pool's metrics and
-the release its lifecycle agents report, `gpu-release-served` among them. Every run is made, and
+the release its lifecycle agents report as a metric and in their heartbeat rows,
+`gpu-release-served` and `release-heartbeat` among them. Every run is made, and
 the script's exit is that of the first that failed. With the variable set and no file, the
 decision did not run, and the script fails before any test.
 
