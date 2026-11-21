@@ -162,3 +162,42 @@ def test_the_kind_is_the_run_label_and_20_starts_are_the_default() -> None:
         s1.kind_of({"RHI_S1_KIND": "warm", "RHI_RUN_LABEL": "cold"})
     with pytest.raises(ValueError, match="kind of start"):
         s1.kind_of({})
+
+
+def test_a_promotion_abandoned_in_its_image_stage_fails_there_and_is_no_evidence_of_the_image() -> None:
+    stopped = launch(served=False, reached="image")
+    numbers = s1.numbers_of([s1.Start(None, (stopped,)), *warm_starts([200.0] * 2)], s1.Kind.WARM)
+    assert numbers[s1.Number.STARTS_FAILED] == numbers[s1.Number.STARTS_FAILED_IMAGE] == 1
+    assert numbers[s1.Number.WARM_STARTS_IMAGE_ZERO] == 2
+
+
+def test_a_cold_run_carries_the_verdict_of_the_records_warm_runs_whatever_its_starts(tmp_path) -> None:
+    front = 'id = "S1"\npass_condition = "Warm start under 5 min at the 90th percentile over 20 starts"\n'
+    warm = '[[runs]]\nrun = "warm-3"\ndate = 2026-01-15\ncommit = "' + "a" * 40 + '"\nverdict = "pass"\n'
+    pending, passed = tmp_path / "pending.md", tmp_path / "passed.md"
+    pending.write_text(f'+++\n{front}verdict = "pending"\n+++\n', encoding="utf-8")
+    passed.write_text(f'+++\n{front}verdict = "pass"\n\n{warm}+++\n', encoding="utf-8")
+    # Three starts, one of them failed: the cold run's count judges nothing.
+    cold = [s1.Start(600.0, (launch("cold-launch"),), launch("cold-launch"))] * 2
+    numbers = s1.numbers_of(
+        [*cold, s1.Start(None, (launch("cold-launch", served=False, reached="boot"),))], s1.Kind.COLD
+    )
+    assert numbers[s1.Number.STARTS_FAILED_BOOT] == 1
+    assert replace(s1.SPIKES[s1.Kind.COLD], record=pending).verdict(numbers) is Verdict.NOT_MEASURED
+    assert replace(s1.SPIKES[s1.Kind.COLD], record=passed).verdict(numbers) is Verdict.PASS
+
+
+def test_a_start_not_ready_in_time_reads_only_the_stages_sampled_by_the_deadline() -> None:
+    wall = [WAKE]
+
+    def sleep(seconds: float) -> None:
+        wall[0] += seconds
+
+    read: list[tuple[float, float]] = []
+    stopped = launch(served=False, reached="weights")
+    pool = SimpleNamespace(quiet=lambda _now: True, launches=lambda woke, now: read.append((woke, now)) or [stopped])
+    run = s1.Run(Gateway(wall, ready_after=10**6), pool, 1, s1.Kind.WARM, wall=lambda: wall[0], sleep=sleep, log=print)
+    start = run.start()
+    assert read == [(WAKE, WAKE + s1.READY_WAIT_SECONDS)]
+    assert wall[0] > WAKE + s1.READY_WAIT_SECONDS
+    assert s1.outcome(start, s1.Kind.WARM) == (s1.Outcome.FAILED, "weights")
