@@ -11,8 +11,10 @@ pre-warm for sessions.
 **One run is one kind of start**, the kind the job is given (`RHI_S1_KIND`): `warm`, a promotion of
 a stopped instance from the warm pool, on the pool as configured; or `cold`, a launch straight into
 service, on the pool the owner deployed with `warm_instances` 0 for the run. The job never changes
-the configuration. The kind is the run's label: each kind is posted as its own run,
-`measure/S1/warm/<part>` and `measure/S1/cold/<part>`.
+the configuration. The kind labels the run, with CodeBuild's build number after it (`label_of`):
+each build is posted as its own run, `measure/S1/warm-<build>/<part>` or
+`measure/S1/cold-<build>/<part>`, so that a second build on one commit, which may post its numbers
+in fewer parts, never leaves a part of the first behind.
 
 **What it does**, through the gateway only, as a canary student (`common.canary_keys`), reading the
 pool only from the workspace. It never sets a group's capacity: the wake goes to the gateway, the
@@ -24,7 +26,9 @@ For each of the starts it is given, 20 unless told otherwise:
 2. **The wake.** It notes the time and sends `POST /wake` for the pool, and repeats it every minute
    while the pool is not ready, as a student's `rhi wait` does: an explicit wake counts as demand
    for 10 minutes only (section 5.3). It reads the status every `POLL_SECONDS` until the pool is
-   `ready`, or until `READY_WAIT_SECONDS` have passed. A status of `unavailable` for
+   `ready`, or until `READY_WAIT_SECONDS` have passed; then it waits `LATE_SECONDS` more before it
+   reads the launches, for the samples taken before the deadline to reach the workspace. A status
+   of `unavailable` for
    `capacity_unavailable` on the way, the scaler's evidence that a launch found no capacity, is
    noted. **The whole start** is the seconds from the wake to `ready`: a healthy target behind the
    gateway, the end of section 5.3's wait. It holds what no stage does, the time before the kernel
@@ -44,27 +48,31 @@ For each of the starts it is given, 20 unless told otherwise:
    the start that did not reach service failed: it was abandoned, or Auto Scaling did not take its
    completion.
 
-**Which starts count** (`outcome`). A start whose pool was not ready in time failed. So did one in
-which a launch of the run's kind failed, or the gateway reported `capacity_unavailable`, even when a
-replacement then served: the replacement's timing is not this kind's start. A failed start is
-counted by why, the last stage, in launch order, the failed launch reached (`last_stage`); with no
-stage series, `capacity` when the gateway said so and `unknown` otherwise. Any other start counts
-when the launch that became ready settled as the run's kind (`promotion` for a warm run,
-`cold-launch` for a cold one), and is otherwise logged and not counted: a cold launch in a warm run
-(no warm instance, or one whose disk had lost the image) is not a warm start.
+**Which starts count** (`outcome`). A start failed when a launch of the run's kind (`promotion`
+for a warm run, `cold-launch` for a cold one) failed, or the gateway reported
+`capacity_unavailable`, even when a replacement then served: the replacement's timing is not this
+kind's start. It failed too when the pool was not ready in time and a launch of the run's kind, or
+none at all, was seen. A failed start is counted by why, the last stage, in launch order, its
+launch of the run's kind reached (`last_stage`), served or not; with no stage series, `capacity`
+when the gateway said so and `unknown` otherwise. A start whose launches are all of the other kind
+is logged and not counted, and is in no number but the starts run, whether it served or not: a
+cold launch in a warm run (no warm instance, or one whose disk had lost the image) is not a warm
+start. Any other start counts when the launch that became ready settled as the run's kind.
 
 **The numbers** (`Number`), posted with the verdict through `common.run_spike`: each stage and the
 whole start at the median and the 90th percentile, over the counted starts; `starts_run`,
 `starts_counted` and `starts_failed`, with `starts_failed_<reason>` for each reason; and
-`warm_starts_image_zero`, the starts whose launch the agent settled as a promotion: the host held
-the engine image after the stop and start, so the image stage pulled nothing and only read the
-metadata and asked the host. Each start's outcome, transition, instance type and seconds are
+`warm_starts_image_zero`, in a warm run only, the starts of its kind with a promotion that passed
+its image stage (`image_held`): the host held the engine image after the stop and start, so the
+image stage pulled nothing and only read the metadata and asked the host. Each start's outcome, transition, instance type and seconds are
 printed, and the instance types of the counted starts, for the record's labels.
 
 **The verdict** (`StartSpike`). Fewer than 20 counted starts give none. A warm run passes when its
 whole start's 90th percentile is under 300 seconds. The condition judges warm starts only: a cold
-run with its 20 starts passes, so that the record's verdict is the warm run's, and its numbers
-reach the record as the warm run's do.
+run with its 20 starts carries the verdict the warm runs of the record `docs/measurements/s1.md`
+give at the commit it runs from (`ColdSpike`, `warm_verdict`), so that the record's verdict is the
+warm runs' and the cold run's numbers reach it as theirs do. With no warm run recorded there, it
+has none, and cold numbers alone never make the record pass: record the warm run first.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s1_cold_start`):
 
@@ -76,7 +84,8 @@ reach the record as the warm run's do.
 | `RHI_S1_STARTS` | The starts to make, 20 unless given |
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
 
-`RHI_RUN_LABEL`, if given, must be the kind. The region comes from CodeBuild's `AWS_REGION`. Run it
+`RHI_RUN_LABEL`, if given, must be the kind. The region comes from CodeBuild's `AWS_REGION`, the
+build number from `CODEBUILD_BUILD_NUMBER`. Run it
 while nothing else sends to the pool: the pool has to go cold between starts.
 """
 
@@ -84,8 +93,10 @@ from __future__ import annotations
 
 import os
 import time
+import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -105,6 +116,10 @@ MEASUREMENT = "S1"
 KIND_VARIABLE = "RHI_S1_KIND"
 STARTS_VARIABLE = "RHI_S1_STARTS"
 DEFAULT_STARTS = 20
+BUILD_NUMBER_VARIABLE = "CODEBUILD_BUILD_NUMBER"
+# The record, at the commit the job runs from: a cold run reads the verdict of its warm runs.
+RECORD = Path(__file__).resolve().parents[1] / "docs" / "measurements" / "s1.md"
+FENCE = "+++"
 
 READY, COLD, CAPACITY_UNAVAILABLE = "ready", "cold", "capacity_unavailable"
 # The pass condition (section 12): the whole warm start under this many seconds at the 90th
@@ -118,6 +133,9 @@ POLL_SECONDS = 5
 WAKE_EVERY_SECONDS = 60
 # Seconds. A cold launch may pull the image for 7 minutes; the hook's own timeout is 15 (section 17).
 READY_WAIT_SECONDS = 40 * 60
+# Seconds. How long after the deadline a stage sample taken before it may take to reach the
+# workspace: the collector scrapes every 15 seconds and writes after.
+LATE_SECONDS = 2 * 60
 
 # The stages of a launch into service, in the order a launch goes through them.
 STAGES = (
@@ -310,17 +328,24 @@ class Outcome(StrEnum):
 
 def outcome(start: Start, kind: Kind) -> tuple[Outcome, str | None]:
     """Whether a start counts for a run of `kind`, failed (with its reason, one of `REASONS`), or is
-    of another kind and is not counted."""
+    of another kind and is not counted. A start whose launches are all of the other kind is of
+    another kind, whether or not the pool was ready in time: it is a wake, and nothing else, of the
+    run."""
     transition = TRANSITION[kind]
-    failed = start.failed
-    of_kind = [launch for launch in failed if launch.transition == transition]
+    abandoned = [launch for launch in start.failed if launch.transition == transition]
+    if abandoned:
+        return Outcome.FAILED, abandoned[-1].last_stage
     if start.seconds is None:
-        reached = of_kind or failed
-        if reached:
-            return Outcome.FAILED, reached[-1].last_stage
-        return Outcome.FAILED, CAPACITY if start.capacity else UNKNOWN
-    if of_kind:
-        return Outcome.FAILED, of_kind[-1].last_stage
+        # Not ready in time: a launch of the run's kind stopped where it was last seen, served or not
+        # (Auto Scaling may have taken its hook, and the gateway still not seen it healthy).
+        of_kind = sorted(
+            (launch for launch in start.launches if launch.transition == transition), key=lambda one: one.first_seen
+        )
+        if of_kind:
+            return Outcome.FAILED, of_kind[-1].last_stage
+        if start.capacity:
+            return Outcome.FAILED, CAPACITY
+        return (Outcome.OTHER, None) if start.launches else (Outcome.FAILED, UNKNOWN)
     if start.capacity:
         return Outcome.FAILED, CAPACITY
     if start.ready is None or start.ready.transition != transition:
@@ -328,9 +353,19 @@ def outcome(start: Start, kind: Kind) -> tuple[Outcome, str | None]:
     return Outcome.COUNTED, None
 
 
+def image_held(start: Start) -> bool:
+    """Whether a promotion of the start passed its image stage: the host held the engine image after
+    the stop and start, so the agent kept the launch a promotion."""
+    return any(
+        launch.transition == Transition.PROMOTION.value and Stage.IMAGE.value in launch.sampled
+        for launch in start.launches
+    )
+
+
 def numbers_of(starts: Sequence[Start], kind: Kind) -> dict[str, int | float]:
     """The numbers of a run of `kind` that made `starts`. A stage no counted start has a value for
-    has no number."""
+    has no number, and a cold run has no warm start whose image stage was zero. A start of the other
+    kind is one of the starts run, and in no other number."""
     outcomes = [outcome(start, kind) for start in starts]
     counted = [start for start, (result, _) in zip(starts, outcomes, strict=True) if result is Outcome.COUNTED]
     reasons = [reason for result, reason in outcomes if result is Outcome.FAILED]
@@ -339,10 +374,12 @@ def numbers_of(starts: Sequence[Start], kind: Kind) -> dict[str, int | float]:
         Number.STARTS_COUNTED: len(counted),
         Number.STARTS_FAILED: len(reasons),
         **{failed_number(reason): reasons.count(reason) for reason in REASONS},
-        Number.WARM_STARTS_IMAGE_ZERO: sum(
-            start.ready is not None and start.ready.transition == Transition.PROMOTION.value for start in starts
-        ),
     }
+    if kind is Kind.WARM:
+        numbers[Number.WARM_STARTS_IMAGE_ZERO] = sum(
+            result is not Outcome.OTHER and image_held(start)
+            for start, (result, _) in zip(starts, outcomes, strict=True)
+        )
     samples: dict[str, list[float]] = {"start": [start.seconds for start in counted if start.seconds is not None]}
     for stage in STAGES:
         samples[stage.value] = [
@@ -363,9 +400,26 @@ def passes_warm(numbers: common.Numbers) -> bool:
     return numbers[Number.START_SECONDS_P90] < PASS_SECONDS
 
 
-def measured(numbers: common.Numbers) -> bool:
-    """A cold run's condition: the spike's condition judges warm starts only."""
-    return True
+def is_warm_label(label: object) -> bool:
+    """Whether a run label is a warm run's (`label_of`)."""
+    return isinstance(label, str) and (label == Kind.WARM.value or label.startswith(f"{Kind.WARM.value}-"))
+
+
+def warm_verdict(record: Path = RECORD) -> Verdict:
+    """The verdict the warm runs of the record give, by the record's rule (docs/measurements/README.md):
+    fail when one failed; otherwise none (not measured) when one is pending or there is none;
+    otherwise pass. A record that cannot be read gives none."""
+    try:
+        lines = record.read_text(encoding="utf-8").splitlines()
+        runs = tomllib.loads("\n".join(lines[1 : lines.index(FENCE, 1)])).get("runs", [])
+        verdicts = [run.get("verdict") for run in runs if is_warm_label(run.get("run"))]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return Verdict.NOT_MEASURED
+    if "fail" in verdicts:
+        return Verdict.FAIL
+    if not verdicts or any(verdict != "pass" for verdict in verdicts):
+        return Verdict.NOT_MEASURED
+    return Verdict.PASS
 
 
 @dataclass(frozen=True)
@@ -378,9 +432,23 @@ class StartSpike(common.Spike):
         return super().verdict(numbers)
 
 
-SPIKES = {
+@dataclass(frozen=True)
+class ColdSpike(StartSpike):
+    """A cold run. The condition judges warm starts only, so a cold run with its counted starts
+    carries the verdict the record's warm runs give at the commit it runs from (`warm_verdict`):
+    with no warm run recorded yet it has none, and cannot make the record pass."""
+
+    record: Path = RECORD
+
+    def verdict(self, numbers: common.Numbers) -> Verdict:
+        if super().verdict(numbers) is Verdict.NOT_MEASURED:
+            return Verdict.NOT_MEASURED
+        return warm_verdict(self.record)
+
+
+SPIKES: dict[Kind, StartSpike] = {
     Kind.WARM: StartSpike(MEASUREMENT, Number, passes_warm),
-    Kind.COLD: StartSpike(MEASUREMENT, Number, measured),
+    Kind.COLD: ColdSpike(MEASUREMENT, Number, lambda _numbers: True),
 }
 
 
@@ -470,6 +538,8 @@ class Run:
                 self.gateway.wake()
             self.sleep(POLL_SECONDS)
         if state != READY:
+            # A sample taken before the deadline reaches the workspace up to `LATE_SECONDS` after it.
+            self.sleep(LATE_SECONDS)
             return Start(None, tuple(self.pool.launches(woke_at, self.wall())), capacity=capacity)
         ready_at = self.wall()
         while True:
@@ -525,6 +595,15 @@ def kind_of(environ: Mapping[str, str]) -> Kind:
     return kind
 
 
+def label_of(kind: Kind, environ: Mapping[str, str]) -> str:
+    """The run's label: the kind, and CodeBuild's number of the build after a hyphen (`warm-7`).
+    A status replaces the one of its context, so a second build on one commit, which may post its
+    numbers in fewer parts, never leaves a part of the first behind it. Without a build number,
+    the kind alone."""
+    build = environ.get(BUILD_NUMBER_VARIABLE, "")
+    return f"{kind.value}-{build}" if build.isdigit() else kind.value
+
+
 def starts_of(environ: Mapping[str, str]) -> int:
     """The starts to make, `DEFAULT_STARTS` unless given. ValueError for a count that is not a whole
     number of one or more."""
@@ -552,7 +631,8 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
         print(f"pool {name}, {kind} starts, {starts} of them")
         return Run(gateway, Pool(name, workspace), starts, kind).measure()
 
-    return common.run_spike(SPIKES[kind], JOB, measure, environ={**environ, common.RUN_LABEL_VARIABLE: kind.value})
+    label = label_of(kind, environ)
+    return common.run_spike(SPIKES[kind], JOB, measure, environ={**environ, common.RUN_LABEL_VARIABLE: label})
 
 
 if __name__ == "__main__":
