@@ -70,12 +70,13 @@ compaction is no error, and the session went on after it or did not end in an er
 holds what shows whether the window was reached at all: the window Claude Code reported, the
 largest input it reported, the turns of its main loop the gateway or the engine refused (a token
 count or a side query is in the per-request lines, not here), and among them those refused with a
-cause that names a length once the session had grown (`window_refusals_of`). When it neither
-compacted nor had such a turn refused, the window was not shown to be reached: a refusal of another
-kind, a budget's on the first request among them, shows nothing of the window. The gateway answers
-`request_refused` for a body above its limits and for any other body its filter refuses, and
-`engine_error` both for an engine that refused a prompt too long and for one it lost, so a grown
-turn refused so is counted apart (`undetermined_refusals`), with the status of every refused turn.
+cause that names the model's context once the session had grown (`window_refusals_of`). When it
+neither compacted nor had such a turn refused, the window was not shown to be reached: a refusal of
+another kind, a budget's on the first request among them, shows nothing of the window. The gateway
+answers `request_refused` for a body above its limits and for any other body its filter refuses,
+`engine_error` both for an engine that refused a prompt too long and for one it lost, and a body
+too large (413) counts bytes, not tokens, so a grown turn refused so is counted apart
+(`undetermined_refusals`), with the status of every refused turn.
 
 **The replay.** The Claude Code session of the task, every request the forwarder saw answered,
 side queries and token counts included, with the pauses between them, is replayed through the gateway with the load
@@ -240,20 +241,26 @@ KNOWN_CAUSES = frozenset(
         "server_error",
     }
 )
-# The causes that name a length and nothing else, should the engine's error pass through.
-LENGTH_CAUSES = frozenset({"request_too_large", "context_length_exceeded"})
-# The status such a refusal comes with when it names no cause.
-LENGTH_STATUSES = frozenset({413})
+# The causes that name the model's context and nothing else, should the engine's error pass through.
+LENGTH_CAUSES = frozenset({"context_length_exceeded"})
 # A refusal whose cause a length may explain, among other things, so that it leaves undetermined
 # whether the window was reached: the gateway answers `request_refused` (400) for a body above its
 # limits and for every other body its filter refuses (a media reference that is not inline data, a
 # field outside its allow-list); `engine_error` (502) both for an engine that refused a prompt
-# longer than its context and for an engine it lost the connection to; and the formats' own
-# validation errors name no more than a request that was not valid.
+# longer than its context and for an engine it lost the connection to; the formats' own validation
+# errors name no more than a request that was not valid; and a body too large to take (413, or
+# `request_too_large`) counts bytes on the wire, which an image or a field can fill as well as
+# tokens can.
 UNDETERMINED_CAUSES = frozenset(
-    {Cause.REQUEST_REFUSED.value, Cause.ENGINE_ERROR.value, "invalid_request_error", "BadRequestError"}
+    {
+        Cause.REQUEST_REFUSED.value,
+        Cause.ENGINE_ERROR.value,
+        "invalid_request_error",
+        "BadRequestError",
+        "request_too_large",
+    }
 )
-UNDETERMINED_STATUSES = frozenset({400, 502})
+UNDETERMINED_STATUSES = frozenset({400, 413, 502})
 MESSAGES_ROUTE = "/v1/messages"
 # The Messages routes a recorded session replays: the turns and the token counts.
 REPLAYED_ROUTES = (MESSAGES_ROUTE, "/v1/messages/count_tokens")
@@ -736,7 +743,7 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
 def window_refusals_of(
     session: Session, kind: Callable[[s2.Exchange], bool] | None = None
 ) -> list[s2.Exchange]:
-    """The turns of the main loop refused as a body the pool could not take (or, given `kind`, refused
+    """The turns of the main loop refused as longer than the model's context (or, given `kind`, refused
     as it decides), each larger than every turn accepted before it: what a session refused at its
     window looks like. A refusal on the first turn, or of a kind no length causes (a budget, a limit,
     a cold pool, an engine error), is not one."""
@@ -758,9 +765,7 @@ def main_turn(exchange: s2.Exchange) -> bool:
 
 
 def _refused_as_too_long(exchange: s2.Exchange) -> bool:
-    if exchange.cause is not None:
-        return exchange.cause in LENGTH_CAUSES
-    return exchange.status in LENGTH_STATUSES
+    return exchange.cause in LENGTH_CAUSES
 
 
 def _refused_undetermined(exchange: s2.Exchange) -> bool:

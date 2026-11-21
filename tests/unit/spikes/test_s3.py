@@ -417,12 +417,15 @@ def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="request_refused")], False),
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502, cause="engine_error")], False),
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502)], False),
+        # A body over a size limit counts bytes, not the model's context: undetermined too.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 413)], False),
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 413, cause="request_too_large")], False),
     ]  # fmt: skip
     for exchanges, exercised in cases:
         row = s3.compaction_of(claude_session(s3.Step.COMPACTION, [], exchanges), "rhiabc123")
         assert (row["window_exercised"], row["compacted"]) == (exercised, False)
         assert (row["refused_turns"], row["refused_turn_statuses"]) == (1, [exchanges[-1].status])
-        assert row["undetermined_refusals"] == (exchanges[-1].status in (400, 502) and not exercised)
+        assert row["undetermined_refusals"] == (exchanges[-1].status in (400, 413, 502) and not exercised)
 
 
 def test_a_refused_token_count_is_no_refused_turn() -> None:
