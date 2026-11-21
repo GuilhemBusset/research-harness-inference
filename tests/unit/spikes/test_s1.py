@@ -201,3 +201,21 @@ def test_a_start_not_ready_in_time_reads_only_the_stages_sampled_by_the_deadline
     assert read == [(WAKE, WAKE + s1.READY_WAIT_SECONDS)]
     assert wall[0] > WAKE + s1.READY_WAIT_SECONDS
     assert s1.outcome(start, s1.Kind.WARM) == (s1.Outcome.FAILED, "weights")
+
+
+def test_a_pool_ready_only_after_the_deadline_is_a_failed_start() -> None:
+    wall = [WAKE]
+
+    def sleep(seconds: float) -> None:
+        # Each poll lands a little late, so an unclamped poll would straddle the deadline.
+        wall[0] += seconds + 0.01
+
+    stopped = launch(served=False, reached="weights")
+    pool = SimpleNamespace(
+        quiet=lambda _now: True,
+        launches=lambda _woke, now: [stopped if now <= WAKE + s1.READY_WAIT_SECONDS else launch()],
+    )
+    gateway = Gateway(wall, ready_after=s1.READY_WAIT_SECONDS + 1)
+    run = s1.Run(gateway, pool, 1, s1.Kind.WARM, wall=lambda: wall[0], sleep=sleep, log=lambda _: None)
+    numbers = run.measure()
+    assert (numbers[s1.Number.STARTS_COUNTED], numbers[s1.Number.STARTS_FAILED_WEIGHTS]) == (0, 1)
