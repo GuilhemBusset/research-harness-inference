@@ -33,8 +33,12 @@ scaler alone starts an instance (section 5.1). For each of the starts it is give
    instance was writing when the wake was sent, so these samples come from a launch that began
    after it. **The launch that became ready** is the one, an instance and a transition into service
    (a promotion from the warm pool, or a cold launch), that has both a weights and a hook sample
-   after the wake, whose instance was still scraped when the pool became ready (a sample taken no
-   more than `FRESH_SECONDS` before readiness), and whose instance reached service: it wrote
+   after the wake, whose weights stage was first sampled by readiness (no more than `FRESH_SECONDS`
+   after it, a scrape's delay: the weights load before the engine serves, so a launch first sampled
+   later, a replacement started after readiness, is not the one that became ready, and its samples
+   are not taken for that launch's even when they reach the workspace first), whose instance was
+   still scraped when the pool became ready (a sample taken no more than `FRESH_SECONDS` before
+   readiness), and whose instance reached service: it wrote
    `rhi_lifecycle_release_info` (`rhi_lifecycle.serving`) after the wake. The agent starts its
    serving duties, and so exposes that metric, only once Auto Scaling has taken the launch's
    `CONTINUE` (`rhi_lifecycle.__main__`), and its process starts afresh with every boot
@@ -60,7 +64,8 @@ start's seconds, instance transition and the setting are printed, for the record
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
 
 The canary key goes to the gateway over HTTPS only: an address of any other scheme is refused
-before anything is sent. `RHI_RUN_LABEL`, if given, must be the loader setting's name. The region comes from CodeBuild's
+before anything is sent, and the key is sent with no redirect the gateway answers.
+`RHI_RUN_LABEL`, if given, must be the loader setting's name. The region comes from CodeBuild's
 `AWS_REGION`. Run it while nothing else sends to the pool: the pool has to go cold between starts.
 """
 
@@ -168,13 +173,19 @@ def _launch_of(labels: Mapping[str, str]) -> tuple[str, str] | None:
 
 
 def weights_of_launch(
-    values: Sequence[common.Series], stamps: Sequence[common.Series], serving: Sequence[common.Series], ready_at: float
+    values: Sequence[common.Series],
+    stamps: Sequence[common.Series],
+    serving: Sequence[common.Series],
+    woke_at: float,
+    ready_at: float,
 ) -> Launch:
-    """The launch that became ready at `ready_at`, from the weights and hook stages of the pool
-    taken after the wake (`values`), the times the pool's stage samples were taken (`stamps`) and
-    the pool's release samples taken after the wake (`serving`): the one launch into service with a
-    weights and a hook sample, whose instance had a stage sample taken no more than `FRESH_SECONDS`
-    before readiness and has a release sample. NoLaunch when there is none, or more than one."""
+    """The launch that became ready at `ready_at` for the wake at `woke_at`, from the weights and
+    hook stages of the pool taken after the wake (`values`), the times the pool's stage samples were
+    taken (`stamps`) and the pool's release samples taken after the wake (`serving`): the one launch
+    into service with a weights and a hook sample, whose weights stage was first sampled after the
+    wake and no more than `FRESH_SECONDS` after readiness, whose instance had a stage sample taken no
+    more than `FRESH_SECONDS` before readiness, and which has a release sample. NoLaunch when there
+    is none, or more than one."""
     weights: dict[tuple[str, str], float] = {}
     completed: set[tuple[str, str]] = set()
     for one in values:
@@ -191,8 +202,20 @@ def weights_of_launch(
         if (launch := _launch_of(one.labels)) is not None
         and any(taken >= ready_at - FRESH_SECONDS for taken in one.values())
     }
+    # The weights load before the engine serves, so the launch that made the pool ready had loaded
+    # them by readiness, and the collector sampled them within a scrape: a launch whose weights were
+    # first sampled later (a replacement after readiness) is another one.
+    first_weights: dict[tuple[str, str], float] = {}
+    for one in stamps:
+        launch = _launch_of(one.labels)
+        if launch is None or one.labels.get("stage") != Stage.WEIGHTS.value:
+            continue
+        for taken in one.values():
+            if taken > woke_at:
+                first_weights[launch] = min(taken, first_weights.get(launch, taken))
+    loaded = {launch for launch, taken in first_weights.items() if taken <= ready_at + FRESH_SECONDS}
     in_service = {one.labels.get("instance", "") for one in serving if one.samples}
-    completed &= {launch for launch in running if launch[0] in in_service}
+    completed &= {launch for launch in running & loaded if launch[0] in in_service}
     ready = sorted(launch for launch in weights if launch in completed)
     if len(ready) != 1:
         raise NoLaunch(f"{len(ready)} launches into service reached service and ran at readiness, not one")
@@ -232,8 +255,11 @@ class Gateway:
         object.__setattr__(self, "endpoint", gateway_address(self.endpoint))
 
     def _ask(self, method: str, path: str, body: bytes | None = None) -> Any:
-        headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         request = urllib.request.Request(self.endpoint + path, data=body, headers=headers, method=method)
+        # Sent with this request only: urllib does not copy it onto a redirect, so the key never
+        # follows the gateway's answer to another address, of any scheme.
+        request.add_unredirected_header("Authorization", f"Bearer {self.key}")
         with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT) as answer:
             return json.loads(answer.read())
 
@@ -278,7 +304,7 @@ class Pool:
         # The release metric: written only by an instance whose launch Auto Scaling took into service.
         release = f'{RELEASE_METRIC}{{pool="{self.name}"}}'
         serving = self.workspace.read_series(f"{release} and timestamp({release}) > {woke_at:.3f}", **span)
-        return weights_of_launch(values, stamps, serving, ready_at)
+        return weights_of_launch(values, stamps, serving, woke_at, ready_at)
 
 
 class Run:
