@@ -19,14 +19,16 @@ each number of streams the job is given, then one at the class size it is given:
 - at the class size, every student of the class runs at once in the shape: hands-on, one session
   each, as many streams as students; several agents, two each, twice as many streams.
 
-Each student is a canary student of their own, with their own key (`common.canary_keys`), as the
-load generator sends them (`loadgen.replay`): a student's sessions share the student's key, cache
-salt and limits, as a real student's agents do, and every session is its own in the records.
+The students are the run's label. Every session is sent as a canary student of its own, with its
+own key (`common.canary_keys`), as the load generator sends them (`loadgen.replay`): its own cache
+salt and limits, and its own in the records. A run needs a key for each of its sessions, and the job
+refuses, before it sends anything, runs that need more keys than the spikes' secret holds.
 
 **One run** first wakes the pool through the gateway and waits until it is ready, so that a run
 measures a warm pool, never a cold start. It then replays its sessions (`loadgen.agent_session`, of
-section 4.7's sizes) for the duration it is given: no session sends a request once the duration
-has passed (`Until`), and the run ends when the requests in flight have. A session holds
+section 4.7's sizes) for the duration it is given: no session starts a pause that would end after
+the duration (`Until`), none sends a request once the duration has passed, however late a pause
+ends (`loadgen.Load.sending`), and the run ends when the requests in flight have. A session holds
 `TURNS_PER_SESSION` turns, which keeps its transcript inside the table's longest row; a session
 that ends before the duration is followed, once every session of its round has ended, by a new
 round of sessions, whose first turns are first turns again: new text, so nothing of it is cached.
@@ -48,13 +50,19 @@ names of the per-engine table (`rhi_common.engine_metrics`), as section 7.2 defi
 
 A quantity an engine's row leaves out (the mock's has none of the further ones) reads `None`, not
 zero, as does one with nothing to divide. Counters and histograms are increased per series before
-they are summed per instance: an instance's counters restart from zero with its engine.
+they are summed per instance: an instance's counters restart from zero with its engine. They are
+read one scrape after the run's end, over the run and that scrape, so that the tokens of the last
+answers, which the workspace sees only at the next scrape, are counted; nothing else is sent to the
+pool then. The gauges are read over the run alone. Rates are over the run's seconds.
 
 **What each instance's lifecycle agent reported**: the cache capacity in tokens the engine gave at
 start (`rhi_lifecycle.cache.METRIC`), and its release (`rhi_lifecycle.serving.RELEASE_METRIC`),
 which an instance writes only while in service: the build, its `model_revision`, and from the
-times of its samples, the seconds the instance was in service during the window. A pool whose
-instances report two builds in one window is refused: the run is no one build's.
+times of its samples, the seconds the instance was in service during the window. The samples are
+read to one scrape past the window's end, so that an instance in service at the end is seen there.
+An instance whose last sample is older than a scrape before the window, which the workspace still
+returns for some minutes, did not serve in it and is left out. A pool whose instances report two
+builds in one window is refused: the run is no one build's.
 
 **What the students got**, from the load generator's records (`experience_of`): the time to first
 token at the median and the 95th percentile, for later turns and for first turns apart; the speed
@@ -175,11 +183,12 @@ def plan(streams: Sequence[int], class_size: int) -> list[Planned]:
 
 
 def load_of(planned: Planned, model: str, seed: int) -> loadgen.Load:
-    """The sessions of one round of `planned`, for the pool `model` names, drawn from `seed` on."""
+    """The sessions of one round of `planned`, for the pool `model` names, drawn from `seed` on,
+    each sent as a canary student of its own."""
     if planned.shape is Shape.HANDS_ON:
         return loadgen.hands_on(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
     load = loadgen.several_agents(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
-    return loadgen.Load(load.sessions[: planned.streams], sessions_per_student=load.sessions_per_student)
+    return loadgen.Load(load.sessions[: planned.streams])
 
 
 @dataclass(frozen=True)
@@ -267,14 +276,15 @@ def release_query(pool: str) -> str:
 
 def in_service_of(release: Sequence[common.Series], start: float, end: float) -> dict[str, InService]:
     """Each instance's release from `start` to `end`, from the times of its release samples
-    (`release_query`): in service from its first sample, or the window's start, to a scrape after
-    its last, or the window's end. ValueError for an instance whose samples carry no instance type
-    or two releases."""
+    (`release_query`, read to a scrape past `end`): in service from its first sample, or the
+    window's start, to a scrape after its last, or the window's end. An instance with no sample
+    from a scrape before `start` to `end` did not serve in the window and is not in the answer.
+    ValueError for an instance whose samples carry no instance type or two releases."""
     times: dict[str, list[float]] = {}
     kinds: dict[str, set[tuple[str, str]]] = {}
     for one in release:
         instance = one.labels.get("instance", "")
-        if not instance or not one.samples:
+        if not instance or not any(start - SCRAPE_SECONDS < taken <= end for taken in one.values()):
             continue
         times.setdefault(instance, []).extend(one.values())
         kinds.setdefault(instance, set()).add(
@@ -348,16 +358,39 @@ def _selector(name: Name, suffix: str, pool: str) -> str:
     return f"{name}{suffix}{{{','.join(matchers)}}}"
 
 
-def queries(pool: str, engine: str, window_seconds: float) -> dict[Key, str]:
-    """The queries of the engine's quantities on the pool, over the window that ends where they are
-    evaluated, by the names of `engine`'s row; a further quantity the row leaves out has none."""
+# The queries of gauges and of the lifecycle agent's numbers: read over the run alone, at its end.
+GAUGES = frozenset(
+    {
+        Key.RUNNING_MEAN,
+        Key.RUNNING_PEAK,
+        Key.WAITING_MEAN,
+        Key.WAITING_PEAK,
+        Key.CACHE_USE_MEAN,
+        Key.CACHE_USE_PEAK,
+        Key.CACHE_CAPACITY,
+    }
+)
+
+
+def _range(seconds: float) -> str:
+    return f"{max(1, math.ceil(seconds))}s"
+
+
+def queries(
+    pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None
+) -> dict[Key, str]:
+    """The queries of the engine's quantities on the pool, by the names of `engine`'s row; a further
+    quantity the row leaves out has none. The gauges (`GAUGES`) are over the `window_seconds` that
+    end where they are evaluated, the counters and histograms over the `counted_seconds` that do,
+    the window unless given."""
     names, further = metric_names(engine), further_names(engine)
-    window = f"{max(1, math.ceil(window_seconds))}s"
+    window = _range(window_seconds)
+    counted = _range(window_seconds if counted_seconds is None else counted_seconds)
 
     def increase(name: Name, suffix: str = "", by: str = "instance") -> str:
         if not suffix:
             suffix = "_total" if name.kind is Kind.COUNTER else ""
-        return f"sum by ({by}) (increase({_selector(name, suffix, pool)}[{window}]))"
+        return f"sum by ({by}) (increase({_selector(name, suffix, pool)}[{counted}]))"
 
     def quantile(fraction: float, name: Name) -> str:
         return f"histogram_quantile({fraction}, {increase(name, '_bucket', 'instance, le')})"
@@ -565,8 +598,6 @@ class Job:
         if duration <= 0:
             raise ValueError("each run of spike S5 lasts some seconds")
         self.runs = plan(streams, class_size)
-        if max(run.students for run in self.runs) > len(keys):
-            raise ValueError("the runs need more canary students than there are keys")
         metric_names(engine)
         self.pool, self.engine, self.prices, self.lever = pool, engine, dict(prices), lever
         self.duration, self.keys, self.endpoint = duration, tuple(keys), endpoint
@@ -587,38 +618,56 @@ class Job:
                 woke = self.wall()
             self.sleep(POLL_SECONDS)
 
+    def _keyed(self, runs: Sequence[Planned]) -> None:
+        """ValueError for a run with more sessions than there are canary students' keys."""
+        if max(run.streams for run in runs) > len(self.keys):
+            raise ValueError("a run needs a canary student for each session, and there are fewer keys")
+
     def _replay(self, planned: Planned, deadline: float) -> list[loadgen.Record]:
         records: list[loadgen.Record] = []
-        while self.wall() < deadline:
+
+        def sending() -> bool:
+            return self.wall() < deadline
+
+        while sending():
             load = load_of(planned, self.pool, self._seed)
             self._seed += len(load.sessions)
             bounded = loadgen.Load(
-                tuple(Until(session, deadline, self.wall) for session in load.sessions), load.sessions_per_student
+                tuple(Until(session, deadline, self.wall) for session in load.sessions),
+                load.sessions_per_student,
+                sending,
             )
+            began = self.wall()
             round_records = asyncio.run(self._send(bounded))
-            if not round_records:
-                break
             records += round_records
+            # A round in which no time passed would be repeated, on a clock the requests do not
+            # move, for ever: it is the last.
+            if not round_records or self.wall() <= began:
+                break
         return records
 
     async def _send(self, load: loadgen.Load) -> list[loadgen.Record]:
         return await self.replay(load, self.keys, self.endpoint, at_once=len(load.sessions))
 
     def run(self, planned: Planned) -> Measured:
-        """One run: the pool ready, the sessions replayed for the duration, then what it measured."""
+        """One run: the pool ready, the sessions replayed for the duration, then what it measured.
+        ValueError, with nothing sent, for a run with more sessions than there are keys."""
+        self._keyed([planned])
         self._ready()
         start = self.wall()
         records = self._replay(planned, start + self.duration)
         end = self.wall()
         self.sleep(SETTLE_SECONDS)
         window = max(end - start, 1.0)
-        release = self.workspace.read_series(release_query(self.pool), start=start, end=end, step=SCRAPE_SECONDS)
+        # The scrape after the run's end holds what the run's last answers added.
+        after = end + SCRAPE_SECONDS
+        release = self.workspace.read_series(release_query(self.pool), start=start, end=after, step=SCRAPE_SECONDS)
         in_service = in_service_of(release, start, end)
         build = build_of(in_service)
-        answers = {
-            key: self.workspace.read_series(query, start=end, end=end, step=SCRAPE_SECONDS)
-            for key, query in queries(self.pool, self.engine, window).items()
-        }
+        answers = {}
+        for key, query in queries(self.pool, self.engine, window, after - start).items():
+            at = end if key in GAUGES else after
+            answers[key] = self.workspace.read_series(query, start=at, end=at, step=SCRAPE_SECONDS)
         engine = quantities_of(answers, window)
         experience = experience_of(records)
         instances = {
@@ -648,7 +697,9 @@ class Job:
         )
 
     def measure(self) -> list[Measured]:
-        """Every run, in the plan's order, each printed as one JSON line once measured."""
+        """Every run, in the plan's order, each printed as one JSON line once measured. ValueError,
+        with nothing sent, for runs with more sessions than there are keys."""
+        self._keyed(self.runs)
         measured = []
         for planned in self.runs:
             one = self.run(planned)
