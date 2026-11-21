@@ -33,7 +33,15 @@ the duration (`Until`), none sends a request once the duration has passed, howev
 ends (`loadgen.Load.sending`), and the run ends when the requests in flight have. A session holds
 `TURNS_PER_SESSION` turns, which keeps its transcript inside the table's longest row; a session
 that ends before the duration is followed, once every session of its round has ended, by a new
-round of sessions, whose first turns are first turns again: new text, so nothing of it is cached.
+round of sessions, whose first turns are first turns again: new text after the opening.
+
+**As Claude Code sends them** (`AsClaudeCode`). Every request carries the reasoning Claude Code
+asks for by default, adaptive thinking at the effort `high`, so the pool's `reasoning_effort`
+mapping decides what the engine is asked for, and the lever that maps it lower changes it. Every
+session starts with the same opening, `OPENING_TOKENS` of Claude Code's instructions and tools
+(section 4.7), as its system prompt, in the place of as many tokens of its transcript: the rest is
+the session's own text. With the per-student cache salt each student computes the opening once;
+with the class's salt (`cache_salt_scope = "class"`) the students share it.
 
 **What the engine measured**, per instance, read from the workspace over the run's window by the
 names of the per-engine table (`rhi_common.engine_metrics`), as section 7.2 defines each:
@@ -122,9 +130,9 @@ how the owner holds the pool there).
 **A smaller window** is a setting of the client, not of the pool: Claude Code compacts a session
 when its transcript nears its window. With `RHI_S5_WINDOW_TOKENS`, each session compacts as such a
 client would (`Windowed`): a turn that would take its transcript past the window starts a new
-transcript of `COMPACTED_TOKENS`, new text, then the turn's input, which the engine computes in
-full. Without it no session compacts: a session's transcript stays inside the 200,000 tokens of
-Claude Code's own window.
+transcript of `COMPACTED_TOKENS`, the opening then `SUMMARY_TOKENS` of new text, then the turn's
+input, which the engine computes in full but for the opening. Without it no session compacts: a
+session's transcript stays inside the 200,000 tokens of Claude Code's own window.
 
 **The numbers** (`Number`), one per quantity (`Figure`) and condition: the shape, and the number of
 streams or the class's size. A name is `<quantity>_<shape>_<streams>`, or `<quantity>_<shape>_class`
@@ -141,9 +149,11 @@ every instance reported its count.
 has a 95th-percentile time to first token of later turns under `target_ttft_p95_seconds`, a median
 stream at `target_stream_median_tokens_per_second` or more, a slowest tenth at
 `target_stream_p10_tokens_per_second` or more, and no preemption. Those keys of the configuration
-(`rhi.config`, issue E4-31) default to section 17's 5 seconds, 15 and 10 tokens a second. A job
-whose class-size runs lack one of those numbers (an engine that does not count preemptions) has
-no verdict, and is posted as not measured.
+(`rhi.config`, issue E4-31) default to section 17's 5 seconds, 15 and 10 tokens a second. A
+class-size number that misses its floor fails the job, a preemption among them, whatever else is
+missing. Short of that, a job whose class-size runs lack one of those numbers (an engine that does
+not count preemptions) has no verdict, and is posted as not measured. The numbers of a job are one
+build's: a run served by another build than the job's earlier runs stops the job, as not measured.
 
 **The record.** The run label is `<build>-<lever>-<instances>`. `record_statuses` writes a commit's
 runs of S5 into `docs/measurements/s5.md` (`tools/measurements/record.py`), and then gives each
@@ -155,6 +165,13 @@ record holds the whole matrix:
     gh api --paginate "repos/{owner}/{repo}/commits/<sha>/statuses" |
         env PYTHONPATH=src:services/common:services/gateway:services/reporter:services/engine/lifecycle:spikes \\
         uv run --locked python spikes/s5_capacity.py record --commit <sha> --instance-type <type>
+
+It reads the pages `gh api --paginate` writes one after the other (`statuses_of`). Each run is read
+from its newest posting alone (`newest_postings`): a retry of a run label, posted in fewer parts
+than the run before it, is not joined to that run's older parts. `--run`, repeated, names the runs
+to write, every run of S5 on the commit unless given; a run the record already holds measured on
+another pool or instance type is refused, with nothing written, so the runs of each instance type
+are written apart, each with its own.
 """
 
 from __future__ import annotations
@@ -171,6 +188,7 @@ import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -184,10 +202,10 @@ from rhi import config
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
 from rhi_lifecycle.serving import RELEASE_METRIC
-from rhi_reporter.measure import Verdict
+from rhi_reporter.measure import Verdict, context_parts
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Generator, Mapping, Sequence
     from collections.abc import Set as AbstractSet
     from types import ModuleType
 
@@ -211,9 +229,20 @@ DEFAULT_INSTANCES = 1
 # The numbers of streams the names of the numbers are declared for: section 4.7's 1, 4, 8 and 16,
 # and the larger pools' 32 and 64, which spike S6 runs with this job.
 DECLARED_STREAMS = (1, 4, 8, 16, 32, 64)
-# Tokens. The transcript a compacted session goes on from: Claude Code's opening, about 20,000
-# tokens (section 4.7), with the summary in it.
-COMPACTED_TOKENS = 20_000
+# Tokens. Claude Code's opening, its instructions and its tools, about 20,000 tokens (section 4.7):
+# the same text at the start of every session of every student, which a cache salt shared by the
+# class lets the students share.
+OPENING_TOKENS = 20_000
+# A seed no session of the job draws its text from: the opening's.
+OPENING_SEED = 2**63
+# Tokens. The summary a compacted session holds after the opening: new text.
+SUMMARY_TOKENS = 5_000
+# Tokens. The transcript a compacted session goes on from: the opening, then the summary.
+COMPACTED_TOKENS = OPENING_TOKENS + SUMMARY_TOKENS
+# The reasoning Claude Code asks for by default (tests/captures/profile-reasoning-effort/): adaptive
+# thinking at the effort `high`, which the pool's `reasoning_effort` mapping rewrites (section 6.2).
+CLAUDE_CODE_THINKING = {"type": "adaptive"}
+CLAUDE_CODE_EFFORT = "high"
 # The smallest window a session may compact at: a compacted transcript, the largest turn and its answer.
 SMALLEST_WINDOW_TOKENS = COMPACTED_TOKENS + loadgen.TURN_INPUT_TOKENS[1] + loadgen.TURN_OUTPUT_TOKENS
 
@@ -281,20 +310,65 @@ def load_of(planned: Planned, model: str, seed: int, window_tokens: int | None =
     """The sessions of one round of `planned`, for the pool `model` names, drawn from `seed` on,
     each student's sessions sent as that canary student (`loadgen.hands_on` and
     `loadgen.several_agents`, an odd count of several agents leaving its last student one); each
-    compacting at `window_tokens` when it is given."""
+    compacting at `window_tokens` when it is given, and each sent as Claude Code sends it
+    (`AsClaudeCode`)."""
     synthetic = [loadgen.agent_session(model, TURNS_PER_SESSION, seed + number) for number in range(planned.streams)]
     sessions: tuple[loadgen.Session, ...] = (
         tuple(synthetic) if window_tokens is None else tuple(Windowed(one, window_tokens) for one in synthetic)
     )
     per = 1 if planned.shape is Shape.HANDS_ON else loadgen.AGENTS_PER_STUDENT
-    return loadgen.Load(sessions, per)
+    return loadgen.Load(tuple(AsClaudeCode(one) for one in sessions), per)
+
+
+@functools.cache
+def opening() -> str:
+    """Claude Code's opening as the job's sessions send it: `OPENING_TOKENS` of text, drawn as a
+    synthetic session draws its own, from `OPENING_SEED`."""
+    _, first = next(loadgen.SyntheticSession("", OPENING_TOKENS, (), 0, OPENING_SEED).requests())
+    return json.loads(first.body)["messages"][0]["content"]
+
+
+def as_claude_code(request: loadgen.Request) -> loadgen.Request:
+    """`request`, a synthetic session's, as Claude Code would send it: the opening every session
+    shares as its system prompt, in the place of as many tokens at the start of its transcript, so
+    the transcript keeps its size; and the reasoning Claude Code asks for by default."""
+    body = json.loads(request.body)
+    first, *rest = body["messages"]
+    words = first["content"].split(" ")
+    if len(words) > OPENING_TOKENS:
+        first = {**first, "content": " ".join(words[OPENING_TOKENS:])}
+    body |= {
+        "system": opening(),
+        "messages": [first, *rest],
+        "thinking": CLAUDE_CODE_THINKING,
+        "output_config": {"effort": CLAUDE_CODE_EFFORT},
+    }
+    return replace(request, body=json.dumps(body).encode())
+
+
+@dataclass(frozen=True)
+class AsClaudeCode:
+    """`session`, each of its requests sent as Claude Code would send it (`as_claude_code`)."""
+
+    session: loadgen.Session
+
+    def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
+        steps = self.session.requests()
+        step = next(steps, None)
+        while step is not None:
+            answer = yield step[0], as_claude_code(step[1])
+            try:
+                step = steps.send(answer)
+            except StopIteration:
+                return
 
 
 @dataclass(frozen=True)
 class Windowed:
     """`session` as a client that compacts at `window_tokens` sends it: a turn that would take the
     transcript, as its sizes count it, past the window starts a new transcript instead, of
-    `COMPACTED_TOKENS` of new text and the turn's input, after the turn's pause."""
+    `COMPACTED_TOKENS` of new text and the turn's input, after the turn's pause; `AsClaudeCode`
+    puts the opening at its start."""
 
     session: loadgen.SyntheticSession
     window_tokens: int
@@ -1028,14 +1102,17 @@ class Job:
     def measure(self) -> list[Measured]:
         """Every run, in the plan's order, each printed as one JSON line once measured. ValueError,
         with nothing sent, for runs with more students than there are keys; and once printed, for
-        a run that another number of instances than `instances` served, with no run after it."""
+        a run that another number of instances than `instances` served, or that another build than
+        the job's earlier runs served, with no run after it: the job's numbers are one build's."""
         self._keyed(self.runs)
-        measured = []
+        measured: list[Measured] = []
         for planned in self.runs:
             one = self.run(planned)
             self.log(one.to_json())
             if self.instances is not None and not held_at(one, self.instances):
                 raise ValueError("a run was served by another number of instances than the pool is held at")
+            if measured and one.label.build != measured[0].label.build:
+                raise ValueError("a run was served by another build than the job's earlier runs")
             measured.append(one)
         return measured
 
@@ -1179,36 +1256,45 @@ def floors_of(settings: config.Config) -> Floors:
 JUDGED = (Figure.TTFT_P95, Figure.STREAM_MEDIAN, Figure.STREAM_P10, Figure.PREEMPTIONS)
 
 
+def meets(figure: Figure, value: float, floors: Floors) -> bool:
+    """Whether one number the verdict reads meets its floor: the time to first token under its
+    floor, each speed at its floor or above, no preemption."""
+    if figure is Figure.TTFT_P95:
+        return value < floors.ttft_p95_seconds
+    if figure is Figure.STREAM_MEDIAN:
+        return value >= floors.stream_median_tokens_per_second
+    if figure is Figure.STREAM_P10:
+        return value >= floors.stream_p10_tokens_per_second
+    if figure is Figure.PREEMPTIONS:
+        return value == 0
+    raise ValueError("the verdict does not read that quantity")
+
+
 def passes(numbers: common.Numbers, floors: Floors) -> bool:
     """Whether the class-size runs of both shapes meet the floors, with no preemption."""
-    for shape in Shape:
-
-        def at(figure: Figure, shape: Shape = shape) -> float:
-            return numbers[name_of(figure, shape, None)]
-
-        if not (
-            at(Figure.TTFT_P95) < floors.ttft_p95_seconds
-            and at(Figure.STREAM_MEDIAN) >= floors.stream_median_tokens_per_second
-            and at(Figure.STREAM_P10) >= floors.stream_p10_tokens_per_second
-            and at(Figure.PREEMPTIONS) == 0
-        ):
-            return False
-    return True
+    return all(meets(figure, numbers[name_of(figure, shape, None)], floors) for shape in Shape for figure in JUDGED)
 
 
 @dataclass(frozen=True)
 class CapacitySpike(common.Spike):
-    """Spike S5: no verdict when a class-size run lacks a number the verdict reads."""
+    """Spike S5 against `floors`: a class-size number that misses its floor fails the job, whatever
+    else is missing; with none missed, a class-size run that lacks a number the verdict reads leaves
+    the job with no verdict."""
+
+    floors: Floors
 
     def verdict(self, numbers: common.Numbers) -> Verdict:
-        if any(name_of(figure, shape, None) not in numbers for shape in Shape for figure in JUDGED):
+        judged = {(figure, shape): numbers.get(name_of(figure, shape, None)) for shape in Shape for figure in JUDGED}
+        if any(value is not None and not meets(figure, value, self.floors) for (figure, _), value in judged.items()):
+            return Verdict.FAIL
+        if None in judged.values():
             return Verdict.NOT_MEASURED
         return super().verdict(numbers)
 
 
 def spike_of(floors: Floors) -> CapacitySpike:
     """What the job declares to `common.run_spike`, judged against `floors`."""
-    return CapacitySpike(MEASUREMENT, Number, functools.partial(passes, floors=floors))
+    return CapacitySpike(MEASUREMENT, Number, functools.partial(passes, floors=floors), floors)
 
 
 # The record.
@@ -1242,20 +1328,93 @@ def row_of(run: str, name: str, *, pool: str, instance_type: str) -> tuple[str, 
     return figure.value, labels | {"session_shape": shape.value, "streams": CLASS if streams is None else str(streams)}
 
 
+def statuses_of(text: str) -> list[Any]:
+    """The statuses GitHub's API lists, as `gh api --paginate` writes them: one JSON list a page,
+    the pages one after the other, or, with `--slurp`, one list of the pages. ValueError, which
+    quotes nothing of the text, for any other text."""
+    decoder, found, at, pages = json.JSONDecoder(), [], 0, 0
+    while True:
+        at = len(text) - len(text[at:].lstrip())
+        if at == len(text):
+            break
+        try:
+            page, at = decoder.raw_decode(text, at)
+        except ValueError:
+            page = None
+        if not isinstance(page, list):
+            raise ValueError("the statuses are not GitHub's list of a commit's statuses")  # noqa: TRY004 - one refusal
+        found += [one for item in page for one in (item if isinstance(item, list) else [item])]
+        pages += 1
+    if not pages:
+        raise ValueError("the statuses are not GitHub's list of a commit's statuses")
+    return found
+
+
+def _measured(status: object) -> tuple[tuple[str, str], int, datetime] | None:
+    """The run a measurement's status is of, its part and when it was posted; None for a status
+    that is not a measurement's, or that this cannot read."""
+    context = status.get("context") if isinstance(status, dict) else None
+    created = status.get("created_at") if isinstance(status, dict) else None
+    try:
+        measurement, label, part = context_parts(context) if isinstance(context, str) else ("", "", 0)
+        posted = datetime.fromisoformat(created) if isinstance(created, str) else None
+    except ValueError:
+        return None
+    if not part or posted is None or posted.tzinfo is None:
+        return None
+    return (measurement, label), part, posted
+
+
+def newest_postings(statuses: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The statuses without those of a run that an earlier posting of its label left behind. A job
+    posts a run's parts in their order, part 1 first, so a run's newest posting is its newest part
+    1 and the parts posted at its time or after it: a retry posted in fewer parts than the run
+    before it is read alone, and none of the earlier parts joins it. A status this cannot read is
+    kept, for `tools/measurements/record.py` to refuse."""
+    read = [_measured(status) for status in statuses]
+    newest: dict[tuple[str, str], datetime] = {}
+    for one in read:
+        if one is not None and one[1] == 1:
+            run, _, posted = one
+            newest[run] = max(newest.get(run, posted), posted)
+    return [
+        status
+        for status, one in zip(statuses, read, strict=True)
+        if one is None or one[0] not in newest or one[2] >= newest[one[0]]
+    ]
+
+
 def record_statuses(
-    statuses: Sequence[Mapping[str, Any]], commit: str, *, pool: str, instance_type: str, path: Path = RECORD
+    statuses: Sequence[Mapping[str, Any]],
+    commit: str,
+    *,
+    pool: str,
+    instance_type: str,
+    path: Path = RECORD,
+    only: Collection[str] | None = None,
 ) -> list[str]:
-    """Writes the runs of S5 a commit's statuses hold into the record at `path`, with
-    `tools/measurements/record.py`, each row named after its quantity and labelled with its
-    conditions; returns the run labels written. ValueError, with nothing written, for no run of
-    S5, or one whose label or numbers are not the job's."""
+    """Writes the runs of S5 a commit's statuses hold, each from its newest posting
+    (`newest_postings`), into the record at `path`, with `tools/measurements/record.py`, each row
+    named after its quantity and labelled with its conditions; returns the run labels written.
+    `only` names the runs to write, every run of S5 on the commit unless given. ValueError, with
+    nothing written, for no run of S5 to write, one whose label or numbers are not the job's, and
+    one the record already holds measured on another pool or instance type: the runs of each
+    instance type are written apart, each with its own."""
     tool = record_tool()
-    runs = [(run, day) for run, day in tool.runs_of(statuses, commit) if run.measurement == MEASUREMENT]
+    found = tool.runs_of(newest_postings(statuses), commit)
+    runs = [(run, day) for run, day in found if run.measurement == MEASUREMENT and (only is None or run.label in only)]
     if not runs or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("the statuses hold no run of spike S5 on that commit")
     rows = {run.label: [row_of(run.label, name, pool=pool, instance_type=instance_type) for name in run.numbers]
             for run, _ in runs}  # fmt: skip
     record, rest = tool.read(path.read_text(encoding="utf-8"))
+    held = {
+        (row["labels"].get("run"), row["labels"].get("pool"), row["labels"].get("instance_type"))
+        for row in record["rows"]
+        if isinstance(row.get("labels"), dict) and row["labels"].get("run") in rows
+    }
+    if any((pool, instance_type) != (held_pool, held_type) for _, held_pool, held_type in held):
+        raise ValueError("the record holds one of these runs measured on another pool or instance type")
     for run, day in runs:
         tool.with_run(record, run, day, commit, NAME_UNITS)
         named = iter(rows[run.label])
@@ -1274,12 +1433,15 @@ def record_main(argv: Sequence[str]) -> int:
     parser.add_argument("--commit", required=True, help="the commit the statuses are of: its full id")
     parser.add_argument("--instance-type", required=True, help="the instance type the pool ran")
     parser.add_argument("--pool", default=DEFAULT_POOL, help="the pool (default: coursework)")
+    parser.add_argument("--run", action="append", help="a run label to write, repeated (default: every run of S5)")
     parser.add_argument("--statuses", default="-", help="the statuses, as JSON (default: stdin)")
     args = parser.parse_args(argv)
     text = sys.stdin.read() if args.statuses == "-" else Path(args.statuses).read_text(encoding="utf-8")
     try:
-        labels = record_statuses(json.loads(text), args.commit, pool=args.pool, instance_type=args.instance_type)
-    except ValueError as refusal:  # a JSONDecodeError is one, and quotes nothing of the text
+        labels = record_statuses(
+            statuses_of(text), args.commit, pool=args.pool, instance_type=args.instance_type, only=args.run
+        )
+    except ValueError as refusal:  # each refusal is fixed text, and quotes nothing of the statuses
         print(f"record: {refusal}", file=sys.stderr)
         return 1
     print(f"{RECORD.relative_to(REPO)}: {', '.join(labels)}")
