@@ -208,7 +208,7 @@ class InterleavedRefUpdateTests(IsolationCase):
         refs = ["refs/heads/examiner/temporary", "refs/tags/examiner/temporary"]
         observed = []
 
-        def examiner(vendor, role, scratch, prompt, number):
+        def examiner(vendor, role, scratch, prompt, number, escalate=False):
             self.assertEqual(role, "examine")
             self.assertNotEqual(scratch, wt)
             for ref in refs:

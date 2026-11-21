@@ -330,6 +330,18 @@ are recorded here as proposed and are part of what the owner approves.
    An item that ends with `(needs <capability>)` for a capability no CI job provides gets no
    verdict demand; it is the owner's obligation. The supervisor gives a repair run only to an
    engine exception, never to an issue that stalled (`ceiling`, `no_progress`).
+12. **The steps that decide about a protected path run on the strongest Codex model
+    (2026-11-21).** Amendment 3 is answered no: changes to the safety surface wait for no person,
+    and the factory runs on its own. The examiner and the policy tests are then the only checks
+    on those paths, so the calls that decide about one run on Codex `gpt-6.2-astra`
+    (`loop.toml`, `codex_escalated_model`): deciding requests among which is a `protected_change`,
+    every arbitration, and examining a commit whose change against its base adds, changes or
+    removes a protected path (decision 10's lists, the safety surface included). While astra
+    refuses calls (a usage limit or quota, a rate limit, a model the account may not use, as
+    Codex reports it), those calls run on `gpt-6.2-sol`, the default model (`codex_fallback_model`),
+    and go back to astra 30 minutes later; a refused call did no work and is charged to no
+    budget, as amendment 8 does for Claude. Every other Codex call stays on the default model,
+    and `plan` and `build` stay on Fable, then Opus.
 
 ## Verified and taken on trust
 

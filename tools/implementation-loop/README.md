@@ -74,7 +74,14 @@ the answer validated against the role's schema
 duration and cost under `<run dir>/calls/` and `agents.jsonl`. Prompts are in `prompts/`;
 per-role effort, models and timeouts in `loop.toml`. Here the operator is `claude`: `plan` and
 `build` run on Claude Fable (`claude-fable-5-2`), `explore` on a cheap Claude model, and every
-examiner role on Codex with its default model (ADR 0001, decision 2).
+examiner role on Codex with its default model (ADR 0001, decision 2). A Codex call that decides
+about a protected path is escalated to `codex_escalated_model` (`gpt-6.2-astra`): a `decide` call
+with a `protected_change` request among its requests, every `arbitrate` call, and an `examine`
+call on a head whose change against its base adds, changes or removes a protected path (ADR 0001,
+amendment 12). A model that refuses a call (`claude_refused`, `codex_refused`: a usage limit or
+quota, a rate limit, a model the account may not use) is an outage charged to nothing; with a
+fallback model for that vendor (`claude_fallback_model`, `codex_fallback_model`) the same attempt
+is made again at once on it, and the fallback is kept for 30 minutes.
 
 | Role | Vendor | Access |
 | --- | --- | --- |

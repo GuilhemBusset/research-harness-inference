@@ -25,6 +25,21 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## Escalated Codex calls: a protected path is decided on the strongest model (2026-11-21)
+
+A local patch, not in upstream. No person reviews a change to a protected path, so the calls that
+decide about one run on Codex `gpt-6.2-astra`, and on `gpt-6.2-sol`, the default model, while
+astra refuses calls (ADR 0001, amendment 12). Every other Codex call stays on the default model;
+`plan` and `build` stay on Fable, then Opus. The engine's version stays 1.2.21: nothing here
+repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/live.py` | `RoleSettings` gains `codex_escalated_model` and `codex_fallback_model`. `call` takes `escalate`: an escalated Codex call asks for the role's `codex_escalated_model`. A Codex call that gave no answer is refused when an `error` or `turn.failed` event of its stream, or its stderr, says so (`codex_refused`: a usage limit or quota, a rate limit, a model the account may not use); like a refused Claude call it is an outage charged to nothing, and with a `codex_fallback_model` the same attempt is made again at once on it, kept for `REFUSED_RETRY_S`. Refusals are remembered per vendor and model (`_model`, which replaces `_claude_model`). `examine` escalates when `git diff --name-only --no-renames <base>..<head>` lists a path `is_protected` or `is_safety_surface` holds, or cannot be listed; `decide` when a `protected_change` is among its requests; `arbitrate` always. `agents.jsonl` keeps the error messages of a Codex attempt (`errors`) and marks an escalated one (`escalated`). |
+| `loop.toml` | `examine`, `decide` and `arbitrate` get `codex_escalated_model = "gpt-6.2-astra"` and `codex_fallback_model = "gpt-6.2-sol"`; the header documents both keys. |
+| `tests/test_codex_escalation.py` | New, against a fake `codex` that refuses a model as `codex exec --json` reports it: which calls escalate (an arbitration; a decision with a `protected_change`; an examination of a change that adds, changes, moves out or removes a protected file, or whose paths cannot be listed), and which do not; the fallback at once, charged to nothing, kept 30 minutes for every role; both models refusing, a refused default model and a crash; what counts as a refusal; the error messages kept from the stream. |
+| `tests/test_agent_git_isolation.py` | Its stand-in for `call` accepts `escalate`. |
+
 ## A root takes over the deliveries of another root's run (2026-11-19)
 
 A local patch, not in upstream. A delivered issue stays open on GitHub while it still has owner

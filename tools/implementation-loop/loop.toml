@@ -8,6 +8,15 @@
 #               nothing; the role keeps the fallback for 30 minutes, then asks its own model again.
 #               "" or absent: no fallback, and the issue waits as an outage.
 # codex_model:  model for `codex exec -m`; "" uses your Codex default.
+# codex_escalated_model: model for `codex exec -m` on a call the adapter escalates (ADR 0001,
+#               amendment 12): deciding requests among which is a `protected_change`, any arbitration,
+#               and examining a head whose change against its base adds, changes or removes a
+#               protected path (`PROTECTED_*` and `SAFETY_SURFACE_*` in config.py). "" or absent: such
+#               a call runs on `codex_model`.
+# codex_fallback_model: the model a Codex call asks for instead while the model it asked for refuses
+#               calls (its usage limit or quota reached, rate limited, or not available to the
+#               account), as `claude_fallback_model` does for Claude: the refused attempt is charged to
+#               nothing, and the role keeps the fallback for 30 minutes. "" or absent: no fallback.
 #
 # max_budget_usd: Claude only: `claude --max-budget-usd` for one call of the role; the call stops
 #               there and is not tried again. Provisional values (ADR 0001, decision 8): they are
@@ -19,7 +28,9 @@
 #
 # Roles here (ADR 0001, decision 2): with operator `claude`, plan and build run on Claude Fable,
 # on Claude Opus while Fable refuses calls, and explore on a cheap Claude model; triage, examine,
-# decide, resolve_locked and arbitrate go to the other vendor, Codex, on its default model.
+# decide, resolve_locked and arbitrate go to the other vendor, Codex, on its default model. The
+# escalated calls of examine, decide and arbitrate (above) run on Codex `gpt-6.2-astra`, and on
+# `gpt-6.2-sol`, the default, while astra refuses calls (ADR 0001, amendment 12).
 
 [roles.explore]
 effort = "low"
@@ -53,14 +64,20 @@ timeout_s = 1800
 [roles.examine]
 effort = "high"
 timeout_s = 3600
+codex_escalated_model = "gpt-6.2-astra"
+codex_fallback_model = "gpt-6.2-sol"
 
 [roles.decide]
 effort = "high"
 timeout_s = 1800
+codex_escalated_model = "gpt-6.2-astra"
+codex_fallback_model = "gpt-6.2-sol"
 
 [roles.arbitrate]
 effort = "high"
 timeout_s = 1200
+codex_escalated_model = "gpt-6.2-astra"
+codex_fallback_model = "gpt-6.2-sol"
 
 # What this host cannot provide (ADR 0012; ADR 0001, decision 6). Only these make an item the
 # owner's; the doctor adds what it can verify (missing API keys, a WSL host lacking native
