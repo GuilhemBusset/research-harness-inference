@@ -56,19 +56,26 @@ they are summed per instance: an instance's counters restart from zero with its 
 read one scrape after the run's end, from the run's start to then, with Prometheus' `anchored`
 range modifier: the increase starts from the last sample at or before the run's start, what each
 counter held when the run began, so what the run added before its first scrape is counted, and it
-is not extended past the samples it saw. The scrape after the run's end holds the tokens of the
-last answers, which the workspace sees only then; nothing else is sent to the pool in it. The
-gauges are read over the run alone. Rates are over the run's seconds.
+is not extended past the samples it saw. A series with no sample at or before the run's start, an
+instance that joined during it, began at zero with its engine: its first sample is added to its
+increase, which `anchored` takes from that sample (`counted_of`). The quantiles are computed from
+the buckets so counted (`quantile_of`), as `histogram_quantile` would. The scrape after the run's
+end holds the tokens of the last answers, which the workspace sees only then; nothing else is sent
+to the pool in it. The gauges are read over the run alone, on a grid of a second (`fine_step`) that
+ends at the run's end, so that every scrape of the run shows, however short the run. Rates are over
+the run's seconds.
 
 **What each instance's lifecycle agent reported**: the cache capacity in tokens the engine gave at
-start (`rhi_lifecycle.cache.METRIC`), and its release (`rhi_lifecycle.serving.RELEASE_METRIC`),
-which an instance writes only while in service: the build, its `model_revision`, and from the
-times of its samples, the seconds the instance was in service during the window. The samples are
-read to one scrape past the window's end, so that an instance in service at the end is seen there,
-and a run shorter than a scrape, whose instances are first scraped after it ends, is still labelled.
-An instance whose last sample is older than a scrape before the window, which the workspace still
-returns for some minutes, did not serve in it and is left out. A pool whose instances report two
-builds in one window is refused: the run is no one build's.
+start (`rhi_lifecycle.cache.METRIC`), the last reported from a scrape before the run to a scrape
+after it, and its release (`rhi_lifecycle.serving.RELEASE_METRIC`), which an instance writes only
+while in service: the build, its `model_revision`, and from the times of its samples, the seconds
+the instance was in service during the window. The samples are read on the same fine grid to one
+scrape past the window's end, so that an instance in service at the end is seen there, and a run
+shorter than a scrape, whose instances are first scraped after it ends, is still labelled. An
+instance whose last sample is older than a scrape before the window, which the workspace still
+returns for some minutes, or whose first is a whole scrape after it, did not serve in it and is
+left out. A pool whose instances report two builds in one window is refused: the run is no one
+build's.
 
 **What the students got**, from the load generator's records (`experience_of`): the time to first
 token at the median and the 95th percentile, for later turns and for first turns apart; the speed
@@ -103,6 +110,7 @@ import json
 import math
 import os
 import re
+import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -286,7 +294,8 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
     sample, or the window's start, to a scrape after its last, or the window's end, since a sample
     shows the instance in service at some time in the scrape before it. An instance with no sample
     from a scrape before `start` to a scrape after `end` did not serve in the window and is not in
-    the answer; one first scraped after a short window ended still labels it. ValueError for an
+    the answer, nor is one whose seconds in it come to none; one first scraped after a short window
+    ended still labels it. ValueError for an
     instance whose samples carry no instance type or two releases."""
     times: dict[str, list[float]] = {}
     kinds: dict[str, set[tuple[str, str]]] = {}
@@ -304,8 +313,11 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
         if len(kinds[instance]) != 1 or not all(next(iter(kinds[instance]))):
             raise ValueError("an instance reported no instance type, no build, or two of either in the window")
         ((kind, build),) = kinds[instance]
-        seconds = max(0.0, min(end, max(taken) + SCRAPE_SECONDS) - max(start, min(taken) - SCRAPE_SECONDS))
-        found[instance] = InService(kind, build, seconds)
+        seconds = min(end, max(taken) + SCRAPE_SECONDS) - max(start, min(taken) - SCRAPE_SECONDS)
+        # An instance first scraped a whole scrape after the window, or last a whole scrape before
+        # it, was in service for none of it, and labels nothing.
+        if seconds > 0:
+            found[instance] = InService(kind, build, seconds)
     return found
 
 
@@ -367,47 +379,61 @@ def _selector(name: Name, suffix: str, pool: str) -> str:
     return f"{name}{suffix}{{{','.join(matchers)}}}"
 
 
-# The queries of gauges and of the lifecycle agent's numbers: read over the run alone, at its end.
-GAUGES = frozenset(
-    {
-        Key.RUNNING_MEAN,
-        Key.RUNNING_PEAK,
-        Key.WAITING_MEAN,
-        Key.WAITING_PEAK,
-        Key.CACHE_USE_MEAN,
-        Key.CACHE_USE_PEAK,
-        Key.CACHE_CAPACITY,
-    }
-)
-
-
 def _range(seconds: float) -> str:
     return f"{max(1, math.ceil(seconds))}s"
 
 
-def queries(
-    pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None
-) -> dict[Key, str]:
-    """The queries of the engine's quantities on the pool, by the names of `engine`'s row; a further
-    quantity the row leaves out has none. The gauges (`GAUGES`) are over the `window_seconds` that
-    end where they are evaluated, the counters and histograms over the `counted_seconds` that do,
-    the window unless given."""
-    names, further = metric_names(engine), further_names(engine)
-    window = _range(window_seconds)
-    counted = _range(window_seconds if counted_seconds is None else counted_seconds)
+class How(StrEnum):
+    """How the answer to one query becomes one number an instance."""
 
-    def increase(name: Name, suffix: str = "", by: str = "instance") -> str:
+    SUM = "sum"
+    """An increase, read at one time, with the series born in the run counted from zero."""
+    QUANTILE = "quantile"
+    """A histogram's bucket increases, so read, then its quantile at `Read.fraction`."""
+    MEAN = "mean"
+    """A gauge, read over the run on a fine grid: the mean of its points."""
+    PEAK = "peak"
+    """The same: the largest of its points."""
+    LAST = "last"
+    """A number read at one time as it is."""
+
+
+@dataclass(frozen=True)
+class Read:
+    """One query of the engine's quantities, and how its answer becomes a number an instance. `raw`
+    is the selector of the series an increase sums, for those born in the run."""
+
+    query: str
+    how: How
+    raw: str = ""
+    fraction: float = 0.0
+
+
+def reads(pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None) -> dict[Key, Read]:
+    """The reads of the engine's quantities on the pool, by the names of `engine`'s row; a further
+    quantity the row leaves out has none. The counters and histograms are increased over the
+    `counted_seconds` that end where they are read, the window's unless given; the lifecycle agent's
+    cache capacity is the last it reported over those seconds and a scrape before them; the gauges
+    are read over the run as they are."""
+    names, further = metric_names(engine), further_names(engine)
+    counted_seconds = window_seconds if counted_seconds is None else counted_seconds
+    counted = _range(counted_seconds)
+
+    def increase(name: Name, suffix: str = "", by: str = "instance") -> Read:
         if not suffix:
             suffix = "_total" if name.kind is Kind.COUNTER else ""
-        return f"sum by ({by}) (increase({_selector(name, suffix, pool)}[{counted}] anchored))"
+        raw = _selector(name, suffix, pool)
+        return Read(f"sum by ({by}) (increase({raw}[{counted}] anchored))", How.SUM, raw)
 
-    def quantile(fraction: float, name: Name) -> str:
-        return f"histogram_quantile({fraction}, {increase(name, '_bucket', 'instance, le')})"
+    def quantile(fraction: float, name: Name) -> Read:
+        buckets = increase(name, "_bucket", "instance, le")
+        return Read(buckets.query, How.QUANTILE, buckets.raw, fraction)
 
-    def over_time(function: str, aggregate: str, name: Name) -> str:
-        return f"{function}({aggregate} by (instance) ({_selector(name, '', pool)})[{window}:{SCRAPE_SECONDS}s])"
+    def gauge(how: How, aggregate: str, name: Name) -> Read:
+        return Read(f"{aggregate} by (instance) ({_selector(name, '', pool)})", how)
 
     ttft, tpot = names[Quantity.TIME_TO_FIRST_TOKEN], names[Quantity.TIME_PER_OUTPUT_TOKEN]
+    capacity = f'{CACHE_CAPACITY_METRIC}{{pool="{pool}"}}[{_range(counted_seconds + SCRAPE_SECONDS)}]'
     found = {
         Key.OUTPUT_TOKENS: increase(names[Quantity.OUTPUT_TOKENS]),
         Key.INPUT_TOKENS: increase(names[Quantity.INPUT_TOKENS]),
@@ -418,13 +444,13 @@ def queries(
         Key.TOKEN_TIME_MEDIAN: quantile(0.5, tpot),
         # The slowest tenth of the streams' speed is the longest tenth of the time per token.
         Key.TOKEN_TIME_P90: quantile(0.9, tpot),
-        Key.RUNNING_MEAN: over_time("avg_over_time", "sum", names[Quantity.RUNNING_REQUESTS]),
-        Key.RUNNING_PEAK: over_time("max_over_time", "sum", names[Quantity.RUNNING_REQUESTS]),
-        Key.WAITING_MEAN: over_time("avg_over_time", "sum", names[Quantity.WAITING_REQUESTS]),
-        Key.WAITING_PEAK: over_time("max_over_time", "sum", names[Quantity.WAITING_REQUESTS]),
-        Key.CACHE_USE_MEAN: over_time("avg_over_time", "max", names[Quantity.CACHE_USAGE]),
-        Key.CACHE_USE_PEAK: over_time("max_over_time", "max", names[Quantity.CACHE_USAGE]),
-        Key.CACHE_CAPACITY: f'max by (instance) (last_over_time({CACHE_CAPACITY_METRIC}{{pool="{pool}"}}[{window}]))',
+        Key.RUNNING_MEAN: gauge(How.MEAN, "sum", names[Quantity.RUNNING_REQUESTS]),
+        Key.RUNNING_PEAK: gauge(How.PEAK, "sum", names[Quantity.RUNNING_REQUESTS]),
+        Key.WAITING_MEAN: gauge(How.MEAN, "sum", names[Quantity.WAITING_REQUESTS]),
+        Key.WAITING_PEAK: gauge(How.PEAK, "sum", names[Quantity.WAITING_REQUESTS]),
+        Key.CACHE_USE_MEAN: gauge(How.MEAN, "max", names[Quantity.CACHE_USAGE]),
+        Key.CACHE_USE_PEAK: gauge(How.PEAK, "max", names[Quantity.CACHE_USAGE]),
+        Key.CACHE_CAPACITY: Read(f"max by (instance) (last_over_time({capacity}))", How.LAST),
     }
     sums = {
         Key.REQUEST_OUTPUT_TOKENS: Further.REQUEST_OUTPUT_TOKENS,
@@ -445,6 +471,72 @@ def queries(
         if quantity in further
     }
     return found
+
+
+def queries(pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None) -> dict[Key, str]:
+    """The query of each read (`reads`): a quantile's is the bucket increases it is computed from."""
+    return {key: one.query for key, one in reads(pool, engine, window_seconds, counted_seconds).items()}
+
+
+def counted_of(
+    increases: Sequence[common.Series], raw: Sequence[common.Series], start: float
+) -> dict[tuple[str, str], float]:
+    """Each instance's increase, by bucket (`le`, empty for none): the anchored increases, plus, for
+    each series of `raw` born after `start`, its first sample. Such a series began at zero with its
+    engine, and with nothing at or before the range's start to anchor on, its increase is taken from
+    its first sample, which would leave out what the engine counted before it was first scraped."""
+    totals: dict[tuple[str, str], float] = {}
+
+    def add(one: common.Series, value: float) -> None:
+        where = (one.labels.get("instance", ""), one.labels.get("le", ""))
+        if where[0]:
+            totals[where] = totals.get(where, 0.0) + value
+
+    for one in increases:
+        if one.samples:
+            add(one, one.samples[-1][1])
+    for one in raw:
+        if one.samples:
+            first_at, first = min(one.samples)
+            if first_at > start:
+                add(one, first)
+    return totals
+
+
+def quantile_of(fraction: float, buckets: Mapping[str, float]) -> float | None:
+    """The quantile at `fraction` of one histogram's cumulative bucket counts by their upper bound,
+    as Prometheus' `histogram_quantile` interpolates it. None for no `+Inf` bucket or no count."""
+    bounds = sorted((float(le), count) for le, count in buckets.items())
+    if len(bounds) < 2 or bounds[-1][0] != math.inf:
+        return None
+    cumulative, most = [], 0.0
+    for bound, count in bounds:
+        most = max(most, count)
+        cumulative.append((bound, most))
+    total = cumulative[-1][1]
+    if total <= 0:
+        return None
+    rank = fraction * total
+    at = next(index for index, (_, count) in enumerate(cumulative) if count >= rank)
+    if at == len(cumulative) - 1:
+        return cumulative[-2][0]
+    upper, count = cumulative[at]
+    if at == 0 and upper <= 0:
+        return upper
+    lower, below = cumulative[at - 1] if at else (0.0, 0.0)
+    return lower + (upper - lower) * (rank - below) / (count - below)
+
+
+def fine_step(seconds: float) -> float:
+    """A range query's step finer than a scrape, so every scrape shows: a second, or the coarsest
+    the workspace's 11,000 points a series allow."""
+    return float(max(1, math.ceil(seconds / 10_000)))
+
+
+def grid_start(start: float, end: float, step: float) -> float:
+    """Where a range query from `start` begins so that `end` is on its grid: `start` or a step less
+    after it."""
+    return end - math.floor((end - start) / step) * step
 
 
 @dataclass(frozen=True)
@@ -658,6 +750,52 @@ class Job:
     async def _send(self, load: loadgen.Load) -> list[loadgen.Record]:
         return await self.replay(load, self.keys, self.endpoint, at_once=len(load.sessions))
 
+    def _read(self, query: str, start: float, end: float, step: float) -> list[common.Series]:
+        return self.workspace.read_series(query, start=start, end=end, step=step)
+
+    def _engine(self, start: float, end: float) -> dict[Key, list[common.Series]]:
+        """The workspace's answers to `reads` for the run from `start` to `end`, each made one
+        number an instance at the time it was read, as `quantities_of` takes them."""
+        after = end + SCRAPE_SECONDS
+        read_at = {after: fine_step(after - start), end: fine_step(end - start)}
+        held: dict[tuple[str, float, float], list[common.Series]] = {}
+
+        def read(query: str, low: float, high: float, step: float) -> list[common.Series]:
+            if (query, low, high) not in held:
+                held[query, low, high] = self._read(query, low, high, step)
+            return held[query, low, high]
+
+        def one(instance: str, at: float, value: float, le: str = "") -> common.Series:
+            return common.Series({"instance": instance, **({"le": le} if le else {})}, ((at, value),))
+
+        answers: dict[Key, list[common.Series]] = {}
+        for key, how in reads(self.pool, self.engine, max(end - start, 1.0), after - start).items():
+            if how.how is How.LAST:
+                answers[key] = read(how.query, after, after, SCRAPE_SECONDS)
+            elif how.how in (How.MEAN, How.PEAK):
+                step = read_at[end]
+                points: dict[str, list[float]] = {}
+                for series in read(how.query, grid_start(start, end, step), end, step):
+                    instance = series.labels.get("instance", "")
+                    inside = [value for at, value in series.samples if start <= at <= end]
+                    if instance and inside:
+                        points.setdefault(instance, []).extend(inside)
+                summary = statistics.fmean if how.how is How.MEAN else max
+                answers[key] = [one(instance, end, summary(values)) for instance, values in points.items()]
+            else:
+                step = read_at[after]
+                born = read(how.raw, grid_start(start, after, step), after, step)
+                counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), born, start)
+                if how.how is How.SUM:
+                    answers[key] = [one(instance, after, value, le) for (instance, le), value in counted.items()]
+                    continue
+                buckets: dict[str, dict[str, float]] = {}
+                for (instance, le), value in counted.items():
+                    buckets.setdefault(instance, {})[le] = value
+                found = {instance: quantile_of(how.fraction, counts) for instance, counts in buckets.items()}
+                answers[key] = [one(instance, after, value) for instance, value in found.items() if value is not None]
+        return answers
+
     def run(self, planned: Planned) -> Measured:
         """One run: the pool ready, the sessions replayed for the duration, then what it measured.
         ValueError, with nothing sent, for a run with more students than there are keys."""
@@ -671,14 +809,11 @@ class Job:
         # The scrape after the run's end holds what the run's last answers added; the counters'
         # increase is anchored on what they held at the run's start.
         after = end + SCRAPE_SECONDS
-        release = self.workspace.read_series(release_query(self.pool), start=start, end=after, step=SCRAPE_SECONDS)
+        step = fine_step(after - start)
+        release = self._read(release_query(self.pool), grid_start(start, after, step), after, step)
         in_service = in_service_of(release, start, end)
         build = build_of(in_service)
-        answers = {}
-        for key, query in queries(self.pool, self.engine, window, after - start).items():
-            at = end if key in GAUGES else after
-            answers[key] = self.workspace.read_series(query, start=at, end=at, step=SCRAPE_SECONDS)
-        engine = quantities_of(answers, window)
+        engine = quantities_of(self._engine(start, end), window)
         experience = experience_of(records)
         instances = {
             instance: Instance(
