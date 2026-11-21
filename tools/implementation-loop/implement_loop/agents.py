@@ -176,6 +176,8 @@ class Script:
     unmet_review: int = 0                         # the first N examinations judge review items unmet
     findings: int = 0                             # the first N examinations report a blocking, reproduced defect
     unquoted_findings: int = 0                    # ... a reproduced defect tied to no item (a follow-up)
+    new_findings: int = 0                         # the first N examinations each report another corner case, on an item
+    invariant_findings: int = 0                   # ... another reproduced defect that names a safety invariant
     probe: str = "pass"                           # the examiner's probe: pass | unconditional | none
     blocked_once: bool = False                    # the first build needs a protected path, with a request
     extra_path: str = ""                          # ... this one
@@ -316,6 +318,9 @@ class FakeAgents:
             test.write_text(self._test_script(n))
             if any(re.search(r"\bedge", f) for f in feedback):   # a blocking finding asked for the edge case
                 (worktree / f"edge_{n}.txt").write_text("handled\n")
+            for corner in sorted(set(re.findall(rf"corners_{n}/\w+\.txt", " ".join(feedback)))):   # each one it was shown
+                (worktree / corner).parent.mkdir(parents=True, exist_ok=True)
+                (worktree / corner).write_text("handled\n")
             if s.commits:
                 subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
                 subprocess.run(["git", "commit", "-qm", "agent commit"], cwd=worktree, check=True)
@@ -355,6 +360,14 @@ class FakeAgents:
             if k < s.unquoted_findings:
                 findings.append(Finding(id=f"U{n}-{k}", title="a nicer error message", observed="terse",
                                         expected="friendlier", reproduction=f"test -f friendlier_{n}.txt"))
+            if k < s.new_findings:   # a corner case no earlier examination raised: the builder handles each one shown
+                findings.append(Finding(id=f"N{n}-{k}", title=f"corner case {k} breaks the item", item=item.id,
+                                        quote=quote, observed=f"corners_{n}/case_{k}.txt is missing",
+                                        expected="the corner case is handled", reproduction=f"test -f corners_{n}/case_{k}.txt"))
+            if k < s.invariant_findings:
+                findings.append(Finding(id=f"I{n}-{k}", title=f"corner case {k} exposes a secret",
+                                        invariant="secret exposure", observed=f"corners_{n}/guard_{k}.txt is missing",
+                                        expected="no secret is exposed", reproduction=f"test -f corners_{n}/guard_{k}.txt"))
             if k < s.advisory_findings:
                 findings.append(Finding(id=f"A{n}-{k}", title="the edge case may break the item", item=item.id,
                                         quote=quote, observed="unclear", expected="the edge case is handled"))

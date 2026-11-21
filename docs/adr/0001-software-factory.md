@@ -357,6 +357,15 @@ are recorded here as proposed and are part of what the owner approves.
     filed. A red `required` check is not run again: it goes back to the builder with the failed
     job's log, as any failed check does, so the factory's GitHub App needs no write access to
     Actions.
+12. **An examiner bound (2026-11-21).** Issues spent their call ceilings while every round
+    closed the findings it was given and each examination raised new edge cases. From an issue's
+    fourth examination since its latest plan (`Caps.examiner_bound`; a replan, or an edit of the
+    issue, starts the count again), only a finding that names a safety invariant blocks. A
+    finding that names only an item becomes the follow-up issue the engine already files for
+    non-blocking findings, and a commit whose items are all met is certified even when the
+    examiner withholds its certificate; the pull request's "Decisions" section records it, with
+    the examiner's summary. An `unmet` verdict on an item still withholds the certificate, and the
+    examiner is told in each examination which one it is and what blocks in it.
 
 ## Verified and taken on trust
 

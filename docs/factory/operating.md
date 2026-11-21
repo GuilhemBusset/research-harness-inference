@@ -94,6 +94,15 @@ Elsewhere:
 An issue moves through `pending → plan → planned → build → verify → examine → land → merged`, then
 ends in one of the outcomes below.
 
+A finding of the examiner blocks when the engine reproduces it on the exact commit and it quotes
+an item or names a safety invariant (`loop.toml [invariants]`). From an issue's fourth examination
+since its latest plan on (a replan, or an edit of the issue, starts the count again), only a
+finding that names a safety invariant blocks. One that names only an item goes to the follow-up
+issue the engine files once the issue lands, and a commit whose items are all met is certified
+even when the examiner withholds its certificate, with a line in the pull request's "Decisions"
+section that quotes the examiner. An `unmet` verdict still holds the commit back. The bound is
+`examiner_bound` in `config.py`.
+
 ## Stop
 
 ```sh

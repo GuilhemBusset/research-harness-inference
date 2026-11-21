@@ -37,6 +37,14 @@ public-repository scan. Read each one: unless the value is public on purpose and
 why, report it as a finding under the safety invariant "an aws account id, arn or secret
 committed".
 
+What blocks depends on how often this issue has been examined since its latest plan. Up to the
+examiner bound, a finding blocks as described below. From the bound on, only a finding that names
+a safety invariant blocks: a finding that names only an item becomes a follow-up issue, and you
+certify the commit once every item an agent must prove is met. The engine tells you which
+examination this is, and what else it asks of this one:
+
+{{feedback}}
+
 Return, in **one** pass:
 - `verdicts`: for every `review` item, `met` or `unmet`, with `quote` (words of the item) and a note.
   An `owner` item whose `agent_part` no command proves needs a verdict too, on that part alone
@@ -53,6 +61,7 @@ Return, in **one** pass:
   agents' to deliver; the owner's real-world evidence is not a defect), or name one of these safety
   invariants:
 {{invariants}}
+  Past the examiner bound, only a safety invariant makes a finding block.
   Anything else is still worth reporting: it becomes a follow-up issue, not a blocker. Never report
   something no item or invariant requires as if it were one; never write a reproduction that fails
   unconditionally.
@@ -73,4 +82,5 @@ Return, in **one** pass:
   real code, fails only while the defect holds and, for infrastructure, asserts on the synthesized
   template; it never needs an account.
 - `certify`: true when every item an agent must prove is met on this exact commit and no blocking
-  finding remains; `summary`: one paragraph.
+  finding remains (past the examiner bound, a finding that names only an item does not block);
+  `summary`: one paragraph.

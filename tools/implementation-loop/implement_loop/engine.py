@@ -1137,6 +1137,7 @@ class Engine:
             items = fixed
         plan = {"items": items, "notes": res.notes}
         st.plan = plan
+        st.examinations = 0   # the examiner bound counts from the latest plan (`_examination_note`)
         self.store.put(st)
         objections = [asdict(o) for o in self.agents.triage(self.other, self._req(n), plan)]
         kept = [o for o in objections if gate.keep_objection(o, item_text, self._lookup_issue)]
@@ -1942,10 +1943,14 @@ class Engine:
             return self._set_phase(n, Phase.VERIFY)
         since = st.examined_sha
         memory = [f for f in st.findings if f.get("status") in ("open", "closed", "follow_up")]
+        exam = self._examinations(n, st) + 1
+        bounded = exam >= self.caps.examiner_bound
+        feedback = [self._examination_note(n, exam)] + list(st.exam_feedback)
         with self.ws.disposable(wt) as scratch:   # whatever the examiner changes is discarded with its copy
-            res = self.agents.examine(self.other, self._req(n, st.exam_feedback), st.plan, scratch, st.base_sha, head,
+            res = self.agents.examine(self.other, self._req(n, feedback), st.plan, scratch, st.base_sha, head,
                                       st.evidence, memory, [], since)
         st = self.store.issue(n)
+        st.examinations = exam
         item_text = self._item_text(n)
         rnd = len({f.get("round") for f in st.findings}) + 1
         # A probe is a finding's reproduction with a file: only one a finding names is linted and
@@ -1979,6 +1984,15 @@ class Engine:
                     runs[f.id] = run_record(ran)
             new.append(gate.classify(f, item_text, self.invariants, reproduced, self._agent_items(st),
                                      self._owner_items(st), {i["id"]: i.get("agent_part") or "" for i in self._items(st)}))
+        # The examiner bound (ADR 0001, amendment 12): from this examination on, a finding that
+        # names no safety invariant is a follow-up issue, however well it quotes an item. Several
+        # issues spent their ceilings while every round closed its findings and each examination
+        # raised new edge cases. Findings of earlier examinations still block until they close.
+        bound = [f.id for f in new if bounded and f.blocking and not gate.invariant_ok(f.invariant, self.invariants)]
+        for f in new:
+            if f.id in bound:
+                f.status, f.blocking = "follow_up", False
+                f.reason = f"examination {exam}: past the examiner bound only a safety invariant blocks ({f.reason})"
         # An owner item is judged on its agent part alone, like a finding on one (`gate.classify`):
         # the words an `unmet` must quote are that part's. One that quotes anything else is about
         # what the owner still owes, which is an obligation and nothing the builder can change (#20
@@ -1998,15 +2012,24 @@ class Engine:
                                                      for f in st.findings if f.get("status") == "open"
                                                      and f.get("round") != rnd]
         self.store.event("examined", issue=n, head=head, findings={f.id: f.status for f in new},
-                         unmet=unmet, missing=missing, certify=res.certify, rejected=rejected,
-                         **({"owner_evidence": misjudged} if misjudged else {}))
+                         unmet=unmet, missing=missing, certify=res.certify, rejected=rejected, examination=exam,
+                         **({"bounded": bound} if bound else {}), **({"owner_evidence": misjudged} if misjudged else {}))
         problems = []
         if unmet:
             problems += [f"{i} judged unmet by the examiner" for i in unmet]
         if blocking:
             problems += [f"blocking finding {f.id}: {f.title}" for f in blocking]
         if not res.certify and not problems and not missing:
-            problems.append(f"the examiner withheld its certificate: {res.summary[:400]}")
+            if not bounded:
+                problems.append(f"the examiner withheld its certificate: {res.summary[:400]}")
+            else:   # every item is met and nothing names an invariant: past the bound, that certifies
+                self._decide(st, {"id": f"examiner-bound-{exam}",
+                                  "choice": f"examination {exam} certified `{head[:12]}` without the examiner's certificate",
+                                  "rationale": "past the examiner bound only an unmet item or a finding that names a "
+                                               "safety invariant withholds a certificate; the examiner said: "
+                                               + res.summary[:400]})
+                self.store.put(st)
+                self.store.event("certified_by_bound", issue=n, head=head, examination=exam, summary=res.summary[:400])
         if problems:
             bundled = [f for f in new if f.status == "follow_up"]
             if bundled:
@@ -2028,6 +2051,33 @@ class Engine:
         if missing:
             return self._round_failed(n, [f"no verdict on {', '.join(missing)} after two requests"], [], missing)
         self._set_phase(n, Phase.VERIFY, certified_sha=head, feedback=[], exam_feedback=[], exam_retries=0)
+
+    def _examinations(self, n: int, st: IssueState) -> int:
+        """The examinations of `n` since its latest plan. A state an earlier engine wrote has no
+        count (None): it is read from the journal, as the `examined` events after `n`'s last
+        `planned` one, so an issue in flight keeps the examinations it already had."""
+        if st.examinations is not None:
+            return st.examinations
+        count = 0
+        for e in self.store.events():
+            if e.get("issue") == n and e.get("kind") == "planned":
+                count = 0
+            elif e.get("issue") == n and e.get("kind") == "examined":
+                count += 1
+        return count
+
+    def _examination_note(self, n: int, exam: int) -> str:
+        """What the examiner is told of the examiner bound (`Caps.examiner_bound`): which
+        examination this is, and what blocks in it."""
+        bound = self.caps.examiner_bound
+        said = f"This is examination {exam} of #{n} since its latest plan."
+        if exam < bound:
+            return (f"{said} A finding blocks when it quotes an item or names a safety invariant. From examination "
+                    f"{bound} on, only a finding that names a safety invariant will block.")
+        return (f"{said} From examination {bound} on, only a finding that names a safety invariant blocks: a "
+                f"finding that names only an item becomes a follow-up issue and does not block. Certify this commit "
+                f"once every item an agent must prove is met; withhold the certificate only with an `unmet` verdict "
+                f"or a finding that names a safety invariant.")
 
     def _probe_problem(self, p) -> str | None:
         if not p.file or not p.command or not p.content:
@@ -2779,11 +2829,13 @@ class Engine:
         follow = [f for f in st.findings if f.get("status") == "follow_up"]
         if not follow or st.followup:
             return
-        lines = [f"- **{f['title']}** — observed: {f.get('observed')}; expected: {f.get('expected')}; reproduce: "
+        lines = [f"- **{f['title']}**" + (f" (on {f['item']})" if f.get("item") else "")
+                 + f" — observed: {f.get('observed')}; expected: {f.get('expected')}; reproduce: "
                  f"`{f.get('reproduction') or f.get('probe')}`" for f in follow]
         body = (f"Follow-up to #{n}" + (f" (PR #{st.pr})" if st.pr else "") + ". The other vendor's examination "
-                "reproduced these findings, which no ledger item or safety invariant requires, so they did not block "
-                "the merge:\n\n" + "\n".join(lines) + "\n")
+                "reproduced these findings. They did not block the merge: no ledger item or safety invariant requires "
+                f"them, or they were raised from examination {self.caps.examiner_bound} on, when only a safety "
+                "invariant blocks:\n\n" + "\n".join(lines) + "\n")
         created = self._safe(self.gh.create_issue, f"Follow-up to #{n}: {len(follow)} non-blocking finding(s)", body,
                              [FOLLOWUP_LABEL[0]])
         if created:

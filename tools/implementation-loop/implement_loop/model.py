@@ -226,6 +226,9 @@ class IssueState:
     extra_deps: list[int] = field(default_factory=list)      # prerequisites found mid-run, kept across runs
     exam_feedback: list[str] = field(default_factory=list)   # what the next examination must supply
     exam_retries: int = 0                # examinations re-asked for missing verdicts or probes
+    # Examinations since the latest plan (`Caps.examiner_bound`); None in a state an earlier engine
+    # wrote, which is counted from the journal instead (`Engine._examinations`).
+    examinations: int | None = None
     # Waiting and failure.
     wait: dict | None = None             # {kind, resume, detail, since, vendor?, version?, env?}
     fail: dict | None = None             # {cause, detail, version, resumed}

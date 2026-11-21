@@ -25,6 +25,24 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## An examiner bound: from the fourth examination, only a safety invariant blocks (2026-11-21)
+
+A local patch, not in upstream. Several issues failed on their call ceiling while every round
+closed the findings it was given and each examination raised new edge cases. From an issue's
+fourth examination since its latest plan, a finding that names only an item becomes a follow-up
+issue, and a head whose items are all met is certified even when the examiner withholds its
+certificate (ADR 0001, amendment 12). The engine's version stays 1.2.21: nothing here repairs a
+failed issue. An issue in flight keeps the examinations it already had, read from the journal.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/config.py` | `Caps` gains `examiner_bound`, 4. |
+| `implement_loop/model.py` | `IssueState` gains `examinations`, the examinations since the latest plan; `None` in a state an earlier engine wrote. |
+| `implement_loop/engine.py` | The plan step sets the count to 0. The examine step counts each examination (`_examinations`, which reads a missing count from the journal: the `examined` events after the issue's last `planned` one) and tells the examiner which one it is and what blocks in it (`_examination_note`, the first line of the examination's feedback). From the bound on, a finding the gate would block and that names no safety invariant becomes `follow_up`, its reason says why, and the `examined` event lists it under `bounded`; a withheld certificate with no unmet item, no missing verdict and no blocking finding certifies the head, with a decision (`examiner-bound-<n>`, quoting the examiner's summary) and the event `certified_by_bound`. The follow-up issue names the item of each finding and says that past the bound only a safety invariant blocks. |
+| `prompts/examine.md` | States the bound, and renders `{{feedback}}`: what the engine tells the examiner. Until now the examination prompt had no such placeholder, so the request to complete an incomplete examination and the note that an examination certifies a revert never reached the examiner. |
+| `implement_loop/agents.py` | The fake examiner can raise another reproduced finding on an item at each examination (`new_findings`), or on a safety invariant (`invariant_findings`); the fake builder handles each one it is shown. |
+| `tests/test_examiner_bound.py` | New: the fourth examination's finding on an item is a follow-up and the issue lands; a finding on a safety invariant still blocks past the bound; a withheld certificate no longer holds a met head there, and an unmet item still does; a replan starts the count again; a state with no count reads it from the journal; the examiner is told which examination it is. |
+
 ## No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21)
 
 A local patch, not in upstream (ADR 0001, amendment 11). A deadline stops a supervision in the
