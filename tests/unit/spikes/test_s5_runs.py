@@ -301,7 +301,8 @@ class Scraped:
         held = [(labels, sorted(samples.items())) for name, labels, samples in self.series if f"{name}{{" in query]
         by: dict[tuple[tuple[str, str], ...], list[tuple[float, float]]] = {}
         if "anchored" in query or "last_over_time" in query:
-            left = end - float(re.findall(r"\[(\d+)s\]", query)[0])
+            number, unit = re.findall(r"\[(\d+)(ms|s)\]", query)[0]
+            left = end - float(number) / (1000 if unit == "ms" else 1)
             for labels, samples in held:
                 inside = [value for at, value in samples if left < at <= end]
                 anchor = [value for at, value in samples if at <= left][-1:] or inside[:1]
@@ -332,6 +333,7 @@ def test_a_short_run_reads_every_instance_scraped_during_it_and_the_scrape_after
         ("rhi_lifecycle_release_info", later, {1019.0: 1}),
         ("rhi_lifecycle_engine_cache_capacity_tokens", resident, {987.0: 1_400_000, 1017.0: 1_400_000}),
         ("rhi_lifecycle_engine_cache_capacity_tokens", joined, {1016.0: 1_200_000}),
+        ("rhi_lifecycle_engine_cache_capacity_tokens", later, {1019.0: 900_000}),
         ("vllm:generation_tokens_total", resident, {987.0: 100, 1002.0: 300, 1017.0: 300}),
         ("vllm:generation_tokens_total", joined, {1016.0: 500}),
         ("vllm:num_requests_running", resident, {987.0: 0, 1002.0: 2, 1017.0: 0}),
@@ -358,3 +360,40 @@ def test_a_short_run_reads_every_instance_scraped_during_it_and_the_scrape_after
     assert there.engine.output_tokens_per_second == pytest.approx(200 / 4)
     assert new.engine.output_tokens_per_second == pytest.approx(500 / 4)
     assert there.engine.running_requests_peak == 2
+
+
+@pytest.mark.parametrize("baseline_at", [990.0, 1000.0])
+def test_a_run_between_whole_seconds_counts_only_the_output_generated_in_it(baseline_at: float) -> None:
+    # The run lasts from 1000.25 to 1030.75 and generates 500 tokens; the counter held 1,000 at the
+    # last scrape before the run, at 990 or at 1000, and 600 at the one before that.
+    at = [baseline_at + 15 * n for n in range(-1, 4)]
+    labels = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    scraped = Scraped(
+        ("rhi_lifecycle_release_info", labels, dict.fromkeys(at, 1.0)),
+        ("vllm:generation_tokens_total", labels, dict(zip(at, (600.0, 1000.0, 1500.0, 1500.0, 1500.0), strict=True))),
+    )
+    clock = Clock()
+    clock.now = 1000.25
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        clock.now = 1030.75
+        return [record(True, 1.0)]
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=30, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=scraped, replay=replay, wall=clock, sleep=lambda _: None,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert run.instances["worker"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
+
+
+def test_a_warm_instance_is_not_charged_while_stopped_between_two_periods_of_service() -> None:
+    labels = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    # Four scrapes in service, stopped for 13 minutes, then four more.
+    taken = (1000.0, 1015.0, 1030.0, 1045.0, 1855.0, 1870.0, 1885.0, 1900.0)
+    in_service = s5.in_service_of([common.Series(labels, tuple((t, t) for t in taken))], 1000.0, 1900.0)
+    # A scrape either side of each period's samples, inside the window: 60 seconds each.
+    assert in_service["worker"].seconds == 120.0
+    cost = s5.cost_per_million(in_service, {"g7e.2xlarge": 3.36}, 500)
+    assert cost == pytest.approx(3.36 * 120 / 3600 / 500 * 1_000_000)
