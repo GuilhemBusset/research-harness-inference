@@ -19,10 +19,12 @@ each number of streams the job is given, then one at the class size it is given:
 - at the class size, every student of the class runs at once in the shape: hands-on, one session
   each, as many streams as students; several agents, two each, twice as many streams.
 
-The students are the run's label. Every session is sent as a canary student of its own, with its
-own key (`common.canary_keys`), as the load generator sends them (`loadgen.replay`): its own cache
-salt and limits, and its own in the records. A run needs a key for each of its sessions, and the job
-refuses, before it sends anything, runs that need more keys than the spikes' secret holds.
+The students are the run's label. Every student is sent as a canary student of its own, with its
+own key (`common.canary_keys`), as the load generator sends them (`loadgen.replay`, which keys each
+session by its student): its own cache salt and limits, and its own in the records; the sessions of
+a several-agents student share their student's key, as a real student's agents would. A run needs a
+key for each of its students, and the job refuses, before it sends anything, runs that need more
+keys than the spikes' secret holds.
 
 **One run** first wakes the pool through the gateway and waits until it is ready, so that a run
 measures a warm pool, never a cold start. It then replays its sessions (`loadgen.agent_session`, of
@@ -184,11 +186,11 @@ def plan(streams: Sequence[int], class_size: int) -> list[Planned]:
 
 def load_of(planned: Planned, model: str, seed: int) -> loadgen.Load:
     """The sessions of one round of `planned`, for the pool `model` names, drawn from `seed` on,
-    each sent as a canary student of its own."""
+    each student's sessions sent as that canary student."""
     if planned.shape is Shape.HANDS_ON:
         return loadgen.hands_on(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
     load = loadgen.several_agents(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
-    return loadgen.Load(load.sessions[: planned.streams])
+    return loadgen.Load(load.sessions[: planned.streams], load.sessions_per_student)
 
 
 @dataclass(frozen=True)
@@ -619,9 +621,9 @@ class Job:
             self.sleep(POLL_SECONDS)
 
     def _keyed(self, runs: Sequence[Planned]) -> None:
-        """ValueError for a run with more sessions than there are canary students' keys."""
-        if max(run.streams for run in runs) > len(self.keys):
-            raise ValueError("a run needs a canary student for each session, and there are fewer keys")
+        """ValueError for a run with more students than there are canary students' keys."""
+        if max(run.students for run in runs) > len(self.keys):
+            raise ValueError("a run needs a canary student's key for each student, and there are fewer keys")
 
     def _replay(self, planned: Planned, deadline: float) -> list[loadgen.Record]:
         records: list[loadgen.Record] = []
@@ -651,7 +653,7 @@ class Job:
 
     def run(self, planned: Planned) -> Measured:
         """One run: the pool ready, the sessions replayed for the duration, then what it measured.
-        ValueError, with nothing sent, for a run with more sessions than there are keys."""
+        ValueError, with nothing sent, for a run with more students than there are keys."""
         self._keyed([planned])
         self._ready()
         start = self.wall()
@@ -698,7 +700,7 @@ class Job:
 
     def measure(self) -> list[Measured]:
         """Every run, in the plan's order, each printed as one JSON line once measured. ValueError,
-        with nothing sent, for runs with more sessions than there are keys."""
+        with nothing sent, for runs with more students than there are keys."""
         self._keyed(self.runs)
         measured = []
         for planned in self.runs:
