@@ -18,14 +18,15 @@ order (`Session`):
   (`GET /v1/models`, ...), a path outside its table, or a refusal. The replay harness only reads
   `*.json` files, so it leaves these and the unreplayed ones out.
 
-A session is written to a folder of its own: the recorder refuses a folder that already holds a file,
-and never writes over one.
+A session is written to a folder of its own: the recorder refuses a folder that already holds a file
+or that another recorder is recording into, and never writes over a file.
 
 Before a capture is written, every text of it is made neutral (`Neutral`): the endpoint's host and
 the recorder's own address become `EXAMPLE_HOST`, the student key becomes `KEY_PLACEHOLDER`, the
 recording machine's home directory becomes `NEUTRAL_HOME` and its user name becomes `NEUTRAL_USER`,
 wherever any of them appears in a request or an answer, percent-encoded as in a URL as well. The
-headers that carry the key are dropped.
+headers that carry the key are dropped. An image's or a document's base64 bytes are kept as they
+are, and a capture whose decoded bytes hold the home directory or a key is not written.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
 engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
@@ -62,8 +63,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import fcntl
 import getpass
 import json
+import os
 import re
 import socket
 import sys
@@ -305,10 +309,17 @@ _HOP_BY_HOP = frozenset(
 _DATA = re.compile(r"data: ?")
 # A name of a JSON object that is an identifier is a field of a wire format or of a tool's schema
 # (`max_tokens`, `maxLength`): the harness's makers wrote it, not the machine. The user name is not
-# looked for in it, so that a short one (`max`) does not rename a field.
+# looked for in it, so that a short one (`max`) does not rename a field. Inside what a tool or a
+# person wrote, the names are data like any text: a tool call's input, a request's metadata, and the
+# names of a schema's properties (which its `required` list writes as texts).
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
 # A key in the format of `rhi_common.keys`, its underscore percent-encoded or not.
 _ANY_KEY = KEY_PATTERN.replace("_", "(?:_|%5[Ff])", 1)
+_ANY_KEY_BYTES = re.compile(KEY_PATTERN.encode("ascii"))
+# A data URL whose payload is base64: an image or a PDF as a harness sends one (`data:image/png;base64,...`).
+_DATA_URL = re.compile(r"data:[^,]*;base64,", re.IGNORECASE)
+_BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
 
 
 def _spelled(value: str) -> str:
@@ -327,7 +338,14 @@ class Neutral:
     characters percent-encoded as in a URL, in one pass: what a replacement writes is not read
     again. A host and the user name match in any letter case. A body's JSON is rewritten string by
     string and name by name, so that no replacement falls on JSON's own syntax or escapes; a name
-    that is an identifier is a field of the format, and only the user name is not looked for in it.
+    that is an identifier is a field of the format, and only the user name is not looked for in it,
+    except inside a tool call's input, a request's metadata and among a schema's property names,
+    where every name is data.
+
+    A base64 payload (an image's or a document's `data`, a `data:` URL) is kept byte for byte: a
+    replacement inside it would corrupt the file, and a short user name occurs in any encoding by
+    chance. It is decoded and read instead: one that holds the home directory or a key is refused
+    (`scrub.Refused`), and the capture is not written.
     A body that needs no replacement keeps its bytes.
     """
 
@@ -342,13 +360,32 @@ class Neutral:
         common = f"(?P<host>(?i:{literal(hosts)}))|(?P<key>{literal(keys)}|{_ANY_KEY})|(?P<home>{literal(homes)})"
         self._pattern = re.compile(f"{common}|(?P<user>(?i:{literal([user])}))")
         self._field_pattern = re.compile(common)
+        self._homes = [value.encode("utf-8") for value in homes]
+        self._keys = [value.encode("utf-8") for value in keys if value]
 
     def text(self, text: str) -> str:
+        found = _DATA_URL.match(text)
+        if found is not None and self._encoded(text[found.end() :]):
+            return text
         return self._pattern.sub(self._replacement, text)
 
-    def name(self, name: str) -> str:
+    def _encoded(self, payload: str) -> bool:
+        """Whether a text is a base64 payload, kept as it is; `scrub.Refused` if it holds the home directory or a key."""
+        if not _BASE64.fullmatch(payload):
+            return False
+        try:
+            decoded = base64.b64decode(payload)
+        except ValueError:
+            return False
+        if _ANY_KEY_BYTES.search(decoded) or any(key in decoded for key in self._keys):
+            raise scrub.Refused(scrub.KEY, "a base64 payload")
+        if any(home in decoded for home in self._homes):
+            raise scrub.Refused("home directory", "a base64 payload")
+        return True
+
+    def name(self, name: str, *, data: bool = False) -> str:
         """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
-        if _IDENTIFIER.fullmatch(name):
+        if not data and _IDENTIFIER.fullmatch(name):
             return self._field_pattern.sub(self._replacement, name)
         return self.text(name)
 
@@ -358,13 +395,23 @@ class Neutral:
             str(found.lastgroup)
         ]
 
-    def value(self, value: Any) -> Any:
-        """A JSON value, each of its names and strings made neutral."""
-        if isinstance(value, dict):
-            return {self.name(name): self.value(inner) for name, inner in value.items()}
+    def value(self, value: Any, *, data: bool = False) -> Any:
+        """A JSON value, each of its names and strings made neutral; `data` for what a tool or a person wrote."""
         if isinstance(value, list):
-            return [self.value(inner) for inner in value]
-        return self.text(value) if isinstance(value, str) else value
+            return [self.value(inner, data=data) for inner in value]
+        if not isinstance(value, dict):
+            return self.text(value) if isinstance(value, str) else value
+        neutral = {}
+        for name, inner in value.items():
+            if name == "data" and value.get("type") == "base64" and isinstance(inner, str) and self._encoded(inner):
+                written = inner  # An image's or a document's bytes (Messages, `source`).
+            elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
+                written = {self.text(field): self.value(schema) for field, schema in inner.items()}
+            else:
+                tool_input = name == "input" and str(value.get("type", "")).endswith("tool_use")
+                written = self.value(inner, data=data or tool_input or name == "metadata")
+            neutral[self.name(name, data=data)] = written
+        return neutral
 
     def json_text(self, text: str) -> str:
         """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not."""
@@ -510,13 +557,18 @@ def _replays(capture: Mapping[str, Any]) -> bool:
 
 
 def _key_presented(headers: Sequence[tuple[str, str]]) -> list[str]:
-    """The key in the headers that carry one: `x-api-key`, or the bearer of `authorization`."""
+    """The key in the headers that carry one: `x-api-key`, or the credential of `authorization`.
+
+    The scheme is read in any letter case, as the gateway reads it (`rhi_gateway.auth`); an
+    `authorization` of another scheme is removed whole.
+    """
     presented = []
     for name, value in headers:
         if name.lower() == "x-api-key":
             presented.append(value.strip())
         elif name.lower() == "authorization":
-            presented.append(value.strip().removeprefix("Bearer").strip())
+            scheme, _, credential = value.strip().partition(" ")
+            presented.append(credential.strip() if scheme.lower() == "bearer" else value.strip())
     return presented
 
 
@@ -546,7 +598,17 @@ class Session:
         parts = urlsplit(upstream)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError("the upstream is an http or https URL with a host")
-        if out.exists() and any(out.iterdir()):
+        out.mkdir(parents=True, exist_ok=True)
+        # The folder is held for as long as the session lasts (`close`): a second recorder, in this
+        # process or another, cannot start in it, and the empty folder is checked once it is held.
+        self._held: int | None = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(self._held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.close()
+            raise FileExistsError(f"{out} is being recorded into by another session") from None
+        if any(out.iterdir()):
+            self.close()
             raise FileExistsError(f"{out} already holds files: a session is recorded into a folder of its own")
         self._upstream = upstream.rstrip("/")
         self._hosts = (parts.netloc, parts.hostname)
@@ -558,6 +620,12 @@ class Session:
         self._transport = transport
         self._arrived = 0
         self.written: list[Path] = []
+
+    def close(self) -> None:
+        """Let the folder go: another session may start in it, if it is still empty."""
+        if self._held is not None:
+            os.close(self._held)  # The lock goes with the descriptor.
+            self._held = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -653,7 +721,10 @@ class Session:
 
 @contextmanager
 def serve(app: Session, port: int = 0) -> Generator[str]:
-    """The recorder served on a loopback port while the context lasts (any free one by default): its address."""
+    """The recorder served on a loopback port while the context lasts (any free one by default): its address.
+
+    The session ends with it (`Session.close`).
+    """
     server = uvicorn.Server(uvicorn.Config(app, lifespan="off", access_log=False, log_level="warning"))
     with socket.socket() as listening:
         listening.bind(("127.0.0.1", port))
@@ -670,6 +741,7 @@ def serve(app: Session, port: int = 0) -> Generator[str]:
         finally:
             server.should_exit = True
             serving.join(timeout=30)
+            app.close()
 
 
 def main(arguments: Sequence[str] | None = None) -> None:
