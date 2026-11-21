@@ -13,7 +13,8 @@ engine, its tag `rhi-engine`, is not the mock's (`rhi.pools.group`).
 On yes, the script waits for every such refresh to end before it answers, polling every
 `POLL_SECONDS` for at most `WAIT_SECONDS`: the smoke tests are only meaningful against the
 instances the refresh left. A refresh that is still pending has no start time yet: it is waited
-for too, and counts only once it has one. One that ends without ever having begun, a pending
+for too, and counts once any read of it has given it one, even if a later read omits it. One that
+ends without ever having begun, a pending
 request cancelled, began after nothing and asks for no verification. A refresh that ends `Successful` lets the verification go on; while
 it is pending, in progress, baking, being cancelled or rolling back it is waited for; any other
 end, a failure, a cancellation or a rollback that succeeded or failed, fails the decision, and so
@@ -42,7 +43,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -160,11 +161,15 @@ def decide(
     deadline = clock() + wait_seconds
     began_since = False
     for refresh in refreshes_since(autoscaling, started):
-        while (read := status_of(autoscaling, refresh))[0] in RUNNING:
+        while True:
+            # A start time once read is kept: a later answer that omits it does not unbegin it.
+            status, began = status_of(autoscaling, refresh)
+            refresh = replace(refresh, began=began)
+            if status not in RUNNING:
+                break
             if clock() >= deadline:
-                raise DecisionError(f"the instance refresh of the pool {refresh.pool} is still {read[0]}")
+                raise DecisionError(f"the instance refresh of the pool {refresh.pool} is still {status}")
             sleep(poll_seconds)
-        status, began = read
         if began is None or began <= started:
             print(f"{NAME}: the instance refresh of the pool {refresh.pool} ended {status} without having begun")
             continue
