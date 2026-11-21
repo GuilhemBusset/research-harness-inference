@@ -352,10 +352,10 @@ _JPEG = b"\xff\xd8"
 # An XMP packet: the metadata a file of any type may write as XML (an author, a source path).
 _XMP = re.compile(rb"<x:xmpmeta.*?</x:xmpmeta>", re.DOTALL)
 # A PDF's streams, and its strings written as they are, in hexadecimal (`<FEFF0074...>`) or with
-# escapes (`(\164...)`). `endstream` is no stream's start.
+# escapes (`(\164...)`); a string written as it is may hold balanced parentheses (`(name (label))`).
+# `endstream` is no stream's start.
 _PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
 _PDF_HEX = re.compile(rb"<([0-9A-Fa-f\s]+)>")
-_PDF_LITERAL = re.compile(rb"\(((?:\\.|[^\\()])*)\)", re.DOTALL)
 _PDF_ESCAPE = re.compile(rb"\\([0-7]{1,3}|\r\n|.)", re.DOTALL)
 _PDF_ESCAPED = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f", b"\n": b"", b"\r": b"", b"\r\n": b""}
 # The bytes of a text: printable ASCII and its white space. A stream mostly made of others is binary
@@ -437,6 +437,25 @@ def _texty(data: bytes) -> bool:
     return len(data) - len(data.translate(None, _PRINTABLE)) >= _TEXT_SHARE * len(data)
 
 
+def _pdf_literals(data: bytes) -> Iterator[bytes]:
+    """The strings a PDF writes in parentheses, whole: a string holds balanced parentheses and escaped
+    ones (`\\(`), and one left open runs to the end of the bytes."""
+    at = data.find(b"(")
+    while at >= 0:
+        depth, end = 0, at
+        while end < len(data):
+            byte = data[end]
+            if byte == 0x5C:  # A backslash: the byte it escapes is no parenthesis.
+                end += 2
+                continue
+            depth += {0x28: 1, 0x29: -1}.get(byte, 0)
+            if depth == 0:
+                break
+            end += 1
+        yield data[at + 1 : end]
+        at = data.find(b"(", end + 1)
+
+
 def _pdf_parts(data: bytes, depth: int) -> Iterator[tuple[bytes, bool]]:
     """A PDF's streams inflated (not texts), and its strings, decoded from hexadecimal and from their escapes
     (texts), in its objects and in the streams that are text (its pages, its object streams)."""
@@ -461,8 +480,8 @@ def _pdf_parts(data: bytes, depth: int) -> Iterator[tuple[bytes, bool]]:
         escape = found.group(1)
         return bytes([int(escape, 8) & 0xFF]) if escape[:1].isdigit() else _PDF_ESCAPED.get(escape, escape)
 
-    for found in _PDF_LITERAL.finditer(outside):
-        yield _PDF_ESCAPE.sub(unescaped, found.group(1)), True
+    for literal in _pdf_literals(bytes(outside)):
+        yield _PDF_ESCAPE.sub(unescaped, literal), True
     for found in _PDF_HEX.finditer(outside):
         digits = re.sub(rb"\s", b"", found.group(1))
         yield bytes.fromhex((digits + b"0" * (len(digits) % 2)).decode("ascii")), True
@@ -538,6 +557,26 @@ def _spelled(value: str) -> str:
         return f"(?:{'|'.join(written)})"
 
     return "".join(spellings(char) for char in value)
+
+
+def _distinct(fields: Sequence[tuple[str, str, Any]]) -> dict[str, Any]:
+    """An object of these fields, each given as its name, its neutral name and its value.
+
+    Two names may become one (`operator` and `user` for the login `operator`): a name that was
+    renamed then takes a suffix (`user_2`), so that no value is lost. A name left as it was keeps it.
+    """
+    taken = {written for name, written, _ in fields if written == name}
+    neutral: dict[str, Any] = {}
+    for name, written, value in fields:
+        if written != name:
+            unique, number = written, 1
+            while unique in taken:
+                number += 1
+                unique = f"{written}_{number}"
+            written = unique
+            taken.add(written)
+        neutral[written] = value
+    return neutral
 
 
 class Neutral:
@@ -678,7 +717,7 @@ class Neutral:
         if not isinstance(value, dict):
             # A string may hold JSON (a tool call's `arguments`): what a tool wrote, read as JSON.
             return self.json_text(value, data=True) if isinstance(value, str) else value
-        neutral = {}
+        neutral: list[tuple[str, str, Any]] = []
         for name, inner in value.items():
             if name == "data" and value.get("type") == "base64" and isinstance(inner, str) and self._encoded(inner):
                 written = inner  # An image's or a document's bytes (Messages, `source`).
@@ -687,14 +726,14 @@ class Neutral:
             elif name == "model" and isinstance(inner, str) and not data:
                 written = self.model(inner)
             elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
-                written = {self.text(field): self.value(schema) for field, schema in inner.items()}
+                written = _distinct([(field, self.text(field), self.value(schema)) for field, schema in inner.items()])
             elif name in _FORMAT_VALUES and isinstance(inner, str) and not data:
                 written = self.format(inner)
             else:
                 tool_input = name == "input" and str(value.get("type", "")).endswith("tool_use")
                 written = self.value(inner, data=data or tool_input or name in _DATA_FIELDS)
-            neutral[self.name(name, data=data)] = written
-        return neutral
+            neutral.append((name, self.name(name, data=data), written))
+        return _distinct(neutral)
 
     def json_text(self, text: str, *, data: bool = False) -> str:
         """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not.
