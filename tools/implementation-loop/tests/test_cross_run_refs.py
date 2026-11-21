@@ -182,7 +182,7 @@ class RefOwnershipTests(LoopCase):
 
     def test_other_vendor_refs_never_reach_the_shared_repository_and_person_refs_survive(self):
         # The other vendor decides the builder's requests in a disposable copy of its head.
-        run = self.run_fixture(n=19, blocked_once=True, extra_path="docs/registry.txt")
+        run = self.run_fixture(n=19, blocked_once=True, extra_path=".github/registry.txt")
         decide = run.agents.decide
         agent_refs = ["refs/heads/request-decider/topic", "refs/tags/request-decider/probe"]
         person_refs = ["refs/heads/person/decision-window", "refs/tags/person/decision-window"]

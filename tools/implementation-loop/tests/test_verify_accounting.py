@@ -1,6 +1,6 @@
 """Test accounting of the trusted verifier: the `loop_pytest` plugin's per-process records,
-how `run_check` turns them into a verdict, the selection manifest, and the check files that
-can never pass. Real pytest in temporary repositories; skipped where pytest is missing."""
+how `run_check` turns them into a verdict, a command several criteria name, and the check files
+that can never pass. Real pytest in temporary repositories; skipped where pytest is missing."""
 
 import json
 import os
@@ -278,7 +278,7 @@ class RepeatedCommandTests(TempTree):
     """A command that several criteria name runs once per verification, and counts for each."""
 
     def verify(self, *specs):
-        return verify.verify(self.root, list(specs), "f00d" * 10, self.work, {}, [], None)
+        return verify.verify(self.root, list(specs), "f00d" * 10, self.work)
 
     def runs(self) -> int:
         counter = self.root / "runs.txt"
@@ -286,8 +286,8 @@ class RepeatedCommandTests(TempTree):
 
     def test_one_run_is_the_evidence_of_every_criterion_that_names_it(self):
         command = "echo ran >> runs.txt"
-        ok, evidence, problems, _ = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command),
-                                                CheckSpec("D3", "command", "true"))
+        ok, evidence, problems = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command),
+                                             CheckSpec("D3", "command", "true"))
         self.assertTrue(ok, problems)
         self.assertEqual(self.runs(), 1)
         self.assertEqual([(e["criterion"], e["command"], e["passed"]) for e in evidence],
@@ -295,7 +295,7 @@ class RepeatedCommandTests(TempTree):
 
     def test_its_failure_is_a_problem_of_every_criterion_that_names_it(self):
         command = "echo ran >> runs.txt; exit 1"
-        ok, evidence, problems, _ = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command))
+        ok, evidence, problems = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command))
         self.assertFalse(ok)
         self.assertEqual(self.runs(), 1)
         self.assertEqual(problems, ["A1 failed: exit 1", "D2 failed: exit 1"])
@@ -303,97 +303,11 @@ class RepeatedCommandTests(TempTree):
 
     def test_another_directory_or_timeout_is_another_run(self):
         (self.root / "sub").mkdir()
-        ok, _, problems, _ = self.verify(CheckSpec("A1", "command", "echo ran >> runs.txt"),
-                                         CheckSpec("A2", "command", "echo ran >> runs.txt", timeout_s=60),
-                                         CheckSpec("A3", "command", "echo ran >> ../runs.txt", cwd="sub"))
+        ok, _, problems = self.verify(CheckSpec("A1", "command", "echo ran >> runs.txt"),
+                                      CheckSpec("A2", "command", "echo ran >> runs.txt", timeout_s=60),
+                                      CheckSpec("A3", "command", "echo ran >> ../runs.txt", cwd="sub"))
         self.assertTrue(ok, problems)
         self.assertEqual(self.runs(), 3)
-
-
-@unittest.skipUnless(HAS_PYTEST, "pytest is not installed")
-class ManifestTests(TempTree):
-    def setUp(self):
-        super().setUp()
-        self.write("tests/test_feature.py", """
-            import pytest
-
-            @pytest.mark.parametrize("n", [1, 2])
-            def test_param(n):
-                assert n
-
-            def test_contract():
-                pass
-
-            def test_benchmark_owner_only():
-                pass
-        """)
-        self.files = ["tests/test_feature.py"]
-        self.locked = verify.lock(self.root, self.files, ["."])
-        self.spec = CheckSpec("A1", "command", f"{PY} -m pytest -q tests/test_feature.py -k 'not benchmark'")
-
-    def run_verify(self, manifest, specs=None):
-        return verify.verify(self.root, specs or [self.spec], "sha", self.work, self.locked, self.files, manifest)
-
-    def test_a_test_no_command_selects_is_not_a_failure_but_is_reported(self):
-        ok, evidence, problems, ran = self.run_verify(None)
-        self.assertTrue(ok, problems)
-        self.assertEqual(ran, ["tests/test_feature.py::test_contract", "tests/test_feature.py::test_param[1]",
-                               "tests/test_feature.py::test_param[2]"])
-        manifest = verify.selection({e["criterion"]: e for e in evidence})
-        self.assertEqual(manifest, {"A1": ran})
-        ok, _, problems, _ = self.run_verify(manifest)
-        self.assertTrue(ok, problems)
-        self.assertEqual(verify.unselected(self.root, self.files, manifest, {}),
-                         ["tests/test_feature.py::test_benchmark_owner_only"])
-        self.assertEqual(verify.unselected(self.root, self.files, manifest,
-                                           {"tests/test_feature.py::test_benchmark_owner_only": "owner-run"}), [])
-
-    def test_a_missing_manifest_test_fails_verification(self):
-        manifest = {"A1": ["tests/test_feature.py::test_contract", "tests/test_feature.py::test_param[1]"]}
-        narrowed = CheckSpec("A1", "command", f"{PY} -m pytest -q tests/test_feature.py -k param")
-        ok, _, problems, ran = self.run_verify(manifest, [narrowed])
-        self.assertFalse(ok)
-        self.assertEqual(problems, ["locked tests did not run: ['tests/test_feature.py::test_contract']"])
-        self.assertNotIn("tests/test_feature.py::test_contract", ran)
-
-    def test_parametrized_ids_match_exactly_and_bare_ids_match_any_case(self):
-        only_one = CheckSpec("A1", "command", f"{PY} -m pytest -q 'tests/test_feature.py::test_param[1]'")
-        ok, _, problems, _ = self.run_verify({"A1": ["tests/test_feature.py::test_param"]}, [only_one])
-        self.assertTrue(ok, problems)
-        ok, _, problems, _ = self.run_verify({"A1": ["tests/test_feature.py::test_param[2]"]}, [only_one])
-        self.assertEqual(problems, ["locked tests did not run: ['tests/test_feature.py::test_param[2]']"])
-
-    def test_tests_outside_the_manifest_may_run(self):
-        ok, _, problems, _ = self.run_verify({"A1": ["tests/test_feature.py::test_contract"]})
-        self.assertTrue(ok, problems)
-
-    def test_a_skip_still_fails_even_when_the_manifest_is_met(self):
-        self.write("tests/test_feature.py", "import pytest\n\ndef test_contract():\n    pass\n\ndef test_other():\n    pytest.skip('x')\n")
-        self.locked = verify.lock(self.root, self.files, ["."])
-        ok, _, problems, _ = self.run_verify({"A1": ["tests/test_feature.py::test_contract"]},
-                                             [CheckSpec("A1", "command", f"{PY} -m pytest -q tests/test_feature.py")])
-        self.assertFalse(ok)
-        self.assertEqual(problems, ["A1 failed: unexpected skip: ['tests/test_feature.py::test_other']"])
-
-
-class SelectionTests(unittest.TestCase):
-    def test_selection_merges_commands_and_drops_criteria_without_tests(self):
-        cases = {"A1": [{"passed": ["b::t", "a::t"]}, {"passed_tests": ["a::t", "c::t[1]"], "passed": True}],
-                 "A2": None, "A3": {"passed": []}}
-        self.assertEqual(verify.selection(cases), {"A1": ["a::t", "b::t", "c::t[1]"]})
-
-    def test_unselected_compares_without_parameters(self):
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        (root / "t").mkdir()
-        (root / "t" / "test_u.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n\ndef test_c():\n    pass\n")
-        (root / "t" / "test_bad.py").write_text("def test_(:\n")
-        manifest = {"A1": ["t/test_u.py::test_a[x-1]"]}
-        self.assertEqual(verify.unselected(root, ["t/test_u.py", "t/test_bad.py"], manifest,
-                                           {"t/test_u.py::test_b": "excluded: needs a GPU"}),
-                         ["t/test_bad.py::<unparseable>", "t/test_u.py::test_c"])
-        self.assertEqual(verify.unselected(root, ["t/test_u.py"], None, None),
-                         ["t/test_u.py::test_a", "t/test_u.py::test_b", "t/test_u.py::test_c"])
 
 
 class UnconditionalFailureTests(TempTree):

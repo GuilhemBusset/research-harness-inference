@@ -64,10 +64,10 @@ class StandingCheckTests(unittest.TestCase):
 
     def verify(self, standing=STANDING_CHECKS):
         head = git("rev-parse", "HEAD", cwd=self.root)
-        return verify.verify(self.root, [self.own], head, self.tmp / "work", {}, [], None, standing=standing)
+        return verify.verify(self.root, [self.own], head, self.tmp / "work", standing=standing)
 
     def test_a_clean_head_passes_and_the_scan_is_recorded_first(self):
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertTrue(ok, problems)
         self.assertEqual([e["criterion"] for e in evidence], ["standing:hygiene", "D1"], "before the issue's own commands")
         scan = evidence[0]
@@ -79,7 +79,7 @@ class StandingCheckTests(unittest.TestCase):
         (self.root / "docs").mkdir()
         (self.root / "docs" / "notes.md").write_text(f"The account is {ACCOUNT}.\n")
         self.commit("a leak")
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertFalse(ok)
         [problem] = problems
         self.assertTrue(problem.startswith("standing check `hygiene` failed (exit 1)"), problem)
@@ -90,14 +90,14 @@ class StandingCheckTests(unittest.TestCase):
 
     def test_a_file_git_would_add_is_scanned_too(self):
         (self.root / "new.txt").write_text(f"{ACCOUNT}\n")
-        ok, _, problems, _ = self.verify()
+        ok, _, problems = self.verify()
         self.assertFalse(ok)
         self.assertIn("new.txt:1: account-id", problems[0])
 
     def test_a_tree_without_the_scanner_fails_closed(self):
         shutil.rmtree(self.root / "tools")
         self.commit("the scanner is gone")
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertFalse(ok)
         self.assertTrue(problems[0].startswith("standing check `hygiene` failed"), problems[0])
         self.assertIn("scan.py", problems[0])
@@ -108,21 +108,20 @@ class StandingCheckTests(unittest.TestCase):
         add_scanner(plain)
         with mock.patch.dict("os.environ", {"GIT_CEILING_DIRECTORIES": str(self.tmp)}):
             try:
-                ok, _, problems, _ = verify.verify(plain, [], "a" * 40, self.tmp / "work", {}, [], None,
-                                                   standing=STANDING_CHECKS)
+                ok, _, problems = verify.verify(plain, [], "a" * 40, self.tmp / "work", standing=STANDING_CHECKS)
             except GitError as e:   # pragma: no cover - the failure this test exists to rule out
                 self.fail(f"the standing check surfaced as a GitError: {e}")
         self.assertFalse(ok)
         self.assertTrue(problems[0].startswith("standing check `hygiene` failed"), problems[0])
 
     def test_a_usage_error_of_the_command_fails_as_well(self):
-        ok, _, problems, _ = self.verify(standing=(("hygiene", "python3 tools/hygiene/scan.py --no-such-flag"),))
+        ok, _, problems = self.verify(standing=(("hygiene", "python3 tools/hygiene/scan.py --no-such-flag"),))
         self.assertFalse(ok)
         self.assertIn("failed (exit 2)", problems[0])
 
     def test_without_standing_checks_only_the_issues_commands_run(self):
         (self.root / "new.txt").write_text(f"{ACCOUNT}\n")
-        ok, evidence, _, _ = self.verify(standing=())
+        ok, evidence, _ = self.verify(standing=())
         self.assertTrue(ok, "the verifier's default")
         self.assertEqual([e["criterion"] for e in evidence], ["D1"])
 

@@ -29,19 +29,11 @@ You are the builder. Build this issue in your working directory, following your 
     no test file per issue or per acceptance item, and no issue number in a test's name. A
     defect a finding showed is covered by such a behaviour test; the examiner's probe is never
     committed.
-- `tests`: the test files you own. Every test function in them must be selected by one of your
-  commands, or listed in `dispositions` as `owner-run` (only the owner can run it) or
-  `excluded: <reason>`.
-- Locked tests (the engine names them in the feedback after the first examination) are not yours
-  to change: an edit is reverted unless you ask with a `test_change` request naming the file (leave
-  your proposed version in the worktree); the other vendor decides.
-  Every test function in them must also be selected by a command (a pytest command naming the
-  file) or given a disposition.
-- After the first examination your commands are locked as well. Leave an item out of `commands`
-  to keep its commands, or repeat them character for character: any other wording is a request to
-  change them, which the other vendor decides in a call of this issue's ceiling. The feedback
-  says what was decided on your requests; do not ask again for what was refused unless you bring
-  new evidence.
+- `tests`: the test files you wrote or changed. `dispositions`: leave it empty.
+- Any file is yours to change, tests and commands included, except a protected path the issue
+  does not name (below). An item you leave out of `commands` keeps the commands it had; an item
+  you list runs exactly the commands you give it from then on. The examiner reviews every change
+  in the diff, tests first: never weaken a test so that a change passes.
 - A command, and the reproduction of an open finding, count where the verifier runs them: in a
   throwaway copy of your commit, in the verifier's own environment, not in your worktree. When
   one fails there, the feedback carries what that run printed. Read it first. "It passes here"
@@ -50,15 +42,14 @@ You are the builder. Build this issue in your working directory, following your 
   `PYTHONPATH`, and the type checker reads it, so `scripts/check.sh types` and `fast` report
   unresolved imports in the engine's files there on any commit; as a command of yours, write
   `env -u PYTHONPATH scripts/check.sh types`. If what a finding's reproduction prints is not this
-  change's doing and is not yours to repair (it fails the same way on `main`, or for files
-  outside your zones), say so in this round with a `dispute` request, with that output as your
-  evidence.
+  change's doing and is not yours to repair (it fails the same way on `main`), say so in this round
+  with a `dispute` request, with that output as your evidence.
 - `requests`, typed, each decided by the other vendor (or the arbiter):
-  - `paths` / `protected_change`: a path outside your zones you must change (say why);
-  - `command_change`: add a command to a locked `item` (give `command`, `cwd`); it is kept beside
-    the item's other commands. To change or drop a locked command, list the item's whole new set
-    in `commands` instead: the engine makes it one request;
-  - `test_change`: change a locked test (`paths`, and why it is wrong for the item as written);
+  - `protected_change`: a protected path the issue does not name that you must change (`paths`, and
+    why). A protected path is anything under `tools/implementation-loop/`, `tools/hygiene/`,
+    `.github/`, `.githooks/`, `tests/policy/`, `.claude/`, `.agents/` or `.codex/`, the pipeline
+    stack under `src/rhi/pipeline/`, the bootstrap policies under `setup/bootstrap/`, the gate
+    scripts in `scripts/`, the ruleset;
   - `reclassify`: an agent item that needs a capability this host lacks (`item`, `capability`, and
     in `detail` the part agents still deliver);
   - `depends`: an item needs another open issue (`item`, `depends_on`, `depends_quote`);

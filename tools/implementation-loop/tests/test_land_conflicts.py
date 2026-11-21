@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import SHIP, TempRepo, git, issue_body, present
+from helpers import SHIP, TempRepo, git, issue_body
 from implement_loop import workspace
 from implement_loop.agents import FakeAgents, Script
 from implement_loop.config import CEILINGS, Caps, Config
@@ -59,19 +59,11 @@ class ObservedAgents(FakeAgents):
         super().__init__(case.scripts, **kwargs)
         self.case = case
         self.entries = []        # one per build call
-        self.lanes = []          # one per resolve_locked call
         self.exam_heads = []     # (issue, head) per examination
         self.before_build = None
         self.after_build = None
         self.on_examine = None
-        self.preserve_test = None
         self._observe_lock = threading.Lock()
-
-    def resolve_locked(self, vendor, req, worktree, files, feedback):
-        conflicted = git("diff", "--name-only", "--diff-filter=U", cwd=worktree).splitlines()
-        self.lanes.append({"vendor": vendor, "issue": req.issue.number, "files": list(files),
-                           "conflicted": conflicted, "feedback": list(feedback)})
-        return super().resolve_locked(vendor, req, worktree, files, feedback)
 
     def build(self, vendor, req, plan, worktree, feedback):
         entry = {"issue": req.issue.number, "vendor": vendor, "worktree": worktree,
@@ -83,12 +75,7 @@ class ObservedAgents(FakeAgents):
         self.entries.append(entry)
         if self.before_build:
             self.before_build(req, plan, worktree, entry)
-        kept = None
-        if self.preserve_test and (worktree / self.preserve_test).is_file():
-            kept = (worktree / self.preserve_test).read_bytes()   # this fixture's test is already on main
         result = super().build(vendor, req, plan, worktree, feedback)
-        if kept is not None:
-            (worktree / self.preserve_test).write_bytes(kept)
         if self.after_build:
             self.after_build(req, plan, worktree, entry)
         return result
@@ -153,10 +140,9 @@ class LandConflictTests(unittest.TestCase):
                           ["Keep this widget's content and shared suite registration."],
                           ["All acceptance checks pass."]), labels=("size:M",))
 
-    def setup_pair(self, *, locked=False):
-        options = {"test_file": "checks/shared.sh"} if locked else {}
-        self.add_issue(2, **options)
-        self.add_issue(3, conflict_tamper=locked, **options)
+    def setup_pair(self):
+        self.add_issue(2)
+        self.add_issue(3)
         self.gh.add_issue(1, "Stale widget epic", "Epic.\n", subs=(3,))
         self.gh.add_issue(10, "First widget epic", "Epic.\n", subs=(2,))
 
@@ -214,8 +200,8 @@ class LandConflictTests(unittest.TestCase):
         agents.on_examine = during_examination
         return seen
 
-    def conflict_scenario(self, *, move_again=False, locked=False, caps=None):
-        self.setup_pair(locked=locked)
+    def conflict_scenario(self, *, move_again=False, caps=None):
+        self.setup_pair()
         agents = ObservedAgents(self)
         self.install_peer_hook(agents, move_again=move_again)
         original = Engine._set_phase
@@ -245,8 +231,7 @@ class LandConflictTests(unittest.TestCase):
 
     def assert_exact_gates(self, engine):
         """No merge without a certificate for the exact head: after the last update from main, the
-        head was verified, then examined and certified, then verified again as it lands. The
-        certificate covers the examined head plus the examiner's own adopted probes (ADR 0012)."""
+        head was verified, then examined and certified, then verified again as it lands."""
         events = engine.store.events()
         merged = [e for e in events if e["kind"] == "merged"]
         self.assertTrue(merged, events)
@@ -262,10 +247,7 @@ class LandConflictTests(unittest.TestCase):
             exam = exams[-1]
             self.assertTrue(exam["certify"])
             examined = exam["head"]
-            if examined != head:
-                self.assertEqual(git("rev-parse", f"{head}^", cwd=self.repo.work), examined)
-                self.assertTrue(git("log", "-1", "--format=%s", head, cwd=self.repo.work)
-                                .startswith(f"Lock the tests for #{n} and adopt the examiner's probes"))
+            self.assertEqual(examined, head, "the examined head is the head that lands")
             verified = [e for e in mine if e["kind"] == "verified" and e["ok"] is True and e["seq"] > barrier]
             self.assertTrue([e for e in verified if e["head"] == examined and e["seq"] < exam["seq"]],
                             f"{examined} was examined before it was verified: {events}")
@@ -390,161 +372,6 @@ class LandConflictTests(unittest.TestCase):
         self.assert_no_operation(Path(st.worktree), clean=True)
         self.assertLessEqual(len([e for e in agents.entries if e["issue"] == 3]), LOW_CEILING["M"])
 
-    def test_locked_test_conflict_is_resolved_by_the_other_vendor(self):
-        agents = self.conflict_scenario(locked=True)
-        self.assert_success()
-        lane = "checks/shared.sh"
-        resolutions = [e for e in agents.lanes if e["issue"] == 3 and lane in e["conflicted"]]
-        self.assertTrue(resolutions, agents.lanes)
-        self.assertTrue(all(e["vendor"] == agents.other for e in resolutions))
-        self.assertTrue(all(e["files"] == [lane] for e in resolutions))
-        self.assertTrue(all(lane in "\n".join(e["feedback"]) for e in resolutions))
-        builds = [c for c in agents.calls if c[0] == "build" and c[2] == 3]
-        self.assertTrue(all(c[1] == agents.operator for c in builds), "the builder never resolves its locked test")
-        reverted = self.events("locked_changes_reverted")
-        self.assertTrue(any(lane in e["files"] for e in reverted))
-        relocked = self.events("checks_relocked")
-        self.assertTrue(any(lane in e["files"] and e["source"] == "other-vendor" for e in relocked))
-        self.assertFalse(self.events("locked_tests_changed"), "no test change request was needed")
-        final = present(self.repo.main_file(lane))
-        self.assertFalse(has_markers(final))
-        for n in (2, 3):
-            self.assertIn(f"docs/issue-{n}.txt", final)
-        # Retaining main's test requirements is observable, not just a relock event.
-        coord = self.engine.ws.coord_path()
-        self.assertEqual(subprocess.run(["bash", lane], cwd=coord, capture_output=True, check=False).returncode, 0)
-        for n in (2, 3):
-            target = coord / f"docs/issue-{n}.txt"
-            original = target.read_bytes()
-            try:
-                target.write_text("broken\n")
-                self.assertNotEqual(subprocess.run(["bash", lane], cwd=coord, capture_output=True,
-                                                   check=False).returncode, 0)
-            finally:
-                target.write_bytes(original)
-
-    def test_locked_test_conflict_restores_resolver_edits_outside_its_lane(self):
-        self.setup_pair(locked=True)
-        agents = ObservedAgents(self)
-        self.install_peer_hook(agents)
-        real_resolve = agents.resolve_locked
-        attempted = []
-        before_resolver = []
-        restored = []
-
-        def stray_edit(vendor, req, wt, files, feedback):
-            was_conflicted = "checks/shared.sh" in git(
-                "diff", "--name-only", "--diff-filter=U", cwd=wt).splitlines()
-            if was_conflicted:
-                before_resolver.append((wt / self.shared_paths[0]).read_bytes())
-            result = real_resolve(vendor, req, wt, files, feedback)
-            if was_conflicted:
-                attempted.append(True)
-                # This is outside the resolver's lane, and restoring HEAD
-                # here would lose the conflict's main-side registration.
-                (wt / self.shared_paths[0]).write_text("out-of-lane replacement\n")
-            return result
-
-        def observe_restoration(req, plan, wt, entry):
-            if before_resolver and "MERGE_HEAD" in entry["operations"]:
-                self.assertEqual((wt / self.shared_paths[0]).read_bytes(), before_resolver[-1])
-                restored.append(True)
-
-        agents.resolve_locked = stray_edit  # ty: ignore[invalid-assignment]  # test double
-        agents.before_build = observe_restoration
-        self.run_engine(agents)
-        self.assertTrue(attempted)
-        self.assertTrue(restored)
-        self.assertTrue(any(self.shared_paths[0] in e["discarded"] for e in self.events("resolver_out_of_lane")))
-        self.assert_success()
-
-    def test_locked_test_conflict_unresolved_markers_never_reach_the_builder(self):
-        self.setup_pair(locked=True)
-        agents = ObservedAgents(self)
-        self.install_peer_hook(agents)
-        real_resolve = agents.resolve_locked
-
-        def leave_locked_markers(vendor, req, wt, files, feedback):
-            lane = wt / "checks/shared.sh"
-            if lane.exists() and has_markers(lane.read_text()):
-                # An unsuccessful resolver answers, but leaves the merge unresolvable.
-                return agents._metered(req.issue.number, "resolve_locked", vendor, lambda: None)
-            return real_resolve(vendor, req, wt, files, feedback)
-
-        def observe_build(req, plan, wt, entry):
-            lane = wt / "checks/shared.sh"
-            self.assertFalse(lane.exists() and has_markers(lane.read_text()))
-
-        agents.resolve_locked = leave_locked_markers  # ty: ignore[invalid-assignment]  # test double
-        agents.before_build = observe_build
-        with mock.patch.dict(CEILINGS, LOW_CEILING):
-            self.run_engine(agents)
-        st = self.engine.store.issue(3)
-        self.assertTrue(self.events("check_conflict_unresolved"))
-        # Conflicts spend no round; the issue's call ceiling bounds them (ADR 0012).
-        assert st.fail is not None
-        self.assertEqual((st.phase, st.fail["cause"]), (Phase.FAILED, "ceiling"), self.events())
-        self.assertFalse(self.events("step_crashed"))
-        self.assertFalse(self.events("merged"))
-        assert st.worktree is not None
-        self.assert_no_operation(Path(st.worktree), clean=True)
-
-    def test_conflict_scope_allows_a_conflicted_path_outside_the_plan(self):
-        # A differently named shared file prevents a suites.txt-only workaround.
-        path = "shared/alternate-registry.txt"
-        self.seed_main({path: "other-base\n"})
-        self.shared_paths = [path]
-        self.setup_pair()
-        self.scripts[2].lines[path] = "different-first-registration"
-        self.scripts[3].lines[path] = "different-second-registration"
-        agents = ObservedAgents(self)
-        self.install_peer_hook(agents)
-        # The branch was verified and certified with its original zones. Model a narrowed plan
-        # as it lands, before main's merge introduces the conflict; otherwise the original
-        # edit would fail the zone check before reaching land.
-        real_land = Engine._step_land
-        narrowed = []
-
-        def narrow_then_land(engine, n):
-            if n == 3 and not narrowed:
-                narrowed.append(True)
-                st = engine.store.issue(3)
-                st.plan["zones"].remove(path)
-                st.grants = [g for g in st.grants if g["path"] != path]
-                engine.store.put(st)
-                engine.plan.specs[3].declared_paths.remove(path)
-            return real_land(engine, n)
-
-        real_build = Engine._step_build
-        stopped = []
-
-        def stop_after_conflict(engine, n):
-            if n == 3 and engine.store.issue(n).conflict_pending and not stopped:
-                stopped.append(True)
-                (engine.store.dir / "STOP").write_text("stop after conflict scope was persisted\n")
-                raise type("AgentStopped", (RuntimeError,), {})("pause repair fixture")
-            return real_build(engine, n)
-
-        with mock.patch.object(Engine, "_step_land", narrow_then_land), \
-                mock.patch.object(Engine, "_step_build", stop_after_conflict):
-            self.run_engine(agents)
-        self.assertTrue(narrowed)
-        self.assertTrue(stopped)
-        self.assertEqual(self.engine.store.issue(3).phase, Phase.BUILD)
-        self.assert_no_operation(Path(present(self.engine.store.issue(3).worktree)), clean=True)
-        # A fresh plan must recover the conflict permission from persisted state,
-        # not merely retain a mutation of the first run's in-memory declared paths.
-        self.run_engine(agents)
-        self.assert_success(path=path)
-        st = self.engine.store.issue(3)
-        assert st.plan is not None
-        self.assertNotIn(path, st.plan["zones"])
-        self.assertIn({"path": path, "source": "conflict", "protected": False}, st.grants)
-        self.assertIn(path, st.conflict_paths)
-        self.assertIn(path, self.engine.plan.specs[3].declared_paths)
-        self.assertFalse(st.conflict_pending)
-        self.assertTrue(any(path in e["files"] for e in self.events("conflict")))
-
     def test_each_build_round_starts_from_current_main(self):
         self.build_round_case(conflicting=False)
 
@@ -588,31 +415,6 @@ class LandConflictTests(unittest.TestCase):
             self.assertTrue(self.events("updated_from_main"))
             self.assertFalse(self.events("conflict"))
             self.assert_exact_gates(self.engine)
-
-    def test_main_changes_a_locked_file_without_conflict(self):
-        lane = "checks/stable.sh"
-        original_check = '#!/usr/bin/env bash\nset -eu\n# baseline metadata\ntest "$(cat docs/issue-3.txt)" = "content-3"\n'
-        self.seed_main({lane: original_check})
-        # A blocking finding at the first examination (where the test locks) brings a second round.
-        self.add_issue(3, lines={}, test_file=lane, findings=1)
-        self.gh.add_issue(1, "Epic", "Epic.\n", subs=(3,))
-        agents = ObservedAgents(self)
-        agents.preserve_test = lane
-        moved = []
-
-        def update_check(req, wt, head):
-            if not moved:
-                moved.append(True)
-                self.seed_main({lane: original_check.replace("baseline metadata", "metadata from main")})
-
-        agents.on_examine = update_check
-        self.run_engine(agents)
-        self.assertEqual(self.engine.store.issue(3).phase, Phase.DONE, self.events())
-        self.assertFalse(self.events("conflict"))
-        self.assertTrue(any(lane in e["files"] and e["source"] == "main"
-                            for e in self.events("checks_relocked")))
-        self.assertIn("metadata from main", present(self.repo.main_file(lane)))
-        self.assert_exact_gates(self.engine)
 
     def test_each_implement_round_starts_from_current_main_update_preserves_commits(self):
         ws = workspace.Workspace(self.repo.work, 1, SHIP, base_dir=self.repo.loop_dir)

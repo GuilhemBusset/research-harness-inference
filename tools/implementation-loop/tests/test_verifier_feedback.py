@@ -5,9 +5,9 @@ The examiner's finding had a repository-wide gate as its reproduction. Where the
 it, that gate failed on every head, for files the change did not touch; in the builder's worktree
 it passed. Ten builds were told that the finding "still reproduces" (and three times that a
 command "failed: exit 1") and no more; nine answered that it passed for them and changed nothing.
-Each build also said its locked commands again in other words, which is a request the other
-vendor decides: nine decisions, each refused, and no refusal reached the next build, because the
-failed verification replaced the feedback that carried it. The dispute that closed the finding
+Each build also made a request the other vendor decides again: nine decisions, each refused,
+and no refusal reached the next build, because the failed verification replaced the feedback that
+carried it. The dispute that closed the finding
 came at the 27th call.
 
 The engine runs are real (git, the verifier, squash merges into a bare remote); the agents and
@@ -15,7 +15,6 @@ GitHub are the fakes. The fake builder answers as #32's did, and acts on a fact 
 holds it."""
 
 import json
-from dataclasses import replace
 
 import pytest
 
@@ -27,7 +26,7 @@ ROUND = "docs/round.txt"
 PRINTED = "59 diagnostics, all in files this change does not touch"
 # Fails wherever it runs, whatever the builder does, and prints why and which build it ran on.
 REPRODUCTION = f"echo '{PRINTED}'; cat {ROUND}; test -f docs/never.txt"
-REFUSAL = "the locked commands prove the item as they are"
+REFUSAL = "the item does not need that protected path"
 HOLDS = "docs/a.txt holds:"
 Phase = L.model.Phase
 
@@ -36,30 +35,25 @@ class Agents(L.agents.FakeAgents):
     """The fake agents, as #32's were. Every build writes its number to `ROUND`. The first
     examination leaves a blocking finding whose reproduction is `REPRODUCTION`. The builder
     disputes it from its build number `disputes` on, and only once its feedback holds what the
-    verifier's run of the reproduction printed. With `restates`, a build that follows the
-    examination says its commands again in other words, until it is told that this was refused;
-    the decider refuses with `REFUSAL`. The arbiter rules for the builder."""
+    verifier's run of the reproduction printed. With `asks`, a build that follows the
+    examination asks for a protected path, until it is told that this was refused; the decider
+    refuses with `REFUSAL`. The arbiter rules for the builder."""
 
-    def __init__(self, scripts, disputes=2, restates=False):
+    def __init__(self, scripts, disputes=2, asks=False):
         super().__init__(scripts)
-        self.disputes, self.restates = disputes, restates
+        self.disputes, self.asks = disputes, asks
 
     def _test_script(self, n):
         lines = super()._test_script(n).splitlines()
         return "\n".join([*lines[:2], f'echo "{HOLDS} $(cat docs/a.txt)"', *lines[2:]]) + "\n"
-
-    def plan(self, vendor, req, worktree):
-        result = super().plan(vendor, req, worktree)
-        result.zones.append(ROUND)
-        return result
 
     def build(self, vendor, req, plan, worktree, feedback):
         result = super().build(vendor, req, plan, worktree, feedback)
         k = self._built[ISSUE]
         (worktree / ROUND).write_text(f"build {k}\n")
         told = "\n".join(feedback)
-        if self.restates and k > 1 and REFUSAL not in told:
-            result.commands = [replace(c, command=f"{c.command} && true") for c in result.commands]
+        if self.asks and k > 1 and REFUSAL not in told:
+            result.requests.append(L.agents.Request("protected_change", "a hook as well", paths=[".githooks/x"]))
         if k >= self.disputes and PRINTED in told:
             result.requests.append(L.agents.Request("dispute", "it fails for files this change does not touch",
                                                     finding=f"E{ISSUE}-1-1"))
@@ -130,10 +124,10 @@ def test_an_open_finding_comes_with_what_the_verifiers_run_printed(loop):
 
 
 def test_after_a_failed_verification_the_builder_knows_its_refused_requests_and_the_new_run(loop):
-    agents = Agents({ISSUE: L.agents.Script(files={"docs/a.txt": "alpha"}, findings=1)}, disputes=3, restates=True)
+    agents = Agents({ISSUE: L.agents.Script(files={"docs/a.txt": "alpha"}, findings=1)}, disputes=3, asks=True)
     st = loop.run(agents)
 
-    # the second build restated its commands and did not dispute: its verification failed
+    # the second build asked for a path and did not dispute: its verification failed
     assert any("still reproduces" in p for problems in loop.failures() for p in problems)
     third = agents.feedback(3)
     assert REFUSAL in third, "the decision on the second build's requests, and its reason"
