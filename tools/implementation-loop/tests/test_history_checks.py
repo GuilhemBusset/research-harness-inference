@@ -289,8 +289,9 @@ class EngineHistoryTests(HistoryCase):
 class RevertHistoryTests(HistoryCase):
     def breaking_pair(self) -> None:
         self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))   # its deployment fails
         self.epic(2, 3)
+        self.failing_deployments(3)
 
     def test_the_commits_of_a_revert_are_scanned_before_it_is_pushed(self):
         self.breaking_pair()
@@ -324,9 +325,9 @@ class RevertHistoryTests(HistoryCase):
         self.assertFalse(self.events("reverted", 3))
 
     def test_a_revert_looks_past_a_round_that_was_abandoned_unmerged(self):
-        # #3 merges and breaks main; its fix-forward round is abandoned for its history; the retry's
-        # round repairs nothing either. The revert must still find the pull request that broke main,
-        # two rounds back, although only one fix-forward was counted.
+        # #3 merges and its deployment fails; its fix-forward round is abandoned for its history; the
+        # retry's round repairs nothing either. The revert must still find the pull request that broke
+        # main, two rounds back, although only one fix-forward was counted.
         self.breaking_pair()
         real = Engine._step_verify
         abandoned = []
@@ -661,8 +662,9 @@ class OwnersListRevertTests(OwnersListCase):
         # The words git puts into a revert commit's message are on the list: no earlier push holds them.
         self.values.write_text("This reverts commit\n")
         self.issue(2, "alpha")
-        self.issue(3, "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.issue(3, "broken", blocked_by=(2,))   # its deployment fails
         self.epic(2, 3)
+        self.failing_deployments(3)
         self.run_engine()
         st = self.store.issue(3)
         self.assertEqual(self.ended(3), ("failed", "main_broken"))

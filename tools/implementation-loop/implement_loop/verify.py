@@ -5,8 +5,9 @@ judges, and it trusts nothing an implementer could have changed.
   them) are hashed when the checks are committed. Any later change, deletion, or new
   configuration file fails verification. In `pyproject.toml` only the `[tool.pytest...]`
   section is locked, so implementers can still add dependencies.
-- Each command check produces an `Evidence` record bound to the exact head SHA. Every pytest
-  process the command starts, however it starts it, reports each test through the
+- Each command check produces an `Evidence` record bound to the exact head SHA. A command
+  that several criteria name runs once per verification, and its run is the record of each.
+  Every pytest process the command starts, however it starts it, reports each test through the
   `loop_pytest` plugin: a failed, erroring, skipped, xfailed or xpassed test fails the check,
   and so does a pytest that ran no test or could not run (usage error, nothing collected,
   internal error, interrupted).
@@ -33,7 +34,7 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from . import sandbox
@@ -494,14 +495,16 @@ def verify(root: Path, specs: list[CheckSpec], head_sha: str, work_dir: Path, lo
            standing: Iterable[tuple[str, str]] = (),
            mounts: sandbox.Mounts | None = None) -> tuple[bool, list[dict], list[str], list[str]]:
     """Run the `standing` checks, then every command check. Returns (all passed, evidence
-    records, problems, ids of the tests that passed).
+    records, problems, ids of the tests that passed). A command that several checks give (the
+    same command, directory and timeout, for several criteria) runs once, and its run is the
+    evidence record of each of those criteria.
 
     With a selection `manifest` (criterion -> test ids, from `selection`), each of its tests
     must run and pass in this verification; tests that run without being in it are fine. With
     None, only each command's own result counts. Each evidence record also carries the ids its
     command passed (`passed_tests`), what `selection` needs to lock a manifest.
     `extra_env` reaches the check commands only;
-    `check_tamper=False` re-runs another issue's checks for regressions, behaviour only.
+    `check_tamper=False` checks behaviour only.
     `standing` is `config.STANDING_CHECKS` when the engine verifies a head that may be examined,
     pushed or kept on `main`; `mounts` is what the commands may see (`run_check`)."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -511,10 +514,16 @@ def verify(root: Path, specs: list[CheckSpec], head_sha: str, work_dir: Path, lo
     problems += standing_problems
     ran: set[str] = set()
     accounted = False
+    runs: dict[tuple[str | None, str, int | None], tuple[Evidence, dict | None]] = {}
     for spec in specs:
         if spec.kind != "command":
             continue
-        ev, cases = run_check(root, spec, head_sha, work_dir, default_timeout, extra_env, mounts)
+        # A command several criteria name runs once; its run counts for each of them.
+        key = (spec.command, spec.cwd, spec.timeout_s)
+        if key not in runs:
+            runs[key] = run_check(root, spec, head_sha, work_dir, default_timeout, extra_env, mounts)
+        ev, cases = runs[key]
+        ev = replace(ev, criterion=spec.criterion)
         evidence.append(asdict(ev) | {"passed_tests": list(cases["passed"]) if cases else []})
         if cases is not None:
             accounted = True

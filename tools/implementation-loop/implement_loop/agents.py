@@ -13,6 +13,7 @@ after every attempt, so the engine can charge calls to the issue's ceilings.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -326,7 +327,7 @@ class FakeAgents:
             if not test.exists() or not any("locked" in f for f in feedback):
                 test.parent.mkdir(parents=True, exist_ok=True)
                 test.write_text(self._test_script(n))
-            if any("edge" in f for f in feedback):   # a blocking finding asked for the edge case
+            if any(re.search(r"\bedge", f) for f in feedback):   # a blocking finding asked for the edge case
                 (worktree / f"edge_{n}.txt").write_text("handled\n")
             if s.tamper and k >= 1:
                 test.write_text("#!/usr/bin/env bash\nexit 0\n")
