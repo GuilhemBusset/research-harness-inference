@@ -1,11 +1,11 @@
-"""Spike S5, the runs: replayed agent sessions against a pool, and what each run measured (system
-design, sections 0, 4.7, 7.2, 12 and 17).
+"""Spike S5: replayed agent sessions against a pool, what each run measured, and the verdict
+against the floors (system design, sections 0, 4.7, 7.2, 7.3, 12 and 17).
 
 What one instance serves is an estimate until it is measured (section 4.7). This job takes the
 measurements: it replays agent sessions of both shapes against a pool, and reads what each run
 measured, from the engine through the workspace and from the students' side through the load
-generator's records. The verdict against the floors, the record and the posting are not this job's:
-it prints each run's numbers, one JSON line a run, for them.
+generator's records. It prints each run's numbers, one JSON line a run, then posts the numbers of
+all its runs and their verdict with `common.run_spike`, as one run of spike S5 (below).
 
 **Nothing in it is the coursework pool's own.** The pool, the stream counts, the class size, the
 duration and the lever are inputs, so the upgrade pool's spike S6 runs the same job with its own.
@@ -103,23 +103,76 @@ the number of streams, the students, and the class size when the run is at it.
 | `RHI_S5_CLASS_SIZE` | The class's size, in students |
 | `RHI_S5_DURATION_SECONDS` | How long each run sends requests, in seconds |
 | `RHI_S5_LEVER` | The name of the lever the pool is deployed with, lower-case letters, digits and hyphens: `baseline` unless given |
+| `RHI_S5_BUILD` | The name of the build the pool serves, lower-case letters and digits: `8bit` or `4bit` |
+| `RHI_S5_INSTANCES` | The instances the owner holds the pool at for the job: `1` unless given |
+| `RHI_S5_WINDOW_TOKENS` | The window at which each session compacts, in tokens, for the smaller window of section 4.7; unset, no session compacts |
 
-The pool's engine and prices come from the deployed configuration (`rhi.config.read_ssm`), the
-region from CodeBuild's `AWS_REGION`. Each lever is a configuration the owner deploys before
-starting the job; the job never changes the pool. Run it while nothing else sends to the pool.
+The pool's engine and prices, and the floors, come from the deployed configuration
+(`rhi.config.read_ssm`), the region from CodeBuild's `AWS_REGION`. Each lever is a configuration
+the owner deploys before starting the job; the job never changes the pool. Run it while nothing
+else sends to the pool.
+
+**The instances.** The job is told how many instances the pool is held at (`RHI_S5_INSTANCES`),
+and refuses, as not measured, a run that any other number of instances served, or that one of them
+did not serve from its start to its end (`held_at`): the numbers of a job are always those many
+instances'. What one instance serves is a job at one; the class's size
+over the session's instances is a job at the session's instances (`docs/measurements/s5.md` says
+how the owner holds the pool there).
+
+**A smaller window** is a setting of the client, not of the pool: Claude Code compacts a session
+when its transcript nears its window. With `RHI_S5_WINDOW_TOKENS`, each session compacts as such a
+client would (`Windowed`): a turn that would take its transcript past the window starts a new
+transcript of `COMPACTED_TOKENS`, new text, then the turn's input, which the engine computes in
+full. Without it no session compacts: a session's transcript stays inside the 200,000 tokens of
+Claude Code's own window.
+
+**The numbers** (`Number`), one per quantity (`Figure`) and condition: the shape, and the number of
+streams or the class's size. A name is `<quantity>_<shape>_<streams>`, or `<quantity>_<shape>_class`
+at the class's size, with the shape `hands_on` or `several_agents`: `ttft_p95_hands_on_8`,
+`stream_median_several_agents_class`. The numbers of streams are those of `DECLARED_STREAMS`, and
+the job refuses any other before it sends anything. `class_size` is the class's size itself. A
+quantity with no sample behind it is left out of a run's numbers. The students' quantities come from
+the load generator's records; the engine's, from its instances: the output throughput, the prefill
+speed and the cached share are their means over the instances, the cache capacity the smallest any
+reported, the running requests the largest peak, and the preemptions their sum, given only when
+every instance reported its count.
+
+**The verdict** (`spike_of`) reads the class-size runs of both shapes only. They pass when each
+has a 95th-percentile time to first token of later turns under `target_ttft_p95_seconds`, a median
+stream at `target_stream_median_tokens_per_second` or more, a slowest tenth at
+`target_stream_p10_tokens_per_second` or more, and no preemption. Those keys of the configuration
+(`rhi.config`, issue E4-31) default to section 17's 5 seconds, 15 and 10 tokens a second. A job
+whose class-size runs lack one of those numbers (an engine that does not count preemptions) has
+no verdict, and is posted as not measured.
+
+**The record.** The run label is `<build>-<lever>-<instances>`. `record_statuses` writes a commit's
+runs of S5 into `docs/measurements/s5.md` (`tools/measurements/record.py`), and then gives each
+row its quantity as its name, and the conditions as its labels: the run, the pool, the instance
+type, the build, the lever, the instances, the session's shape and the streams (`streams = "class"`
+at the class's size). The same quantity of every run and condition is then one name, and the
+record holds the whole matrix:
+
+    gh api --paginate "repos/{owner}/{repo}/commits/<sha>/statuses" |
+        env PYTHONPATH=src:services/common:services/gateway:services/reporter:services/engine/lifecycle:spikes \\
+        uv run --locked python spikes/s5_capacity.py record --commit <sha> --instance-type <type>
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import functools
+import importlib.util
 import json
 import math
 import os
 import re
 import statistics
+import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import boto3
@@ -131,12 +184,15 @@ from rhi import config
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
 from rhi_lifecycle.serving import RELEASE_METRIC
+from rhi_reporter.measure import Verdict
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
     from collections.abc import Set as AbstractSet
+    from types import ModuleType
 
 JOB = "s5_capacity"
+MEASUREMENT = "S5"
 
 ENDPOINT_VARIABLE = "RHI_SPIKE_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SPIKE_WORKSPACE_URL"
@@ -145,9 +201,21 @@ STREAMS_VARIABLE = "RHI_S5_STREAMS"
 CLASS_SIZE_VARIABLE = "RHI_S5_CLASS_SIZE"
 DURATION_VARIABLE = "RHI_S5_DURATION_SECONDS"
 LEVER_VARIABLE = "RHI_S5_LEVER"
+BUILD_VARIABLE = "RHI_S5_BUILD"
+INSTANCES_VARIABLE = "RHI_S5_INSTANCES"
+WINDOW_VARIABLE = "RHI_S5_WINDOW_TOKENS"
 DEFAULT_POOL = "coursework"
 DEFAULT_STREAMS = (1, 4, 8, 16)
 DEFAULT_LEVER = "baseline"
+DEFAULT_INSTANCES = 1
+# The numbers of streams the names of the numbers are declared for: section 4.7's 1, 4, 8 and 16,
+# and the larger pools' 32 and 64, which spike S6 runs with this job.
+DECLARED_STREAMS = (1, 4, 8, 16, 32, 64)
+# Tokens. The transcript a compacted session goes on from: Claude Code's opening, about 20,000
+# tokens (section 4.7), with the summary in it.
+COMPACTED_TOKENS = 20_000
+# The smallest window a session may compact at: a compacted transcript, the largest turn and its answer.
+SMALLEST_WINDOW_TOKENS = COMPACTED_TOKENS + loadgen.TURN_INPUT_TOKENS[1] + loadgen.TURN_OUTPUT_TOKENS
 
 # Turns after a session's first. A transcript starts at up to 100,000 tokens and a turn adds up to
 # 5,000 and the answer before it: ten keep it inside section 4.7's longest row, 150,000.
@@ -167,6 +235,9 @@ READY_WAIT_SECONDS = 40 * 60
 READY = "ready"
 
 _LEVER = re.compile(r"[a-z0-9-]+")
+_BUILD = re.compile(r"[a-z0-9]+")
+# A run label of the job: its build, its lever and its instances.
+_RUN = re.compile(r"(?P<build>[a-z0-9]+)-(?P<lever>[a-z0-9-]+)-(?P<instances>[1-9][0-9]*)")
 
 
 class Shape(StrEnum):
@@ -206,13 +277,59 @@ def plan(streams: Sequence[int], class_size: int) -> list[Planned]:
     return runs
 
 
-def load_of(planned: Planned, model: str, seed: int) -> loadgen.Load:
+def load_of(planned: Planned, model: str, seed: int, window_tokens: int | None = None) -> loadgen.Load:
     """The sessions of one round of `planned`, for the pool `model` names, drawn from `seed` on,
-    each student's sessions sent as that canary student."""
-    if planned.shape is Shape.HANDS_ON:
-        return loadgen.hands_on(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
-    load = loadgen.several_agents(model, planned.students, turns=TURNS_PER_SESSION, seed=seed)
-    return loadgen.Load(load.sessions[: planned.streams], load.sessions_per_student)
+    each student's sessions sent as that canary student (`loadgen.hands_on` and
+    `loadgen.several_agents`, an odd count of several agents leaving its last student one); each
+    compacting at `window_tokens` when it is given."""
+    synthetic = [loadgen.agent_session(model, TURNS_PER_SESSION, seed + number) for number in range(planned.streams)]
+    sessions: tuple[loadgen.Session, ...] = (
+        tuple(synthetic) if window_tokens is None else tuple(Windowed(one, window_tokens) for one in synthetic)
+    )
+    per = 1 if planned.shape is Shape.HANDS_ON else loadgen.AGENTS_PER_STUDENT
+    return loadgen.Load(sessions, per)
+
+
+@dataclass(frozen=True)
+class Windowed:
+    """`session` as a client that compacts at `window_tokens` sends it: a turn that would take the
+    transcript, as its sizes count it, past the window starts a new transcript instead, of
+    `COMPACTED_TOKENS` of new text and the turn's input, after the turn's pause."""
+
+    session: loadgen.SyntheticSession
+    window_tokens: int
+
+    def parts(self) -> list[tuple[float, loadgen.SyntheticSession]]:
+        """The transcripts the session is sent as, each with the pause before its first request."""
+        whole = self.session
+        held, parts = whole.start_tokens, [(0.0, whole.start_tokens, list[loadgen.Turn]())]
+        for turn in whole.turns:
+            added = whole.output_tokens + turn.input_tokens
+            if held + added > self.window_tokens:
+                held = COMPACTED_TOKENS + turn.input_tokens
+                parts.append((turn.pause_seconds, held, []))
+            else:
+                held += added
+                parts[-1][2].append(turn)
+        # Each later transcript is new text: a seed no session of the job draws its own from.
+        return [
+            (pause, replace(whole, start_tokens=start, turns=tuple(turns), seed=(whole.seed + 1) * 2**32 + number))
+            if number
+            else (pause, replace(whole, turns=tuple(turns)))
+            for number, (pause, start, turns) in enumerate(parts)
+        ]
+
+    def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
+        for pause, part in self.parts():
+            steps = part.requests()
+            _, request = next(steps)
+            step = (pause, request)
+            while True:
+                answer = yield step
+                try:
+                    step = steps.send(answer)
+                except StopIteration:
+                    break
 
 
 @dataclass(frozen=True)
@@ -712,6 +829,15 @@ class Measured:
         return json.dumps(asdict(self), sort_keys=True)
 
 
+def held_at(measured: Measured, instances: int) -> bool:
+    """Whether `instances` instances served the run, and each of them all of it, to within two
+    scrapes: a pool that grew or shrank during the run was not held at that many."""
+    whole = measured.seconds - 2 * SCRAPE_SECONDS
+    return len(measured.instances) == instances and all(
+        one.seconds_in_service >= whole for one in measured.instances.values()
+    )
+
+
 class Reader(Protocol):
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]: ...
 
@@ -726,7 +852,8 @@ class Job:
     """The runs of `plan(streams, class_size)` against the pool `pool`, served by `engine` at
     `prices`, each `duration` seconds, labelled with `lever`: sent through the gateway at
     `endpoint` as the canary students of `keys`, the pool woken through `gateway`, read from
-    `workspace`."""
+    `workspace`. Each session compacts at `window_tokens` when it is given, and each run must be
+    served by `instances` instances when that is given."""
 
     def __init__(
         self,
@@ -746,6 +873,8 @@ class Job:
         wall: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         log: Callable[[str], None] = print,
+        instances: int | None = None,
+        window_tokens: int | None = None,
     ) -> None:
         if duration <= 0:
             raise ValueError("each run of spike S5 lasts some seconds")
@@ -755,6 +884,7 @@ class Job:
         self.duration, self.keys, self.endpoint = duration, tuple(keys), endpoint
         self.gateway, self.workspace, self.replay = gateway, workspace, replay
         self.wall, self.sleep, self.log = wall, sleep, log
+        self.instances, self.window_tokens = instances, window_tokens
         self._seed = 0
 
     def _ready(self) -> None:
@@ -782,7 +912,7 @@ class Job:
             return self.wall() < deadline
 
         while sending():
-            load = load_of(planned, self.pool, self._seed)
+            load = load_of(planned, self.pool, self._seed, self.window_tokens)
             self._seed += len(load.sessions)
             bounded = loadgen.Load(
                 tuple(Until(session, deadline, self.wall) for session in load.sessions),
@@ -897,14 +1027,263 @@ class Job:
 
     def measure(self) -> list[Measured]:
         """Every run, in the plan's order, each printed as one JSON line once measured. ValueError,
-        with nothing sent, for runs with more students than there are keys."""
+        with nothing sent, for runs with more students than there are keys; and once printed, for
+        a run that another number of instances than `instances` served, with no run after it."""
         self._keyed(self.runs)
         measured = []
         for planned in self.runs:
             one = self.run(planned)
             self.log(one.to_json())
+            if self.instances is not None and not held_at(one, self.instances):
+                raise ValueError("a run was served by another number of instances than the pool is held at")
             measured.append(one)
         return measured
+
+
+# The numbers.
+
+
+class Figure(StrEnum):
+    """A quantity the job posts for each condition, its name in the record."""
+
+    REQUESTS = "requests"
+    FAILED_REQUESTS = "failed_requests"
+    INSTANCES = "instances"
+    TTFT_MEDIAN = "ttft_median"
+    """Later turns' time to first token: first turns are apart."""
+    TTFT_P95 = "ttft_p95"
+    FIRST_TURN_TTFT_P95 = "first_turn_ttft_p95"
+    STREAM_MEDIAN = "stream_median"
+    STREAM_P10 = "stream_p10"
+    """The slowest tenth of the streams' speed."""
+    OUTPUT_THROUGHPUT_PER_INSTANCE = "output_throughput_per_instance"
+    PREFILL_SPEED = "prefill_speed"
+    CACHED_SHARE = "cached_share"
+    CACHE_CAPACITY = "cache_capacity"
+    RUNNING_REQUESTS_PEAK = "running_requests_peak"
+    PREEMPTIONS = "preemptions"
+    COST_PER_MILLION_OUTPUT_TOKENS = "cost_per_million_output_tokens"
+
+
+UNITS = {
+    Figure.REQUESTS: "count",
+    Figure.FAILED_REQUESTS: "count",
+    Figure.INSTANCES: "count",
+    Figure.TTFT_MEDIAN: "s",
+    Figure.TTFT_P95: "s",
+    Figure.FIRST_TURN_TTFT_P95: "s",
+    Figure.STREAM_MEDIAN: "tokens/s",
+    Figure.STREAM_P10: "tokens/s",
+    Figure.OUTPUT_THROUGHPUT_PER_INSTANCE: "tokens/s",
+    Figure.PREFILL_SPEED: "tokens/s",
+    Figure.CACHED_SHARE: "percent",
+    Figure.CACHE_CAPACITY: "tokens",
+    Figure.RUNNING_REQUESTS_PEAK: "count",
+    Figure.PREEMPTIONS: "count",
+    Figure.COST_PER_MILLION_OUTPUT_TOKENS: "USD per million output tokens",
+}
+CLASS = "class"
+CLASS_SIZE = "class_size"
+
+
+def name_of(figure: Figure, shape: Shape, streams: int | None) -> str:
+    """The name of `figure` at `streams`, or at the class's size for None, in `shape`."""
+    return f"{figure}_{shape.value.replace('-', '_')}_{CLASS if streams is None else streams}"
+
+
+# Each declared name, and its quantity and condition.
+CONDITIONS: dict[str, tuple[Figure, Shape, int | None]] = {
+    name_of(figure, shape, streams): (figure, shape, streams)
+    for figure in Figure
+    for shape in Shape
+    for streams in (*DECLARED_STREAMS, None)
+}
+Number = StrEnum("Number", {name.upper(): name for name in (CLASS_SIZE, *CONDITIONS)})
+"""The names of the numbers the job posts."""
+NAME_UNITS = {CLASS_SIZE: "count", **{name: UNITS[figure] for name, (figure, _, _) in CONDITIONS.items()}}
+
+
+def _present(values: Sequence[float | None]) -> list[float]:
+    return [value for value in values if value is not None]
+
+
+def _mean(values: Sequence[float | None]) -> float | None:
+    present = _present(values)
+    return statistics.fmean(present) if present else None
+
+
+def figures_of(measured: Measured) -> dict[Figure, int | float | None]:
+    """What one run measured, as the quantities it posts: None where it has nothing."""
+    seen, engines = measured.experience, [one.engine for one in measured.instances.values()]
+    cached = _mean([one.cached_share for one in engines])
+    capacity = _present([one.cache_capacity_tokens for one in engines])
+    running = _present([one.running_requests_peak for one in engines])
+    preemptions = [one.preemptions for one in engines]
+    return {
+        Figure.REQUESTS: seen.requests,
+        Figure.FAILED_REQUESTS: seen.failed,
+        Figure.INSTANCES: len(measured.instances),
+        Figure.TTFT_MEDIAN: seen.first_token_seconds_median,
+        Figure.TTFT_P95: seen.first_token_seconds_p95,
+        Figure.FIRST_TURN_TTFT_P95: seen.first_turn_first_token_seconds_p95,
+        Figure.STREAM_MEDIAN: seen.tokens_per_second_median,
+        Figure.STREAM_P10: seen.tokens_per_second_slowest_tenth,
+        Figure.OUTPUT_THROUGHPUT_PER_INSTANCE: _mean([one.output_tokens_per_second for one in engines]),
+        Figure.PREFILL_SPEED: _mean([one.prefill_tokens_per_second for one in engines]),
+        Figure.CACHED_SHARE: None if cached is None else 100 * cached,
+        Figure.CACHE_CAPACITY: min(capacity) if capacity else None,
+        Figure.RUNNING_REQUESTS_PEAK: max(running) if running else None,
+        Figure.PREEMPTIONS: sum(_present(preemptions)) if engines and None not in preemptions else None,
+        Figure.COST_PER_MILLION_OUTPUT_TOKENS: measured.cost_per_million_output_tokens,
+    }
+
+
+def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int | float]:
+    """The numbers of a job's runs under their declared names, and the class's size. ValueError
+    for a run at a number of streams no name is declared for."""
+    numbers: dict[str, int | float] = {CLASS_SIZE: class_size}
+    for one in measured:
+        streams = None if one.label.class_size is not None else one.label.streams
+        if streams is not None and streams not in DECLARED_STREAMS:
+            raise ValueError("a run is at a number of streams no name is declared for")
+        for figure, value in figures_of(one).items():
+            if value is not None:
+                numbers[name_of(figure, one.label.shape, streams)] = value
+    return numbers
+
+
+# The verdict.
+
+
+@dataclass(frozen=True)
+class Floors:
+    """The floors of section 7.3: the 95th percentile of the time to first token, in seconds, which
+    a run stays under, and the median and the slowest tenth of a stream's speed, in tokens a
+    second, which it reaches."""
+
+    ttft_p95_seconds: float
+    stream_median_tokens_per_second: float
+    stream_p10_tokens_per_second: float
+
+
+def floors_of(settings: config.Config) -> Floors:
+    """The floors the configuration holds (issue E4-31), section 17's unless it gives others."""
+    return Floors(
+        ttft_p95_seconds=settings.target_ttft_p95_seconds,
+        stream_median_tokens_per_second=settings.target_stream_median_tokens_per_second,
+        stream_p10_tokens_per_second=settings.target_stream_p10_tokens_per_second,
+    )
+
+
+# What the verdict reads, at the class's size in each shape.
+JUDGED = (Figure.TTFT_P95, Figure.STREAM_MEDIAN, Figure.STREAM_P10, Figure.PREEMPTIONS)
+
+
+def passes(numbers: common.Numbers, floors: Floors) -> bool:
+    """Whether the class-size runs of both shapes meet the floors, with no preemption."""
+    for shape in Shape:
+
+        def at(figure: Figure, shape: Shape = shape) -> float:
+            return numbers[name_of(figure, shape, None)]
+
+        if not (
+            at(Figure.TTFT_P95) < floors.ttft_p95_seconds
+            and at(Figure.STREAM_MEDIAN) >= floors.stream_median_tokens_per_second
+            and at(Figure.STREAM_P10) >= floors.stream_p10_tokens_per_second
+            and at(Figure.PREEMPTIONS) == 0
+        ):
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class CapacitySpike(common.Spike):
+    """Spike S5: no verdict when a class-size run lacks a number the verdict reads."""
+
+    def verdict(self, numbers: common.Numbers) -> Verdict:
+        if any(name_of(figure, shape, None) not in numbers for shape in Shape for figure in JUDGED):
+            return Verdict.NOT_MEASURED
+        return super().verdict(numbers)
+
+
+def spike_of(floors: Floors) -> CapacitySpike:
+    """What the job declares to `common.run_spike`, judged against `floors`."""
+    return CapacitySpike(MEASUREMENT, Number, functools.partial(passes, floors=floors))
+
+
+# The record.
+
+REPO = Path(__file__).resolve().parents[1]
+RECORD = REPO / "docs" / "measurements" / "s5.md"
+RECORD_TOOL = REPO / "tools" / "measurements" / "record.py"
+
+
+def record_tool() -> ModuleType:
+    """`tools/measurements/record.py`, a script and not a package."""
+    spec = importlib.util.spec_from_file_location("measurement_record", RECORD_TOOL)
+    if spec is None or spec.loader is None:
+        raise ValueError("the record tool is not there")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def row_of(run: str, name: str, *, pool: str, instance_type: str) -> tuple[str, dict[str, str]]:
+    """The name and the labels of the row of the number `name` the run `run` posted: its quantity,
+    and its conditions. ValueError for a run label that is not `<build>-<lever>-<instances>`, or a
+    name the job does not declare."""
+    match = _RUN.fullmatch(run)
+    if match is None or (name != CLASS_SIZE and name not in CONDITIONS):
+        raise ValueError("the run label or the name is not one of spike S5's")
+    labels = {"run": run, "pool": pool, "instance_type": instance_type, **match.groupdict()}
+    if name == CLASS_SIZE:
+        return name, labels
+    figure, shape, streams = CONDITIONS[name]
+    return figure.value, labels | {"session_shape": shape.value, "streams": CLASS if streams is None else str(streams)}
+
+
+def record_statuses(
+    statuses: Sequence[Mapping[str, Any]], commit: str, *, pool: str, instance_type: str, path: Path = RECORD
+) -> list[str]:
+    """Writes the runs of S5 a commit's statuses hold into the record at `path`, with
+    `tools/measurements/record.py`, each row named after its quantity and labelled with its
+    conditions; returns the run labels written. ValueError, with nothing written, for no run of
+    S5, or one whose label or numbers are not the job's."""
+    tool = record_tool()
+    runs = [(run, day) for run, day in tool.runs_of(statuses, commit) if run.measurement == MEASUREMENT]
+    if not runs or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("the statuses hold no run of spike S5 on that commit")
+    rows = {run.label: [row_of(run.label, name, pool=pool, instance_type=instance_type) for name in run.numbers]
+            for run, _ in runs}  # fmt: skip
+    record, rest = tool.read(path.read_text(encoding="utf-8"))
+    for run, day in runs:
+        tool.with_run(record, run, day, commit, NAME_UNITS)
+        named = iter(rows[run.label])
+        for row in record["rows"]:
+            if row["labels"].get("run") == run.label:
+                row["name"], row["labels"] = next(named)
+    if record.get("verdict") != "waived":
+        record["verdict"] = tool.verdict_of([run.get("verdict") for run in record["runs"]])
+    path.write_text(tool.written(record) + rest, encoding="utf-8")
+    return list(rows)
+
+
+def record_main(argv: Sequence[str]) -> int:
+    """`record`: a commit's statuses, as GitHub's API lists them, into the record."""
+    parser = argparse.ArgumentParser(prog="s5_capacity.py record", description="Record spike S5's runs.")
+    parser.add_argument("--commit", required=True, help="the commit the statuses are of: its full id")
+    parser.add_argument("--instance-type", required=True, help="the instance type the pool ran")
+    parser.add_argument("--pool", default=DEFAULT_POOL, help="the pool (default: coursework)")
+    parser.add_argument("--statuses", default="-", help="the statuses, as JSON (default: stdin)")
+    args = parser.parse_args(argv)
+    text = sys.stdin.read() if args.statuses == "-" else Path(args.statuses).read_text(encoding="utf-8")
+    try:
+        labels = record_statuses(json.loads(text), args.commit, pool=args.pool, instance_type=args.instance_type)
+    except ValueError as refusal:  # a JSONDecodeError is one, and quotes nothing of the text
+        print(f"record: {refusal}", file=sys.stderr)
+        return 1
+    print(f"{RECORD.relative_to(REPO)}: {', '.join(labels)}")
+    return 0
 
 
 # The job's inputs.
@@ -912,17 +1291,21 @@ class Job:
 
 def streams_of(environ: Mapping[str, str]) -> tuple[int, ...]:
     """The numbers of streams, `DEFAULT_STREAMS` unless given. ValueError for a count that is not a
-    whole number of one or more, or one given twice."""
+    whole number of one or more, one given twice, or one no name is declared for."""
     written = environ.get(STREAMS_VARIABLE, "")
     counts = tuple(int(one) for one in written.split(",")) if written.strip() else DEFAULT_STREAMS
     if any(count < 1 for count in counts) or len(set(counts)) != len(counts):
         raise ValueError("the numbers of streams are distinct whole numbers of one or more")
+    if not set(counts) <= set(DECLARED_STREAMS):
+        raise ValueError(f"the numbers of streams are among {', '.join(map(str, DECLARED_STREAMS))}")
     return counts
 
 
-def whole_of(environ: Mapping[str, str], variable: str) -> int:
-    """A whole number of one or more the job is given. ValueError for any other."""
-    number = int(environ.get(variable, ""))
+def whole_of(environ: Mapping[str, str], variable: str, default: int | None = None) -> int:
+    """A whole number of one or more the job is given, `default` unless given when there is one.
+    ValueError for any other."""
+    written = environ.get(variable)
+    number = default if written is None and default is not None else int(written or "")
     if number < 1:
         raise ValueError(f"{variable} is a whole number of one or more")
     return number
@@ -936,35 +1319,68 @@ def lever_of(environ: Mapping[str, str]) -> str:
     return lever
 
 
-def main(environ: Mapping[str, str] = os.environ) -> list[Measured]:
-    """Runs every run with the job's environment and credentials, and prints what each measured."""
-    streams, lever = streams_of(environ), lever_of(environ)
+def build_name_of(environ: Mapping[str, str]) -> str:
+    """The build's name. ValueError when it is not given, or is not lower-case letters and digits."""
+    build = environ.get(BUILD_VARIABLE, "")
+    if not _BUILD.fullmatch(build):
+        raise ValueError("the build's name is lower-case letters and digits, such as 8bit or 4bit")
+    return build
+
+
+def window_of(environ: Mapping[str, str]) -> int | None:
+    """The window the sessions compact at, None unless given. ValueError for one smaller than
+    `SMALLEST_WINDOW_TOKENS`, at which a compacted session could not go on."""
+    if WINDOW_VARIABLE not in environ:
+        return None
+    window = int(environ[WINDOW_VARIABLE])
+    if window < SMALLEST_WINDOW_TOKENS:
+        raise ValueError(f"{WINDOW_VARIABLE} is {SMALLEST_WINDOW_TOKENS} tokens or more")
+    return window
+
+
+def main(environ: Mapping[str, str] = os.environ) -> Verdict:
+    """Runs every run with the job's environment and credentials, prints what each measured, and
+    posts their numbers and verdict as the run `<build>-<lever>-<instances>` of S5."""
+    streams, lever, build = streams_of(environ), lever_of(environ), build_name_of(environ)
     class_size, duration = whole_of(environ, CLASS_SIZE_VARIABLE), whole_of(environ, DURATION_VARIABLE)
+    instances, window = whole_of(environ, INSTANCES_VARIABLE, DEFAULT_INSTANCES), window_of(environ)
     # Refused before anything is sent: the canary keys go over HTTPS only.
     endpoint = s4_weights.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
-    pools = [pool for pool in config.read_ssm().pools if pool.name == name]
+    settings = config.read_ssm()
+    pools = [pool for pool in settings.pools if pool.name == name]
     if len(pools) != 1:
         raise ValueError("the deployed configuration has no pool of that name")
     (pool,) = pools
-    session = boto3.Session()
-    workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
-    keys = common.canary_keys().students
-    print(f"pool {name}, lever {lever}, streams {list(streams)}, class of {class_size}, {duration} s a run")
-    return Job(
-        pool=name,
-        engine=pool.engine,
-        prices=pool.prices,
-        lever=lever,
-        streams=streams,
-        class_size=class_size,
-        duration=duration,
-        keys=keys,
-        endpoint=endpoint,
-        gateway=s4_weights.Gateway(endpoint, name, keys[0]),
-        workspace=workspace,
-    ).measure()
+    floors = floors_of(settings)
+    label = f"{build}-{lever}-{instances}"
+
+    def measure() -> dict[str, int | float]:
+        session = boto3.Session()
+        workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
+        keys = common.canary_keys().students
+        print(f"pool {name}, run {label}, streams {list(streams)}, class of {class_size}, {duration} s a run")
+        measured = Job(
+            pool=name,
+            engine=pool.engine,
+            prices=pool.prices,
+            lever=lever,
+            streams=streams,
+            class_size=class_size,
+            duration=duration,
+            keys=keys,
+            endpoint=endpoint,
+            gateway=s4_weights.Gateway(endpoint, name, keys[0]),
+            workspace=workspace,
+            instances=instances,
+            window_tokens=window,
+        ).measure()
+        return numbers_of(measured, class_size)
+
+    return common.run_spike(spike_of(floors), JOB, measure, environ={**environ, common.RUN_LABEL_VARIABLE: label})
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["record"]:
+        sys.exit(record_main(sys.argv[2:]))
     main()
