@@ -222,13 +222,20 @@ def read_recorded(text: str | bytes) -> RecordedSession:
 # The students, and the two shapes.
 
 
+def _always() -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class Load:
     """Sessions to replay, and how many of them one student runs: session `n` is student
-    `n // sessions_per_student`'s."""
+    `n // sessions_per_student`'s. `sending` says whether the load still sends: it is read before
+    each request, once the pause before it has passed, and a session it says no to sends nothing
+    more, its requests in flight left to end."""
 
     sessions: tuple[Session, ...]
     sessions_per_student: int = 1
+    sending: Callable[[], bool] = _always
 
     def __post_init__(self) -> None:
         if self.sessions_per_student < 1:
@@ -472,6 +479,8 @@ async def replay(
                 pause, request = step
                 if pause > 0:
                     await sleep(pause)
+                if not load.sending():
+                    break
                 text, read = await _send(http, request, keys[student], clock)
                 records.append(Record(student=student, session=number, first_turn=not records, **read))
                 try:
