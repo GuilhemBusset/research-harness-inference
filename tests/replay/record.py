@@ -24,9 +24,11 @@ or that another recorder is recording into, and never writes over a file.
 Before a capture is written, every text of it is made neutral (`Neutral`): the endpoint's host and
 the recorder's own address become `EXAMPLE_HOST`, the student key becomes `KEY_PLACEHOLDER`, the
 recording machine's home directory becomes `NEUTRAL_HOME` and its user name becomes `NEUTRAL_USER`,
-wherever any of them appears in a request or an answer, percent-encoded as in a URL as well. The
-headers that carry the key are dropped. An image's or a document's base64 bytes are kept as they
-are, and a capture whose decoded bytes hold the home directory or a key is not written.
+wherever any of them appears in a request or an answer, percent-encoded as in a URL or escaped as
+in a JSON text as well; what the wire format itself writes (its field names, block types, media
+types, roles) keeps a user name that happens to be one of its words. The headers that carry the key
+are dropped. An image's or a document's base64 bytes are kept as they are, and a capture whose
+decoded bytes hold the home directory, the user name or a key is not written.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
 engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
@@ -314,6 +316,16 @@ _DATA = re.compile(r"data: ?")
 # names of a schema's properties (which its `required` list writes as texts).
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+# Fields whose values are what a tool or a person wrote, names included: a request's metadata, a
+# tool's input examples, and a schema's instance values.
+_DATA_FIELDS = frozenset({"metadata", "input_examples", "examples", "default", "const", "enum"})
+# Fields whose text values the wire format enumerates (`image`, `image/png`, `assistant`, `end_turn`):
+# the user name is not looked for in them, so that a login that is one of them changes no block.
+_FORMAT_VALUES = frozenset(
+    {"type", "role", "media_type", "object", "stop_reason", "finish_reason", "status", "model", "effort"}
+)
+# Headers of the wire format, names and values: the user name is not looked for in them either.
+_FORMAT_HEADERS = frozenset({"content-type", "accept", "anthropic-version", "anthropic-beta", "openai-beta"})
 # A key in the format of `rhi_common.keys`, its underscore percent-encoded or not.
 _ANY_KEY = KEY_PATTERN.replace("_", "(?:_|%5[Ff])", 1)
 _ANY_KEY_BYTES = re.compile(KEY_PATTERN.encode("ascii"))
@@ -323,29 +335,43 @@ _BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
 
 
 def _spelled(value: str) -> str:
-    """A pattern of a literal value, each of its characters written as itself or percent-encoded."""
+    """A pattern of a literal value, each of its characters written as itself, percent-encoded as in a
+    URL, or escaped as in a JSON text a string holds (`\\u0074`, `\\/`), the escapes in either letter case."""
 
-    def hexed(byte: int) -> str:
-        return "%" + "".join(f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in f"{byte:02X}")
+    def hexed(digits: str) -> str:
+        return "".join(f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in digits.upper())
 
-    return "".join(f"(?:{re.escape(char)}|{''.join(hexed(byte) for byte in char.encode('utf-8'))})" for char in value)
+    def spellings(char: str) -> str:
+        written = [re.escape(char)]
+        for variant in dict.fromkeys((char, char.lower(), char.upper())):
+            written.append("".join("%" + hexed(f"{byte:02X}") for byte in variant.encode("utf-8")))
+            units = variant.encode("utf-16-be")
+            written.append("".join(r"\\u" + hexed(units[at : at + 2].hex()) for at in range(0, len(units), 2)))
+        if char == "/":
+            written.append(r"\\/")
+        return f"(?:{'|'.join(written)})"
+
+    return "".join(spellings(char) for char in value)
 
 
 class Neutral:
     """What a recorded text has in place of the endpoint's host, the key, the home directory and the user name.
 
     Each value is replaced wherever it appears, inside a longer word as well, and with any of its
-    characters percent-encoded as in a URL, in one pass: what a replacement writes is not read
-    again. A host and the user name match in any letter case. A body's JSON is rewritten string by
-    string and name by name, so that no replacement falls on JSON's own syntax or escapes; a name
-    that is an identifier is a field of the format, and only the user name is not looked for in it,
-    except inside a tool call's input, a request's metadata and among a schema's property names,
-    where every name is data.
+    characters percent-encoded as in a URL or escaped as in a JSON text that a string holds (a tool
+    call's `arguments`), in one pass: what a replacement writes is not read again. A host and the
+    user name match in any letter case. A body's JSON is rewritten string by string and name by
+    name, so that no replacement falls on JSON's own syntax or escapes. What the wire format itself
+    writes keeps the user name, so that a login that is also one of its words changes no block: a
+    name that is an identifier, the values of the fields it enumerates (`_FORMAT_VALUES`), a
+    stream's event names. Inside a tool call's input, a request's metadata, a tool's input examples
+    and a schema's property names and instance values, every name is data.
 
     A base64 payload (an image's or a document's `data`, a `data:` URL) is kept byte for byte: a
     replacement inside it would corrupt the file, and a short user name occurs in any encoding by
-    chance. It is decoded and read instead: one that holds the home directory or a key is refused
-    (`scrub.Refused`), and the capture is not written.
+    chance. It is decoded and read instead: one whose bytes hold the home directory, the user name
+    (an author in an image's or a PDF's metadata, say) or a key is refused (`scrub.Refused`), and
+    the capture is not written.
     A body that needs no replacement keeps its bytes.
     """
 
@@ -362,6 +388,13 @@ class Neutral:
         self._field_pattern = re.compile(common)
         self._homes = [value.encode("utf-8") for value in homes]
         self._keys = [value.encode("utf-8") for value in keys if value]
+        # The user name in a file's bytes, as its metadata writes text: UTF-8, or UTF-16 of either order.
+        spelled = [re.escape(user.encode(encoding)) for encoding in ("utf-8", "utf-16-le", "utf-16-be")] if user else []
+        self._user_bytes = re.compile(b"|".join(spelled) or b"(?!)", re.IGNORECASE)
+
+    def format(self, text: str) -> str:
+        """A text the wire format writes: only a host, a key or the home directory is replaced in it."""
+        return self._field_pattern.sub(self._replacement, text)
 
     def text(self, text: str) -> str:
         found = _DATA_URL.match(text)
@@ -381,12 +414,14 @@ class Neutral:
             raise scrub.Refused(scrub.KEY, "a base64 payload")
         if any(home in decoded for home in self._homes):
             raise scrub.Refused("home directory", "a base64 payload")
+        if self._user_bytes.search(decoded):
+            raise scrub.Refused("user name", "a base64 payload")
         return True
 
     def name(self, name: str, *, data: bool = False) -> str:
         """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
         if not data and _IDENTIFIER.fullmatch(name):
-            return self._field_pattern.sub(self._replacement, name)
+            return self.format(name)
         return self.text(name)
 
     @staticmethod
@@ -407,9 +442,11 @@ class Neutral:
                 written = inner  # An image's or a document's bytes (Messages, `source`).
             elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
                 written = {self.text(field): self.value(schema) for field, schema in inner.items()}
+            elif name in _FORMAT_VALUES and isinstance(inner, str) and not data:
+                written = self.format(inner)
             else:
                 tool_input = name == "input" and str(value.get("type", "")).endswith("tool_use")
-                written = self.value(inner, data=data or tool_input or name == "metadata")
+                written = self.value(inner, data=data or tool_input or name in _DATA_FIELDS)
             neutral[self.name(name, data=data)] = written
         return neutral
 
@@ -435,6 +472,8 @@ class Neutral:
         return "\n".join(self._line(line) for line in text.split("\n"))
 
     def _line(self, line: str) -> str:
+        if line.startswith("event:"):  # A stream's event name is the format's.
+            return self.format(line)
         found = _DATA.match(line)
         return self.text(line) if found is None else found.group() + self.json_text(line[found.end() :])
 
@@ -501,15 +540,19 @@ async def capture_of(
         answer = _without_keep_alives(route, answer)
     request_body = neutral.body(exchange.body.decode("utf-8"))
     answer_body = neutral.body(answer.decode("utf-8"))
-    headers = {"host": EXAMPLE_HOST} | {
-        neutral.text(name.lower()): neutral.text(value)
-        for name, value in exchange.headers
-        if name.lower() not in _UNRECORDED
-    }
+    headers = {"host": EXAMPLE_HOST}
+    for name, value in exchange.headers:
+        if name.lower() in _UNRECORDED:
+            continue
+        written = neutral.format if name.lower() in _FORMAT_HEADERS else neutral.text
+        headers[written(name.lower())] = written(value)
+    # The path of a route of the gateway is the format's; a query, or a path it does not know, is text.
+    path, mark, query = exchange.target.decode("latin-1").partition("?")
+    target = (neutral.text(path) if route is None else neutral.format(path)) + mark + neutral.text(query)
     capture: dict[str, Any] = {
         "request": {
             "method": exchange.method,
-            "path": neutral.text(exchange.target.decode("latin-1")),
+            "path": target,
             "headers": headers,
             "body": request_body,
         }
@@ -530,7 +573,7 @@ async def capture_of(
     lines = answer_body.splitlines(keepends=True)
     capture["answer"] = {
         "status": exchange.status,
-        "headers": {"content-type": neutral.text(content_type)} if content_type else {},
+        "headers": {"content-type": neutral.format(content_type)} if content_type else {},
         # One text for each line of a stream, so that the file reads and compares line by line.
         "body": lines if len(lines) > 1 else answer_body,
     }
@@ -598,6 +641,8 @@ class Session:
         parts = urlsplit(upstream)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError("the upstream is an http or https URL with a host")
+        # Read before the folder is held, so that a pool with no profile leaves it free.
+        self._stated = None if profile is None else profile_of(profile)
         out.mkdir(parents=True, exist_ok=True)
         # The folder is held for as long as the session lasts (`close`): a second recorder, in this
         # process or another, cannot start in it, and the empty folder is checked once it is held.
@@ -614,7 +659,6 @@ class Session:
         self._hosts = (parts.netloc, parts.hostname)
         self._out = out
         self._pool = pool
-        self._stated = None if profile is None else profile_of(profile)
         self._home = str(Path.home()) if home is None else home
         self._user = getpass.getuser() if user is None else user
         self._transport = transport
