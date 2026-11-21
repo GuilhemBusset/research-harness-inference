@@ -435,3 +435,40 @@ def test_a_release_reported_only_after_the_run_does_not_label_it() -> None:
     in_service = s5.in_service_of(series, 1000.0, 1030.0)
     assert s5.build_of(in_service) == "build-a"
     assert in_service["worker"].seconds == 30.0
+
+
+def test_a_counter_that_went_stale_before_the_run_and_resumed_in_it_counts_only_the_runs_output() -> None:
+    # The worker's counter held 1,000, went stale at END + 15, and its engine resumed in the run, from
+    # END + 15.25 to END + 45.75, generating 500 tokens. A plain selector shows nothing after the stale
+    # marker; a range one ignores it; the anchored increase starts from 1,000 and sees the reset.
+    scrapes = [(END, 1000.0), (END + 15, None), (END + 30, 500.0), (END + 45, 500.0), (END + 60, 500.0)]
+    clock = Clock()
+    clock.now = END + 15.25
+
+    class Stale(Workspace):
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if "vllm:generation_tokens_total" not in query:
+                return super().read_series(query, start=start, end=end, step=step)
+            if "anchored" in query:
+                return [common.Series({"instance": "instance-a"}, ((end, 500.0),))]
+            ranged = "last_over_time(" in query
+            points = [start + n * step for n in range(int((end - start) / step) + 1)]
+            seen = [
+                (point, latest[-1][1])
+                for point in points
+                if (latest := [s for s in scrapes if s[0] <= point and (s[1] is not None or not ranged)])
+                and latest[-1][1] is not None
+            ]
+            return [common.Series({"instance": "instance-a"}, tuple(seen))] if seen else []
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        clock.now = END + 45.75
+        return [record(True, 1.0)]
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=30, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=Stale(), replay=replay, wall=clock, sleep=lambda _: None,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert run.instances["instance-a"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
