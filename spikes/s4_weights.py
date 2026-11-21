@@ -27,14 +27,19 @@ scaler alone starts an instance (section 5.1). For each of the starts it is give
 3. **The weights stage of that start.** The lifecycle agent sets `rhi_lifecycle_stage_seconds`
    (`rhi_lifecycle.stages`) for each stage of its launch, and the node's collector writes it to the
    workspace with the instance's ID as the label `instance`. The job reads the weights and the hook
-   stages of the pool, with the time each sample was taken (`timestamp()`), from the wake on, and
-   keeps only the samples taken after the wake: no instance was writing when it was sent, so these
-   come from a launch that began after it. **The launch that became ready** is the one, an instance
-   and a transition into service (a promotion from the warm pool, or a cold launch), that has both
-   a weights and a hook sample after the wake. The hook stage ends only when Auto Scaling has taken
-   the launch's completion with `CONTINUE`: a launch abandoned after its weights loaded has a
-   weights sample and no hook, and is not counted; its replacement is. A start with no such launch,
-   or with two, is not counted, and stops the run (`weights_of_launch`).
+   stages of the pool from the wake on, in one query that keeps only the samples taken after the
+   wake (`X and timestamp(X) > <wake>`): each value and the time of its own sample are read
+   together, so a sample that reaches the workspace late cannot lend its time to an older value. No
+   instance was writing when the wake was sent, so these samples come from a launch that began
+   after it. **The launch that became ready** is the one, an instance and a transition into service
+   (a promotion from the warm pool, or a cold launch), that has both a weights and a hook sample
+   after the wake, and whose instance was still scraped when the pool became ready: a sample taken
+   no more than `FRESH_SECONDS` before readiness (`Pool.launch`). A launch abandoned after its
+   weights loaded has no hook sample. A launch whose completion Auto Scaling did not take still
+   has one, but its instance waits out the hook and is gone before the group launches its
+   replacement: neither is counted, and the replacement is, once its samples reach the workspace.
+   A start with no such launch, or with two, is not counted, and stops the run
+   (`weights_of_launch`).
 
 **The numbers** (`Number`), posted with the verdict through `common.run_spike`: `starts`, the
 starts made, and `weights_seconds_median`, the median of their weights stages in seconds. Each
@@ -44,13 +49,14 @@ start's seconds, instance transition and the setting are printed, for the record
 
 | Variable | What it is |
 | --- | --- |
-| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output |
+| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, or an `https://` address |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_S4_LOADER` | The name of the loader setting the pool runs: lower-case letters, digits and hyphens |
 | `RHI_S4_STARTS` | The starts to make, one or more |
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
 
-`RHI_RUN_LABEL`, if given, must be the loader setting's name. The region comes from CodeBuild's
+The canary key goes to the gateway over HTTPS only: an address of any other scheme is refused
+before anything is sent. `RHI_RUN_LABEL`, if given, must be the loader setting's name. The region comes from CodeBuild's
 `AWS_REGION`. Run it while nothing else sends to the pool: the pool has to go cold between starts.
 """
 
@@ -59,6 +65,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -97,6 +104,9 @@ QUIET_WAIT_SECONDS = 30 * 60
 # that runs has a sample this recent.
 SCRAPE_SECONDS = 15
 QUIET_SECONDS = 90
+# Seconds. An instance that still runs when the pool becomes ready has a stage sample this recent
+# then: the collector scrapes it every `SCRAPE_SECONDS`.
+FRESH_SECONDS = 2 * SCRAPE_SECONDS
 # Seconds. A cold launch pulls the engine image before it loads the weights.
 READY_WAIT_SECONDS = 40 * 60
 # Seconds. How long after readiness the launch's samples may take to reach the workspace, read
@@ -146,42 +156,36 @@ class Launch:
     weights_seconds: float
 
 
-def _identity(labels: Mapping[str, str]) -> frozenset[tuple[str, str]]:
-    # `timestamp()` drops the metric's name, and keeps every other label.
-    return frozenset((name, value) for name, value in labels.items() if name != "__name__")
+def _launch_of(labels: Mapping[str, str]) -> tuple[str, str] | None:
+    """The launch into service a series is of, its instance and its transition; None for another."""
+    instance, transition = labels.get("instance", ""), labels.get("transition", "")
+    return (instance, transition) if instance and transition in INTO_SERVICE else None
 
 
-def taken_after(values: Sequence[common.Series], stamps: Sequence[common.Series], woke_at: float) -> list[common.Series]:
-    """The samples of `values` taken after `woke_at`: each series of `values` paired with the series
-    of `stamps` of the same labels, which gives at each step the time its sample was taken."""
-    taken = {_identity(one.labels): dict(one.samples) for one in stamps}
-    kept = []
-    for one in values:
-        at = taken.get(_identity(one.labels), {})
-        samples = tuple((step, value) for step, value in one.samples if at.get(step, woke_at) > woke_at)
-        if samples:
-            kept.append(common.Series(one.labels, samples))
-    return kept
-
-
-def weights_of_launch(values: Sequence[common.Series], stamps: Sequence[common.Series], woke_at: float) -> Launch:
-    """The launch that became ready for the wake at `woke_at`, from the weights and hook stages of
-    the pool (`values`) and the times their samples were taken (`stamps`): the one launch into
-    service with a weights and a hook sample taken after the wake. NoLaunch when there is none, or
-    more than one."""
+def weights_of_launch(values: Sequence[common.Series], stamps: Sequence[common.Series], ready_at: float) -> Launch:
+    """The launch that became ready at `ready_at`, from the weights and hook stages of the pool
+    taken after the wake (`values`) and the times the pool's stage samples were taken (`stamps`):
+    the one launch into service with a weights and a hook sample, whose instance had a sample taken
+    no more than `FRESH_SECONDS` before readiness. NoLaunch when there is none, or more than one."""
     weights: dict[tuple[str, str], float] = {}
     completed: set[tuple[str, str]] = set()
-    for one in taken_after(values, stamps, woke_at):
-        launch = (one.labels.get("instance", ""), one.labels.get("transition", ""))
-        if not launch[0] or launch[1] not in INTO_SERVICE:
+    for one in values:
+        launch = _launch_of(one.labels)
+        if launch is None or not one.samples:
             continue
         if one.labels.get("stage") == Stage.WEIGHTS.value:
             weights[launch] = one.samples[-1][1]
         elif one.labels.get("stage") == Stage.HOOK.value:
             completed.add(launch)
-    ready = sorted(launch for launch in weights if launch in completed)
+    running = {
+        launch
+        for one in stamps
+        if (launch := _launch_of(one.labels)) is not None
+        and any(taken >= ready_at - FRESH_SECONDS for taken in one.values())
+    }
+    ready = sorted(launch for launch in weights if launch in completed and launch in running)
     if len(ready) != 1:
-        raise NoLaunch(f"{len(ready)} launches into service completed after the wake, not one")
+        raise NoLaunch(f"{len(ready)} launches into service completed and ran at readiness, not one")
     ((instance, transition),) = ready
     return Launch(instance, transition, weights[(instance, transition)])
 
@@ -193,17 +197,33 @@ class Reader(Protocol):
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]: ...
 
 
+def gateway_address(endpoint: str) -> str:
+    """The gateway's HTTPS address from `endpoint`: the gateway stack's output, a host name, or an
+    `https://` address. ValueError for any other: the canary key is sent over HTTPS only."""
+    address = endpoint.strip()
+    if "://" not in address:
+        address = f"https://{address}"
+    parts = urllib.parse.urlsplit(address)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("the gateway's address is not a host name or an https address")
+    return address.rstrip("/")
+
+
 @dataclass(frozen=True)
 class Gateway:
-    """The gateway at `endpoint`, asked about the pool `pool` as the canary student of `key`."""
+    """The gateway at `endpoint` (`gateway_address`), asked about the pool `pool` as the canary
+    student of `key`."""
 
     endpoint: str
     pool: str
     key: str = field(repr=False)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "endpoint", gateway_address(self.endpoint))
+
     def _ask(self, method: str, path: str, body: bytes | None = None) -> Any:
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
-        request = urllib.request.Request(self.endpoint.rstrip("/") + path, data=body, headers=headers, method=method)
+        request = urllib.request.Request(self.endpoint + path, data=body, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT) as answer:
             return json.loads(answer.read())
 
@@ -238,13 +258,14 @@ class Pool:
         )
         return all(taken <= now - QUIET_SECONDS for one in stamps for taken in one.values())
 
-    def launch(self, woke_at: float, now: float) -> Launch:
-        """The launch that became ready for the wake at `woke_at` (`weights_of_launch`)."""
-        selector = self._selector(f"{Stage.WEIGHTS.value}|{Stage.HOOK.value}")
+    def launch(self, woke_at: float, ready_at: float, now: float) -> Launch:
+        """The launch that became ready at `ready_at` for the wake at `woke_at` (`weights_of_launch`)."""
+        stages = self._selector(f"{Stage.WEIGHTS.value}|{Stage.HOOK.value}")
         span = {"start": woke_at, "end": now, "step": SCRAPE_SECONDS}
-        values = self.workspace.read_series(selector, **span)
-        stamps = self.workspace.read_series(f"timestamp({selector})", **span)
-        return weights_of_launch(values, stamps, woke_at)
+        # One query: each value is kept on the test of its own sample's time, both read together.
+        values = self.workspace.read_series(f"{stages} and timestamp({stages}) > {woke_at:.3f}", **span)
+        stamps = self.workspace.read_series(f"timestamp({self._selector()})", **span)
+        return weights_of_launch(values, stamps, ready_at)
 
 
 class Run:
@@ -284,7 +305,7 @@ class Run:
         ready_at = self.wall()
         while True:
             try:
-                return self.pool.launch(woke_at, self.wall())
+                return self.pool.launch(woke_at, ready_at, self.wall())
             except NoLaunch:
                 if self.wall() - ready_at >= READ_WAIT_SECONDS:
                     raise
@@ -328,12 +349,14 @@ def main(environ: Mapping[str, str] = os.environ) -> common.Verdict:
     loader setting's name."""
     label = run_label(environ)
     starts = starts_of(environ)
+    # Refused before anything is measured: the canary key goes over HTTPS only.
+    endpoint = gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
 
     def measure() -> dict[str, int | float]:
         name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
-        gateway = Gateway(environ[ENDPOINT_VARIABLE], name, common.canary_keys().students[0])
+        gateway = Gateway(endpoint, name, common.canary_keys().students[0])
         print(f"pool {name}, loader setting {label}, {starts} starts")
         return Run(gateway, Pool(name, workspace), starts, label).measure()
 
