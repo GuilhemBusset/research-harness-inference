@@ -119,6 +119,32 @@ def test_a_refresh_that_did_not_end_successful_fails_the_decision(ended: str) ->
         decide(autoscaling)
 
 
+class PendingAutoScaling(AutoScaling):
+    """A coursework refresh listed while pending, with no start time: each read of it gives the
+    next of `reads`, as `(status, start time or None)`, the last one repeated."""
+
+    def __init__(self, reads: list[tuple[str, datetime | None]]) -> None:
+        super().__init__({})
+        self.pending = reads
+
+    def describe_instance_refreshes(self, **request: Any) -> dict[str, Any]:
+        if "InstanceRefreshIds" not in request:
+            listed = [{"InstanceRefreshId": "r-1", "Status": "Pending"}]
+            return {"InstanceRefreshes": listed if request["AutoScalingGroupName"] == "coursework-group" else []}
+        status, began = self.pending.pop(0) if len(self.pending) > 1 else self.pending[0]
+        return {"InstanceRefreshes": [{"InstanceRefreshId": "r-1", "Status": status, "StartTime": began}]}
+
+
+def test_a_pending_refresh_is_waited_for_and_counts_once_it_has_begun() -> None:
+    reads: list[tuple[str, datetime | None]] = [("Pending", None), ("InProgress", AFTER), ("Successful", AFTER)]
+    assert decide(PendingAutoScaling(reads)) == ["coursework"]
+
+
+@pytest.mark.parametrize("ended", ["Cancelled", "Failed"])
+def test_a_refresh_that_ends_without_having_begun_asks_for_nothing(ended: str) -> None:
+    assert decide(PendingAutoScaling([("Pending", None), (ended, None)])) == []
+
+
 def test_a_refresh_still_running_after_the_wait_fails_the_decision() -> None:
     autoscaling, clock = AutoScaling({"coursework-group": [("r-1", AFTER)]}, {"r-1": ["InProgress"]}), Clock()
     with pytest.raises(decision.DecisionError, match="still InProgress"):
