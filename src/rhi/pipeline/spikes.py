@@ -5,7 +5,8 @@ A spike that needs AWS runs as a job the owner starts: a merge never starts one,
 cost real money are the owner's call. **`JOBS` is the list.** Each entry names a job and the script
 under `spikes/` it runs, and a job exists only for an entry: a module of `spikes/` that is not a
 job (`spikes/common.py`, the load generator) never becomes one. Each spike's issue adds its own
-entry to `JOBS`, and nothing else of this module changes.
+entry to `JOBS`, and nothing else of this module changes. An entry may give its job a longer
+timeout than the default, in hours, up to CodeBuild's limit.
 
 **What a job is.** A CodeBuild project of the pipeline's stack, named `rhi-spike-<job>`. The owner
 starts a build of it on a commit of `main`, its head unless the build is given another commit. It
@@ -74,9 +75,10 @@ BRANCH = "main"
 # it from the spikes' too (`rhi.observability.grafana`).
 LOG_GROUP_NAME = "/aws/codebuild/rhi-spikes"
 LOG_RETENTION = logs.RetentionDays.ONE_YEAR
-# A spike may wait on a pool's starts one after another, or replay a class's sessions: longer
-# than CodeBuild's default hour, within its limit.
-TIMEOUT = cdk.Duration.hours(8)
+# Hours. A spike may wait on a pool's starts one after another, or replay a class's sessions:
+# longer than CodeBuild's default hour. A job that needs more gives its own, within CodeBuild's limit.
+TIMEOUT_HOURS = 8
+MAX_TIMEOUT_HOURS = 36
 # What CodeBuild's user guide asks of a project's role to read a repository through a connection.
 CONNECTION_ACTIONS = ["codeconnections:GetConnection", "codeconnections:GetConnectionToken"]
 # What CodeBuild does with a project's key: encrypt and decrypt what it stores of a build.
@@ -87,16 +89,20 @@ POOL_STATE_READS = ["dynamodb:GetItem", "dynamodb:Query"]
 @dataclass(frozen=True)
 class SpikeJob:
     """One spike job: its name, lower-case letters, digits and underscores, which is also the name
-    `spikes/common.py` gives its runs, and the script it runs, a file directly under `spikes/`."""
+    `spikes/common.py` gives its runs, the script it runs, a file directly under `spikes/`, and the
+    hours a build of it may take."""
 
     name: str
     script: str
+    timeout_hours: int = TIMEOUT_HOURS
 
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
             raise ValueError(f"a spike job's name is lower-case letters, digits and underscores: {self.name!r}")
         if not _SCRIPT.fullmatch(self.script):
             raise ValueError(f"a spike job's script is a Python file directly under {FOLDER}/: {self.script!r}")
+        if not 1 <= self.timeout_hours <= MAX_TIMEOUT_HOURS:
+            raise ValueError(f"a spike job's timeout is 1 to {MAX_TIMEOUT_HOURS} hours: {self.timeout_hours!r}")
 
     @property
     def project_name(self) -> str:
@@ -114,6 +120,8 @@ JOBS: tuple[SpikeJob, ...] = (
     SpikeJob("s8_stickiness", "s8_stickiness.py"),
     SpikeJob("s2_client_hold", "s2_client_hold.py"),
     SpikeJob("s4_weights", "s4_weights.py"),
+    # Twenty starts, each until the pool falls idle and the scaler returns its instance.
+    SpikeJob("s1_cold_start", "s1_cold_start.py", timeout_hours=24),
 )
 
 
@@ -208,7 +216,7 @@ class SpikeJobs(Construct):
                 logging=codebuild.LoggingOptions(
                     cloud_watch=codebuild.CloudWatchLoggingOptions(log_group=self.log_group)
                 ),
-                timeout=TIMEOUT,
+                timeout=cdk.Duration.hours(job.timeout_hours),
             )
             # The repository through the pipeline's connection, not through a credential of the account.
             resource = project.node.default_child
