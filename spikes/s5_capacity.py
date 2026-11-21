@@ -168,13 +168,15 @@ record holds the whole matrix:
 
 It reads the pages `gh api --paginate` writes one after the other (`statuses_of`). Each run is read
 from its newest posting alone (`postings_of`): a retry of a run label is not joined to that run's
-older parts, and a run is a pass only from one whole posting. `class_size` is the last number a job
-posts, so the part that holds it is a posting's last: a posting whose last part is not listed yet
-is written pending, and one that began before the posting before it had ended, which nothing in
-the statuses tells apart from it, is written pending with no row. `--run`, repeated, names the runs
+older parts, and a run is a pass only from one whole posting. A job posts `numbers_posted`, how
+many numbers its posting holds, so a posting is whole once that many are listed, whatever the
+order the reporter took them in: a posting with some not listed yet is written pending, and one
+that began before the posting before it had ended, which nothing in the statuses tells apart from
+it, is written pending with no row. A status listed twice, on two pages, is read once. `--run`, repeated, names the runs
 to write, every run of S5 on the commit unless given; a run the record already holds measured on
 another pool or instance type is refused, with nothing written, so the runs of each instance type
-are written apart, each with its own. GitHub dates a status to the second: a retry in the same
+are written apart, each with its own. A job is one instance type's, since its rows take one: one
+whose runs another type served, or two, is refused (`Job.measure`). GitHub dates a status to the second: a retry in the same
 second as the run before it is told apart by the statuses' ids.
 """
 
@@ -209,7 +211,7 @@ from rhi_lifecycle.serving import RELEASE_METRIC
 from rhi_reporter.measure import Verdict, context_parts
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Generator, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Mapping, Sequence
     from collections.abc import Set as AbstractSet
     from types import ModuleType
 
@@ -1106,8 +1108,10 @@ class Job:
     def measure(self) -> list[Measured]:
         """Every run, in the plan's order, each printed as one JSON line once measured. ValueError,
         with nothing sent, for runs with more students than there are keys; and once printed, for
-        a run that another number of instances than `instances` served, or that another build than
-        the job's earlier runs served, with no run after it: the job's numbers are one build's."""
+        a run that another number of instances than `instances` served, or that another build or
+        another instance type than the job's earlier runs served, or two instance types, with no run
+        after it: the job's numbers are one build's on one instance type, the one its record's rows
+        are labelled with."""
         self._keyed(self.runs)
         measured: list[Measured] = []
         for planned in self.runs:
@@ -1117,6 +1121,9 @@ class Job:
                 raise ValueError("a run was served by another number of instances than the pool is held at")
             if measured and one.label.build != measured[0].label.build:
                 raise ValueError("a run was served by another build than the job's earlier runs")
+            types = one.label.instance_types
+            if len(types) > 1 or (measured and types != measured[0].label.instance_types):
+                raise ValueError("a run was served by another instance type than the job's earlier runs, or by two")
             measured.append(one)
         return measured
 
@@ -1165,6 +1172,9 @@ UNITS = {
 }
 CLASS = "class"
 CLASS_SIZE = "class_size"
+POSTED = "numbers_posted"
+"""How many numbers a posting holds, this one included: what tells a whole posting, whatever order
+its numbers reach the reporter in (`postings_of`). Like the class's size, its row is the run's."""
 
 
 def name_of(figure: Figure, shape: Shape, streams: int | None) -> str:
@@ -1179,9 +1189,13 @@ CONDITIONS: dict[str, tuple[Figure, Shape, int | None]] = {
     for shape in Shape
     for streams in (*DECLARED_STREAMS, None)
 }
-Number = StrEnum("Number", {name.upper(): name for name in (CLASS_SIZE, *CONDITIONS)})
+Number = StrEnum("Number", {name.upper(): name for name in (CLASS_SIZE, POSTED, *CONDITIONS)})
 """The names of the numbers the job posts."""
-NAME_UNITS = {CLASS_SIZE: "count", **{name: UNITS[figure] for name, (figure, _, _) in CONDITIONS.items()}}
+NAME_UNITS = {
+    CLASS_SIZE: "count",
+    POSTED: "count",
+    **{name: UNITS[figure] for name, (figure, _, _) in CONDITIONS.items()},
+}
 
 
 def _present(values: Sequence[float | None]) -> list[float]:
@@ -1224,8 +1238,9 @@ def figures_of(measured: Measured) -> dict[Figure, int | float | None]:
 
 
 def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int | float]:
-    """The numbers of a job's runs under their declared names, and the class's size. ValueError
-    for a run at a number of streams no name is declared for."""
+    """The numbers of a job's runs under their declared names, the class's size, and how many
+    numbers they are (`POSTED`). ValueError for a run at a number of streams no name is declared
+    for."""
     numbers: dict[str, int | float] = {}
     for one in measured:
         streams = None if one.label.class_size is not None else one.label.streams
@@ -1234,8 +1249,8 @@ def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int |
         for figure, value in figures_of(one).items():
             if value is not None:
                 numbers[name_of(figure, one.label.shape, streams)] = value
-    # Last, so that the last part of a posting holds it (`ends_posting`).
     numbers[CLASS_SIZE] = class_size
+    numbers[POSTED] = len(numbers) + 1
     return numbers
 
 
@@ -1329,10 +1344,10 @@ def row_of(run: str, name: str, *, pool: str, instance_type: str) -> tuple[str, 
     and its conditions. ValueError for a run label that is not `<build>-<lever>-<instances>`, or a
     name the job does not declare."""
     match = _RUN.fullmatch(run)
-    if match is None or (name != CLASS_SIZE and name not in CONDITIONS):
+    if match is None or (name not in (CLASS_SIZE, POSTED) and name not in CONDITIONS):
         raise ValueError("the run label or the name is not one of spike S5's")
     labels = {"run": run, "pool": pool, "instance_type": instance_type, **match.groupdict()}
-    if name == CLASS_SIZE:
+    if name in (CLASS_SIZE, POSTED):
         return name, labels
     figure, shape, streams = CONDITIONS[name]
     return figure.value, labels | {"session_shape": shape.value, "streams": CLASS if streams is None else str(streams)}
@@ -1384,13 +1399,25 @@ class Posting(StrEnum):
     OVERLAPPING = "overlapping"
 
 
-def ends_posting(status: Mapping[str, Any], part: int) -> bool:
-    """Whether a status is the last part of its posting: the one that holds the class's size, the
-    last number the job posts, or a first part with no number, all a job posts that measured
-    nothing."""
+def _pairs(status: Mapping[str, Any]) -> list[str]:
     description = status.get("description") or ""
-    pairs = description.split(" ") if isinstance(description, str) else []
-    return any(pair.startswith(f"{CLASS_SIZE}=") for pair in pairs) or (part == 1 and not description)
+    return description.split(" ") if isinstance(description, str) and description else []
+
+
+def _counts(statuses: Iterable[Mapping[str, Any]]) -> tuple[int, list[int | None], bool]:
+    """Of some statuses of one run label: the numbers they hold, the counts of their postings
+    (`POSTED`) they hold, None for one that is not a whole number, and whether one of them is a
+    first part with no number, all a job posts that measured nothing."""
+    numbers, counts, empty = 0, [], False
+    for status in statuses:
+        pairs = _pairs(status)
+        numbers += len(pairs)
+        for pair in pairs:
+            name, _, value = pair.partition("=")
+            if name == POSTED:
+                counts.append(int(value) if value.isdigit() else None)
+        empty = empty or not pairs
+    return numbers, counts, empty
 
 
 def postings_of(
@@ -1398,28 +1425,42 @@ def postings_of(
 ) -> tuple[list[Mapping[str, Any]], dict[str, tuple[Posting, datetime]]]:
     """The statuses of each run of S5 that its newest posting holds, and what they show of it,
     with the time of the label's newest status. A job posts a run's parts in their order, one
-    after the other, part 1 first and the class's size last (`ends_posting`); a posting carries
-    nothing else that tells it from another of its label. The newest posting is the newest part 1
-    and the parts posted at its time or after it, up to its last part:
+    after the other, part 1 first; one of them, whichever the order its numbers reached the
+    reporter in, holds how many numbers the posting holds (`POSTED`), or the posting is one part
+    with no number, all a job posts that measured nothing. A posting carries nothing else that
+    tells it from another of its label. The newest posting is the newest part 1 and the parts
+    posted at its time or after it:
 
-    - `WHOLE` when every posting before it had ended before it began, and it holds one status of
-      each part up to its last: a retry is read alone, never joined to an earlier posting's parts;
-    - `INCOMPLETE` when, with the same, its last part is not there yet;
+    - `WHOLE` when every posting before it had ended before it began (all its numbers, its count
+      among them, were there), and it holds one status of each part from 1 and the numbers its
+      count says: a retry is read alone, never joined to an earlier posting's parts;
+    - `INCOMPLETE` when, with the same, some of its numbers are not there yet;
     - `OVERLAPPING` when an earlier posting had not ended when it began, or two statuses of one
-      part, or a part past its last, were posted from its time on: the postings cannot be told
-      apart, and none of their statuses is returned.
+      part, two counts, or more numbers than its count were posted from its time on: the postings
+      cannot be told apart, and none of their statuses is returned.
 
-    GitHub's date of a status is to the second, and its id grows with each status it takes, so when
+    GitHub's id of a status is the status: one listed twice, on two pages a new status shifted the
+    boundary of, is read once. GitHub's date of a status is to the second, and its id grows with
+    each status it takes, so when
     every measurement's status carries its id the statuses are ordered by date then id, and a
     retry in the same second as the run before it is still told apart; without the ids, by date
     alone, and statuses of one instant may be of either posting. The statuses of other
     measurements are left out; a measurement's status this cannot read is kept, for
     `tools/measurements/record.py` to refuse."""
-    read = [_measured(status) for status in statuses]
+    seen: set[int] = set()
+    unique: list[Mapping[str, Any]] = []
+    for status in statuses:
+        number = status.get("id") if isinstance(status, dict) else None
+        if type(number) is int:
+            if number in seen:
+                continue  # a page boundary moved while the pages were read: the same status twice
+            seen.add(number)
+        unique.append(status)
+    read = [_measured(status) for status in unique]
     with_ids = all(one[3] is not None for one in read if one is not None)
     by_label: dict[str, list[tuple[tuple[datetime, int], int, Mapping[str, Any]]]] = {}
     kept: list[Mapping[str, Any]] = []
-    for status, one in zip(statuses, read, strict=True):
+    for status, one in zip(unique, read, strict=True):
         if one is None:
             context = status.get("context") if isinstance(status, dict) else None
             if isinstance(context, str) and context.startswith(f"measure/{MEASUREMENT}/"):
@@ -1437,21 +1478,30 @@ def postings_of(
             continue
         newest = max(firsts)
         before = [(part, status) for order, part, status in of_label if order < newest]
-        begun = sum(part == 1 for part, _ in before)
-        ended = sum(ends_posting(status, part) for part, status in before)
+        # The earlier postings had all ended when it began: each that holds numbers holds its
+        # count, and all their numbers are there.
+        begun = sum(part == 1 and bool(_pairs(status)) for part, status in before)
+        numbers, counts, _ = _counts(status for _, status in before)
+        ended = len(counts) == begun and None not in counts and numbers == sum(c or 0 for c in counts)
         since: dict[int, list[Mapping[str, Any]]] = {}
         for order, part, status in of_label:
             if order >= newest:
                 since.setdefault(part, []).append(status)
-        last = next((part for part in sorted(since) if ends_posting(since[part][0], part)), None)
-        overlapping = (
-            begun > ended or any(len(one) > 1 for one in since.values()) or (last is not None and max(since) > last)
-        )
-        if overlapping:
-            found[label] = (Posting.OVERLAPPING, when)
-            continue
-        found[label] = (Posting.INCOMPLETE if last is None else Posting.WHOLE, when)
-        kept += [one[0] for one in since.values()]
+        numbers, counts, empty = _counts(one for of_part in since.values() for one in of_part)
+        if not _pairs(since[1][0]):
+            read = Posting.WHOLE if len(since) == len(since[1]) == 1 else Posting.OVERLAPPING
+        elif empty or len(counts) > 1 or None in counts:
+            read = Posting.OVERLAPPING
+        elif not counts or numbers < (counts[0] or 0):
+            read = Posting.INCOMPLETE
+        else:
+            whole = numbers == counts[0] and sorted(since) == list(range(1, len(since) + 1))
+            read = Posting.WHOLE if whole else Posting.OVERLAPPING
+        if not ended or any(len(one) > 1 for one in since.values()):
+            read = Posting.OVERLAPPING
+        found[label] = (read, when)
+        if read is not Posting.OVERLAPPING:
+            kept += [one[0] for one in since.values()]
     return kept, found
 
 
