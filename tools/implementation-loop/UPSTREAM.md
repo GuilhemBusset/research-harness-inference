@@ -25,6 +25,37 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## Nothing locks a test, and no zone restricts the builder (2026-11-21)
+
+A local patch, not in upstream, by the owner's decision of 2026-11-21 (ADR 0001, amendment 10).
+The tests the builder wrote locked at the first examination: an edit was reverted unless the
+other vendor approved a `test_change` request, a conflict in one went to the other vendor
+(`resolve_locked`), and every test a command once ran had to keep running. The plan's zones
+bounded what a builder could change, behind a `paths` request, and a changed command needed a
+`command_change` request. A third of the failed rounds came from the locks alone, and almost
+every `paths` request was approved. The builder may now change any file, its tests and commands
+included; the examiner reviews every change to a test, and protected paths stay as they were.
+The engine's version stays 1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/engine.py` | Gone: the lock commit at the first examination (`_lock_tests`) and the late one, the revert of edits to locked tests, `test_change`, the relock after main's merge, the other vendor's resolution of a conflict in a locked test, the selection manifest and the "unselected" check, the plan's zones (`_declare`, conflict and `paths` grants, the zone failure), and `command_change`. The examined head is the head that lands, with no delta examination after a lock commit. A protected path is granted at planning when the issue's deliverables name it (it used to need the plan's zones too); the verify step passes every changed file as in the lane to `gate.zone_problems`, so only a protected path without a grant, or the safety surface in a repair run, fails it. A stored request of a retired kind is refused with the reason (`RETIRED_REQUESTS`). `_release_locks`: before a build on a branch whose acceptance-checks commits still lock files in CI's loop guard (`locked_on_branch`, read as the guard reads them), one commit that changes no file releases them (`locks_released`). Unreviewed files of an external merge are those of the issue's own change, not of its zones. |
+| `implement_loop/workspace.py` | `commit_unlocks`: that release commit, on top of HEAD, leaving the index and the working tree as they are. |
+| `implement_loop/verify.py` | `verify` takes no locks, check files or manifest and returns `(ok, evidence, problems)`. Gone: `digest`, `lock`, `tamper_report`, `config_candidates`, `selection`, `unselected`, `not_run`, `defined_tests`, `base_id`. |
+| `implement_loop/config.py` | `TEST_CONFIG_NAMES` goes. |
+| `implement_loop/model.py` | `IssueState` loses `tests`, `locked`, `manifest`, `dispositions`, `reverted` and `last_ran`. A `state.json` that holds them, or a plan with `zones`, still loads: unknown keys are dropped. |
+| `implement_loop/schemas.py`, `implement_loop/agents.py` | The request kinds `paths`, `command_change` and `test_change`, and a request's command fields, go. The fake agents lose `resolve_locked` and the lock scenarios; a blocked build asks with `protected_change`. |
+| `prompts/build.md`, `plan.md`, `decide.md`, `examine.md` | No locks, no zones, no command or test requests. The examiner is told that a weakened test is a finding under "check or gate bypass". |
+| tests | The tests of locks, zones and command requests go (`test_relock_digest.py`, `test_main_suite_selection.py`, `test_test_change_proposals.py`, `test_command_tests_oserror.py` whole); `test_protected_zones.py` becomes `test_protected_paths.py` and `test_deleted_on_main.py` becomes `test_committed_probes.py`. New: an earlier engine's lock is released before the builder edits the test, and CI's guard passes (`test_engine_recovery.py`); the engine reads the guard's locks as the guard does (`test_live.py`); old state still loads (`test_scheduler_state_verify.py`). |
+
+Left in place on purpose, because they are on the safety surface and this change does not need
+them changed: `live.py` still has the `resolve_locked` role and parses the plan's `zones` and the
+build's `dispositions` (so `schemas.py` keeps those fields, `prompts/resolve_locked.md` stays,
+and the prompts tell the agents to leave them empty), `loop.toml` keeps `[roles.resolve_locked]`,
+`gate.py` keeps its zone check (`path_allowed`, the "outside the plan's zones" message) and
+`lint_plan`'s zones argument, and `scripts/check-loop-guard.sh` keeps enforcing the locks of
+earlier acceptance-checks commits. The engine calls none of the first ones.
+
 ## Nothing runs again on `main` after a merge, and a repeated command runs once (2026-11-21)
 
 A local patch, not in upstream, by the owner's decision of 2026-11-21 to remove the engine's

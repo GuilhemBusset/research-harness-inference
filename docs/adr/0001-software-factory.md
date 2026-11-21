@@ -330,6 +330,23 @@ are recorded here as proposed and are part of what the owner approves.
    An item that ends with `(needs <capability>)` for a capability no CI job provides gets no
    verdict demand; it is the owner's obligation. The supervisor gives a repair run only to an
    engine exception, never to an issue that stalled (`ceiling`, `no_progress`).
+10. **The engine no longer restricts the builder (2026-11-21).** Four controls over the builder
+   go, because they caused most of the loop's false failures. The builder's tests no longer lock
+   at the first examination: no reverted edit, no `test_change` request, no conflict in a locked
+   test handed to the other vendor, no selection manifest. The plan has no zones: no `paths` or
+   `command_change` request, and no failure for a file outside the plan. Nothing is re-run on
+   `main` after a merge: neither the issue's checks nor those of earlier issues, so no fix-forward
+   or revert follows from them. And a command that several criteria name runs once per
+   verification. The builder may change any file, its tests and commands included; the examiner
+   reviews every change to a test in the diff, and one that weakens what an item or an invariant
+   needs proven is a finding under "check or gate bypass". What stays: the hygiene scan and the
+   issue's commands on the exact head, the protected paths of decision 10 with the
+   `protected_change` request, the examiner's certificate, `required` on the merged head (CI runs
+   every test on each pull request and on each push to `main`), and the deployment verdict of
+   point 5 with its fix-forward and revert. In the gate table of point 4, the verifier's row now
+   reads "Issue commands and adopted probes; protected paths; skip accounting". An acceptance-checks
+   commit an earlier engine made on a branch still binds CI's loop guard, so before the builder
+   works on such a branch the engine releases what it locked, once.
 
 ## Verified and taken on trust
 
