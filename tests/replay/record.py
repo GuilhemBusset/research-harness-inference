@@ -1,4 +1,35 @@
-"""Record the captures the mock engine can produce by itself (`tests/captures/README.md`).
+"""Record captures (`tests/captures/README.md`): the mock engine's own, or a harness's session.
+
+**A harness's session.**
+
+    uv run --locked python tests/replay/record.py session --upstream https://<endpoint> --out <folder>
+
+serves a local recorder on a loopback port. Someone points a harness at it in place of the
+endpoint. The recorder forwards every request to the endpoint as it came, and streams the answer
+back unchanged. It saves each exchange in the order it arrived, as a capture numbered in that
+order (`Session`):
+
+- `<n>.json` for an exchange that the replay harness replays: an engine's answer (status 200) on a
+  forwarded route of the gateway;
+- `<n>.gateway` for every other exchange, in the same format: a route the gateway answers itself
+  (`GET /v1/models`, ...), a path outside its table, or a refusal. The replay harness only reads
+  `*.json` files, so it leaves these out.
+
+Before a capture is written, every text of it is made neutral (`Neutral`): the endpoint's host and
+the recorder's own address become `EXAMPLE_HOST`, the student key becomes `KEY_PLACEHOLDER`, the
+recording machine's home directory becomes `NEUTRAL_HOME` and its user name becomes `NEUTRAL_USER`,
+wherever any of them appears in a request or an answer. The headers that carry the key are dropped.
+The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
+engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
+reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
+the scrubber found it, never the value.
+
+`--pool <name>` sends every forwarded request to that pool of the endpoint, by writing the pool's
+name in the `model` field of what goes upstream. The capture keeps the model the harness sent.
+`--profile <name>` writes a profile into each replayable capture: the request profile of that pool
+of `config.example.toml`, and the body the engine must receive with that profile applied.
+
+**The mock engine's own captures.**
 
     uv run --locked python tests/replay/record.py
 
@@ -22,14 +53,24 @@ so that recording again writes the same files until the mock or a filter changes
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import getpass
 import json
+import re
+import socket
 import sys
+import threading
+import time
 import tomllib
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
+from urllib.parse import urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 # Python gives a script its own folder and nothing else: the roots pytest is given go on the path.
@@ -38,14 +79,18 @@ _ROOTS = [str(REPO / root) for root in _PYPROJECT["tool"]["pytest"]["ini_options
 sys.path[:0] = [root for root in _ROOTS if root not in sys.path]
 
 import httpx
+import uvicorn
 from prometheus_client.parser import text_string_to_metric_families
-from starlette.types import Message
+from starlette.types import Message, Receive, Scope, Send
 
 import harness
 import scrub
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
+from rhi_common.keys import KEY_PATTERN
 from rhi_gateway import routes
 from rhi_gateway.app import RequestBody
+from rhi_gateway.errors import GatewayError
+from rhi_gateway.hold import keep_alive
 from rhi_mock_engine import app as engine
 
 # The moment the mock's clock stands at while it is recorded: 2027-01-15, an invented one.
@@ -210,11 +255,389 @@ def record() -> dict[str, dict[str, Any]]:
         return asyncio.run(every())
 
 
-def main() -> None:
-    for name, capture in record().items():
-        path = harness.CAPTURES / f"{name}.json"
+# What a recorded session's captures write in place of the machine's and the student's own values.
+EXAMPLE_HOST = "gateway.example.com"
+NEUTRAL_HOME = "/home/user"
+NEUTRAL_USER = "user"
+KEY_PLACEHOLDER = "the-student-key"  # Not in the shape of a key: the scrubber passes it.
+# Headers left out of a capture's request: those that carry the key, the connection's own, and the
+# cookie, which may hold the load balancer's stickiness. The host is written as `EXAMPLE_HOST`.
+_UNRECORDED = frozenset(
+    {
+        *harness.KEY_HEADERS,
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "accept-encoding",
+        "cookie",
+    }
+)
+# Headers the recorder does not pass on between a harness and the endpoint: the connection's own.
+# It asks the endpoint for an answer with no encoding, so that what it records is the bytes as sent.
+_HOP_BY_HOP = frozenset(
+    {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "accept-encoding",
+        "content-encoding",
+    }
+)
+_DATA = re.compile(r"data: ?")
+
+
+class Neutral:
+    """What a recorded text has in place of the endpoint's host, the key, the home directory and the user name.
+
+    Each value is replaced wherever it appears, inside a longer word as well, in one pass: what a
+    replacement writes is not read again. A host and the user name match in any letter case. A
+    body's JSON is rewritten string by string and name by name, so that no replacement falls on
+    JSON's own syntax or escapes. A body that needs no replacement keeps its bytes.
+    """
+
+    def __init__(self, *, hosts: Sequence[str], home: str, user: str, keys: Sequence[str] = ()) -> None:
+        def literal(values: Sequence[str]) -> str:
+            # The longest first, so that a host with its port wins over the host alone. An empty one matches nothing.
+            written = sorted({value for value in values if value}, key=len, reverse=True)
+            return "|".join(re.escape(value) for value in written) or "(?!)"
+
+        # The root of the file system is no home directory: replacing every `/` would write nonsense.
+        homes = [home] if home.strip("/") else []
+        self._pattern = re.compile(
+            f"(?P<host>(?i:{literal(hosts)}))|(?P<key>{literal(keys)}|{KEY_PATTERN})"
+            f"|(?P<home>{literal(homes)})|(?P<user>(?i:{literal([user])}))"
+        )
+
+    def text(self, text: str) -> str:
+        return self._pattern.sub(self._replacement, text)
+
+    @staticmethod
+    def _replacement(found: re.Match[str]) -> str:
+        return {"host": EXAMPLE_HOST, "key": KEY_PLACEHOLDER, "home": NEUTRAL_HOME, "user": NEUTRAL_USER}[
+            str(found.lastgroup)
+        ]
+
+    def value(self, value: Any) -> Any:
+        """A JSON value, each of its names and strings made neutral."""
+        if isinstance(value, dict):
+            return {self.text(name): self.value(inner) for name, inner in value.items()}
+        if isinstance(value, list):
+            return [self.value(inner) for inner in value]
+        return self.text(value) if isinstance(value, str) else value
+
+    def json_text(self, text: str) -> str:
+        """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not."""
+        try:
+            held = json.loads(text)
+        except ValueError:
+            return self.text(text)
+        if not isinstance(held, (dict, list)):
+            return self.text(text)
+        neutral = self.value(held)
+        return text if neutral == held else json.dumps(neutral, separators=(",", ":"), ensure_ascii=False)
+
+    def body(self, text: str) -> str:
+        """A body: JSON, or a stream whose `data:` lines are JSON, or any other text."""
+        try:
+            whole = json.loads(text)
+        except ValueError:
+            whole = None
+        if isinstance(whole, (dict, list)):
+            return self.json_text(text)
+        return "\n".join(self._line(line) for line in text.split("\n"))
+
+    def _line(self, line: str) -> str:
+        found = _DATA.match(line)
+        return self.text(line) if found is None else found.group() + self.json_text(line[found.end() :])
+
+
+@dataclass(frozen=True)
+class Exchange:
+    """One request of a session as the harness sent it, and the endpoint's answer as it came."""
+
+    method: str
+    target: bytes
+    """The path and the query string, as the harness sent them."""
+    headers: Sequence[tuple[str, str]]
+    body: bytes
+    status: int
+    answer_headers: Sequence[tuple[str, str]]
+    answer: bytes
+
+
+def profile_of(pool_name: str) -> dict[str, Any]:
+    """The request profile of a pool of `config.example.toml`, as a capture states it."""
+    pool = next((pool for pool in harness.POOLS if pool.name == pool_name), None)
+    if pool is None or not pool.request_profile:
+        raise ValueError(f"config.example.toml has no pool {pool_name!r} with a request profile")
+    stated: dict[str, Any] = {"request_profile": list(pool.request_profile)}
+    if pool.reasoning_effort is not None:
+        stated["reasoning_effort"] = dict(pool.reasoning_effort)
+    return stated
+
+
+def _without_keep_alives(route: routes.Route, answer: bytes) -> bytes:
+    """A stream without the keep-alives the gateway wrote before the engine's first event (section 5.3)."""
+    assert route.wire_format is not None
+    written = keep_alive(route.wire_format).data
+    while answer.startswith(written):
+        answer = answer[len(written) :]
+    return answer
+
+
+def _usage(route: routes.Route | None, answer: bytes) -> dict[str, int]:
+    """The usage an answer reports, read as its route's answers write it."""
+    if route == routes.COUNT_TOKENS:
+        # A token count's answer is `{"input_tokens": n}`, with no usage object.
+        try:
+            counted = json.loads(answer).get("input_tokens")
+        except (ValueError, AttributeError):
+            counted = None
+        return {"input_tokens": counted if isinstance(counted, int) else 0, "output_tokens": 0}
+    reported = harness.reported(answer)
+    return {"input_tokens": reported.input_tokens, "output_tokens": reported.output_tokens}
+
+
+async def capture_of(
+    exchange: Exchange, neutral: Neutral, stated: Mapping[str, Any] | None = None
+) -> tuple[bool, dict[str, Any]]:
+    """The capture of one exchange, neutral and read by the scrubber, and whether the replay harness replays it.
+
+    Raises `scrub.Refused` for what the scrubber refuses.
+    """
+    route = routes.match(exchange.method, exchange.target)
+    replayable = route is not None and route.wire_format is not None and exchange.status == 200
+    content_type = next((value for name, value in exchange.answer_headers if name.lower() == "content-type"), "")
+    answer = exchange.answer
+    if replayable and route is not None and content_type.split(";", 1)[0].strip().lower() == harness.STREAM_TYPE:
+        answer = _without_keep_alives(route, answer)
+    request_body = neutral.body(exchange.body.decode("utf-8"))
+    answer_body = neutral.body(answer.decode("utf-8"))
+    headers = {"host": EXAMPLE_HOST} | {
+        name.lower(): neutral.text(value) for name, value in exchange.headers if name.lower() not in _UNRECORDED
+    }
+    capture: dict[str, Any] = {
+        "request": {
+            "method": exchange.method,
+            "path": neutral.text(exchange.target.decode("latin-1")),
+            "headers": headers,
+            "body": request_body,
+        }
+    }
+    if stated is not None and replayable and route is not None:
+        sent = request_body.encode("utf-8")
+
+        async def receive() -> Message:
+            return {"type": "http.request", "body": sent, "more_body": False}
+
+        forwarded = await harness.filters(stated)[route].read(
+            RequestBody(receive), student=str(harness.STUDENT), request_id=REQUEST_ID
+        )
+        capture["profile"] = dict(stated)
+        capture["forward"] = {
+            field: value for field, value in json.loads(forwarded.body).items() if field not in harness.LEFT_OUT
+        }
+    lines = answer_body.splitlines(keepends=True)
+    capture["answer"] = {
+        "status": exchange.status,
+        "headers": {"content-type": neutral.text(content_type)} if content_type else {},
+        # One text for each line of a stream, so that the file reads and compares line by line.
+        "body": lines if len(lines) > 1 else answer_body,
+    }
+    capture["usage"] = _usage(route, answer_body.encode("utf-8"))
+    scrub.check(capture)
+    return replayable, capture
+
+
+def _key_presented(headers: Sequence[tuple[str, str]]) -> list[str]:
+    """The key in the headers that carry one: `x-api-key`, or the bearer of `authorization`."""
+    presented = []
+    for name, value in headers:
+        if name.lower() == "x-api-key":
+            presented.append(value.strip())
+        elif name.lower() == "authorization":
+            presented.append(value.strip().removeprefix("Bearer").strip())
+    return presented
+
+
+class Session:
+    """The recorder of a session: an ASGI application to put between a harness and the endpoint.
+
+    Every request is forwarded to `upstream` and its answer streamed back as it comes. Each exchange
+    is numbered in the order its request arrived and written to `out` once its answer has ended:
+    `<n>.json` when the replay harness replays it, `<n>.gateway` when not (see the module's text).
+    `pool` sends the forwarded requests to that pool of the endpoint; `profile` states the request
+    profile of that pool of `config.example.toml` in each replayable capture. The home directory and
+    the user name replaced are the machine's own unless given.
+    """
+
+    def __init__(
+        self,
+        upstream: str,
+        out: Path,
+        *,
+        pool: str | None = None,
+        profile: str | None = None,
+        home: str | None = None,
+        user: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        parts = urlsplit(upstream)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("the upstream is an http or https URL with a host")
+        self._upstream = upstream.rstrip("/")
+        self._hosts = (parts.netloc, parts.hostname)
+        self._out = out
+        self._pool = pool
+        self._stated = None if profile is None else profile_of(profile)
+        self._home = str(Path.home()) if home is None else home
+        self._user = getpass.getuser() if user is None else user
+        self._transport = transport
+        self._arrived = 0
+        self.written: list[Path] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return
+        self._arrived += 1
+        number = self._arrived
+        target = scope.get("raw_path") or scope["path"].encode("ascii")
+        if scope.get("query_string"):
+            target += b"?" + scope["query_string"]
+        headers = [(name.decode("latin-1"), value.decode("latin-1")) for name, value in scope["headers"]]
+        body = await self._request_body(receive)
+        async with httpx.AsyncClient(transport=self._transport, timeout=None, trust_env=False) as client:
+            sent = [(name, value) for name, value in headers if name.lower() not in _HOP_BY_HOP]
+            request = client.build_request(
+                scope["method"],
+                self._upstream + target.decode("latin-1"),
+                headers=[*sent, ("accept-encoding", "identity")],
+                content=self._upstream_body(scope["method"], target, body),
+            )
+            answer = await client.send(request, stream=True)
+            answer_headers = list(answer.headers.multi_items())
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": answer.status_code,
+                    "headers": [
+                        (name.encode("latin-1"), value.encode("latin-1"))
+                        for name, value in answer_headers
+                        if name.lower() not in _HOP_BY_HOP
+                    ],
+                }
+            )
+            received = bytearray()
+            try:
+                async for chunk in answer.aiter_raw():
+                    received += chunk
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            finally:
+                await answer.aclose()
+        exchange = Exchange(scope["method"], target, headers, body, answer.status_code, answer_headers, bytes(received))
+        # Written before the answer ends, so that a harness that has its answer finds its capture.
+        await self._keep(number, exchange)
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    @staticmethod
+    async def _request_body(receive: Receive) -> bytes:
+        body = bytearray()
+        while True:
+            message: Message = await receive()
+            body += message.get("body", b"")
+            if message["type"] != "http.request" or not message.get("more_body"):
+                return bytes(body)
+
+    def _upstream_body(self, method: str, target: bytes, body: bytes) -> bytes:
+        """What goes upstream: the body as sent, with the pool's name as its model if a pool is given."""
+        route = routes.match(method, target)
+        if self._pool is None or route is None or route.wire_format is None:
+            return body
+        try:
+            value = json.loads(body)
+        except ValueError:
+            return body
+        if not isinstance(value, dict):
+            return body
+        return json.dumps({**value, "model": self._pool}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    async def _keep(self, number: int, exchange: Exchange) -> None:
+        name = f"{number:03d}"
+        own_host = [value for header, value in exchange.headers if header.lower() == "host"]
+        neutral = Neutral(
+            hosts=[*self._hosts, *own_host], home=self._home, user=self._user, keys=_key_presented(exchange.headers)
+        )
+        try:
+            replayable, capture = await capture_of(exchange, neutral, self._stated)
+        except scrub.Refused as refused:  # Its message names the rule and the place, never the value.
+            print(f"{name}: not written: {refused}", file=sys.stderr)
+            return
+        except (UnicodeDecodeError, GatewayError) as error:
+            print(f"{name}: not written: {type(error).__name__}", file=sys.stderr)
+            return
+        self._out.mkdir(parents=True, exist_ok=True)
+        path = self._out / f"{name}{'.json' if replayable else '.gateway'}"
         path.write_text(json.dumps(capture, indent=2) + "\n", encoding="utf-8")
-        print(path.relative_to(REPO))
+        self.written.append(path)
+        print(path)
+
+
+@contextmanager
+def serve(app: Session, port: int = 0) -> Generator[str]:
+    """The recorder served on a loopback port while the context lasts (any free one by default): its address."""
+    server = uvicorn.Server(uvicorn.Config(app, lifespan="off", access_log=False, log_level="warning"))
+    with socket.socket() as listening:
+        listening.bind(("127.0.0.1", port))
+        address = f"http://127.0.0.1:{listening.getsockname()[1]}"
+        serving = threading.Thread(target=server.run, kwargs={"sockets": [listening]}, name="recorder", daemon=True)
+        serving.start()
+        try:
+            deadline = time.monotonic() + 30
+            while not server.started:
+                if not serving.is_alive() or time.monotonic() > deadline:
+                    raise RuntimeError("the recorder did not start")
+                time.sleep(0.01)
+            yield address
+        finally:
+            server.should_exit = True
+            serving.join(timeout=30)
+
+
+def main(arguments: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Record the mock engine's captures, or a harness's session.")
+    commands = parser.add_subparsers(dest="command")
+    session = commands.add_parser("session", help="serve a recorder between a harness and the endpoint")
+    session.add_argument("--upstream", required=True, help="the endpoint's URL")
+    session.add_argument("--out", required=True, type=Path, help="the folder the captures are written to")
+    session.add_argument("--port", type=int, default=0, help="the loopback port to listen on (any free one: 0)")
+    session.add_argument("--pool", help="the pool of the endpoint every forwarded request is sent to")
+    session.add_argument("--profile", help="the pool of config.example.toml whose request profile the captures state")
+    given = parser.parse_args(arguments)
+    if given.command is None:
+        for name, capture in record().items():
+            path = harness.CAPTURES / f"{name}.json"
+            path.write_text(json.dumps(capture, indent=2) + "\n", encoding="utf-8")
+            print(path.relative_to(REPO))
+        return
+    recorder = Session(given.upstream, given.out, pool=given.pool, profile=given.profile)
+    with serve(recorder, given.port) as address:
+        print(f"Recording into {given.out}. Point the harness at {address}; stop with Ctrl-C.", flush=True)
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
