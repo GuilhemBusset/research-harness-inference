@@ -557,3 +557,22 @@ def test_two_argument_names_made_one_by_the_user_name_keep_both_values(stack: tu
     (capture,) = harness.folder(tmp_path)
     saved = json.loads(json.loads(capture.body)["input"][1]["arguments"])
     assert "operator" not in saved and sorted(saved.values()) == ["first-entry", "second-entry"]
+
+
+def test_schema_properties_made_one_by_the_user_name_keep_the_required_property(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    schema = {
+        "type": "object",
+        "properties": {"operator": {"type": "integer"}, "user": {"type": "string"}},
+        "required": ["operator"],
+    }
+    tool = {"name": "Lookup", "input_schema": schema}
+    with recording(address, tmp_path, user="operator", profile="coursework") as (_, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(tools=[tool])).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["tools"][0]["input_schema"]
+    (required,) = saved["required"]
+    assert "operator" not in saved["properties"] and saved["properties"]["user"] == {"type": "string"}
+    assert saved["properties"][required] == {"type": "integer"}
