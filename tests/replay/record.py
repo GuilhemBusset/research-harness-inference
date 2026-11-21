@@ -559,15 +559,15 @@ def _spelled(value: str) -> str:
     return "".join(spellings(char) for char in value)
 
 
-def _distinct(fields: Sequence[tuple[str, str, Any]]) -> dict[str, Any]:
-    """An object of these fields, each given as its name, its neutral name and its value.
+def _unique(names: Sequence[tuple[str, str]]) -> list[str]:
+    """The neutral names of an object's fields, each given as its name and its neutral name, made distinct.
 
     Two names may become one (`operator` and `user` for the login `operator`): a name that was
     renamed then takes a suffix (`user_2`), so that no value is lost. A name left as it was keeps it.
     """
-    taken = {written for name, written, _ in fields if written == name}
-    neutral: dict[str, Any] = {}
-    for name, written, value in fields:
+    taken = {written for name, written in names if written == name}
+    unique_names: list[str] = []
+    for name, written in names:
         if written != name:
             unique, number = written, 1
             while unique in taken:
@@ -575,8 +575,14 @@ def _distinct(fields: Sequence[tuple[str, str, Any]]) -> dict[str, Any]:
                 unique = f"{written}_{number}"
             written = unique
             taken.add(written)
-        neutral[written] = value
-    return neutral
+        unique_names.append(written)
+    return unique_names
+
+
+def _distinct(fields: Sequence[tuple[str, str, Any]]) -> dict[str, Any]:
+    """An object of these fields, each given as its name, its neutral name and its value (`_unique`)."""
+    written = _unique([(name, neutral) for name, neutral, _ in fields])
+    return {name: value for name, (_, _, value) in zip(written, fields, strict=True)}
 
 
 class Neutral:
@@ -717,6 +723,11 @@ class Neutral:
         if not isinstance(value, dict):
             # A string may hold JSON (a tool call's `arguments`): what a tool wrote, read as JSON.
             return self.json_text(value, data=True) if isinstance(value, str) else value
+        # A schema's property names as they are written, so that its `required` list names the same ones.
+        properties = value.get("properties") if not data else None
+        renamed: dict[str, str] = {}
+        if isinstance(properties, dict):
+            renamed = dict(zip(properties, _unique([(field, self.text(field)) for field in properties]), strict=True))
         neutral: list[tuple[str, str, Any]] = []
         for name, inner in value.items():
             if name == "data" and value.get("type") == "base64" and isinstance(inner, str) and self._encoded(inner):
@@ -725,6 +736,10 @@ class Neutral:
                 written = inner  # A file's bytes, in base64 with no data URL (Responses and Chat Completions).
             elif name == "model" and isinstance(inner, str) and not data:
                 written = self.model(inner)
+            elif name == "properties" and isinstance(inner, dict) and not data:
+                written = {renamed[field]: self.value(schema) for field, schema in inner.items()}
+            elif name == "required" and isinstance(inner, list) and renamed:
+                written = [renamed[item] if isinstance(item, str) and item in renamed else self.value(item) for item in inner]
             elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
                 written = _distinct([(field, self.text(field), self.value(schema)) for field, schema in inner.items()])
             elif name in _FORMAT_VALUES and isinstance(inner, str) and not data:
