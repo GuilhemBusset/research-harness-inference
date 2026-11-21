@@ -1,13 +1,17 @@
 """The GPU release smoke test (tests/smoke/deployed/test_gpu_release.py) takes as served only a
 release reported after the wake: a stopped instance's report from before it stopped, still
-returned by an instant query, cannot pass it. A fake workspace stands in for Prometheus, keeping a
-series for 5 minutes after its last sample, and a fake clock for time: no account, no network.
+returned by an instant query, cannot pass it, and a wrong release reported after the wake fails it
+even once its series has aged out. A fake workspace stands in for Prometheus, returning each
+series' latest sample for 5 minutes after it was taken, and a fake clock for time: no account, no
+network.
 """
 
 from __future__ import annotations
 
+import math
 import runpy
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,9 +44,17 @@ class Clock:
     monotonic = time
 
 
-def run_check(monkeypatch: pytest.MonkeyPatch, served: tuple[str, str]) -> None:
+def run_check(
+    monkeypatch: pytest.MonkeyPatch,
+    served: tuple[str, str],
+    *,
+    woken_scrapes: Sequence[float] | None = None,
+    partner: bool = False,
+) -> None:
     """The smoke test against a coursework pool woken from cold, whose stopped instance reported
-    the deployed release before it stopped and whose woken instance reports `served`."""
+    the deployed release before it stopped and whose woken instance reports `served`: on every
+    scrape from one after the wake, or at `woken_scrapes`, seconds from the wake, on one series.
+    A `partner` instance reports the deployed release on every scrape from one after the wake."""
     with warnings.catch_warnings():  # the smoke tests' mark is registered by their own conftest
         warnings.simplefilter("ignore", pytest.PytestUnknownMarkWarning)
         smoke = runpy.run_path(str(DEPLOYED / "test_gpu_release.py"))
@@ -61,11 +73,23 @@ def run_check(monkeypatch: pytest.MonkeyPatch, served: tuple[str, str]) -> None:
     def answer(request: httpx.Request) -> httpx.Response:
         (query,) = parse_qs(request.content.decode())["query"]
         assert query == 'rhi_lifecycle_release_info{pool="coursework"}'
-        result = []
-        if clock.now - stopped_at <= STALE:
-            result.append({"instance": "stopped", "digest": RELEASE})
-        if woken_at and clock.now >= woken_at[0] + SCRAPE:
-            result.append({"instance": "woken", "digest": served})
+        # Each series' latest sample: the series is returned while it is at most STALE old.
+        latest = {("stopped", RELEASE): stopped_at}
+        if woken_at:
+            woken = woken_at[0]
+            every = woken + SCRAPE * math.floor((clock.now - woken) / SCRAPE)
+            if woken_scrapes is None:
+                latest[("woken", served)] = every if every >= woken + SCRAPE else -math.inf
+            else:
+                taken = [woken + offset for offset in woken_scrapes if woken + offset <= clock.now]
+                latest[("woken", served)] = max(taken, default=-math.inf)
+            if partner:
+                latest[("partner", RELEASE)] = every if every >= woken + SCRAPE else -math.inf
+        result = [
+            {"instance": instance, "digest": digest}
+            for (instance, digest), sampled in latest.items()
+            if clock.now - sampled <= STALE
+        ]
         series = [
             {
                 "metric": {
@@ -104,3 +128,12 @@ def test_a_woken_instance_serving_another_release_fails_despite_a_stopped_instan
 
 def test_a_woken_instance_serving_the_deployed_release_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     run_check(monkeypatch, served=RELEASE)
+
+
+def test_a_wrong_release_reported_after_the_wake_fails_once_its_series_has_aged_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The instance that served the stream reported another release before it stopped and twice
+    after the wake, then stopped reporting, while a partner reports the deployed one."""
+    with pytest.raises(AssertionError, match="another release"):
+        run_check(monkeypatch, served=OTHER, woken_scrapes=(-10.0, 5.0, 20.0), partner=True)
