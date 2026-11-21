@@ -12,7 +12,9 @@ engine, its tag `rhi-engine`, is not the mock's (`rhi.pools.group`).
 
 On yes, the script waits for every such refresh to end before it answers, polling every
 `POLL_SECONDS` for at most `WAIT_SECONDS`: the smoke tests are only meaningful against the
-instances the refresh left. A refresh that ends `Successful` lets the verification go on; while
+instances the refresh left. A refresh that is still pending has no start time yet: it is waited
+for too, and counts only once it has one. One that ends without ever having begun, a pending
+request cancelled, began after nothing and asks for no verification. A refresh that ends `Successful` lets the verification go on; while
 it is pending, in progress, baking, being cancelled or rolling back it is waited for; any other
 end, a failure, a cancellation or a rollback that succeeded or failed, fails the decision, and so
 does a refresh still running when the wait is over. Whichever GPU pool's refresh it was, the pool
@@ -82,11 +84,12 @@ class DecisionError(Exception):
 
 @dataclass(frozen=True)
 class Refresh:
-    """An instance refresh of a GPU pool's group."""
+    """An instance refresh of a GPU pool's group, and when it began: None while it has not."""
 
     group: str
     pool: str
     refresh_id: str
+    began: datetime | None = None
 
 
 def _pages(call: Callable[..., dict[str, Any]], token: str, **request: Any) -> list[dict[str, Any]]:
@@ -115,8 +118,8 @@ def gpu_groups(autoscaling: Any) -> list[tuple[str, str]]:
 
 
 def refreshes_since(autoscaling: Any, started: datetime) -> list[Refresh]:
-    """The instance refreshes of the GPU pools' groups that began after `started`. A refresh that
-    has no start time yet has not begun before it."""
+    """The instance refreshes of the GPU pools' groups that began after `started`, and those that
+    have not begun yet: a refresh with no start time has not begun before it."""
     found = []
     for group, pool in gpu_groups(autoscaling):
         pages = _pages(autoscaling.describe_instance_refreshes, "NextToken", AutoScalingGroupName=group)
@@ -124,16 +127,19 @@ def refreshes_since(autoscaling: Any, started: datetime) -> list[Refresh]:
             for refresh in page.get("InstanceRefreshes", []):
                 began = refresh.get("StartTime")
                 if began is None or began > started:
-                    found.append(Refresh(group=group, pool=pool, refresh_id=refresh["InstanceRefreshId"]))
+                    found.append(Refresh(group, pool, refresh["InstanceRefreshId"], began))
     return found
 
 
-def status_of(autoscaling: Any, refresh: Refresh) -> str:
+def status_of(autoscaling: Any, refresh: Refresh) -> tuple[str, datetime | None]:
+    """The refresh's status now, and its start time: the one read now, or else the one it had."""
     answer = autoscaling.describe_instance_refreshes(
         AutoScalingGroupName=refresh.group, InstanceRefreshIds=[refresh.refresh_id]
     )
     found = answer.get("InstanceRefreshes", [])
-    return found[0].get("Status", "unknown") if found else "unknown"
+    if not found:
+        return "unknown", refresh.began
+    return found[0].get("Status", "unknown"), found[0].get("StartTime") or refresh.began
 
 
 def decide(
@@ -147,19 +153,26 @@ def decide(
 ) -> list[str]:
     """The pools to run the smoke tests on for an execution that started at `started`:
     `[COURSEWORK_POOL]` once every refresh of a GPU pool's group that began after it has ended
-    well, `[]` when there is none. A refresh that ended otherwise, or that is still running after
-    `wait_seconds`, raises `DecisionError`. `autoscaling` is an Auto Scaling client of the AWS SDK."""
-    found = refreshes_since(autoscaling, started)
+    well, `[]` when there is none. A pending refresh is waited for, and one that ends without
+    having begun is left out. A refresh that began and ended otherwise, or that is still running
+    after `wait_seconds`, raises `DecisionError`. `autoscaling` is an Auto Scaling client of the
+    AWS SDK."""
     deadline = clock() + wait_seconds
-    for refresh in found:
-        while (status := status_of(autoscaling, refresh)) in RUNNING:
+    began_since = False
+    for refresh in refreshes_since(autoscaling, started):
+        while (read := status_of(autoscaling, refresh))[0] in RUNNING:
             if clock() >= deadline:
-                raise DecisionError(f"the instance refresh of the pool {refresh.pool} is still {status}")
+                raise DecisionError(f"the instance refresh of the pool {refresh.pool} is still {read[0]}")
             sleep(poll_seconds)
+        status, began = read
+        if began is None or began <= started:
+            print(f"{NAME}: the instance refresh of the pool {refresh.pool} ended {status} without having begun")
+            continue
         if status != SUCCESSFUL:
             raise DecisionError(f"the instance refresh of the pool {refresh.pool} ended {status}")
         print(f"{NAME}: the instance refresh of the pool {refresh.pool} ended {status}")
-    return [COURSEWORK_POOL] if found else []
+        began_since = True
+    return [COURSEWORK_POOL] if began_since else []
 
 
 def pipeline_name(env: Mapping[str, str]) -> str:
