@@ -26,9 +26,14 @@ the recorder's own address become `EXAMPLE_HOST`, the student key becomes `KEY_P
 recording machine's home directory becomes `NEUTRAL_HOME` and its user name becomes `NEUTRAL_USER`,
 wherever any of them appears in a request or an answer, percent-encoded as in a URL or escaped as
 in a JSON text as well; what the wire format itself writes (its field names, block types, media
-types, roles) keeps a user name that happens to be one of its words. The headers that carry the key
-are dropped. An image's or a document's base64 bytes are kept as they are, and a capture whose
-decoded bytes hold the home directory, the user name or a key is not written.
+types, roles, a pool's name, the `claude-` of a model's name, a stream's `[DONE]`) keeps a user name
+that happens to be one of its words. The headers that carry the key are dropped. A body whose JSON
+writes a name twice is rewritten as text. An image's or a document's base64 bytes are kept as they
+are, and a capture whose decoded bytes hold the home directory, the user name or a key is not
+written: the bytes as they are, and the texts of their metadata that are compressed (an image's
+`zTXt`, a PDF's streams), in hexadecimal or escaped (a PDF's strings). Last, every text of the
+capture is read once more, percent-decoded and through the JSON it holds, and a capture in which a
+key or the home directory is left is not written.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
 engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
@@ -72,18 +77,20 @@ import json
 import os
 import re
 import socket
+import struct
 import sys
 import threading
 import time
 import tomllib
-from collections.abc import Generator, Mapping, Sequence
+import zlib
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 # Python gives a script its own folder and nothing else: the roots pytest is given go on the path.
@@ -321,17 +328,138 @@ _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitio
 _DATA_FIELDS = frozenset({"metadata", "input_examples", "examples", "default", "const", "enum"})
 # Fields whose text values the wire format enumerates (`image`, `image/png`, `assistant`, `end_turn`):
 # the user name is not looked for in them, so that a login that is one of them changes no block.
-_FORMAT_VALUES = frozenset(
-    {"type", "role", "media_type", "object", "stop_reason", "finish_reason", "status", "model", "effort"}
-)
+_FORMAT_VALUES = frozenset({"type", "role", "media_type", "object", "stop_reason", "finish_reason", "status", "effort"})
+# What a stream of Chat Completions ends with: the format's, whatever the user name.
+_STREAM_END = "[DONE]"
 # Headers of the wire format, names and values: the user name is not looked for in them either.
 _FORMAT_HEADERS = frozenset({"content-type", "accept", "anthropic-version", "anthropic-beta", "openai-beta"})
 # A key in the format of `rhi_common.keys`, its underscore percent-encoded or not.
 _ANY_KEY = KEY_PATTERN.replace("_", "(?:_|%5[Ff])", 1)
 _ANY_KEY_BYTES = re.compile(KEY_PATTERN.encode("ascii"))
+_ANY_KEY_RE = re.compile(KEY_PATTERN)
+_ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
 # A data URL whose payload is base64: an image or a PDF as a harness sends one (`data:image/png;base64,...`).
 _DATA_URL = re.compile(r"data:[^,]*;base64,", re.IGNORECASE)
 _BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
+# What the last check of a capture decodes and reads (`Neutral.check`): a data URL anywhere in a text,
+# and a text that is base64 and long enough to be a file's bytes.
+_ANY_DATA_URL = re.compile(r"data:[^,\s\"']*;base64,([A-Za-z0-9+/=]+)", re.IGNORECASE)
+_LONG_BASE64 = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_PNG = b"\x89PNG\r\n\x1a\n"
+# A PDF's streams, and its strings written in hexadecimal (`<FEFF0074...>`) or with escapes (`(\164...)`).
+_PDF_STREAM = re.compile(rb"stream\r?\n")
+_PDF_HEX = re.compile(rb"<([0-9A-Fa-f\s]+)>")
+_PDF_LITERAL = re.compile(rb"\(((?:\\.|[^\\()])*)\)", re.DOTALL)
+_PDF_ESCAPE = re.compile(rb"\\([0-7]{1,3}|\r\n|.)", re.DOTALL)
+_PDF_ESCAPED = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f", b"\n": b"", b"\r": b"", b"\r\n": b""}
+# The most bytes a compressed part of a file is inflated to, when it is read: no bomb fills the memory.
+_INFLATED_MAX = 1 << 26
+# What a model name begins with when it selects the default pool (`rhi_gateway.body.pool_named`).
+_CLAUDE_PREFIX = "claude-"
+
+
+def _strict_json(text: str) -> Any:
+    """A JSON text's value; `ValueError` for a text that is not JSON, or an object that writes a name twice.
+
+    A name written twice is read once by `json.loads`: what was rewritten from its value would not be
+    what is written, so such a body is rewritten as text instead.
+    """
+
+    def pairs(found: list[tuple[str, Any]]) -> dict[str, Any]:
+        value = dict(found)
+        if len(value) != len(found):
+            raise ValueError("a name written twice")
+        return value
+
+    return json.loads(text, object_pairs_hook=pairs)
+
+
+def _inflated(data: bytes) -> bytes | None:
+    """What a zlib stream at the start of these bytes inflates to; None if it is none."""
+    try:
+        return zlib.decompressobj().decompress(data, _INFLATED_MAX)
+    except zlib.error:
+        return None
+
+
+def _png_texts(data: bytes) -> Iterator[bytes]:
+    """The compressed texts of an image in PNG, inflated: `zTXt`, `iTXt` and the `iCCP` profile. Its pixels are left."""
+    at = len(_PNG)
+    while at + 12 <= len(data):
+        size, kind = struct.unpack(">I4s", data[at : at + 8])
+        chunk = data[at + 8 : at + 8 + size]
+        at += 12 + size
+        if kind in (b"zTXt", b"iCCP"):
+            compressed = chunk.partition(b"\0")[2][1:]
+        elif kind == b"iTXt":
+            _, _, rest = chunk.partition(b"\0")
+            if rest[:1] != b"\1":
+                continue  # Not compressed: its text is in the bytes as they are.
+            compressed = rest[2:].partition(b"\0")[2].partition(b"\0")[2]
+        else:
+            continue
+        inflated = _inflated(compressed)
+        if inflated is not None:
+            yield inflated
+
+
+def _pdf_parts(data: bytes) -> Iterator[bytes]:
+    """A PDF's streams inflated, and its strings decoded from hexadecimal and from their escapes."""
+    for found in _PDF_STREAM.finditer(data):
+        inflated = _inflated(data[found.end() :])
+        if inflated:
+            yield inflated
+    hexed = [re.sub(rb"\s", b"", found.group(1)) for found in _PDF_HEX.finditer(data)]
+    yield b"\0".join(bytes.fromhex((digits + b"0" * (len(digits) % 2)).decode("ascii")) for digits in hexed)
+
+    def unescaped(found: re.Match[bytes]) -> bytes:
+        escape = found.group(1)
+        return bytes([int(escape, 8) & 0xFF]) if escape[:1].isdigit() else _PDF_ESCAPED.get(escape, escape)
+
+    literals = [found.group(1) for found in _PDF_LITERAL.finditer(data) if b"\\" in found.group(1)]
+    yield b"\0".join(_PDF_ESCAPE.sub(unescaped, literal) for literal in literals)
+
+
+def _views(data: bytes, *, pdf: bool = False, depth: int = 0) -> Iterator[bytes]:
+    """A file's bytes, then what its metadata writes in another form: compressed, in hexadecimal, escaped."""
+    yield data
+    if depth >= 2:
+        return
+    pdf = pdf or b"%PDF-" in data[:1024]
+    parts = [*_png_texts(data)] if data.startswith(_PNG) else []
+    if pdf:
+        parts.extend(_pdf_parts(data))
+    for part in parts:
+        yield from _views(part, pdf=pdf, depth=depth + 1)
+
+
+def _decoded(payload: str) -> bytes | None:
+    """The bytes a base64 text holds; None if it holds none."""
+    try:
+        return base64.b64decode(re.sub(r"\s", "", payload) + "==")
+    except ValueError:
+        return None
+
+
+def _all_texts(value: Any) -> Iterator[str]:
+    """Every name and string of a JSON value, and of the JSON its strings hold, a name written twice included."""
+    if isinstance(value, dict):
+        for name, inner in value.items():
+            yield from _all_texts(name)
+            yield from _all_texts(inner)
+    elif isinstance(value, (list, tuple)):  # A tuple is a name and its value, as the JSON read here keeps them.
+        for inner in value:
+            yield from _all_texts(inner)
+    elif isinstance(value, str):
+        yield value
+        lines = (line.strip() for line in value.split("\n"))
+        for text in dict.fromkeys([value, *(line.removeprefix("data:").strip() for line in lines)]):
+            try:
+                held = json.loads(text, object_pairs_hook=list)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(held, (list, str)) and held != value:
+                yield from _all_texts(held)
 
 
 def _spelled(value: str) -> str:
@@ -375,22 +503,34 @@ class Neutral:
     A body that needs no replacement keeps its bytes.
     """
 
-    def __init__(self, *, hosts: Sequence[str], home: str, user: str, keys: Sequence[str] = ()) -> None:
+    def __init__(
+        self, *, hosts: Sequence[str], home: str, user: str, keys: Sequence[str] = (), pools: Sequence[str] = ()
+    ) -> None:
         def literal(values: Sequence[str]) -> str:
             # The longest first, so that a host with its port wins over the host alone. An empty one matches nothing.
             written = sorted({value for value in values if value}, key=len, reverse=True)
             return "|".join(_spelled(value) for value in written) or "(?!)"
 
+        def in_bytes(values: Sequence[str], flags: int = 0) -> re.Pattern[bytes]:
+            # As a file's metadata writes text: UTF-8, or UTF-16 of either order.
+            spelled = [re.escape(value.encode(encoding)) for value in values for encoding in _ENCODINGS]
+            return re.compile(b"|".join(spelled) or b"(?!)", flags)
+
         # The root of the file system is no home directory: replacing every `/` would write nonsense.
         homes = [home] if home.strip("/") else []
+        keys = [key for key in keys if key]
         common = f"(?P<host>(?i:{literal(hosts)}))|(?P<key>{literal(keys)}|{_ANY_KEY})|(?P<home>{literal(homes)})"
         self._pattern = re.compile(f"{common}|(?P<user>(?i:{literal([user])}))")
         self._field_pattern = re.compile(common)
-        self._homes = [value.encode("utf-8") for value in homes]
-        self._keys = [value.encode("utf-8") for value in keys if value]
-        # The user name in a file's bytes, as its metadata writes text: UTF-8, or UTF-16 of either order.
-        spelled = [re.escape(user.encode(encoding)) for encoding in ("utf-8", "utf-16-le", "utf-16-be")] if user else []
-        self._user_bytes = re.compile(b"|".join(spelled) or b"(?!)", re.IGNORECASE)
+        self._home_bytes = in_bytes(homes)
+        self._key_bytes = in_bytes(keys)
+        self._user_bytes = in_bytes([user] if user else [], re.IGNORECASE)
+        # What the last check looks for in every text of a capture (`check`), once its escapes are read.
+        # What a replacement writes is left out of it: a home directory or a key it holds is no one's.
+        self._keys_left = [key for key in keys if len(key) >= 8 and key not in KEY_PLACEHOLDER]
+        self._homes_left = [value for value in homes if value not in NEUTRAL_HOME]
+        # The names of the pools a request may name as its model: the format's, whatever the user name.
+        self._pools = frozenset({*(pool.name for pool in harness.POOLS), *pools})
 
     def format(self, text: str) -> str:
         """A text the wire format writes: only a host, a key or the home directory is replaced in it."""
@@ -399,8 +539,19 @@ class Neutral:
     def text(self, text: str) -> str:
         found = _DATA_URL.match(text)
         if found is not None and self._encoded(text[found.end() :]):
-            return text
+            # The bytes are kept; the media type is the format's, and a parameter (a file's name) is text.
+            media, *parameters = text[len("data:") : found.end() - len(";base64,")].split(";")
+            written = ";".join([self.format(media), *(self.text(parameter) for parameter in parameters)])
+            return f"data:{written}{text[found.end() - len(';base64,') :]}"
         return self._pattern.sub(self._replacement, text)
+
+    def model(self, model: str) -> str:
+        """A request's model: a pool's name is the format's; a `claude-` name keeps its prefix, which selects its pool."""
+        if model in self._pools:
+            return self.format(model)
+        if model.startswith(_CLAUDE_PREFIX):
+            return _CLAUDE_PREFIX + self.text(model[len(_CLAUDE_PREFIX) :])
+        return self.text(model)
 
     def _encoded(self, payload: str) -> bool:
         """Whether a text is a base64 payload, kept as it is; `scrub.Refused` if it holds the home directory or a key."""
@@ -410,13 +561,39 @@ class Neutral:
             decoded = base64.b64decode(payload)
         except ValueError:
             return False
-        if _ANY_KEY_BYTES.search(decoded) or any(key in decoded for key in self._keys):
-            raise scrub.Refused(scrub.KEY, "a base64 payload")
-        if any(home in decoded for home in self._homes):
-            raise scrub.Refused("home directory", "a base64 payload")
-        if self._user_bytes.search(decoded):
-            raise scrub.Refused("user name", "a base64 payload")
+        self.read_bytes(decoded, "a base64 payload")
         return True
+
+    def read_bytes(self, decoded: bytes, where: str) -> None:
+        """`scrub.Refused` if a file's bytes hold a key, the home directory or the user name, its metadata's
+        compressed, hexadecimal and escaped texts included (`_views`)."""
+        for view in _views(decoded):
+            if _ANY_KEY_BYTES.search(view) or self._key_bytes.search(view):
+                raise scrub.Refused(scrub.KEY, where)
+            if self._home_bytes.search(view):
+                raise scrub.Refused("home directory", where)
+            if self._user_bytes.search(view):
+                raise scrub.Refused("user name", where)
+
+    def check(self, capture: Mapping[str, Any]) -> None:
+        """`scrub.Refused` if a key or the home directory is left in a capture, however a text writes it.
+
+        Each text is read as it is, percent-decoded, and through the JSON it holds (a name written
+        twice included); a data URL, or a text that is long base64, is decoded and read as a file's bytes.
+        """
+        for text in _all_texts(capture):
+            for view in (text, unquote(text)):
+                if _ANY_KEY_RE.search(view) or any(key in view for key in self._keys_left):
+                    raise scrub.Refused(scrub.KEY, "a text of the capture")
+                if any(home in view for home in self._homes_left):
+                    raise scrub.Refused("home directory", "a text of the capture")
+            payloads = [found.group(1) for found in _ANY_DATA_URL.finditer(text)]
+            if _LONG_BASE64.fullmatch(text.strip()):
+                payloads.append(text)
+            for payload in payloads:
+                decoded = _decoded(payload)
+                if decoded is not None:
+                    self.read_bytes(decoded, "a base64 payload")
 
     def name(self, name: str, *, data: bool = False) -> str:
         """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
@@ -440,6 +617,10 @@ class Neutral:
         for name, inner in value.items():
             if name == "data" and value.get("type") == "base64" and isinstance(inner, str) and self._encoded(inner):
                 written = inner  # An image's or a document's bytes (Messages, `source`).
+            elif name == "file_data" and isinstance(inner, str) and not _DATA_URL.match(inner) and self._encoded(inner):
+                written = inner  # A file's bytes, in base64 with no data URL (Responses and Chat Completions).
+            elif name == "model" and isinstance(inner, str) and not data:
+                written = self.model(inner)
             elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
                 written = {self.text(field): self.value(schema) for field, schema in inner.items()}
             elif name in _FORMAT_VALUES and isinstance(inner, str) and not data:
@@ -453,7 +634,7 @@ class Neutral:
     def json_text(self, text: str) -> str:
         """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not."""
         try:
-            held = json.loads(text)
+            held = _strict_json(text)
         except ValueError:
             return self.text(text)
         if not isinstance(held, (dict, list)):
@@ -464,7 +645,7 @@ class Neutral:
     def body(self, text: str) -> str:
         """A body: JSON, or a stream whose `data:` lines are JSON, or any other text."""
         try:
-            whole = json.loads(text)
+            whole = _strict_json(text)
         except ValueError:
             whole = None
         if isinstance(whole, (dict, list)):
@@ -475,7 +656,11 @@ class Neutral:
         if line.startswith("event:"):  # A stream's event name is the format's.
             return self.format(line)
         found = _DATA.match(line)
-        return self.text(line) if found is None else found.group() + self.json_text(line[found.end() :])
+        if found is None:
+            return self.text(line)
+        if line[found.end() :].rstrip("\r") == _STREAM_END:
+            return line
+        return found.group() + self.json_text(line[found.end() :])
 
 
 @dataclass(frozen=True)
@@ -579,6 +764,7 @@ async def capture_of(
     }
     capture["usage"] = _usage(route, answer_body.encode("utf-8"))
     scrub.check(capture)
+    neutral.check(capture)
     if replayable:
         # The replay runs a gateway in an event loop of its own, so in a thread of its own.
         replayable = await asyncio.to_thread(_replays, capture)
@@ -740,7 +926,11 @@ class Session:
         name = f"{number:03d}"
         own_host = [value for header, value in exchange.headers if header.lower() == "host"]
         neutral = Neutral(
-            hosts=[*self._hosts, *own_host], home=self._home, user=self._user, keys=_key_presented(exchange.headers)
+            hosts=[*self._hosts, *own_host],
+            home=self._home,
+            user=self._user,
+            keys=_key_presented(exchange.headers),
+            pools=[self._pool] if self._pool else [],
         )
         route = routes.match(exchange.method, exchange.target)
         engine_answered = route is not None and route.wire_format is not None and exchange.status == 200
