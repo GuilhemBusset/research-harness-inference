@@ -76,10 +76,11 @@ class Workspace:
     http: httpx.Client
     session: Any
 
-    def series(self, selector: str) -> list[dict[str, str]]:
-        """The labels of every series an instant query of `selector` returns now."""
+    def series(self, selector: str, *, at: float | None = None) -> list[dict[str, str]]:
+        """The labels of every series an instant query of `selector` returns now, or evaluated at
+        `at`, a Unix time, when it is given."""
         url = f"{self.url}/api/v1/query"
-        body = urlencode({"query": selector})
+        body = urlencode({"query": selector} if at is None else {"query": selector, "time": f"{at:.3f}"})
         request = AWSRequest(
             method="POST", url=url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
