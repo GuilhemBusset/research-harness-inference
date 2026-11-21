@@ -68,10 +68,11 @@ warnings. Then state, and ask for one explicit yes:
   reports for its calls (S $40, M $70, L $120, provisional), one and a half times both for an
   issue that touches the factory's own tooling. Each Claude call also stops at its role's own
   budget (explore $2, plan $8, build $25). An issue that cannot be delivered within its ceilings
-  ends `failed`, is filed as a loop fault, and is retried once by the next engine version.
-- The supervisor keeps running for at most 10 runs and 24 hours. It may run one repair run per
-  loop fault on the engine itself, never on its safety surface (the gates, the verifier, the
-  hygiene scanner, CI).
+  ends `failed`, with its cause in the run's journal and the issue's progress comment (no fault
+  issue is filed for it), and is retried once by the next engine version or by `retry`.
+- The supervisor keeps running for at most 10 runs, and for a time bound only when it is given
+  `--max-hours`. It may run one repair run per loop fault (an exception in the engine) on the
+  engine itself, never on its safety surface (the gates, the verifier, the hygiene scanner, CI).
 - Agents and the commands they write run inside a sandbox that holds no AWS material and no
   GitHub login, both vendors with the same access. Say what the doctor's `sandbox` line reported.
   Network access stays open to agents, and each vendor's own login is readable by that vendor's
@@ -112,7 +113,7 @@ run summary comment on the root issue. Then:
      observation that would discharge it, and every deferred item with the issue it waits for.
      Do not run an owner's command yourself when it needs AWS.
    - **Waiting** (if the supervisor's bounds ran out first): each issue and what it waits for.
-   - **Failed**: each issue, its cause, and the loop-fault issue filed for it. For the cause
+   - **Failed**: each issue and its cause, from the run's journal. For the cause
      `history`, say that its branch was abandoned unpushed (the commits the scan refused never
      reached GitHub) and that a retry builds on a new branch.
    - **Follow-ups**: the follow-up issues filed for non-blocking findings.
