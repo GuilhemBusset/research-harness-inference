@@ -18,7 +18,7 @@ A run never waits for a person and never parks:
   resumes by itself (in this run, or under the supervisor);
 - every answered agent call is charged to the issue's ceiling, every timeout or crash to its
   infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
-  them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
+  them ends the issue `failed`, kept in the run's journal, which a new engine version resumes once;
 - an item that needs a capability the host lacks becomes an owner obligation; one that needs
   another issue waits for it in the run, or becomes a deferred obligation.
 
@@ -151,7 +151,7 @@ LABELS = {
     "loop:merged": ("BFDADC", "implement loop: merged, verifying on main"),
     "loop:delivered": ("F9D0C4", "implement loop: merged; owner obligations or deferred items remain"),
     "loop:waiting": ("EDEDED", "implement loop: waiting; resumes by itself"),
-    "loop:failed": ("B60205", "implement loop: not delivered; filed as a loop fault"),
+    "loop:failed": ("B60205", "implement loop: not delivered"),
 }
 DEFERRED_LABEL = ("loop:deferred", "C2E0C6", "implement loop: an item waits for another issue")
 FOLLOWUP_LABEL = ("loop:follow-up", "BFD4F2", "implement loop: non-blocking findings to consider")
@@ -896,21 +896,12 @@ class Engine:
         self._set_phase(n, Phase.WAITING)
 
     def _fail(self, n: int, cause: str, detail: str) -> None:
-        """Explicit non-delivery: nothing partial is merged, nothing is called delivered. Filed as
-        a loop fault; a new engine version resumes it once."""
+        """Explicit non-delivery: nothing partial is merged, nothing is called delivered. A stall is
+        no loop fault: no issue is filed for it, and the run's journal (the event `failed`) keeps
+        its cause and detail. A new engine version resumes it once."""
         st = self.store.issue(n)
         st.fail = {"cause": cause, "detail": detail[:800], "version": VERSION, "resumed": bool((st.fail or {}).get("resumed"))}
         self.store.put(st)
-        fingerprint = hashlib.sha256(f"stall:{cause}:{n}".encode()).hexdigest()[:10]
-        body = (f"{report.FAULT_MARKER.format(fingerprint)}\nThe implement loop could not deliver #{n} (run for "
-                f"#{self.plan.root}, engine {VERSION}): **{cause}**.\n\n{detail[:1500]}\n\nThe issue resumes once, with a "
-                f"fresh ceiling, on the next engine version. Its branch keeps the work.\n\n"
-                f"## Deliverables\n- [ ] From #{n}'s run log (`events.jsonl` and `calls/`), the cause is diagnosed and fixed "
-                f"in the engine or its prompts, with a regression test.\n"
-                f"- [ ] The engine version (`implement_loop/__init__.py`) is bumped, so #{n} resumes.\n\n"
-                f"## Acceptance criteria\n- [ ] The engine's full test suite passes.\n"
-                f"- [ ] Nothing on the loop's safety surface changes.\n")
-        self.faults.record(fingerprint, f"implement loop: #{n} not delivered ({cause})", body, issue=n, run=self.plan.root)
         self.store.event("failed", issue=n, cause=cause, detail=detail[:800])
         self.log(f"#{n} failed ({cause}): {detail[:200]}")
         self._set_phase(n, Phase.FAILED)
@@ -2171,14 +2162,7 @@ class Engine:
                 return self._set_phase(n, Phase.VERIFY)
             self._open_pull(n, st, head)
             assert st.pr is not None   # recorded by `_open_pull`
-            conclusion, run_id = self._wait_required(head)
-            if conclusion != "success" and head not in st.ci_rerun_heads:
-                st.ci_rerun_heads.append(head)
-                self.store.put(st)
-                rerun = self._safe(self.gh.rerun_failed, head)
-                self.store.event("ci_rerun", issue=n, head=head, conclusion=conclusion, started=bool(rerun))
-                if rerun:
-                    conclusion, run_id = self._wait_required(head, after=run_id)
+            conclusion = self._wait_required(head)
             if conclusion != "success":
                 return self._ci_failed(n, head, conclusion)
             try:
@@ -2594,26 +2578,25 @@ class Engine:
 
     def _ci_failed(self, n: int, head: str, conclusion: str | None) -> None:
         if conclusion in CI_NO_VERDICT:
-            st = self.store.issue(n)
-            st.ci_rerun_heads = [h for h in st.ci_rerun_heads if h != head]
-            self.store.put(st)
             return self._wait(n, WAIT_CI, f"the required check gave no verdict on {head[:7]} ({conclusion})",
                               resume=Phase.LAND)
         log = self._safe(self.gh.failed_log, head, skip=self.cfg.required_check) or "(no log available)"
         self.store.event("ci_failed", issue=n, head=head, conclusion=conclusion)
-        self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}, also after one re-run. Find and "
-                                f"fix the cause; never weaken or skip a check to get green. Tail of the failed log:\n"
+        self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}. Find and fix the cause; "
+                                f"never weaken or skip a check to get green. Tail of the failed log:\n"
                                 f"{log[-3000:]}")])
 
-    def _wait_required(self, sha: str, after: int | None = None) -> tuple[str, int | None]:
+    def _wait_required(self, sha: str) -> str:
+        """The conclusion of the required check on `sha`: `pending` when it ran and gave none in
+        time, `missing` when it never ran. A failed check is never run again: it goes to the
+        builder with its log (`_ci_failed`)."""
         waited = 0
         while True:
             run = self.gh.required_check_run(sha, self.cfg.required_check)
-            fresh = run is not None and (after is None or run["id"] != after)
-            if fresh and run["status"] == "completed" and run["conclusion"] not in (None, "pending"):
-                return run["conclusion"], run["id"]
+            if run is not None and run["status"] == "completed" and run["conclusion"] not in (None, "pending"):
+                return run["conclusion"]
             if waited >= self.caps.ci_timeout_s:
-                return ("pending" if fresh else "missing"), (run or {}).get("id")
+                return "pending" if run is not None else "missing"
             self.sleep(self.caps.ci_poll_s)
             waited += self.caps.ci_poll_s
 
@@ -2924,7 +2907,7 @@ class Engine:
             if not self._push(wt, head if local is not None else None) or self.ws.head(wt) != head:
                 return self._fail(n, "main_broken", "main moved while the revert was being certified")
             rpr = self._revert_pull(n, branch, [pr["number"] for pr in merged], feedback)
-            conclusion, _ = self._wait_required(head)
+            conclusion = self._wait_required(head)
             if conclusion != "success":
                 return self._fail(n, "main_broken", f"the revert PR #{rpr['number']} did not pass the required check "
                                                     f"({conclusion})")

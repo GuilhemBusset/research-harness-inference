@@ -89,7 +89,8 @@ def published(fake) -> list[str]:
 class Leaky(L.agents.FakeAgents):
     """Agents whose output carries the account and the ARN: a decision of the plan (the pull request
     body), the output of the builder's test (the evidence comment), what the examiner observed (the
-    follow-up issue) and, for the issues in `crashing`, the error of a build (the fault issue)."""
+    follow-up issue) and, for the issues in `crashing`, the error of a build (the progress comment of
+    the issue that failed)."""
     crashing: tuple[int, ...] = ()
     scanner_in_worktree = False
 
@@ -229,11 +230,12 @@ def test_the_run_command_publishes_through_the_redacting_client():
 def test_what_the_engine_publishes_reaches_github_masked():
     with loop() as run:
         run.add_work(2, unquoted_findings=1)   # lands, with a finding that becomes a follow-up issue
-        run.add_work(3)                        # its build crashes: not delivered, filed as a fault issue
+        run.add_work(3)                        # its build crashes: not delivered, said in its progress comment
         run.run(crashing=(3,), infra_budget=1)
         assert (run.state(2)[0], run.state(3)[0]) == (Phase.DONE, Phase.FAILED)
         places = {"a comment": run.evidence(), "a pull request body": [pr["body"] for pr in run.fake.prs.values()],
-                  "a fault issue": run.labelled("loop:engine-bug"), "a follow-up issue": run.labelled("loop:follow-up")}
+                  "a failed issue's progress comment": [text for text in published(run.fake) if says(Phase.FAILED)(text)],
+                  "a follow-up issue": run.labelled("loop:follow-up")}
         for place, texts in places.items():
             assert len(texts) == 1 and masked() in texts[0], place
         assert not [text for text in published(run.fake) if ACCOUNT in text]
@@ -315,17 +317,18 @@ def test_an_issue_the_owner_ticked_stays_delivered_until_its_last_comment_is_wri
         assert run.state(2) == (Phase.DONE, None, None, "closed")
 
 
-def test_a_failed_issue_waits_until_its_fault_issue_and_its_last_comment_are_written():
+def test_a_failed_issue_waits_until_its_last_comment_is_written():
     """A failed issue is settled for the supervisor too. It waits as it failed, and is failed again,
-    for the same cause and without being worked again, once the next run has published."""
-    for refused in (lambda text: text.startswith("implement loop: #2 not delivered"), says(Phase.FAILED)):
-        with loop() as run:
-            run.add_work(2)
-            run.run(mask=failing_on(refused), crashing=(2,), infra_budget=1)
-            assert run.state(2) == (Phase.WAITING, WAIT_GITHUB, "failed", "open")
-            assert not [text for text in published(run.fake) if refused(text)]
-            run.run()
-            assert run.state(2) == (Phase.FAILED, None, None, "open") and run.store.issue(2).fail["cause"] == "ceiling"
-            assert not [call for call in run.agents.calls if call[0] == "build"]
-            assert len(run.labelled("loop:engine-bug")) == 1 and masked() in run.labelled("loop:engine-bug")[0]
-            assert [text for text in published(run.fake) if says(Phase.FAILED)(text)]
+    for the same cause and without being worked again, once the next run has published. No fault
+    issue is filed for it: a stall stays in the run's journal."""
+    refused = says(Phase.FAILED)
+    with loop() as run:
+        run.add_work(2)
+        run.run(mask=failing_on(refused), crashing=(2,), infra_budget=1)
+        assert run.state(2) == (Phase.WAITING, WAIT_GITHUB, "failed", "open")
+        assert not [text for text in published(run.fake) if refused(text)]
+        run.run()
+        assert run.state(2) == (Phase.FAILED, None, None, "open") and run.store.issue(2).fail["cause"] == "ceiling"
+        assert not [call for call in run.agents.calls if call[0] == "build"]
+        assert run.labelled("loop:engine-bug") == []
+        assert [text for text in published(run.fake) if refused(text)]

@@ -544,7 +544,8 @@ class Finding17RepairBeforeSettling(SupervisorCase):
 
         def script(args):
             if "--repair" not in args and not any("--repair" in c for c in self.calls):
-                # the root run fails its issue for good on this version, and files a loop fault
+                # the root run fails its issue for good on this version, and files a loop fault for an
+                # engine exception it met on the way
                 self.put(2, Phase.FAILED, fail={"cause": "no_progress", "version": VERSION})
                 self.fault()
         out = self.sup(script).supervise()
