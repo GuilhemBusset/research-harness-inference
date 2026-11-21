@@ -27,11 +27,13 @@ recording machine's home directory becomes `NEUTRAL_HOME` and its user name beco
 wherever any of them appears in a request or an answer, percent-encoded as in a URL or escaped as
 in a JSON text as well; what the wire format itself writes (its field names, block types, media
 types, roles, a pool's name, the `claude-` of a model's name, a stream's `[DONE]`) keeps a user name
-that happens to be one of its words. The headers that carry the key are dropped. A body whose JSON
+that happens to be one of its words. A string that holds JSON (a tool call's `arguments`) is
+rewritten as JSON, its literals kept. The headers that carry the key are dropped. A body whose JSON
 writes a name twice is rewritten as text. An image's or a document's base64 bytes are kept as they
-are, and a capture whose decoded bytes hold the home directory, the user name or a key is not
-written: the bytes as they are, and the texts of their metadata that are compressed (an image's
-`zTXt`, a PDF's streams), in hexadecimal or escaped (a PDF's strings). Last, every text of the
+are, and a capture is not written whose decoded bytes hold the home directory or a key, or whose
+file writes the user name in a text (an image's text chunks, a PDF's strings, an XMP packet): read
+as they are, percent-decoded, inflated where compressed (an image's `zTXt`, a PDF's streams), in
+hexadecimal or escaped (a PDF's strings). Last, every text of the
 capture is read once more, percent-decoded and through the JSON it holds, and a capture in which a
 key or the home directory is left is not written.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
@@ -90,7 +92,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 # Python gives a script its own folder and nothing else: the roots pytest is given go on the path.
@@ -346,12 +348,20 @@ _BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
 _ANY_DATA_URL = re.compile(r"data:[^,\s\"']*;base64,([A-Za-z0-9+/=]+)", re.IGNORECASE)
 _LONG_BASE64 = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 _PNG = b"\x89PNG\r\n\x1a\n"
-# A PDF's streams, and its strings written in hexadecimal (`<FEFF0074...>`) or with escapes (`(\164...)`).
-_PDF_STREAM = re.compile(rb"stream\r?\n")
+_JPEG = b"\xff\xd8"
+# An XMP packet: the metadata a file of any type may write as XML (an author, a source path).
+_XMP = re.compile(rb"<x:xmpmeta.*?</x:xmpmeta>", re.DOTALL)
+# A PDF's streams, and its strings written as they are, in hexadecimal (`<FEFF0074...>`) or with
+# escapes (`(\164...)`). `endstream` is no stream's start.
+_PDF_STREAM = re.compile(rb"(?<!end)stream\r?\n")
 _PDF_HEX = re.compile(rb"<([0-9A-Fa-f\s]+)>")
 _PDF_LITERAL = re.compile(rb"\(((?:\\.|[^\\()])*)\)", re.DOTALL)
 _PDF_ESCAPE = re.compile(rb"\\([0-7]{1,3}|\r\n|.)", re.DOTALL)
 _PDF_ESCAPED = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f", b"\n": b"", b"\r": b"", b"\r\n": b""}
+# The bytes of a text: printable ASCII and its white space. A stream mostly made of others is binary
+# (a font, an image's pixels), and its bytes are not read as strings.
+_PRINTABLE = bytes([*range(0x20, 0x7F), 0x09, 0x0A, 0x0D])
+_TEXT_SHARE = 0.7
 # The most bytes a compressed part of a file is inflated to, when it is read: no bomb fills the memory.
 _INFLATED_MAX = 1 << 26
 # What a model name begins with when it selects the default pool (`rhi_gateway.body.pool_named`).
@@ -383,54 +393,102 @@ def _inflated(data: bytes) -> bytes | None:
 
 
 def _png_texts(data: bytes) -> Iterator[bytes]:
-    """The compressed texts of an image in PNG, inflated: `zTXt`, `iTXt` and the `iCCP` profile. Its pixels are left."""
+    """What an image in PNG writes as text: its text chunks' texts (inflated where compressed), its colour
+    profile's name and its inflated profile, its EXIF data. Its pixels, and its chunks' own keywords, are left."""
     at = len(_PNG)
     while at + 12 <= len(data):
         size, kind = struct.unpack(">I4s", data[at : at + 8])
         chunk = data[at + 8 : at + 8 + size]
         at += 12 + size
-        if kind in (b"zTXt", b"iCCP"):
-            compressed = chunk.partition(b"\0")[2][1:]
+        keyword, _, rest = chunk.partition(b"\0")
+        texts: list[bytes | None] = []
+        if kind == b"tEXt":
+            texts = [rest]
+        elif kind == b"zTXt":
+            texts = [_inflated(rest[1:])]
+        elif kind == b"iCCP":
+            texts = [keyword, _inflated(rest[1:])]
         elif kind == b"iTXt":
-            _, _, rest = chunk.partition(b"\0")
-            if rest[:1] != b"\1":
-                continue  # Not compressed: its text is in the bytes as they are.
-            compressed = rest[2:].partition(b"\0")[2].partition(b"\0")[2]
-        else:
+            language, _, rest_of = rest[2:].partition(b"\0")
+            translated, _, text = rest_of.partition(b"\0")
+            texts = [language, translated, _inflated(text) if rest[:1] == b"\1" else text]
+        elif kind == b"eXIf":
+            texts = [chunk]
+        yield from (text for text in texts if text)
+
+
+def _jpeg_segments(data: bytes) -> Iterator[bytes]:
+    """What an image in JPEG writes before its pixels: its application segments (EXIF, XMP) and its comments."""
+    at = len(_JPEG)
+    while at + 4 <= len(data) and data[at] == 0xFF:
+        marker = data[at + 1]
+        if marker in (0xDA, 0xD9):  # The scan's start, or the image's end: pixels follow, or nothing.
+            return
+        if marker == 0xFF:  # A fill byte.
+            at += 1
             continue
-        inflated = _inflated(compressed)
-        if inflated is not None:
-            yield inflated
+        size = struct.unpack(">H", data[at + 2 : at + 4])[0]
+        if 0xE0 <= marker <= 0xEF or marker == 0xFE:
+            yield data[at + 4 : at + 2 + size]
+        at += 2 + size
 
 
-def _pdf_parts(data: bytes) -> Iterator[bytes]:
-    """A PDF's streams inflated, and its strings decoded from hexadecimal and from their escapes."""
+def _texty(data: bytes) -> bool:
+    return len(data) - len(data.translate(None, _PRINTABLE)) >= _TEXT_SHARE * len(data)
+
+
+def _pdf_parts(data: bytes, depth: int) -> Iterator[tuple[bytes, bool]]:
+    """A PDF's streams inflated (not texts), and its strings, decoded from hexadecimal and from their escapes
+    (texts), in its objects and in the streams that are text (its pages, its object streams)."""
+    outside, at = bytearray(), 0
     for found in _PDF_STREAM.finditer(data):
-        inflated = _inflated(data[found.end() :])
+        if found.start() < at:
+            continue
+        end = data.find(b"endstream", found.end())
+        end = len(data) if end < 0 else end
+        outside += data[at : found.start()]
+        at = end
+        body = data[found.end() : end]
+        inflated = _inflated(body)
         if inflated:
-            yield inflated
-    hexed = [re.sub(rb"\s", b"", found.group(1)) for found in _PDF_HEX.finditer(data)]
-    yield b"\0".join(bytes.fromhex((digits + b"0" * (len(digits) % 2)).decode("ascii")) for digits in hexed)
+            yield inflated, False
+        held = inflated or body
+        if depth < 2 and _texty(held):
+            yield from _pdf_parts(held, depth + 1)
+    outside += data[at:]
 
     def unescaped(found: re.Match[bytes]) -> bytes:
         escape = found.group(1)
         return bytes([int(escape, 8) & 0xFF]) if escape[:1].isdigit() else _PDF_ESCAPED.get(escape, escape)
 
-    literals = [found.group(1) for found in _PDF_LITERAL.finditer(data) if b"\\" in found.group(1)]
-    yield b"\0".join(_PDF_ESCAPE.sub(unescaped, literal) for literal in literals)
+    for found in _PDF_LITERAL.finditer(outside):
+        yield _PDF_ESCAPE.sub(unescaped, found.group(1)), True
+    for found in _PDF_HEX.finditer(outside):
+        digits = re.sub(rb"\s", b"", found.group(1))
+        yield bytes.fromhex((digits + b"0" * (len(digits) % 2)).decode("ascii")), True
+    for packet in _XMP.findall(data):
+        yield packet, True
 
 
-def _views(data: bytes, *, pdf: bool = False, depth: int = 0) -> Iterator[bytes]:
-    """A file's bytes, then what its metadata writes in another form: compressed, in hexadecimal, escaped."""
-    yield data
-    if depth >= 2:
-        return
-    pdf = pdf or b"%PDF-" in data[:1024]
-    parts = [*_png_texts(data)] if data.startswith(_PNG) else []
-    if pdf:
-        parts.extend(_pdf_parts(data))
-    for part in parts:
-        yield from _views(part, pdf=pdf, depth=depth + 1)
+def _file_parts(data: bytes) -> Iterator[tuple[bytes, bool]]:
+    """A file's bytes and what they hold in another form, each with whether it is a text the file writes.
+
+    A text is where a name is written: a PNG's text chunks, a JPEG's segments before its pixels, a PDF's
+    strings, an XMP packet. The rest (the bytes as they are, a PDF's inflated streams) is the file's
+    format and its pixels, where a short word occurs by chance. A file of another type is text whole.
+    """
+    if data.startswith(_PNG):
+        yield data, False
+        yield from ((text, True) for text in _png_texts(data))
+    elif b"%PDF-" in data[:1024]:
+        yield data, False
+        yield from _pdf_parts(data, 0)
+    elif data.startswith(_JPEG):
+        yield data, False
+        yield from ((segment, True) for segment in _jpeg_segments(data))
+    else:
+        yield data, True
+    yield from ((packet, True) for packet in _XMP.findall(data))
 
 
 def _decoded(payload: str) -> bytes | None:
@@ -565,15 +623,21 @@ class Neutral:
         return True
 
     def read_bytes(self, decoded: bytes, where: str) -> None:
-        """`scrub.Refused` if a file's bytes hold a key, the home directory or the user name, its metadata's
-        compressed, hexadecimal and escaped texts included (`_views`)."""
-        for view in _views(decoded):
-            if _ANY_KEY_BYTES.search(view) or self._key_bytes.search(view):
-                raise scrub.Refused(scrub.KEY, where)
-            if self._home_bytes.search(view):
-                raise scrub.Refused("home directory", where)
-            if self._user_bytes.search(view):
-                raise scrub.Refused("user name", where)
+        """`scrub.Refused` if a file holds a key or the home directory, or if a text it writes holds the user name.
+
+        What it holds in another form is read too (`_file_parts`): its metadata compressed, in
+        hexadecimal or escaped, and each part percent-decoded, as a `file://` URI writes a path. The user
+        name is looked for in the file's texts only: in its format's own bytes or its pixels, a short
+        one occurs by chance (a PDF's `%PDF-` for the login `pdf`).
+        """
+        for part, text in _file_parts(decoded):
+            for view in (part, unquote_to_bytes(part)) if b"%" in part else (part,):
+                if _ANY_KEY_BYTES.search(view) or self._key_bytes.search(view):
+                    raise scrub.Refused(scrub.KEY, where)
+                if self._home_bytes.search(view):
+                    raise scrub.Refused("home directory", where)
+                if text and self._user_bytes.search(view):
+                    raise scrub.Refused("user name", where)
 
     def check(self, capture: Mapping[str, Any]) -> None:
         """`scrub.Refused` if a key or the home directory is left in a capture, however a text writes it.
@@ -612,7 +676,8 @@ class Neutral:
         if isinstance(value, list):
             return [self.value(inner, data=data) for inner in value]
         if not isinstance(value, dict):
-            return self.text(value) if isinstance(value, str) else value
+            # A string may hold JSON (a tool call's `arguments`): what a tool wrote, read as JSON.
+            return self.json_text(value, data=True) if isinstance(value, str) else value
         neutral = {}
         for name, inner in value.items():
             if name == "data" and value.get("type") == "base64" and isinstance(inner, str) and self._encoded(inner):
@@ -631,15 +696,19 @@ class Neutral:
             neutral[self.name(name, data=data)] = written
         return neutral
 
-    def json_text(self, text: str) -> str:
-        """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not."""
+    def json_text(self, text: str, *, data: bool = False) -> str:
+        """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not.
+
+        As JSON, only its names and strings are rewritten: its literals (`true`, `null`, a number) and
+        its syntax stay what they were, whatever the user name.
+        """
         try:
             held = _strict_json(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             return self.text(text)
         if not isinstance(held, (dict, list)):
             return self.text(text)
-        neutral = self.value(held)
+        neutral = self.value(held, data=data)
         return text if neutral == held else json.dumps(neutral, separators=(",", ":"), ensure_ascii=False)
 
     def body(self, text: str) -> str:
