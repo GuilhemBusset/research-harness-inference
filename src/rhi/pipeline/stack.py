@@ -205,11 +205,12 @@ class PipelineStack(cdk.Stack):
         )
         # Started by the owner, by hand: it writes a pool's image parameter, then starts the pipeline.
         self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
-        # Started by the owner, each on a commit of `main`: the spikes that need AWS.
+        # CodeBuild validates GitHub source credentials at project creation. The first deploy
+        # creates a pending connection. Once the owner authorizes it, self-update adds the jobs.
         self.spikes = SpikeJobs(
             self,
             "Spikes",
-            jobs=spike_jobs,
+            jobs=() if self.node.try_get_context("pipeline-first-deploy") == "true" else spike_jobs,
             connection_arn=connection.attr_connection_arn,
             repository=f"{config.github_owner}/{config.github_repo}",
             stage=stage,

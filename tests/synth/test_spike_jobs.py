@@ -44,7 +44,14 @@ class Built:
     findings: list[tuple[str, str]]
 
 
-def build(app_module: ModuleType, folder: Path, entries: tuple[tuple[str, str], ...], *, acknowledged: bool) -> Built:
+def build(
+    app_module: ModuleType,
+    folder: Path,
+    entries: tuple[tuple[str, str], ...],
+    *,
+    acknowledged: bool,
+    context: dict[str, Any] = CONTEXT,
+) -> Built:
     """The app with the spike jobs of `entries`, synthesized under cdk-nag with the repository's
     acknowledgement files, or with none, so that every finding is reported."""
     import aws_cdk as cdk
@@ -55,7 +62,7 @@ def build(app_module: ModuleType, folder: Path, entries: tuple[tuple[str, str], 
 
     example = config.load({"RHI_CONFIG": "example"})
     outdir = folder / "cdk.out"
-    app = cdk.App(outdir=str(outdir), context=CONTEXT, analytics_reporting=False)
+    app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
     stage = EndpointStage(app, "Rhi", config=example)
     if acknowledged:
         app_module.add_nag(app)
@@ -192,6 +199,33 @@ def test_an_empty_list_gives_none(app_module: ModuleType, tmp_path: Path, templa
         for command in runs_a_spike(project)
     )
     assert found == sorted(f"uv run --locked python spikes/{job.script}" for job in JOBS)
+
+
+def test_the_first_deploy_creates_the_pipeline_and_connection_before_spike_jobs(
+    app_module: ModuleType, tmp_path: Path
+) -> None:
+    initial = build(
+        app_module, tmp_path, TWO, acknowledged=True, context=CONTEXT | {"pipeline-first-deploy": "true"}
+    )
+    assert not initial.projects
+    assert of_type(initial.template, "AWS::CodeConnections::Connection")
+    assert of_type(initial.template, "AWS::CodePipeline::Pipeline")
+    projects = of_type(initial.template, "AWS::CodeBuild::Project").values()
+    assert all(project["Source"].get("Auth", {}).get("Type") != "CODECONNECTIONS" for project in projects)
+
+
+def test_spike_projects_wait_for_the_connection_policy(two: Built) -> None:
+    (policy,) = (
+        name
+        for name, properties in of_type(two.template, "AWS::IAM::Policy").items()
+        if {"Ref": two.role} in properties.get("Roles", [])
+        and any(
+            "codeconnections:GetConnectionToken" in statement["Action"]
+            for statement in properties["PolicyDocument"]["Statement"]
+        )
+    )
+    for name in two.projects.values():
+        assert policy in two.template["Resources"][name]["DependsOn"]
 
 
 def test_every_job_runs_on_the_one_role_log_group_and_key(app_module: ModuleType, tmp_path: Path, two: Built) -> None:

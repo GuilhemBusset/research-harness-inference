@@ -176,8 +176,11 @@ class SpikeJobs(Construct):
         # renamed parameter by position.
         codebuild_service = iam.ServicePrincipal("codebuild.amazonaws.com")
         self.role = iam.Role(self, "Role", assumed_by=codebuild_service)  # ty: ignore[invalid-argument-type]
-        for statement in self._statements(stack, connection_arn, stage):
+        for statement in self._statements(stack, stage):
             self.role.add_to_policy(statement)
+        connection_access = iam.Grant.add_to_principal(
+            grantee=self.role, actions=CONNECTION_ACTIONS, resource_arns=[connection_arn]
+        )
         environment: dict[str, str] = {"PYTHONPATH": ":".join(import_path())}
         reporter.measuring_job(self.role, environment)
 
@@ -223,10 +226,11 @@ class SpikeJobs(Construct):
             resource = project.node.default_child
             assert isinstance(resource, codebuild.CfnProject)
             resource.add_property_override("Source.Auth", {"Type": "CODECONNECTIONS", "Resource": connection_arn})
+            connection_access.apply_before(project)
             self.projects[job.name] = project
 
-    def _statements(self, stack: cdk.Stack, connection_arn: str, stage: cdk.Stage) -> list[iam.PolicyStatement]:
-        """What the shared role may do, but the measurement grant, which `measuring_job` adds."""
+    def _statements(self, stack: cdk.Stack, stage: cdk.Stage) -> list[iam.PolicyStatement]:
+        """The shared role's permissions other than the connection and measurement grants."""
         # Secrets Manager adds six random characters to a secret's name in its ARN.
         secret = stack.format_arn(
             service="secretsmanager",
@@ -237,7 +241,6 @@ class SpikeJobs(Construct):
         statements = [
             config_reader(stack),
             iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]),
-            iam.PolicyStatement(actions=CONNECTION_ACTIONS, resources=[connection_arn]),
             iam.PolicyStatement(
                 actions=["logs:CreateLogStream", "logs:PutLogEvents"], resources=[self.log_group.log_group_arn]
             ),

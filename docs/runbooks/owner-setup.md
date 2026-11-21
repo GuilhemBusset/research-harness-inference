@@ -428,9 +428,18 @@ RHI_CONFIG=example node_modules/.bin/cdk bootstrap aws://123456789012/us-east-1 
   --custom-permissions-boundary rhi-permissions-boundary --output <a temporary folder>
 ```
 
-The first deployment of the pipeline stack, once, from this machine, follows. The pipeline stack
-is not in the repository yet: its command arrives with it. It needs this bootstrap and the
-configuration of step 4.
+After bootstrap, deploy the pipeline stack from the same terminal, in the region where you wrote
+the configuration in step 4:
+
+```sh
+RHI_CONFIG=ssm node_modules/.bin/cdk deploy RhiPipeline --lookups=false \
+  -c pipeline-first-deploy=true --output "$(mktemp -d)"
+```
+
+Use `pipeline-first-deploy` for the first deployment only. CloudFormation creates the pipeline
+and its pending GitHub connection. Once you authorize the connection in step 7, the first pipeline
+execution adds the spike jobs during self-update. By then, CodeBuild can validate their GitHub
+source credentials.
 
 **Check.** Both read, and change nothing. The first lists `rhi-cfn-execution` and nothing else,
 the second names `rhi-permissions-boundary`. The script offers both.
