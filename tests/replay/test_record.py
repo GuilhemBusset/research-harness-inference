@@ -6,10 +6,13 @@ name the recorder replaces are invented here.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import secrets
+import struct
 import sys
+import zlib
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -225,3 +228,64 @@ def test_an_answer_a_replay_would_not_give_back_is_not_replayed(stack: tuple[str
     assert [path.name for path in session.written] == ["001.unreplayed"]
     assert harness.load(session.written[0]).answer == answer.content
     assert harness.folder(tmp_path) == []
+
+
+def test_the_key_is_removed_under_any_spelling_of_the_bearer_scheme(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    encoded = f"%{ord(key[0]):02x}{key[1:]}"
+    with recording(address, tmp_path) as (session, client):
+        headers = {"authorization": f"bearer {key}", "anthropic-version": "2023-06-01"}
+        assert client.post(f"/v1/messages?note={encoded}", headers=headers, json=messages()).status_code == 200
+    (path,) = session.written
+    assert key not in unquote(harness.load(path).target)
+
+
+def _png() -> bytes:
+    """A valid image of one pixel."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b"")
+
+
+def test_an_image_in_a_tool_result_is_kept_byte_for_byte(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    encoded = base64.b64encode(_png()).decode("ascii")
+    login = next(encoded[i : i + 2] for i in range(len(encoded)) if encoded[i : i + 2].isalpha())  # Found in the image.
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}}
+    history = [
+        {"role": "user", "content": "Read this image."},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [image]}]},
+    ]
+    with recording(address, tmp_path, user=login, profile="coursework") as (session, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(messages=history)).status_code == 200
+    (path,) = session.written
+    capture = harness.load(path)
+    assert json.loads(capture.body)["messages"][2]["content"][0]["content"][0] == image
+    assert_replays(capture)
+
+
+def test_the_user_name_is_removed_from_the_names_of_a_tool_input(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    call = {"type": "tool_use", "id": "t1", "name": "Lookup", "input": {"owners": {login: True}}}
+    history = [
+        {"role": "user", "content": "Look up these owners."},
+        {"role": "assistant", "content": [call]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Done."}]},
+    ]
+    with recording(address, tmp_path, user=login) as (session, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(messages=history)).status_code == 200
+    (path,) = session.written
+    sent = json.loads(harness.load(path).body)
+    assert sent["messages"][1]["content"][0]["input"] == {"owners": {"user": True}} and sent["max_tokens"] == 64
+
+
+def test_two_recorders_cannot_share_a_folder(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, _ = stack
+    with recording(address, tmp_path), pytest.raises(FileExistsError):
+        record.Session(address, tmp_path)
+    record.Session(address, tmp_path).close()  # The first has ended, and wrote nothing: the folder is free.
