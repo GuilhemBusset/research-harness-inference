@@ -9,7 +9,7 @@
 #               "" or absent: no fallback, and the issue waits as an outage.
 # codex_model:  model for `codex exec -m`; "" uses your Codex default.
 # codex_escalated_model: model for `codex exec -m` on a call the adapter escalates (ADR 0001,
-#               amendment 12): deciding requests among which is a `protected_change`, any arbitration,
+#               amendment 13): deciding requests among which is a `protected_change`, any arbitration,
 #               and examining a head whose change against its base adds, changes or removes a
 #               protected path (`PROTECTED_*` and `SAFETY_SURFACE_*` in config.py). "" or absent: such
 #               a call runs on `codex_model`.
@@ -30,7 +30,7 @@
 # on Claude Opus while Fable refuses calls, and explore on a cheap Claude model; triage, examine,
 # decide, resolve_locked and arbitrate go to the other vendor, Codex, on its default model. The
 # escalated calls of examine, decide and arbitrate (above) run on Codex `gpt-6.2-astra`, and on
-# `gpt-6.2-sol`, the default, while astra refuses calls (ADR 0001, amendment 12).
+# `gpt-6.2-sol`, the default, while astra refuses calls (ADR 0001, amendment 13).
 
 [roles.explore]
 effort = "low"

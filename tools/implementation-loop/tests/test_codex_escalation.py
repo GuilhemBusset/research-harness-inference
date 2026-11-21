@@ -1,4 +1,4 @@
-"""Escalated Codex calls (ADR 0001, amendment 12): deciding a `protected_change` request, any
+"""Escalated Codex calls (ADR 0001, amendment 13): deciding a `protected_change` request, any
 arbitration, and examining a change to a protected path run on the role's `codex_escalated_model`,
 and on its `codex_fallback_model` while that model refuses calls. Driven against a fake `codex`
 that refuses one model the way `codex exec --json` reports it (an `error` and a `turn.failed`
@@ -151,8 +151,8 @@ class CodexEscalationTests(unittest.TestCase):
         self.assertTrue(self.records()[-1]["escalated"])
 
     def test_a_decision_is_escalated_only_when_a_protected_change_is_among_the_requests(self):
-        self.decide("paths", "reclassify")
-        self.decide("paths", "protected_change")
+        self.decide("reclassify", "depends")
+        self.decide("depends", "protected_change")
         self.assertEqual(self.models(), ["", "gpt-6.2-astra"])
         self.assertNotIn("escalated", self.records()[0])
 
@@ -225,7 +225,7 @@ class CodexEscalationTests(unittest.TestCase):
     def test_a_default_model_that_refuses_is_an_outage_not_a_crash(self):
         os.environ["ESCALATION_REFUSED"] = "DEFAULT"   # the fake's name for a call with no `-m`
         with self.assertRaises(live.AgentFailure) as caught:
-            self.decide("paths")
+            self.decide("reclassify")
         self.assertEqual(caught.exception.kind, "outage")
         self.assertEqual(self.models(), [""] * 3, "no fallback for a call on the default model")
 

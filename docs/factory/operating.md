@@ -182,7 +182,7 @@ Budgets, per issue and kept across runs:
 
 Codex calls run on the host's default Codex model, except the steps that decide about a
 protected path (`PROTECTED_*` in `config.py`), which are escalated to `gpt-6.2-astra`
-(`loop.toml`, `codex_escalated_model`; ADR 0001, amendment 12): deciding requests among which is
+(`loop.toml`, `codex_escalated_model`; ADR 0001, amendment 13): deciding requests among which is
 a `protected_change`, every arbitration, and examining a commit whose change against its base
 adds, changes or removes a protected path.
 

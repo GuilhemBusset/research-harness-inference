@@ -392,7 +392,7 @@ class LiveAgents:
         keeps using it for `REFUSED_RETRY_S` before it asks its own model again.
 
         `escalate`: a Codex call runs on the role's `codex_escalated_model` (ADR 0001, amendment
-        12), with the same fallback."""
+        13), with the same fallback."""
         schema = schemas.BY_ROLE[role]
         s = self.roles[role]
         own, fallback = self._own_model(vendor, role, escalate), self._fallback_model(vendor, role)
@@ -544,7 +544,7 @@ class LiveAgents:
                  f"below. Check the open findings and the delta; certify the new head if it still holds."
                  if since else "This is the first examination: examine the whole change.")
         diff = self._diff(worktree, since or base_sha, head_sha)
-        # A change to a protected path is examined on the escalated model (ADR 0001, amendment 12):
+        # A change to a protected path is examined on the escalated model (ADR 0001, amendment 13):
         # the whole change against its base, whatever a follow-up examination is shown.
         escalate = self._touches_protected(worktree, base_sha, head_sha)
         with self.ws.disposable(worktree) as scratch:
@@ -560,7 +560,7 @@ class LiveAgents:
     def decide(self, vendor, req, worktree, requests):
         prompt = render("decide", requests=json.dumps(requests, indent=1)[:20000],
                         **self._issue_vars(req, "examiner (deciding requests)"))
-        # Deciding a `protected_change` request is escalated (ADR 0001, amendment 12), with the
+        # Deciding a `protected_change` request is escalated (ADR 0001, amendment 13), with the
         # requests decided in the same call.
         escalate = any(r.get("kind") == "protected_change" for r in requests)
         v = self.call(vendor, "decide", worktree, prompt, req.issue.number, escalate=escalate)
@@ -569,6 +569,6 @@ class LiveAgents:
 
     def arbitrate(self, vendor, req, dispute, worktree=None):
         prompt = render("arbitrate", dispute=json.dumps(dispute, indent=1)[:20000], **self._issue_vars(req, "arbiter"))
-        # Every arbitration is escalated (ADR 0001, amendment 12): it settles a dispute between the keys.
+        # Every arbitration is escalated (ADR 0001, amendment 13): it settles a dispute between the keys.
         v = self.call(vendor, "arbitrate", worktree or self._root(), prompt, req.issue.number, escalate=True)
         return Ruling(upheld=v["upheld"], reason=v["reason"])
