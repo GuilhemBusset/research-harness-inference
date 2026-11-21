@@ -329,8 +329,8 @@ def test_claude_code_s_refusals_image_and_compaction_are_recorded(
     assert set(end["instances"]["instance-1"]) == {"input_tokens", "cached_input_tokens"}
     # The end is read for the scrape after the replay's end.
     assert when(end["counters_at"]) == when(replay["ended_at"]) + timedelta(seconds=s3.SCRAPE_SECONDS)
-    # The start is read for a scrape before the replay sent anything.
-    assert when(start["counters_at"]) <= when(replay["started_at"])
+    # The start is read for the replay's own start.
+    assert when(start["counters_at"]) == when(replay["started_at"])
 
 
 def test_a_line_that_would_hold_a_key_is_not_written() -> None:
@@ -398,6 +398,24 @@ def test_a_turn_after_compaction_counts_as_completed_only_when_it_succeeded() ->
     assert (rows[2]["window_exercised"], rows[2]["client_window"]) == (False, 1_000_000)
 
 
+def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
+    tools = [{"name": "Read"}]
+    short = {"tools": tools, "messages": [{"role": "user", "content": "Read the files."}]}
+    grown = {"tools": tools, "messages": [{"role": "user", "content": "Read the files. " * 50}]}
+    cases = [
+        # A budget refusal on the first, short request: no evidence of the window.
+        ([exchange("/v1/messages", short, 1.0, 402, cause="budget_reached")], False),
+        # A grown turn refused for a budget or a limit: still none.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 429, cause="concurrency_limit")], False),
+        # A grown turn refused as a body the pool could not take.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="request_refused")], True),
+    ]  # fmt: skip
+    for exchanges, exercised in cases:
+        row = s3.compaction_of(claude_session(s3.Step.COMPACTION, [], exchanges), "rhiabc123")
+        assert (row["window_exercised"], row["compacted"]) == (exercised, False)
+        assert row["refused_turns"] == 1
+
+
 def test_the_recorded_session_keeps_the_token_counts_in_order() -> None:
     paths = ["/v1/messages?beta=true", "/v1/messages/count_tokens", "/v1/messages?beta=true", "/v1/messages"]
     seen = [exchange(path, {"messages": []}, float(at), completed=True) for at, path in enumerate(paths)]
@@ -448,8 +466,9 @@ def test_a_workspace_failure_keeps_the_run_s_observations(tmp_path: Path, monkey
     assert (kinds["harness_run"]["build"], kinds["step_failed"]["error"]) == (None, "OSError")
 
 
-def test_the_replay_s_counters_start_after_the_job_s_earlier_traffic(tmp_path: Path) -> None:
+def test_the_replay_s_counters_exclude_traffic_scraped_before_it(tmp_path: Path) -> None:
     clock, charges, written, keys = Clock(), [], [], [generate_key() for _ in range(4)]
+    first = clock()
 
     class Scraped:
         """Counters as the workspace holds them: the sum of what was charged before each scrape."""
@@ -459,6 +478,12 @@ def test_the_replay_s_counters_start_after_the_job_s_earlier_traffic(tmp_path: P
             value = sum(charge[2 if "cached" in query else 1] for charge in charges if charge[0] <= scrape)
             return [common.Series({"instance": INSTANCE}, ((end, value),))]
 
+    def sleep(seconds: float) -> None:
+        # Other traffic, ten tokens a second, until the replay starts.
+        if not any(charge[1] == 100 for charge in charges):
+            charges.extend((clock.now + at, 10, 0) for at in range(1, int(seconds) + 1))
+        clock.sleep(seconds)
+
     async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
         charges.append((clock(), 100, 90))
         return [loadgen.Record(0, 0, True, 200, None, None, None, 100, 90, 1)]
@@ -466,11 +491,12 @@ def test_the_replay_s_counters_start_after_the_job_s_earlier_traffic(tmp_path: P
     job = s3.Job(
         pool="coursework", engine="vllm", endpoint="https://example.com", keys=keys, gateway=Ready(),
         workspace=Scraped(), lines=s3.Lines(keys, wall=clock, out=written.append), work=tmp_path,
-        replay=replay, wall=clock, sleep=clock.sleep,
+        replay=replay, wall=clock, sleep=sleep,
     )  # fmt: skip
-    charges.append((clock(), 900, 0))  # the compaction, just before
+    charges.append((first, 900, 0))  # the compaction, just before
     job.replayed(claude_session(s3.Step.TASK, [], [exchange("/v1/messages", {}, 1.0, completed=True)]))
     start, end = (json.loads(one)["instances"]["instance-1"] for one in written if '"engine_counters"' in one)
+    assert start["input_tokens"] >= 900
     assert (end["input_tokens"] - start["input_tokens"], end["cached_input_tokens"] - start["cached_input_tokens"]) == (
         100,
         90,

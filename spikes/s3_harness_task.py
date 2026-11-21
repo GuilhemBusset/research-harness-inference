@@ -68,17 +68,19 @@ own output that it compacted (an event `compact_boundary`), and gives every turn
 as an `assistant` event: the session completed its next turn when the first such event after the
 compaction is no error, and the session went on after it or did not end in an error. The line also
 holds what shows whether the window was reached at all: the window Claude Code reported, the
-largest input it reported, and the turns the gateway or the engine refused as the session grew.
-When it neither compacted nor had a turn refused, the experiment ended before the window.
+largest input it reported, the turns the gateway or the engine refused, and among them those
+refused as a body too long once the session had grown (`window_refusals_of`). When it neither
+compacted nor had such a turn refused, the experiment ended before the window: a refusal of another
+kind, a budget's on the first request among them, shows nothing of the window.
 
 **The replay.** The Claude Code session of the task, every request the forwarder saw answered,
 side queries and token counts included, with the pauses between them, is replayed through the gateway with the load
 generator (`loadgen.replay`) as a canary student that has sent nothing in the job, so its cache
 starts empty. The engine's input and cached input token counters, by the names of the per-engine
-table (`rhi_common.engine_metrics`), are read for a scrape after the job's earlier traffic, once
-the workspace holds it, and the replay starts only then, so that the start holds none of the
-replay and all of what came before it; the end is read for a scrape after the replay's end, once
-the workspace holds that scrape, so that the counters hold the replay's last answers. Each instance is named by its order of appearance in the job, never by its own name.
+table (`rhi_common.engine_metrics`), are read at the replay's own start, which comes a whole
+scrape interval after the job's earlier traffic, so that the last scrape before it holds all of
+that traffic and none of the replay; the end is read for a scrape after the replay's end. Both are
+read once the workspace holds that scrape, so that the counters hold the replay's last answers. Each instance is named by its order of appearance in the job, never by its own name.
 
 **The build** is the one the pool's lifecycle agents report (`rhi_lifecycle.serving.RELEASE_METRIC`)
 over the run, read once the workspace holds the scrape after it (`s5_capacity.in_service_of`); it is
@@ -234,6 +236,21 @@ KNOWN_CAUSES = frozenset(
         "server_error",
     }
 )
+LENGTH_CAUSES = frozenset(
+    {
+        # The gateway's: a body over the pool's limits, and an engine that refused one (it answers
+        # a prompt longer than its context with a status that is not a success).
+        Cause.REQUEST_REFUSED.value,
+        Cause.ENGINE_ERROR.value,
+        # The formats' own, should the engine's error pass through.
+        "invalid_request_error",
+        "request_too_large",
+        "BadRequestError",
+        "context_length_exceeded",
+    }
+)
+# The statuses such a refusal comes with when it names no cause.
+LENGTH_STATUSES = frozenset({400, 413, 502})
 MESSAGES_ROUTE = "/v1/messages"
 # The Messages routes a recorded session replays: the turns and the token counts.
 REPLAYED_ROUTES = (MESSAGES_ROUTE, "/v1/messages/count_tokens")
@@ -688,6 +705,7 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
     trigger = metadata.get("trigger")
     answer = session.result().get("result")
     refused_turns = sum(1 for one in session.exchanges if s2.refused(one) and bool((one.json() or {}).get("tools")))
+    window_refusals = len(window_refusals_of(session))
     return {
         "compacted": boundary is not None,
         "compacted_at": utc_or_none(boundary),
@@ -699,10 +717,33 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         "client_window": client_window(session),
         "largest_input_tokens": largest_input(session),
         "refused_turns": refused_turns,
-        # Whether the session met its window: it compacted, or a turn was refused as it grew. When
-        # neither, the experiment ended before the window was exercised.
-        "window_exercised": boundary is not None or refused_turns > 0,
+        "window_refusals": window_refusals,
+        # Whether the session met its window: it compacted, or a turn was refused as a body too long
+        # once the session had grown. A refusal of another kind (a budget, a limit, a cold pool)
+        # shows neither: the experiment then ended before the window was exercised.
+        "window_exercised": boundary is not None or window_refusals > 0,
     }
+
+
+def window_refusals_of(session: Session) -> list[s2.Exchange]:
+    """The turns of the main loop refused as a body the pool could not take, each larger than every
+    turn accepted before it: what a session refused at its window looks like. A refusal on the first
+    turn, or of a kind no length causes (a budget, a limit, a cold pool), is not one."""
+    found, largest = [], None
+    for one in session.exchanges:
+        if one.route != MESSAGES_ROUTE or not (one.json() or {}).get("tools"):
+            continue
+        if not s2.refused(one):
+            largest = max(largest or 0, len(one.body))
+        elif largest is not None and len(one.body) > largest and _refused_as_too_long(one):
+            found.append(one)
+    return found
+
+
+def _refused_as_too_long(exchange: s2.Exchange) -> bool:
+    if exchange.cause is not None:
+        return exchange.cause in LENGTH_CAUSES
+    return exchange.status in LENGTH_STATUSES
 
 
 def recorded_session(exchanges: Sequence[s2.Exchange]) -> loadgen.RecordedSession:
@@ -1019,13 +1060,11 @@ class Job:
 
     def replayed(self, task: Session) -> None:
         """The task's Claude Code session replayed through the pool as a student that has sent nothing
-        yet, with the engine's counters for the moment before it and for the scrape after its end."""
+        yet, with the engine's counters as they stood at its start and at the scrape after its end."""
         session = recorded_session(task.exchanges)
-        # The start: a scrape after all the job sent before, read once the workspace holds it; the
-        # replay sends nothing before then.
-        baseline = self.wall() + SCRAPE_SECONDS
-        self._wait_until(baseline + SETTLE_SECONDS)
-        self.counters("start", baseline)
+        # A whole scrape interval first, so that a scrape falls between all the job sent before and
+        # the replay's start: the counters at the start hold the one and nothing of the other.
+        self._wait_until(self.wall() + SCRAPE_SECONDS)
         start = self.wall()
         records = asyncio.run(self._send(session))
         end = self.wall()
@@ -1039,8 +1078,10 @@ class Job:
             input_tokens=sum(record.input_tokens or 0 for record in records),
             cached_input_tokens=sum(record.cached_input_tokens or 0 for record in records),
         )
-        # The scrape after the replay's end holds its last answers: read once the workspace holds it.
+        # Both read once the workspace holds the scrape after the replay's end, which holds its last
+        # answers; the start is the last scrape before the replay's first request.
         self._wait_until(end + SETTLE_SECONDS)
+        self.counters("start", start)
         self.counters("end", end + SCRAPE_SECONDS)
 
     async def _send(self, session: loadgen.RecordedSession) -> list[loadgen.Record]:
