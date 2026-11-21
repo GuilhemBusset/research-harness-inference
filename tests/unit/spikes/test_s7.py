@@ -1,762 +1,370 @@
-"""Spike S7's verdict (`spikes/s7_drain.py`): how long an idle instance took to leave on each path,
-whether the held streams completed and whether a wake was lost, from recorded numbers. No number
-here is a measurement; the instance names are made up.
+"""Spike S7's job (`spikes/s7_drain.py`): each step writes its lines, on stubbed clients and a clock
+the test controls. The pool-state table and the workspace are stubs that answer as a scripted
+scaler and the instances' collectors would; the gateway is a stub transport. No AWS, no network.
 """
 
 from __future__ import annotations
 
 import asyncio
-import math
-from types import SimpleNamespace
+import json
+import re
+import secrets
+import tomllib
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import botocore.exceptions
 import httpx
 import pytest
 
 import common
 import s7_drain as s7
+from rhi import config
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
 from rhi_common.records import ScalerNote
 from rhi_gateway.errors import WireFormat, render_stream_event
-from rhi_mock_engine.app import Settings, create_app
-from rhi_reporter.measure import Verdict, measurement_event
 
-Number = s7.Number
-
-RECORDED: dict[str, int | float] = {
-    Number.LEAVE_SECONDS_TERMINATED: 90,
-    Number.LEAVE_SECONDS_WARM_POOL: 90,
-    Number.STREAM_COMPLETED_SCALE_IN: 1,
-    Number.STREAM_COMPLETED_GATEWAY_DEPLOYMENT: 1,
-    Number.WAKES_SENT: 3,
-    Number.WAKES_LOST: 0,
-}
-
-
-def test_an_idle_instance_gone_in_90_seconds_with_every_stream_complete_and_no_wake_lost_passes() -> None:
-    assert s7.SPIKE.measurement == "S7"
-    assert set(RECORDED) == set(Number)
-    assert s7.SPIKE.verdict(RECORDED) is Verdict.PASS
-    # The numbers are the declared names, in the shape the reporter takes.
-    names = [name.value for name in Number]
-    measurement_event("S7", "s7-drain", Verdict.PASS, RECORDED, names=names, commit="a" * 40, bus="bus")
-
-
-@pytest.mark.parametrize("path", [Number.LEAVE_SECONDS_TERMINATED, Number.LEAVE_SECONDS_WARM_POOL])
-def test_an_idle_instance_gone_in_180_seconds_fails(path: Number) -> None:
-    assert s7.SPIKE.verdict({**RECORDED, path: 180}) is Verdict.FAIL
-
-
-def test_one_lost_wake_fails() -> None:
-    assert s7.SPIKE.verdict({**RECORDED, Number.WAKES_LOST: 1}) is Verdict.FAIL
-
-
-@pytest.mark.parametrize("stream", [Number.STREAM_COMPLETED_SCALE_IN, Number.STREAM_COMPLETED_GATEWAY_DEPLOYMENT])
-def test_a_held_stream_that_did_not_complete_fails(stream: Number) -> None:
-    assert s7.SPIKE.verdict({**RECORDED, stream: 0}) is Verdict.FAIL
-
-
-def test_an_instance_has_left_once_its_collector_has_been_silent() -> None:
-    asked_at = 1000.0
-    series = [
-        common.Series({"instance": "instance-a"}, ((1000.0, 990.0), (1015.0, 1005.0), (1030.0, 1005.0))),
-        common.Series({"instance": "instance-b"}, ((1000.0, 990.0), (1015.0, 1080.0))),
-    ]
-    written = s7.last_writes(series)
-    assert written == {"instance-a": 1005.0, "instance-b": 1080.0}
-    # instance-b still writes; instance-a has been silent long enough to have stopped.
-    assert s7.stopped(written, {"instance-a", "instance-b"}, now=1100.0) == {"instance-a": 1005.0}
-    assert s7.leave_seconds(asked_at, 1005.0) == 1005.0 + s7.SCRAPE_SECONDS - asked_at
-
-
-def test_the_path_follows_the_warm_count() -> None:
-    assert s7.path_of(0, 0, newcomer=False) is s7.Path.TERMINATED
-    assert s7.path_of(0, 1, newcomer=False) is s7.Path.WARM_POOL
-    # A fresh instance launched into the warm pool may stand for a terminated one: not told.
-    assert s7.path_of(0, 1, newcomer=True) is None
-    assert s7.warm_around([(990.0, 0.0), (1005.0, 0.0), (1020.0, 1.0)], 1000.0) == (0, 1)
-
-
-def test_a_run_without_both_paths_is_not_measured() -> None:
-    streams = {Number.STREAM_COMPLETED_SCALE_IN: True, Number.STREAM_COMPLETED_GATEWAY_DEPLOYMENT: True}
-    terminated = s7.Departure(s7.Path.TERMINATED, 60.0)
-    with pytest.raises(ValueError, match="warm_pool"):
-        s7.numbers_of([terminated, s7.Departure(None, 30.0)], streams, 3, 0)
-    numbers = s7.numbers_of([terminated, s7.Departure(s7.Path.WARM_POOL, 40.0), terminated], streams, 3, 0)
-    assert numbers[Number.LEAVE_SECONDS_WARM_POOL] == 40.0
-    assert s7.SPIKE.verdict(numbers) is Verdict.PASS
-
-
-def test_a_slow_stream_is_read_over_the_seconds_given_and_completes() -> None:
-    key = generate_key()
-
-    async def no_delay(seconds: float) -> None:
-        pass
-
-    paused: list[float] = []
-
-    async def pause(seconds: float) -> None:
-        paused.append(seconds)
-
-    transport = httpx.ASGITransport(app=create_app(Settings(secret=key), sleep=no_delay))
-    request = s7._request("mock")
-    assert asyncio.run(s7.slow_stream("http://engine", key, request, 60.0, transport=transport, sleep=pause))
-    assert sum(paused) == pytest.approx(60.0)
-    # A student the engine refuses has no stream to complete.
-    refused = httpx.ASGITransport(app=create_app(Settings(secret=key), sleep=no_delay))
-    assert not asyncio.run(s7.slow_stream("http://engine", generate_key(), request, 60.0, transport=refused))
-
-
-class _Departing:
-    """A pool whose one instance, writing when the scaler asked for fewer, wrote last at `last`,
-    and whose warm count the scaler read as `warm`."""
-
-    name = "mock"
-
-    def __init__(self, asked_at: int, last: float, warm: list[tuple[float, float]]) -> None:
-        self.asked_at, self.last, self.warm = asked_at, last, warm
-
-    def note(self) -> ScalerNote:
-        return ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=self.asked_at)
-
-    def writes(self, start: float, end: float) -> dict[str, float]:
-        return {"instance-a": float(self.asked_at) if end == self.asked_at else self.last}
-
-    def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
-        return self.warm
-
-
-@pytest.mark.parametrize(
-    ("last", "warm", "path"),
-    [
-        (1005.0, [(990.0, 0.0), (1080.0, 0.0)], s7.Path.TERMINATED),
-        (1005.0, [(990.0, 0.0), (1080.0, 1.0)], s7.Path.WARM_POOL),
-        # No reading of the warm count across the departure: its path is not told.
-        (1005.0, [], None),
-        (1005.0, [(990.0, 0.0), (1010.0, 0.0)], None),
-        # Still writing when the job stops waiting: no stop was seen.
-        (2000.0, [(990.0, 0.0), (1980.0, 1.0)], None),
-    ],
+REPO = Path(__file__).resolve().parents[3]
+MOCK = next(
+    pool
+    for pool in config.parse(tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8")), "test").pools
+    if pool.name == "mock"
 )
-def test_a_departure_has_a_path_only_when_its_stop_and_the_warm_count_were_seen(
-    monkeypatch: pytest.MonkeyPatch, last: float, warm: list[tuple[float, float]], path: s7.Path | None
-) -> None:
-    now = 1000 + (s7.LEAVE_WAIT_SECONDS + 1 if last > 1500 else 110)
-    monkeypatch.setattr(s7.time, "time", lambda: now)
-    pool = _Departing(1000, last, warm)
-    run = s7.Run(pool, "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
-    departure = asyncio.run(run.departure(1, 1))
-    assert departure.path is path
-    if path is not None:
-        assert departure.seconds == s7.leave_seconds(1000, last)
+T0 = 1_800_000_000.0
+UTC_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
+# What an AWS error's text might hold: it must reach no line.
+AWS_TEXT = "an AWS message naming arn:aws:dynamodb:us-east-1:123456789012:table/pool-state"
 
 
-def test_a_held_stream_is_answered_only_once_the_event_it_spans_is_over() -> None:
-    key, happened = generate_key(), []
-    engine = create_app(Settings(secret=key))
+class FakeClock:
+    """A clock the test moves: `sleep` advances it at once."""
 
-    async def recorded(scope: Any, receive: Any, send: Any) -> None:
-        async def sent(message: Any) -> None:
-            await send(message)
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                happened.append("answered")
+    def __init__(self, now: float = T0) -> None:
+        self.at = now
 
-        await engine(scope, receive, sent)
+    def now(self) -> float:
+        return self.at
 
-    async def over() -> bool:
-        if len(happened) < 3:
-            happened.append("held")
-            return False
-        happened.append("over")
-        return True
+    async def sleep(self, seconds: float) -> None:
+        self.at += seconds
+        await asyncio.sleep(0)
 
-    async def no_wait(seconds: float) -> None:
-        pass
 
-    transport = httpx.ASGITransport(app=recorded)
-    request = s7._request("mock")
-    held = s7.slow_stream("http://engine", key, request, 600.0, until=over, transport=transport, sleep=no_wait)
-    assert asyncio.run(held)
-    assert happened == ["held", "held", "held", "over", "answered"]
+def instance_id() -> str:
+    """An instance ID of the shape AWS gives, made at run time."""
+    return "i-" + secrets.token_hex(9)[:17]
 
 
-def _warming_stream(request: httpx.Request) -> httpx.Response:
-    event = render_stream_event(Cause.WARMING, WireFormat.MESSAGES)
-    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=event)
+@dataclass
+class Scaler:
+    """A scaler that runs every minute: its note asks for `asked(run)`, and its gauges, stamped a
+    moment after the note's `written_at`, read `in_service(run)` and `warm(run)`. Each instance's
+    collector writes `up` every 15 seconds from its first write to its last. Nothing is visible
+    before the clock reaches it."""
 
+    clock: FakeClock
+    asked: Callable[[float], int]
+    in_service: Callable[[float], int]
+    warm: Callable[[float], int] = lambda run: 0
+    instances: dict[str, tuple[float, float]] = field(default_factory=dict)
+    failing: bool = False
 
-def _cut(request: httpx.Request) -> httpx.Response:
-    raise httpx.ReadError("cut", request=request)
+    def runs(self, until: float) -> list[float]:
+        return [T0 - 1200 + 60 * n for n in range(int((until - T0 + 1200) // 60) + 1)]
 
+    # The pool-state table.
+    def get_item(self, **arguments: Any) -> dict[str, Any]:
+        if self.failing:
+            error = {"Error": {"Code": "ThrottlingException", "Message": AWS_TEXT}}
+            raise botocore.exceptions.ClientError(error, "GetItem")
+        run = self.runs(self.clock.now())[-1]
+        note = ScalerNote(pool="mock", capacity_asked=self.asked(run), no_capacity_at=None, written_at=int(run))
+        return {"Item": note.to_item()}
 
-def test_a_wake_is_lost_unless_its_inference_completes() -> None:
-    key = generate_key()
-    engine = httpx.ASGITransport(app=create_app(Settings(secret=key)))
-    assert asyncio.run(s7.wake("http://gateway", key, "mock", 5, transport=engine))
-    for respond in (_warming_stream, _cut, lambda request: httpx.Response(503)):
-        lost = s7.wake("http://gateway", key, "mock", 5, transport=httpx.MockTransport(respond))
-        assert not asyncio.run(lost)
-
-
-def test_each_wake_goes_when_no_instance_serves_and_a_lost_one_does_not_end_them(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The pool as the scaler reads it, (asked, in service), one reading per look.
-    readings = iter([(1, 1), (0, 1), (0, 0), (1, 1), (0, 0), (1, 1), (0, 0)])
-    now = next(readings)
-    pool = SimpleNamespace(name="mock", asked=lambda: now[0], gauge=lambda name: now[1])
-    answers = iter([True, False, True, True, True])  # the second request is a lost wake
-    sent: list[tuple[int, int]] = []
-
-    async def wait(condition: Any, *arguments: Any) -> None:
-        nonlocal now
-        while not condition():
-            now = next(readings)
-
-    async def wake(*arguments: Any, **options: Any) -> bool:
-        sent.append(now)
-        return next(answers)
-
-    monkeypatch.setattr(s7, "_wait", wait)
-    monkeypatch.setattr(s7, "wake", wake)
-    settings = SimpleNamespace(hold_seconds=30, idle_minutes=1)
-    run = s7.Run(pool, "http://gateway", [generate_key()], settings, 3, 60)  # ty: ignore[invalid-argument-type] - a double
-    assert asyncio.run(run.send_wakes()) == (3, 1)
-    # A request to bring the pool back, the first wake, lost, at zero in service, another request
-    # to bring the pool back, then the two other wakes, each at zero in service.
-    assert sent == [(1, 1), (0, 0), (0, 0), (0, 0), (0, 0)]
-
-
-def test_a_gateway_deployment_counts_only_when_seen_under_the_stream() -> None:
-    tasks = {"task-a": (900.0, 1500.0), "task-b": (1100.0, 1500.0)}
-    assert s7.rollout_at({"task-a"}, tasks) == 1100.0
-    assert s7.rollout_at({"task-a", "task-b"}, tasks) is None
-    assert s7.across_rollout(completed=True, spanned=True, rolled_out_at=1100.0)
-    assert not s7.across_rollout(completed=False, spanned=False, rolled_out_at=1100.0)
-    for completed, spanned in ((True, False), (False, False)):
-        with pytest.raises(ValueError, match="no gateway deployment"):
-            s7.across_rollout(completed=completed, spanned=spanned, rolled_out_at=None)
-    # A stream the mock answers while the same task writes throughout is no survived deployment.
-    key = generate_key()
-    pool = SimpleNamespace(name="mock", gateway_tasks=lambda start, end: {"task-a": (start, end)})
-    engine = httpx.ASGITransport(app=create_app(Settings(secret=key)))
-    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=engine)  # ty: ignore[invalid-argument-type] - a double
-    with pytest.raises(RuntimeError, match="no gateway deployment"):
-        asyncio.run(run.across_deployment())
-
-
-def test_a_task_that_appears_while_the_old_ones_keep_writing_is_no_rollout() -> None:
-    began, ended, now = 1000.0, 1500.0, 1700.0
-    transient = {"task-a": (900.0, 1690.0), "task-b": (1100.0, 1200.0)}
-    assert s7.rollout_under({"task-a"}, transient, began, ended, now) is None
-    replaced = {"task-a": (900.0, 1200.0), "task-b": (1100.0, 1690.0)}
-    assert s7.rollout_under({"task-a"}, replaced, began, ended, now) == 1200.0
-    # The new task had stopped before the old one did: nothing took its place.
-    gone_first = {"task-a": (900.0, 1300.0), "task-b": (1100.0, 1200.0)}
-    assert s7.rollout_under({"task-a"}, gone_first, began, ended, now) is None
-
-
-def test_the_warm_baseline_is_the_reading_the_scaler_decided_on() -> None:
-    # The scaler writes the readings it decided on just after its note's whole second.
-    already_warm = [(940.0, 0.0), (1000.4, 1.0), (1060.0, 1.0)]
-    assert s7.warm_around(already_warm, 1000.0) == (1, 1)
-    assert s7.path_of(*s7.warm_around(already_warm, 1000.0) or (0, 0), newcomer=False) is s7.Path.TERMINATED
-    went_warm = [(940.0, 0.0), (1000.4, 0.0), (1060.2, 1.0)]
-    assert s7.warm_around(went_warm, 1000.0) == (0, 1)
-
-
-class _Streaming(httpx.AsyncBaseTransport):
-    """An ASGI transport that hands the client each part of an answer as the app sends it, as a
-    connection does: httpx's own hands over the whole answer once the app has returned. `read` is
-    set once the client has a part of the answer."""
-
-    def __init__(self, app: Any) -> None:
-        self.app, self.read = app, asyncio.Event()
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        body = b"".join([part async for part in request.stream])  # ty: ignore[not-iterable] - an async stream
-        parts: asyncio.Queue[bytes | None] = asyncio.Queue()
-        started: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        scope = {
-            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": request.method,
-            "headers": [(name.lower(), value) for name, value in request.headers.raw], "scheme": "http",
-            "path": request.url.path, "raw_path": request.url.raw_path, "query_string": request.url.query,
-            "server": ("gateway", 80), "client": ("127.0.0.1", 1), "root_path": "",
-        }  # fmt: skip
-        received = False
-
-        async def receive() -> dict[str, Any]:
-            nonlocal received
-            if not received:
-                received = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            await asyncio.Event().wait()  # the client stays until the answer ends
-            return {"type": "http.disconnect"}
-
-        async def send(message: Any) -> None:
-            if message["type"] == "http.response.start":
-                started.set_result(message)
-            elif message["type"] == "http.response.body":
-                parts.put_nowait(message.get("body", b""))
-                if not message.get("more_body", False):
-                    parts.put_nowait(None)
-
-        app = asyncio.ensure_future(self.app(scope, receive, send))
-        start = await started
-        transport = self
-
-        class Parts(httpx.AsyncByteStream):
-            async def __aiter__(self) -> Any:
-                while (part := await parts.get()) is not None:
-                    if part:
-                        transport.read.set()
-                        yield part
-
-            async def aclose(self) -> None:
-                app.cancel()
-
-        return httpx.Response(start["status"], headers=start.get("headers", []), stream=Parts())
-
-
-def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    key, happened = generate_key(), []
-    engine = create_app(Settings(secret=key))
-
-    async def scenario() -> bool | None:
-        answering, departed = asyncio.Event(), asyncio.Event()
-        transport = _Streaming(None)
-
-        async def recorded(scope: Any, receive: Any, send: Any) -> None:
-            async def sent(message: Any) -> None:
-                if message["type"] == "http.response.start":
-                    happened.append("answering")
-                    answering.set()
-                if message["type"] == "http.response.body" and not message.get("more_body", False):
-                    # The closing event goes only once the instance has left.
-                    await asyncio.wait_for(departed.wait(), 5)
-                    await send(message)
-                    happened.append("answered")
-                    return
-                await send(message)
-
-            await engine(scope, receive, sent)
-
-        async def nothing() -> None:
-            pass
-
-        async def departure(asked: int, wait: float, after: Any = None) -> s7.Departure:
-            if after is not None:
-                await after
-                return s7.Departure(s7.Path.WARM_POOL, 60.0, "instance-b")
-            assert run.asked_fewer is not None
-            run.asked_fewer.set()  # the scaler asked for fewer: the relay begins
-            try:
-                # The client has the first part of the answer: its inference has begun.
-                await asyncio.wait_for(transport.read.wait(), 1)
-            except TimeoutError:
-                pass
-            happened.append("scale-in")
-            now = s7.time.time()
-            gone = s7.Departure(s7.Path.TERMINATED, 0.01, "instance-a", now, now + 0.01, now, now)
-            run.leaving.append(gone)
-            departed.set()
-            return gone
-
-        transport.app = recorded
-        pool: Any = SimpleNamespace(name="mock")
-        settings: Any = SimpleNamespace(idle_minutes=0)
-        run = s7.Run(pool, "http://gateway", [key], settings, 1, 60, transport=transport)
-        monkeypatch.setattr(run, "two_instances", nothing)
-        monkeypatch.setattr(run, "departure", departure)
-        return await run.cycle(scale_in_stream=True)
-
-    assert asyncio.run(scenario()) is True
-    # A request was being answered when the instance left, and its answer ended after.
-    assert happened.index("answering") < happened.index("scale-in") < happened.index("answered")
-
-
-def test_a_scale_in_seen_over_between_two_streams_is_not_a_stream_across_it() -> None:
-    gone = s7.Departure(s7.Path.TERMINATED, 30.0, "idle-node", 1000.0, 1030.0, 1005.0, 1015.0)
-    before = s7.Streamed(999.5, 999.9, s7.Answer(completed=True, begun_at=999.5))
-    after = s7.Streamed(1030.5, 1030.9, s7.Answer(completed=True, begun_at=1030.5))
-    # The first stream ended before the scale-in, the second began after: neither spanned it.
-    assert s7.across_scale_in([before, after], gone) is None
-
-
-def test_overlapping_mock_streams_read_as_they_come_span_a_scale_in() -> None:
-    key = generate_key()
-    # A turn of about twenty tokens at 100 a second: each stream lasts about 0.2 s.
-    transport = _Streaming(create_app(Settings(secret=key, tokens_per_second=100)))
-    run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=transport)  # ty: ignore[invalid-argument-type] - a double
-    t0 = s7.time.time()
-    # Both events' bounds are longer than any one stream: only streams that overlap cover them.
-    gone = s7.Departure(s7.Path.TERMINATED, 1.0, "idle-node", t0 + 0.2, t0 + 1.2, t0 + 0.6, t0 + 0.7)
-
-    def over() -> bool:
-        if s7.time.time() >= t0 + 1.4 and not run.leaving:
-            run.leaving.append(gone)
-        return bool(run.leaving)
-
-    assert asyncio.run(run.relay(over)) is True
-
-
-def test_a_mock_answer_sent_whole_before_the_scale_in_does_not_span_it() -> None:
-    key = generate_key()
-    engine = create_app(Settings(secret=key))
-
-    async def scenario() -> bool | None:
-        answered, departed, requests = asyncio.Event(), asyncio.Event(), [0]
-
-        async def app(scope: Any, receive: Any, send: Any) -> None:
-            requests[0] += 1
-            if requests[0] > 1:
-                await departed.wait()  # every later inference begins after the stop
-            await engine(scope, receive, send)
-            answered.set()
-
-        # httpx's own transport hands over the whole answer once the engine has sent it.
-        transport = httpx.ASGITransport(app=app)
-        run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=transport)  # ty: ignore[invalid-argument-type] - a double
-
-        async def scale_in() -> None:
-            await answered.wait()
-            await asyncio.sleep(0.02)
-            asked = s7.time.time()
-            await asyncio.sleep(0.02)
-            stopped = s7.time.time()
-            run.leaving.append(s7.Departure(s7.Path.TERMINATED, stopped - asked, "idle-node", asked, stopped, asked, asked))
-            departed.set()
-
-        relayed, _ = await asyncio.gather(run.relay(lambda: bool(run.leaving)), scale_in())
-        return relayed
-
-    assert asyncio.run(scenario()) is None
-
-
-class _TwoInstances:
-    """A pool where instance-a, writing when the scaler asked for fewer at 1000, last wrote at
-    1005, and instance-b writes from `b_from` on, and whose warm count the scaler read as `warm`."""
-
-    name = "mock"
-
-    def __init__(self, b_from: float, warm: list[tuple[float, float]]) -> None:
-        self.b_from, self.warm = b_from, warm
-
-    def note(self) -> ScalerNote:
-        return ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=1000)
-
-    def writes(self, start: float, end: float) -> dict[str, float]:
-        found = {"instance-a": min(end, 1005.0)}
-        if end >= self.b_from:
-            found["instance-b"] = min(end, 1115.0)
-        return found
-
-    def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
-        return self.warm
-
-
-@pytest.mark.parametrize(
-    ("b_from", "warm", "path"),
-    [
-        # The decision run's own reading is the baseline.
-        (500.0, [(940.0, 1.0), (1000.3, 1.0), (1060.0, 1.0)], s7.Path.TERMINATED),
-        (500.0, [(940.0, 1.0), (1000.3, 1.0), (1060.0, 2.0)], s7.Path.WARM_POOL),
-        # Its push was lost: one warm instance read before may have left and been replaced.
-        (500.0, [(940.0, 1.0), (1060.0, 1.0)], None),
-        # An empty warm pool read before has none to lose.
-        (500.0, [(940.0, 0.0), (1060.0, 1.0)], s7.Path.WARM_POOL),
-        # Unless an instance new since that reading may have filled it.
-        (980.0, [(940.0, 0.0), (1060.0, 1.0)], None),
-    ],
-)
-def test_the_path_is_told_only_from_the_warm_count_the_decision_was_made_on(
-    monkeypatch: pytest.MonkeyPatch, b_from: float, warm: list[tuple[float, float]], path: s7.Path | None
-) -> None:
-    monkeypatch.setattr(s7.time, "time", lambda: 1120.0)
-    run = s7.Run(_TwoInstances(b_from, warm), "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
-    departure = asyncio.run(run.departure(2, 1))
-    assert (departure.instance, departure.path) == ("instance-a", path)
-
-
-@pytest.mark.parametrize(
-    ("old_last", "new_first", "query_seconds", "survived"),
-    [
-        # The old task was replaced while the job read the tasks, before the stream opened.
-        (1005.0, 1010.0, 25.0, None),
-        # It was replaced while the stream was held.
-        (1200.0, 1100.0, 0.0, True),
-    ],
-)
-def test_a_gateway_deployment_counts_only_when_it_replaced_a_task_after_the_stream_opened(
-    monkeypatch: pytest.MonkeyPatch, old_last: float, new_first: float, query_seconds: float, survived: bool | None
-) -> None:
-    key = generate_key()
-    engine = create_app(Settings(secret=key))
-    clock = [1000.0]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-
-    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
-        if end == 1000.0:
-            clock[0] += query_seconds
-        # task-c, the old task the stream is on, runs until the stream has ended.
-        found = {"task-a": (900.0, min(end, old_last)), "task-c": (900.0, end)}
-        if end >= new_first:
-            found["task-b"] = (new_first, end)
-        return found
-
-    async def gateway(scope: Any, receive: Any, send: Any) -> None:
-        async def held() -> Any:
-            message = await receive()
-            if not message.get("more_body", False):
-                clock[0] = 1400.0  # the stream is let go, long after
-            return message
-
-        await engine(scope, held, send)
-
-    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
-    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
-    if survived is None:
-        with pytest.raises(RuntimeError, match="no gateway deployment"):
-            asyncio.run(run.across_deployment())
-    else:
-        assert asyncio.run(run.across_deployment()) is survived
-
-
-def test_only_the_streams_in_flight_while_the_instance_left_are_across_the_scale_in() -> None:
-    gone = s7.Departure(s7.Path.TERMINATED, 20.0, "instance-a", asked_at=1000.0, stopped_at=1020.0)
-
-    def stream(began: float, ended: float, completed: bool = True) -> s7.Streamed:
-        return s7.Streamed(began, ended, s7.Answer(completed, over_as_begun=False, over_as_ended=True))
-
-    # Begun after the stop, while the job waited for the collector to stay silent: not across it.
-    assert s7.across_scale_in([stream(990.0, 999.0), stream(1115.0, 1116.0)], gone) is None
-    assert s7.across_scale_in([stream(999.0, 1001.0), stream(1115.0, 1116.0)], gone) is True
-    assert s7.across_scale_in([stream(1010.0, 1011.0, completed=False)], gone) is False
-    # No stop seen: nothing to be across.
-    assert s7.across_scale_in([stream(999.0, 1001.0)], s7.Departure(None, 900.0, asked_at=1000.0)) is None
-
-
-def test_a_stream_begun_after_the_measured_stop_does_not_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(s7.time, "time", lambda: 1115.0)
-    key = generate_key()
-    engine = create_app(Settings(secret=key))
-    pool = _TwoInstances(500.0, [(1000.3, 0.0), (1060.0, 0.0)])  # instance-a stopped by 1020
-
-    async def scenario() -> bool | None:
-        seen_over = asyncio.Event()
-
-        async def held(scope: Any, receive: Any, send: Any) -> None:
-            async def sent(message: Any) -> None:
-                if message["type"] == "http.response.body" and not message.get("more_body", False):
-                    await seen_over.wait()  # in flight, at 1115, when the stop is seen over
-                await send(message)
-
-            await engine(scope, receive, sent)
-
-        run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 60, transport=_Streaming(held))  # ty: ignore[invalid-argument-type] - a double
-        first = asyncio.create_task(run.departure(2, 1))
-        first.add_done_callback(lambda _: seen_over.set())
-        return await run.relay(first.done)
-
-    assert asyncio.run(scenario()) is None
-
-
-def test_a_deployment_stream_opened_while_a_replacement_was_already_serving_is_not_measured() -> None:
-    on_new = {"task-a": (900.0, 1120.0), "task-b": (1010.0, 1400.0)}
-    assert s7.rollout_under({"task-a"}, on_new, 1020.0, 1300.0, 1400.0) is None
-    after_open = {"task-a": (900.0, 1120.0), "task-b": (1030.0, 1400.0)}
-    assert s7.rollout_under({"task-a"}, after_open, 1020.0, 1300.0, 1400.0) == 1120.0
-
-
-def _note(asked: int, at: int) -> ScalerNote:
-    return ScalerNote(pool="mock", capacity_asked=asked, no_capacity_at=None, written_at=at)
-
-
-def test_the_warm_count_of_a_departure_ends_before_the_next_decision() -> None:
-    assert s7.warm_bound(1, [_note(1, 1060), _note(1, 1120)], 1000.0) == math.inf
-    assert s7.warm_bound(1, [_note(1, 1060), _note(0, 1120), _note(0, 1180)], 1000.0) == 1060.0 + s7.NOTE_SECOND
-
-
-def test_a_warm_return_after_the_next_decision_is_not_the_earlier_departure_s(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [1391.0]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-
-    class Pool(_TwoInstances):
-        def note(self) -> ScalerNote:
-            # The next decision, at 1300, came while instance-a, asked away at 1000, still drained.
-            return _note(1, 1000) if clock[0] < 1300 else _note(0, 1300)
-
-        def writes(self, start: float, end: float) -> dict[str, float]:
-            return {"instance-a": min(end, 1300.0), "instance-b": min(end, 1360.0)}
-
-    async def scenario() -> s7.Departure:
-        clock[0] = 1000.0
-        pool: Any = Pool(500.0, [(1000.4, 0.0), (1300.4, 0.0), (1360.4, 1.0)])
-        settings: Any = SimpleNamespace()
-        run = s7.Run(pool, "http://gateway", [generate_key()], settings, 1, 60)
-
-        async def wait(condition: Any, seconds: float, what: str, *arguments: Any) -> None:
-            if what == "an instance to stop":
-                clock[0] = 1391.0
-            assert condition()
-
-        monkeypatch.setattr(s7, "_wait", wait)
-        return await run.departure(2, 1)
-
-    departure = asyncio.run(scenario())
-    assert (departure.instance, departure.path) == ("instance-a", None)
-
-
-class _Workspace:
-    """A workspace whose samples of one gauge are `samples`, which become `later` once read."""
-
-    def __init__(self, samples: list[tuple[float, float]], later: list[tuple[float, float]] | None = None) -> None:
-        self.samples, self.later = samples, later
-
+    # The workspace.
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
-        found, at = [], start
-        while at <= end:
-            seen = [(stamp, value) for stamp, value in self.samples if stamp <= at]
-            if seen:
-                found.append((at, seen[-1][0] if query.startswith("timestamp(") else seen[-1][1]))
-            at += step
-        if self.later is not None:
-            self.samples, self.later = self.later, None
-        return [common.Series({"pool": "mock"}, tuple(found))]
+        steps, now = [], self.clock.now()
+        moment = start
+        while moment <= end:
+            steps.append(min(moment, now))
+            moment += step
+        if query.startswith("max by (instance)"):
+            series = []
+            for instance, (first, last) in self.instances.items():
+                samples = []
+                for at in steps:
+                    written = [first + 15 * n for n in range(int((min(last, at) - first) // 15) + 1)]
+                    if min(last, at) >= first and at - written[-1] <= 300:
+                        samples.append((at, written[-1]))
+                series.append(common.Series({"instance": instance}, tuple(samples)))
+            return series
+        gauge = self.in_service if s7.INSTANCES_IN_SERVICE in query else self.warm
+        samples = []
+        for at in steps:
+            stamped = [run + 0.2 for run in self.runs(at) if run + 0.2 <= at]
+            if stamped:
+                value = stamped[-1] if query.startswith("timestamp(") else gauge(stamped[-1] - 0.2)
+                samples.append((at, float(value)))
+        return [common.Series({"pool": "mock"}, tuple(samples))]
 
 
-def test_a_reading_is_its_own_value_at_its_own_time() -> None:
-    # A newer reading becomes visible between the queries: its time is not paired with the old value.
-    workspace = _Workspace([(1000.4, 0.0)], later=[(1000.4, 0.0), (1119.5, 1.0)])
-    pool = s7.Pool("mock", workspace, None)  # ty: ignore[invalid-argument-type] - a double
-    assert pool.warm_counts(880.0, 1120.0) == [(1000.4, 0.0)]
-    assert pool.warm_counts(880.0, 1120.0) == [(1000.4, 0.0), (1119.5, 1.0)]
+def sse(name: str, data: dict[str, Any] | None = None) -> bytes:
+    return f"event: {name}\ndata: {json.dumps(data or {'type': name})}\n\n".encode()
 
 
-def test_a_gauge_older_than_the_scaler_s_note_is_not_its_last_reading(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [1001.0]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-    note = [_note(0, 1000)]
-    table = SimpleNamespace(get_item=lambda **arguments: {"Item": note[0].to_item()})
-    # Zero in service, read at 940, before a wake: the note asking for none is newer.
-    pool = s7.Pool("mock", _Workspace([(940.3, 0.0)]), table)  # ty: ignore[invalid-argument-type] - a double
-    assert pool.gauge(s7.INSTANCES_IN_SERVICE) is None
-    clock[0], note[0] = 1065.0, _note(0, 1060)
-    pool = s7.Pool("mock", _Workspace([(940.3, 0.0), (1000.3, 1.0), (1060.3, 0.0)]), table)  # ty: ignore[invalid-argument-type] - a double
-    assert pool.gauge(s7.INSTANCES_IN_SERVICE) == 0
+TURN = [
+    sse("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 50}}}),
+    sse("content_block_start"),
+    sse("content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}),
+    sse("content_block_stop"),
+    sse("message_delta", {"type": "message_delta", "usage": {"output_tokens": 2}}),
+    sse("message_stop"),
+]
+PINGS = [sse("ping"), sse("ping")]
+WARMING = [render_stream_event(Cause.WARMING, WireFormat.MESSAGES)]
 
 
-def test_completed_requests_between_the_ask_and_the_stop_do_not_span_the_scale_in() -> None:
-    gone = s7.Departure(s7.Path.TERMINATED, 60.0, "node-a", asked_at=1000.0, stopped_at=1060.0)
+@dataclass(frozen=True)
+class Reply:
+    """What the gateway answers one request of the canary student with: a status, the events, and
+    whether the connection is cut after them."""
 
-    def stream(began: float, ended: float) -> s7.Streamed:
-        return s7.Streamed(began, ended, s7.Answer(completed=True, begun_at=began))
-
-    assert s7.across_scale_in([stream(1010.0, 1010.4), stream(1020.0, 1020.4)], gone) is None
-    assert s7.across_scale_in([stream(1010.0, 1010.4), stream(1059.8, 1060.3)], gone) is True
-
-
-def test_a_completed_stream_was_on_a_replaced_task_only_if_an_old_one_ran_until_it_ended() -> None:
-    before, stop, ended = {"task-a", "task-c"}, 1200.0, 1400.0
-    # task-a stopped; task-c, which the stream kept running, wrote within a scrape of its end.
-    assert s7.held_under(before, {"task-a": (900.0, 1200.0), "task-c": (900.0, 1395.0)}, stop, ended, 1400.0)
-    # Every old task had stopped well before: the stream was on a replacement.
-    on_new = {"task-a": (900.0, 1200.0), "task-c": (900.0, 1210.0), "task-b": (1030.0, 1400.0)}
-    assert s7.held_under(before, on_new, stop, ended, 1400.0) is False
-    # task-c last showed 1350: it may still write, or stop.
-    assert s7.held_under(before, {"task-a": (900.0, 1200.0), "task-c": (900.0, 1350.0)}, stop, ended, 1400.0) is None
+    events: list[bytes] = field(default_factory=lambda: list(TURN))
+    status: int = 200
+    cut: bool = False
 
 
-def test_a_stream_on_a_replacement_already_serving_does_not_prove_survival(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [1000.0]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-    key = generate_key()
-    engine = create_app(Settings(secret=key))
+class Events(httpx.AsyncByteStream):
+    def __init__(self, reply: Reply) -> None:
+        self.reply = reply
 
-    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
-        if end == 1000.0:
-            clock[0] = 1020.0
-        found = {"old-task": (900.0, min(end, 1200.0))}
-        if end >= 1030.0:
-            found["new-task"] = (1030.0, end)  # its collector first wrote after it took the stream
-        return found
-
-    async def gateway(scope: Any, receive: Any, send: Any) -> None:
-        async def read() -> Any:
-            message = await receive()
-            if not message.get("more_body", False):
-                clock[0] = 1400.0
-            return message
-
-        await engine(scope, read, send)
-
-    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
-    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
-    with pytest.raises(RuntimeError, match="no gateway deployment"):
-        asyncio.run(run.across_deployment())
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for event in self.reply.events:
+            yield event
+        if self.reply.cut:
+            raise httpx.RemoteProtocolError("the stub cut the connection")
 
 
-@pytest.mark.parametrize("completes", [True, False], ids=["answers", "disconnects"])
-def test_a_stream_a_late_written_replacement_may_hold_is_unmeasured_while_an_old_task_runs_on(
-    monkeypatch: pytest.MonkeyPatch, completes: bool
+@dataclass
+class Gateway:
+    """The gateway: the canary student's requests get the replies given, in order, then a whole
+    turn; the load's always get a whole turn. It keeps the student's bodies and when they arrived."""
+
+    clock: FakeClock
+    student: str
+    replies: list[Reply] = field(default_factory=list)
+    received: list[tuple[float, dict[str, Any]]] = field(default_factory=list)
+
+    async def handle(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(await request.aread())
+        reply = Reply()
+        if request.headers["authorization"] == f"Bearer {self.student}":
+            self.received.append((self.clock.now(), body))
+            reply = self.replies.pop(0) if self.replies else Reply()
+        else:
+            # The load sends one stream after another: it lets the job run between two.
+            await asyncio.sleep(0.01)
+        return httpx.Response(reply.status, headers={"content-type": "text/event-stream"}, stream=Events(reply))
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+
+def a_run(scaler: Scaler, replies: list[Reply] | None = None, *, wakes: int = 1) -> tuple[s7.Run, Gateway, list[str]]:
+    keys = [generate_key() for _ in range(7)]
+    gateway = Gateway(scaler.clock, keys[0], replies or [])
+    out: list[str] = []
+    pool = s7.Pool("mock", scaler, scaler)
+    run = s7.Run(
+        pool,
+        "http://gateway.example.com",
+        keys,
+        MOCK,
+        wakes,
+        60.0,
+        s7.Recorder(scaler.clock, out.append),
+        scaler.clock,
+        gateway.transport(),
+        inline,
+    )
+    return run, gateway, out
+
+
+async def inline(action: Callable[[], Any]) -> Any:
+    """Reads the stubs on the event loop: the clock moves only when the job waits on it."""
+    return action()
+
+
+def parsed(out: list[str], *hidden: str) -> list[dict[str, Any]]:
+    """Every line as one JSON object with a UTC time and a kind, none holding any of `hidden`."""
+    lines = []
+    for line in out:
+        record = json.loads(line)
+        assert isinstance(record, dict)
+        assert UTC_TIME.fullmatch(record["at"])
+        assert isinstance(record["kind"], str)
+        for text in hidden:
+            assert text not in line
+        lines.append(record)
+    return lines
+
+
+def of(lines: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    return [line for line in lines if line["kind"] == kind]
+
+
+def test_the_scale_in_step_records_both_paths_and_one_stream_held_across_the_departure() -> None:
+    clock = FakeClock()
+    first, second = T0 + 120, T0 + 900  # The scaler asks for one, then for none.
+    leaving, staying = instance_id(), instance_id()
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < first else 1 if run < second else 0,
+        # A run reads the pool as it was before it acted.
+        in_service=lambda run: 2 if run <= first else 1 if run <= second else 0,
+        # The first to leave goes back to the warm pool; the second is terminated.
+        warm=lambda run: 0 if run <= first else 1,
+        instances={leaving: (T0 - 600, first + 30), staying: (T0 - 600, second + 30)},
+    )
+    run, gateway, out = a_run(scaler)
+    asyncio.run(run.cycle())
+
+    lines = parsed(out, leaving, staying)
+    assert [line["writing"] for line in of(lines, "instances")] == [["instance-1", "instance-2"]]
+    asked, out_of_service, gone = of(lines, "scale_in_asked"), of(lines, "out_of_service"), of(lines, "gone")
+    assert [line["capacity_asked"] for line in asked] == [1, 0]
+    assert [line["departure"] for line in out_of_service] == [1, 2]
+    names = [line["instance"] for line in gone]
+    assert sorted(names) == ["instance-1", "instance-2"]
+    departures = of(lines, "scale_in")
+    assert [(line["path"], line["instance"]) for line in departures] == [("warm_pool", names[0]), ("terminated", names[1])]
+    for line in departures:
+        assert line["asked_at"] <= line["asked_read_at"] <= line["out_of_service_read_at"] <= line["gone_read_at"]
+
+    # One stream, opened once the scaler asked for fewer and sent whole once the instance was read
+    # out of service, and read to its end.
+    (stream,) = of(lines, "stream")
+    assert (stream["stream"], stream["departure"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
+    assert asked[0]["read_at"] <= stream["sent_at"] < stream["body_sent_at"]
+    assert out_of_service[0]["read_at"] <= stream["body_sent_at"] <= stream["first_event_at"] <= stream["last_event_at"]
+    assert stream["body_sent_at"] < gone[0]["read_at"]
+    assert len(gateway.received) == 1
+
+
+def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
+    asked_at, stopped = 1000.0, 1030.0
+
+    def told(warm: list[tuple[float, float]], bound: float = float("inf"), **changes: Any) -> s7.Told:
+        given: dict[str, Any] = {"out_of_service": True, "newcomer": False, "another_stopped": False}
+        return s7.path_of(asked_at=asked_at, last_write=stopped, warm=warm, bound=bound, **(given | changes))
+
+    assert told([(1000.2, 0), (1060.2, 1)]).path is s7.Path.WARM_POOL
+    assert told([(1000.2, 0), (1060.2, 0)]).path is s7.Path.TERMINATED
+    # A reading not yet after the stop says nothing of the path.
+    assert told([(1000.2, 0), (1040.2, 0)]).unknown is s7.Unknown.NO_READING_AFTER_STOP
+    # A rise after the next decision acted is that decision's.
+    assert told([(1000.2, 0), (1120.2, 1)], bound=1061.0).unknown is s7.Unknown.NO_READING_AFTER_STOP
+    assert told([(1000.2, 0), (1060.2, 0), (1120.2, 1)]).unknown is s7.Unknown.WARM_COUNT_DIFFERS
+    assert told([(1000.2, 0), (1060.2, 1)], newcomer=True).unknown is s7.Unknown.NEW_INSTANCE
+    assert told([(1000.2, 0), (1060.2, 1)], another_stopped=True).unknown is s7.Unknown.ANOTHER_INSTANCE_STOPPED
+    assert told([(1000.2, 0), (1060.2, 1)], out_of_service=False).unknown is s7.Unknown.NOT_READ_OUT_OF_SERVICE
+
+
+def test_a_stream_the_gateway_cuts_is_recorded_as_ended_by_the_connection_closing_with_its_events_counted() -> None:
+    clock = FakeClock()
+    scaler = Scaler(clock, asked=lambda run: 1, in_service=lambda run: 1)
+    run, gateway, out = a_run(scaler, [Reply(TURN[:3], cut=True)])
+    asyncio.run(run.across_deployment())
+
+    hold, stream = parsed(out)
+    assert (hold["kind"], hold["stream"], hold["hold_seconds"]) == ("hold_started", "gateway_deployment", 60.0)
+    assert (stream["kind"], stream["stream"]) == ("stream", "gateway_deployment")
+    assert (stream["ended"], stream["events"], stream["error"]) == ("connection_closed", 3, "protocol_error")
+    assert stream["last_event_at"] is not None
+    # The body was held open for the hold, then sent whole: the gateway read it as JSON.
+    assert stream["body_sent_at"] == hold["until"]
+    assert gateway.received[0][1]["model"] == "mock"
+
+
+@pytest.mark.parametrize(
+    ("reply", "ended", "events"),
+    [
+        (Reply(), "closing_event", 6),
+        (Reply(TURN[:2] + WARMING), "error_event", 3),
+        (Reply(TURN[:2]), "connection_closed", 2),
+        (Reply([], status=429), "http_status", 0),
+    ],
+)
+def test_a_stream_records_how_it_ended(reply: Reply, ended: str, events: int) -> None:
+    clock = FakeClock()
+    gateway = Gateway(clock, "key", [reply])
+    request = s7._request("mock")
+    read = asyncio.run(s7.send("http://gateway.example.com", "key", request, clock=clock, transport=gateway.transport()))
+    assert (read.ended, read.events, read.status) == (ended, events, reply.status)
+
+
+def test_each_wake_goes_at_a_fresh_zero_and_its_first_engine_event_is_told_from_keep_alives() -> None:
+    clock = FakeClock()
+    idle = 600
+    woke: list[float] = []
+
+    def asked(run: float) -> int:
+        return int(any(at < run <= at + idle for at in woke))
+
+    scaler = Scaler(clock, asked=asked, in_service=lambda run: asked(run - 60))
+    # The first request wakes the pool; the first wake, answered with keep-alives until the hold
+    # ends, does not; the second request, sent to wake the pool again, does; the second wake does.
+    replies = [Reply(), Reply(PINGS + WARMING), Reply(), Reply(PINGS + TURN)]
+    run, gateway, out = a_run(scaler, replies, wakes=2)
+    wakes_the_pool = [True, False, True, True]
+    handle = gateway.handle
+
+    async def waking(request: httpx.Request) -> httpx.Response:
+        answer = await handle(request)
+        if wakes_the_pool[len(gateway.received) - 1]:
+            woke.append(clock.now())
+        return answer
+
+    run.transport = httpx.MockTransport(waking)
+    asyncio.run(run.send_wakes())
+
+    lines = parsed(out)
+    rewakes, wakes = of(lines, "rewake"), of(lines, "wake")
+    assert len(rewakes) == 2
+    assert [line["wake"] for line in wakes] == [1, 2]
+    lost, answered = wakes
+    assert (lost["none_within_hold"], lost["ended"], lost["cause"]) == (True, "error_event", "warming")
+    assert lost["first_engine_event_at"] is None and lost["pings"] == 2
+    assert lost["capacity_asked_at"] is None
+    assert (answered["none_within_hold"], answered["ended"], answered["pings"]) == (False, "closing_event", 2)
+    assert answered["first_event_at"] <= answered["first_engine_event_at"]
+    assert answered["zero_written_at"] <= answered["zero_read_at"] <= answered["sent_at"]
+    assert answered["capacity_asked_at"] > answered["zero_written_at"]
+    # The lost wake left the pool asleep: the second wake waited for the pool to wake and idle again.
+    assert answered["zero_written_at"] > rewakes[1]["sent_at"] > lost["sent_at"]
+
+
+def test_a_failing_read_of_the_pool_is_recorded_by_its_kind_without_its_text() -> None:
+    clock = FakeClock()
+    scaler = Scaler(clock, asked=lambda run: 2, in_service=lambda run: 2, failing=True)
+    run, _, out = a_run(scaler)
+    assert asyncio.run(run.note()) is None
+    (line,) = parsed(out, AWS_TEXT, "ThrottlingException")
+    assert (line["kind"], line["source"], line["error"]) == ("read_failed", "pool_state", "aws_error")
+
+
+def test_the_job_ends_with_a_line_and_no_traceback_when_aws_refuses(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    clock = [1000.0]
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-    key = generate_key()
-    engine = create_app(Settings(secret=key))
+    def refused() -> config.Config:
+        raise botocore.exceptions.ClientError({"Error": {"Code": "AccessDenied", "Message": AWS_TEXT}}, "GetParameters")
 
-    def tasks(start: float, end: float) -> dict[str, tuple[float, float]]:
-        if end == 1000.0:
-            clock[0] = 1020.0  # the stream opens at 1020
-        # old-a is replaced; old-b runs on, the rollout waiting for a second replacement.
-        found = {"old-a": (900.0, min(end, 1200.0)), "old-b": (900.0, end)}
-        if end >= 1030.0:
-            found["new-a"] = (1030.0, end)  # serving from 1015, its collector first wrote at 1030
-        return found
-
-    async def gateway(scope: Any, receive: Any, send: Any) -> None:
-        async def read() -> Any:
-            message = await receive()
-            if not message.get("more_body", False):
-                clock[0] = 1400.0
-                if not completes:
-                    raise httpx.ReadError("cut")
-            return message
-
-        await engine(scope, read, send)
-
-    pool = SimpleNamespace(name="mock", gateway_tasks=tasks)
-    run = s7.Run(pool, "http://gateway", [key], SimpleNamespace(), 1, 0.01, transport=httpx.ASGITransport(app=gateway))  # ty: ignore[invalid-argument-type] - a double
-    with pytest.raises(RuntimeError, match="no gateway deployment"):
-        asyncio.run(run.across_deployment())
-
-
-@pytest.mark.parametrize(("began", "ended"), [(999.9, 1000.2), (1019.8, 1020.3)], ids=["before-ask", "after-stop"])
-def test_a_stream_that_only_crosses_a_bound_of_a_scale_in_event_is_unmeasured(
-    monkeypatch: pytest.MonkeyPatch, began: float, ended: float
-) -> None:
-    # The run began at 1000 and asked for fewer by 1120, when the job read its note; idle-node last
-    # wrote at 1005, so it stopped between 1005 and 1020.
-    monkeypatch.setattr(s7.time, "time", lambda: 1120.0)
-
-    class Pool:
-        name = "mock"
-
-        def note(self) -> ScalerNote:
-            return _note(1, 1000)
-
-        def writes(self, start: float, end: float) -> dict[str, float]:
-            return {"idle-node": min(end, 1005.0), "serving-node": end}
-
-        def warm_counts(self, start: float, end: float) -> list[tuple[float, float]]:
-            return [(1000.3, 0.0), (1060.3, 0.0)]
-
-    run = s7.Run(Pool(), "http://gateway", [generate_key()], SimpleNamespace(), 1, 60)  # ty: ignore[invalid-argument-type] - a double
-    departure = asyncio.run(run.departure(2, 1))
-    assert departure.events() == [(1000.0, 1120.0), (1005.0, 1020.0)]
-    caught = s7.Streamed(began, ended, s7.Answer(completed=True, begun_at=began))
-    assert s7.across_scale_in([caught], departure) is None
-    # A stream in flight over the whole of the stop's bounds spanned it.
-    spanning = s7.Streamed(1004.0, 1021.0, s7.Answer(completed=True, begun_at=1004.0))
-    assert s7.across_scale_in([caught, spanning], departure) is True
+    monkeypatch.setattr(s7.config, "read_ssm", refused)
+    assert s7.main({}, FakeClock()) == 1
+    captured = capsys.readouterr()
+    (line,) = parsed(captured.out.splitlines(), AWS_TEXT, "AccessDenied")
+    assert (line["kind"], line["step"], line["error"]) == ("failed", "configuration", "aws_error")
+    assert captured.err == ""
