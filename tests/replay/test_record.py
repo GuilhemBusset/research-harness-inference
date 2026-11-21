@@ -289,3 +289,82 @@ def test_two_recorders_cannot_share_a_folder(stack: tuple[str, str], tmp_path: P
     with recording(address, tmp_path), pytest.raises(FileExistsError):
         record.Session(address, tmp_path)
     record.Session(address, tmp_path).close()  # The first has ended, and wrote nothing: the folder is free.
+
+
+def _read_png(history_image: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "Read the attachment."},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [history_image]}]},
+    ]
+
+
+def test_a_user_name_that_is_a_word_of_the_format_changes_no_block(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    data = base64.b64encode(_png()).decode("ascii")
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+    with recording(address, tmp_path, user="image", profile="coursework") as (_, client):
+        assert (
+            client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(image))).status_code
+            == 200
+        )
+    (capture,) = harness.folder(tmp_path)
+    assert json.loads(capture.body)["messages"][2]["content"][0]["content"][0] == image
+
+
+def test_an_attachment_whose_metadata_names_the_user_is_not_written(
+    stack: tuple[str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    text = b"Author\x00" + login.encode("ascii")
+    chunk = struct.pack(">I", len(text)) + b"tEXt" + text + struct.pack(">I", zlib.crc32(b"tEXt" + text))
+    png = _png()
+    data = base64.b64encode(png[:-12] + chunk + png[-12:]).decode("ascii")
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+    with recording(address, tmp_path, user=login) as (session, client):
+        assert (
+            client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(image))).status_code
+            == 200
+        )
+    assert session.written == [] and list(tmp_path.iterdir()) == []
+    assert "`user name`" in capsys.readouterr().err
+
+
+def test_the_user_name_is_removed_from_the_json_a_string_holds(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    arguments = f'{{"owner":"\\u{ord(login[0]):04x}{login[1:]}"}}'  # JSON's escape of its first letter.
+    body = {
+        "model": smoke.MOCK_POOL,
+        "input": [
+            {"role": "user", "content": "Find the owner."},
+            {"type": "function_call", "call_id": "c1", "name": "Lookup", "arguments": arguments},
+            {"type": "function_call_output", "call_id": "c1", "output": "Done."},
+        ],
+    }
+    with recording(address, tmp_path, user=login) as (_, client):
+        assert client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    assert json.loads(json.loads(capture.body)["input"][1]["arguments"]) == {"owner": "user"}
+
+
+def test_the_user_name_is_removed_from_the_names_of_a_tool_input_example(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    schema = {"type": "object", "properties": {login: {"type": "string"}}, "required": [login]}
+    tool = {"name": "Lookup", "input_schema": schema, "input_examples": [{login: "sample"}]}
+    with recording(address, tmp_path, user=login) as (_, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(tools=[tool])).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["tools"][0]
+    assert saved["input_examples"] == [{"user": "sample"}] and list(saved["input_schema"]["properties"]) == ["user"]
+
+
+def test_a_refused_profile_leaves_the_folder_free(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, _ = stack
+    with pytest.raises(ValueError, match="request profile"):
+        record.Session(address, tmp_path, profile="no-such-pool")
+    record.Session(address, tmp_path).close()
