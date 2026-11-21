@@ -30,14 +30,16 @@ types, roles, a pool's name, the `claude-` of a model's name, a stream's `[DONE]
 that happens to be one of its words. A string that holds JSON (a tool call's `arguments`) is
 rewritten as JSON, its literals kept. The headers that carry the key are dropped. A body whose JSON
 writes a name twice is rewritten as text. An image's or a document's base64 bytes are kept as they
-are, and a capture is not written whose decoded bytes hold the home directory or a key, or whose
+are, and a capture is not written whose decoded bytes hold the home directory, the endpoint's host or a key, or whose
 file writes the user name in a text (an image's text chunks, a PDF's strings, an XMP packet): read
 as they are, percent-decoded, inflated where compressed (an image's `zTXt`, a PDF's streams), in
 hexadecimal or escaped (a PDF's strings). Last, every text of the
 capture is read once more, percent-decoded and through the JSON it holds, and so is what a stream
 writes in pieces, joined for each block and each call; a capture in which a key, the home directory
-or the endpoint's host is left is not written. A schema's property names are renamed the same way
-wherever they are named for the same instance (its `required`, its dependencies, its `allOf`, ...).
+or the endpoint's host is left is not written, unless wholly inside what a replacement wrote. A
+schema's property names are renamed the same way wherever they are named for the same instance (its
+`required`, its dependencies, its `allOf`, ...), and a name it only requires is given a neutral name
+distinct from those it declares.
 The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
 engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
@@ -660,14 +662,35 @@ def _same_instance(schema: Mapping[str, Any]) -> Iterator[Any]:
 
 
 def _instance_properties(schema: Any) -> list[str]:
-    """The property names of the instance a schema describes: its own and its same-instance subschemas'."""
+    """The property names of the instance a schema describes, its own and its same-instance subschemas':
+    those it declares, and those it only names (in its `required` list, its dependencies), so that each
+    is given a neutral name of its own."""
     if not isinstance(schema, dict):
         return []
     properties = schema.get("properties")
     names = list(properties) if isinstance(properties, dict) else []
+    required = schema.get("required")
+    if isinstance(required, list):
+        names += [name for name in required if isinstance(name, str)]
+    for keyword in sorted(_DEPENDENCY_MAPS):
+        dependencies = schema.get(keyword)
+        if isinstance(dependencies, dict):
+            names += list(dependencies)
+            names += [
+                name
+                for given in dependencies.values()
+                if isinstance(given, list)
+                for name in given
+                if isinstance(name, str)
+            ]
     for inner in _same_instance(schema):
         names += _instance_properties(inner)
     return list(dict.fromkeys(names))
+
+
+def _occurrences(values: Sequence[str], flags: int = 0) -> list[re.Pattern[str]]:
+    """A pattern for each value that finds each of its occurrences in a text, overlapping ones included."""
+    return [re.compile(f"(?=({re.escape(value)}))", flags) for value in dict.fromkeys(values) if value]
 
 
 def _unique(names: Sequence[tuple[str, str]]) -> list[str]:
@@ -711,8 +734,8 @@ class Neutral:
 
     A base64 payload (an image's or a document's `data`, a `data:` URL) is kept byte for byte: a
     replacement inside it would corrupt the file, and a short user name occurs in any encoding by
-    chance. It is decoded and read instead: one whose bytes hold the home directory, the user name
-    (an author in an image's or a PDF's metadata, say) or a key is refused (`scrub.Refused`), and
+    chance. It is decoded and read instead: one whose bytes hold the home directory, the endpoint's
+    host, the user name (an author in an image's or a PDF's metadata, say) or a key is refused (`scrub.Refused`), and
     the capture is not written.
     A body that needs no replacement keeps its bytes.
     """
@@ -739,16 +762,16 @@ class Neutral:
         self._home_bytes = in_bytes(homes)
         self._key_bytes = in_bytes(keys)
         self._user_bytes = in_bytes([user] if user else [], re.IGNORECASE)
-        # What the last check looks for in every text of a capture (`check`), once its escapes are read.
-        # What a replacement writes is left out of it: a home directory or a key it holds is no one's.
-        self._keys_left = [key for key in keys if len(key) >= 8 and key not in KEY_PLACEHOLDER]
-        self._homes_left = [value for value in homes if value not in NEUTRAL_HOME]
-        # A user name a stream writes in pieces (`check`): each piece holds none of it whole, so none was
-        # replaced. What a replacement writes is taken out of the joined text before it is read.
-        self._user_left = re.compile(re.escape(user) if user else "(?!)", re.IGNORECASE)
-        # The endpoint's host, looked for the same way: a URL a stream writes in pieces holds it in none.
-        written_hosts = sorted({host for host in hosts if host}, key=len, reverse=True)
-        self._host_left = re.compile("|".join(re.escape(host) for host in written_hosts) or "(?!)", re.IGNORECASE)
+        self._host_bytes = in_bytes([host for host in hosts if host], re.IGNORECASE)
+        # What the last check looks for in every text of a capture (`check`), once its escapes are read: a
+        # key, the home directory, the endpoint's host, and the user name in what a stream writes in pieces,
+        # each of which holds none of them whole, so that none was replaced. An occurrence that lies
+        # inside what a replacement wrote (`NEUTRAL_USER` for the user name `use`) is no one's; one
+        # that only shares some of its characters with it (a host `user-...` after a piece `user`) is.
+        self._keys_left = _occurrences([key for key in keys if len(key) >= 8])
+        self._homes_left = _occurrences(homes)
+        self._hosts_left = _occurrences([host for host in hosts if host], re.IGNORECASE)
+        self._users_left = _occurrences([user] if user else [], re.IGNORECASE)
         self._neutral_values = re.compile(
             "|".join(re.escape(value) for value in (NEUTRAL_HOME, EXAMPLE_HOST, KEY_PLACEHOLDER, NEUTRAL_USER))
         )
@@ -788,7 +811,8 @@ class Neutral:
         return True
 
     def read_bytes(self, decoded: bytes, where: str) -> None:
-        """`scrub.Refused` if a file holds a key or the home directory, or if a text it writes holds the user name.
+        """`scrub.Refused` if a file holds a key, the home directory or the endpoint's host, or if a text it
+        writes holds the user name.
 
         What it holds in another form is read too (`_file_parts`): its metadata compressed, in
         hexadecimal or escaped, and each part percent-decoded, as a `file://` URI writes a path. The user
@@ -801,6 +825,8 @@ class Neutral:
                     raise scrub.Refused(scrub.KEY, where)
                 if self._home_bytes.search(view):
                     raise scrub.Refused("home directory", where)
+                if self._host_bytes.search(view):
+                    raise scrub.Refused(scrub.HOST, where)
                 if text and self._user_bytes.search(view):
                     raise scrub.Refused("user name", where)
 
@@ -831,19 +857,26 @@ class Neutral:
         """`scrub.Refused` if a text, as it is or percent-decoded, holds a key, the home directory or the
         endpoint's host, or the user name if `user`."""
         for view in (text, unquote(text)):
-            if _ANY_KEY_RE.search(view) or any(key in view for key in self._keys_left):
+            if _ANY_KEY_RE.search(view) or self._uncovered(self._keys_left, view):
                 raise scrub.Refused(scrub.KEY, where)
-            if any(home in view for home in self._homes_left):
+            if self._uncovered(self._homes_left, view):
                 raise scrub.Refused("home directory", where)
-            left = self._without_neutral(view)
-            if self._host_left.search(left):
+            if self._uncovered(self._hosts_left, view):
                 raise scrub.Refused(scrub.HOST, where)
-            if user and self._user_left.search(left):
+            if user and self._uncovered(self._users_left, view):
                 raise scrub.Refused("user name", where)
 
-    def _without_neutral(self, text: str) -> str:
-        """A text with what a replacement writes taken out, each in place of a character no name holds."""
-        return self._neutral_values.sub("\0", text)
+    def _uncovered(self, patterns: Sequence[re.Pattern[str]], text: str) -> bool:
+        """Whether a value occurs in a text other than wholly inside what a replacement wrote."""
+        written: list[tuple[int, int]] | None = None
+        for pattern in patterns:
+            for found in pattern.finditer(text):
+                if written is None:
+                    written = [neutral.span() for neutral in self._neutral_values.finditer(text)]
+                start, end = found.span(1)
+                if not any(begin <= start and end <= stop for begin, stop in written):
+                    return True
+        return False
 
     def name(self, name: str, *, data: bool = False) -> str:
         """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
