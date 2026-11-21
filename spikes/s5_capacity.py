@@ -53,15 +53,19 @@ names of the per-engine table (`rhi_common.engine_metrics`), as section 7.2 defi
 A quantity an engine's row leaves out (the mock's has none of the further ones) reads `None`, not
 zero, as does one with nothing to divide. Counters and histograms are increased per series before
 they are summed per instance: an instance's counters restart from zero with its engine. They are
-read one scrape after the run's end, over the run and that scrape, so that the tokens of the last
-answers, which the workspace sees only at the next scrape, are counted; nothing else is sent to the
-pool then. The gauges are read over the run alone. Rates are over the run's seconds.
+read one scrape after the run's end, over the scrape before the run's start, the run and the scrape
+after it: the scrape before holds what each counter held when the run began, so what the run added
+before its first scrape is counted, and the scrape after holds the tokens of the last answers,
+which the workspace sees only then. Nothing else is sent to the pool in either. (Prometheus'
+`increase` extends what it saw to the edges of its range, so a count can read up to a scrape's
+worth above the run's.) The gauges are read over the run alone. Rates are over the run's seconds.
 
 **What each instance's lifecycle agent reported**: the cache capacity in tokens the engine gave at
 start (`rhi_lifecycle.cache.METRIC`), and its release (`rhi_lifecycle.serving.RELEASE_METRIC`),
 which an instance writes only while in service: the build, its `model_revision`, and from the
 times of its samples, the seconds the instance was in service during the window. The samples are
-read to one scrape past the window's end, so that an instance in service at the end is seen there.
+read to one scrape past the window's end, so that an instance in service at the end is seen there,
+and a run shorter than a scrape, whose instances are first scraped after it ends, is still labelled.
 An instance whose last sample is older than a scrape before the window, which the workspace still
 returns for some minutes, did not serve in it and is left out. A pool whose instances report two
 builds in one window is refused: the run is no one build's.
@@ -278,15 +282,18 @@ def release_query(pool: str) -> str:
 
 def in_service_of(release: Sequence[common.Series], start: float, end: float) -> dict[str, InService]:
     """Each instance's release from `start` to `end`, from the times of its release samples
-    (`release_query`, read to a scrape past `end`): in service from its first sample, or the
-    window's start, to a scrape after its last, or the window's end. An instance with no sample
-    from a scrape before `start` to `end` did not serve in the window and is not in the answer.
-    ValueError for an instance whose samples carry no instance type or two releases."""
+    (`release_query`, read to a scrape past `end`): in service from a scrape before its first
+    sample, or the window's start, to a scrape after its last, or the window's end, since a sample
+    shows the instance in service at some time in the scrape before it. An instance with no sample
+    from a scrape before `start` to a scrape after `end` did not serve in the window and is not in
+    the answer; one first scraped after a short window ended still labels it. ValueError for an
+    instance whose samples carry no instance type or two releases."""
     times: dict[str, list[float]] = {}
     kinds: dict[str, set[tuple[str, str]]] = {}
     for one in release:
         instance = one.labels.get("instance", "")
-        if not instance or not any(start - SCRAPE_SECONDS < taken <= end for taken in one.values()):
+        taken_in = (start - SCRAPE_SECONDS < taken <= end + SCRAPE_SECONDS for taken in one.values())
+        if not instance or not any(taken_in):
             continue
         times.setdefault(instance, []).extend(one.values())
         kinds.setdefault(instance, set()).add(
@@ -297,7 +304,7 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
         if len(kinds[instance]) != 1 or not all(next(iter(kinds[instance]))):
             raise ValueError("an instance reported no instance type, no build, or two of either in the window")
         ((kind, build),) = kinds[instance]
-        seconds = max(0.0, min(end, max(taken) + SCRAPE_SECONDS) - max(start, min(taken)))
+        seconds = max(0.0, min(end, max(taken) + SCRAPE_SECONDS) - max(start, min(taken) - SCRAPE_SECONDS))
         found[instance] = InService(kind, build, seconds)
     return found
 
@@ -661,13 +668,14 @@ class Job:
         end = self.wall()
         self.sleep(SETTLE_SECONDS)
         window = max(end - start, 1.0)
-        # The scrape after the run's end holds what the run's last answers added.
+        # The scrape after the run's end holds what the run's last answers added; the scrape before
+        # its start holds what the counters held when it began.
         after = end + SCRAPE_SECONDS
         release = self.workspace.read_series(release_query(self.pool), start=start, end=after, step=SCRAPE_SECONDS)
         in_service = in_service_of(release, start, end)
         build = build_of(in_service)
         answers = {}
-        for key, query in queries(self.pool, self.engine, window, after - start).items():
+        for key, query in queries(self.pool, self.engine, window, after - start + SCRAPE_SECONDS).items():
             at = end if key in GAUGES else after
             answers[key] = self.workspace.read_series(query, start=at, end=at, step=SCRAPE_SECONDS)
         engine = quantities_of(answers, window)
