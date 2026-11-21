@@ -6,7 +6,6 @@ are generated.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import json
 import shutil
 import tomllib
@@ -20,13 +19,8 @@ import pytest
 import s5_capacity as s5
 from rhi_common.keys import generate_key
 from rhi_reporter.measure import Verdict, read_event
+from test_s5 import COMMIT, job, settings, verdict  # the recorded runs of the verdict's own tests
 
-# The recorded runs of the verdict's own tests.
-_SPEC = importlib.util.spec_from_file_location("s5_verdict_tests", Path(__file__).with_name("test_s5.py"))
-assert _SPEC is not None and _SPEC.loader is not None
-runs = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(runs)
-COMMIT, job, settings, verdict = runs.COMMIT, runs.job, runs.settings, runs.verdict
 LABEL = "8bit-baseline-1"
 
 
@@ -40,7 +34,7 @@ def post(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(s5.common, "canary_keys", lambda: SimpleNamespace(students=(generate_key(),)))
     monkeypatch.setattr(s5.config, "read_ssm", settings)
 
-    def posted(class_size: int = 20, **at_class: float) -> list[Any]:
+    def posted(class_size: int = 20, **at_class: Any) -> list[Any]:
         monkeypatch.setattr(s5.Job, "measure", lambda self: job(class_size=class_size, **at_class))
         environ = {
             "AWS_REGION": "us-east-1", "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
