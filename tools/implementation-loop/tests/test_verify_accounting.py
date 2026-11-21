@@ -274,6 +274,42 @@ class RunCheckWithoutPytestTests(TempTree):
         self.assertEqual(ev.note, "")
 
 
+class RepeatedCommandTests(TempTree):
+    """A command that several criteria name runs once per verification, and counts for each."""
+
+    def verify(self, *specs):
+        return verify.verify(self.root, list(specs), "f00d" * 10, self.work, {}, [], None)
+
+    def runs(self) -> int:
+        counter = self.root / "runs.txt"
+        return len(counter.read_text().splitlines()) if counter.is_file() else 0
+
+    def test_one_run_is_the_evidence_of_every_criterion_that_names_it(self):
+        command = "echo ran >> runs.txt"
+        ok, evidence, problems, _ = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command),
+                                                CheckSpec("D3", "command", "true"))
+        self.assertTrue(ok, problems)
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual([(e["criterion"], e["command"], e["passed"]) for e in evidence],
+                         [("A1", command, True), ("D2", command, True), ("D3", "true", True)])
+
+    def test_its_failure_is_a_problem_of_every_criterion_that_names_it(self):
+        command = "echo ran >> runs.txt; exit 1"
+        ok, evidence, problems, _ = self.verify(CheckSpec("A1", "command", command), CheckSpec("D2", "command", command))
+        self.assertFalse(ok)
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(problems, ["A1 failed: exit 1", "D2 failed: exit 1"])
+        self.assertEqual([(e["criterion"], e["passed"]) for e in evidence], [("A1", False), ("D2", False)])
+
+    def test_another_directory_or_timeout_is_another_run(self):
+        (self.root / "sub").mkdir()
+        ok, _, problems, _ = self.verify(CheckSpec("A1", "command", "echo ran >> runs.txt"),
+                                         CheckSpec("A2", "command", "echo ran >> runs.txt", timeout_s=60),
+                                         CheckSpec("A3", "command", "echo ran >> ../runs.txt", cwd="sub"))
+        self.assertTrue(ok, problems)
+        self.assertEqual(self.runs(), 3)
+
+
 @unittest.skipUnless(HAS_PYTEST, "pytest is not installed")
 class ManifestTests(TempTree):
     def setUp(self):

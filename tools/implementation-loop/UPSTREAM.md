@@ -25,6 +25,27 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## Nothing runs again on `main` after a merge, and a repeated command runs once (2026-11-21)
+
+A local patch, not in upstream, by the owner's decision of 2026-11-21 to remove the engine's
+controls over the builder that only produced false failures. After each merge the engine ran the
+issue's checks again on `main`, then the locked test ids of every earlier issue of the run, and
+blamed the last merge for any failure: a fix-forward round, then a trial revert. None of those
+failures was a defect (engine tests under load, deleted probes, renamed test ids), they held the
+only writer for up to 77 minutes per merge, and CI already runs every test on each push to `main`.
+And a command that several criteria named ran once for each of them in every verification. The
+engine's version stays 1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/engine.py` | The evidence step (`_accept`) runs no check. Its evidence is the verifier's records of the head that landed (`IssueState.evidence`, kind `command`), and the evidence comment names that head. Gone: the re-verification on `main` (event `post_merge_verify`), the re-run of earlier issues' checks (`_regressions`, events `regression_check` and `regression_check_skipped`, the run state's `accepted_checks` section) and the helpers that chose which checks to skip (`named_tests`, `named_nodes`, `defines_test`). A failed deployment still gets one fix-forward and then a revert (ADR 0001, decision 5), and so does a ledger item without evidence; the revert no longer re-runs earlier issues' checks before it is certified. The evidence step still refreshes the coordination worktree. An `accepted_checks` section in an older `state.json` is ignored. |
+| `implement_loop/verify.py` | `verify` runs a command once per verification when several checks give it (the same command, directory and timeout). Each criterion still gets its own evidence record of that run, and its own problem when it failed. |
+| `implement_loop/agents.py` | The fake builder writes its edge-case file for feedback that names an edge, not for a word that holds one ("ledger"). |
+| `prompts/build.md` | A command listed for several items runs once. |
+| `tests/test_verify_accounting.py` | New: one run is the evidence of every criterion that names the command, a failure is a problem of each, and another directory or timeout is another run. |
+| `tests/test_engine.py` | `EngineCase.failing_deployments`: the fake pipeline fails the deployment of an issue's merges. The tests of the revert's gates (`test_review_fixes.py`, `test_standing_checks.py`, `test_history_checks.py`) reach the revert through it instead of through a broken earlier issue. |
+| `tests/test_deleted_on_main.py`, `tests/test_engine_recovery.py`, `tests/test_owner_landing.py` | The tests of the re-checks on `main` are removed; the edit of an issue during the evidence step is made while its evidence comment is written. |
+
 ## A root takes over the deliveries of another root's run (2026-11-19)
 
 A local patch, not in upstream. A delivered issue stays open on GitHub while it still has owner
