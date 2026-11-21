@@ -17,7 +17,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import httpx
 import pytest
@@ -481,3 +481,48 @@ def test_an_inline_file_whose_metadata_names_no_one_is_kept_byte_for_byte(
         assert client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body).status_code == 200
     (capture,) = harness.folder(tmp_path)
     assert json.loads(capture.body)["input"][0]["content"][0]["file_data"] == data
+
+
+def test_a_user_name_that_is_a_json_literal_keeps_the_arguments_json(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    arguments = json.dumps({"owner": "true", "enabled": True})
+    body = {
+        "model": smoke.MOCK_POOL,
+        "input": [
+            {"role": "user", "content": "Find the owner."},
+            {"type": "function_call", "call_id": "c1", "name": "Lookup", "arguments": arguments},
+            {"type": "function_call_output", "call_id": "c1", "output": "Done."},
+        ],
+    }
+    with recording(address, tmp_path, user="true", profile="coursework") as (_, client):
+        assert client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["input"][1]["arguments"]
+    assert json.loads(saved) == {"owner": "user", "enabled": True}
+
+
+def test_a_user_name_in_a_file_format_signature_keeps_the_file(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    payload = base64.b64encode(_pdf(b"(nobody)")).decode("ascii")
+    document = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": payload}}
+    with recording(address, tmp_path, user="pdf", profile="coursework") as (_, client):
+        answer = client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(document)))
+    assert answer.status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    assert json.loads(capture.body)["messages"][2]["content"][0]["content"][0]["source"]["data"] == payload
+
+
+def test_an_attachment_whose_metadata_names_the_home_as_a_uri_is_not_written(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    home = str(Path("/home") / f"recording {secrets.token_hex(4)}")
+    text = b"Source\x00file://" + quote(home).encode("ascii") + b"/notes.png"
+    chunk = struct.pack(">I", len(text)) + b"tEXt" + text + struct.pack(">I", zlib.crc32(b"tEXt" + text))
+    png = _png()
+    data = base64.b64encode(png[:-12] + chunk + png[-12:]).decode("ascii")
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+    with recording(address, tmp_path, home=home) as (session, client):
+        answer = client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(image)))
+    assert answer.status_code == 200
+    assert session.written == [] and list(tmp_path.iterdir()) == []
