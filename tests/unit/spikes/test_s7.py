@@ -349,14 +349,19 @@ def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatc
             if after is not None:
                 await after
                 return s7.Departure(s7.Path.WARM_POOL, 60.0, "instance-b")
+            assert run.asked_fewer is not None
+            run.asked_fewer.set()  # the scaler asked for fewer: the relay begins
             try:
                 # The client has the first part of the answer: its inference has begun.
                 await asyncio.wait_for(transport.read.wait(), 1)
             except TimeoutError:
                 pass
             happened.append("scale-in")
+            now = s7.time.time()
+            gone = s7.Departure(s7.Path.TERMINATED, 0.01, "instance-a", now, now + 0.01, now, now)
+            run.leaving.append(gone)
             departed.set()
-            return s7.Departure(s7.Path.TERMINATED, 60.0, "instance-a")
+            return gone
 
         transport.app = recorded
         pool: Any = SimpleNamespace(name="mock")
@@ -368,7 +373,7 @@ def test_the_stream_across_a_scale_in_is_answered_on_both_sides_of_it(monkeypatc
 
     assert asyncio.run(scenario()) is True
     # A request was being answered when the instance left, and its answer ended after.
-    assert happened[:3] == ["answering", "scale-in", "answered"]
+    assert happened.index("answering") < happened.index("scale-in") < happened.index("answered")
 
 
 def test_a_scale_in_seen_over_between_two_streams_is_not_a_stream_across_it() -> None:
@@ -379,63 +384,54 @@ def test_a_scale_in_seen_over_between_two_streams_is_not_a_stream_across_it() ->
     assert s7.across_scale_in([before, after], gone) is None
 
 
-class _Paced(httpx.AsyncBaseTransport):
-    """The mock engine as the gateway's pool, on a clock that only its pace moves: each frame is
-    read at the moment the engine sent it."""
-
-    def __init__(self, key: str, clock: list[float]) -> None:
-        async def pace(seconds: float) -> None:
-            clock[0] += seconds
-
-        self.engine, self.clock = create_app(Settings(secret=key), sleep=pace), clock
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        clock, frames, start = self.clock, [], []
-        body = await request.aread()
-        scope = {
-            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1",
-            "method": request.method, "headers": [(name.lower(), value) for name, value in request.headers.raw],
-            "scheme": "http", "path": request.url.path, "raw_path": request.url.raw_path, "query_string": b"",
-            "server": ("gateway", 80), "client": ("127.0.0.1", 1), "root_path": "",
-        }  # fmt: skip
-
-        async def receive() -> dict[str, Any]:
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        async def send(message: Any) -> None:
-            if message["type"] == "http.response.start":
-                start.append(message)
-            elif message["type"] == "http.response.body":
-                frames.append((clock[0], message.get("body", b"")))
-
-        sent_at = clock[0]
-        await self.engine(scope, receive, send)
-        clock[0] = sent_at
-
-        class Frames(httpx.AsyncByteStream):
-            async def __aiter__(self) -> Any:
-                for moment, data in frames:
-                    clock[0] = moment
-                    yield data
-
-        return httpx.Response(start[0]["status"], headers=start[0].get("headers", []), stream=Frames())
-
-
-def test_the_relay_holds_one_real_mock_response_over_a_scale_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock, key = [999.75], generate_key()
-    monkeypatch.setattr(s7.time, "time", lambda: clock[0])
-    run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=_Paced(key, clock))  # ty: ignore[invalid-argument-type] - a double
-    # The scaler asked for fewer between 1000 and 1005; the instance stopped between 1015 and 1030.
-    gone = s7.Departure(s7.Path.TERMINATED, 30.0, "idle-node", 1000.0, 1030.0, 1005.0, 1015.0)
+def test_overlapping_mock_streams_read_as_they_come_span_a_scale_in() -> None:
+    key = generate_key()
+    # A turn of about twenty tokens at 100 a second: each stream lasts about 0.2 s.
+    transport = _Streaming(create_app(Settings(secret=key, tokens_per_second=100)))
+    run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=transport)  # ty: ignore[invalid-argument-type] - a double
+    t0 = s7.time.time()
+    # Both events' bounds are longer than any one stream: only streams that overlap cover them.
+    gone = s7.Departure(s7.Path.TERMINATED, 1.0, "idle-node", t0 + 0.2, t0 + 1.2, t0 + 0.6, t0 + 0.7)
 
     def over() -> bool:
-        # Seen over only once the instance's collector has been silent long enough.
-        if clock[0] >= 1110.0 and not run.leaving:
+        if s7.time.time() >= t0 + 1.4 and not run.leaving:
             run.leaving.append(gone)
         return bool(run.leaving)
 
-    # Each of the mock's turns lasts under half a second: only one held open spans either bound.
     assert asyncio.run(run.relay(over)) is True
+
+
+def test_a_mock_answer_sent_whole_before_the_scale_in_does_not_span_it() -> None:
+    key = generate_key()
+    engine = create_app(Settings(secret=key))
+
+    async def scenario() -> bool | None:
+        answered, departed, requests = asyncio.Event(), asyncio.Event(), [0]
+
+        async def app(scope: Any, receive: Any, send: Any) -> None:
+            requests[0] += 1
+            if requests[0] > 1:
+                await departed.wait()  # every later inference begins after the stop
+            await engine(scope, receive, send)
+            answered.set()
+
+        # httpx's own transport hands over the whole answer once the engine has sent it.
+        transport = httpx.ASGITransport(app=app)
+        run = s7.Run(SimpleNamespace(name="mock"), "http://gateway", [key], SimpleNamespace(), 1, 60, transport=transport)  # ty: ignore[invalid-argument-type] - a double
+
+        async def scale_in() -> None:
+            await answered.wait()
+            await asyncio.sleep(0.02)
+            asked = s7.time.time()
+            await asyncio.sleep(0.02)
+            stopped = s7.time.time()
+            run.leaving.append(s7.Departure(s7.Path.TERMINATED, stopped - asked, "idle-node", asked, stopped, asked, asked))
+            departed.set()
+
+        relayed, _ = await asyncio.gather(run.relay(lambda: bool(run.leaving)), scale_in())
+        return relayed
+
+    assert asyncio.run(scenario()) is None
 
 
 class _TwoInstances:
