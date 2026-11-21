@@ -11,7 +11,7 @@ import math
 import re
 import secrets
 import tomllib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -249,12 +249,12 @@ def test_the_scale_in_step_records_both_paths_and_one_stream_in_flight_as_the_in
     for line in departures:
         assert line["asked_at"] <= line["asked_read_at"] <= line["out_of_service_read_at"] <= line["gone_read_at"]
 
-    # One stream, held open at the gateway across the whole scale-in, from before the scaler asked
-    # for fewer until the job read the departing instance gone, then sent whole and answered.
+    # One stream, held open at the gateway from before the scaler asked for fewer, sent whole as the
+    # job read the decision, so forwarded before the departing instance stopped, and answered.
     (stream,) = of(lines, "stream")
     assert (stream["stream"], stream["decision"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
-    assert stream["sent_at"] < asked[0]["written_at"] < out_of_service[0]["read_at"]
-    assert out_of_service[0]["read_at"] <= gone[0]["read_at"] <= stream["body_sent_at"] < asked[1]["written_at"]
+    assert stream["sent_at"] < asked[0]["written_at"] <= asked[0]["read_at"] <= stream["body_sent_at"]
+    assert stream["body_sent_at"] < gone[0]["last_write_at"]
     assert stream["body_sent_at"] <= stream["first_event_at"] <= stream["last_event_at"]
     ((received, body),) = gateway.received
     assert received == datetime.fromisoformat(stream["body_sent_at"]).timestamp()
@@ -342,27 +342,45 @@ def test_a_return_to_the_warm_pool_counted_late_is_still_its_departures() -> Non
     assert [line["path"] for line in of(parsed(out, early, late), "scale_in")] == ["terminated", "warm_pool"]
 
 
-def test_the_stream_across_a_scale_in_is_held_until_the_instance_is_gone_and_a_cut_is_recorded() -> None:
+def test_a_response_the_departing_instance_cuts_as_it_stops_is_recorded_as_the_connection_closing() -> None:
     clock = FakeClock()
     first, second = T0 + 120, T0 + 900
-    leaves = first + 30
+    stops = first + 30
     scaler = Scaler(
         clock,
         asked=lambda run: 2 if run < first else int(run < second),
         in_service=lambda run: 2 if run <= first else int(run <= second),
         warm=lambda run: int(run > second),
-        instances={instance_id(): (T0 - 600, leaves), instance_id(): (T0 - 600, second + 30)},
+        instances={instance_id(): (T0 - 600, stops), instance_id(): (T0 - 600, second + 30)},
     )
-    run, gateway, out = a_run(scaler, [Reply(TURN[:3], cut=True)])
+    run, gateway, out = a_run(scaler)
+
+    class Draining(httpx.AsyncByteStream):
+        """The departing instance's answer: one event, then nothing until it stops and cuts it."""
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield TURN[0]
+            while clock.now() < stops:
+                await asyncio.sleep(0)
+            raise httpx.ReadError("the stub's instance stopped")
+
+    async def serve(request: httpx.Request) -> httpx.Response:
+        answer = await gateway.handle(request)
+        if request.headers["authorization"] == f"Bearer {run.student}" and clock.now() < stops:
+            return httpx.Response(200, stream=Draining())
+        return answer
+
+    run.transport = httpx.MockTransport(serve)
     asyncio.run(run.cycle())
 
     lines = parsed(out)
     (stream,) = of(lines, "stream")
-    (gone, _) = of(lines, "gone")
-    # The gateway had nothing to forward until the instance was gone; then the stub cut the answer.
+    (asked, _) = of(lines, "scale_in_asked")
+    # Forwarded to the pool once the scaler asked for fewer, before the instance stopped, which cut it.
     ((received, _),) = gateway.received
-    assert s7.utc(leaves) < gone["read_at"] <= s7.utc(received) == stream["body_sent_at"]
-    assert (stream["ended"], stream["events"], stream["error"]) == ("connection_closed", 3, "protocol_error")
+    assert asked["written_at"] <= s7.utc(received) == stream["body_sent_at"] < s7.utc(stops)
+    assert (stream["ended"], stream["events"], stream["error"]) == ("connection_closed", 1, "read_error")
+    assert stream["last_event_at"] < s7.utc(stops)
 
 
 def test_a_warm_reading_the_workspace_shows_late_is_waited_for_past_the_settle_time() -> None:
@@ -555,7 +573,7 @@ def test_an_instance_back_from_the_warm_pool_is_recorded_leaving_again() -> None
 def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
     asked_at, stopped = 1000.0, 1030.0
 
-    def told(warm: list[tuple[float, float]], **changes: Any) -> s7.Told:
+    def told(warm: Sequence[tuple[float, float]], **changes: Any) -> s7.Told:
         given: dict[str, Any] = {
             "stops": [stopped],
             "leaving": 1,
@@ -570,11 +588,16 @@ def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
         """The scaler's readings, one a minute from the decision's own."""
         return [(asked_at + 0.2 + 60 * n, value) for n, value in enumerate(values)]
 
-    assert told(runs(0, 1)).path is s7.Path.WARM_POOL
+    assert told(runs(0, 1, 1, 1, 1, 1, 1)).path is s7.Path.WARM_POOL
     assert told(runs(0, 0, 0, 0, 0, 0, 0)).path is s7.Path.TERMINATED
     # The warm count may rise some time after the stop: a late rise is a return to the warm pool,
     # and the same count over a window another decision cut short tells neither.
-    assert told(runs(0, 0, 0, 1)).path is s7.Path.WARM_POOL
+    assert told(runs(0, 0, 0, 1, 1, 1, 1)).path is s7.Path.WARM_POOL
+    # Nor is a return told from readings that end early, or miss a run that may have held a fall.
+    assert told(runs(0, 1)).unknown is s7.Unknown.WARM_READINGS_END_EARLY
+    slot = [(1000.2 + 60 * n, value) for n, value in enumerate((0, 1, 0, 1, 1, 1, 1, 1, 1))]
+    assert told(slot, stops=[1150.0]).unknown is s7.Unknown.WARM_COUNT_DIFFERS
+    assert told(slot[:2] + slot[3:], stops=[1150.0]).unknown is s7.Unknown.WARM_READINGS_END_EARLY
     assert told(runs(0, 0, 0, 0, 0, 0, 0), settled=False).unknown is s7.Unknown.NOT_SETTLED
     # Readings that stop short of the settle time, or that miss a run of the scaler within it, the
     # rest not shown yet, establish no termination.
@@ -600,7 +623,7 @@ def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
     assert told(runs(0, 1), out_of_service=False).unknown is s7.Unknown.NOT_READ_OUT_OF_SERVICE
     # Two instances leaving on one decision: told only when the count moved for both or for neither.
     both = {"stops": [stopped, stopped + 300], "leaving": 2}
-    assert told(runs(0, 1, 1, 1, 1, 1, 2), **both).path is s7.Path.WARM_POOL
+    assert told(runs(0, 1, 1, 1, 1, 1, *[2] * 6), **both).path is s7.Path.WARM_POOL
     assert told(runs(*[0] * 12), **both).path is s7.Path.TERMINATED
     assert told(runs(*[0] * 11, 1), **both).unknown is s7.Unknown.ANOTHER_INSTANCE_STOPPED
 

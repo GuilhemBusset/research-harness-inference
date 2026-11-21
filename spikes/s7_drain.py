@@ -52,15 +52,15 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    A cycle in which both paths were not seen is run again, up to `CYCLES` times; once both were,
    the job goes on to the wakes.
 3. **The stream across a scale-in**, in the first cycle. As the load stops, before the scaler acts,
-   it opens one slow stream, as across the deployment, and holds its body open at the gateway
-   through the whole scale-in: the scaler's first decision, the departing instance out of service
-   and the instance gone. The gateway reads a body whole before it counts the request as demand or
-   forwards it, so the held stream keeps no instance busy and delays no scale-in; and the scaler
-   removes only instances that report nothing running (section 5.1), so a request on the mock pool
-   can be in flight across a scale-in only there. Once the job reads every instance of the first
-   decision gone, it sends the last byte and reads the answer to its end: whether the request held
-   across the scale-in was then served, with an error event or cut, is what the line records. When
-   that decision asked for none, the stream is held to the cycle's end instead, so that it wakes no
+   it opens one slow stream, as across the deployment, and holds its body open at the gateway while
+   it watches the pool. The gateway reads a body whole before it counts the request as demand or
+   forwards it, so the held stream keeps no instance busy and delays no scale-in. As soon as the job
+   reads the scaler's first decision, it sends the last byte: the gateway forwards the request to
+   the pool while the group takes the departing instance out of service and before that instance
+   stops, the window in which a request may meet a deregistering target (section 5.1), and the job
+   reads the answer to its end, as the pool sends it, through the departure when it lasts that long.
+   Whether it finished, ended with an error event or was cut is what the line records. When that
+   decision asked for none, the stream is held to the cycle's end instead, so that it wakes no
    instance while the paths are told. Its `stream` line holds its times, among them `body_sent_at`,
    when it was forwarded, and its end, with the first decision's number; the departures' lines hold
    theirs, so a reader places one against the other.
@@ -92,9 +92,10 @@ decision's own reading included: the scaler read it before it acted (`in_window`
 since the decision's last stop, or at the next decision, whichever comes first, from every reading
 of the window the workspace then shows. An instance stopped into the warm pool may be counted there
 a while after its collector falls silent, so the count may rise late but never fall, not even
-before the instance stopped (a slot emptied then may be refilled by it): once every
-instance of the decision has stopped, ending as many more as left, `warm_pool`; the same all along
-a window that ran at least `WARM_SETTLE_SECONDS`, its readings reaching its end, `terminated`. A
+before the instance stopped (a slot emptied then may be refilled by it). Either path is told only
+from readings that cover the window (below): once every instance of the decision has stopped,
+ending as many more as left, `warm_pool`; the same all along a window that ran at least
+`WARM_SETTLE_SECONDS`, `terminated`. A
 new instance writing, a decision whose instances the count does not tell apart, no reading on
 either side, readings that end early, a window the next decision cut short, or readings that
 differ, leave it `unknown`. The readings cover the window (`covers`) when they reach its end, the
@@ -498,12 +499,12 @@ def path_of(
     The warm count is a pool total that may rise some time after an instance stops. From the
     decision's reading, those made before the instances stopped included, it must never fall and
     never pass `leaving` more: a slot that empties and fills again may have been filled by the
-    departing instance or by a new one, so the readings cannot tell. Once every instance has
-    stopped, a last reading `leaving` more is `warm_pool`. Short of that, the readings must cover
-    the window (`covers`) up to `WARM_SETTLE_SECONDS` past the last stop, or up to the last run that
-    asked for as many before the next decision when `end` comes first, or the workspace has not
-    shown the rest yet. Then every reading since the decision's the same, over a settled window, is
-    `terminated`. Anything else is `unknown`, with its reason: the same count over a window another
+    departing instance or by a new one, so the readings cannot tell. Before either path is told,
+    the readings must cover the window (`covers`) up to `WARM_SETTLE_SECONDS` past the last stop,
+    or up to the last run that asked for as many before the next decision when `end` comes first:
+    otherwise the workspace has not shown the rest yet, and a reading it misses may hold a fall.
+    Then, once every instance has stopped, a last reading `leaving` more is `warm_pool`, and every
+    reading since the decision's the same, over a settled window, is `terminated`. Anything else is `unknown`, with its reason: the same count over a window another
     decision cut short cannot tell a terminated instance from a late return, and a count between the
     two, after more than one stop, cannot tell which went where."""
     if not stops or min(stops) < asked_at:
@@ -524,11 +525,13 @@ def path_of(
     last = [round(value) for moment, value in readings if moment >= max(stops) + SCRAPE_SECONDS]
     if not after or not last:
         return Told(Path.UNKNOWN, Unknown.NO_READING_AFTER_STOP, before)
+    # Either path is told only from readings that cover the window: a gap may hide a fall, a slot
+    # that emptied and was filled again, and readings that end early a fall after them.
+    if not covers(readings, since=decided[0], until=min(max(stops) + WARM_SETTLE_SECONDS, end - NOTE_SECOND)):
+        return Told(Path.UNKNOWN, Unknown.WARM_READINGS_END_EARLY, before, after)
     steady = all(earlier <= later <= before + leaving for earlier, later in itertools.pairwise((before, *counts)))
     if steady and last[-1] == before + leaving:
         return Told(Path.WARM_POOL, None, before, after)
-    if not covers(readings, since=decided[0], until=min(max(stops) + WARM_SETTLE_SECONDS, end - NOTE_SECOND)):
-        return Told(Path.UNKNOWN, Unknown.WARM_READINGS_END_EARLY, before, after)
     if set(counts) == {before} and settled:
         return Told(Path.TERMINATED, None, before, after)
     if len(stops) > 1 or leaving > 1:
@@ -1128,8 +1131,9 @@ class Run:
     async def cycle(self) -> None:
         """Two instances, then the departures down to none, each with its lines. In the first cycle,
         the stream across a scale-in: a slow stream sent as the load stops, before the scaler asks
-        for fewer, held open while the job watches the pool and sent whole once it reads the first
-        decision's instances gone (`_scaled_in`), then read to its end."""
+        for fewer, held open while the job watches the pool and sent whole as soon as it reads the
+        scaler's first decision (`_scaled_in`), then read to its end while the job goes on
+        watching."""
         if not await self.two_instances():
             self.recorder.line("timeout", waiting_for="two_in_service")
             return
@@ -1166,21 +1170,19 @@ class Run:
 
     @staticmethod
     def _scaled_in(watch: Watch) -> bool:
-        """Whether the stream across a scale-in may end: the job has read every instance of the
-        scaler's first decision gone, and that decision left an instance in service to serve it.
-        A first decision that asked for none holds it to the cycle's end, when the paths are told:
-        sent before, it would wake the pool and change the warm count the paths are told from."""
-        if not watch.decisions:
-            return False
-        first = watch.decisions[0]
-        return first.asked > 0 and len(first.departures) >= first.fewer
+        """Whether the stream across a scale-in is sent whole: the job has read the scaler's first
+        decision, and that decision leaves an instance in service, so the gateway forwards the
+        request to the pool while the departing instance drains. A first decision that asked for
+        none holds it to the cycle's end, when the paths are told: sent before, it would wake the
+        pool and change the warm count the paths are told from."""
+        return bool(watch.decisions) and watch.decisions[0].asked > 0
 
     async def _across_scale_in(self, release: asyncio.Event, hold: float) -> Read:
         """The stream across a scale-in: one slow stream (`slow_stream`), its body held open from
-        now, before the scaler asks for fewer, until `release` is set, once the job has read the
-        departing instance gone (`_scaled_in`), or for `hold` seconds; then read to its end. Its
-        request is open, at the gateway, through the whole scale-in: the decision, the instance
-        out of service and the instance gone."""
+        now, before the scaler asks for fewer, until `release` is set, as the job reads the scaler's
+        first decision (`_scaled_in`), or for `hold` seconds; then read to its end. The gateway
+        forwards it once its body is whole, so it reaches the pool as the group takes the departing
+        instance out of service, before that instance stops."""
         return await slow_stream(
             self.endpoint,
             self.student,
