@@ -70,8 +70,10 @@ compaction is no error, and the session went on after it or did not end in an er
 holds what shows whether the window was reached at all: the window Claude Code reported, the
 largest input it reported, the turns the gateway or the engine refused, and among them those
 refused as a body too long once the session had grown (`window_refusals_of`). When it neither
-compacted nor had such a turn refused, the experiment ended before the window: a refusal of another
-kind, a budget's on the first request among them, shows nothing of the window.
+compacted nor had such a turn refused, the window was not shown to be reached: a refusal of another
+kind, a budget's on the first request among them, shows nothing of the window. The gateway answers
+`engine_error` both for an engine that refused a prompt too long and for one it lost, so a grown
+turn refused so is counted apart (`undetermined_refusals`), with the status of every refused turn.
 
 **The replay.** The Claude Code session of the task, every request the forwarder saw answered,
 side queries and token counts included, with the pauses between them, is replayed through the gateway with the load
@@ -238,10 +240,8 @@ KNOWN_CAUSES = frozenset(
 )
 LENGTH_CAUSES = frozenset(
     {
-        # The gateway's: a body over the pool's limits, and an engine that refused one (it answers
-        # a prompt longer than its context with a status that is not a success).
+        # The gateway's: a body over the pool's limits.
         Cause.REQUEST_REFUSED.value,
-        Cause.ENGINE_ERROR.value,
         # The formats' own, should the engine's error pass through.
         "invalid_request_error",
         "request_too_large",
@@ -250,7 +250,12 @@ LENGTH_CAUSES = frozenset(
     }
 )
 # The statuses such a refusal comes with when it names no cause.
-LENGTH_STATUSES = frozenset({400, 413, 502})
+LENGTH_STATUSES = frozenset({400, 413})
+# A refusal whose cause no length decides: the gateway answers `engine_error` (502) both for an
+# engine that refused a prompt longer than its context and for an engine it lost the connection to,
+# so such a refusal of a grown turn leaves undetermined whether the window was reached.
+UNDETERMINED_CAUSES = frozenset({Cause.ENGINE_ERROR.value})
+UNDETERMINED_STATUSES = frozenset({502})
 MESSAGES_ROUTE = "/v1/messages"
 # The Messages routes a recorded session replays: the turns and the token counts.
 REPLAYED_ROUTES = (MESSAGES_ROUTE, "/v1/messages/count_tokens")
@@ -704,8 +709,9 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         after = next_turn_completed(events[index + 1 :])
     trigger = metadata.get("trigger")
     answer = session.result().get("result")
-    refused_turns = sum(1 for one in session.exchanges if s2.refused(one) and bool((one.json() or {}).get("tools")))
+    refused = [one for one in session.exchanges if s2.refused(one) and bool((one.json() or {}).get("tools"))]
     window_refusals = len(window_refusals_of(session))
+    undetermined = len(window_refusals_of(session, _refused_undetermined))
     return {
         "compacted": boundary is not None,
         "compacted_at": utc_or_none(boundary),
@@ -716,26 +722,32 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         "answered": isinstance(answer, str) and word in re.findall(r"[a-z0-9]+", answer.lower()),
         "client_window": client_window(session),
         "largest_input_tokens": largest_input(session),
-        "refused_turns": refused_turns,
+        "refused_turns": len(refused),
+        "refused_turn_statuses": [one.status for one in refused],
         "window_refusals": window_refusals,
+        # Grown turns refused with a cause that may be the window or a failure of the engine.
+        "undetermined_refusals": undetermined,
         # Whether the session met its window: it compacted, or a turn was refused as a body too long
-        # once the session had grown. A refusal of another kind (a budget, a limit, a cold pool)
-        # shows neither: the experiment then ended before the window was exercised.
+        # once the session had grown. A refusal of another kind (a budget, a limit, a cold pool, an
+        # engine error that may be a lost connection) shows neither.
         "window_exercised": boundary is not None or window_refusals > 0,
     }
 
 
-def window_refusals_of(session: Session) -> list[s2.Exchange]:
-    """The turns of the main loop refused as a body the pool could not take, each larger than every
-    turn accepted before it: what a session refused at its window looks like. A refusal on the first
-    turn, or of a kind no length causes (a budget, a limit, a cold pool), is not one."""
+def window_refusals_of(
+    session: Session, kind: Callable[[s2.Exchange], bool] | None = None
+) -> list[s2.Exchange]:
+    """The turns of the main loop refused as a body the pool could not take (or, given `kind`, refused
+    as it decides), each larger than every turn accepted before it: what a session refused at its
+    window looks like. A refusal on the first turn, or of a kind no length causes (a budget, a limit,
+    a cold pool, an engine error), is not one."""
     found, largest = [], None
     for one in session.exchanges:
         if one.route != MESSAGES_ROUTE or not (one.json() or {}).get("tools"):
             continue
         if not s2.refused(one):
             largest = max(largest or 0, len(one.body))
-        elif largest is not None and len(one.body) > largest and _refused_as_too_long(one):
+        elif largest is not None and len(one.body) > largest and (kind or _refused_as_too_long)(one):
             found.append(one)
     return found
 
@@ -744,6 +756,12 @@ def _refused_as_too_long(exchange: s2.Exchange) -> bool:
     if exchange.cause is not None:
         return exchange.cause in LENGTH_CAUSES
     return exchange.status in LENGTH_STATUSES
+
+
+def _refused_undetermined(exchange: s2.Exchange) -> bool:
+    if exchange.cause is not None:
+        return exchange.cause in UNDETERMINED_CAUSES
+    return exchange.status in UNDETERMINED_STATUSES
 
 
 def recorded_session(exchanges: Sequence[s2.Exchange]) -> loadgen.RecordedSession:
@@ -1066,23 +1084,34 @@ class Job:
         # the replay's start: the counters at the start hold the one and nothing of the other.
         self._wait_until(self.wall() + SCRAPE_SECONDS)
         start = self.wall()
-        records = asyncio.run(self._send(session))
+        failure: Exception | None = None
+        try:
+            records = asyncio.run(self._send(session))
+        except Exception as error:  # noqa: BLE001 - the counters of what ran are read, then it is raised
+            failure, records = error, None
         end = self.wall()
         self.lines.write(
             Line.REPLAY,
             started_at=utc(start),
             ended_at=utc(end),
             requests=len(session.exchanges),
-            sent=len(records),
-            answered=sum(1 for record in records if record.status == 200),
-            input_tokens=sum(record.input_tokens or 0 for record in records),
-            cached_input_tokens=sum(record.cached_input_tokens or 0 for record in records),
+            # A replay the load generator gave up returns no records: what it sent is then unknown.
+            sent=None if records is None else len(records),
+            answered=None if records is None else sum(1 for record in records if record.status == 200),
+            input_tokens=None if records is None else sum(record.input_tokens or 0 for record in records),
+            cached_input_tokens=None
+            if records is None
+            else sum(record.cached_input_tokens or 0 for record in records),
+            error=None if failure is None else type(failure).__name__,
         )
         # Both read once the workspace holds the scrape after the replay's end, which holds its last
-        # answers; the start is the last scrape before the replay's first request.
+        # answers; the start is the last scrape before the replay's first request. A replay that
+        # failed part of the way still has both, over the interval that ran.
         self._wait_until(end + SETTLE_SECONDS)
         self.counters("start", start)
         self.counters("end", end + SCRAPE_SECONDS)
+        if failure is not None:
+            raise failure
 
     async def _send(self, session: loadgen.RecordedSession) -> list[loadgen.Record]:
         return await self.replay(loadgen.Load((session,)), [self.keys[len(Harness)]], self.endpoint, at_once=1)

@@ -18,11 +18,13 @@ import urllib.error
 import urllib.request
 import zlib
 from datetime import datetime, timedelta
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from random import Random
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 from botocore.exceptions import ClientError
 
@@ -409,11 +411,15 @@ def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 429, cause="concurrency_limit")], False),
         # A grown turn refused as a body the pool could not take.
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="request_refused")], True),
+        # A grown turn the gateway answered `engine_error`, as it does for a lost connection: undetermined.
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502, cause="engine_error")], False),
+        ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 502)], False),
     ]  # fmt: skip
     for exchanges, exercised in cases:
         row = s3.compaction_of(claude_session(s3.Step.COMPACTION, [], exchanges), "rhiabc123")
         assert (row["window_exercised"], row["compacted"]) == (exercised, False)
-        assert row["refused_turns"] == 1
+        assert (row["refused_turns"], row["refused_turn_statuses"]) == (1, [exchanges[-1].status])
+        assert row["undetermined_refusals"] == (exchanges[-1].status == 502)
 
 
 def test_the_recorded_session_keeps_the_token_counts_in_order() -> None:
@@ -501,6 +507,30 @@ def test_the_replay_s_counters_exclude_traffic_scraped_before_it(tmp_path: Path)
         100,
         90,
     )
+
+
+def test_a_replay_that_fails_part_way_keeps_its_counters(tmp_path: Path) -> None:
+    clock, written, keys = Clock(), [], [generate_key() for _ in range(4)]
+    sent: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.path)
+        if len(sent) == 2:
+            raise httpx.ReadError("stream closed", request=request)
+        return httpx.Response(200, json={"usage": {"input_tokens": 50, "output_tokens": 1}})
+
+    job = s3.Job(
+        pool="coursework", engine="vllm", endpoint="https://example.com", keys=keys, gateway=Ready(),
+        workspace=Workspace(), lines=s3.Lines(keys, wall=clock, out=written.append), work=tmp_path,
+        replay=partial(loadgen.replay, transport=httpx.MockTransport(respond)), wall=clock, sleep=clock.sleep,
+    )  # fmt: skip
+    turns = [exchange("/v1/messages", {}, float(at), completed=True) for at in (1, 2)]
+    assert job._step("replay", lambda: job.replayed(claude_session(s3.Step.TASK, [], turns))) is None
+    rows = [json.loads(one) for one in written]
+    assert len(sent) == 2
+    assert [row["point"] for row in rows if row["kind"] == "engine_counters"] == ["start", "end"]
+    assert all(when(row["counters_at"]) for row in rows if row["kind"] == "engine_counters")
+    assert [row["kind"] for row in rows if row["kind"] in ("replay", "step_failed")] == ["replay", "step_failed"]
 
 
 def test_the_check_runs_without_the_build_s_credential_environment(
