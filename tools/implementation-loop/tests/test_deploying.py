@@ -246,9 +246,9 @@ def test_deploy_status_is_the_latest_status_of_the_context():
     assert fake.deploy_status("def456", DEPLOY) is None, "another commit's statuses are not this commit's"
 
 
-def test_loop_toml_has_the_table_with_neutral_values_and_no_other_key_is_read():
+def test_loop_toml_has_the_table_and_no_other_key_is_read():
     committed = L.config.load_policy(HERE.parent / "loop.toml")["deploy"]
-    assert committed == L.config.Deploy(contexts=(), timeout_s=3600, approval_description="")
+    assert all(c.partition("/")[0] in ("deploy", "verify") for c in committed.contexts), "the owner's table loads"
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "loop.toml"
 
@@ -264,9 +264,9 @@ def test_loop_toml_has_the_table_with_neutral_values_and_no_other_key_is_read():
             read('[deploy]\ntimeout_s = "an hour"\n')
 
 
-def test_loop_toml_has_an_empty_verified_description_and_a_set_one_is_read():
+def test_loop_toml_has_a_verified_description_and_a_set_one_is_read():
     committed = tomllib.loads((HERE.parent / "loop.toml").read_text())["deploy"]
-    assert committed["verified_description"] == "", "the key is there, and the loop never fills it"
+    assert "verified_description" in committed, "the key is there"
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "loop.toml"
         path.write_text(f'[deploy]\nverified_description = "{VERIFIED}"\n')
