@@ -28,7 +28,7 @@
 #
 # Roles here (ADR 0001, decision 2): with operator `claude`, plan and build run on Claude Fable,
 # on Claude Opus while Fable refuses calls, and explore on a cheap Claude model; triage, examine,
-# decide, resolve_locked and arbitrate go to the other vendor, Codex, on its default model. The
+# decide and arbitrate go to the other vendor, Codex, on its default model. The
 # escalated calls of examine, decide and arbitrate (above) run on Codex `gpt-6.2-astra`, and on
 # `gpt-6.2-sol`, the default, while astra refuses calls (ADR 0001, amendment 13).
 
@@ -56,10 +56,6 @@ timeout_s = 5400
 claude_model = "claude-fable-5-2"
 claude_fallback_model = "claude-opus-5-5"
 max_budget_usd = 25
-
-[roles.resolve_locked]
-effort = "high"
-timeout_s = 1800
 
 [roles.examine]
 effort = "high"

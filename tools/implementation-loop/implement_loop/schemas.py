@@ -30,7 +30,7 @@ SMOKE = obj(ok=BOOL)
 PROOF = {"type": "string", "enum": ["test", "command", "review", "owner", "deferred"]}
 ITEM_PLAN = obj(id=STR, reading=STR, quote=STR, proof=PROOF, capability=NSTR, agent_part=NSTR,
                 depends_on=NINT, depends_quote=NSTR)
-PLAN = obj(items=arr(ITEM_PLAN), zones=arr(STR), decisions=arr(DECISION), notes=STR)
+PLAN = obj(items=arr(ITEM_PLAN), decisions=arr(DECISION), notes=STR)
 TRIAGE = obj(objections=arr(obj(
     kind={"type": "string", "enum": ["misreading", "classification", "dependency", "scenario"]},
     text=STR, item=NSTR, quote=NSTR, proof={"type": ["string", "null"]}, capability=NSTR,
@@ -43,9 +43,8 @@ REQUEST = obj(
 )
 BUILD = obj(
     status={"type": "string", "enum": ["done", "blocked"]}, note=STR, tests=arr(STR), commands=arr(COMMAND),
-    dispositions=arr(obj(test=STR, disposition=STR)), decisions=arr(DECISION), requests=arr(REQUEST),
+    decisions=arr(DECISION), requests=arr(REQUEST),
 )
-RESOLVED = obj(files=arr(STR), note=STR)
 FINDING = obj(title=STR, item=NSTR, quote=NSTR, invariant=NSTR, observed=STR, expected=STR, reproduction=NSTR,
               cwd=STR, probe=NSTR, file=NSTR, line=NINT, severity=INT)
 EXAMINE = obj(
@@ -55,8 +54,7 @@ EXAMINE = obj(
     certify=BOOL,
     summary=STR,
 )
-DECIDE = obj(decisions=arr(obj(request=STR, approve=BOOL, reason=STR,
-                               dispositions=arr(obj(test=STR, disposition=STR)))))
+DECIDE = obj(decisions=arr(obj(request=STR, approve=BOOL, reason=STR)))
 ARBITRATE = obj(upheld=BOOL, reason=STR)
 
 BY_ROLE = {
@@ -65,7 +63,6 @@ BY_ROLE = {
     "plan": PLAN,
     "triage": TRIAGE,
     "build": BUILD,
-    "resolve_locked": RESOLVED,
     "examine": EXAMINE,
     "decide": DECIDE,
     "arbitrate": ARBITRATE,

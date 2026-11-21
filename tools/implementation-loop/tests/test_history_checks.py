@@ -425,11 +425,6 @@ class OwnersValueAgents(L.agents.FakeAgents):
         self.rounds = rounds
         self.given: list[str] = []
 
-    def plan(self, vendor, req, worktree):
-        result = super().plan(vendor, req, worktree)
-        result.zones.append(NOTE)
-        return result
-
     def build(self, vendor, req, plan, worktree, feedback):
         self.given.append(repr((req, plan, feedback)))
         result = super().build(vendor, req, plan, worktree, feedback)

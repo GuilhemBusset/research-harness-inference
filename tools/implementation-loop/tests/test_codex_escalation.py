@@ -141,7 +141,7 @@ class CodexEscalationTests(unittest.TestCase):
             self.assertEqual((roles[role].codex_escalated_model, roles[role].codex_fallback_model),
                              ("gpt-6.2-astra", "gpt-6.2-sol"), role)
             self.assertIsNone(roles[role].codex_model, f"{role}: every other call stays on the default model")
-        for role in ("explore", "plan", "triage", "build", "resolve_locked"):
+        for role in ("explore", "plan", "triage", "build"):
             self.assertIsNone(roles[role].codex_escalated_model, role)
             self.assertIsNone(roles[role].codex_fallback_model, role)
 

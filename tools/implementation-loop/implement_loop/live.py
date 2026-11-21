@@ -2,7 +2,7 @@
 call, with per-role permissions, schema-validated answers, retries, and a full call record.
 
 Read-only roles (explore, plan, triage, arbitrate) get read-only tools (Claude) or the read-only
-sandbox (Codex). Working roles (build, resolve_locked, examine, decide) may edit their worktree,
+sandbox (Codex). Working roles (build, examine, decide) may edit their worktree,
 use the network and run anything the checks run, with the same access for both vendors (Codex
 runs without its own sandbox, like Claude Code; ADR 0012): a limit of a vendor's sandbox is an
 engine problem, not an owner obligation. The boundary is the engine's: every process started here
@@ -113,7 +113,6 @@ DEFAULT_ROLES = {
     "plan": RoleSettings(timeout_s=1800, max_budget_usd=8),
     "triage": RoleSettings(timeout_s=1200),
     "build": RoleSettings(timeout_s=5400, max_budget_usd=25),
-    "resolve_locked": RoleSettings(timeout_s=1800),
     "examine": RoleSettings(timeout_s=3600),
     "decide": RoleSettings(timeout_s=1800),
     "arbitrate": RoleSettings(timeout_s=1200),
@@ -506,8 +505,7 @@ class LiveAgents:
                  if worktree else "There is no branch yet; you are reading `main`.")
         prompt = render("plan", branch_note=where, **self._issue_vars(req, "builder (planning)"))
         v = self.call(vendor, "plan", worktree or self._root(), prompt, req.issue.number)
-        return PlanResult(items=[ItemPlan(**i) for i in v["items"]], zones=v["zones"], decisions=v["decisions"],
-                          notes=v["notes"])
+        return PlanResult(items=[ItemPlan(**i) for i in v["items"]], decisions=v["decisions"], notes=v["notes"])
 
     def triage(self, vendor, req, plan):
         prompt = render("triage", plan=json.dumps(plan, indent=1), **self._issue_vars(req, "examiner (triage)"))
@@ -528,14 +526,7 @@ class LiveAgents:
         return BuildResult(status=v["status"], note=v["note"], tests=v["tests"],
                            commands=[CheckSpec(criterion=c["criterion"], command=c["command"], cwd=c["cwd"],
                                                timeout_s=c["timeout_s"]) for c in v["commands"]],
-                           dispositions={d["test"]: d["disposition"] for d in v["dispositions"]},
                            decisions=v["decisions"], requests=requests)
-
-    def resolve_locked(self, vendor, req, worktree, files, feedback):
-        req = IssueRequest(issue=req.issue, spec=req.spec, context=req.context, feedback=feedback, facts=req.facts)
-        prompt = render("resolve_locked", files=", ".join(f"`{f}`" for f in files),
-                        **self._issue_vars(req, "conflict resolver for locked tests"))
-        self.call(vendor, "resolve_locked", worktree, prompt, req.issue.number)
 
     def examine(self, vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since):
         compact = [{k: e.get(k) for k in ("criterion", "kind", "command", "passed", "exit_code", "note", "tests")} |
@@ -564,8 +555,7 @@ class LiveAgents:
         # requests decided in the same call.
         escalate = any(r.get("kind") == "protected_change" for r in requests)
         v = self.call(vendor, "decide", worktree, prompt, req.issue.number, escalate=escalate)
-        return [Decision(request=d["request"], approve=d["approve"], reason=d["reason"],
-                         dispositions={x["test"]: x["disposition"] for x in d["dispositions"]}) for d in v["decisions"]]
+        return [Decision(request=d["request"], approve=d["approve"], reason=d["reason"]) for d in v["decisions"]]
 
     def arbitrate(self, vendor, req, dispute, worktree=None):
         prompt = render("arbitrate", dispute=json.dumps(dispute, indent=1)[:20000], **self._issue_vars(req, "arbiter"))
