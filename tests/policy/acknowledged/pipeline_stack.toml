@@ -22,6 +22,12 @@
 #   the objects verification/<execution ID>/not-run, when no test could run,
 #   verification/<execution ID>/failed-smoke-tests, the IDs of the smoke tests that failed, and
 #   verification/<execution ID>/last-stages, the last lifecycle stage each instance reached.
+# - autoscaling:DescribeAutoScalingGroups and autoscaling:DescribeInstanceRefreshes on every
+#   resource, the only resource AWS grants them on: before the smoke tests, the step's decision
+#   finds each GPU pool's group by its tags rhi-pool and rhi-engine and reads its instance
+#   refreshes, to learn whether this execution started one and to wait for it to end.
+# - codepipeline:ListPipelineExecutions on this pipeline, by its ARN, and on no other: the decision
+#   reads when this execution started, which a refresh must have begun after.
 # - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
 #   CDK Pipelines' grant to a project that takes an input, here the source the step runs.
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
@@ -87,4 +93,6 @@
 "codebuild:StopBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codepipeline:GetPipelineState" = "The function that approves a check with no widened permissions reads the pipeline's state, and its condition admits only a pipeline tagged for that approval."
 "codepipeline:PutApprovalResult" = "The function that approves a check with no widened permissions approves it, and its condition admits only a pipeline tagged for that approval."
+"autoscaling:DescribeAutoScalingGroups" = "The verification step's decision finds each GPU pool's group by its tags rhi-pool and rhi-engine, which it reads with the group; AWS grants describing groups on every resource only, and the action reads, never changes, a group."
+"autoscaling:DescribeInstanceRefreshes" = "The verification step's decision reads the instance refreshes of each GPU pool's group, to learn whether this execution started one and to wait for it to end; AWS grants describing refreshes on every resource only, and the action reads, never changes, a refresh."
 "sts:AssumeRole" = "The project that checks for widened permissions assumes the bootstrap's deploy role to compare the stage with what is deployed, and its condition admits only a role tagged as that deploy role."

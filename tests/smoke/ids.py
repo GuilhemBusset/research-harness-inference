@@ -35,6 +35,7 @@ SMOKE_TEST_IDS: tuple[str, ...] = (
     "metrics-gateway",
     "metrics-pool",
     "release-served",
+    "gpu-release-served",
     # tests/smoke/test_smoke.py: the tests of the smoke tests themselves, which reach no stack.
     "ids-listed",
     "deployed-need-endpoint",
