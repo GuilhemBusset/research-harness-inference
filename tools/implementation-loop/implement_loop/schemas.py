@@ -38,10 +38,8 @@ TRIAGE = obj(objections=arr(obj(
 )))
 COMMAND = obj(criterion=STR, command=STR, cwd=STR, timeout_s=NINT)
 REQUEST = obj(
-    kind={"type": "string", "enum": ["paths", "protected_change", "command_change", "test_change", "reclassify",
-                                     "depends", "dispute"]},
+    kind={"type": "string", "enum": ["protected_change", "reclassify", "depends", "dispute"]},
     detail=STR, paths=arr(STR), item=NSTR, finding=NSTR, capability=NSTR, depends_on=NINT, depends_quote=NSTR,
-    command=NSTR, cwd=NSTR, timeout_s=NINT,
 )
 BUILD = obj(
     status={"type": "string", "enum": ["done", "blocked"]}, note=STR, tests=arr(STR), commands=arr(COMMAND),

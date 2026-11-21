@@ -86,19 +86,18 @@ class LandConflictModesAndGatesTests(unittest.TestCase):
         git("push", "-q", "origin", "HEAD:main", cwd=self.repo.merger)
         return git("rev-parse", "HEAD", cwd=self.repo.merger)
 
-    def add_issue(self, n, *, locked=False, **options):
+    def add_issue(self, n, **options):
         self.scripts[n] = Script(files={f"docs/issue-{n}.txt": f"content-{n}"},
-                                 lines={self.shared_paths[0]: f"registration-{n}"},
-                                 test_file="checks/combined.sh" if locked else "", **options)
+                                 lines={self.shared_paths[0]: f"registration-{n}"}, **options)
         self.gh.add_issue(n, f"Widget {n}", issue_body(f"feat/issue-{n}",
                           ["Keep the widget and its registration."], ["The checks pass."]),
                           labels=("size:M",))
 
-    def setup_issues(self, *, pair=False, locked=False, **options):
-        self.add_issue(3, locked=locked, **options)
+    def setup_issues(self, *, pair=False, **options):
+        self.add_issue(3, **options)
         self.gh.add_issue(1, "Second widget", "Epic.\n", subs=(3,))
         if pair:
-            self.add_issue(2, locked=locked)
+            self.add_issue(2)
             self.gh.add_issue(10, "First widget", "Epic.\n", subs=(2,))
 
     def make_engine(self, root=1, agents=None):
@@ -197,54 +196,6 @@ class LandConflictModesAndGatesTests(unittest.TestCase):
         (wt / alike).symlink_to(Path(copy).name)  # dereferences to identical bytes
         self.assertEqual((wt / alike).read_bytes(), (wt / copy).read_bytes())
 
-    def test_locked_test_conflict_restores_file_modes_outside_its_lane(self):
-        targets = self.mode_targets()
-        late = "bin/tool introduced by main.sh"
-        self.setup_issues(pair=True, locked=True)
-        agents = ObservedAgents(self)
-        self.install_peer_hook(agents, after_peer=lambda: self.seed_main(
-            {late: "#!/bin/sh\necho introduced-on-main\n"}, executables=(late,)))
-        real_resolve = agents.resolve_locked
-        snapshots, restored = [], []
-        watched = [*targets[:3], late, self.shared_paths[0]]
-
-        def outside_lane(vendor, req, wt, files, feedback):
-            resolving = req.issue.number == 3 and "checks/combined.sh" in git(
-                "diff", "--name-only", "--diff-filter=U", cwd=wt).splitlines()
-            if resolving:
-                snapshots.append({f: (disk_state(wt / f), index_state(wt, f)) for f in watched})
-                self.assertIn(b" 1\t", snapshots[-1][self.shared_paths[0]][1],
-                              "the out-of-lane shared conflict must still have index stages")
-                self.assertEqual(git("ls-tree", "HEAD", "--", late, cwd=wt), "",
-                                 "the executable must come from main, not the issue's HEAD")
-            result = real_resolve(vendor, req, wt, files, feedback)
-            if resolving:
-                self.stray_modes(wt, targets)
-                content = (wt / late).read_bytes()
-                (wt / late).unlink()
-                (wt / late).write_bytes(content)
-                executable(wt / late, False)
-                git("add", "--", late, cwd=wt)
-            return result
-
-        def before_builder(req, plan, wt, entry):
-            if snapshots:
-                for f, (state, index) in snapshots[-1].items():
-                    self.assertEqual(disk_state(wt / f), state, f)
-                    self.assertEqual(index_state(wt, f), index, f)
-                restored.append(True)
-
-        agents.resolve_locked = outside_lane  # ty: ignore[invalid-assignment]  # test double
-        agents.before_build = before_builder
-        self.run_engine(agents)
-        self.assert_done(pair=True)
-        self.assertEqual((len(snapshots), len(restored)), (1, 1))
-        for f in watched[:-1]:
-            self.assert_main_state(f, snapshots[0][f][0])
-        discarded = set().union(*(set(e["discarded"]) for e in self.events("resolver_out_of_lane")))
-        self.assertTrue(set(watched[:-1]) <= discarded)
-        self.assertFalse(self.events("round_failed"), "a conflict charges no round")
-
     def test_examiner_mode_changes_never_reach_the_branch(self):
         # The examiner works in a disposable copy of the exact head; whatever it changes there,
         # modes included, is discarded with the copy (ADR 0012).
@@ -270,55 +221,6 @@ class LandConflictModesAndGatesTests(unittest.TestCase):
         for f in targets[:3]:
             self.assert_main_state(f, disk_state(self.repo.merger / f))
         self.assertEqual(git("ls-tree", "origin/main", "--", targets[1], cwd=self.repo.merger).split()[0], "100755")
-
-    def test_builder_chmod_of_a_locked_test_is_reverted(self):
-        self.builder_mode_change_case(mid_merge=False, change="chmod")
-
-    def test_builder_symlink_over_a_locked_test_mid_merge_is_reverted(self):
-        self.builder_mode_change_case(mid_merge=True, change="symlink")
-
-    def builder_mode_change_case(self, mid_merge, change):
-        # Without a conflict, a blocking finding at the first examination (where the
-        # test locks) brings the second build that tampers.
-        self.setup_issues(pair=mid_merge, locked=True, **({} if mid_merge else {"findings": 1}))
-        lane = "checks/combined.sh"
-        agents = ObservedAgents(self)
-        intended, tampered = [], []
-
-        def tamper(req, plan, wt, entry):
-            if req.issue.number != 3:
-                return
-            if lane not in self.engine.store.issue(3).locked:
-                executable(wt / lane, mid_merge)   # the builder's own test, as it wants it
-                return
-            if tampered or (mid_merge and not self.events("conflict")):
-                return
-            intended.append(disk_state(wt / lane))
-            if change == "chmod":
-                executable(wt / lane, not intended[-1][2])
-            else:
-                copy = self.repo.tmp / "identical-check.sh"
-                copy.write_bytes(intended[-1][1])
-                (wt / lane).unlink()
-                (wt / lane).symlink_to(copy)
-            if mid_merge:
-                git("add", "--", lane, cwd=wt)
-            self.assertEqual((wt / lane).read_bytes(), intended[-1][1])
-            self.assertNotEqual(disk_state(wt / lane), intended[-1])
-            tampered.append(True)
-
-        agents.after_build = tamper
-        if mid_merge:
-            self.install_peer_hook(agents)
-        self.run_engine(agents)
-        self.assert_done(pair=mid_merge)
-        self.assertEqual(len(tampered), 1)
-        self.assert_main_state(lane, intended[0])
-        self.assertTrue(any(lane in e["files"] for e in self.events("locked_changes_reverted")))
-        if mid_merge:
-            self.assertEqual(len([e for e in self.events("conflict") if e["phase"] == "land"]), 1)
-            for n in (2, 3):
-                self.assertIn(f"docs/issue-{n}.txt", present(self.repo.main_file(lane)))
 
     def logged_checks(self, agents):
         """A test logs real HEAD only after its assertions pass, outside all worktrees.

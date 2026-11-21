@@ -12,9 +12,6 @@ SHARED_FILES = frozenset({
 })
 SHARED_PREFIXES = (".github/workflows/", ".githooks/")
 
-# Files that can change how tests run without touching a test file.
-TEST_CONFIG_NAMES = frozenset({"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"})
-
 # Paths a builder changes only with the examiner's approval (a `protected_change` request),
 # unless the issue's own text names them: the loop's machinery, the repository's gates, the
 # invariants written as tests (ADR 0001, decision 10), and the agents' own configuration: a hook
@@ -147,7 +144,7 @@ class Caps:
     merge_refusals: int = 3
     # From this examination of an issue since its latest plan on, only a finding that names a safety
     # invariant blocks: one that names only an item becomes a follow-up issue, and a withheld
-    # certificate no longer holds a head whose items are met (ADR 0001, amendment 11).
+    # certificate no longer holds a head whose items are met (ADR 0001, amendment 12).
     examiner_bound: int = 4
     run_ceiling_factor: float = 1.2
     max_parallel_writers: int = 1     # one issue built at a time: three at once ran the host out of memory (2026-11-15)

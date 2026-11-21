@@ -210,14 +210,6 @@ class ObligationTests(EngineCase):
         self.assertIn({"name": "loop:deferred"}, self.gh.issues[2]["labels"])
         self.assertTrue(any("implement-loop:deferred" in c["body"] for c in self.gh.comments[2]))
 
-    def test_a_blocked_build_asks_for_a_path_and_carries_on(self):
-        self.add_work(2, "docs/a.txt", "alpha", blocked_once=True, extra_path="docs/registry.txt")
-        self.epic(2)
-        self.run_engine()
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(self.roles("decide"), {"codex"})
-        self.assertTrue(any(g["path"] == "docs/registry.txt" for g in self.store.issue(2).grants))
-
 
 class WaitAndFailTests(EngineCase):
     def test_timeouts_spend_the_infrastructure_budget_then_fail(self):

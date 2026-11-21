@@ -775,6 +775,18 @@ class Workspace:
             self.git("commit", "--quiet", "--allow-empty", "-m", message, cwd=path)
             return self.head(path)
 
+    def commit_unlocks(self, path: Path, subject: str, issue: int, unlocks: list[str]) -> str:
+        """An acceptance-checks commit on top of HEAD that changes no file and releases `unlocks`
+        in the CI guard. The index and the working tree are left as they are, whatever they hold:
+        work the standing checks refused is never committed with it."""
+        with self._mutex:
+            footer = "Loop-Phase: acceptance-checks\n" + "".join(f"Loop-Unlocks: {f}\n" for f in unlocks)
+            head = self.head(path)
+            sha = self.git("commit-tree", f"{head}^{{tree}}", "-p", head, "-m", f"{subject}\n\nRefs #{issue}\n\n{footer}",
+                           cwd=path)
+            self.git("update-ref", "-m", subject, "HEAD", sha, head, cwd=path)
+            return sha
+
     def commit_paths(self, path: Path, paths: list[str], subject: str, phase: str, issue: int) -> str | None:
         """Commit only `paths` (changed, added or deleted), leaving every other change uncommitted."""
         with self._mutex:

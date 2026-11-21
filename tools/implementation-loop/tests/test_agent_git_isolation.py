@@ -496,31 +496,23 @@ class AgentGitDirTests(IsolationCase):
 
 
 class MergeStateTests(IsolationCase):
-    def prepare_conflict(self, *, locked=False):
+    def prepare_conflict(self):
         self.script.lines = {"README.md": "issue-side"}
         # Stop after the first honest build; it has committed an append to README. Main then
-        # independently appends, yielding a real same-hunk conflict. A conflict in the test only
-        # goes to the other vendor once the test is locked, at the first examination.
-        name = "_step_examine" if locked else "_step_build"
-        step = getattr(self.engine, name)
+        # independently appends, yielding a real same-hunk conflict.
+        step = self.engine._step_build
 
         def stop(n):
             step(n)
             (self.store.dir / "STOP").write_text("stop after the first step\n")
 
-        with mock.patch.object(self.engine, name, stop):
+        with mock.patch.object(self.engine, "_step_build", stop):
             self.engine.run()
         self.assertEqual(self.store.issue(self.n).phase, Phase.VERIFY)
         wt = Path(present(self.store.issue(self.n).worktree))
-        check = f"checks/issue_{self.n}.sh"
-        self.assertEqual(check in self.store.issue(self.n).locked, locked)
         git("checkout", "-q", "main", cwd=self.repo.merger)
         (self.repo.merger / "README.md").write_text("test repo\nmain-side\n")
         (self.repo.merger / "main-only.txt").write_text("retain main's new file\n")
-        if locked:
-            target = self.repo.merger / check
-            target.parent.mkdir(exist_ok=True)
-            target.write_text((wt / check).read_text() + "test -e main-only.txt\n")
         git("add", "--all", cwd=self.repo.merger)
         git("commit", "-qm", "person advances main independently", cwd=self.repo.merger)
         git("push", "-q", "origin", "HEAD:main", cwd=self.repo.merger)
@@ -595,37 +587,6 @@ class MergeStateTests(IsolationCase):
 
     def test_a_builder_resetting_the_private_merge_returns_to_conflict_resolution(self):
         self.drop_merge("reset")
-
-    def test_a_locked_test_resolver_aborting_the_private_merge_returns_to_resolution(self):
-        wt, main = self.prepare_conflict(locked=True)
-        resolve = self.agents.resolve_locked
-        observed = []
-
-        def worker(vendor, req, path, files, feedback):
-            self.assertEqual(git("rev-parse", "MERGE_HEAD", cwd=path), main)
-            self.assertEqual((vendor, files), (self.agents.other, [f"checks/issue_{self.n}.sh"]))
-            git("merge", "--abort", cwd=path)
-            answer = resolve(vendor, req, path, files, feedback)
-            observed.append(True)
-            return answer
-
-        self.agents.resolve_locked = worker  # ty: ignore[invalid-assignment]  # test double
-        with self.stop_after_build("inspect the dropped resolution\n"):
-            self.engine.run()
-        self.assertEqual(observed, [True])
-        self.assertEqual(self.events("step_crashed"), [])
-        self.assertEqual(self.store.issue(self.n).phase, Phase.BUILD)
-        self.assertEqual(len(self.events("agent_merge_dropped")), 1)
-        self.assertEqual(len(self.events("check_conflict_unresolved")), 1)
-        self.assertEqual([c for c in self.gh.calls if c[0] == "merge_pr"], [])
-        self.assertNotEqual(result(wt, "rev-parse", "--verify", "MERGE_HEAD").returncode, 0)
-        self.agents.resolve_locked = resolve  # ty: ignore[invalid-assignment]  # test double
-        (self.store.dir / "STOP").unlink()
-        self.engine = self.new_engine()
-        self.engine.run()
-        self.assert_done()
-        self.assert_main_preserved(main)
-        self.assertIn("test -e main-only.txt", present(self.repo.main_file(f"checks/issue_{self.n}.sh")))
 
     def test_a_builder_committing_the_private_merge_is_absorbed_and_lands(self):
         _wt, main = self.prepare_conflict()

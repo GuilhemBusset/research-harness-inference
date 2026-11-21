@@ -1,4 +1,4 @@
-"""The examiner bound (ADR 0001, amendment 11): from an issue's fourth examination since its latest
+"""The examiner bound (ADR 0001, amendment 12): from an issue's fourth examination since its latest
 plan on, only a finding that names a safety invariant blocks. A finding that names only an item
 becomes a follow-up issue, and a head whose items are all met lands without the examiner's
 certificate. Fake agents, real git and the real verifier, as in test_engine.py."""
