@@ -53,12 +53,12 @@ names of the per-engine table (`rhi_common.engine_metrics`), as section 7.2 defi
 A quantity an engine's row leaves out (the mock's has none of the further ones) reads `None`, not
 zero, as does one with nothing to divide. Counters and histograms are increased per series before
 they are summed per instance: an instance's counters restart from zero with its engine. They are
-read one scrape after the run's end, over the scrape before the run's start, the run and the scrape
-after it: the scrape before holds what each counter held when the run began, so what the run added
-before its first scrape is counted, and the scrape after holds the tokens of the last answers,
-which the workspace sees only then. Nothing else is sent to the pool in either. (Prometheus'
-`increase` extends what it saw to the edges of its range, so a count can read up to a scrape's
-worth above the run's.) The gauges are read over the run alone. Rates are over the run's seconds.
+read one scrape after the run's end, from the run's start to then, with Prometheus' `anchored`
+range modifier: the increase starts from the last sample at or before the run's start, what each
+counter held when the run began, so what the run added before its first scrape is counted, and it
+is not extended past the samples it saw. The scrape after the run's end holds the tokens of the
+last answers, which the workspace sees only then; nothing else is sent to the pool in it. The
+gauges are read over the run alone. Rates are over the run's seconds.
 
 **What each instance's lifecycle agent reported**: the cache capacity in tokens the engine gave at
 start (`rhi_lifecycle.cache.METRIC`), and its release (`rhi_lifecycle.serving.RELEASE_METRIC`),
@@ -399,7 +399,7 @@ def queries(
     def increase(name: Name, suffix: str = "", by: str = "instance") -> str:
         if not suffix:
             suffix = "_total" if name.kind is Kind.COUNTER else ""
-        return f"sum by ({by}) (increase({_selector(name, suffix, pool)}[{counted}]))"
+        return f"sum by ({by}) (increase({_selector(name, suffix, pool)}[{counted}] anchored))"
 
     def quantile(fraction: float, name: Name) -> str:
         return f"histogram_quantile({fraction}, {increase(name, '_bucket', 'instance, le')})"
@@ -668,14 +668,14 @@ class Job:
         end = self.wall()
         self.sleep(SETTLE_SECONDS)
         window = max(end - start, 1.0)
-        # The scrape after the run's end holds what the run's last answers added; the scrape before
-        # its start holds what the counters held when it began.
+        # The scrape after the run's end holds what the run's last answers added; the counters'
+        # increase is anchored on what they held at the run's start.
         after = end + SCRAPE_SECONDS
         release = self.workspace.read_series(release_query(self.pool), start=start, end=after, step=SCRAPE_SECONDS)
         in_service = in_service_of(release, start, end)
         build = build_of(in_service)
         answers = {}
-        for key, query in queries(self.pool, self.engine, window, after - start + SCRAPE_SECONDS).items():
+        for key, query in queries(self.pool, self.engine, window, after - start).items():
             at = end if key in GAUGES else after
             answers[key] = self.workspace.read_series(query, start=at, end=at, step=SCRAPE_SECONDS)
         engine = quantities_of(answers, window)
