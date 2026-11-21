@@ -32,8 +32,9 @@ def test_a_median_of_80_seconds_passes_and_one_of_120_fails() -> None:
 
 @dataclass(frozen=True)
 class Sample:
-    """A stage sample of a launch: its value, when it was taken, and from when the workspace holds
-    it: its time `available`, and then after `after_reads` reads that end there or later."""
+    """A stage sample of a launch (or, with the stage `release`, its instance's release sample): its
+    value, when it was taken, and from when the workspace holds it: its time `available`, and then
+    after `after_reads` reads that end there or later."""
 
     instance: str
     stage: str
@@ -46,7 +47,8 @@ class Sample:
 
 class Workspace:
     """Evaluates the job's queries on `samples`: at each step, each series' latest sample taken by
-    then, its value or (`timestamp()`) its time, and with `> t` only where that time is after t."""
+    then, its value or (`timestamp()`) its time, and with `> t` only where that time is after t. The
+    release metric's queries read the `release` samples, the stage metric's the others."""
 
     def __init__(self, samples: list[Sample]) -> None:
         self.samples = samples
@@ -62,7 +64,12 @@ class Workspace:
             at = start + index * step
             latest: dict[tuple[str, str, str], Sample] = {}
             for one in sorted(held, key=lambda s: s.taken):
-                if one.taken <= at and ("stage=~" not in query or one.stage in query):
+                release = query.startswith(s4.RELEASE_METRIC)
+                if (
+                    one.taken <= at
+                    and (one.stage == "release") == release
+                    and ("stage=~" not in query or one.stage in query)
+                ):
                     latest[(one.instance, one.transition, one.stage)] = one
             for key, one in latest.items():
                 if after is None or one.taken > after:
@@ -107,6 +114,7 @@ def test_an_earlier_launch_s_weights_are_not_this_start_s_even_when_a_scrape_is_
             Sample("instance-a", "hook", 1.0, WAKE - 100),
             Sample("instance-a", "weights", 120.0, WAKE + 135, available=WAKE + 150, after_reads=1),
             Sample("instance-a", "hook", 2.0, WAKE + 135, available=WAKE + 150, after_reads=1),
+            Sample("instance-a", "release", 1.0, WAKE + 140, available=WAKE + 150, after_reads=1),
         ],
         ready_after=150,
     )
@@ -125,6 +133,27 @@ def test_a_launch_gone_before_readiness_is_not_the_one_that_became_ready() -> No
             Sample("instance-d", "weights", 50.0, ready - 10, transition="cold-launch"),
             Sample("instance-c", "weights", 120.0, ready - 15, available=ready + 20),
             Sample("instance-c", "hook", 3.0, ready - 15, available=ready + 20),
+            Sample("instance-c", "release", 1.0, ready - 10, available=ready + 20),
+        ],
+        ready_after=900,
+    )
+    assert launch == s4.Launch("instance-c", "promotion", 120.0)
+
+
+def test_a_launch_whose_completion_was_not_taken_is_not_counted_while_its_instance_is_still_scraped() -> None:
+    # The agent ends the hook stage whatever Auto Scaling answered, and the instance is still scraped
+    # while it waits out the hook; only the replacement, which reached service, writes the release.
+    ready = WAKE + 900
+    launch = _one_start(
+        [
+            *(
+                Sample("instance-b", stage, value, at)
+                for at in (WAKE + 120, ready - 5)
+                for stage, value in (("weights", 60.0), ("hook", 3.0))
+            ),
+            Sample("instance-c", "weights", 120.0, ready - 15, available=ready + 20),
+            Sample("instance-c", "hook", 3.0, ready - 15, available=ready + 20),
+            Sample("instance-c", "release", 1.0, ready - 10, available=ready + 20),
         ],
         ready_after=900,
     )
@@ -152,7 +181,12 @@ def test_a_run_wakes_the_pool_once_per_start_and_reads_each_start_s_weights() ->
         def wake(self) -> None:
             super().wake()
             at = self.wall[0] + 100
-            samples.extend([Sample("instance-a", "weights", next(weights), at), Sample("instance-a", "hook", 1.0, at)])
+            samples.extend(
+                [
+                    Sample("instance-a", stage, value, at)
+                    for stage, value in (("weights", next(weights)), ("hook", 1.0), ("release", 1.0))
+                ]
+            )
 
     def sleep(seconds: float) -> None:
         wall[0] += seconds
