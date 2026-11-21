@@ -1,0 +1,36 @@
+# What the roles of the weekly GPU canary (`src/rhi/pipeline/canary.py`) may do, each action on
+# each resource, with its reason. The file's tables hold only what cdk-nag and the wildcard check
+# read, so the inventory is written here as comments. `tests/synth/test_canary.py` and
+# `tests/policy/test_pipeline.py` hold the roles to it.
+#
+# The job's role, given to its project as a role that takes no new statement, so these are all its
+# statements:
+# - secretsmanager:GetSecretValue on the secret rhi/canary-key-?????? only: the canary's key, with
+#   which the smoke tests reach the coursework pool through the gateway. No other secret.
+# - aps:QueryMetrics on workspace/* of the deploying account and region, under the condition that
+#   the workspace carries the tag rhi-stage with the stage's name: the queries of the smoke tests
+#   that read the pool's metrics and the release its instances report. The workspace's address is
+#   in the settings of the coursework pool's release parameter, so nothing lists or describes it.
+# - ssm:GetParameter on the release parameter of each pool the stage deploys,
+#   parameter/rhi/pools/<pool>/release, each by its name: the release the smoke tests compare with
+#   the one the pool serves, and, in its settings, the stage's workspace.
+# - events:PutEvents on event-bus/rhi-measurements only, through `measuring_job`: the measurement
+#   gpu-canary, handed to the reporter, since a job holds no GitHub credential.
+# - codeconnections:GetConnection and codeconnections:GetConnectionToken on the pipeline's
+#   connection only: CodeBuild reads this repository through it, as CodeBuild's user guide asks of a
+#   project's role.
+# - logs:CreateLogStream and logs:PutLogEvents on the job's log group, /aws/codebuild/rhi-gpu-canary,
+#   only: the job's logs.
+# Nothing of CodePipeline, DynamoDB, Auto Scaling, EC2 or IAM, and no report group: the project
+# declares none.
+#
+# The schedule's role, which EventBridge assumes to start the job:
+# - codebuild:StartBuild on the canary's project only. Nothing else.
+#
+# What the AWS Solutions pack finds on the project is fixed where it can be: the project runs
+# CodeBuild's standard image (AwsSolutions-CB5) and is not privileged (AwsSolutions-CB3). The key
+# AWS manages encrypts what CodeBuild stores of a build (AwsSolutions-CB4), acknowledged below.
+
+[nag]
+"AwsSolutions-CB4" = "The canary's project keeps no artifact and encrypts what CodeBuild stores with the key AWS manages, the default; a customer managed key would add a monthly cost and a key policy to keep for a build that holds nothing but this public repository."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The canary queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
