@@ -29,25 +29,30 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    it while the deployment replaces that task. Then one `stream` line.
 2. **The scale-in paths** (`Run.cycle`). It holds twice the pool's `target_concurrency` of short
    streams until the scaler asks for two instances and reads two in service (`load_started`,
-   `instances`, `load_stopped`), then lets the pool go idle and watches each departure, the scaler
-   taking it from two to one and then, after its idle period, to none:
-   - `scale_in_asked`: the first note that asks for fewer, with its `written_at` and when it was read;
-   - `out_of_service`: when the job first reads the scaler's in-service gauge, as fresh as that note,
-     below what it read before;
-   - `gone`: when the job first reads an instance that was writing as the scaler asked silent for
-     `QUIET_SECONDS`: the instance has stopped, terminated or stopped into the warm pool. Its node's
-     collector writes the series `up` of each of its scrape targets every `SCRAPE_SECONDS` until the
-     instance shuts down;
-   - `scale_in`: the departure whole, with its path (`path_of`).
+   `instances`, `load_stopped`), then lets the pool go idle and watches the scaler take it to none,
+   from two to one and then, after its idle period, to none, or from two to none at once. Each
+   reading is kept apart and read again at every poll, so that a gap in the workspace loses
+   nothing it shows later:
+   - `scale_in_asked`: each note that asks for fewer than the last (a decision), with its
+     `written_at`, when it was read and how many fewer;
+   - `out_of_service`: when the job first reads the scaler's in-service gauge, as fresh as the
+     note, below what it read before; each instance fewer is one owed to the decisions, in order;
+   - `gone`: when the job first reads an instance silent for `QUIET_SECONDS` that was writing as
+     the watch began or since, the instance stopped, terminated or stopped into the warm pool. Its
+     node's collector writes the series `up` of each of its scrape targets every `SCRAPE_SECONDS`
+     until the instance shuts down. Each stopped instance is one departure, given to the first
+     decision owed one; an instance that returns from the warm pool and stops again is another;
+   - `scale_in`: each departure whole, with its path (`path_of`), once every decision has its
+     instances out of service and gone and the warm count has been read `WARM_SETTLE_SECONDS`
+     past the last stop.
    A cycle in which both paths were not seen is run again, up to `CYCLES` times.
-3. **The stream across a scale-in**, in the first cycle with a departure. Once the job reads the
-   scaler ask for fewer, it opens one slow stream; it sends the body's last byte when it reads the
-   instance out of service: the request, whole, is forwarded while the departing target drains, and
-   its answer is in flight through the internal load balancer then. Its `stream` line holds its
-   times; the departure's lines hold the departure's, so a reader places one against the other. The
+3. **The stream across a scale-in**, in the first cycle. As the load stops, it opens one slow
+   stream and holds it; it sends the body's last byte the moment it reads the scaler ask for fewer,
+   before the departing instance stops: the request, whole, is then in flight through the gateway
+   and the internal load balancer while the instance leaves. Its `stream` line holds its times and
+   its end; the departures' lines hold theirs, so a reader places one against the other. The
    mock's canned turn lasts under a second at its default rate and nothing in a request makes it
-   longer, so its answer is in flight for that part of the departure: the job changes neither the
-   pool nor its engine.
+   longer: the job changes neither the pool nor its engine.
 4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it waits for a fresh
    transition of the pool to zero: a note that asks for an instance after the last zero it used,
    then a note asking for none and an in-service reading of zero as fresh as it, which the scaler
@@ -68,13 +73,18 @@ without either or the read failing; with a status other than 200; or, for a wake
 bound, the pool's hold and `WAKE_MARGIN_SECONDS`.
 
 **Which path a departure took** (`path_of`) is told only when the readings agree on it within that
-one scale-in, and is `unknown`, with the reason, otherwise. The in-service and the warm gauges are
+one decision, and is `unknown`, with the reason, otherwise. The in-service and the warm gauges are
 pool totals, so the departure's instance is the one whose collector stopped, the in-service
 reading must have dropped, and the warm count is compared between the reading the scaler decided on
-(`decided_on`) and its readings made after the instance had stopped (its last write and a scrape)
-and before the scaler's next decision acted (`warm_bound`): every one of them one more, `warm_pool`;
-every one the same, `terminated`. A new instance writing, another instance stopping, no reading on
-either side, or readings that differ, leave it `unknown`.
+(`decided_on`) and its readings made after the instance had stopped (its last write and a scrape),
+up to `WARM_SETTLE_SECONDS` after the decision's last stop or the scaler's next decision
+(`warm_bound`), whichever comes first. An instance stopped into the warm pool may be counted there
+a while after its collector falls silent, so the count may rise late but never fall: once every
+instance of the decision has stopped, ending as many more as left, `warm_pool`; the same all along
+a window that ran its whole length, `terminated`. A new instance writing, a decision whose
+instances the count does not tell apart, no reading on either side, a window the next decision cut
+short, or readings that differ, leave it `unknown`. A reading missing from the workspace is read
+again for `FRESH_SECONDS` before the path is told without it.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s7_drain`):
 
@@ -162,6 +172,11 @@ SCALE_OUT_WAIT_SECONDS = 20 * 60
 SCALE_IN_WAIT_SECONDS = 30 * 60
 # Seconds the job waits for an instance to stop once the scaler asked for fewer.
 LEAVE_WAIT_SECONDS = 15 * 60
+# Seconds after an instance stops over which the warm count is read to tell its path: an instance
+# stopped into the warm pool may be counted there some time after its collector falls silent.
+WARM_SETTLE_SECONDS = 5 * 60
+# Seconds a reading may take to show in the workspace once the scaler has written it.
+INGEST_SECONDS = 30
 # The instances the job brings the pool to (`max_instances` of the mock pool), and how many times
 # it does, to see both paths.
 INSTANCES = 2
@@ -327,14 +342,16 @@ class Pool:
             return None
         return found[-1][0], round(found[-1][1])
 
-    def writes(self, start: float, end: float) -> dict[str, float]:
-        """Each instance of the pool that wrote from `start` to `end`, with its last write."""
+    def writes(self, start: float, end: float) -> dict[str, tuple[float, float]]:
+        """Each instance of the pool that wrote from `start` to `end`, with its first write read in
+        that time and its last."""
         query = f'max by (instance) (timestamp(up{{pool="{self.name}"}}))'
-        found: dict[str, float] = {}
+        found: dict[str, tuple[float, float]] = {}
         for one in self.workspace.read_series(query, start=start, end=end, step=STEP_SECONDS):
             instance = one.labels.get("instance")
             if instance and one.samples:
-                found[instance] = max(found.get(instance, 0.0), *one.values())
+                first, last = found.get(instance, (math.inf, -math.inf))
+                found[instance] = (min(first, *one.values()), max(last, *one.values()))
         return found
 
 
@@ -354,11 +371,17 @@ class Unknown(StrEnum):
 
     STOPPED_BEFORE_ASK = "stopped_before_ask"
     NOT_READ_OUT_OF_SERVICE = "not_read_out_of_service"
+    NOT_ASKED = "not_asked"
     ANOTHER_INSTANCE_STOPPED = "another_instance_stopped"
     NEW_INSTANCE = "new_instance"
     NO_DECISION_READING = "no_decision_reading"
     NO_READING_AFTER_STOP = "no_reading_after_stop"
+    NOT_SETTLED = "not_settled"
     WARM_COUNT_DIFFERS = "warm_count_differs"
+
+
+# The reasons that say a reading was missing: the job reads the warm count again before it gives one.
+MISSING = frozenset({Unknown.NO_DECISION_READING, Unknown.NO_READING_AFTER_STOP})
 
 
 def decided_on(samples: Sequence[tuple[float, float]], at: float) -> tuple[float, int] | None:
@@ -391,7 +414,7 @@ def warm_bound(asked: int, notes: Sequence[ScalerNote], decided_at: float) -> fl
 
 @dataclass(frozen=True)
 class Told:
-    """A departure's path, why it is unknown when it is, and the warm counts it was told from."""
+    """A decision's path, why it is unknown when it is, and the warm counts it was told from."""
 
     path: Path
     unknown: Unknown | None = None
@@ -402,62 +425,126 @@ class Told:
 def path_of(
     *,
     asked_at: float,
-    last_write: float,
+    stops: Sequence[float],
+    leaving: int,
     out_of_service: bool,
     warm: Sequence[tuple[float, float]],
-    bound: float,
+    end: float,
+    settled: bool,
     newcomer: bool,
-    another_stopped: bool,
 ) -> Told:
-    """The path of the departure the scaler decided at `asked_at`, whose instance last wrote at
-    `last_write`, from the warm readings `warm`, each with its time, those from `bound` on being
-    another decision's. `out_of_service` says whether the in-service reading dropped, `newcomer`
-    whether an instance new to the pool wrote since the decision, and `another_stopped` whether an
-    instance other than this one, writing at the decision, has stopped too. Every reading after the
-    stop one more than the decision's: `warm_pool`; every one the same: `terminated`. Anything else
-    is `unknown`, with its reason."""
-    if last_write < asked_at:
+    """The path of the instances that left on the decision the scaler made at `asked_at`, asking for
+    `leaving` fewer, whose collectors last wrote at `stops`, from the warm readings `warm`, each
+    with its time, read up to `end`: `settled` when that is `WARM_SETTLE_SECONDS` after the last stop
+    rather than another decision's, and has passed. `out_of_service` says whether the in-service
+    reading dropped, `newcomer` whether an instance new to the pool wrote meanwhile.
+
+    The warm count is a pool total that may rise some time after an instance stops. From the
+    decision's reading, it must never fall and never pass `leaving` more: once every instance has
+    stopped, a last reading `leaving` more is `warm_pool`; every reading since the first stop the
+    same, over a settled window, is `terminated`. Anything else is `unknown`, with its reason: the
+    same count over a window another decision cut short cannot tell a terminated instance from a
+    late return, and a count between the two, after more than one stop, cannot tell which went where."""
+    if not stops or min(stops) < asked_at:
         return Told(Path.UNKNOWN, Unknown.STOPPED_BEFORE_ASK)
     if not out_of_service:
         return Told(Path.UNKNOWN, Unknown.NOT_READ_OUT_OF_SERVICE)
-    if another_stopped:
-        return Told(Path.UNKNOWN, Unknown.ANOTHER_INSTANCE_STOPPED)
     if newcomer:
         return Told(Path.UNKNOWN, Unknown.NEW_INSTANCE)
-    readings = [(moment, value) for moment, value in warm if moment < bound]
+    readings = [(moment, value) for moment, value in warm if moment < end]
     decided = decided_on(readings, asked_at)
     if decided is None:
         return Told(Path.UNKNOWN, Unknown.NO_DECISION_READING)
     before = decided[1]
-    after = tuple(round(value) for moment, value in readings if moment >= last_write + SCRAPE_SECONDS)
-    if not after:
+    after = tuple(round(value) for moment, value in readings if moment >= min(stops) + SCRAPE_SECONDS)
+    last = [round(value) for moment, value in readings if moment >= max(stops) + SCRAPE_SECONDS]
+    if not after or not last:
         return Told(Path.UNKNOWN, Unknown.NO_READING_AFTER_STOP, before)
-    if set(after) == {before + 1}:
+    pairs = zip((before, *after[:-1]), after, strict=True)
+    steady = all(earlier <= later <= before + leaving for earlier, later in pairs)
+    if steady and last[-1] == before + leaving:
         return Told(Path.WARM_POOL, None, before, after)
-    if set(after) == {before}:
+    if set(after) == {before} and settled:
         return Told(Path.TERMINATED, None, before, after)
+    if len(stops) > 1 or leaving > 1:
+        return Told(Path.UNKNOWN, Unknown.ANOTHER_INSTANCE_STOPPED, before, after)
+    if set(after) == {before}:
+        return Told(Path.UNKNOWN, Unknown.NOT_SETTLED, before, after)
     return Told(Path.UNKNOWN, Unknown.WARM_COUNT_DIFFERS, before, after)
 
 
 @dataclass
 class Departure:
-    """One instance leaving service, as the job reads it. `writing` holds the instances, by their
-    AWS identifiers, that were writing as the scaler asked: never written in a line."""
+    """One instance leaving service, as the job reads it: its collector silent for `QUIET_SECONDS`.
+    `instance` is its AWS identifier, never written in a line."""
+
+    number: int
+    instance: str
+    last_write: float
+    gone_read_at: float
+    decision: Decision | None = None
+    path: Path | None = None
+
+
+@dataclass
+class Decision:
+    """One note of the scaler asking for `fewer` instances fewer, and what the job read of it: the
+    notes read since, the in-service drops it read for it (when each was read, and the reading's
+    time), and the departures it read for it, in order."""
 
     number: int
     asked: int
+    fewer: int
     asked_at: float
     asked_read_at: float
     in_service_before: int
-    writing: set[str]
-    known: set[str]
     notes: list[ScalerNote] = field(default_factory=list)
-    out_of_service_read_at: float | None = None
-    out_of_service_reading_at: float | None = None
-    instance: str | None = None
-    last_write: float | None = None
-    gone_read_at: float | None = None
-    path: Path | None = None
+    drops: list[tuple[float, float]] = field(default_factory=list)
+    departures: list[Departure] = field(default_factory=list)
+
+    def window(self, now: float) -> tuple[float, bool]:
+        """Up to when the warm readings belong to this decision's departures, and whether that
+        window is whole and past (`path_of`)."""
+        if not self.departures:
+            return math.inf, False
+        settle = max(departure.last_write for departure in self.departures) + WARM_SETTLE_SECONDS
+        bound = warm_bound(self.asked, self.notes, self.asked_at)
+        end = min(settle, bound)
+        return end, settle <= bound and now >= end + INGEST_SECONDS
+
+
+@dataclass
+class Watch:
+    """What one cycle reads from the time its load stopped, `start`: the number the scaler asks
+    for and the in-service count last read, the note last read, each instance's first and last write
+    read so far (by AWS identifier, never written), the decisions, and the departures no decision
+    has taken yet."""
+
+    start: float
+    asked: int
+    in_service: int
+    note: ScalerNote | None = None
+    seen: dict[str, tuple[float, float]] = field(default_factory=dict)
+    decisions: list[Decision] = field(default_factory=list)
+    unattributed: list[Departure] = field(default_factory=list)
+    ready_at: float | None = None
+
+    @property
+    def since(self) -> float:
+        return self.start - FRESH_SECONDS
+
+    def owing(self) -> Decision | None:
+        """The first decision with an instance not yet read gone."""
+        return next((one for one in self.decisions if len(one.departures) < one.fewer), None)
+
+    def waiting_for(self) -> str:
+        if not self.decisions or self.asked != 0:
+            return "scale_in_asked"
+        if any(len(one.departures) < one.fewer for one in self.decisions):
+            return "gone"
+        if any(len(one.drops) < one.fewer for one in self.decisions):
+            return "out_of_service"
+        return "warm_readings"
 
 
 # The requests.
@@ -662,7 +749,10 @@ class Run:
     transport: httpx.AsyncBaseTransport | None = None
     offload: Callable[[Callable[[], Any]], Awaitable[Any]] = _off_loop
     names: Names = field(default_factory=Names)
+    decisions: list[Decision] = field(default_factory=list, init=False)
     departures: list[Departure] = field(default_factory=list, init=False)
+    # The last write of each instance's last departure, by AWS identifier: never written.
+    departed: dict[str, float] = field(default_factory=dict, init=False)
     scale_in_streamed: bool = field(default=False, init=False)
 
     @property
@@ -686,7 +776,7 @@ class Run:
         now = self.clock.now()
         return await self.read("workspace", lambda: self.pool.gauge(name, now, note))
 
-    async def writes(self, start: float, end: float) -> dict[str, float] | None:
+    async def writes(self, start: float, end: float) -> dict[str, tuple[float, float]] | None:
         return await self.read("workspace", lambda: self.pool.writes(start, end))
 
     def stream_line(self, stream: str, read: Read, **fields: object) -> None:
@@ -747,164 +837,227 @@ class Run:
         if reached:
             now = self.clock.now()
             written = await self.writes(now - FRESH_SECONDS, now) or {}
-            writing = sorted((at, instance) for instance, at in written.items() if at >= now - 2 * SCRAPE_SECONDS)
+            writing = sorted((at, instance) for instance, (_, at) in written.items() if at >= now - 2 * SCRAPE_SECONDS)
             self.recorder.line("instances", writing=[self.names(instance) for _, instance in writing])
         return reached
 
-    def _gone(self) -> set[str]:
-        return {departure.instance for departure in self.departures if departure.instance is not None}
-
-    async def _asked_fewer(self, note: ScalerNote, in_service: int, now: float) -> Departure:
-        written = await self.writes(note.written_at - FRESH_SECONDS, now) or {}
-        writing = {
-            instance for instance, at in written.items() if at >= note.written_at - SCRAPE_SECONDS
-        } - self._gone()
-        departure = Departure(
-            number=len(self.departures) + 1,
-            asked=note.capacity_asked,
-            asked_at=float(note.written_at),
-            asked_read_at=now,
-            in_service_before=in_service,
-            writing=writing,
-            known=set(written),
-        )
-        self.departures.append(departure)
-        for instance in sorted(writing, key=written.__getitem__):
-            self.names(instance)
-        self.recorder.line(
-            "scale_in_asked",
-            departure=departure.number,
-            capacity_asked=note.capacity_asked,
-            written_at=utc(departure.asked_at),
-            read_at=utc(now),
-            writing=[self.names(instance) for instance in sorted(writing, key=written.__getitem__)],
-        )
-        return departure
-
-    async def _read_gone(self, departure: Departure) -> bool:
-        """Whether an instance of the departure has stopped: then `gone` and `scale_in` lines."""
+    async def _read_note(self, watch: Watch, release: asyncio.Event) -> None:
+        """Reads the scaler's note: a note that asks for fewer than the last is a decision, with its
+        `scale_in_asked` line, and releases the stream across the scale-in."""
+        note = await self.note()
+        if note is None:
+            return
         now = self.clock.now()
-        written = await self.writes(departure.asked_at - FRESH_SECONDS, now)
+        watch.note = note
+        for decision in watch.decisions:
+            decision.notes.append(note)
+        if note.capacity_asked < watch.asked:
+            decision = Decision(
+                number=len(self.decisions) + 1,
+                asked=note.capacity_asked,
+                fewer=watch.asked - note.capacity_asked,
+                asked_at=float(note.written_at),
+                asked_read_at=now,
+                in_service_before=watch.in_service,
+            )
+            self.decisions.append(decision)
+            watch.decisions.append(decision)
+            writing = sorted(
+                (last, instance)
+                for instance, (_, last) in watch.seen.items()
+                if last >= note.written_at - SCRAPE_SECONDS and last > self.departed.get(instance, -math.inf)
+            )
+            self.recorder.line(
+                "scale_in_asked",
+                decision=decision.number,
+                capacity_asked=note.capacity_asked,
+                fewer=decision.fewer,
+                written_at=utc(decision.asked_at),
+                read_at=utc(now),
+                writing=[self.names(instance) for _, instance in writing],
+            )
+            release.set()
+            for departure in list(watch.unattributed):
+                self._attribute(watch, departure)
+        watch.asked = note.capacity_asked
+
+    async def _read_in_service(self, watch: Watch) -> None:
+        """While a decision is owed an instance out of service, reads the scaler's in-service gauge,
+        as fresh as the note: each instance fewer than the last reading is one decision's, in order,
+        with an `out_of_service` line."""
+        if watch.note is None or not any(len(one.drops) < one.fewer for one in watch.decisions):
+            return
+        reading = await self.gauge(INSTANCES_IN_SERVICE, watch.note)
+        read_at = self.clock.now()
+        if reading is None:
+            return
+        reading_at, in_service = reading
+        if in_service < watch.in_service:
+            owed = [one for one in watch.decisions if len(one.drops) < one.fewer]
+            self.recorder.line(
+                "out_of_service",
+                decision=owed[0].number,
+                in_service=in_service,
+                reading_at=utc(reading_at),
+                read_at=utc(read_at),
+            )
+            for _ in range(watch.in_service - in_service):
+                owing = next((one for one in watch.decisions if len(one.drops) < one.fewer), None)
+                if owing is None:
+                    break
+                owing.drops.append((read_at, reading_at))
+        watch.in_service = in_service
+
+    def _attribute(self, watch: Watch, departure: Departure) -> None:
+        """Gives `departure` to the first decision owed an instance, or keeps it until one is read."""
+        owing = watch.owing()
+        if owing is None:
+            if departure not in watch.unattributed:
+                watch.unattributed.append(departure)
+            return
+        owing.departures.append(departure)
+        departure.decision = owing
+        if departure in watch.unattributed:
+            watch.unattributed.remove(departure)
+
+    async def _read_writes(self, watch: Watch) -> None:
+        """Reads every collector's writes since the watch began, kept with those read before: an
+        instance writing since then whose last write is `QUIET_SECONDS` old, and later than the last
+        departure read for it, has left, with a `gone` line. An instance that returns to service
+        and stops again leaves again."""
+        now = self.clock.now()
+        written = await self.writes(watch.since, now)
         read_at = self.clock.now()
         if written is None:
+            return
+        for instance, (first, last) in written.items():
+            known = watch.seen.get(instance)
+            watch.seen[instance] = (first, last) if known is None else (min(known[0], first), max(known[1], last))
+        for instance, (_, last) in sorted(watch.seen.items(), key=lambda item: item[1][1]):
+            if last < watch.start - 2 * SCRAPE_SECONDS or last > now - QUIET_SECONDS:
+                continue
+            if last <= self.departed.get(instance, -math.inf):
+                continue
+            self.departed[instance] = last
+            departure = Departure(len(self.departures) + 1, instance, last, read_at)
+            self.departures.append(departure)
+            self._attribute(watch, departure)
+            self.recorder.line(
+                "gone",
+                departure=departure.number,
+                decision=None if departure.decision is None else departure.decision.number,
+                instance=self.names(instance),
+                last_write_at=utc(last),
+                read_at=utc(read_at),
+            )
+
+    async def _settled(self, watch: Watch) -> bool:
+        """Whether the cycle is over: the scaler asks for none, every decision has its instances out
+        of service and gone, and the warm readings of each are whole; then its `scale_in` lines."""
+        now = self.clock.now()
+        if watch.waiting_for() != "warm_readings":
             return False
-        stopped = {
-            instance: written[instance]
-            for instance in departure.writing
-            if instance in written and written[instance] <= now - QUIET_SECONDS
-        }
-        if not stopped:
+        if any(now < decision.window(now)[0] + INGEST_SECONDS for decision in watch.decisions):
             return False
-        instance = min(stopped, key=stopped.__getitem__)
-        departure.instance, departure.last_write, departure.gone_read_at = instance, stopped[instance], read_at
-        self.recorder.line(
-            "gone",
-            departure=departure.number,
-            instance=self.names(instance),
-            last_write_at=utc(stopped[instance]),
-            read_at=utc(read_at),
-        )
-        start = departure.asked_at - FRESH_SECONDS
-        warm = await self.read("workspace", lambda: self.pool.readings(WARM_INSTANCES, start, now))
-        newcomers = set(written) - departure.known
-        for newcomer in sorted(newcomers, key=written.__getitem__):
-            self.names(newcomer)
-        told = path_of(
-            asked_at=departure.asked_at,
-            last_write=stopped[instance],
-            out_of_service=departure.out_of_service_read_at is not None,
-            warm=warm or [],
-            bound=warm_bound(departure.asked, departure.notes, departure.asked_at),
-            newcomer=bool(newcomers),
-            another_stopped=len(stopped) > 1,
-        )
+        watch.ready_at = now if watch.ready_at is None else watch.ready_at
+        return await self._tell(watch, final=now >= watch.ready_at + FRESH_SECONDS)
+
+    async def _tell(self, watch: Watch, *, final: bool) -> bool:
+        """Tells the path of each departure of the watch from the warm readings and writes its
+        `scale_in` line. Unless `final`, writes nothing and says False when a reading was missing:
+        the workspace may show it a moment later."""
+        now = self.clock.now()
+        warm = await self.read("workspace", lambda: self.pool.readings(WARM_INSTANCES, watch.since, now)) or []
+        told: dict[int, Told] = {}
+        for decision in watch.decisions:
+            if not decision.departures:
+                continue
+            end, settled = decision.window(now)
+            newcomer = any(decision.asked_at < first < end for first, _ in watch.seen.values())
+            told[decision.number] = path_of(
+                asked_at=decision.asked_at,
+                stops=[departure.last_write for departure in decision.departures],
+                leaving=decision.fewer,
+                out_of_service=len(decision.drops) >= len(decision.departures),
+                warm=warm,
+                end=end,
+                settled=settled,
+                newcomer=newcomer,
+            )
+        if not final and any(one.unknown in MISSING for one in told.values()):
+            return False
+        for decision in watch.decisions:
+            for index, departure in enumerate(sorted(decision.departures, key=lambda one: one.last_write)):
+                drop = decision.drops[index] if index < len(decision.drops) else (None, None)
+                self._scale_in_line(departure, told[decision.number], decision, drop)
+        for departure in watch.unattributed:
+            self._scale_in_line(departure, Told(Path.UNKNOWN, Unknown.NOT_ASKED), None, (None, None))
+        return True
+
+    def _scale_in_line(
+        self, departure: Departure, told: Told, decision: Decision | None, drop: tuple[float | None, float | None]
+    ) -> None:
         departure.path = told.path
         self.recorder.line(
             "scale_in",
             departure=departure.number,
+            decision=None if decision is None else decision.number,
             path=told.path.value,
             unknown=None if told.unknown is None else told.unknown.value,
-            instance=self.names(instance),
-            asked_at=utc(departure.asked_at),
-            asked_read_at=utc(departure.asked_read_at),
-            out_of_service_read_at=utc(departure.out_of_service_read_at),
-            out_of_service_reading_at=utc(departure.out_of_service_reading_at),
+            instance=self.names(departure.instance),
+            asked_at=None if decision is None else utc(decision.asked_at),
+            asked_read_at=None if decision is None else utc(decision.asked_read_at),
+            out_of_service_read_at=utc(drop[0]),
+            out_of_service_reading_at=utc(drop[1]),
             last_write_at=utc(departure.last_write),
             gone_read_at=utc(departure.gone_read_at),
             warm_before=told.warm_before,
             warm_after=list(told.warm_after),
         )
-        return True
 
     async def cycle(self) -> None:
-        """Two instances, then the departures down to none, each with its lines; in the first
-        cycle that gives a departure, the stream across a scale-in."""
+        """Two instances, then the departures down to none, each with its lines. In the first cycle,
+        the stream across a scale-in: opened as the load stops, held, and sent whole the moment the
+        job reads the scaler ask for fewer, so that the request is in flight as the instance leaves."""
         if not await self.two_instances():
             self.recorder.line("timeout", waiting_for="two_in_service")
             return
-        asked, in_service = INSTANCES, INSTANCES
-        watched: list[Departure] = []
+        watch = Watch(start=self.clock.now(), asked=INSTANCES, in_service=INSTANCES)
+        deadline = watch.start + SCALE_IN_WAIT_SECONDS + self.settings.idle_minutes * 60 + LEAVE_WAIT_SECONDS
         release = asyncio.Event()
-        streaming: asyncio.Task[Read] | None = None
-        streamed_for: int | None = None
-        deadline = self.clock.now() + SCALE_IN_WAIT_SECONDS + self.settings.idle_minutes * 60 + LEAVE_WAIT_SECONDS
+        streaming = None if self.scale_in_streamed else asyncio.create_task(self._across_scale_in(release, deadline))
+
+        def stream_line(read: Read) -> None:
+            first = watch.decisions[0].number if watch.decisions else None
+            self.stream_line("scale_in", read, decision=first)
+            self.scale_in_streamed = True
+
         try:
             while self.clock.now() < deadline:
-                note = await self.note()
-                now = self.clock.now()
-                if note is not None:
-                    for departure in watched:
-                        departure.notes.append(note)
-                if note is not None and note.capacity_asked < asked:
-                    watched.append(await self._asked_fewer(note, in_service, now))
-                    asked = note.capacity_asked
-                    if streaming is None and not self.scale_in_streamed:
-                        streamed_for = watched[-1].number
-                        streaming = asyncio.create_task(self._across_scale_in(release))
-                waiting = [departure for departure in watched if departure.out_of_service_read_at is None]
-                if waiting and note is not None:
-                    reading = await self.gauge(INSTANCES_IN_SERVICE, note)
-                    read_at = self.clock.now()
-                    if reading is not None and reading[1] < waiting[0].in_service_before:
-                        departure, in_service = waiting[0], reading[1]
-                        departure.out_of_service_read_at, departure.out_of_service_reading_at = read_at, reading[0]
-                        self.recorder.line(
-                            "out_of_service",
-                            departure=departure.number,
-                            in_service=reading[1],
-                            reading_at=utc(reading[0]),
-                            read_at=utc(read_at),
-                        )
-                        if departure.number == streamed_for:
-                            release.set()
-                for departure in watched:
-                    gone = departure.instance is None and await self._read_gone(departure)
-                    if gone and departure.number == streamed_for:
-                        release.set()
+                await self._read_note(watch, release)
+                await self._read_in_service(watch)
+                await self._read_writes(watch)
                 if streaming is not None and streaming.done() and not self.scale_in_streamed:
-                    self.stream_line("scale_in", streaming.result(), departure=streamed_for)
-                    self.scale_in_streamed = True
-                if asked == 0 and watched and all(departure.instance is not None for departure in watched):
+                    stream_line(streaming.result())
+                if await self._settled(watch):
                     return
                 await self.clock.sleep(NOTE_POLL_SECONDS)
-            self.recorder.line(
-                "timeout",
-                waiting_for="gone" if any(departure.instance is None for departure in watched) else "scale_in_asked",
-            )
+            self.recorder.line("timeout", waiting_for=watch.waiting_for())
+            await self._tell(watch, final=True)
         finally:
             release.set()
             if streaming is not None and not self.scale_in_streamed:
-                self.stream_line("scale_in", await streaming, departure=streamed_for)
-                self.scale_in_streamed = True
+                stream_line(await streaming)
 
-    async def _across_scale_in(self, release: asyncio.Event) -> Read:
-        """The stream across a scale-in: opened now, its body sent whole once `release` is set."""
+    async def _across_scale_in(self, release: asyncio.Event, until: float) -> Read:
+        """The stream across a scale-in: opened now, held until `release` is set or `until`, then
+        sent whole and read to its end."""
         return await slow_stream(
             self.endpoint,
             self.student,
             _request(self.pool.name),
             clock=self.clock,
-            hold=LEAVE_WAIT_SECONDS + 2 * QUIET_SECONDS,
+            hold=max(until - self.clock.now(), 0.0),
             release=release,
             transport=self.transport,
         )

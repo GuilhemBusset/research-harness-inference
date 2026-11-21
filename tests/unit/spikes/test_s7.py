@@ -151,12 +151,14 @@ class Events(httpx.AsyncByteStream):
 @dataclass
 class Gateway:
     """The gateway: the canary student's requests get the replies given, in order, then a whole
-    turn; the load's always get a whole turn. It keeps the student's bodies and when they arrived."""
+    turn, not before `busy_until` when it is given; the load's always get a whole turn at once. It
+    keeps the student's bodies and when they arrived."""
 
     clock: FakeClock
     student: str
     replies: list[Reply] = field(default_factory=list)
     received: list[tuple[float, dict[str, Any]]] = field(default_factory=list)
+    busy_until: float | None = None
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(await request.aread())
@@ -164,6 +166,8 @@ class Gateway:
         if request.headers["authorization"] == f"Bearer {self.student}":
             self.received.append((self.clock.now(), body))
             reply = self.replies.pop(0) if self.replies else Reply()
+            while self.busy_until is not None and self.clock.now() < self.busy_until:
+                await self.clock.sleep(1)
         else:
             # The load sends one stream after another: it lets the job run between two.
             await asyncio.sleep(0.01)
@@ -216,7 +220,7 @@ def of(lines: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     return [line for line in lines if line["kind"] == kind]
 
 
-def test_the_scale_in_step_records_both_paths_and_one_stream_held_across_the_departure() -> None:
+def test_the_scale_in_step_records_both_paths_and_one_stream_in_flight_as_the_instance_leaves() -> None:
     clock = FakeClock()
     first, second = T0 + 120, T0 + 900  # The scaler asks for one, then for none.
     leaving, staying = instance_id(), instance_id()
@@ -230,13 +234,16 @@ def test_the_scale_in_step_records_both_paths_and_one_stream_held_across_the_dep
         instances={leaving: (T0 - 600, first + 30), staying: (T0 - 600, second + 30)},
     )
     run, gateway, out = a_run(scaler)
+    # The engine answers the held stream only once the departing instance has stopped.
+    gateway.busy_until = first + 30
     asyncio.run(run.cycle())
 
     lines = parsed(out, leaving, staying)
     assert [line["writing"] for line in of(lines, "instances")] == [["instance-1", "instance-2"]]
     asked, out_of_service, gone = of(lines, "scale_in_asked"), of(lines, "out_of_service"), of(lines, "gone")
-    assert [line["capacity_asked"] for line in asked] == [1, 0]
-    assert [line["departure"] for line in out_of_service] == [1, 2]
+    assert [(line["decision"], line["capacity_asked"]) for line in asked] == [(1, 1), (2, 0)]
+    assert [(line["decision"], line["in_service"]) for line in out_of_service] == [(1, 1), (2, 0)]
+    assert [line["decision"] for line in gone] == [1, 2]
     names = [line["instance"] for line in gone]
     assert sorted(names) == ["instance-1", "instance-2"]
     departures = of(lines, "scale_in")
@@ -244,33 +251,132 @@ def test_the_scale_in_step_records_both_paths_and_one_stream_held_across_the_dep
     for line in departures:
         assert line["asked_at"] <= line["asked_read_at"] <= line["out_of_service_read_at"] <= line["gone_read_at"]
 
-    # One stream, opened once the scaler asked for fewer and sent whole once the instance was read
-    # out of service, and read to its end.
+    # One stream, held from the load's end, sent whole as the job read the scaler ask for fewer:
+    # the request was in flight before the departing instance's last write, and read to its end.
     (stream,) = of(lines, "stream")
-    assert (stream["stream"], stream["departure"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
-    assert asked[0]["read_at"] <= stream["sent_at"] < stream["body_sent_at"]
-    assert out_of_service[0]["read_at"] <= stream["body_sent_at"] <= stream["first_event_at"] <= stream["last_event_at"]
-    assert stream["body_sent_at"] < gone[0]["read_at"]
+    assert (stream["stream"], stream["decision"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
+    assert stream["sent_at"] < asked[0]["read_at"] <= stream["body_sent_at"] < gone[0]["last_write_at"]
+    assert gone[0]["last_write_at"] <= stream["first_event_at"] <= stream["last_event_at"]
     assert len(gateway.received) == 1
+
+
+def test_two_instances_leaving_on_one_idle_note_are_each_recorded() -> None:
+    clock = FakeClock()
+    ask = T0 + 120  # From two to none at once, the collectors stopping five minutes apart.
+    one, two = instance_id(), instance_id()
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < ask else 0,
+        in_service=lambda run: 2 if run <= ask else int(run <= ask + 300),
+        warm=lambda run: 0 if run <= ask else 1 if run <= ask + 300 else 2,
+        instances={one: (T0 - 600, ask + 30), two: (T0 - 600, ask + 330)},
+    )
+    run, _, out = a_run(scaler)
+    asyncio.run(run.cycle())
+
+    lines = parsed(out, one, two)
+    assert [line["fewer"] for line in of(lines, "scale_in_asked")] == [2]
+    assert [line["in_service"] for line in of(lines, "out_of_service")] == [1, 0]
+    gone = of(lines, "gone")
+    assert [line["decision"] for line in gone] == [1, 1]
+    assert sorted(line["instance"] for line in gone) == ["instance-1", "instance-2"]
+    # Both stopped into the warm pool: the count rose by two.
+    assert [line["path"] for line in of(lines, "scale_in")] == ["warm_pool", "warm_pool"]
+
+
+@pytest.mark.parametrize("gap", ["collectors", "in_service", "warm"])
+def test_a_gap_in_the_workspace_loses_no_observation_it_can_still_read(gap: str) -> None:
+    clock = FakeClock()
+    first, second = T0 + 120, T0 + 900
+    leaving, staying = instance_id(), instance_id()
+    scaler = Scaler(
+        clock,
+        asked=lambda run: 2 if run < first else 1 if run < second else 0,
+        in_service=lambda run: 2 if run <= first else 1 if run <= second else 0,
+        warm=lambda run: 0 if run <= first else 1,
+        instances={leaving: (T0 - 600, first + 30), staying: (T0 - 600, second + 30)},
+    )
+    read = scaler.read_series
+    # The workspace answers nothing for a while: the collectors as the scaler first asks for fewer,
+    # the in-service gauge after the last scale-in, or the warm gauge until the end.
+    missing = {
+        "collectors": ("max by (instance)", first, first + 30),
+        "in_service": (s7.INSTANCES_IN_SERVICE, second + 1, second + 170),
+        "warm": (s7.WARM_INSTANCES, T0, second + 420),
+    }[gap]
+
+    def gapped(query: str, **window: float) -> list[common.Series]:
+        if missing[0] in query and missing[1] <= clock.now() < missing[2]:
+            return []
+        return read(query, **window)
+
+    scaler.read_series = gapped  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    run, _, out = a_run(scaler)
+    asyncio.run(run.cycle())
+
+    lines = parsed(out, leaving, staying)
+    assert [line["last_write_at"] for line in of(lines, "gone")] == [s7.utc(first + 30), s7.utc(second + 30)]
+    assert [line["in_service"] for line in of(lines, "out_of_service")] == [1, 0]
+    assert [line["path"] for line in of(lines, "scale_in")] == ["warm_pool", "terminated"]
+
+
+def test_an_instance_back_from_the_warm_pool_is_recorded_leaving_again() -> None:
+    clock = FakeClock()
+    returning = instance_id()
+    scaler = Scaler(clock, asked=lambda run: 2, in_service=lambda run: 2)
+    run, _, out = a_run(scaler)
+    stops = []
+    for cycle in range(2):
+        start = clock.now()
+        first = 60 * (start // 60) + 120
+        second = first + 780
+        scaler.asked = lambda run, first=first, second=second: 2 if run < first else int(run < second)
+        scaler.in_service = lambda run, first=first, second=second: 2 if run <= first else int(run <= second)
+        scaler.warm = lambda run, second=second: int(run > second)
+        # The instance returning stops last in each cycle; another instance stops first.
+        scaler.instances = {instance_id(): (start - 45, first + 30), returning: (start - 45, second + 30)}
+        asyncio.run(run.cycle())
+        stops.append(s7.utc(second + 30))
+        clock.at += 600
+
+    gone = of(parsed(out, returning), "gone")
+    assert len(gone) == 4
+    named = {line["last_write_at"]: line["instance"] for line in gone}
+    # The same name each time: it left, returned and left again.
+    assert named[stops[0]] == named[stops[1]]
 
 
 def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
     asked_at, stopped = 1000.0, 1030.0
 
-    def told(warm: list[tuple[float, float]], bound: float = float("inf"), **changes: Any) -> s7.Told:
-        given: dict[str, Any] = {"out_of_service": True, "newcomer": False, "another_stopped": False}
-        return s7.path_of(asked_at=asked_at, last_write=stopped, warm=warm, bound=bound, **(given | changes))
+    def told(warm: list[tuple[float, float]], **changes: Any) -> s7.Told:
+        given: dict[str, Any] = {
+            "stops": [stopped],
+            "leaving": 1,
+            "out_of_service": True,
+            "end": stopped + s7.WARM_SETTLE_SECONDS,
+            "settled": True,
+            "newcomer": False,
+        }
+        return s7.path_of(asked_at=asked_at, warm=warm, **(given | changes))
 
     assert told([(1000.2, 0), (1060.2, 1)]).path is s7.Path.WARM_POOL
     assert told([(1000.2, 0), (1060.2, 0)]).path is s7.Path.TERMINATED
-    # A reading not yet after the stop says nothing of the path.
+    # The warm count may rise some time after the stop: a late rise is a return to the warm pool,
+    # and the same count over a window another decision cut short tells neither.
+    assert told([(1000.2, 0), (1060.2, 0), (1180.2, 1)]).path is s7.Path.WARM_POOL
+    assert told([(1000.2, 0), (1060.2, 0)], settled=False).unknown is s7.Unknown.NOT_SETTLED
+    # A reading not yet after the stop says nothing of the path, nor one from the next decision on.
     assert told([(1000.2, 0), (1040.2, 0)]).unknown is s7.Unknown.NO_READING_AFTER_STOP
-    # A rise after the next decision acted is that decision's.
-    assert told([(1000.2, 0), (1120.2, 1)], bound=1061.0).unknown is s7.Unknown.NO_READING_AFTER_STOP
-    assert told([(1000.2, 0), (1060.2, 0), (1120.2, 1)]).unknown is s7.Unknown.WARM_COUNT_DIFFERS
+    assert told([(1000.2, 0), (1120.2, 1)], end=1061.0).unknown is s7.Unknown.NO_READING_AFTER_STOP
+    assert told([(1000.2, 0), (1060.2, 1), (1120.2, 0)]).unknown is s7.Unknown.WARM_COUNT_DIFFERS
     assert told([(1000.2, 0), (1060.2, 1)], newcomer=True).unknown is s7.Unknown.NEW_INSTANCE
-    assert told([(1000.2, 0), (1060.2, 1)], another_stopped=True).unknown is s7.Unknown.ANOTHER_INSTANCE_STOPPED
     assert told([(1000.2, 0), (1060.2, 1)], out_of_service=False).unknown is s7.Unknown.NOT_READ_OUT_OF_SERVICE
+    # Two instances leaving on one decision: told only when the count moved for both or for neither.
+    both = {"stops": [stopped, stopped + 300], "leaving": 2, "end": stopped + 600}
+    assert told([(1000.2, 0), (1060.2, 1), (1360.2, 2)], **both).path is s7.Path.WARM_POOL
+    assert told([(1000.2, 0), (1060.2, 0), (1360.2, 0)], **both).path is s7.Path.TERMINATED
+    assert told([(1000.2, 0), (1060.2, 0), (1360.2, 1)], **both).unknown is s7.Unknown.ANOTHER_INSTANCE_STOPPED
 
 
 def test_a_stream_the_gateway_cuts_is_recorded_as_ended_by_the_connection_closing_with_its_events_counted() -> None:
