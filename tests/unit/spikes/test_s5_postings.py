@@ -106,6 +106,19 @@ def test_a_posting_is_a_pass_only_once_its_last_part_is_listed(post: Any, tmp_pa
     assert held["verdict"] == "pass" and has_cost(held)
 
 
+def test_a_posting_missing_a_middle_part_keeps_the_rows_it_has(post: Any, tmp_path: Path) -> None:
+    whole = post()
+    assert len(whole) >= 3
+    gapped = [whole[0], *whole[2:]]
+    held = recorded(tmp_path, listed(gapped))
+    assert [(one["run"], one["verdict"]) for one in held["runs"]] == [(LABEL, "pending")]
+    assert held["verdict"] == "pending"
+    assert len(held["rows"]) == sum(len(one.numbers) for one in decode(whole)) - len(whole[1].description.split(" "))
+    held = recorded(tmp_path, listed(whole))
+    assert held["verdict"] == "pass"
+    assert len(held["rows"]) == sum(len(one.numbers) for one in decode(whole))
+
+
 def test_a_retry_in_the_same_second_is_read_alone(post: Any, tmp_path: Path) -> None:
     first = post()
     retry = read_event({"detail": {
