@@ -1,12 +1,13 @@
 """End-to-end runs of the builder/examiner engine (ADR 0012): real git, the real ship.sh, the real
 verifier and real squash merges into a local bare remote. Only the agents and GitHub are fakes."""
 
+import re
 import unittest
 from unittest import mock
 
 from helpers import SHIP, TempRepo, issue_body, present
 from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import Caps, Config
+from implement_loop.config import Caps, Config, Deploy
 from implement_loop.engine import Engine
 from implement_loop.github import FakeGitHub
 from implement_loop.graph import build_plan
@@ -36,6 +37,21 @@ class EngineCase(unittest.TestCase):
 
     def epic(self, *children):
         self.gh.add_issue(EPIC, "Epic", "An epic.\n", subs=children)
+
+    def failing_deployments(self, n, context="deploy/test"):
+        """The pipeline's verdict on each merge commit: the deployment of a merge of issue `n` fails,
+        every other one (a revert's included) succeeds. A merge of `n` then takes the broken-`main`
+        path: one fix-forward, then a revert."""
+        merge = self.gh.on_merge
+        assert merge is not None
+
+        def deployed(branch, sha):
+            commit = merge(branch, sha)
+            broke = re.search(rf"issue-{n}(-r\d+)?$", branch) is not None
+            self.gh.set_status(commit, context, "failure" if broke else "success")
+            return commit
+        self.gh.on_merge = deployed
+        self.policy = {**self.policy, "deploy": Deploy(contexts=(context,))}
 
     def run_engine(self, agents=None, caps=None, fresh=False, policy=None):
         plan = build_plan(self.gh, EPIC, self.repo.work)
@@ -114,11 +130,11 @@ class HappyPathTests(EngineCase):
         self.assertLess(max(building.values()), min(merged.values()))
         self.assertEqual((self.phase(2), self.phase(3)), (Phase.DONE, Phase.DONE))
 
-    def test_by_default_one_issue_is_built_at_a_time(self):
+    def test_with_one_writer_one_issue_is_built_at_a_time(self):
         self.add_work(2, "docs/a.txt", "alpha")
         self.add_work(3, "docs/b.txt", "beta")
         self.epic(2, 3)
-        self.run_engine()
+        self.run_engine(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=1))
         building = {n: [e for e in self.events("phase", n) if e["to"] == "build"][0]["seq"] for n in (2, 3)}
         merged = {e["issue"]: e["seq"] for e in self.events("merged")}
         first, second = sorted((2, 3), key=lambda n: building[n])
@@ -194,14 +210,6 @@ class ObligationTests(EngineCase):
         self.assertIn({"name": "loop:deferred"}, self.gh.issues[2]["labels"])
         self.assertTrue(any("implement-loop:deferred" in c["body"] for c in self.gh.comments[2]))
 
-    def test_a_blocked_build_asks_for_a_path_and_carries_on(self):
-        self.add_work(2, "docs/a.txt", "alpha", blocked_once=True, extra_path="docs/registry.txt")
-        self.epic(2)
-        self.run_engine()
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(self.roles("decide"), {"codex"})
-        self.assertTrue(any(g["path"] == "docs/registry.txt" for g in self.store.issue(2).grants))
-
 
 class WaitAndFailTests(EngineCase):
     def test_timeouts_spend_the_infrastructure_budget_then_fail(self):
@@ -211,14 +219,6 @@ class WaitAndFailTests(EngineCase):
         self.assertEqual(self.phase(2), Phase.FAILED)
         self.assertEqual(present(self.store.issue(2).fail)["cause"], "ceiling")
         self.assertEqual(self.store.issue(2).infra, 3)
-
-    def test_a_flaky_required_check_is_rerun_once(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.epic(2)
-        self.gh.check_script = ["failure", "success"]
-        self.run_engine()
-        self.assertEqual(self.phase(2), Phase.DONE)
-        self.assertEqual(len(self.gh.reruns), 1)
 
     def test_a_check_with_no_verdict_waits(self):
         self.add_work(2, "docs/a.txt", "alpha")

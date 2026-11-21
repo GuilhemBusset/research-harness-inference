@@ -65,7 +65,7 @@ class OpenIssue:
 
 
 def lint_plan(items: list[dict], ledger_ids: list[str], item_text: dict[str, str], lacks: list[str],
-              lookup, zones: list[str]) -> list[str]:
+              lookup) -> list[str]:
     """Problems with a plan, each one actionable by the builder. `lookup(n)` returns an
     `OpenIssue` or None."""
     problems = []
@@ -92,9 +92,6 @@ def lint_plan(items: list[dict], ledger_ids: list[str], item_text: dict[str, str
                 problems.append(f"{i['id']}: `deferred` needs an open, non-tracking issue; #{i.get('depends_on')} is not one")
             elif not quote_ok(other.title + "\n" + other.body, i.get("depends_quote"), 2):
                 problems.append(f"{i['id']}: quote words of #{other.number}'s title or body that show the dependency")
-    for z in zones:
-        if z.startswith("/") or ".." in z.split("/"):
-            problems.append(f"zone {z!r} must be a repo-relative path")
     return problems
 
 
@@ -192,21 +189,13 @@ def review_verdicts(verdicts: list[dict], item_text: dict[str, str], review_item
     return accepted, sorted(set(unmet)), missing
 
 
-# ------------------------------------------------------------------ zones
+# ------------------------------------------------------------------ protected paths
 
-def path_allowed(path: str, grants: list[dict], test_files: list[str]) -> bool:
-    from .scheduler import overlaps  # local import: scheduler imports config only
-    return any(overlaps(path, g["path"]) for g in grants) or path in test_files
-
-
-def zone_problems(changed: list[str], grants: list[dict], test_files: list[str], repair: bool) -> list[str]:
-    """Changed files outside the issue's grants, protected paths without an approval, and (in a
-    fault-repair run) anything on the safety surface."""
+def protected_problems(changed: list[str], grants: list[dict], repair: bool) -> list[str]:
+    """Protected paths changed without an approval (a grant marked protected: the path itself, or
+    a directory above it), and, in a fault-repair run, anything on the safety surface. Any other
+    changed file is the builder's to change."""
     problems = []
-    outside = [f for f in changed if not path_allowed(f, grants, test_files)]
-    if outside:
-        problems.append(f"changed files outside the plan's zones and approved paths: {outside[:8]} "
-                        f"(ask with a `paths` request if the issue needs them)")
     approved_protected = {g["path"] for g in grants if g.get("protected")}
     protected = [f for f in changed if is_protected(f) and f not in approved_protected
                  and not any(f.startswith(p.rstrip('/') + '/') for p in approved_protected)]

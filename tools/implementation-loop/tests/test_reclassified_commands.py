@@ -24,12 +24,12 @@ PROBE = {"criterion": "A2", "command": "pytest -q checks/probe.py", "cwd": ".", 
 
 def plan(a2: str) -> dict:
     return {"items": [{"id": "A1", "reading": "r", "quote": TEXT["A1"], "proof": "command"},
-                      {"id": "A2", "reading": "r", "quote": TEXT["A2"], "proof": a2}], "zones": [], "notes": ""}
+                      {"id": "A2", "reading": "r", "quote": TEXT["A2"], "proof": a2}], "notes": ""}
 
 
 class Agents:
     def plan(self, vendor, req, wt):
-        return PlanResult(items=[ItemPlan(**i) for i in plan("review")["items"]], zones=[], decisions=[])
+        return PlanResult(items=[ItemPlan(**i) for i in plan("review")["items"]], decisions=[])
 
     def triage(self, vendor, req, plan):
         return []
@@ -43,7 +43,8 @@ class ReclassifiedCommandCase(unittest.TestCase):
         self.engine.caps, self.engine.repair, self.engine.other, self.engine.op = Caps(), False, "codex", "claude"
         self.engine.lacks, self.engine._lookup_issue = [], lambda n: None   # ty: ignore[invalid-assignment]  # test double
         ledger = [SimpleNamespace(id=k, text=v) for k, v in TEXT.items()]
-        self.engine.plan = SimpleNamespace(specs={148: SimpleNamespace(ledger=ledger, declared_paths=[])}, work=[148])  # ty: ignore[invalid-assignment]  # test double
+        self.engine.plan = SimpleNamespace(specs={148: SimpleNamespace(ledger=ledger, declared_paths=[])},  # ty: ignore[invalid-assignment]  # test double
+                                           issues={148: SimpleNamespace(body="", labels=[])}, work=[148])
         self.engine.agents = Agents()  # ty: ignore[invalid-assignment]  # test double
 
     def tearDown(self):

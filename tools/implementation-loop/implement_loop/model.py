@@ -196,15 +196,11 @@ class IssueState:
     owner_landing: dict | None = None
     body_hash: str | None = None
     round: int = 1                       # work rounds: a new one after a post-merge edit or a fix-forward
-    # The plan (ADR 0012): per-item readings and proof kinds, zones, decisions.
+    # The plan (ADR 0012): per-item readings and proof kinds, decisions.
     plan: dict | None = None
     commands: list[dict] = field(default_factory=list)       # CheckSpec per item (builder's, then probes)
-    tests: list[str] = field(default_factory=list)           # the builder's test files
-    probes: list[str] = field(default_factory=list)          # adopted probe files (the examiner's)
-    locked: dict[str, str] = field(default_factory=dict)     # path -> digest, from the first examination
-    manifest: dict[str, list[str]] = field(default_factory=dict)  # criterion -> test ids that must run and pass
-    dispositions: dict[str, str] = field(default_factory=dict)    # unselected test id -> owner-run | excluded: why
-    grants: list[dict] = field(default_factory=list)         # {path, source, protected}
+    probes: list[str] = field(default_factory=list)          # probe files an earlier engine committed (the examiner's)
+    grants: list[dict] = field(default_factory=list)         # protected paths: {path, source, protected}
     findings: list[dict] = field(default_factory=list)       # Finding records, the examiner's memory
     verdicts: dict[str, dict] = field(default_factory=dict)  # item -> {verdict, quote, head, note}
     requests: list[dict] = field(default_factory=list)       # typed builder requests and their outcomes
@@ -212,8 +208,6 @@ class IssueState:
     decisions: list[dict] = field(default_factory=list)      # published in the PR's Decisions section
     feedback: list[str] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)
-    last_ran: dict[str, list[str]] = field(default_factory=dict)  # criterion -> passed test ids, last verify
-    reverted: list[str] = field(default_factory=list)        # locked files the builder edited, reverted
     dropped: list[str] = field(default_factory=list)         # builder commands not kept, and why
     conflict_paths: list[str] = field(default_factory=list)
     conflict_pending: bool = False
@@ -228,11 +222,13 @@ class IssueState:
     reverts: int = 0
     restarts: int = 0                    # rounds abandoned unmerged (a refused history) since the last accepted one
     merge_refusals: int = 0
-    ci_rerun_heads: list[str] = field(default_factory=list)
     followup: int | None = None          # the follow-up issue filed for non-blocking findings
     extra_deps: list[int] = field(default_factory=list)      # prerequisites found mid-run, kept across runs
     exam_feedback: list[str] = field(default_factory=list)   # what the next examination must supply
     exam_retries: int = 0                # examinations re-asked for missing verdicts or probes
+    # Examinations since the latest plan (`Caps.examiner_bound`); None in a state an earlier engine
+    # wrote, which is counted from the journal instead (`Engine._examinations`).
+    examinations: int | None = None
     # Waiting and failure.
     wait: dict | None = None             # {kind, resume, detail, since, vendor?, version?, env?}
     fail: dict | None = None             # {cause, detail, version, resumed}

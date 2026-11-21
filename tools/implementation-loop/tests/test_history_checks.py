@@ -170,7 +170,7 @@ class EngineHistoryTests(HistoryCase):
                         refused["findings"])
         self.assertEqual((st.branch, st.round, st.restarts, st.worktree, st.pr), ("feat/issue-2-r2", 2, 1, None, None))
         self.assertTrue(st.plan, "the plan is kept")
-        self.assertEqual((st.locked, st.tests, st.probes, st.verified_sha, st.certified_sha), ({}, [], [], None, None))
+        self.assertEqual((st.probes, st.verified_sha, st.certified_sha), ([], None, None))
         detail = (st.fail or {}).get("detail", "")
         self.assertIn("the commits of `feat/issue-2` carry what the history scan refuses", detail)
         self.assertIn("builds on a new branch from main, `feat/issue-2-r2`", detail)
@@ -181,12 +181,14 @@ class EngineHistoryTests(HistoryCase):
         self.assertNotIn(ACCOUNT, self.published())
         self.assertTrue(git("branch", "--list", "feat/issue-2", cwd=self.repo.work), "the abandoned branch stays, locally")
         self.assertFalse(self.events("step_crashed"), "not an engine fault")
-        [fault] = [i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]]
+        self.assertFalse([i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]],
+                         "a stall files no fault issue")
         everything = json.dumps([self.store.events(), st.to_dict(), self.gh.issues, self.gh.comments])
         self.assertNotIn(ACCOUNT, everything, "the scanner's excerpts are redacted, and what is published has none")
-        self.assertIn("**history**", fault["body"])
-        self.assertIn("docs/a.txt@", fault["body"])
-        self.assertNotIn("[redacted", fault["body"], "the place and the rule, not the line around the value")
+        progress = [c["body"] for c in self.gh.comments.get(2, []) if c["body"].startswith(L.report.PROGRESS_MARKER)]
+        self.assertIn("**Not delivered (history):**", progress[-1])
+        self.assertIn("docs/a.txt@", progress[-1])
+        self.assertNotIn("[redacted", progress[-1], "the place and the rule, not the line around the value")
 
     def test_a_value_committed_and_then_removed_is_stopped_before_the_push(self):
         # The head's tree is clean and an examiner certified it: only its history carries the value.
@@ -289,8 +291,9 @@ class EngineHistoryTests(HistoryCase):
 class RevertHistoryTests(HistoryCase):
     def breaking_pair(self) -> None:
         self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))   # its deployment fails
         self.epic(2, 3)
+        self.failing_deployments(3)
 
     def test_the_commits_of_a_revert_are_scanned_before_it_is_pushed(self):
         self.breaking_pair()
@@ -324,9 +327,9 @@ class RevertHistoryTests(HistoryCase):
         self.assertFalse(self.events("reverted", 3))
 
     def test_a_revert_looks_past_a_round_that_was_abandoned_unmerged(self):
-        # #3 merges and breaks main; its fix-forward round is abandoned for its history; the retry's
-        # round repairs nothing either. The revert must still find the pull request that broke main,
-        # two rounds back, although only one fix-forward was counted.
+        # #3 merges and its deployment fails; its fix-forward round is abandoned for its history; the
+        # retry's round repairs nothing either. The revert must still find the pull request that broke
+        # main, two rounds back, although only one fix-forward was counted.
         self.breaking_pair()
         real = Engine._step_verify
         abandoned = []
@@ -421,11 +424,6 @@ class OwnersValueAgents(L.agents.FakeAgents):
         super().__init__(scripts)
         self.rounds = rounds
         self.given: list[str] = []
-
-    def plan(self, vendor, req, worktree):
-        result = super().plan(vendor, req, worktree)
-        result.zones.append(NOTE)
-        return result
 
     def build(self, vendor, req, plan, worktree, feedback):
         self.given.append(repr((req, plan, feedback)))
@@ -524,10 +522,12 @@ class OwnersListTests(OwnersListCase):
         self.assertNotIn(VALUE, self.published())
         self.assertEqual((st.branch, st.round, st.worktree), ("feat/issue-2-r2", 2, None))
         self.assertTrue(git("branch", "--list", "feat/issue-2", cwd=self.repo.work), "the abandoned branch stays, locally")
-        [fault] = [i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]]
+        self.assertFalse([i for i in self.gh.issues.values() if {"name": "loop:engine-bug"} in i["labels"]],
+                         "a stall files no fault issue")
+        progress = [c["body"] for c in self.gh.comments.get(2, []) if c["body"].startswith(L.report.PROGRESS_MARKER)]
         detail = (st.fail or {}).get("detail", "")
         self.assertIn("the scan with the owner's local values", detail)
-        for text in (detail, fault["body"], st.feedback[0]):
+        for text in (detail, progress[-1], st.feedback[0]):
             self.assertIn(NOTED, text)
         for secret in SECRET:
             self.assertNotIn(secret, self.kept())
@@ -661,8 +661,9 @@ class OwnersListRevertTests(OwnersListCase):
         # The words git puts into a revert commit's message are on the list: no earlier push holds them.
         self.values.write_text("This reverts commit\n")
         self.issue(2, "alpha")
-        self.issue(3, "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.issue(3, "broken", blocked_by=(2,))   # its deployment fails
         self.epic(2, 3)
+        self.failing_deployments(3)
         self.run_engine()
         st = self.store.issue(3)
         self.assertEqual(self.ended(3), ("failed", "main_broken"))

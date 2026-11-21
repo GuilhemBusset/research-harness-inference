@@ -14,11 +14,12 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from helpers import REPO_ROOT, TempRepo, git, load_fixture
-from implement_loop import live, schemas
+from helpers import REPO_ROOT, SHIP, TempRepo, git, load_fixture
+from implement_loop import engine, live, schemas
 from implement_loop.agents import IssueRequest
 from implement_loop.issue_parser import parse
 from implement_loop.model import CheckSpec, Issue
+from implement_loop.workspace import Workspace
 
 FAKE = r'''#!{python}
 import json, os, sys, time
@@ -48,7 +49,7 @@ else:
 '''
 
 PLAN = {"items": [{"id": "D1", "reading": "a lab page", "quote": "type-to-tokenize colored chips", "proof": "test"}],
-        "zones": ["cursus/labs/"], "notes": ""}
+        "notes": "the plan's own notes"}
 
 ANSWERS = {
     "explore": {"notes": "x"},
@@ -58,19 +59,16 @@ ANSWERS = {
         {"id": "A1", "reading": "fast on a laptop", "quote": "updates in under 50 ms", "proof": "owner",
          "capability": "hardware:laptop", "agent_part": "measure it on this host", "depends_on": None,
          "depends_quote": None}],
-        "zones": ["cursus/labs/tokenizer.html"],
         "decisions": [{"id": "lib", "choice": "gpt-tokenizer", "rationale": "UMD build"}], "notes": "plan notes"},
     "triage": {"objections": [{"kind": "misreading", "text": "it is a lab, not a deck", "item": "D1",
                                "quote": "type-to-tokenize colored chips", "proof": None, "capability": None,
                                "depends_on": None, "depends_quote": None}]},
     "build": {"status": "done", "note": "built", "tests": ["tests/test_lab.py"],
               "commands": [{"criterion": "D1", "command": "pytest -q tests/test_lab.py", "cwd": ".", "timeout_s": None}],
-              "dispositions": [{"test": "tests/test_lab.py::test_speed", "disposition": "owner-run"}],
               "decisions": [{"id": "layout", "choice": "one page", "rationale": "simplest"}],
-              "requests": [{"kind": "command_change", "detail": "select one more test", "paths": [], "item": "D1",
-                            "finding": None, "capability": None, "depends_on": None, "depends_quote": None,
-                            "command": "pytest -q tests", "cwd": "tests", "timeout_s": 600}]},
-    "resolve_locked": {"files": ["checks/shared.sh"], "note": "kept both sides"},
+              "requests": [{"kind": "protected_change", "detail": "register the suite", "paths": ["tests/policy/x.py"],
+                            "item": None, "finding": None, "capability": None, "depends_on": None,
+                            "depends_quote": None}]},
     "examine": {"verdicts": [{"item": "A2", "verdict": "unmet", "quote": "Page weight is documented", "note": "missing"}],
                 "findings": [{"title": "the toggle loses the text", "item": "D1", "quote": "a GPT-2 (r50k) vs o200k toggle",
                               "invariant": None, "observed": "empty box", "expected": "the text stays",
@@ -79,12 +77,11 @@ ANSWERS = {
                 "probes": [{"file": "checks/probe_toggle.sh", "criterion": "D1", "command": "bash checks/probe_toggle.sh",
                             "cwd": ".", "content": "#!/usr/bin/env bash\ntest -s cursus/labs/tokenizer.html\n"}],
                 "certify": False, "summary": "one finding"},
-    "decide": {"decisions": [{"request": "R28-1", "approve": True, "reason": "the suite needs it",
-                              "dispositions": [{"test": "tests/test_lab.py::test_net", "disposition": "excluded: needs CDN"}]}]},
+    "decide": {"decisions": [{"request": "R28-1", "approve": True, "reason": "the suite needs it"}]},
     "arbitrate": {"upheld": False, "reason": "the item does not ask for it"},
 }
 READ_ONLY_ROLES = ("plan", "triage", "arbitrate")
-WORKING_ROLES = ("build", "resolve_locked", "examine", "decide")
+WORKING_ROLES = ("build", "examine", "decide")
 
 
 class StubWorkspace:
@@ -168,13 +165,11 @@ class LiveAdapterTests(unittest.TestCase):
             return a.triage(vendor, req, PLAN)
         if role == "build":
             return a.build(vendor, req, PLAN, cwd, ["fix the edge case"])
-        if role == "resolve_locked":
-            return a.resolve_locked(vendor, req, cwd, ["checks/shared.sh"], ["keep both sides"])
         if role == "examine":
             return a.examine(vendor, req, PLAN, cwd, "a" * 40, "b" * 40, [{"criterion": "D1", "passed": True}],
                              list(memory), [], since)
         if role == "decide":
-            return a.decide(vendor, req, cwd, [{"id": "R28-1", "kind": "paths", "paths": ["setup/suites.txt"]}])
+            return a.decide(vendor, req, cwd, [{"id": "R28-1", "kind": "protected_change", "paths": ["setup/suites.txt"]}])
         if role == "arbitrate":
             return a.arbitrate(vendor, req, {"kind": "finding", "argument": "the item never asks for offline"})
         raise AssertionError(role)
@@ -264,8 +259,7 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual([(i.id, i.proof, i.capability) for i in p.items],
                          [("D1", "test", None), ("A1", "owner", "hardware:laptop")])
         self.assertEqual(p.items[1].agent_part, "measure it on this host")
-        self.assertEqual((p.zones, p.decisions[0]["choice"], p.notes),
-                         (["cursus/labs/tokenizer.html"], "gpt-tokenizer", "plan notes"))
+        self.assertEqual((p.decisions[0]["choice"], p.notes), ("gpt-tokenizer", "plan notes"))
         record = [json.loads(l) for l in (self.tmp / "run" / "agents.jsonl").read_text().splitlines()][-1]
         self.assertEqual((record["role"], record["vendor"], record["issue"], record["ok"], record["outcome"]),
                          ("plan", "codex", 28, True, "answered"))
@@ -280,22 +274,13 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual((b.status, b.tests), ("done", ["tests/test_lab.py"]))
         self.assertEqual(b.commands, [CheckSpec(criterion="D1", command="pytest -q tests/test_lab.py", cwd=".",
                                                 timeout_s=None)])
-        self.assertEqual(b.dispositions, {"tests/test_lab.py::test_speed": "owner-run"})
         self.assertEqual(b.decisions[0]["id"], "layout")
         r = b.requests[0]
-        self.assertEqual((r.kind, r.item, r.paths), ("command_change", "D1", []))
-        self.assertEqual(r.command, {"criterion": "D1", "command": "pytest -q tests", "cwd": "tests",
-                                     "timeout_s": 600, "author": "builder"})
+        self.assertEqual((r.kind, r.item, r.paths, r.command), ("protected_change", None, ["tests/policy/x.py"], None))
         prompt = self.calls()[-1]["prompt"]
         self.assertIn("fix the edge case", prompt)
         self.assertNotIn("the plan feedback", prompt, "a build gets this round's feedback, not the plan's")
-        self.assertIn('"cursus/labs/"', prompt, "the builder sees its plan")
-
-    def test_the_locked_conflict_resolver_is_told_its_files(self):
-        self.invoke("resolve_locked", "codex")
-        prompt = self.calls()[-1]["prompt"]
-        self.assertIn("`checks/shared.sh`", prompt)
-        self.assertIn("keep both sides", prompt)
+        self.assertIn("the plan's own notes", prompt, "the builder sees its plan")
 
     def test_examine_answers_are_mapped_and_it_runs_in_a_disposable_copy(self):
         e = self.invoke("examine", "codex")
@@ -318,8 +303,7 @@ class LiveAdapterTests(unittest.TestCase):
 
     def test_decide_and_arbitrate_answers_are_mapped(self):
         d = self.invoke("decide", "codex")
-        self.assertEqual((d[0].request, d[0].approve, d[0].dispositions),
-                         ("R28-1", True, {"tests/test_lab.py::test_net": "excluded: needs CDN"}))
+        self.assertEqual((d[0].request, d[0].approve, d[0].reason), ("R28-1", True, "the suite needs it"))
         self.assertIn("setup/suites.txt", self.calls()[-1]["prompt"])
         r = self.invoke("arbitrate", "claude")
         self.assertEqual((r.upheld, r.reason), (False, "the item does not ask for it"))
@@ -585,6 +569,27 @@ class LoopGuardTests(unittest.TestCase):
         self.trailers("implementation", locks=["tests/test_a.py"])
         self.commit("tests/test_a.py", "def test_a(): assert True\n", "implementation")
         self.assertEqual(self.guard().returncode, 0)
+
+    # The engine locks nothing any more: what an earlier engine locked on a branch is released
+
+    def test_the_engine_reads_what_the_guard_holds_locked_and_releases_it(self):
+        self.commit("tests/test_a.py", "def test_a(): pass\n", "acceptance-checks")      # locked as written
+        self.commit("tests/test_b.py", "def test_b(): pass\n", "implementation")
+        self.trailers("acceptance-checks", locks=["tests/test_b.py"])                    # locked by name
+        self.commit("tests/test_c.py", "def test_c(): pass\n", "acceptance-checks")
+        self.trailers("acceptance-checks", unlocks=["tests/test_c.py"])                  # already released
+        ws = Workspace(self.repo.work, 1, SHIP, base_dir=self.repo.loop_dir)
+        self.assertEqual(engine.locked_on_branch(ws, self.wt), ["tests/test_a.py", "tests/test_b.py"])
+        (self.wt / "tests" / "test_a.py").write_text("work the standing checks refused\n")
+        tree = git("rev-parse", "HEAD^{tree}", cwd=self.wt)
+        ws.commit_unlocks(self.wt, "Release the locked tests of #2", 2, ["tests/test_a.py", "tests/test_b.py"])
+        self.assertEqual(git("rev-parse", "HEAD^{tree}", cwd=self.wt), tree, "the release changes no file")
+        self.assertIn("tests/test_a.py", git("status", "--porcelain", cwd=self.wt), "uncommitted work stays so")
+        self.assertEqual(engine.locked_on_branch(ws, self.wt), [])
+        self.commit("tests/test_a.py", "def test_a(): assert True\n", "implementation")
+        self.commit("tests/test_b.py", "def test_b(): assert True\n", "implementation")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stdout)
 
 
 if __name__ == "__main__":
