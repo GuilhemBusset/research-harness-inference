@@ -551,7 +551,12 @@ class Forwarder:
         headers["Accept-Encoding"] = "identity"
         upstream = self._connection()
         done = threading.Event()
-        watcher = threading.Thread(target=self._watch, args=(handler.connection, upstream, exchange, done), daemon=True)
+        # Set once the client has been sent, or is being sent, all the gateway declared: its close is
+        # then the end of what it was given, not a client giving up.
+        delivered = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch, args=(handler.connection, upstream, exchange, done, delivered), daemon=True
+        )
         # Which side the exchange is at: an error while writing to the client is the client closing
         # it; one while reading the gateway is the gateway ending it, which no client did.
         to_client = False
@@ -587,6 +592,8 @@ class Forwarder:
                 if not chunk:
                     break
                 to_client = True
+                if answer.length == 0:
+                    delivered.set()
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
                 if streaming:
@@ -613,17 +620,23 @@ class Forwarder:
             upstream.close()
 
     def _watch(
-        self, client: socket.socket, upstream: http.client.HTTPConnection, exchange: Exchange, done: threading.Event
+        self,
+        client: socket.socket,
+        upstream: http.client.HTTPConnection,
+        exchange: Exchange,
+        done: threading.Event,
+        delivered: threading.Event,
     ) -> None:
         """Notes when the client closes the exchange before its end, and closes the gateway's side
-        then, as a client that gives up does."""
+        then, as a client that gives up does. A client that closes once it has all the gateway
+        declared has not given up: what became of the exchange is the gateway's doing."""
         while not done.is_set():
             try:
                 readable, _, _ = select.select([client], [], [], 0.2)
                 if readable and not client.recv(1, socket.MSG_PEEK):
                     raise ConnectionResetError
             except (OSError, ValueError):
-                if not done.is_set():
+                if not done.is_set() and not delivered.is_set():
                     exchange.closed_at = self.clock()
                     with contextlib.suppress(OSError):
                         if upstream.sock is not None:
