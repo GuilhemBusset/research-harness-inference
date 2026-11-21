@@ -26,6 +26,7 @@ src = [
   "tools/examiner-pilot",
   "tests/examiner",
   "tests/replay",
+  "tests/unit/spikes",
   "src",
   "services/common",
   "services/gateway",
