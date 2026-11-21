@@ -16,9 +16,21 @@ key.
 
 **The tests it leaves out.** The step runs outside the private network, and only the gateway may
 reach the internal load balancer (section 6.5), so the tests that call the forbidden routes
-through it cannot run from here. They are deselected by their IDs, `DESELECTED`, and no other
-test is. How the verification reaches that load balancer is the owner's decision: once it is
-made, those IDs leave this one tuple.
+through it cannot run from here. They are deselected by their IDs, `DESELECTED`. How the
+verification reaches that load balancer is the owner's decision: once it is made, those IDs leave
+this one tuple. The tests of `GPU_PASS_ONLY` are deselected too in the run on the mock pool, the
+one that names no pool: they belong to the run on the coursework pool. No other test is.
+
+**The coursework pool.** Before this script, the step runs the decision of `gpu_verification.py`,
+which waits for the instance refresh a GPU pool's release started and leaves, in the file
+`RHI_VERIFY_GPU_POOLS_FILE` names, the pools the smoke tests must also run on: `coursework` when
+this execution deployed a GPU pool's release, nothing otherwise. After the run on the mock pool,
+the script runs the same smoke tests once more for each pool of that file, with `RHI_SMOKE_POOL`
+naming it: the first stream's wake and hold, the streams of each format, the pool's metrics and
+the release its lifecycle agents report as a metric and in their heartbeat rows,
+`gpu-release-served` and `release-heartbeat` among them. Every run is made, and
+the script's exit is that of the first that failed. With the variable set and no file, the
+decision did not run, and the script fails before any test.
 
 **When no test runs.** Two states of a correct deployment leave nothing to test: the endpoint has
 no HTTPS listener yet, which its address reading `none` says, or the canary's secret does not
@@ -55,6 +67,7 @@ What the step gives, in the environment:
 | `RHI_VERIFY_FAILED_TESTS_FILE` | The file the IDs of the failed tests are left in |
 | `RHI_VERIFY_HEARTBEATS_TABLE` | The name of the heartbeats table of the stage |
 | `RHI_VERIFY_LAST_STAGES_FILE` | The file the instances' last stages are left in |
+| `RHI_VERIFY_GPU_POOLS_FILE` | The file the decision left the pools to verify on in, one per line |
 
 The pools' parameters come from a stack's output through the pipeline, which puts the value into
 JSON as it is, so they arrive without a quote; the smoke tests read them as JSON, in
@@ -99,6 +112,8 @@ REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
 FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 HEARTBEATS_TABLE_VARIABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
 LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
+GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
+POOL_VARIABLE = "RHI_SMOKE_POOL"
 
 # The heartbeats table as far as the script reads it: its partition key, its sort key, what comes
 # before an instance's ID in the sort key, and the attribute that holds the last stage the
@@ -128,6 +143,9 @@ DESELECTED: tuple[str, ...] = (
     "internal-metrics",
     "internal-health",
 )
+# The tests that only the run on a pool the decision named makes, by their IDs: a run that names no
+# pool, the mock pool's, leaves them out.
+GPU_PASS_ONLY: tuple[str, ...] = ("gpu-release-served",)
 # The marker a smoke test carries its ID in.
 ID_MARKER = "smoke_id"
 
@@ -143,10 +161,10 @@ _left: set[str] = set()
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of `DESELECTED`,
-    and keeps the IDs of the others for `pytest_runtest_logreport`."""
-    left_out = [
-        item for item in items if any(set(marker.args) & set(DESELECTED) for marker in item.iter_markers(ID_MARKER))
-    ]
+    and, in a run that names no pool, of `GPU_PASS_ONLY`, and keeps the IDs of the others for
+    `pytest_runtest_logreport`."""
+    deselected = set(DESELECTED) | (set() if os.environ.get(POOL_VARIABLE) else set(GPU_PASS_ONLY))
+    left_out = [item for item in items if any(set(marker.args) & deselected for marker in item.iter_markers(ID_MARKER))]
     if left_out:
         config.hook.pytest_deselected(items=left_out)
         items[:] = [item for item in items if item not in left_out]
@@ -158,13 +176,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """As a plugin of the run of the smoke tests: when a test fails, in its set-up, its call or its
-    teardown, adds its ID as a line of the file `RHI_VERIFY_FAILED_TESTS_FILE` names, once. Only
-    the ID is written: nothing of what the test held or printed. Without the variable, nothing is."""
+    teardown, adds its ID as a line of the file `RHI_VERIFY_FAILED_TESTS_FILE` names, once, even
+    across the runs of one verification. Only the ID is written: nothing of what the test held or
+    printed. Without the variable, nothing is."""
     named = os.environ.get(FAILED_TESTS_FILE_VARIABLE)
     failed = [test_id for test_id in _ids.get(report.nodeid, ()) if test_id not in _left] if report.failed else []
     if not named or not failed:
         return
     path = Path(named)
+    if path.is_file():
+        _left.update(path.read_text(encoding="utf-8").splitlines())
+        failed = [test_id for test_id in failed if test_id not in _left]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.writelines(f"{test_id}\n" for test_id in failed)
@@ -300,6 +322,18 @@ def not_run(reason: str, env: Mapping[str, str]) -> int:
     return 0
 
 
+def gpu_pools(env: Mapping[str, str]) -> list[str] | None:
+    """The pools the decision left in the file `RHI_VERIFY_GPU_POOLS_FILE` names, one per line:
+    none without the variable. None when the variable names a file the decision did not leave."""
+    named = env.get(GPU_POOLS_FILE_VARIABLE)
+    if not named:
+        return []
+    path = Path(named)
+    if not path.is_file():
+        return None
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def main(
     environ: Mapping[str, str] | None = None,
     client: Any = None,
@@ -309,8 +343,9 @@ def main(
     """Verifies the deployment the environment names; 0 when every test passed or none could run.
     `client` is a Secrets Manager client of the AWS SDK and `dynamodb` a DynamoDB one; without one,
     the build's own credentials and region make it. `run` runs the smoke tests in the environment
-    it is given. When that run fails, the last stage each instance of the tested pools reached is
-    left for the step's post-build phase."""
+    it is given: once on the mock pool, then once on each pool the decision left. When a run
+    fails, the last stage each instance of the tested pools reached is left for the step's
+    post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
     if not endpoint:
@@ -326,8 +361,15 @@ def main(
     key = canary_key(client)
     if key is None:
         return not_run(CANARY_MISSING, env)
+    passes = gpu_pools(env)
+    if passes is None:
+        print(f"{NAME}: {GPU_POOLS_FILE_VARIABLE} names no file: the decision did not run", file=sys.stderr)
+        return 1
     pools = release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, ""))
-    exit_code = run({**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)})
+    given = {**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)}
+    given.pop(POOL_VARIABLE, None)
+    exits = [run(given)] + [run({**given, POOL_VARIABLE: pool}) for pool in passes]
+    exit_code = next((code for code in exits if code != 0), 0)
     if exit_code != 0:
         leave_last_stages(env, pools, dynamodb)
     return exit_code

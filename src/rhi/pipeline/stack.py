@@ -22,7 +22,9 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
   `verification/<execution ID>/`: `not-run`, its reason when it ran no test,
   `failed-smoke-tests`, the IDs of the tests that failed, and `last-stages`, when its tests
   failed, the last lifecycle stage each instance of the pools it tested reached, which it reads
-  from their heartbeat rows. The reporter reads them there.
+  from their heartbeat rows. The reporter reads them there. When the execution deployed a GPU
+  pool's release, the step first waits for that pool's instance refresh to end, then runs the
+  smoke tests on the coursework pool as well.
 
 The asset step builds every image asset of the stage for its pool's processor architecture
 (sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
@@ -163,7 +165,7 @@ class PipelineStack(cdk.Stack):
         # step leaves its marks in the pipeline's artifact bucket, where the reporter reads them. It
         # takes from the stage, as text, what names the stage's heartbeats table to its role: this
         # stack, another assembly, holds no reference to a resource of the stage.
-        verify = verify_step(self, source, stage=stage, artifacts=underlying.artifact_bucket)
+        verify = verify_step(self, source, stage=stage, artifacts=underlying.artifact_bucket, pipeline=underlying)
         # Before any deployment action of the stage, and after the approval: the weights of a
         # release that will be deployed, in the model bucket before an instance asks for them.
         copy_weights = copy_weights_step(self, source)
@@ -203,11 +205,12 @@ class PipelineStack(cdk.Stack):
         )
         # Started by the owner, by hand: it writes a pool's image parameter, then starts the pipeline.
         self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
-        # Started by the owner, each on a commit of `main`: the spikes that need AWS.
+        # CodeBuild validates GitHub source credentials at project creation. The first deploy
+        # creates a pending connection. Once the owner authorizes it, self-update adds the jobs.
         self.spikes = SpikeJobs(
             self,
             "Spikes",
-            jobs=spike_jobs,
+            jobs=() if self.node.try_get_context("pipeline-first-deploy") == "true" else spike_jobs,
             connection_arn=connection.attr_connection_arn,
             repository=f"{config.github_owner}/{config.github_repo}",
             stage=stage,

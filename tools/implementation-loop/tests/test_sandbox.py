@@ -546,7 +546,7 @@ class LaunchSiteTests(SandboxCase):
     def test_the_standing_checks_are_sandboxed(self):
         root = self.tmp / "tree"
         root.mkdir()
-        verify.verify(root, [], "a" * 40, self.tmp / "work", {}, [], None, standing=(("hygiene", "true"),))
+        verify.verify(root, [], "a" * 40, self.tmp / "work", standing=(("hygiene", "true"),))
         self.assertEqual([(l.vendor, l.argv) for l in self.recorder.launches], [(None, ["bash", "-c", "true"])])
 
     def test_the_engines_checks_see_the_tree_its_private_git_directory_and_the_objects(self):
@@ -593,7 +593,7 @@ class RefusalTests(SandboxCase):
         with self.assertRaises(sandbox.SandboxUnavailable):
             verify.run_check(root, spec, "a" * 40, self.tmp / "work")
         with self.assertRaises(sandbox.SandboxUnavailable):
-            verify.verify(root, [spec], "a" * 40, self.tmp / "work", {}, [], None)
+            verify.verify(root, [spec], "a" * 40, self.tmp / "work")
         with self.assertRaises(sandbox.SandboxUnavailable):
             verify.standing_checks(root, (("hygiene", f"touch {self.ran}"),), "a" * 40, self.tmp / "work")
         self.assertFalse(self.ran.exists())
@@ -1084,7 +1084,7 @@ class SuperviseRefusalTests(SandboxCase):
     refused, waited, and launched it again until its bounds. It refuses up front now."""
 
     def args(self, **changes) -> argparse.Namespace:
-        values = {"issue": 7, "operator": "claude", "yes": True, "detach": False, "max_runs": 10, "max_hours": 24.0,
+        values = {"issue": 7, "operator": "claude", "yes": True, "detach": False, "max_runs": 10, "max_hours": None,
                   "repo": "o/r"}
         return argparse.Namespace(**(values | changes))
 
@@ -1135,6 +1135,17 @@ class SuperviseRefusalTests(SandboxCase):
         self.assertEqual(code, 0)
         popen.assert_called_once()
         supervisor.assert_not_called()
+
+    def test_a_supervision_has_a_deadline_only_when_one_is_given(self):
+        passing = [("PASS", "git", "git version 2")]
+        for hours in (None, 6.0):
+            with self.subTest(hours=hours):
+                _, _, _, supervisor, _ = self.supervise(passing, max_hours=hours)
+                self.assertEqual(supervisor.call_args.kwargs["max_hours"], hours)
+                _, _, popen, _, _ = self.supervise(passing, detach=True, max_hours=hours)
+                cmd = popen.call_args.args[0]
+                self.assertEqual(cmd[cmd.index("--max-hours") + 1] if "--max-hours" in cmd else None,
+                                 None if hours is None else "6.0", "the detached supervisor gets the same bound")
 
     def test_run_and_supervise_refuse_alike_on_a_repository_nothing_was_pushed_to(self):
         root = self.tmp / "work"

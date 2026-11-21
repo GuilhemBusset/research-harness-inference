@@ -330,6 +330,54 @@ are recorded here as proposed and are part of what the owner approves.
    An item that ends with `(needs <capability>)` for a capability no CI job provides gets no
    verdict demand; it is the owner's obligation. The supervisor gives a repair run only to an
    engine exception, never to an issue that stalled (`ceiling`, `no_progress`).
+10. **The engine no longer restricts the builder (2026-11-21).** Four controls over the builder
+   go, because they caused most of the loop's false failures. The builder's tests no longer lock
+   at the first examination: no reverted edit, no `test_change` request, no conflict in a locked
+   test handed to the other vendor, no selection manifest. The plan has no zones: no `paths` or
+   `command_change` request, and no failure for a file outside the plan. Nothing is re-run on
+   `main` after a merge: neither the issue's checks nor those of earlier issues, so no fix-forward
+   or revert follows from them. And a command that several criteria name runs once per
+   verification. The builder may change any file, its tests and commands included; the examiner
+   reviews every change to a test in the diff, and one that weakens what an item or an invariant
+   needs proven is a finding under "check or gate bypass". What stays: the hygiene scan and the
+   issue's commands on the exact head, the protected paths of decision 10 with the
+   `protected_change` request, the examiner's certificate, `required` on the merged head (CI runs
+   every test on each pull request and on each push to `main`), and the deployment verdict of
+   point 5 with its fix-forward and revert. In the gate table of point 4, the verifier's row now
+   reads "Issue commands and adopted probes; protected paths; skip accounting". An acceptance-checks
+   commit an earlier engine made on a branch still binds CI's loop guard, so before the builder
+   works on such a branch the engine releases what it locked, once.
+11. **No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21).** A
+    supervision is bounded by its 10 engine runs and the per-issue ceilings, which keep it
+    finite; it has no deadline of its own, and what sequences supervisions over time runs
+    outside the engine (a caller may still give one with `--max-hours`). An issue that stalls
+    (`ceiling`, `no_progress`, `history`, `main_broken`) is no engine defect and gets no repair
+    run, so it files no `loop:engine-bug` issue: it ends `failed`, its progress comment says why,
+    and the run's `events.jsonl` keeps the cause and the detail. Only an engine exception is
+    filed. A red `required` check is not run again: it goes back to the builder with the failed
+    job's log, as any failed check does, so the factory's GitHub App needs no write access to
+    Actions.
+12. **An examiner bound (2026-11-21).** Issues spent their call ceilings while every round
+    closed the findings it was given and each examination raised new edge cases. From an issue's
+    fourth examination since its latest plan (`Caps.examiner_bound`; a replan, or an edit of the
+    issue, starts the count again), only a finding that names a safety invariant blocks. A
+    finding that names only an item becomes the follow-up issue the engine already files for
+    non-blocking findings, and a commit whose items are all met is certified even when the
+    examiner withholds its certificate; the pull request's "Decisions" section records it, with
+    the examiner's summary. An `unmet` verdict on an item still withholds the certificate, and the
+    examiner is told in each examination which one it is and what blocks in it.
+13. **The steps that decide about a protected path run on the strongest Codex model
+    (2026-11-21).** Amendment 3 is answered no: changes to the safety surface wait for no person,
+    and the factory runs on its own. The examiner and the policy tests are then the only checks
+    on those paths, so the calls that decide about one run on Codex `gpt-6.2-astra`
+    (`loop.toml`, `codex_escalated_model`): deciding requests among which is a `protected_change`,
+    every arbitration, and examining a commit whose change against its base adds, changes or
+    removes a protected path (decision 10's lists, the safety surface included). While astra
+    refuses calls (a usage limit or quota, a rate limit, a model the account may not use, as
+    Codex reports it), those calls run on `gpt-6.2-sol`, the default model (`codex_fallback_model`),
+    and go back to astra 30 minutes later; a refused call did no work and is charged to no
+    budget, as amendment 8 does for Claude. Every other Codex call stays on the default model,
+    and `plan` and `build` stay on Fable, then Opus.
 
 ## Verified and taken on trust
 

@@ -19,7 +19,7 @@ from implement_loop.agents import FakeAgents
 from implement_loop.engine import Engine
 from implement_loop.model import CheckSpec, Phase
 from implement_loop.workspace import GitError
-from test_engine import EPIC, EngineCase
+from test_engine import EngineCase
 
 SCANNER = REPO_ROOT / "tools" / "hygiene"
 # An account ID that is not one of the documentation placeholders, never written out in a file.
@@ -64,10 +64,10 @@ class StandingCheckTests(unittest.TestCase):
 
     def verify(self, standing=STANDING_CHECKS):
         head = git("rev-parse", "HEAD", cwd=self.root)
-        return verify.verify(self.root, [self.own], head, self.tmp / "work", {}, [], None, standing=standing)
+        return verify.verify(self.root, [self.own], head, self.tmp / "work", standing=standing)
 
     def test_a_clean_head_passes_and_the_scan_is_recorded_first(self):
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertTrue(ok, problems)
         self.assertEqual([e["criterion"] for e in evidence], ["standing:hygiene", "D1"], "before the issue's own commands")
         scan = evidence[0]
@@ -79,7 +79,7 @@ class StandingCheckTests(unittest.TestCase):
         (self.root / "docs").mkdir()
         (self.root / "docs" / "notes.md").write_text(f"The account is {ACCOUNT}.\n")
         self.commit("a leak")
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertFalse(ok)
         [problem] = problems
         self.assertTrue(problem.startswith("standing check `hygiene` failed (exit 1)"), problem)
@@ -90,14 +90,14 @@ class StandingCheckTests(unittest.TestCase):
 
     def test_a_file_git_would_add_is_scanned_too(self):
         (self.root / "new.txt").write_text(f"{ACCOUNT}\n")
-        ok, _, problems, _ = self.verify()
+        ok, _, problems = self.verify()
         self.assertFalse(ok)
         self.assertIn("new.txt:1: account-id", problems[0])
 
     def test_a_tree_without_the_scanner_fails_closed(self):
         shutil.rmtree(self.root / "tools")
         self.commit("the scanner is gone")
-        ok, evidence, problems, _ = self.verify()
+        ok, evidence, problems = self.verify()
         self.assertFalse(ok)
         self.assertTrue(problems[0].startswith("standing check `hygiene` failed"), problems[0])
         self.assertIn("scan.py", problems[0])
@@ -108,22 +108,21 @@ class StandingCheckTests(unittest.TestCase):
         add_scanner(plain)
         with mock.patch.dict("os.environ", {"GIT_CEILING_DIRECTORIES": str(self.tmp)}):
             try:
-                ok, _, problems, _ = verify.verify(plain, [], "a" * 40, self.tmp / "work", {}, [], None,
-                                                   standing=STANDING_CHECKS)
+                ok, _, problems = verify.verify(plain, [], "a" * 40, self.tmp / "work", standing=STANDING_CHECKS)
             except GitError as e:   # pragma: no cover - the failure this test exists to rule out
                 self.fail(f"the standing check surfaced as a GitError: {e}")
         self.assertFalse(ok)
         self.assertTrue(problems[0].startswith("standing check `hygiene` failed"), problems[0])
 
     def test_a_usage_error_of_the_command_fails_as_well(self):
-        ok, _, problems, _ = self.verify(standing=(("hygiene", "python3 tools/hygiene/scan.py --no-such-flag"),))
+        ok, _, problems = self.verify(standing=(("hygiene", "python3 tools/hygiene/scan.py --no-such-flag"),))
         self.assertFalse(ok)
         self.assertIn("failed (exit 2)", problems[0])
 
     def test_without_standing_checks_only_the_issues_commands_run(self):
         (self.root / "new.txt").write_text(f"{ACCOUNT}\n")
-        ok, evidence, _, _ = self.verify(standing=())
-        self.assertTrue(ok, "the verifier's default, for another issue's regression checks on a head already scanned")
+        ok, evidence, _ = self.verify(standing=())
+        self.assertTrue(ok, "the verifier's default")
         self.assertEqual([e["criterion"] for e in evidence], ["D1"])
 
 
@@ -275,8 +274,9 @@ class EngineStandingCheckTests(EngineCase):
     def test_a_revert_passes_the_standing_checks_before_it_is_pushed(self):
         self.seed_scanner()
         self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))   # breaks #2's check on main
+        self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))
         self.epic(2, 3)
+        self.failing_deployments(3)
         ran = []
         real = verify.standing_checks
 
@@ -299,6 +299,7 @@ class EngineStandingCheckTests(EngineCase):
         self.add_work(2, "docs/a.txt", "alpha")
         self.add_work(3, "docs/a.txt", "broken", blocked_by=(2,))
         self.epic(2, 3)
+        self.failing_deployments(3)
         real = verify.standing_checks
 
         def failing_on_the_revert(root, checks, head_sha, work_dir, *args, **kwargs):
@@ -313,28 +314,6 @@ class EngineStandingCheckTests(EngineCase):
         self.assertFalse([p for p in self.gh.prs.values() if p["head"]["ref"].endswith("-revert")])
         self.assertNotIn("-revert", self.branches())
         self.assertFalse(self.events("reverted", 3))
-
-
-class RegressionRunsSkipTheScanTests(EngineCase):
-    def test_another_issues_checks_are_rerun_without_scanning_the_same_head_again(self):
-        self.add_work(2, "docs/a.txt", "alpha")
-        self.add_work(3, "docs/b.txt", "beta", blocked_by=(2,))
-        self.epic(2, 3)
-        seen = []
-        real = verify.verify
-
-        def recorded(root, specs, head_sha, work_dir, *args, **kwargs):
-            seen.append((Path(work_dir).name, tuple(kwargs.get("standing", ())), kwargs.get("mounts") is not None))
-            return real(root, specs, head_sha, work_dir, *args, **kwargs)
-        with mock.patch.object(config, "STANDING_CHECKS", (("hygiene", "true"),)), mock.patch.object(verify, "verify", recorded):
-            summary = self.run_engine()
-        self.assertEqual(summary["phases"], {"done": 2})
-        regression = [s for s in seen if s[0] == "regression"]
-        own = [s for s in seen if s[0] != "regression"]
-        self.assertTrue(regression and all(s[1] == () for s in regression))
-        self.assertTrue(own and all(s[1] == (("hygiene", "true"),) for s in own), "every other verification scans")
-        self.assertTrue(all(s[2] for s in seen), "and every one of them names what its commands may see")
-        self.assertEqual(EPIC, 1)
 
 
 if __name__ == "__main__":

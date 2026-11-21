@@ -18,7 +18,7 @@ A run never waits for a person and never parks:
   resumes by itself (in this run, or under the supervisor);
 - every answered agent call is charged to the issue's ceiling, every timeout or crash to its
   infrastructure budget, and every dollar a vendor reports to its dollar ceiling; spending any of
-  them ends the issue `failed`, filed as a loop fault, which a new engine version resumes once;
+  them ends the issue `failed`, kept in the run's journal, which a new engine version resumes once;
 - an item that needs a capability the host lacks becomes an owner obligation; one that needs
   another issue waits for it in the run, or becomes a deferred obligation.
 
@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import io
 import json
 import os
 import posixpath
@@ -152,7 +151,7 @@ LABELS = {
     "loop:merged": ("BFDADC", "implement loop: merged, verifying on main"),
     "loop:delivered": ("F9D0C4", "implement loop: merged; owner obligations or deferred items remain"),
     "loop:waiting": ("EDEDED", "implement loop: waiting; resumes by itself"),
-    "loop:failed": ("B60205", "implement loop: not delivered; filed as a loop fault"),
+    "loop:failed": ("B60205", "implement loop: not delivered"),
 }
 DEFERRED_LABEL = ("loop:deferred", "C2E0C6", "implement loop: an item waits for another issue")
 FOLLOWUP_LABEL = ("loop:follow-up", "BFD4F2", "implement loop: non-blocking findings to consider")
@@ -227,29 +226,12 @@ COMMIT_STATUS_EVIDENCE = "commit_status"   # the kind of the evidence record of 
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
 CRITERION_LEAD = re.compile(r"\s*([A-Za-z]+\d+)\b")
+# Request kinds an earlier engine took: a path outside the plan's zones, a change of a locked
+# command or of a locked test. A stored one is refused with the reason; the builder changes the
+# file, the test or the command itself.
+RETIRED_REQUESTS = ("paths", "command_change", "test_change")
 # The capability a ledger item ends with, as the backlog lint writes it: `... (needs aws:account).`
 NEEDS_END = re.compile(r"\(needs ([^()\s]+)\)\.?\s*$")
-
-
-class CommittedFile(Path):
-    """A file as a commit holds it, for `verify.digest`: its name, and its bytes from memory. It
-    reads as the same bytes in a file would, and is never on disk."""
-
-    _data = b""
-
-    @classmethod
-    def holding(cls, name: str, data: bytes) -> CommittedFile:
-        file = cls(name)
-        file._data = data
-        return file
-
-    def read_bytes(self) -> bytes:
-        return self._data
-
-    def read_text(self, encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> str:
-        with io.TextIOWrapper(io.BytesIO(self._data), encoding=io.text_encoding(encoding), errors=errors,
-                              newline=newline) as text:   # what `open()` in text mode does to these bytes
-            return text.read()
 
 
 class Engine:
@@ -273,7 +255,7 @@ class Engine:
         self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
         self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
         self.repair = bool(policy.get("repair", False))
-        self._accept_lock = threading.Lock()   # post-merge verification uses the one coord worktree
+        self._accept_lock = threading.Lock()   # one evidence step at a time
         self._meter_lock = threading.Lock()
         self._push_lock = threading.Lock()     # one push at a time in this run; across runs, `_hooks_held`
         self._polling: dict[int, float] = {}
@@ -318,8 +300,7 @@ class Engine:
     # ------------------------------------------------------------------ the meter (agents.meter)
     def _infra(self, n: int) -> bool:
         issue = self.plan.issues[n]
-        zones = (self.store.issue(n).plan or {}).get("zones") or self.plan.specs[n].declared_paths
-        return any(z.startswith(INFRA_PREFIXES) for z in zones) or "loop:infra" in issue.labels
+        return any(p.startswith(INFRA_PREFIXES) for p in self.plan.specs[n].declared_paths) or "loop:infra" in issue.labels
 
     def _ceiling(self, n: int) -> int:
         return ceiling(self.plan.issues[n].size, self._infra(n)) + self.store.budget(n)["bonus"]
@@ -483,7 +464,6 @@ class Engine:
             st.branch = st.branch or spec.branch or f"loop/issue-{n}"
             if st.extra_deps:
                 self._restore_deps(n, st)
-            self._declare(n, st)
             self.store.put(st)
             if restored and st.phase in (Phase.DELIVERED, Phase.FAILED):
                 self._sync(n)   # its labels and its comment said `waiting`; `_withhold` if they still must
@@ -502,35 +482,22 @@ class Engine:
         self._maybe_resume(st)
         return True
 
-    def _declare(self, n: int, st: IssueState) -> None:
-        """What the scheduler sees an issue own: its zones, approved paths and tests."""
-        if st.plan:
-            spec = self.plan.specs[n]
-            spec.declared_paths = sorted(set(st.plan.get("zones", [])) | {g["path"] for g in st.grants}
-                                         | set(st.tests) | set(st.probes)) or spec.declared_paths
-
     def _migrate(self, st: IssueState) -> None:
         """State an earlier engine wrote (ADR 0008/0011): a parked issue resumes; a design becomes
         the starting point of a plan, its locked checks become the builder's tests (released in
-        the CI guard at the next build), and nothing already written is lost."""
+        the CI guard at the next build, `_release_locks`), and nothing already written is lost."""
         legacy = st.wait or {}
         design = legacy.get("design") or {}
         st.wait = None
         old_tests = sorted(set(design.get("check_files", [])) | {f for f in legacy.get("locked", {})
                                                                   if Path(f).suffix in (".py", ".mjs", ".js", ".sh")})
         if old_tests:
-            st.tests = sorted(set(st.tests) | set(old_tests))
             st.feedback = list(st.feedback) + [(f"An earlier version of the loop wrote these tests on your branch: "
                                                 f"{', '.join(old_tests)}. They are yours now; keep, fix or replace them.")]
-            st.requests.append({"id": "legacy-unlock", "kind": "legacy_unlock", "paths": sorted(legacy.get("locked", {})),
-                                "status": "pending", "detail": "release an earlier engine's locked checks"})
-        for f in design.get("files", []):
-            st.grants.append({"path": f, "source": "earlier design", "protected": False})
         if legacy.get("reason"):
             st.feedback.append(f"An earlier version of the loop set this issue aside: {str(legacy['reason'])[:600]}")
         if st.phase not in (Phase.MERGED, Phase.DELIVERED, Phase.DONE):
             st.phase = Phase.PENDING
-        st.locked = {}
         self.store.event("migrated", issue=st.number, park_kind=legacy.get("park_kind"), tests=old_tests)
         self.store.put(st)
 
@@ -652,9 +619,6 @@ class Engine:
                 (wt / p).unlink()
         sha = self.ws.commit_all(wt, f"Drop the examiner's probes for #{n}", "acceptance-checks", n,
                                  unlocks=sorted(dropped) or None)
-        st.locked = {f: d for f, d in st.locked.items() if f not in dropped}
-        if st.manifest:
-            st.manifest = {k: [i for i in v if i.split("::")[0] not in dropped] for k, v in st.manifest.items()}
         st.commands = [c for c in st.commands if c.get("author") != "examiner"]
         st.probes = []
         self.store.put(st)
@@ -663,7 +627,7 @@ class Engine:
 
     def _owner_edit(self, st: IssueState) -> None:
         """The owner edited the issue: new evidence. Plan again on the branch, with the previous
-        decisions as a starting point; budgets are reset; tests stay locked."""
+        decisions as a starting point; budgets are reset."""
         notes = ["The owner edited the issue; plan for the edited version, on your branch."]
         if st.decisions:
             notes.append("Decisions so far, to keep where they still fit: " + json.dumps(st.decisions)[:1500])
@@ -903,12 +867,6 @@ class Engine:
         fields = CheckSpec.__dataclass_fields__
         return [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in st.commands]
 
-    @staticmethod
-    def _item_commands(st: IssueState, item: str) -> list[dict]:
-        """The builder's commands an item runs now: what a `command_change` changes."""
-        return [{"command": c["command"], "cwd": c.get("cwd") or "."} for c in st.commands
-                if c.get("criterion") == item and c.get("author") == "builder"]
-
     def _set_phase(self, n: int, phase: Phase, **changes) -> None:
         st = self.store.issue(n)
         previous = st.phase
@@ -938,21 +896,12 @@ class Engine:
         self._set_phase(n, Phase.WAITING)
 
     def _fail(self, n: int, cause: str, detail: str) -> None:
-        """Explicit non-delivery: nothing partial is merged, nothing is called delivered. Filed as
-        a loop fault; a new engine version resumes it once."""
+        """Explicit non-delivery: nothing partial is merged, nothing is called delivered. A stall is
+        no loop fault: no issue is filed for it, and the run's journal (the event `failed`) keeps
+        its cause and detail. A new engine version resumes it once."""
         st = self.store.issue(n)
         st.fail = {"cause": cause, "detail": detail[:800], "version": VERSION, "resumed": bool((st.fail or {}).get("resumed"))}
         self.store.put(st)
-        fingerprint = hashlib.sha256(f"stall:{cause}:{n}".encode()).hexdigest()[:10]
-        body = (f"{report.FAULT_MARKER.format(fingerprint)}\nThe implement loop could not deliver #{n} (run for "
-                f"#{self.plan.root}, engine {VERSION}): **{cause}**.\n\n{detail[:1500]}\n\nThe issue resumes once, with a "
-                f"fresh ceiling, on the next engine version. Its branch keeps the work.\n\n"
-                f"## Deliverables\n- [ ] From #{n}'s run log (`events.jsonl` and `calls/`), the cause is diagnosed and fixed "
-                f"in the engine or its prompts, with a regression test.\n"
-                f"- [ ] The engine version (`implement_loop/__init__.py`) is bumped, so #{n} resumes.\n\n"
-                f"## Acceptance criteria\n- [ ] The engine's full test suite passes.\n"
-                f"- [ ] Nothing on the loop's safety surface changes.\n")
-        self.faults.record(fingerprint, f"implement loop: #{n} not delivered ({cause})", body, issue=n, run=self.plan.root)
         self.store.event("failed", issue=n, cause=cause, detail=detail[:800])
         self.log(f"#{n} failed ({cause}): {detail[:200]}")
         self._set_phase(n, Phase.FAILED)
@@ -971,10 +920,10 @@ class Engine:
         self._release_hold(n)
         if self._owner_record(st) is not None:
             st.owner_landing = None   # it named the branch this round leaves
-        st.locked, st.manifest, st.tests, st.probes = {}, {}, [], []
+        st.probes = []
         st.commands = [c for c in st.commands if c.get("author") != "examiner"]   # their probes went with the branch
         st.findings = [f for f in st.findings if f.get("status") == "follow_up"]
-        st.human_tasks, st.reverted, st.dropped = [], [], []
+        st.human_tasks, st.dropped = [], []
         st.feedback = list(feedback)
         if owner_edit:
             self._owner_edit(st)
@@ -1142,19 +1091,11 @@ class Engine:
             return "later", None
         if not self.ws.is_ancestor(repo, reviewed, merged_head):
             return "stale", None
-        touched = self.ws.git("diff", "--name-only", reviewed, merged_head, cwd=repo)
-        allowed = self.plan.specs[st.number].declared_paths
-        return "later", sorted({f for f in touched.splitlines() if f and any(scheduler.overlaps(f, a) for a in allowed)})
-
-    def _verify(self, root: Path, st: IssueState, head: str, work_dir: Path, check_tamper: bool = True):
-        with self.ws.disposable(root) as scratch:
-            return self._verify_in(scratch, st, head, work_dir, check_tamper)
-
-    def _verify_in(self, root: Path, st: IssueState, head: str, work_dir: Path, check_tamper: bool = True):
-        return verify.verify(root, self._specs(st), head, work_dir, st.locked, sorted(set(st.tests) | set(st.probes)),
-                             in_tree(st.manifest) or None, self.caps.check_timeout_s,
-                             extra_env=self.check_env, check_tamper=check_tamper,
-                             standing=standing_checks(), mounts=self._mounts(root))
+        # Unreviewed: what the later commits changed of the files this issue's change touches.
+        touched = {f for f in self.ws.git("diff", "--name-only", reviewed, merged_head, cwd=repo).splitlines() if f}
+        own = (set(self.ws.git("diff", "--name-only", st.base_sha, reviewed, cwd=repo).splitlines()) if st.base_sha
+               else touched)
+        return "later", sorted(touched & own)
 
     def _mounts(self, scratch: Path) -> sandbox.Mounts:
         """What a check command may see of the tree under judgement: that throwaway copy and its
@@ -1174,11 +1115,11 @@ class Engine:
         ledger_ids = [i.id for i in spec.ledger]
         res = self.agents.plan(self.op, req, wt)
         items = [asdict(i) for i in res.items]
-        problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, res.zones)
+        problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue)
         if problems:   # one free retry, then the engine makes it usable itself
             res = self.agents.plan(self.op, replace(req, feedback=req.feedback + problems), wt)
             items = [asdict(i) for i in res.items]
-            problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, res.zones)
+            problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue)
         st = self.store.issue(n)
         for d in res.decisions:
             self._decide(st, d)
@@ -1188,21 +1129,22 @@ class Engine:
                 self._decide(st, d)
             fixed = []
             for i in items:
-                bad = gate.lint_plan([i], [i["id"]], item_text, self.lacks, self._lookup_issue, [])
+                bad = gate.lint_plan([i], [i["id"]], item_text, self.lacks, self._lookup_issue)
                 if bad and i["proof"] in ("owner", "deferred"):
                     i, d = gate.demote(i, "; ".join(bad))
                     self._decide(st, d)
                 fixed.append(i)
             items = fixed
-        plan = {"items": items, "zones": sorted({z.rstrip("/") for z in res.zones}), "notes": res.notes}
+        plan = {"items": items, "notes": res.notes}
         st.plan = plan
+        st.examinations = 0   # the examiner bound counts from the latest plan (`_examination_note`)
         self.store.put(st)
         objections = [asdict(o) for o in self.agents.triage(self.other, self._req(n), plan)]
         kept = [o for o in objections if gate.keep_objection(o, item_text, self._lookup_issue)]
         st = self.store.issue(n)
         st.plan = plan   # one canonical plan from here on: dependency handling edits st.plan in place
         feedback = []
-        infra = any(z.startswith(INFRA_PREFIXES) for z in plan["zones"])
+        infra = self._infra(n)
         for o in kept:
             if o["kind"] == "classification":
                 ruling = self.agents.arbitrate(self.other, self._req(n), {
@@ -1214,7 +1156,7 @@ class Engine:
                     candidate = {**item, "proof": o["proof"], "capability": o.get("capability"),
                                  "depends_on": o.get("depends_on"), "depends_quote": o.get("depends_quote"),
                                  "agent_part": item.get("agent_part") or "the parts agents can do"}
-                    if not gate.lint_plan([candidate], [o["item"]], item_text, self.lacks, self._lookup_issue, []):
+                    if not gate.lint_plan([candidate], [o["item"]], item_text, self.lacks, self._lookup_issue):
                         plan["items"] = [candidate if i["id"] == o["item"] else i for i in plan["items"]]
                         self._decide(st, {"id": f"classification-{o['item']}", "choice": f"{o['item']} is {o['proof']}",
                                           "rationale": f"the arbiter upheld the examiner: {ruling.reason}"})
@@ -1231,35 +1173,22 @@ class Engine:
             if i["proof"] == "owner":
                 self._obligate(st, {"item": i["id"], "kind": "capability", "detail": i.get("capability"),
                                     "agent_part": i.get("agent_part")})
-        # A protected path among the zones is granted here only when the issue's own text names it
-        # (ADR 0001, decision 10). Triage has no objection kind for a zone, so its silence approves
-        # nothing: any other protected zone is withheld, and the builder asks for it with a typed
-        # `protected_change` request, which the examiner decides. Never the safety surface in a
-        # fault-repair run.
-        # Naming means the protected path itself, or a directory that is protected: an issue that
-        # names `scripts/` or `tools/` has not named `scripts/check.sh` or `tools/hygiene/`.
-        # Earlier plans' zones stay granted, with their provenance: a replan never takes away a path
-        # the branch was allowed to change (the redesign that did so parked #42 and #78).
-        guarded = [z for z in plan["zones"] if is_protected(z) or is_protected(z + "/")]
-        named = [p.rstrip("/") for p in issue_parser.declared_paths(self.plan.issues[n].body)] if guarded else []
-        named = [p for p in named if is_protected(p) or is_protected(p + "/")]
-        approved = [z for z in guarded if any(z == p or z.startswith(p + "/") for p in named)]
-        withheld = [z for z in guarded if z not in approved]
-        earlier = [{**g, "source": "earlier plan"} if g.get("source") == "plan" else g for g in st.grants]
-        st.grants = earlier + [{"path": z, "source": "plan", "protected": z in approved} for z in plan["zones"]
-                               if z not in withheld and not (self.repair and is_safety_surface(z))
-                               and not any(g["path"] == z for g in earlier)]
-        if guarded:
-            choice = [f"granted, because the issue names them: {', '.join(approved)}"] if approved else []
-            choice += [f"not granted, because the issue does not name them: {', '.join(withheld)}"] if withheld else []
-            self._decide(st, {"id": "protected-zones", "choice": "protected paths among the plan's zones: " + "; ".join(choice),
+        # A protected path is granted here only when the issue's own text names it (ADR 0001,
+        # decision 10): the path itself, or a protected directory above what changes. An issue that
+        # names `scripts/` or `tools/` has not named `scripts/check.sh` or `tools/hygiene/`. Any
+        # other protected path needs a typed `protected_change` request, which the examiner
+        # decides. Never the safety surface in a fault-repair run. Earlier grants stay, with their
+        # provenance: a replan never takes away a path the branch was allowed to change.
+        named = [p.rstrip("/") for p in issue_parser.declared_paths(self.plan.issues[n].body)]
+        named = sorted({p for p in named if (is_protected(p) or is_protected(p + "/"))
+                        and not (self.repair and is_safety_surface(p))})
+        added = [p for p in named if not any(g["path"] == p for g in st.grants)]
+        st.grants = st.grants + [{"path": p, "source": "issue", "protected": True} for p in added]
+        if added:
+            self._decide(st, {"id": "protected-paths", "choice": f"protected paths the issue names are granted: "
+                                                                 f"{', '.join(added)}",
                               "rationale": "a protected path changes only when the issue names it or the examiner "
                                            "approves a `protected_change` request"})
-        if withheld:
-            feedback.append(f"Your plan's zones include protected paths the issue does not name: {withheld}. They are "
-                            f"not granted. If the issue cannot be delivered without changing one, ask with a "
-                            f"`protected_change` request that says why; the examiner decides.")
-            self.store.event("protected_zones_withheld", issue=n, zones=withheld)
         plan = st.plan
         retired = self._retire_uncommanded(st)
         if retired:
@@ -1267,8 +1196,7 @@ class Engine:
                             f"command: {retired[:6]}.")
         st.feedback = feedback
         self.store.put(st)
-        self._declare(n, st)
-        self.store.event("planned", issue=n, items={i["id"]: i["proof"] for i in plan["items"]}, zones=plan["zones"],
+        self.store.event("planned", issue=n, items={i["id"]: i["proof"] for i in plan["items"]},
                          objections=len(objections), kept=len(kept), problems=problems)
         if not scheduler.prerequisites_met(self.plan, self._phases(), n):
             self._set_phase(n, Phase.PENDING)    # a prerequisite was added: wait for it
@@ -1363,7 +1291,7 @@ class Engine:
         if not self._restore_branch(n):
             return
         self._recover_worktree(n, wt)
-        self._release_legacy(n, wt)
+        self._release_locks(n, wt)
         self.ws.fetch()
         sync: UpdateResult | None = None
         held = self._uncommittable(n, wt) if self.ws.uncommitted(wt) else []
@@ -1573,16 +1501,19 @@ class Engine:
             f"builds on a new branch from main, `{st.branch}`. Delete `{old}` once you have read it (`git branch -D`)"
             + (f", and close its pull request #{pr}" if pr else "") + f". Found: {said}.{owed}"))
 
-    def _release_legacy(self, n: int, wt: Path) -> None:
+    def _release_locks(self, n: int, wt: Path) -> None:
+        """The loop no longer locks tests, but a branch an earlier engine worked on may hold
+        acceptance-checks commits, and CI's loop guard (`scripts/check-loop-guard.sh`) refuses any
+        later commit that changes what they locked. Before the builder works on such a branch, one
+        acceptance-checks commit releases every file still locked there (`Loop-Unlocks`)."""
+        locked = locked_on_branch(self.ws, wt)
+        if locked:
+            sha = self.ws.commit_unlocks(wt, f"Release the locked tests of #{n}", n, locked)
+            self.store.event("locks_released", issue=n, sha=sha, files=locked)
         st = self.store.issue(n)
         pending = [r for r in st.requests if r.get("kind") == "legacy_unlock" and r.get("status") == "pending"]
-        for r in pending:
-            on_branch = [f for f in r.get("paths", []) if (wt / f).exists()]
-            self.ws.commit_all(wt, f"Release the earlier engine's checks for #{n}", "acceptance-checks", n,
-                               unlocks=on_branch or None)
-            r["status"] = "approved"
-            r["reason"] = "the builder takes over tests an earlier engine locked"
-            self.store.event("legacy_checks_released", issue=n, files=on_branch)
+        for r in pending:   # an earlier engine's checks, released with the rest
+            r["status"], r["reason"] = "approved", "the builder takes over tests an earlier engine locked"
         if pending:
             self.store.put(st)
 
@@ -1591,34 +1522,18 @@ class Engine:
         assert st.plan is not None   # an issue without one goes back to pending at startup
         feedback = list(st.feedback) + self._open_feedback(st)
         files = sync.files if sync.status == "conflict" else []
-        expected: dict[str, str] = {}
-        restore: dict[str, tuple] = {}
-        sources: dict[str, str] = {}
         if st.conflict_pending and not files:
             st.conflict_pending = False
             self.store.put(st)
         if sync.status == "merged":
             self.store.event("updated_from_main", issue=n, phase=Phase.BUILD.value, frm=sync.before,
                              to=self.ws.head(wt), main=sync.main)
-            self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
         elif files:
             st.conflict_paths = sorted(set(st.conflict_paths) | set(files))
-            st.grants = st.grants + [{"path": f, "source": "conflict", "protected": False} for f in files
-                                     if not any(g["path"] == f for g in st.grants)]
             st.conflict_pending = True
             self.store.event("conflict", issue=n, phase=Phase.BUILD.value, files=files)
             self.store.put(st)
-            self._declare(n, st)
-            locked = [f for f in files if f in st.locked]
-            if locked and not self._resolve_locked_conflict(n, wt, locked, sync.main):
-                return self._back_to_build(n, wt, "check_conflict_unresolved", locked,
-                                           f"The other vendor could not resolve main's conflict in the locked tests "
-                                           f"{locked}; the next round merges main again.")
-            expected = self._relock_candidates(n, wt, sync.before)
-            merged = {f: self.ws.file_state(wt, f) for f in {**st.locked, **expected}}
-            restore = {f: s for f, s in merged.items() if s is not None}
-            sources = {f: "other-vendor" if f in locked else "main" for f in expected}
-            feedback.append(conflict_feedback([f for f in files if f not in locked], locked))
+            feedback.append(conflict_feedback(files))
         with self.ws.agent_call(wt) as call:
             result = self.agents.build(self.op, self._req(n, feedback), st.plan, wt, feedback)
         self._absorb_agent_commits(n, wt, call, merge_head=sync.main if files else None)
@@ -1635,7 +1550,6 @@ class Engine:
                                            f"The next round merges main again: resolve every marker.")
             if unresolved:
                 self.ws.abort_in_progress(wt)
-                expected, restore = {}, {}
         refused = self._uncommittable(n, wt)
         if refused:
             # Not committed, and the answer's commands and requests are not kept: the builder gets
@@ -1648,19 +1562,12 @@ class Engine:
             self.store.put(st)
             self.store.event("build_not_committed", issue=n, status=result.status, problems=[p[:600] for p in refused])
             return self._round_failed(n, refused)
-        # A locked test the builder edited without approval is reverted; its proposed content is
-        # kept with a `test_change` request if it made one, for the other vendor to decide.
         st = self.store.issue(n)
-        proposals = self._locked_edits(st, wt, restore)
-        requests = self._new_requests(n, st, result.requests, proposals)
+        requests = self._new_requests(n, st, result.requests)
         subject = (f"Merge main and build #{n}" if files and not unresolved else f"Build #{n}")
-        sha = self._commit_work(n, wt, subject, expected, restore)
-        if files and not unresolved:
-            self._relock(n, wt, expected, sources)
+        sha = self._commit_work(n, wt, subject)
         st = self.store.issue(n)
-        known = {r["id"] for r in st.requests}
         self._absorb_build(st, result, wt)
-        requests = requests + [r for r in st.requests if r["id"] not in known]   # a locked command's change, decided now
         self.store.put(st)
         self.store.event("built", issue=n, sha=sha, status=result.status, note=result.note[:600],
                          requests=[r["id"] for r in requests])
@@ -1681,15 +1588,10 @@ class Engine:
             [r for r in st.requests if r["id"] in {q["id"] for q in requests}]))
 
     def _absorb_build(self, st: IssueState, result, wt: Path | None = None) -> None:
-        """The builder's tests, commands and dispositions. Before the first examination they are its
-        own; after it, commands for locked items change only through an approved request."""
+        """The builder's commands: an item it gives commands for runs those from now on."""
         proofs = {i["id"]: i["proof"] for i in self._items(st)}
         commanded = self._commanded_items(st)
         inside = (lambda rel: self._inside(wt, rel)) if wt is not None else (lambda rel: True)
-        refused = [t for t in result.tests if t and not inside(t)]
-        if refused:
-            self.store.event("test_paths_refused", issue=st.number, paths=refused[:8])
-        st.tests = sorted(set(st.tests) | {t for t in result.tests if t and inside(t)})
         current: dict[str, list[dict]] = {}
         for c in st.commands:
             if c.get("author") == "builder":
@@ -1712,61 +1614,20 @@ class Engine:
         if dropped:
             self.store.event("commands_dropped", issue=st.number, commands=dropped[:8])
         st.dropped = dropped
-
-        def shape(entries: list[dict]) -> list[tuple[str, str]]:
-            return sorted((e["command"], e.get("cwd") or ".") for e in entries)
-        for item, entries in given.items():
-            if st.examined_sha and item in current and shape(current[item]) != shape(entries):
-                st.requests.append({"id": f"R{st.number}-{len(st.requests) + 1}", "kind": "command_change",
-                                    "item": item, "commands": entries, "status": "pending",
-                                    "replaces": self._item_commands(st, item),
-                                    "detail": f"change the locked commands for {item}"})
-                continue
-            current[item] = entries
+        current.update(given)
         st.commands = [e for entries in current.values() for e in entries] + probes
         self._retire_uncommanded(st)
-        for test_id, why in (result.dispositions or {}).items():
-            st.dispositions.setdefault(test_id, why)
         for d in result.decisions or []:
             self._decide(st, d)
 
-    def _locked_edits(self, st: IssueState, wt: Path, restore: dict) -> dict[str, str | None]:
-        """Locked tests the builder changed: their proposed content (None: deleted)."""
-        out = {}
-        for rel, d in st.locked.items():
-            p = wt / rel
-            if rel in restore:
-                continue
-            if not p.is_file():
-                out[rel] = None
-            elif verify.digest(p) != d:
-                out[rel] = p.read_text(errors="replace")
-        return out
-
-    def _new_requests(self, n: int, st: IssueState, requests, proposals: dict[str, str | None]) -> list[dict]:
+    def _new_requests(self, n: int, st: IssueState, requests) -> list[dict]:
         added = []
         for r in requests:
             entry = asdict(r)
             entry["id"] = f"R{n}-{len(st.requests) + 1}"
             entry["status"] = "pending"
-            if r.kind == "test_change":
-                # only locked tests the builder edited (None: deleted); a path it did not edit is no proposal
-                entry["content"] = {p: proposals[p] for p in (r.paths or list(proposals)) if p in proposals}
-            if r.kind == "command_change":
-                # one typed command is added to the item's commands, never put in place of all of them
-                # (#37 lost its checker tests that way); the decider sees what the item runs now
-                entry["replaces"] = self._item_commands(st, r.item or "")
-                if r.command and r.command.get("command"):
-                    c = r.command
-                    entry["command"] = c | {"criterion": r.item, "author": "builder",
-                                            "description": c.get("description") or f"{r.item}: {r.detail[:120]}",
-                                            "timeout_s": min(c.get("timeout_s") or self.caps.check_timeout_s,
-                                                             self.caps.max_check_timeout_s)}
             st.requests.append(entry)
             added.append(entry)
-        unrequested = [p for p in proposals if not any(p in (q.get("content") or {}) for q in added)]
-        if unrequested:
-            st.reverted = sorted(unrequested)
         self.store.put(st)
         return added
 
@@ -1794,8 +1655,7 @@ class Engine:
         self.store.put(st)
         if others:
             with self.ws.disposable(wt) as scratch:
-                shown = [self._shown_request(scratch, r) for r in others]
-                decisions = self.agents.decide(self.other, self._req(n), scratch, shown)
+                decisions = self.agents.decide(self.other, self._req(n), scratch, others)
             by_id = {d.request: d for d in decisions}
             for r in others:
                 d = by_id.get(r["id"])
@@ -1804,7 +1664,7 @@ class Engine:
                     continue
                 r["status"], r["reason"] = ("approved" if d.approve else "refused"), d.reason
                 if d.approve:
-                    self._apply_request(n, st, wt, r, d.dispositions)
+                    self._apply_request(n, st, r)
         for r in disputes:
             f = next((x for x in st.findings if x["id"] == r.get("finding")), None)
             if f is None:
@@ -1824,36 +1684,11 @@ class Engine:
         self.store.put(st)
         self.store.event("requests_decided", issue=n, decided={r["id"]: r["status"] for r in pending})
 
-    def _shown_request(self, scratch: Path, r: dict) -> dict:
-        """A request as its decider gets it. The builder's edit to a locked test is reverted before
-        the decision, so the decider's throwaway copy would hold the locked version, and the proposed
-        file would reach it only as text inside the requests, which an adapter may cut to fit its
-        prompt: #42's examiner was given a replacement that stopped mid-function, and none of the
-        requests listed after it, five builds in a row. So the proposal is put in that copy, where
-        the decider reads and runs it, and the request names its files without their text. The
-        stored request keeps the text, for `_apply_request`."""
-        if r["kind"] != "test_change":
-            return r
-        placed = self._write_proposal(scratch, r)
-        return {k: v for k, v in r.items() if k != "content"} | {
-            "proposed": {p: "deleted" if text is None else "replaced" for p, text in placed.items()}}
-
-    def _write_proposal(self, root: Path, r: dict) -> dict[str, str | None]:
-        """Put the files a `test_change` request proposes in `root` (None: the file is deleted).
-        Returns what was put there: never a path outside `root`, nor the safety surface in a
-        fault-repair run."""
-        content = {p: c for p, c in (r.get("content") or {}).items()
-                   if self._inside(root, p) and (not self.repair or not is_safety_surface(p))}
-        for p, text in content.items():
-            target = root / p
-            if target.is_symlink() or text is None:
-                target.unlink(missing_ok=True)   # replace a link itself, never write through it
-            if text is not None:
-                self._replace_file(target, text)
-        return content
-
     def _engine_refusal(self, st: IssueState, r: dict) -> str | None:
         paths = r.get("paths") or []
+        if r["kind"] in RETIRED_REQUESTS:   # kept by an earlier engine's run: nothing restricts it any more
+            return (f"the loop no longer takes `{r['kind']}` requests: change the file, the test or the command "
+                    f"directly; the examiner reviews it in the diff")
         if self.repair and any(is_safety_surface(p) for p in paths):
             return "a fault-repair run may never change the loop's safety surface"
         if r["kind"] == "reclassify":
@@ -1861,27 +1696,15 @@ class Engine:
                 return f"`owner` is only for a capability this host lacks ({', '.join(self.lacks)})"
             if r.get("item") not in self._agent_items(st):
                 return "only an agent item can be reclassified"
-        if r["kind"] == "test_change" and not r.get("content"):
-            return "a test change needs the proposed content: edit the locked test in your worktree and name it"
         if r["kind"] == "depends" and not r.get("depends_on"):
             return "name the issue it depends on"
         return None
 
-    def _apply_request(self, n: int, st: IssueState, wt: Path, r: dict, dispositions: dict[str, str]) -> None:
+    def _apply_request(self, n: int, st: IssueState, r: dict) -> None:
         kind = r["kind"]
-        if kind in ("paths", "protected_change"):
+        if kind == "protected_change":
             for p in r.get("paths") or []:
-                st.grants.append({"path": p.rstrip("/"), "source": f"approved {r['id']}",
-                                  "protected": kind == "protected_change" or is_protected(p)})
-            self._declare(n, st)
-        elif kind == "command_change" and r.get("commands"):   # the item's whole new list
-            st.commands = [c for c in st.commands if not (c["criterion"] == r["item"] and c.get("author") == "builder")]
-            st.commands.extend(r["commands"])
-        elif kind == "command_change" and (r.get("command") or {}).get("command"):   # one more command
-            c = r["command"]
-            if (c["command"], c.get("cwd") or ".") not in {(x["command"], x.get("cwd") or ".")
-                                                          for x in self._item_commands(st, r["item"])}:
-                st.commands.append(c)
+                st.grants.append({"path": p.rstrip("/"), "source": f"approved {r['id']}", "protected": True})
         elif kind == "reclassify":
             assert st.plan is not None   # requests come from a build, which needs the plan
             st.plan["items"] = [{**i, "proof": "owner", "capability": r.get("capability"),
@@ -1890,26 +1713,6 @@ class Engine:
                                 "agent_part": r.get("detail")})
         elif kind == "depends":
             self._depend(n, st, r.get("item") or "", int(r["depends_on"]), r.get("depends_quote") or "")
-        elif kind == "test_change":
-            content = self._write_proposal(wt, r)
-            removed = [p for p, t in content.items() if t is None]
-            sha = self.ws.commit_all(wt, f"Change locked tests for #{n} (approved {r['id']})", "acceptance-checks", n,
-                                     unlocks=removed or None,
-                                     trailers={"Loop-Approved": f"{r['id']} by {self.other}"})
-            for p, text in content.items():
-                if text is None:
-                    st.locked.pop(p, None)
-                    st.tests = [t for t in st.tests if t != p]
-                    st.probes = [t for t in st.probes if t != p]
-                elif p in st.locked:
-                    st.locked[p] = verify.digest(wt / p)
-            self.store.event("locked_tests_changed", issue=n, request=r["id"], sha=sha, files=sorted(content))
-        st.dispositions.update(dispositions or {})
-        if kind in ("test_change", "command_change") and dispositions and st.manifest:
-            # exact node ids; a disposition naming the function itself retires all its cases
-            def retired(i: str) -> bool:
-                return i in dispositions or (verify.base_id(i) in dispositions and verify.base_id(i) != i)
-            st.manifest = {k: [i for i in v if not retired(i)] for k, v in st.manifest.items()}
         self._decide(st, {"id": r["id"], "choice": f"{kind}: {r.get('detail', '')[:200]}",
                           "rationale": f"approved by {self.other}: {r.get('reason', '')[:300]}"})
 
@@ -1954,125 +1757,14 @@ class Engine:
         st = self.store.issue(n)
         st.conflict_pending = True
         st.conflict_paths = sorted(set(st.conflict_paths) | set(files))
-        st.grants = st.grants + [{"path": f, "source": "conflict", "protected": False} for f in files
-                                 if not any(g["path"] == f for g in st.grants)]
         self.store.put(st)
-        self._declare(n, st)
         self.store.event("conflict", issue=n, phase=phase, files=files)
         self._set_phase(n, Phase.BUILD, feedback=[
             (f"Main moved on and conflicts with this branch in: {', '.join(files)}. The next round starts with main's "
              f"merge in progress; resolve the conflicts in those files.")])
 
-    def _relock_candidates(self, n: int, wt: Path, before: str) -> dict[str, str]:
-        self._drop_deleted_locks(n, wt, before)
-        st = self.store.issue(n)
-        if not st.locked:
-            return {}
-        cwds = sorted({c.get("cwd", ".") for c in st.commands})
-        current = verify.lock(wt, sorted(st.locked), cwds)
-        candidates, refused = {}, []
-        for f, d in current.items():
-            pre = self._digest_at(wt, before, f)
-            if pre == d:
-                continue
-            if pre != st.locked.get(f):
-                refused.append(f)
-                continue
-            candidates[f] = d
-        if refused:
-            self.store.event("checks_not_relocked", issue=n, files=sorted(refused),
-                             reason="changed on the branch before main's merge")
-        return candidates
-
-    def _drop_deleted_locks(self, n: int, wt: Path, before: str) -> None:
-        """A locked file that main's merge deleted, and that the branch had not changed, leaves the
-        lock and the manifest: main removed it, which is no change of this branch to a locked test."""
-        st = self.store.issue(n)
-        gone = sorted(f for f, d in st.locked.items() if not (wt / f).exists() and self._digest_at(wt, before, f) == d)
-        if not gone:
-            return
-        st.locked = {f: d for f, d in st.locked.items() if f not in gone}
-        st.tests = [t for t in st.tests if t not in gone]
-        st.probes = [t for t in st.probes if t not in gone]
-        if st.manifest:
-            st.manifest = {k: [i for i in v if i.split("::")[0] not in gone] for k, v in st.manifest.items()}
-        self.store.put(st)
-        self.store.event("locks_dropped", issue=n, files=gone, reason="deleted on main")
-
-    def _digest_at(self, wt: Path, ref: str, file: str) -> str | None:
-        """The verifier's digest of `file` as `ref` holds it, or None when it is not a file there.
-        Nothing is written for it: a temporary copy is one more file the host can refuse."""
-        data = self.ws.show_bytes(wt, ref, file)
-        return None if data is None else verify.digest(CommittedFile.holding(file, data))
-
-    def _relock(self, n: int, wt: Path, digests: dict[str, str], sources: dict[str, str]) -> None:
-        kept = {f: d for f, d in digests.items() if (wt / f).is_file() and verify.digest(wt / f) == d}
-        if not kept:
-            return
-        st = self.store.issue(n)
-        st.locked = {**st.locked, **kept}
-        self.store.put(st)
-        by_source: dict[str, list[str]] = {}
-        for f in sorted(kept):
-            by_source.setdefault(sources.get(f, "main"), []).append(f)
-        for source, files in sorted(by_source.items()):
-            self.store.event("checks_relocked", issue=n, files=files, source=source)
-
-    def _resolve_locked_conflict(self, n: int, wt: Path, lane: list[str], merge_head: str) -> bool:
-        """Conflicts in locked tests go to the other vendor, never the builder. Its edits outside
-        `lane`, staged or not, are undone from the index entries and bytes taken before it ran."""
-        snapshot = {f: self.ws.file_state(wt, f) for f in self.ws.uncommitted(wt)}
-        index = self.ws.index_entries(wt)
-        feedback = [(f"Main moved on, and merging it into this branch conflicts in the locked tests {', '.join(lane)}. "
-                     f"The merge is in progress: resolve the conflict markers in those files, keeping the requirements "
-                     f"of both sides (main's side tests work already merged). Change nothing else; do not run git "
-                     f"merge, commit or abort.")]
-        with self.ws.agent_call(wt) as call:
-            self.agents.resolve_locked(self.other, self._req(n), wt, lane, feedback)
-        self._absorb_agent_commits(n, wt, call, merge_head=merge_head)
-        restored = []
-        index_now = self.ws.index_entries(wt)
-        changed_in_index = {f for f in set(index) | set(index_now) if index.get(f) != index_now.get(f)}
-        for f in sorted(set(self.ws.uncommitted(wt)) | set(snapshot) | changed_in_index):
-            if any(scheduler.overlaps(f, c) for c in lane):
-                continue
-            now = self.ws.file_state(wt, f)
-            was = snapshot[f] if f in snapshot else self.ws.file_state_at(wt, "HEAD", f)
-            if now == was and f not in changed_in_index:
-                continue
-            if now != was:
-                self.ws.write_file_state(wt, f, was)
-            self.ws.restore_index_entry(wt, f, index.get(f, []))
-            restored.append(f)
-        if restored:
-            self.store.event("resolver_out_of_lane", issue=n, discarded=restored)
-        return self.ws.in_progress(wt) == "merge" and not any(has_conflict_markers(wt / f) for f in lane)
-
-    def _commit_work(self, n: int, wt: Path, subject: str, expected: dict[str, str] | None = None,
-                     restore: dict[str, tuple] | None = None) -> str | None:
-        """Commit the builder's work, minus any edit to a locked test (its proposal is kept with
-        its request). Mid-merge, `expected` holds the locked digests main's merge brought and
-        `restore` their file states: HEAD lacks main's side, so those files are restored from them."""
-        st = self.store.issue(n)
-        restore = restore or {}
-
-        def mode_changed(rel: str) -> bool:
-            ref = restore[rel] if rel in restore else self.ws.file_state_at(wt, "HEAD", rel)
-            now = self.ws.file_state(wt, rel)
-            return ref is not None and (now is None or now[0] != ref[0] or now[2:] != ref[2:])
-
-        touched = [rel for rel, d in {**st.locked, **(expected or {})}.items()
-                   if not (wt / rel).is_file() or verify.digest(wt / rel) != d or mode_changed(rel)]
-        if touched:
-            for rel in touched:
-                if rel in restore:
-                    self.ws.write_file_state(wt, rel, restore[rel])
-            from_head = [rel for rel in touched if rel not in restore]
-            if from_head:
-                self.ws.git("checkout", "HEAD", "--", *from_head, cwd=wt, check=False)
-            self.store.event("locked_changes_reverted", issue=n, files=touched)
-            st.reverted = sorted(set(st.reverted) | set(touched))
-            self.store.put(st)
+    def _commit_work(self, n: int, wt: Path, subject: str) -> str | None:
+        """Commit the builder's work, whatever it changed: the examiner reviews it in the diff."""
         return self.ws.commit_all(wt, subject, "implementation", n)
 
     # ------------------------------------------------------------------ verify
@@ -2085,11 +1777,6 @@ class Engine:
         head = self.ws.head(wt)
         problems: list[str] = []
         notes: list[str] = []
-        if st.reverted:   # already undone: a note for the builder, not a failure of the round
-            notes.append(f"Your edits to the locked tests {st.reverted} were reverted. Leave them unchanged, or "
-                         f"propose a change with a `test_change` request.")
-            self.store.event("reverted_edits_noted", issue=n, files=st.reverted)
-            st.reverted = []
         if st.dropped:
             items = sorted(self._agent_items(st) | {i["id"] for i in self._items(st) if i["proof"] == "owner"})
             notes.append(f"These commands were not kept, so they did not run: {st.dropped[:6]}. A command's "
@@ -2105,58 +1792,30 @@ class Engine:
                              - {c["criterion"] for c in st.commands if c.get("author") == "builder"})
         if uncommanded:
             problems.append(f"no command proves {', '.join(uncommanded)}; return at least one command per item")
-        locked_tests = sorted(set(st.tests) | set(st.probes))
         # Checks are agent-written commands: they run in a throwaway copy of the head on a private git
         # directory, so nothing they do reaches the worktree or another run's refs.
         # The standing checks look at the tree of this head; the history checks at every commit the
         # branch adds to main, which is what a push would publish.
         history = history_checks(f"{self.ws.git('rev-parse', self.ws.base_ref(), cwd=wt)}..{head}")
         with self.ws.disposable(wt) as scratch:
-            ok, evidence, vproblems, ran = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n),
-                                                         st.locked, locked_tests, in_tree(st.manifest) or None,
-                                                         self.caps.check_timeout_s, extra_env=self.check_env,
-                                                         check_tamper=bool(st.examined_sha),
-                                                         standing=standing_checks() + history, mounts=self._mounts(scratch))
+            ok, evidence, vproblems = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n),
+                                                    self.caps.check_timeout_s, extra_env=self.check_env,
+                                                    standing=standing_checks() + history, mounts=self._mounts(scratch))
         refused = history_findings(evidence)
         if refused:   # nothing the builder could do about it in a next round
             return self._history_refused(n, head, refused)
         problems += vproblems
-        selected = {"*": sorted(set(ran) | {t for v in (st.manifest or {}).values() for t in v})}
         base = self.ws.git("merge-base", "HEAD", self.ws.base_ref(), cwd=wt)
-        check_files = [t for t in locked_tests if (wt / t).is_file() and t.endswith(".py")]
-        # A test main already defines is not the issue's to select: a command that runs one test of
-        # an existing suite locks that file, and its other tests were charged to the issue (#51).
-        on_main = self._defined_at(wt, base, check_files)
-        unselected = [t for t in verify.unselected(wt, check_files, selected, st.dispositions) if t not in on_main]
-        if unselected:
-            problems.append(f"tests in locked files that no command selects: {unselected[:6]} — select each one in a "
-                            f"command, or give it a disposition (owner-run, or excluded: <reason>)")
         closed = self._close_findings(n, st, wt, evidence)
         st = self.store.issue(n)
         still = [f for f in st.findings if f.get("status") == "open"]
-        changed = self.ws.changed_files(wt, base)
-        problems += gate.zone_problems(changed, st.grants, st.probes, self.repair)
+        # The builder may change any file: only a protected path without a grant, or the safety
+        # surface in a fault-repair run, is a problem here.
+        problems += gate.protected_problems(self.ws.changed_files(wt, base), st.grants, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
         self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
         st.evidence, st.base_sha = evidence, base
-        st.last_ran = in_tree({"*": sorted(ran)}) if ok else st.last_ran
-        if ok and st.examined_sha:
-            # the manifest only grows: a locked test that ran once must keep running
-            grown = {i for i in ran if i.split("::")[0] in st.locked}
-            if grown - set((st.manifest or {}).get("*", [])):
-                st.manifest = {"*": sorted(set((st.manifest or {}).get("*", [])) | grown)}
         self.store.put(st)
-        if not problems and st.examined_sha:
-            ran_files = {i.split("::")[0] for i in ran} | self._command_tests(wt, st.commands)
-            unlocked = sorted(f for f in ran_files if f not in st.locked and (wt / f).is_file())
-            if unlocked:   # a test file first run now locks now; the new head is verified again
-                self.ws.commit_all(wt, f"Lock newly run tests for #{n}", "acceptance-checks", n, locks=unlocked)
-                st = self.store.issue(n)
-                st.tests = sorted(set(st.tests) | set(unlocked))
-                st.locked = {**st.locked, **verify.lock(wt, unlocked, sorted({c.get("cwd", ".") for c in st.commands}))}
-                self.store.put(st)
-                self.store.event("tests_locked", issue=n, locked=unlocked, late=True)
-                return self._set_phase(n, Phase.VERIFY)
         if not problems:
             nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
@@ -2268,7 +1927,7 @@ class Engine:
             self.store.event("replan", issue=n, count=st.replans)
             return self._set_phase(n, Phase.PLAN, feedback=[
                 "Two rounds changed nothing. Replan on your branch: the same failure keeps coming back. "
-                "Keep what works; change the approach, the zones or the proof kinds (classification changes go through "
+                "Keep what works; change the approach or the proof kinds (classification changes go through "
                 "a request). The failures were: " + "; ".join(problems)[:1500]] + list(told or []))
         self._set_phase(n, Phase.BUILD, feedback=problems + [t for t in told or [] if t not in problems])
 
@@ -2283,10 +1942,14 @@ class Engine:
             return self._set_phase(n, Phase.VERIFY)
         since = st.examined_sha
         memory = [f for f in st.findings if f.get("status") in ("open", "closed", "follow_up")]
+        exam = self._examinations(n, st) + 1
+        bounded = exam >= self.caps.examiner_bound
+        feedback = [self._examination_note(n, exam)] + list(st.exam_feedback)
         with self.ws.disposable(wt) as scratch:   # whatever the examiner changes is discarded with its copy
-            res = self.agents.examine(self.other, self._req(n, st.exam_feedback), st.plan, scratch, st.base_sha, head,
+            res = self.agents.examine(self.other, self._req(n, feedback), st.plan, scratch, st.base_sha, head,
                                       st.evidence, memory, [], since)
         st = self.store.issue(n)
+        st.examinations = exam
         item_text = self._item_text(n)
         rnd = len({f.get("round") for f in st.findings}) + 1
         # A probe is a finding's reproduction with a file: only one a finding names is linted and
@@ -2320,6 +1983,15 @@ class Engine:
                     runs[f.id] = run_record(ran)
             new.append(gate.classify(f, item_text, self.invariants, reproduced, self._agent_items(st),
                                      self._owner_items(st), {i["id"]: i.get("agent_part") or "" for i in self._items(st)}))
+        # The examiner bound (ADR 0001, amendment 12): from this examination on, a finding that
+        # names no safety invariant is a follow-up issue, however well it quotes an item. Several
+        # issues spent their ceilings while every round closed its findings and each examination
+        # raised new edge cases. Findings of earlier examinations still block until they close.
+        bound = [f.id for f in new if bounded and f.blocking and not gate.invariant_ok(f.invariant, self.invariants)]
+        for f in new:
+            if f.id in bound:
+                f.status, f.blocking = "follow_up", False
+                f.reason = f"examination {exam}: past the examiner bound only a safety invariant blocks ({f.reason})"
         # An owner item is judged on its agent part alone, like a finding on one (`gate.classify`):
         # the words an `unmet` must quote are that part's. One that quotes anything else is about
         # what the owner still owes, which is an obligation and nothing the builder can change (#20
@@ -2333,24 +2005,30 @@ class Engine:
             st.verdicts[i] = {**v, "head": head}
         st.findings += [asdict(f) | ({VERIFIER_RUN: runs[f.id]} if f.status == "open" and f.id in runs else {})
                         | ({PROBE_TEXT: probes[f.probe].content} if f.probe else {}) for f in new]
-        first = st.examined_sha is None
         st.examined_sha = head
         self.store.put(st)
-        new_head = self._lock_tests(n, wt) if first else head
-        st = self.store.issue(n)
         blocking = [f for f in new if f.blocking] + [Finding(**{k: v for k, v in f.items() if k in Finding.__dataclass_fields__})
                                                      for f in st.findings if f.get("status") == "open"
                                                      and f.get("round") != rnd]
         self.store.event("examined", issue=n, head=head, findings={f.id: f.status for f in new},
-                         unmet=unmet, missing=missing, certify=res.certify, rejected=rejected,
-                         **({"owner_evidence": misjudged} if misjudged else {}))
+                         unmet=unmet, missing=missing, certify=res.certify, rejected=rejected, examination=exam,
+                         **({"bounded": bound} if bound else {}), **({"owner_evidence": misjudged} if misjudged else {}))
         problems = []
         if unmet:
             problems += [f"{i} judged unmet by the examiner" for i in unmet]
         if blocking:
             problems += [f"blocking finding {f.id}: {f.title}" for f in blocking]
         if not res.certify and not problems and not missing:
-            problems.append(f"the examiner withheld its certificate: {res.summary[:400]}")
+            if not bounded:
+                problems.append(f"the examiner withheld its certificate: {res.summary[:400]}")
+            else:   # every item is met and nothing names an invariant: past the bound, that certifies
+                self._decide(st, {"id": f"examiner-bound-{exam}",
+                                  "choice": f"examination {exam} certified `{head[:12]}` without the examiner's certificate",
+                                  "rationale": "past the examiner bound only an unmet item or a finding that names a "
+                                               "safety invariant withholds a certificate; the examiner said: "
+                                               + res.summary[:400]})
+                self.store.put(st)
+                self.store.event("certified_by_bound", issue=n, head=head, examination=exam, summary=res.summary[:400])
         if problems:
             bundled = [f for f in new if f.status == "follow_up"]
             if bundled:
@@ -2360,7 +2038,7 @@ class Engine:
             # reach the next build. #85's refusals were dropped here, then again by its revival.
             return self._round_failed(n, problems, [f.id for f in blocking], unmet, told=list(st.feedback))
         # A verdict the examiner still owes is asked of it again, at most twice; it is not the
-        # builder's failure. No probe is owed: the builder's locked tests prove the items.
+        # builder's failure. No probe is owed: the builder's tests prove the items.
         st = self.store.issue(n)
         owed = ([f"give a verdict on {', '.join(missing)}"] if missing else []) + (
             [f"judge {i} on its agent part alone (\"{parts[i][:300]}\"): `met` when that part is delivered on this "
@@ -2371,51 +2049,34 @@ class Engine:
                 f"Your previous examination is incomplete: {'; '.join(owed)}."])
         if missing:
             return self._round_failed(n, [f"no verdict on {', '.join(missing)} after two requests"], [], missing)
-        if new_head != head:
-            # the lock commit made a new head: it is verified, then certified by a delta examination
-            return self._set_phase(n, Phase.VERIFY, feedback=[], exam_feedback=[], exam_retries=0)
         self._set_phase(n, Phase.VERIFY, certified_sha=head, feedback=[], exam_feedback=[], exam_retries=0)
 
-    @staticmethod
-    def _command_tests(wt: Path, commands: list[dict]) -> set[str]:
-        """Test files the builder's commands name (a script under tests/ or checks/, test_*.py,
-        *.test.mjs...): they lock with the tests, so a command cannot keep running an editable file."""
-        import shlex
-        out = set()
-        for c in commands:
-            if c.get("author") != "builder":
-                continue
-            try:
-                tokens = shlex.split(c.get("command") or "")
-            except ValueError:
-                continue
-            base = wt / (c.get("cwd") or ".")
-            expanded = []
-            for tok in tokens:
-                tok = tok.split("::")[0]
-                try:
-                    expanded += ([str(p.relative_to(base)) for p in base.glob(tok)] if any(ch in tok for ch in "*?[")
-                                 else [tok])
-                except (OSError, ValueError, NotImplementedError):
-                    # A pattern the file system or pathlib refuses (an overlong name, an absolute
-                    # pattern) names no test file: it is the builder's text, not an engine fault.
-                    continue
-            for tok in expanded:
-                rel = Path(c.get("cwd") or ".") / tok
-                try:
-                    path = (wt / rel).resolve()
-                    if not path.is_file() or not path.is_relative_to(wt.resolve()):
-                        continue
-                except (OSError, ValueError):
-                    # A token the file system refuses (a name longer than it takes, an embedded
-                    # NUL) names no test file either. Nothing of what the system said is kept.
-                    continue
-                rel_s = str(path.relative_to(wt.resolve()))
-                name = path.name
-                if (name.startswith("test_") or name.endswith(("_test.py", ".test.mjs", ".test.js", ".test.ts"))
-                        or any(part in ("tests", "checks") for part in Path(rel_s).parts[:-1])):
-                    out.add(rel_s)
-        return out
+    def _examinations(self, n: int, st: IssueState) -> int:
+        """The examinations of `n` since its latest plan. A state an earlier engine wrote has no
+        count (None): it is read from the journal, as the `examined` events after `n`'s last
+        `planned` one, so an issue in flight keeps the examinations it already had."""
+        if st.examinations is not None:
+            return st.examinations
+        count = 0
+        for e in self.store.events():
+            if e.get("issue") == n and e.get("kind") == "planned":
+                count = 0
+            elif e.get("issue") == n and e.get("kind") == "examined":
+                count += 1
+        return count
+
+    def _examination_note(self, n: int, exam: int) -> str:
+        """What the examiner is told of the examiner bound (`Caps.examiner_bound`): which
+        examination this is, and what blocks in it."""
+        bound = self.caps.examiner_bound
+        said = f"This is examination {exam} of #{n} since its latest plan."
+        if exam < bound:
+            return (f"{said} A finding blocks when it quotes an item or names a safety invariant. From examination "
+                    f"{bound} on, only a finding that names a safety invariant will block.")
+        return (f"{said} From examination {bound} on, only a finding that names a safety invariant blocks: a "
+                f"finding that names only an item becomes a follow-up issue and does not block. Certify this commit "
+                f"once every item an agent must prove is met; withhold the certificate only with an `unmet` verdict "
+                f"or a finding that names a safety invariant.")
 
     def _probe_problem(self, p) -> str | None:
         if not p.file or not p.command or not p.content:
@@ -2440,41 +2101,6 @@ class Engine:
             bad = verify.unconditional_failures(Path(tmp), [p.file])
         return f"it fails unconditionally: {bad[0]}" if bad else None
 
-    @staticmethod
-    def _defined_at(wt: Path, rev: str, files: list[str]) -> set[str]:
-        """The tests defined in these files as they stand at `rev` (a file it lacks defines none)."""
-        with tempfile.TemporaryDirectory(prefix="loop-base-") as tmp:
-            root, present = Path(tmp), []
-            for f in files:
-                proc = subprocess.run(["git", "show", f"{rev}:{f}"], cwd=wt, capture_output=True, check=False)
-                if proc.returncode == 0:
-                    (root / f).parent.mkdir(parents=True, exist_ok=True)
-                    (root / f).write_bytes(proc.stdout)
-                    present.append(f)
-            return set(verify.defined_tests(root, present))
-
-    def _lock_tests(self, n: int, wt: Path) -> str:
-        """At the first examination the builder's tests, their configuration and the selection
-        manifest lock, pass or fail; whatever the commands actually ran locks too, listed by the
-        builder or not. No examiner probe is ever committed."""
-        st = self.store.issue(n)
-        ran_files = {i.split("::")[0] for ids in st.last_ran.values() for i in ids}
-        st.tests = sorted(set(st.tests) | {f for f in ran_files | self._command_tests(wt, st.commands)
-                                           if (wt / f).is_file()})
-        existing = [t for t in st.tests if (wt / t).is_file()]
-        if not existing:
-            return self.ws.head(wt)
-        sha = self.ws.commit_all(wt, f"Lock the tests for #{n}", "acceptance-checks", n, locks=existing)
-        st.locked = {**st.locked, **verify.lock(wt, existing, sorted({c.get("cwd", ".") for c in st.commands}))}
-        if not st.manifest:
-            st.manifest = {k: list(v) for k, v in st.last_ran.items()}
-        head = self.ws.head(wt)
-        st.verified_sha = head
-        self.store.put(st)
-        self.store.event("tests_locked", issue=n, sha=sha, locked=sorted(st.locked))
-        return head
-
-    # ------------------------------------------------------------------ land
     def _step_land(self, n: int) -> None:
         try:
             st = self.store.issue(n)
@@ -2526,7 +2152,6 @@ class Engine:
                 if sync.status == "merged":
                     self.store.event("updated_from_main", issue=n, phase=Phase.LAND.value, frm=sync.before,
                                      to=self.ws.head(wt), main=sync.main)
-                    self._relock(n, wt, self._relock_candidates(n, wt, sync.before), {})
                     return self._set_phase(n, Phase.VERIFY)
             else:
                 # A head the owner lands is not brought up to date: however far main moved, nothing is
@@ -2586,14 +2211,7 @@ class Engine:
                 return self._set_phase(n, Phase.VERIFY)
             self._open_pull(n, st, head)
             assert st.pr is not None   # recorded by `_open_pull`
-            conclusion, run_id = self._wait_required(head)
-            if conclusion != "success" and head not in st.ci_rerun_heads:
-                st.ci_rerun_heads.append(head)
-                self.store.put(st)
-                rerun = self._safe(self.gh.rerun_failed, head)
-                self.store.event("ci_rerun", issue=n, head=head, conclusion=conclusion, started=bool(rerun))
-                if rerun:
-                    conclusion, run_id = self._wait_required(head, after=run_id)
+            conclusion = self._wait_required(head)
             if conclusion != "success":
                 return self._ci_failed(n, head, conclusion)
             try:
@@ -3009,26 +2627,25 @@ class Engine:
 
     def _ci_failed(self, n: int, head: str, conclusion: str | None) -> None:
         if conclusion in CI_NO_VERDICT:
-            st = self.store.issue(n)
-            st.ci_rerun_heads = [h for h in st.ci_rerun_heads if h != head]
-            self.store.put(st)
             return self._wait(n, WAIT_CI, f"the required check gave no verdict on {head[:7]} ({conclusion})",
                               resume=Phase.LAND)
         log = self._safe(self.gh.failed_log, head, skip=self.cfg.required_check) or "(no log available)"
         self.store.event("ci_failed", issue=n, head=head, conclusion=conclusion)
-        self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}, also after one re-run. Find and "
-                                f"fix the cause; never weaken or skip a check to get green. Tail of the failed log:\n"
+        self._round_failed(n, [(f"The required CI check is '{conclusion}' on {head[:7]}. Find and fix the cause; "
+                                f"never weaken or skip a check to get green. Tail of the failed log:\n"
                                 f"{log[-3000:]}")])
 
-    def _wait_required(self, sha: str, after: int | None = None) -> tuple[str, int | None]:
+    def _wait_required(self, sha: str) -> str:
+        """The conclusion of the required check on `sha`: `pending` when it ran and gave none in
+        time, `missing` when it never ran. A failed check is never run again: it goes to the
+        builder with its log (`_ci_failed`)."""
         waited = 0
         while True:
             run = self.gh.required_check_run(sha, self.cfg.required_check)
-            fresh = run is not None and (after is None or run["id"] != after)
-            if fresh and run["status"] == "completed" and run["conclusion"] not in (None, "pending"):
-                return run["conclusion"], run["id"]
+            if run is not None and run["status"] == "completed" and run["conclusion"] not in (None, "pending"):
+                return run["conclusion"]
             if waited >= self.caps.ci_timeout_s:
-                return ("pending" if fresh else "missing"), (run or {}).get("id")
+                return "pending" if run is not None else "missing"
             self.sleep(self.caps.ci_poll_s)
             waited += self.caps.ci_poll_s
 
@@ -3048,25 +2665,12 @@ class Engine:
         edited = ["the issue was edited after its work was merged; deliver the edited version"]
         if not self._requirements_current(n):
             return self._owner_round(n, edited)
-        coord = self.ws.coord()
-        head = self.ws.head(coord)
-        with self.ws.disposable(coord) as scratch:
-            # behaviour only: a later reviewed merge may change this issue's locked tests on main
-            ok, evidence, problems, _ = verify.verify(scratch, self._specs(st), head, self.store.issue_dir(n), st.locked,
-                                                      sorted(set(st.tests) | set(st.probes)), in_tree(st.manifest) or None,
-                                                      self.caps.check_timeout_s, extra_env=self.check_env,
-                                                      check_tamper=False, standing=standing_checks(),
-                                                      mounts=self._mounts(scratch))
-        self.store.event("post_merge_verify", issue=n, head=head, ok=ok, problems=problems)
-        if not ok:
-            env = environment_problem(evidence)
-            if env:
-                return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}",
-                                  resume=Phase.MERGED)
-            return self._fix_forward(n, ["verification failed on main after the merge: " + "; ".join(problems)[:600]])
-        regressions = self._regressions(n, coord, head)
-        if regressions:
-            return self._fix_forward(n, regressions)
+        self.ws.coord()   # the worktree read-only agents work in follows `main`
+        # The evidence is the trusted verifier's, on the head that landed (the land step merges only
+        # a verified and certified head). Nothing runs again on `main`: CI runs every test there.
+        # Only the verifier's own records: a second pass of this step finds the ones added below.
+        evidence = [e for e in st.evidence if e.get("kind") == "command"]
+        head = st.verified_sha or next((e["head_sha"] for e in evidence), "")
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         deployed = self._deployment_evidence(st)   # the pipeline's verdict on the merge commit, when one was awaited
         checked = self._ci_discharged(n, st)       # owner items a CI job proved on the head that was merged
@@ -3085,7 +2689,7 @@ class Engine:
         exempt = owed - self._agent_part_items(st)       # an owner item's agent part must still be proven
         unproven = [i.id for i in issue_parser.ledger(issue.get("body") or "") if i.id not in proven and i.id not in exempt]
         if unproven:
-            return self._fix_forward(n, [f"ledger items without evidence on main: {unproven}"])
+            return self._fix_forward(n, [f"ledger items without evidence on the head that landed: {unproven}"])
         links = {cid: link for cid in proven if cid not in owed} | {i: e["address"] for i, e in checked.items()}
         ticked = issue_parser.tick(issue.get("body") or "", links)
         if ticked != (issue.get("body") or ""):
@@ -3110,9 +2714,6 @@ class Engine:
         if verified:
             self.store.event("obligations_discharged", issue=n, head=next(iter(verified.values()))["head_sha"],
                              items={i: e["context"] for i, e in verified.items()})
-        self.store.put_section("accepted_checks", str(n), {
-            "checks": [c for c in st.commands], "check_files": sorted(set(st.tests) | set(st.probes)),
-            "manifest": st.manifest})
         self._announce(n, st, Phase.DELIVERED if st.obligations else Phase.DONE)
         if st.worktree:
             self.ws.remove(Path(st.worktree))
@@ -3227,11 +2828,13 @@ class Engine:
         follow = [f for f in st.findings if f.get("status") == "follow_up"]
         if not follow or st.followup:
             return
-        lines = [f"- **{f['title']}** — observed: {f.get('observed')}; expected: {f.get('expected')}; reproduce: "
+        lines = [f"- **{f['title']}**" + (f" (on {f['item']})" if f.get("item") else "")
+                 + f" — observed: {f.get('observed')}; expected: {f.get('expected')}; reproduce: "
                  f"`{f.get('reproduction') or f.get('probe')}`" for f in follow]
         body = (f"Follow-up to #{n}" + (f" (PR #{st.pr})" if st.pr else "") + ". The other vendor's examination "
-                "reproduced these findings, which no ledger item or safety invariant requires, so they did not block "
-                "the merge:\n\n" + "\n".join(lines) + "\n")
+                "reproduced these findings. They did not block the merge: no ledger item or safety invariant requires "
+                f"them, or they were raised from examination {self.caps.examiner_bound} on, when only a safety "
+                "invariant blocks:\n\n" + "\n".join(lines) + "\n")
         created = self._safe(self.gh.create_issue, f"Follow-up to #{n}: {len(follow)} non-blocking finding(s)", body,
                              [FOLLOWUP_LABEL[0]])
         if created:
@@ -3257,8 +2860,8 @@ class Engine:
         self._set_phase(n, Phase.PENDING)
 
     def _fix_forward(self, n: int, feedback: list[str]) -> None:
-        """A merged change broke `main`: one fix-forward round, then a revert PR through the same
-        gates; `main` is never left red."""
+        """A merged change broke `main` (its deployment failed, or a ledger item has no evidence):
+        one fix-forward round, then a revert PR through the same gates; `main` is never left red."""
         st = self.store.issue(n)
         if st.fix_forwards >= self.caps.fix_forwards:
             return self._revert(n, feedback)
@@ -3288,9 +2891,9 @@ class Engine:
         if st.worktree:   # the revert's worktree takes the issue worktree's place, as the next round does
             self.ws.remove(Path(st.worktree))
             st.worktree = None
-        # A revert lands through the same gates as any change: the merge queue, the trusted
-        # verifier (every earlier issue's checks on the reverted tree), the other vendor's
-        # certificate for the exact head, and the required check on it.
+        # A revert lands through the same gates as any change: the merge queue, the standing and
+        # history checks, the other vendor's certificate for the exact head, and the required check
+        # on it.
         waited = 0
         while not self._take_queue(n):
             if waited >= self.caps.queue_wait_s or self._unreleasable_hold(n):
@@ -3308,10 +2911,6 @@ class Engine:
             self.ws.git("reset", "--hard", "--quiet", main_sha, cwd=wt)
             self.ws.git("revert", "--no-edit", *[pr["merge_commit_sha"] for pr in merged], cwd=wt)
             head = self.ws.head(wt)
-            regressions = self._regressions(n, wt, head)
-            if regressions:
-                return self._fail(n, "main_broken", "reverting it still leaves earlier issues' checks failing: "
-                                                    + "; ".join(regressions)[:500])
             with self.ws.disposable(wt) as scratch:   # like any head that is pushed: the standing checks first
                 _, standing = verify.standing_checks(scratch, standing_checks(), head, self.store.issue_dir(n) / "revert",
                                                      self.caps.check_timeout_s, self.check_env, self._mounts(scratch))
@@ -3327,7 +2926,7 @@ class Engine:
                 exam = self.agents.examine(self.other, self._req(n, [
                     (f"Certify a revert: the loop reverts this issue's merged change because main fails after it and a "
                      f"fix-forward did not repair it. Check that `{main_sha[:12]}..{head[:12]}` only undoes that "
-                     f"change and leaves main working.")]), {"items": [], "zones": []}, scratch, main_sha, head, [], [], [],
+                     f"change and leaves main working.")]), {"items": []}, scratch, main_sha, head, [], [], [],
                     None)
             serious = []
             for f in exam.findings:   # the same rule as any examination: reproduced, witnessed, tied to an invariant
@@ -3359,7 +2958,7 @@ class Engine:
             if not self._push(wt, head if local is not None else None) or self.ws.head(wt) != head:
                 return self._fail(n, "main_broken", "main moved while the revert was being certified")
             rpr = self._revert_pull(n, branch, [pr["number"] for pr in merged], feedback)
-            conclusion, _ = self._wait_required(head)
+            conclusion = self._wait_required(head)
             if conclusion != "success":
                 return self._fail(n, "main_broken", f"the revert PR #{rpr['number']} did not pass the required check "
                                                     f"({conclusion})")
@@ -3375,8 +2974,8 @@ class Engine:
         """Open the pull request of a revert of the pull requests `of`, from `branch`."""
         prs = ", ".join(f"#{number}" for number in of)
         body = (f"The implement loop reverts PR {prs} for #{n}: after its merge, `main` fails and one fix-forward "
-                f"did not repair it. Verified (earlier issues' checks) and certified by {self.other} on this exact "
-                f"head.\n\n" + "\n".join(f"- {f}" for f in feedback)[:3000])
+                f"did not repair it. Scanned and certified by {self.other} on this exact head.\n\n"
+                + "\n".join(f"- {f}" for f in feedback)[:3000])
         return self.gh.create_pr(branch, self.cfg.base_branch, f"Revert #{n}: it broke main", body)
 
     def _reverted(self, n: int, pr: int, feedback: list[str]) -> None:
@@ -3442,46 +3041,6 @@ class Engine:
         detail = self._owner_pull(n, record, lambda: self._revert_pull(n, branch, of, feedback))
         self.store.put(st)
         self._wait(n, WAIT_OWNER_LANDING, f"a revert: {detail}", resume=Phase.MERGED)
-
-    def _regressions(self, n: int, coord: Path, head: str) -> list[str]:
-        """Re-run the commands of the run's earlier issues on `main` after a merge; an issue whose
-        checks fail is checked once more, and fails only if they fail twice. Not re-run: an
-        examiner's check (a probe an earlier engine committed), and a check that names a test file
-        or a test main no longer holds; nor are the locked tests of the files a skipped check
-        names, or a locked test main no longer defines, required to run. A reviewed merge removed
-        or renamed them on purpose."""
-        out = []
-        fields = CheckSpec.__dataclass_fields__
-        for key, entry in sorted(self.store.state.get("accepted_checks", {}).items()):
-            m = int(key)
-            if m == n:
-                continue
-            commands = [c for c in entry["checks"] if c.get("kind", "command") == "command"]
-            skipped = [c for c in commands if c.get("author") == "examiner"
-                       or any(not (coord / f).exists() for f in named_tests(c))
-                       or any(not defines_test(coord, node) for node in named_nodes(c))]
-            if skipped:
-                self.store.event("regression_check_skipped", issue=n, of=m,
-                                 checks=[(c.get("command") or "")[:160] for c in skipped])
-            gone = {f for c in skipped for f in named_tests(c)}   # no check left runs their tests
-            manifest = {k: [i for i in v if i.split("::")[0] not in gone and defines_test(coord, i)]
-                        for k, v in (entry.get("manifest") or {}).items()}
-            checks = [CheckSpec(**{k: v for k, v in c.items() if k in fields}) for c in commands if c not in skipped]
-            if not checks:
-                continue
-            for attempt in (1, 2):   # a failure is checked once more: a test that fails under load
-                with self.ws.disposable(coord) as scratch:   # once is no regression (#22, 2026-11-16)
-                    ok, evidence, problems, _ = verify.verify(
-                        scratch, checks, head, self.store.issue_dir(m) / "regression", {},
-                        entry.get("check_files", []), manifest or None, self.caps.check_timeout_s,
-                        extra_env=self.check_env, check_tamper=False, mounts=self._mounts(scratch))
-                self.store.event("regression_check", issue=n, of=m, head=head, ok=ok, problems=problems,
-                                 attempt=attempt)
-                if ok or environment_problem(evidence):
-                    break
-            if not ok and not environment_problem(evidence):
-                out.append(f"after #{n} merged, #{m}'s checks fail on main: " + "; ".join(problems)[:400])
-        return out
 
     def _reconcile_delivered(self) -> None:
         """A delivered issue whose owner has since ticked every remaining box is done. A deferred
@@ -3590,20 +3149,36 @@ class Engine:
             self.store.event("run_summary_not_published", error=str(e)[:300])
 
 
+ACCEPTANCE_CHECKS = "^Loop-Phase: acceptance-checks$"   # the trailer of a commit CI's loop guard reads
+
+
+def locked_on_branch(ws: Workspace, wt: Path) -> list[str]:
+    """The files CI's loop guard (`scripts/check-loop-guard.sh`) holds locked at the head of the
+    branch in `wt`, read as it reads them: what each acceptance-checks commit since main wrote or
+    named in `Loop-Locks`, less what that commit or a later one named in `Loop-Unlocks`. Merge
+    commits count for nothing."""
+    locked: set[str] = set()
+    commits = ws.git("rev-list", "--reverse", "--no-merges", f"--grep={ACCEPTANCE_CHECKS}", f"{ws.base_ref()}..HEAD",
+                     cwd=wt).split()
+    for sha in commits:
+        lines = ws.git("log", "-1", "--format=%B", sha, cwd=wt).splitlines()
+        unlocks = {line.removeprefix("Loop-Unlocks: ") for line in lines if line.startswith("Loop-Unlocks: ")}
+        locks = {line.removeprefix("Loop-Locks: ") for line in lines if line.startswith("Loop-Locks: ")}
+        written = set(ws.git("diff-tree", "--no-commit-id", "--name-only", "--diff-filter=d", "-r", sha,
+                             cwd=wt).splitlines())
+        locked = (locked - unlocks) | ({f for f in written | locks if f} - unlocks)
+    return sorted(locked)
+
+
 def has_conflict_markers(path: Path) -> bool:
     return path.is_file() and bool(CONFLICT_MARKER.search(path.read_text(errors="replace")))
 
 
-def conflict_feedback(files: list[str], locked: list[str]) -> str:
-    text = ("Main moved on, and merging it into this branch conflicts. The merge is in progress in your worktree."
-            if files or locked else "")
-    if files:
-        text += (f" Resolve the conflict markers in {', '.join(files)}, keeping the intent of both sides: main's side "
-                 f"is work already merged, this branch's side is this issue's work.")
-    if locked:
-        text += (f" The conflicts in the locked tests {', '.join(locked)} were resolved by the other vendor; do not "
-                 f"edit them.")
-    return text + " Do not run git merge, commit or abort: the engine concludes the merge."
+def conflict_feedback(files: list[str]) -> str:
+    return ("Main moved on, and merging it into this branch conflicts. The merge is in progress in your worktree. "
+            f"Resolve the conflict markers in {', '.join(files)}, keeping the intent of both sides: main's side is "
+            f"work already merged, this branch's side is this issue's work. Do not run git merge, commit or abort: "
+            f"the engine concludes the merge.")
 
 
 def criterion_item(criterion: str | None, items: set[str]) -> str | None:
@@ -3613,66 +3188,6 @@ def criterion_item(criterion: str | None, items: set[str]) -> str | None:
         return criterion
     m = CRITERION_LEAD.match(criterion or "")
     return m.group(1) if m and m.group(1) in items else None
-
-
-def in_tree(manifest: dict | None) -> dict:
-    """A selection without the tests that ran outside the checked tree: the plugin keeps their ids
-    absolute (a copy of the tree a command made under `/tmp`). Their path changes on every run, so
-    they can never be required."""
-    return {k: [i for i in v if not i.startswith("/")] for k, v in (manifest or {}).items()}
-
-
-def named_tests(check: dict) -> list[str]:
-    """The test files a check's command names, from the repository's root, whether they exist or
-    not: a path word named as a test is (`test_*.py`, `*_test.py`, `*.test.js`...), one with a
-    suffix under a `tests/` or `checks/` folder, or any source file (`.py`, `.sh`, `.js`, `.mjs`,
-    `.ts`): an earlier engine committed probes at the root (`examiner_probe_x.py`). A glob
-    pattern or an option names none."""
-    return [path for path, _ in _named(check)]
-
-
-def named_nodes(check: dict) -> list[str]:
-    """The tests a check's command names by node id (`tests/test_a.py::Case::test_x`), from the
-    repository's root."""
-    return [f"{path}::{names}" for path, names in _named(check) if names]
-
-
-def _named(check: dict) -> list[tuple[str, str]]:
-    import shlex
-    try:
-        words = shlex.split(check.get("command") or "")
-    except ValueError:
-        return []
-    out = []
-    for word in words:
-        word, _, names = word.partition("::")
-        if not word or word.startswith("-") or any(ch in word for ch in "*?["):
-            continue
-        path = posixpath.normpath(posixpath.join(check.get("cwd") or ".", word))
-        parts = path.split("/")
-        if path.startswith(("/", "..")) or "." not in parts[-1]:
-            continue
-        if (parts[-1].startswith("test_") or parts[-1].endswith((".py", ".sh", ".js", ".mjs", ".ts"))
-                or any(part in ("tests", "checks") for part in parts[:-1])):
-            out.append((path, names))
-    return out
-
-
-def defines_test(root: Path, node: str) -> bool:
-    """Whether the tree at `root` still holds the test a node id names: its file exists and, in a
-    Python file, each name after the path (a class, then a function; a parameter set dropped) is
-    defined in it. Read from the text, not collected: a test inherited from another module reads
-    as gone."""
-    path, *names = node.split("::")
-    try:
-        text = (root / path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    if not path.endswith(".py"):
-        return True
-    return all(re.search(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(name.split('[')[0])}\b", text,
-                         re.MULTILINE)
-               for name in names)
 
 
 def _names_probe(command: dict, probe: str) -> bool:

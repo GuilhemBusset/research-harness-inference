@@ -42,8 +42,7 @@ print(json.dumps({{"type": "result", "is_error": False, "total_cost_usd": 0.01,
                    "structured_output": {answer}}}))
 '''
 
-BUILT = {"status": "done", "note": "built", "tests": [], "commands": [], "dispositions": [], "decisions": [],
-         "requests": []}
+BUILT = {"status": "done", "note": "built", "tests": [], "commands": [], "decisions": [], "requests": []}
 
 
 class StubWorkspace:

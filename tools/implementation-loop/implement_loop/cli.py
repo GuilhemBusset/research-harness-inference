@@ -625,7 +625,7 @@ def cmd_run(args) -> int:
                     invoked_at=invoked_at, policy=policy)
     import signal as _signal
 
-    def _terminate(signum, frame):   # the supervisor's deadline: stop agents, then let the run save and exit
+    def _terminate(signum, frame):   # a deadline the supervisor was given, or any SIGTERM: stop agents, save, exit
         (store.dir / "STOP").write_text("terminated\n")
         agents.terminate_all()
     _signal.signal(_signal.SIGTERM, _terminate)
@@ -648,7 +648,9 @@ def cmd_supervise(args) -> int:
     if args.detach:
         log = RunStore.for_root(root, args.issue).dir / "supervisor.log"
         cmd = [sys.executable, str(root / "tools" / "implementation-loop" / "implement.py"), "supervise", str(args.issue),
-               "--operator", operator, "--yes", "--max-runs", str(args.max_runs), "--max-hours", str(args.max_hours)]
+               "--operator", operator, "--yes", "--max-runs", str(args.max_runs)]
+        if args.max_hours is not None:
+            cmd += ["--max-hours", str(args.max_hours)]
         with open(log, "a") as out:
             proc = subprocess.Popen(cmd, cwd=root, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True)
@@ -699,7 +701,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--operator", choices=["claude", "codex"])
     p.add_argument("--yes", action="store_true", help="the user confirmed that these runs merge their own PRs")
     p.add_argument("--max-runs", type=int, default=10)
-    p.add_argument("--max-hours", type=float, default=24)
+    p.add_argument("--max-hours", type=float, default=None,
+                   help="stop the supervision after this many hours (default: no deadline)")
     p.add_argument("--detach", action="store_true", help="keep supervising after this terminal or session closes")
     p.set_defaults(func=cmd_supervise)
     p = sub.add_parser("record-fixture", help="record GitHub reads for offline tests")

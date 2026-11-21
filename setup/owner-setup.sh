@@ -659,9 +659,9 @@ EOF
   fi
   cat <<'EOF'
 
-The first deployment of the pipeline stack, once, from this machine: the pipeline stack is not
-in the repository yet, and its command arrives with it. It needs this bootstrap and the
-configuration of step 4.
+After bootstrap, follow the first-deployment command in docs/runbooks/owner-setup.md, step 6.
+It creates the pipeline and its pending GitHub connection. The pipeline adds the spike jobs on
+its first self-update after you authorize that connection.
 EOF
   pause
 }

@@ -1,12 +1,12 @@
 """The pipeline's verification step (src/rhi/pipeline/verify.py; system design, section 8.2, step
-6): the action named Verify, after the stage's deployment, which runs the verification script and
-builds no image; a post-build phase that copies the script's reason, when there is one, to the
+6): the action named Verify, after the stage's deployment, which runs the decision whether the
+execution verifies on the coursework pool before the verification script, and builds no image; a post-build phase that copies the script's reason, when there is one, to the
 key verification/<execution ID>/not-run of the artifact bucket, the IDs of the smoke tests
 that failed to failed-smoke-tests beside it, and the last lifecycle stage each instance reached to
 last-stages; inputs that are outputs of the stage's stacks and the execution's ID; and a role that
 reads the canary's secret, queries the stage's workspace, reads the stage's pools' release
-parameters, queries the stage's heartbeats table, and that one table, and writes under
-verification/.
+parameters, queries the stage's heartbeats table, and that one table, writes under
+verification/, describes groups and their refreshes, and lists its own pipeline's executions.
 
 The tests read the app's own pipeline, the one that is deployed. Two of them also build the app
 from a changed configuration, with no listener and with no pool.
@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import gpu_verification as decision
 import verify as script
 from rhi import config
 
@@ -153,9 +154,14 @@ def test_the_verification_is_the_action_named_verify_after_the_deployment(verifi
 def test_the_step_runs_the_script_outside_the_network_and_builds_no_image(verification: Verification) -> None:
     install, build = verification.phases["install"]["commands"], verification.phases["build"]["commands"]
     assert all(re.fullmatch(r"python3 -m pip install uv==\d+\.\d+\.\d+", command) for command in install) and install
-    # The script is a command of its own, after the locked environment: its exit is the build's.
-    assert build == ["uv sync --locked", "uv run --locked python scripts/pipeline/verify.py"]
-    assert (REPO / "scripts/pipeline/verify.py").is_file()
+    # The decision and the script are each a command of their own, after the locked environment:
+    # each one's exit is the build's.
+    assert build == [
+        "uv sync --locked",
+        "uv run --locked python scripts/pipeline/gpu_verification.py",
+        "uv run --locked python scripts/pipeline/verify.py",
+    ]
+    assert (REPO / "scripts/pipeline/verify.py").is_file() and (REPO / "scripts/pipeline/gpu_verification.py").is_file()
     assert "VpcConfig" not in verification.project
     assert verification.project["Environment"]["PrivilegedMode"] is False
     commands = [command for phase in verification.phases.values() for command in phase["commands"]]
@@ -306,9 +312,19 @@ def test_the_role_reads_one_secret_and_writes_under_verification_only(verificati
     assert write["Action"] == "s3:PutObject"
     assert text(write["Resource"]) == f"<{store}.Arn>/verification/*"
 
-    # Beside the five grants, only CodeBuild's own: the project's logs and test reports.
+    # Beside the seven grants, only CodeBuild's own: the project's logs and test reports.
     services = {action.partition(":")[0] for s in verification.statements for action in as_list(s["Action"])}
-    assert services == {"secretsmanager", "s3", "aps", "ssm", "dynamodb", "logs", "codebuild"}
+    assert services == {
+        "secretsmanager",
+        "s3",
+        "aps",
+        "ssm",
+        "dynamodb",
+        "autoscaling",
+        "codepipeline",
+        "logs",
+        "codebuild",
+    }
     assert all(statement["Effect"] == "Allow" for statement in verification.statements)
 
 
@@ -340,6 +356,41 @@ def test_the_role_queries_the_stage_s_workspace_and_reads_the_stage_s_release_pa
     assert sorted(text(r) for r in as_list(read["Resource"])) == sorted(
         f"arn:<>:ssm:<>:<>:parameter{name}" for name in given.values()
     )
+
+
+def test_the_decision_on_the_coursework_pool_ends_before_the_coursework_tests(
+    verification: Verification, tmp_path: Path
+) -> None:
+    # The decision runs in the build phase, after the locked environment and before the script that
+    # runs the smoke tests on the coursework pool: a command that fails ends the phase, so a failed
+    # decision runs no test, and the tests begin once its wait for the refresh is over.
+    build = verification.phases["build"]["commands"]
+    (decides,) = [at for at, command in enumerate(build) if "scripts/pipeline/gpu_verification.py" in command]
+    (tests,) = [at for at, command in enumerate(build) if "scripts/pipeline/verify.py" in command]
+    assert build.index("uv sync --locked") < decides < tests
+    # The two share one file, outside the checkout: the pools the decision left, which the script reads.
+    by_project, by_action = verification.given_by_the_project(), verification.given_by_the_action()
+    left = by_project[decision.GPU_POOLS_FILE_VARIABLE]
+    assert script.GPU_POOLS_FILE_VARIABLE == decision.GPU_POOLS_FILE_VARIABLE
+    assert Path(left).is_absolute() and not left.startswith("/codebuild")
+    # The decision is given the execution's ID and reads the pipeline's name from CodeBuild: the
+    # project's environment holds no reference to the pipeline, which refers to the project.
+    assert by_action[decision.EXECUTION_VARIABLE] == EXECUTION_ID
+    (pipeline,) = [k for k, r in verification.resources.items() if r["Type"] == "AWS::CodePipeline::Pipeline"]
+    assert pipeline not in json.dumps(verification.project)
+    # It may describe groups and their refreshes, which AWS grants on every resource only, and list
+    # the executions of this pipeline, by its ARN.
+    (describes,) = verification.allowed("autoscaling")
+    assert sorted(as_list(describes["Action"])) == [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeInstanceRefreshes",
+    ]
+    assert describes["Resource"] == "*" and "Condition" not in describes
+    (lists,) = verification.allowed("codepipeline")
+    assert lists["Action"] == "codepipeline:ListPipelineExecutions"
+    assert text(lists["Resource"]) == f"arn:<>:codepipeline:<>:<>:<{pipeline}>"
+    # The step runs long enough for a refresh and two runs of the tests, each with a cold wake.
+    assert verification.project["TimeoutInMinutes"] >= decision.WAIT_SECONDS / 60 + 60
 
 
 def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None:

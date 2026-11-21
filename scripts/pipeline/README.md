@@ -16,8 +16,14 @@ pytest's import path in `PYTHONPATH`:
   letter case, and fails with the file and line of each hit, never with the value. It refuses to
   run when that file lies inside the tree it searches.
 
-The script of the verification step (`src/rhi/pipeline/verify.py`), which runs after the stage's
+The scripts of the verification step (`src/rhi/pipeline/verify.py`), which runs after the stage's
 deployment and needs no import path:
+
+- `gpu_verification.py` runs first and decides whether the execution verifies on the coursework
+  pool: yes when an instance refresh of a GPU pool's group, found by its tags `rhi-pool` and
+  `rhi-engine`, began after the execution started, which it reads from the pipeline CodeBuild
+  names in `CODEBUILD_INITIATOR`. It waits for such a refresh to end, fails when it did not end
+  `Successful`, and leaves `coursework`, or nothing, in the file `RHI_VERIFY_GPU_POOLS_FILE` names.
 
 - `verify.py` reads the canary's key from the secret `rhi/canary-key` and runs the smoke tests of
   `tests/smoke` against the deployed endpoint, in a process of their own that takes the key from
@@ -32,7 +38,10 @@ deployment and needs no import path:
   lifecycle stage each instance reached, one per line and nothing else of a row, in the file
   `RHI_VERIFY_LAST_STAGES_FILE` names, which that phase copies as well. It never prints the key,
   and what the tests print reaches the build's log with `[canary key]` in place of the key and of
-  any piece of it.
+  any piece of it. When the decision's file names a pool, it then runs the same smoke tests once
+  more with `RHI_SMOKE_POOL` naming that pool, `gpu-release-served` among them, which the mock
+  pool's run leaves out, and `release-heartbeat`, which compares the release the pool's instances
+  write in their heartbeat rows with the deployed one.
 
 The rule for model weights (system design, section 4.4), which the job that copies each pool's
 model into the model bucket follows:

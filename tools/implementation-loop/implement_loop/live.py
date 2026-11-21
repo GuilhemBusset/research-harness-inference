@@ -2,7 +2,7 @@
 call, with per-role permissions, schema-validated answers, retries, and a full call record.
 
 Read-only roles (explore, plan, triage, arbitrate) get read-only tools (Claude) or the read-only
-sandbox (Codex). Working roles (build, resolve_locked, examine, decide) may edit their worktree,
+sandbox (Codex). Working roles (build, examine, decide) may edit their worktree,
 use the network and run anything the checks run, with the same access for both vendors (Codex
 runs without its own sandbox, like Claude Code; ADR 0012): a limit of a vendor's sandbox is an
 engine problem, not an owner obligation. The boundary is the engine's: every process started here
@@ -42,6 +42,7 @@ from .agents import (
     Request,
     Ruling,
 )
+from .config import is_protected, is_safety_surface
 from .model import CheckSpec, Finding
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -61,8 +62,8 @@ def classify_failure(code: int | None, stderr: str) -> str:
     return "timeout" if code is None else "crash"
 
 
-# How long a Claude model that refused a call (its usage limit reached, or rate limited) is passed
-# over for the role's fallback model before it is asked again.
+# How long a model that refused a call (its usage limit reached, or rate limited) is passed over
+# for the role's fallback model before it is asked again.
 REFUSED_RETRY_S = 1800
 
 
@@ -75,6 +76,23 @@ def claude_refused(data: dict) -> bool:
                                            or data.get("api_error_status") == 429)
 
 
+# What `codex exec` says when the model a call asked for refused it: the account's usage limit or
+# quota for that model is reached, the API rate limits it, or the account may not use that model.
+# Codex reports it in an `error` or a `turn.failed` event of its JSON stream, or on stderr, and exits
+# with an error; the answer file stays empty.
+CODEX_REFUSED = re.compile(r"usage.?limit|usage_not_included|quota.?exceeded|insufficient.?quota|rate.?limit|\b429\b"
+                           r"|too many requests|model_not_found|\bmodel\b[^\n]{0,80}\b(?:is not supported|does not exist"
+                           r"|not found|is not available|not enabled)|do(?:es)? not have access to (?:the |this )?model",
+                           re.IGNORECASE)
+
+
+def codex_refused(errors: list[str], stderr: str) -> bool:
+    """Whether a Codex call that gave no answer was refused by its model (`CODEX_REFUSED`), from
+    the messages of the call's `error` and `turn.failed` events and from its stderr. What the
+    agent's own commands printed is not read: it is in other events."""
+    return any(CODEX_REFUSED.search(text or "") for text in [*errors, stderr])
+
+
 @dataclass
 class RoleSettings:
     effort: str = "high"
@@ -83,6 +101,11 @@ class RoleSettings:
     codex_model: str | None = None
     max_budget_usd: float | None = None   # Claude only: `--max-budget-usd` for one call (ADR 0001, decision 8)
     claude_fallback_model: str | None = None   # used while `claude_model` refuses calls (`claude_refused`)
+    # Codex: the model of a call the adapter escalates (one that touches a protected path or settles
+    # a dispute: `LiveAgents.examine`, `decide`, `arbitrate`), and the model a Codex call asks for
+    # while the one it asked for refuses calls (`codex_refused`).
+    codex_escalated_model: str | None = None
+    codex_fallback_model: str | None = None
 
 
 DEFAULT_ROLES = {
@@ -90,7 +113,6 @@ DEFAULT_ROLES = {
     "plan": RoleSettings(timeout_s=1800, max_budget_usd=8),
     "triage": RoleSettings(timeout_s=1200),
     "build": RoleSettings(timeout_s=5400, max_budget_usd=25),
-    "resolve_locked": RoleSettings(timeout_s=1800),
     "examine": RoleSettings(timeout_s=3600),
     "decide": RoleSettings(timeout_s=1800),
     "arbitrate": RoleSettings(timeout_s=1200),
@@ -153,7 +175,7 @@ class LiveAgents:
         self.bins = {"claude": claude_bin, "codex": codex_bin}
         self.retries, self.backoff, self.sleep = retries, backoff_s, sleep
         self.clock = clock
-        self._refused: dict[str, float] = {}   # Claude model -> when it last refused a call
+        self._refused: dict[tuple[str, str], float] = {}   # (vendor, model) -> when it last refused a call
         self.no_gh_dir = run_dir / "no-gh"
         self.extra_env = dict(extra_env or {})
         self.calls_dir = run_dir / "calls"
@@ -256,17 +278,29 @@ class LiveAgents:
         return [arg for name in names for arg in ("-c", f"mcp_servers.{name}.enabled=false")]
 
     # ---------------------------------------------------------------- one call
-    def _claude_model(self, role: str) -> str | None:
-        """The model a Claude call of `role` asks for: the role's own, or its fallback while the
-        role's own refused a call less than `REFUSED_RETRY_S` ago."""
+    def _own_model(self, vendor: str, role: str, escalate: bool = False) -> str | None:
+        """The model a call of `role` is for: the role's Claude model, or its Codex model, or for an
+        escalated Codex call its `codex_escalated_model` when it has one. None: the CLI's default."""
         s = self.roles[role]
-        refused_at = self._refused.get(s.claude_model or "")
-        if s.claude_fallback_model and refused_at is not None and self.clock() - refused_at < REFUSED_RETRY_S:
-            return s.claude_fallback_model
-        return s.claude_model
+        if vendor == "claude":
+            return s.claude_model
+        return (s.codex_escalated_model if escalate else None) or s.codex_model
+
+    def _fallback_model(self, vendor: str, role: str) -> str | None:
+        s = self.roles[role]
+        return s.claude_fallback_model if vendor == "claude" else s.codex_fallback_model
+
+    def _model(self, vendor: str, role: str, escalate: bool = False) -> str | None:
+        """The model a call asks for: its own (`_own_model`), or the role's fallback while its own
+        refused a call less than `REFUSED_RETRY_S` ago."""
+        own, fallback = self._own_model(vendor, role, escalate), self._fallback_model(vendor, role)
+        refused_at = self._refused.get((vendor, own or ""))
+        if fallback and refused_at is not None and self.clock() - refused_at < REFUSED_RETRY_S:
+            return fallback
+        return own
 
     def _command(self, vendor: str, role: str, cwd: Path, schema: dict, out_file: Path,
-                 claude_model: str | None = None) -> list[str]:
+                 model: str | None = None) -> list[str]:
         s = self.roles[role]
         write = role not in READ_ONLY
         if vendor == "claude":
@@ -277,7 +311,7 @@ class LiveAgents:
                    "--permission-mode", "acceptEdits" if write else "dontAsk"]
             if write:
                 cmd += ["--disallowedTools", *CLAUDE_DENY]
-            model = claude_model or s.claude_model
+            model = model or s.claude_model
             if model:
                 cmd += ["--model", model]
             if s.max_budget_usd:
@@ -290,8 +324,9 @@ class LiveAgents:
                "-c", 'approval_policy="never"', "-c", f'model_reasoning_effort="{s.effort}"',
                *self._codex_mcp_off(cwd),
                "--sandbox", "danger-full-access" if write else "read-only"]
-        if s.codex_model:
-            cmd += ["-m", s.codex_model]
+        model = model or s.codex_model
+        if model:
+            cmd += ["-m", model]
         return cmd + ["-"]
 
     @staticmethod
@@ -318,19 +353,30 @@ class LiveAgents:
                 except ValueError:
                     value = None
             return value, meta
+        errors = []
         for line in stdout.splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(event, dict):
+                continue
             if event.get("type") == "turn.completed" and "usage" in event:
                 meta["usage"] = event["usage"]
+            elif event.get("type") == "error":
+                errors.append(str(event.get("message") or "")[:300])
+            elif event.get("type") == "turn.failed":
+                error = event.get("error")
+                errors.append(str((error.get("message") if isinstance(error, dict) else error) or "")[:300])
+        if errors:
+            meta["errors"] = errors[-3:]
         try:
             return json.loads(out_file.read_text()), meta
         except (OSError, ValueError):
             return None, meta
 
-    def call(self, vendor: str, role: str, cwd: Path, prompt: str, issue: int | None = None) -> dict:
+    def call(self, vendor: str, role: str, cwd: Path, prompt: str, issue: int | None = None,
+             escalate: bool = False) -> dict:
         """One structured answer. Every attempt is metered: an answer (valid or not) is charged
         to the issue's ceiling, a timeout or crash to its infrastructure budget; an outage to
         neither; and what the attempt cost, when the vendor reports it, to the issue's dollar
@@ -338,16 +384,21 @@ class LiveAgents:
         stopped at its own dollar budget is not tried again. `SandboxUnavailable` is raised, and
         nothing is run, when the sandbox cannot be built.
 
-        A Claude model that refuses the call (`claude_refused`: its usage limit is reached, or it
-        is rate limited) did no work: the attempt is an outage, charged to nothing. When the role
-        has a `claude_fallback_model`, the same attempt is made again at once on that model, and
-        the role keeps using it for `REFUSED_RETRY_S` before it asks its own model again."""
+        A model that refuses the call (`claude_refused`, `codex_refused`: its usage limit is
+        reached, or it is rate limited) did no work: the attempt is an outage, charged to nothing.
+        When the role has a fallback model for that vendor (`claude_fallback_model`,
+        `codex_fallback_model`), the same attempt is made again at once on that model, and the role
+        keeps using it for `REFUSED_RETRY_S` before it asks its own model again.
+
+        `escalate`: a Codex call runs on the role's `codex_escalated_model` (ADR 0001, amendment
+        13), with the same fallback."""
         schema = schemas.BY_ROLE[role]
         s = self.roles[role]
+        own, fallback = self._own_model(vendor, role, escalate), self._fallback_model(vendor, role)
         last_error, kind = "", "crash"
         attempt = 0
         while attempt <= self.retries:
-            model = self._claude_model(role) if vendor == "claude" else None
+            model = self._model(vendor, role, escalate)
             if self.meter:
                 self.meter.before(issue, role, vendor)
             seq = next(self._seq)
@@ -372,13 +423,16 @@ class LiveAgents:
             value, meta = self._parse(vendor, out, out_file)
             if vendor == "claude":
                 out_file.write_text(out)
+            elif code is not None and (code != 0 or value is None) and codex_refused(meta.get("errors") or [], err):
+                meta["refused"], value = True, None
             problems = schemas.validate(value, schema) if value is not None else ["no structured answer"]
             refused = bool(meta.get("refused"))
             outcome = "outage" if refused else "answered" if code == 0 else classify_failure(code, err)
             record = {"seq": seq, "role": role, "vendor": vendor, "issue": issue, "attempt": attempt + 1,
                       "exit": code, "seconds": round(time.monotonic() - started, 1),
                       "ok": code == 0 and not refused and not problems, "outcome": outcome, "problems": problems[:5],
-                      "stderr_tail": err[-400:], **({"model": model} if model else {}), **meta}
+                      "stderr_tail": err[-400:], **({"model": model} if model else {}),
+                      **({"escalated": True} if escalate and vendor == "codex" else {}), **meta}
             with self._lock, self.log_path.open("a") as f:
                 f.write(json.dumps(record, default=str) + "\n")
             spent = getattr(self.meter, "spent", None)
@@ -393,8 +447,8 @@ class LiveAgents:
                                    f"(loop.toml [roles.{role}] max_budget_usd)", kind="crash", vendor=vendor)
             if refused:
                 last_error, kind = f"{vendor} model {model or 'default'} refused the call (usage or rate limit)", "outage"
-                if model and model == s.claude_model and s.claude_fallback_model and s.claude_fallback_model != model:
-                    self._refused[model] = self.clock()
+                if model and model == own and fallback and fallback != model:
+                    self._refused[(vendor, model)] = self.clock()
                     continue   # the same attempt, at once, on the fallback model: not a retry
             elif code == 0:
                 last_error, kind = "it did not match the schema: " + "; ".join(problems[:3]), "crash"
@@ -423,6 +477,17 @@ class LiveAgents:
     def _root(self) -> Path:
         return self.ws.coord_path()
 
+    @staticmethod
+    def _touches_protected(worktree: Path, base: str, head: str) -> bool:
+        """Whether the change `base..head` adds, changes or removes a protected path (`PROTECTED_*`
+        and `SAFETY_SURFACE_*` in config.py). A rename counts as the removal of its old path and the
+        addition of its new one. A change whose paths cannot be listed counts as one that does."""
+        proc = subprocess.run(["git", "diff", "--name-only", "--no-renames", "-z", f"{base}..{head}"], cwd=worktree,
+                              capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return True
+        return any(is_protected(p) or is_safety_surface(p) for p in proc.stdout.split("\0") if p)
+
     def _diff(self, worktree: Path, base: str, head: str) -> str:
         diff = subprocess.run(["git", "diff", f"{base}..{head}"], cwd=worktree, capture_output=True, text=True,
                               check=False).stdout
@@ -440,8 +505,7 @@ class LiveAgents:
                  if worktree else "There is no branch yet; you are reading `main`.")
         prompt = render("plan", branch_note=where, **self._issue_vars(req, "builder (planning)"))
         v = self.call(vendor, "plan", worktree or self._root(), prompt, req.issue.number)
-        return PlanResult(items=[ItemPlan(**i) for i in v["items"]], zones=v["zones"], decisions=v["decisions"],
-                          notes=v["notes"])
+        return PlanResult(items=[ItemPlan(**i) for i in v["items"]], decisions=v["decisions"], notes=v["notes"])
 
     def triage(self, vendor, req, plan):
         prompt = render("triage", plan=json.dumps(plan, indent=1), **self._issue_vars(req, "examiner (triage)"))
@@ -462,14 +526,7 @@ class LiveAgents:
         return BuildResult(status=v["status"], note=v["note"], tests=v["tests"],
                            commands=[CheckSpec(criterion=c["criterion"], command=c["command"], cwd=c["cwd"],
                                                timeout_s=c["timeout_s"]) for c in v["commands"]],
-                           dispositions={d["test"]: d["disposition"] for d in v["dispositions"]},
                            decisions=v["decisions"], requests=requests)
-
-    def resolve_locked(self, vendor, req, worktree, files, feedback):
-        req = IssueRequest(issue=req.issue, spec=req.spec, context=req.context, feedback=feedback, facts=req.facts)
-        prompt = render("resolve_locked", files=", ".join(f"`{f}`" for f in files),
-                        **self._issue_vars(req, "conflict resolver for locked tests"))
-        self.call(vendor, "resolve_locked", worktree, prompt, req.issue.number)
 
     def examine(self, vendor, req, plan, worktree, base_sha, head_sha, evidence, memory, requests, since):
         compact = [{k: e.get(k) for k in ("criterion", "kind", "command", "passed", "exit_code", "note", "tests")} |
@@ -478,12 +535,15 @@ class LiveAgents:
                  f"below. Check the open findings and the delta; certify the new head if it still holds."
                  if since else "This is the first examination: examine the whole change.")
         diff = self._diff(worktree, since or base_sha, head_sha)
+        # A change to a protected path is examined on the escalated model (ADR 0001, amendment 13):
+        # the whole change against its base, whatever a follow-up examination is shown.
+        escalate = self._touches_protected(worktree, base_sha, head_sha)
         with self.ws.disposable(worktree) as scratch:
             prompt = render("examine", plan=json.dumps(plan, indent=1), base=(since or base_sha)[:12], head=head_sha[:12],
                             scope=scope, diff=diff, evidence=json.dumps(compact, indent=1),
                             memory=json.dumps(memory, indent=1)[:12000] if memory else "(none)",
                             **self._issue_vars(req, "examiner"))
-            v = self.call(vendor, "examine", scratch, prompt, req.issue.number)
+            v = self.call(vendor, "examine", scratch, prompt, req.issue.number, escalate=escalate)
         findings = [Finding(id="", **f) for f in v["findings"]]
         return ExamResult(verdicts=v["verdicts"], findings=findings, probes=[Probe(**p) for p in v["probes"]],
                           decisions=[], certify=v["certify"], summary=v["summary"])
@@ -491,11 +551,14 @@ class LiveAgents:
     def decide(self, vendor, req, worktree, requests):
         prompt = render("decide", requests=json.dumps(requests, indent=1)[:20000],
                         **self._issue_vars(req, "examiner (deciding requests)"))
-        v = self.call(vendor, "decide", worktree, prompt, req.issue.number)
-        return [Decision(request=d["request"], approve=d["approve"], reason=d["reason"],
-                         dispositions={x["test"]: x["disposition"] for x in d["dispositions"]}) for d in v["decisions"]]
+        # Deciding a `protected_change` request is escalated (ADR 0001, amendment 13), with the
+        # requests decided in the same call.
+        escalate = any(r.get("kind") == "protected_change" for r in requests)
+        v = self.call(vendor, "decide", worktree, prompt, req.issue.number, escalate=escalate)
+        return [Decision(request=d["request"], approve=d["approve"], reason=d["reason"]) for d in v["decisions"]]
 
     def arbitrate(self, vendor, req, dispute, worktree=None):
         prompt = render("arbitrate", dispute=json.dumps(dispute, indent=1)[:20000], **self._issue_vars(req, "arbiter"))
-        v = self.call(vendor, "arbitrate", worktree or self._root(), prompt, req.issue.number)
+        # Every arbitration is escalated (ADR 0001, amendment 13): it settles a dispute between the keys.
+        v = self.call(vendor, "arbitrate", worktree or self._root(), prompt, req.issue.number, escalate=True)
         return Ruling(upheld=v["upheld"], reason=v["reason"])

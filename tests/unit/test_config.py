@@ -464,6 +464,15 @@ def test_the_example_coursework_pool() -> None:
     assert (coursework.kv_cache_bits, coursework.prefix_caching, coursework.step_budget_tokens) == (8, True, 8192)
     assert (coursework.tool_call_parser, coursework.reasoning_parser) == ("qwen3_coder", "qwen3")
     assert coursework.trust_remote_code is False
+    # The request profile of section 6.2, step 4, and the effort mapping of section 17.
+    assert coursework.request_profile == ("reasoning_effort", "system_in_place", "document_as_text")
+    assert coursework.reasoning_effort == {
+        "low": "low",
+        "medium": "medium",
+        "high": "xhigh",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+    }
     # vLLM's own boundaries put 0.025 alone between 22 and 50 ms, which makes two buckets of that
     # range (section 7.2; evidence E3). Two boundaries or more inside it make three or more.
     assert coursework.histogram_buckets is not None

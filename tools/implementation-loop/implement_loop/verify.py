@@ -1,19 +1,12 @@
 """The trusted verifier. It runs from the engine's own checkout, never from the worktree it
 judges, and it trusts nothing an implementer could have changed.
 
-- Locked files (the acceptance checks, plus the test configuration pytest would load for
-  them) are hashed when the checks are committed. Any later change, deletion, or new
-  configuration file fails verification. In `pyproject.toml` only the `[tool.pytest...]`
-  section is locked, so implementers can still add dependencies.
-- Each command check produces an `Evidence` record bound to the exact head SHA. Every pytest
-  process the command starts, however it starts it, reports each test through the
+- Each command check produces an `Evidence` record bound to the exact head SHA. A command
+  that several criteria name runs once per verification, and its run is the record of each.
+  Every pytest process the command starts, however it starts it, reports each test through the
   `loop_pytest` plugin: a failed, erroring, skipped, xfailed or xpassed test fails the check,
   and so does a pytest that ran no test or could not run (usage error, nothing collected,
   internal error, interrupted).
-- The selection manifest: the test ids a passing verification ran, per criterion (`selection`),
-  locked with the checks. Every later verification must run and pass each of them, so a check
-  cannot be quietly emptied out. A test defined in a check file that no command selects is not
-  a failure; `unselected` reports it until it gets a disposition.
 - The standing checks (`config.STANDING_CHECKS`: the public-repository hygiene scan) run on the
   exact head before the issue's own commands, whatever the issue says. A failure, or a scanner
   that is missing, is a verification problem like any other, returned with its output.
@@ -31,91 +24,17 @@ import shutil
 import signal
 import subprocess
 import time
-import tomllib
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from . import sandbox
-from .config import TEST_CONFIG_NAMES
 from .model import CheckSpec, Evidence
 
 OUTPUT_TAIL = 3000
-NO_PYTEST_CONFIG = hashlib.sha256(b"{}").hexdigest()
 
 
-def digest(path: Path) -> str:
-    """For pyproject.toml, the parsed `[tool.pytest]` table only, whatever its TOML spelling;
-    an unparseable file is hashed whole, so any change to it is caught."""
-    if path.name == "pyproject.toml":
-        try:
-            pytest_cfg = tomllib.loads(path.read_text(errors="replace")).get("tool", {}).get("pytest", {})
-        except tomllib.TOMLDecodeError:
-            return hashlib.sha256(path.read_bytes()).hexdigest()
-        return hashlib.sha256(json.dumps(pytest_cfg, sort_keys=True).encode()).hexdigest()
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def config_candidates(root: Path, check_files: list[str], cwds: list[str]) -> list[str]:
-    """Test configuration pytest could load for these checks: config files in every ancestor
-    directory of a check file or check cwd, and any conftest.py under a check file's folder."""
-    dirs: set[Path] = set()
-    for rel in check_files + cwds:
-        p = Path(rel)
-        d = p if (root / p).is_dir() or rel.endswith("/") or rel in cwds else p.parent
-        while True:
-            dirs.add(d)
-            if d == Path(".") or d == d.parent:
-                break
-            d = d.parent
-    found: set[str] = set()
-    for d in dirs:
-        for name in TEST_CONFIG_NAMES:
-            if (root / d / name).is_file():
-                found.add(str(d / name) if d != Path(".") else name)
-    for rel in check_files:
-        start = root / Path(rel).parent
-        if start.is_dir():
-            for dirpath, dirnames, filenames in os.walk(start):
-                dirnames[:] = [x for x in dirnames if x not in {".git", ".venv", "node_modules", "__pycache__"}]
-                if "conftest.py" in filenames:
-                    found.add(str((Path(dirpath) / "conftest.py").relative_to(root)))
-    return sorted(found)
-
-
-def lock(root: Path, check_files: list[str], cwds: list[str]) -> dict[str, str]:
-    locked = {}
-    for rel in sorted(set(check_files) | set(config_candidates(root, check_files, cwds))):
-        p = root / rel
-        if p.is_file():
-            locked[rel] = digest(p)
-    return locked
-
-
-def tamper_report(root: Path, locked: dict[str, str], check_files: list[str], cwds: list[str]) -> list[str]:
-    problems = []
-    for rel, d in sorted(locked.items()):
-        p = root / rel
-        if not p.is_file():
-            problems.append(f"locked file deleted: {rel}")
-        elif digest(p) != d:
-            problems.append(f"locked file changed: {rel}")
-    for rel in config_candidates(root, check_files, cwds):
-        if rel in locked:
-            continue
-        if Path(rel).name == "pyproject.toml" and digest(root / rel) == NO_PYTEST_CONFIG:
-            continue  # a new pyproject.toml with no pytest settings cannot change how tests run
-        problems.append(f"new test configuration file: {rel}")
-    return problems
-
-
-# ---------------------------------------------------------------------- test ids
-
-def base_id(test_id: str) -> str:
-    """A test id without its parameters: `a/test_x.py::TestA::test_b[1-x]` -> `a/test_x.py::TestA::test_b`."""
-    file_part, sep, rest = test_id.partition("::")
-    return file_part + sep + rest.split("[", 1)[0]
-
+# ------------------------------------------------------- tests that can never pass
 
 def _test_functions(root: Path, files: list[str]):
     """(id, function node) for every `test*` function or method in the Python files, and
@@ -152,50 +71,6 @@ def _test_functions(root: Path, files: list[str]):
                 continue
             yield from walk(tree.body, rel, [])
 
-
-def defined_tests(root: Path, files: list[str]) -> list[str]:
-    """Every test defined in the Python files, as `path::Class::test_name` (or `path::test_name`),
-    without parameters. A file that does not parse yields `path::<unparseable>`."""
-    return sorted({test_id for test_id, _ in _test_functions(root, files)})
-
-
-def selection(cases_by_criterion: dict) -> dict[str, list[str]]:
-    """The selection manifest to lock from a passing verification: for each criterion, the ids
-    of the tests that passed. A value is what `run_check` returned for the criterion's command
-    (its `passed` ids), an evidence record from `verify` (its `passed_tests`), None, or a list
-    of these when several commands prove one criterion. Criteria that ran no test are left out."""
-
-    def passed(value) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, dict):
-            ids = value.get("passed_tests", value.get("passed"))
-            return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
-        return [i for v in value for i in passed(v)]
-
-    out = {criterion: sorted(set(passed(value))) for criterion, value in cases_by_criterion.items()}
-    return {criterion: ids for criterion, ids in sorted(out.items()) if ids}
-
-
-def unselected(root: Path, check_files: list[str], manifest: dict[str, list[str]] | None,
-               dispositions: dict[str, str] | None) -> list[str]:
-    """Tests defined in the check files that no manifest entry selected (compared without
-    parameters) and that have no disposition ("owner-run", or "excluded: <reason>")."""
-    selected = {base_id(i) for ids in (manifest or {}).values() for i in ids}
-    disposed = {base_id(i) for i in (dispositions or {})}
-    return [t for t in defined_tests(root, check_files) if t not in selected and t not in disposed]
-
-
-def not_run(manifest: dict[str, list[str]] | None, ran: list[str] | set[str]) -> list[str]:
-    """Manifest ids that did not run and pass. A parametrized id must match exactly; an id
-    recorded without parameters is satisfied by any of its parametrized cases."""
-    ran = set(ran)
-    ran_bases = {base_id(i) for i in ran}
-    wanted = sorted({i for ids in (manifest or {}).values() for i in ids})
-    return [i for i in wanted if i not in ran and not (base_id(i) == i and i in ran_bases)]
-
-
-# ------------------------------------------------------- tests that can never pass
 
 _FAILING_RAISES = {"AssertionError", "Exception", "NotImplementedError"}
 _JS_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}
@@ -481,50 +356,34 @@ def standing_checks(root: Path, checks: Iterable[tuple[str, str]], head_sha: str
         spec = CheckSpec(criterion=f"{STANDING}{name}", command=command, cwd=".", author="engine",
                          description=f"standing check: {name}")
         ev, _ = run_check(root, spec, head_sha, work_dir, default_timeout, extra_env, mounts)
-        evidence.append(asdict(ev) | {"passed_tests": []})
+        evidence.append(asdict(ev))
         if not ev.passed:
             problems.append(f"standing check `{name}` failed ({ev.note or f'exit {ev.exit_code}'}): every change must "
                             f"pass `{command}`. Its output:\n{ev.output_tail[-1500:].strip() or '(none)'}")
     return evidence, problems
 
 
-def verify(root: Path, specs: list[CheckSpec], head_sha: str, work_dir: Path, locked: dict[str, str],
-           check_files: list[str], manifest: dict[str, list[str]] | None, default_timeout: int = 900,
-           extra_env: dict[str, str] | None = None, check_tamper: bool = True,
-           standing: Iterable[tuple[str, str]] = (),
-           mounts: sandbox.Mounts | None = None) -> tuple[bool, list[dict], list[str], list[str]]:
+def verify(root: Path, specs: list[CheckSpec], head_sha: str, work_dir: Path, default_timeout: int = 900,
+           extra_env: dict[str, str] | None = None, standing: Iterable[tuple[str, str]] = (),
+           mounts: sandbox.Mounts | None = None) -> tuple[bool, list[dict], list[str]]:
     """Run the `standing` checks, then every command check. Returns (all passed, evidence
-    records, problems, ids of the tests that passed).
-
-    With a selection `manifest` (criterion -> test ids, from `selection`), each of its tests
-    must run and pass in this verification; tests that run without being in it are fine. With
-    None, only each command's own result counts. Each evidence record also carries the ids its
-    command passed (`passed_tests`), what `selection` needs to lock a manifest.
-    `extra_env` reaches the check commands only;
-    `check_tamper=False` re-runs another issue's checks for regressions, behaviour only.
-    `standing` is `config.STANDING_CHECKS` when the engine verifies a head that may be examined,
-    pushed or kept on `main`; `mounts` is what the commands may see (`run_check`)."""
+    records, problems). A command that several checks give (the same command, directory and
+    timeout, for several criteria) runs once, and its run is the evidence record of each of those
+    criteria. `extra_env` reaches the check commands only; `standing` is `config.STANDING_CHECKS`
+    when the engine verifies a head that may be examined or pushed; `mounts` is what the commands
+    may see (`run_check`)."""
     work_dir.mkdir(parents=True, exist_ok=True)
-    cwds = sorted({s.cwd for s in specs if s.kind == "command"})
-    problems = tamper_report(root, locked, check_files, cwds) if check_tamper else []
-    evidence, standing_problems = standing_checks(root, standing, head_sha, work_dir, default_timeout, extra_env, mounts)
-    problems += standing_problems
-    ran: set[str] = set()
-    accounted = False
+    evidence, problems = standing_checks(root, standing, head_sha, work_dir, default_timeout, extra_env, mounts)
+    runs: dict[tuple[str | None, str, int | None], Evidence] = {}
     for spec in specs:
         if spec.kind != "command":
             continue
-        ev, cases = run_check(root, spec, head_sha, work_dir, default_timeout, extra_env, mounts)
-        evidence.append(asdict(ev) | {"passed_tests": list(cases["passed"]) if cases else []})
-        if cases is not None:
-            accounted = True
-            ran.update(cases["passed"])
+        # A command several criteria name runs once; its run counts for each of them.
+        key = (spec.command, spec.cwd, spec.timeout_s)
+        if key not in runs:
+            runs[key] = run_check(root, spec, head_sha, work_dir, default_timeout, extra_env, mounts)[0]
+        ev = replace(runs[key], criterion=spec.criterion)
+        evidence.append(asdict(ev))
         if not ev.passed:
             problems.append(f"{spec.criterion} failed: {ev.note or f'exit {ev.exit_code}'}")
-    missing = not_run(manifest, ran)
-    if missing:
-        more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
-        why = "" if accounted else ("; no check command ran pytest, so no test result was recorded: run "
-                                    "the tests with pytest so skips and missing tests can be detected")
-        problems.append(f"locked tests did not run: {missing[:5]}{more}{why}")
-    return (not problems), evidence, problems, sorted(ran)
+    return (not problems), evidence, problems

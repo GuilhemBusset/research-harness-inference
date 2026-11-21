@@ -98,6 +98,8 @@ def sample(value: Any) -> str:
         return re.sub(r"\$\{([^}]+)\}", lambda match: PSEUDO[match[1]], argument)
     if function == "Fn::GetAtt" and argument[1] == "imageDetails.0.imageDigest":
         return IMAGE_DIGEST
+    if function == "Fn::GetAtt" and argument[1] == "LatestVersionNumber":
+        return f"sample-version-{argument[0]}"
     if (function, argument[1:]) == ("Fn::GetAtt", ["PrometheusEndpoint"]) or (
         function == "Fn::ImportValue" and "PrometheusEndpoint" in argument
     ):
@@ -730,7 +732,7 @@ def test_what_is_outside_the_comparison_starts_no_refresh(
         assert other.parameter["Value"] != alone.parameter["Value"]
 
 
-def test_the_trigger_holds_the_compared_release_and_the_machine_image_resolved_at_deployment(mock: Release) -> None:
+def test_the_trigger_holds_the_compared_release_and_the_launch_template(mock: Release) -> None:
     trigger = json.loads(sample(mock.trigger))
     value = mock.value
     assert {key: trigger[key] for key in ("engine_image", "model_revision", "engine_flags")} == {
@@ -748,6 +750,7 @@ def test_the_trigger_holds_the_compared_release_and_the_machine_image_resolved_a
     image = launch_template["LaunchTemplateData"]["ImageId"]["Ref"]
     assert image in references(mock.trigger)
     assert trigger["machine_image"] == f"sample-{image}"
+    assert trigger["launch_template_version"] == sample(specification["Version"])
     assert mock.template["Parameters"][image]["Type"] == "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
     assert mock.template["Parameters"][image]["Default"].startswith("/aws/service/ecs/optimized-ami/")
 

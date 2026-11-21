@@ -3,6 +3,8 @@ no test, exits 0 and leaves its reason; with a key it runs the smoke tests, all 
 must reach the internal load balancer, a failed test is a non-zero exit and leaves its ID, and
 what the tests print reaches the log without the key. After a failed run it leaves the last
 lifecycle stage each instance of the tested pools reached, and nothing else of a heartbeat's row.
+When the decision on the coursework pool left that pool, the smoke tests run again on it, with the
+tests of that run only.
 
 A stand-in for the Secrets Manager client replaces AWS, and moto holds the heartbeats table in
 process: no account, no credentials, no network. The tests that pytest really collects and runs do
@@ -139,6 +141,47 @@ def test_with_a_key_the_tests_run_with_it_and_their_exit_is_the_script_s(
     assert key not in "".join(capsys.readouterr())
 
 
+def coursework_pass(tmp_path: Path, left: str | None, exits: list[int]) -> tuple[int, list[Mapping[str, str]]]:
+    """The script's exit after runs of the tests that end in `exits`, one after the other, once the
+    decision left `left` as the pools to verify on, None for no file, and the environments the runs
+    were given."""
+    named, given = tmp_path / "gpu-pools", []
+    if left is not None:
+        named.write_text(left, encoding="utf-8")
+
+    def run(environ: Mapping[str, str]) -> int:
+        given.append(environ)
+        return exits[len(given) - 1]
+
+    environ = {
+        verify.ENDPOINT_VARIABLE: ENDPOINT,
+        verify.RELEASE_PARAMETERS_VARIABLE: "mock=/rhi/pools/mock/release,coursework=/rhi/pools/coursework/release",
+        verify.GPU_POOLS_FILE_VARIABLE: str(named),
+    }
+    return verify.main(environ, client=Secrets(a_key()), run=run), given
+
+
+def test_the_pools_the_decision_left_are_run_on_after_the_mock_pool(tmp_path: Path) -> None:
+    exit_code, given = coursework_pass(tmp_path, "coursework\n", [0, 0])
+    assert exit_code == 0
+    # The mock pool's run names no pool; the coursework pool's names it, with the same key and pools.
+    assert [environ.get(verify.POOL_VARIABLE) for environ in given] == [None, "coursework"]
+    assert given[0][verify.KEY_VARIABLE] == given[1][verify.KEY_VARIABLE]
+    # Every run is made, and the exit is the first failed one's.
+    assert coursework_pass(tmp_path, "coursework\n", [0, 3])[0] == 3
+    exit_code, given = coursework_pass(tmp_path, "coursework\n", [2, 0])
+    assert exit_code == 2 and len(given) == 2
+
+
+def test_no_pool_left_by_the_decision_is_the_mock_pool_s_run_alone(tmp_path: Path) -> None:
+    exit_code, given = coursework_pass(tmp_path, "", [0])
+    assert exit_code == 0 and [environ.get(verify.POOL_VARIABLE) for environ in given] == [None]
+
+
+def test_a_decision_that_left_no_file_runs_no_test(tmp_path: Path) -> None:
+    assert coursework_pass(tmp_path, None, []) == (1, [])
+
+
 def test_no_pool_is_no_release_parameter() -> None:
     assert verify.release_parameters("none") == {}
 
@@ -270,7 +313,10 @@ def run_tests_in(tmp_path: Path, tests: list[str], *, more: Mapping[str, str] | 
     return verify.run_tests(environ, tests)
 
 
-def test_the_tests_through_the_internal_load_balancer_are_deselected_and_no_other(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pool", [None, "coursework"], ids=["the mock pool's run", "the coursework pool's run"])
+def test_the_tests_through_the_internal_load_balancer_are_deselected_and_no_other(
+    tmp_path: Path, pool: str | None
+) -> None:
     (tmp_path / "recorder.py").write_text(RECORDER, encoding="utf-8")
     recorded = tmp_path / "recorded.json"
     # Collection only: nothing is run, so nothing is reached.
@@ -278,18 +324,21 @@ def test_the_tests_through_the_internal_load_balancer_are_deselected_and_no_othe
         "PYTHONPATH": str(tmp_path),
         "PYTEST_ADDOPTS": "-p recorder --collect-only -q -p no:cacheprovider",
         "RECORDED": str(recorded),
+        **({verify.POOL_VARIABLE: pool} if pool else {}),
     }
 
     assert run_tests_in(tmp_path, [verify.SMOKE_TESTS], more=more) == 0
 
     found = json.loads(recorded.read_text(encoding="utf-8"))
     internal = {test_id for test_id in SMOKE_TEST_IDS if test_id.startswith("internal-")}
-    assert len(internal) == 5
-    assert sorted(found["deselected"]) == sorted(internal) == sorted(verify.DESELECTED)
+    assert len(internal) == 5 and sorted(internal) == sorted(verify.DESELECTED)
+    # The tests of the coursework pool's run are left out of the mock pool's run, and only there.
+    left_out = internal | (set() if pool else {"gpu-release-served"})
+    assert sorted(found["deselected"]) == sorted(left_out)
     # Every other smoke test is kept, the deployed-only ones and the forbidden routes at the
-    # gateway's hop among them.
-    assert sorted(found["kept"]) == sorted(set(SMOKE_TEST_IDS) - internal)
-    assert {"forbidden-invocations", "metrics-pool", "release-served"} <= set(found["kept"])
+    # gateway's hop among them, and on the coursework pool the first stream's wake and hold.
+    assert sorted(found["kept"]) == sorted(set(SMOKE_TEST_IDS) - left_out)
+    assert {"forbidden-invocations", "first-stream-wake", "metrics-pool", "release-served"} <= set(found["kept"])
 
 
 def test_a_failed_test_makes_the_script_exit_non_zero(tmp_path: Path) -> None:
@@ -340,6 +389,11 @@ def test_the_ids_of_the_tests_that_failed_are_left_one_per_line_and_nothing_else
     assert sorted(left.splitlines()) == ["environment", "no-key"] and left.endswith("\n")
     # A run in which no test fails leaves no file: there is nothing for the step to copy.
     assert left_by("-k", "passes") == (0, None)
+    # A second run of the same verification, on another pool, adds only the IDs not yet left.
+    left_by()
+    more = {verify.FAILED_TESTS_FILE_VARIABLE: str(tmp_path / "build" / "failed"), "PYTEST_ADDOPTS": quiet}
+    assert run_tests_in(tmp_path, [str(tests)], more=more) != 0
+    assert sorted((tmp_path / "build" / "failed").read_text(encoding="utf-8").splitlines()) == ["environment", "no-key"]
 
 
 def test_what_the_tests_print_reaches_the_log_without_the_key(

@@ -167,4 +167,7 @@ pythonpath = [
     # The replay harness and the capture scrubber, which the replay tests import by name
     # (tests/captures/README.md).
     "tests/replay",
+    # The spikes' tests: the posting tests of spike S5 reuse the recorded runs of its verdict's
+    # tests (tests/unit/spikes/test_s5.py) by name.
+    "tests/unit/spikes",
 ]

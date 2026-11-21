@@ -110,7 +110,6 @@ class GitHub(Protocol):
     def create_pr(self, head: str, base: str, title: str, body: str) -> dict: ...
     def update_pr(self, n: int, body: str) -> dict: ...
     def merge_pr(self, n: int, sha: str, method: str = "squash") -> dict: ...
-    def rerun_failed(self, sha: str) -> bool: ...
     def failed_log(self, sha: str, skip: str | None = None) -> str: ...
     def create_issue(self, title: str, body: str, labels: list[str]) -> dict: ...
 
@@ -307,14 +306,6 @@ class GhCli:
         runs = (self._api(self._r(f"actions/runs?head_sha={sha}&per_page=50")) or {}).get("workflow_runs", [])
         return [r for r in runs if r.get("conclusion") in ("failure", "timed_out", "cancelled", "startup_failure")]
 
-    def rerun_failed(self, sha):
-        """Re-run the failed jobs of every workflow run on `sha`. True if any re-run started."""
-        started = False
-        for run in self._failed_runs(sha):
-            self._api(self._r(f"actions/runs/{run['id']}/rerun-failed-jobs"), "POST", {})
-            started = True
-        return started
-
     def failed_log(self, sha, skip=None):
         """The tail of the failed jobs' logs on `sha`, for the implementer to read. The lines of job
         `skip` are left out: the required check only names the jobs that failed, and its lines,
@@ -444,7 +435,6 @@ class FakeGitHub:
         self.check_script: list[str | None] = []   # conclusions handed out in order, one per head looked at
         self._check_seen: dict[str, dict] = {}  # sha -> the latest check run handed out
         self._run_ids = iter(range(1, 10**9))
-        self.reruns: list[str] = []
         self.statuses: dict[str, list[dict]] = {}   # sha -> the commit statuses posted on it, oldest first
         self.commit_comments: dict[str, list[str]] = {}   # sha -> the comments on that commit; no read gives them
         self.default_review: str = ""   # the review decision of a pull request when it is opened: none is asked for
@@ -595,12 +585,6 @@ class FakeGitHub:
         pr["head"]["sha"] = sha
         self.calls.append(("merge_pr", n, sha))
         return {"merged": True, "sha": merge_sha}
-
-    def rerun_failed(self, sha):
-        self.reruns.append(sha)
-        self.calls.append(("rerun_failed", sha))
-        self._check_seen.pop(sha, None)   # the re-run is a new check run, with its own id and verdict
-        return True
 
     def failed_log(self, sha, skip=None):
         return f"FAILED tests/test_fake.py::test_platform - fake CI failure on {sha[:7]}"

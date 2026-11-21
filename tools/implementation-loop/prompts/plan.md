@@ -25,14 +25,12 @@ For **every** ledger item ({{ledger_ids}}) return one entry:
     deselects), it stays the owner's;
   - `deferred`: only when it needs another **open** issue's deliverable. Give `depends_on` and
     `depends_quote`, words from that issue's title or body that show it delivers what you need.
-- `zones`: every path you expect to change, registrations and test files included. A protected
-  path (anything under `tools/implementation-loop/`, `tools/hygiene/`, `.github/`, `.githooks/`,
-  `tests/policy/`, `.claude/`, `.agents/` or `.codex/`, the pipeline stack under
-  `src/rhi/pipeline/`, the bootstrap policies under `setup/bootstrap/`, the gate scripts in
-  `scripts/`, the ruleset) is yours only when the issue's
-  deliverables name it, or name a protected directory above it. Listed here without that, it is
-  not granted: plan around it, or ask for it during the build with a `protected_change` request,
-  which the examiner decides.
+- Any file is yours to change, except a protected path (anything under
+  `tools/implementation-loop/`, `tools/hygiene/`, `.github/`, `.githooks/`, `tests/policy/`,
+  `.claude/`, `.agents/` or `.codex/`, the pipeline stack under `src/rhi/pipeline/`, the bootstrap
+  policies under `setup/bootstrap/`, the gate scripts in `scripts/`, the ruleset): it is yours
+  only when the issue names it, or names a protected directory above it. Otherwise plan around it,
+  or ask for it during the build with a `protected_change` request, which the examiner decides.
 - `decisions`: the choices that matter, each with its rationale. They are published in the PR.
 
 Keep it proportional: the smallest correct plan that delivers every item as written.
