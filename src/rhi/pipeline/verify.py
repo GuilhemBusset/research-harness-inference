@@ -5,6 +5,15 @@ canary's key: `scripts/pipeline/verify.py`, on the source, in a locked environme
 image and runs outside the private network. A failed test fails the step, and with it the
 execution (section 8.5).
 
+**The coursework pool.** Before the smoke tests, the step runs the decision of
+`scripts/pipeline/gpu_verification.py`: whether this execution deployed a GPU pool's release,
+which an instance refresh of a GPU pool's group that began after the execution started says
+(sections 4.3 and 8.2, step 6). The decision waits for such a refresh to end, and fails the step
+when it did not end well; its answer is a file, `RHI_VERIFY_GPU_POOLS_FILE`, that names
+`coursework` or nothing. Its command ends before the verification's begins, so the smoke tests
+then run on the mock pool and, when the file names it, on the coursework pool, after the refresh.
+The step's `TIMEOUT` covers a refresh and two runs of the tests, each with a cold wake.
+
 **The action is named `ACTION`.** The reporter maps an action of that name to the context
 `verify/<stage>`, so the step's name is its contract: `tests/policy/test_pipeline.py` lists it.
 
@@ -25,7 +34,11 @@ and of the execution:
 - `RHI_VERIFY_BUCKET`: the pipeline's artifact bucket;
 - `RHI_VERIFY_REASON_FILE`: where the script leaves its reason when it runs no test;
 - `RHI_VERIFY_FAILED_TESTS_FILE`: where the script leaves the IDs of the tests that fail;
-- `RHI_VERIFY_LAST_STAGES_FILE`: where the script leaves the last stage each instance reached.
+- `RHI_VERIFY_LAST_STAGES_FILE`: where the script leaves the last stage each instance reached;
+- `RHI_VERIFY_GPU_POOLS_FILE`: where the decision leaves the pools the smoke tests also run on.
+
+The decision learns the pipeline's name from CodeBuild's own `CODEBUILD_INITIATOR`: the pipeline
+refers to the step's project, so the project's environment may not refer to the pipeline.
 
 **When no test runs.** While the endpoint has no listener, or the canary's secret is missing or
 holds no key, the script runs no test, writes its reason to that file, `listener-off` or
@@ -66,7 +79,9 @@ written (`rhi.observability.stack`); read the release parameter of each pool the
 its name; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
 action on it; and write under `verification/` of the artifact bucket. Beside that it holds what CDK
 Pipelines gives every project of the pipeline: its own logs, its own test reports and a read of
-its input in the artifact bucket. Nothing else: `tests/policy/test_pipeline.py` holds it to that.
+its input in the artifact bucket. For the decision, it may also describe Auto Scaling groups and
+their instance refreshes, which AWS grants on every resource only, and list the executions of this
+pipeline, by its ARN, and of no other. Nothing else: `tests/policy/test_pipeline.py` holds it to that.
 
 The step is a step, not a construct: CDK Pipelines creates its project and role inside the
 pipeline construct of `rhi.pipeline.stack`, whose acknowledgement file covers them.
@@ -78,6 +93,7 @@ from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
 from aws_cdk import aws_codebuild as codebuild
+from aws_cdk import aws_codepipeline as codepipeline
 from aws_cdk import aws_iam as iam
 from aws_cdk import pipelines
 
@@ -92,6 +108,8 @@ if TYPE_CHECKING:
 # The name of the step's action, which the reporter reads.
 ACTION = "Verify"
 SCRIPT = "scripts/pipeline/verify.py"
+# The decision whether the execution verifies on the coursework pool, which runs before `SCRIPT`.
+DECISION = "scripts/pipeline/gpu_verification.py"
 # The secret the admin CLI's canary command writes the canary's key into (`rhi_admin.canary`).
 CANARY_SECRET = "rhi/canary-key"
 # Where, in the artifact bucket, the reporter reads what a verification left: under this prefix,
@@ -105,6 +123,7 @@ LAST_STAGES = "last-stages"
 REASON_FILE = "/tmp/rhi-verification-not-run"
 FAILED_TESTS_FILE = "/tmp/rhi-verification-failed-smoke-tests"
 LAST_STAGES_FILE = "/tmp/rhi-verification-last-stages"
+GPU_POOLS_FILE = "/tmp/rhi-verification-gpu-pools"
 
 ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
@@ -115,11 +134,17 @@ BUCKET_VARIABLE = "RHI_VERIFY_BUCKET"
 REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
 FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
+GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
 # CodePipeline's variable for the ID of the execution an action runs in.
 EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
 
 INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
-COMMANDS = ["uv sync --locked", f"uv run --locked python {SCRIPT}"]
+COMMANDS = ["uv sync --locked", f"uv run --locked python {DECISION}", f"uv run --locked python {SCRIPT}"]
+# What the decision reads of Auto Scaling, which grants it on every resource only.
+DESCRIBES_REFRESHES = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeInstanceRefreshes"]
+# The longest the step runs: the decision's wait for a refresh, an hour at most, and the smoke tests
+# on the mock pool and on the coursework pool, each with a cold wake and the workspace's lag.
+TIMEOUT = cdk.Duration.hours(3)
 
 
 def _copy(file_variable: str, key: str) -> str:
@@ -152,9 +177,14 @@ def heartbeats_table_arn(scope: cdk.Stack, stage: EndpointStage) -> str:
 
 
 def verify_step(
-    scope: cdk.Stack, source: pipelines.IFileSetProducer, *, stage: cdk.Stage, artifacts: s3.IBucket
+    scope: cdk.Stack,
+    source: pipelines.IFileSetProducer,
+    *,
+    stage: cdk.Stage,
+    artifacts: s3.IBucket,
+    pipeline: codepipeline.Pipeline,
 ) -> pipelines.CodeBuildStep:
-    """The verification step of the pipeline of `scope`, on `source`, for `stage`, the stage it
+    """The verification step of `pipeline`, in `scope`, on `source`, for `stage`, the stage it
     runs after, in a pipeline whose artifact bucket is `artifacts`."""
     environment = {
         EXECUTION_VARIABLE: EXECUTION_ID,
@@ -162,6 +192,7 @@ def verify_step(
         REASON_FILE_VARIABLE: REASON_FILE,
         FAILED_TESTS_FILE_VARIABLE: FAILED_TESTS_FILE,
         LAST_STAGES_FILE_VARIABLE: LAST_STAGES_FILE,
+        GPU_POOLS_FILE_VARIABLE: GPU_POOLS_FILE,
     }
     outputs: dict[str, cdk.CfnOutput] = {}
     # Secrets Manager adds six random characters to a secret's name in its ARN.
@@ -174,6 +205,9 @@ def verify_step(
     statements = [
         iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]),
         iam.PolicyStatement(actions=["s3:PutObject"], resources=[artifacts.arn_for_objects(f"{PREFIX}/*")]),
+        # The decision: the groups and their refreshes, and when this pipeline's execution started.
+        iam.PolicyStatement(actions=DESCRIBES_REFRESHES, resources=["*"]),
+        iam.PolicyStatement(actions=["codepipeline:ListPipelineExecutions"], resources=[pipeline.pipeline_arn]),
     ]
     if isinstance(stage, EndpointStage):
         outputs[ENDPOINT_VARIABLE] = stage.gateway.endpoint
@@ -210,4 +244,5 @@ def verify_step(
         env=environment,
         env_from_cfn_outputs=outputs,
         role_policy_statements=statements,
+        timeout=TIMEOUT,
     )
