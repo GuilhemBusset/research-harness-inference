@@ -13,6 +13,7 @@ after every attempt, so the engine can charge calls to the issue's ceilings.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -177,6 +178,8 @@ class Script:
     unmet_review: int = 0                         # the first N examinations judge review items unmet
     findings: int = 0                             # the first N examinations report a blocking, reproduced defect
     unquoted_findings: int = 0                    # ... a reproduced defect tied to no item (a follow-up)
+    new_findings: int = 0                         # the first N examinations each report another corner case, on an item
+    invariant_findings: int = 0                   # ... another reproduced defect that names a safety invariant
     probe: str = "pass"                           # the examiner's probe: pass | unconditional | none
     blocked_once: bool = False                    # the first build needs a path outside its zones
     extra_path: str = ""                          # ... this one
@@ -286,7 +289,8 @@ class FakeAgents:
                 items.append(ItemPlan(item.id, "judged by the examiner", words, "review"))
             else:
                 items.append(ItemPlan(item.id, "proven by the test", words, "test"))
-        zones = sorted(set(s.files) | set(s.lines) | {self.test_file(n)} | ({f"edge_{n}.txt"} if s.findings else set()))
+        zones = sorted(set(s.files) | set(s.lines) | {self.test_file(n)} | ({f"edge_{n}.txt"} if s.findings else set())
+                       | ({f"corners_{n}"} if s.new_findings or s.invariant_findings else set()))
         result = PlanResult(items=items, zones=zones,
                             decisions=[{"id": "approach", "choice": "the simplest variant", "rationale": "fake"}])
         return self._metered(n, "plan", vendor, lambda: result)
@@ -328,6 +332,9 @@ class FakeAgents:
                 test.write_text(self._test_script(n))
             if any("edge" in f for f in feedback):   # a blocking finding asked for the edge case
                 (worktree / f"edge_{n}.txt").write_text("handled\n")
+            for corner in sorted(set(re.findall(rf"corners_{n}/\w+\.txt", " ".join(feedback)))):   # each one it was shown
+                (worktree / corner).parent.mkdir(parents=True, exist_ok=True)
+                (worktree / corner).write_text("handled\n")
             if s.tamper and k >= 1:
                 test.write_text("#!/usr/bin/env bash\nexit 0\n")
             if s.conflict_tamper and resolving:
@@ -387,6 +394,14 @@ class FakeAgents:
             if k < s.unquoted_findings:
                 findings.append(Finding(id=f"U{n}-{k}", title="a nicer error message", observed="terse",
                                         expected="friendlier", reproduction=f"test -f friendlier_{n}.txt"))
+            if k < s.new_findings:   # a corner case no earlier examination raised: the builder handles each one shown
+                findings.append(Finding(id=f"N{n}-{k}", title=f"corner case {k} breaks the item", item=item.id,
+                                        quote=quote, observed=f"corners_{n}/case_{k}.txt is missing",
+                                        expected="the corner case is handled", reproduction=f"test -f corners_{n}/case_{k}.txt"))
+            if k < s.invariant_findings:
+                findings.append(Finding(id=f"I{n}-{k}", title=f"corner case {k} exposes a secret",
+                                        invariant="secret exposure", observed=f"corners_{n}/guard_{k}.txt is missing",
+                                        expected="no secret is exposed", reproduction=f"test -f corners_{n}/guard_{k}.txt"))
             if k < s.advisory_findings:
                 findings.append(Finding(id=f"A{n}-{k}", title="the edge case may break the item", item=item.id,
                                         quote=quote, observed="unclear", expected="the edge case is handled"))
