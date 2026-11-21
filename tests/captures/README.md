@@ -90,4 +90,77 @@ uv run --locked python tests/replay/record.py
 The mock's clock stands still during a recording, so this rewrites the same files when nothing
 has changed.
 
-Captures of the real harnesses are recorded against the deployed mock pool, in phase 2.
+## The captures of the real harnesses
+
+The only way to record what Claude Code, Codex or an SDK script really sends is to run it, so the
+owner records these captures against the deployed mock pool through the public endpoint.
+[`tests/replay/record.py`](../replay/record.py) serves a recorder on a loopback port. The harness
+is pointed at the recorder in place of the endpoint, and the recorder forwards each request to the
+endpoint and streams the answer back unchanged. Each exchange is saved in the order its request
+arrived, numbered from `001`:
+
+- `<n>.json` is a capture the replay tests replay: an engine's answer, status 200, on a forwarded
+  route of the gateway. Its usage is what the answer reports, read the way its route writes it: a
+  usage object, or the top-level `input_tokens` of a token count. The recorder replays it once
+  before it gives it this name: the client must receive the recorded answer, and the request must
+  settle to that usage.
+- `<n>.unreplayed` holds an engine's answer that a replay would not give back as it was recorded,
+  in the same format. The usual one is a streamed Chat Completions answer to a client that did not
+  ask for the usage chunk: the answer reports no usage. The recorder says so when it writes one.
+- `<n>.gateway` holds every other exchange in the same format: a route the gateway answers itself
+  (`GET /v1/models`, ...), a path outside its table, or a refusal. Only the gateway took part in
+  these, so there is nothing to replay. The replay tests read `*.json` only, and leave these and
+  the unreplayed ones out.
+
+Each session goes into a folder of its own: the recorder refuses an `--out` folder that already
+holds a file, and never writes over one.
+
+Before it writes a capture, the recorder replaces each of these wherever it appears in a request
+or an answer: the endpoint's host and its own address become `gateway.example.com`, the student
+key becomes `the-student-key`, the recording machine's home directory becomes `/home/user`, and its
+user name becomes `user`, inside longer words too, and percent-encoded as in a URL as well. A
+name of a JSON object that is an identifier, such as `max_tokens`, is a field of the format: a
+short user name such as `max` is not replaced in it. It drops the headers that carry the key and the
+cookie. While a cold pool held a stream, the gateway wrote keep-alives that the engine never sent,
+and the recorder leaves them out of the answer. The scrubber then reads the capture. If it refuses
+the capture, the recorder does not write it and prints the rule and the place.
+
+What the recorder cannot see, such as a name that a stream writes in pieces or a student's own
+text, is for the person who records to find: read every capture before it is committed.
+
+### How the owner records them
+
+Each harness keeps the model name a student would use: Claude Code its own default `claude-*`
+model, which the gateway gives to the default pool, and Codex and the SDK script `coursework`.
+That keeps Claude Code's default reasoning effort, `high`, which it chooses for its own models.
+`--pool mock` makes the recorder write `mock` into the `model` field of what it sends upstream, so
+every request reaches the deployed mock pool and wakes no GPU. The capture still keeps the model
+the harness sent. `--profile coursework` makes each capture state the coursework pool's request
+profile and the body the engine must receive with that profile applied, so the capture replays
+through that profile. The key is the owner's own canary key, in `RHI_KEY`. Start one recorder for
+each harness, in a terminal of its own, and stop it with Ctrl-C:
+
+```sh
+uv run --locked python tests/replay/record.py session --upstream https://<endpoint> \
+  --out tests/captures/harness/claude-code --pool mock --profile coursework --port 8765
+```
+
+- **Claude Code**: run it in an empty folder made for the recording, with no model and no effort
+  chosen:
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8765 ANTHROPIC_API_KEY="$RHI_KEY" claude`. In one session,
+  get it to place a system message mid-conversation (load a skill, or let its task list change),
+  to read a PDF (a document block), and to read a PNG (an image in a tool result).
+- **Codex**: give it a provider for the recorder, then record into
+  `tests/captures/harness/codex`: a `[model_providers.recorder]` table with
+  `base_url = "http://127.0.0.1:8765/v1"`, `env_key = "RHI_KEY"` and `wire_api = "responses"`,
+  then `codex -c model_provider=recorder -m coursework`.
+- **An SDK script**: point the Anthropic or OpenAI SDK at `http://127.0.0.1:8765` (with `/v1` for
+  OpenAI's), with `model="coursework"` and the key from `RHI_KEY`, and record into
+  `tests/captures/harness/sdk`. A streamed Chat Completions request asks for the usage chunk
+  (`stream_options.include_usage`), as stated above.
+
+Then read each capture, check that Claude Code's carry `"effort": "high"`, a `system` message after
+the first turn, a `document` block and an `image` inside a `tool_result`, and run
+`uv run --locked pytest tests/replay/test_replay.py`. The captures are added once that passes.
+[`tests/replay/test_record.py`](../replay/test_record.py) runs the same recorder against the local
+stack of the smoke tests.
