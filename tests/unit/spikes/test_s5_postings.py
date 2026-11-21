@@ -12,14 +12,17 @@ import tomllib
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import s5_capacity as s5
 from rhi_common.keys import generate_key
-from rhi_reporter.measure import Verdict, read_event
+from rhi_reporter.measure import Verdict, decode, read_event
 from test_s5 import COMMIT, job, settings, verdict  # the recorded runs of the verdict's own tests
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 LABEL = "8bit-baseline-1"
 
@@ -131,3 +134,58 @@ def test_a_preemption_one_instance_saw_counts_whatever_another_left_unsaid() -> 
     assert verdict(at_class(1, None)) is Verdict.FAIL
     assert verdict(at_class(0, None)) is Verdict.NOT_MEASURED
     assert verdict(at_class(0, 0)) is Verdict.PASS
+
+
+def test_a_whole_posting_is_whole_in_any_order_of_its_numbers(post: Any, tmp_path: Path) -> None:
+    whole = post()
+    numbers = {name: value for one in decode(whole) for name, value in one.numbers.items()}
+    # JSON's members have no order: the reporter may take the numbers in another, which moves the
+    # class's size and the count to other parts.
+    for order in (sorted(numbers), sorted(numbers, reverse=True)):
+        event = {"commit": COMMIT, "measurement": "S5", "label": LABEL, "verdict": "pass",
+                 "names": [name.value for name in s5.Number], "numbers": {name: numbers[name] for name in order}}  # fmt: skip
+        reordered = read_event({"detail": event})
+        held = recorded(tmp_path, listed(reordered))
+        assert held["verdict"] == "pass"
+        assert len(held["rows"]) == len(numbers)
+        held = recorded(tmp_path, listed(reordered[1:2], reordered[:1]))
+        assert held["verdict"] == "pending"
+
+
+def test_a_status_listed_on_two_pages_is_read_once(post: Any, tmp_path: Path) -> None:
+    statuses = listed(post())
+    boundary = len(statuses) // 2
+    pages = json.dumps(statuses[:boundary]) + "\n" + json.dumps(statuses[boundary - 1 :])
+    held = recorded(tmp_path, s5.statuses_of(pages))
+    assert held["verdict"] == "pass"
+    # Two statuses of one part are two postings, and cannot be told apart.
+    again = [*statuses[:boundary], {**statuses[boundary - 1], "id": 1_000}, *statuses[boundary:]]
+    assert recorded(tmp_path, again)["verdict"] == "pending"
+
+
+def test_a_job_served_by_two_instance_types_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    one_job = s5.Job(
+        pool="coursework", engine="vllm", prices={}, lever="baseline", streams=(1,), class_size=1, duration=600,
+        keys=[generate_key()], endpoint="https://example.com", gateway=None, workspace=None, log=lambda _: None,  # ty: ignore[invalid-argument-type] - no run reaches them
+    )  # fmt: skip
+    measured = {one.label.shape: one for one in job()[-len(s5.Shape) :]}  # one of each shape
+
+    def served(by_shape: Mapping[s5.Shape, tuple[str, ...]]) -> Any:
+        def run(planned: s5.Planned) -> s5.Measured:
+            one = measured[planned.shape]
+            return dataclasses.replace(
+                one, label=dataclasses.replace(one.label, instance_types=by_shape[planned.shape])
+            )
+
+        return run
+
+    monkeypatch.setattr(one_job, "run", served(dict.fromkeys(s5.Shape, ("g7e.2xlarge",))))
+    assert {one.label.instance_types for one in one_job.measure()} == {("g7e.2xlarge",)}
+    hands_on, several = s5.Shape
+    for by_shape in (
+        {hands_on: ("g7e.2xlarge",), several: ("g7e.4xlarge",)},
+        dict.fromkeys(s5.Shape, ("g7e.2xlarge", "g7e.4xlarge")),
+    ):
+        monkeypatch.setattr(one_job, "run", served(by_shape))
+        with pytest.raises(ValueError, match="instance type"):
+            one_job.measure()
