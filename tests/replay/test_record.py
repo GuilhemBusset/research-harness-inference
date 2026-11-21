@@ -6,6 +6,7 @@ name the recorder replaces are invented here.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import json
@@ -23,7 +24,9 @@ import httpx
 import pytest
 
 import harness
+import scrub
 from harness import Capture, Settled
+from rhi_common.keys import generate_key
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -576,3 +579,38 @@ def test_schema_properties_made_one_by_the_user_name_keep_the_required_property(
     (required,) = saved["required"]
     assert "operator" not in saved["properties"] and saved["properties"]["user"] == {"type": "string"}
     assert saved["properties"][required] == {"type": "integer"}
+
+
+def test_a_key_a_stream_writes_in_two_events_is_not_saved() -> None:
+    key = generate_key()
+    original = harness.load(harness.CAPTURES / "mock-messages-stream.json")
+    pieces = iter((key[:25], key[25:]))
+    lines = []
+    for line in original.answer.decode().splitlines(keepends=True):
+        event = json.loads(line[6:]) if line.startswith("data: ") else {}
+        if event.get("delta", {}).get("type") == "thinking_delta" and (piece := next(pieces, None)) is not None:
+            event["delta"]["thinking"] = piece
+            line = "data: " + json.dumps(event) + "\n"
+        lines.append(line)
+    assert next(pieces, None) is None
+    headers = [*original.headers.items(), ("x-api-key", key)]
+    answer = "".join(lines).encode()
+    exchange = record.Exchange("POST", original.target.encode(), headers, original.body, 200, (), answer)
+    with pytest.raises(scrub.Refused, match=scrub.KEY):
+        asyncio.run(record.capture_of(exchange, record.Neutral(hosts=(), home="", user="", keys=(key,))))
+
+
+def test_schema_dependencies_follow_the_neutral_property_names(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    schema = {
+        "type": "object",
+        "properties": {"operator": {"type": "integer"}, "user": {"type": "string"}, "note": {"type": "string"}},
+        "dependentRequired": {"operator": ["note"], "note": ["operator"]},
+    }
+    tool = {"name": "Lookup", "input_schema": schema}
+    with recording(address, tmp_path, user="operator", profile="coursework") as (_, client):
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(tools=[tool])).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["tools"][0]["input_schema"]
+    (renamed,) = [name for name, value in saved["properties"].items() if value == {"type": "integer"}]
+    assert saved["dependentRequired"] == {renamed: ["note"], "note": [renamed]} and renamed != "operator"
