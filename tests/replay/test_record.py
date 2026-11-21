@@ -526,3 +526,34 @@ def test_an_attachment_whose_metadata_names_the_home_as_a_uri_is_not_written(
         answer = client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(image)))
     assert answer.status_code == 200
     assert session.written == [] and list(tmp_path.iterdir()) == []
+
+
+def test_a_pdf_author_in_nested_parentheses_naming_the_user_is_not_written(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(8)}"
+    payload = base64.b64encode(_pdf(f"({login} (Recorder))".encode("ascii"))).decode("ascii")
+    document = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": payload}}
+    with recording(address, tmp_path, user=login, profile="coursework") as (session, client):
+        answer = client.post("/v1/messages", headers=anthropic(key), json=messages(messages=_read_png(document)))
+    assert answer.status_code == 200
+    assert session.written == [] and list(tmp_path.iterdir()) == []
+
+
+def test_two_argument_names_made_one_by_the_user_name_keep_both_values(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    arguments = json.dumps({"operator": "first-entry", "user": "second-entry"})
+    body = {
+        "model": smoke.MOCK_POOL,
+        "input": [
+            {"role": "user", "content": "Find the owner."},
+            {"type": "function_call", "call_id": "c1", "name": "Lookup", "arguments": arguments},
+            {"type": "function_call_output", "call_id": "c1", "output": "Done."},
+        ],
+    }
+    with recording(address, tmp_path, user="operator", profile="coursework") as (_, client):
+        assert client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(json.loads(capture.body)["input"][1]["arguments"])
+    assert "operator" not in saved and sorted(saved.values()) == ["first-entry", "second-entry"]
