@@ -27,9 +27,9 @@ For each of the starts it is given, 20 unless told otherwise:
    while the pool is not ready, as a student's `rhi wait` does: an explicit wake counts as demand
    for 10 minutes only (section 5.3). It reads the status every `POLL_SECONDS` until the pool is
    `ready`, or until `READY_WAIT_SECONDS` have passed; then it waits `LATE_SECONDS` more before it
-   reads the launches, for the samples taken before the deadline to reach the workspace. A status
-   of `unavailable` for
-   `capacity_unavailable` on the way, the scaler's evidence that a launch found no capacity, is
+   reads the launches, for the samples taken before the deadline to reach the workspace, and reads
+   only those: a stage sampled after the deadline is not one the start reached. A status of
+   `unavailable` for `capacity_unavailable` on the way, the scaler's evidence that a launch found no capacity, is
    noted. **The whole start** is the seconds from the wake to `ready`: a healthy target behind the
    gateway, the end of section 5.3's wait. It holds what no stage does, the time before the kernel
    starts and the registration after the hook (`rhi_lifecycle.stages`).
@@ -63,15 +63,18 @@ start. Any other start counts when the launch that became ready settled as the r
 whole start at the median and the 90th percentile, over the counted starts; `starts_run`,
 `starts_counted` and `starts_failed`, with `starts_failed_<reason>` for each reason; and
 `warm_starts_image_zero`, in a warm run only, the starts of its kind with a promotion that passed
-its image stage (`image_held`): the host held the engine image after the stop and start, so the
-image stage pulled nothing and only read the metadata and asked the host. Each start's outcome, transition, instance type and seconds are
+its image stage, sampled at a later stage (`image_held`): the host held the engine image after the
+stop and start, so the image stage pulled nothing and only read the metadata and asked the host. A
+promotion abandoned in its image stage, a host that did not answer, still has the stage's seconds,
+and is no evidence that the image was on disk. Each start's outcome, transition, instance type and seconds are
 printed, and the instance types of the counted starts, for the record's labels.
 
-**The verdict** (`StartSpike`). Fewer than 20 counted starts give none. A warm run passes when its
-whole start's 90th percentile is under 300 seconds. The condition judges warm starts only: a cold
-run with its 20 starts carries the verdict the warm runs of the record `docs/measurements/s1.md`
-give at the commit it runs from (`ColdSpike`, `warm_verdict`), so that the record's verdict is the
-warm runs' and the cold run's numbers reach it as theirs do. With no warm run recorded there, it
+**The verdict** (`StartSpike`). A warm run with fewer than 20 counted starts gives none. A warm run
+passes when its whole start's 90th percentile is under 300 seconds. The condition judges warm starts
+only, and so does its count of 20: a cold run, whatever its counted and failed starts, carries the
+verdict the warm runs of the record `docs/measurements/s1.md` give at the commit it runs from
+(`ColdSpike`, `warm_verdict`), so that the record's verdict is the warm runs' and the cold run's
+numbers, its timings and its failures, reach it as theirs do. With no warm run recorded there, it
 has none, and cold numbers alone never make the record pass: record the warm run first.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s1_cold_start`):
@@ -354,10 +357,13 @@ def outcome(start: Start, kind: Kind) -> tuple[Outcome, str | None]:
 
 
 def image_held(start: Start) -> bool:
-    """Whether a promotion of the start passed its image stage: the host held the engine image after
-    the stop and start, so the agent kept the launch a promotion."""
+    """Whether a promotion of the start passed its image stage, to a later one: the host said it held
+    the engine image after the stop and start, so the agent kept the launch a promotion. A promotion
+    abandoned in its image stage (the host did not answer) has the stage's seconds, and is no
+    evidence of the image."""
+    image = _ORDER[Stage.IMAGE.value]
     return any(
-        launch.transition == Transition.PROMOTION.value and Stage.IMAGE.value in launch.sampled
+        launch.transition == Transition.PROMOTION.value and any(_ORDER[stage] > image for stage in launch.sampled)
         for launch in start.launches
     )
 
@@ -405,12 +411,12 @@ def is_warm_label(label: object) -> bool:
     return isinstance(label, str) and (label == Kind.WARM.value or label.startswith(f"{Kind.WARM.value}-"))
 
 
-def warm_verdict(record: Path = RECORD) -> Verdict:
+def warm_verdict(record: Path | None = None) -> Verdict:
     """The verdict the warm runs of the record give, by the record's rule (docs/measurements/README.md):
     fail when one failed; otherwise none (not measured) when one is pending or there is none;
-    otherwise pass. A record that cannot be read gives none."""
+    otherwise pass. A record that cannot be read gives none. `RECORD` unless given."""
     try:
-        lines = record.read_text(encoding="utf-8").splitlines()
+        lines = (RECORD if record is None else record).read_text(encoding="utf-8").splitlines()
         runs = tomllib.loads("\n".join(lines[1 : lines.index(FENCE, 1)])).get("runs", [])
         verdicts = [run.get("verdict") for run in runs if is_warm_label(run.get("run"))]
     except (OSError, ValueError, AttributeError, TypeError):
@@ -424,7 +430,7 @@ def warm_verdict(record: Path = RECORD) -> Verdict:
 
 @dataclass(frozen=True)
 class StartSpike(common.Spike):
-    """A run of one kind of start: no verdict with fewer than `VERDICT_STARTS` counted starts."""
+    """A warm run: no verdict with fewer than `VERDICT_STARTS` counted starts."""
 
     def verdict(self, numbers: common.Numbers) -> Verdict:
         if numbers.get(Number.STARTS_COUNTED, 0) < VERDICT_STARTS:
@@ -433,20 +439,19 @@ class StartSpike(common.Spike):
 
 
 @dataclass(frozen=True)
-class ColdSpike(StartSpike):
-    """A cold run. The condition judges warm starts only, so a cold run with its counted starts
-    carries the verdict the record's warm runs give at the commit it runs from (`warm_verdict`):
-    with no warm run recorded yet it has none, and cannot make the record pass."""
+class ColdSpike(common.Spike):
+    """A cold run. The condition and its 20 starts judge warm starts only, so a cold run, whatever
+    its counted and failed starts, carries the verdict the record's warm runs give at the commit it
+    runs from (`warm_verdict`): its numbers are recorded beside theirs. With no warm run recorded
+    yet it has none, and cannot make the record pass."""
 
-    record: Path = RECORD
+    record: Path | None = None
 
     def verdict(self, numbers: common.Numbers) -> Verdict:
-        if super().verdict(numbers) is Verdict.NOT_MEASURED:
-            return Verdict.NOT_MEASURED
         return warm_verdict(self.record)
 
 
-SPIKES: dict[Kind, StartSpike] = {
+SPIKES: dict[Kind, common.Spike] = {
     Kind.WARM: StartSpike(MEASUREMENT, Number, passes_warm),
     Kind.COLD: ColdSpike(MEASUREMENT, Number, lambda _numbers: True),
 }
@@ -538,9 +543,11 @@ class Run:
                 self.gateway.wake()
             self.sleep(POLL_SECONDS)
         if state != READY:
-            # A sample taken before the deadline reaches the workspace up to `LATE_SECONDS` after it.
+            # A sample taken before the deadline reaches the workspace up to `LATE_SECONDS` after it,
+            # and one taken after it is not read.
             self.sleep(LATE_SECONDS)
-            return Start(None, tuple(self.pool.launches(woke_at, self.wall())), capacity=capacity)
+            deadline = woke_at + READY_WAIT_SECONDS
+            return Start(None, tuple(self.pool.launches(woke_at, deadline)), capacity=capacity)
         ready_at = self.wall()
         while True:
             launches = self.pool.launches(woke_at, self.wall())
