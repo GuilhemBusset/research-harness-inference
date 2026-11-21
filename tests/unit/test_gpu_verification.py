@@ -140,6 +140,12 @@ def test_a_pending_refresh_is_waited_for_and_counts_once_it_has_begun() -> None:
     assert decide(PendingAutoScaling(reads)) == ["coursework"]
 
 
+def test_a_refresh_seen_begun_while_polled_fails_even_when_its_last_read_omits_its_start() -> None:
+    reads: list[tuple[str, datetime | None]] = [("Pending", None), ("InProgress", AFTER), ("Failed", None)]
+    with pytest.raises(decision.DecisionError, match="coursework ended Failed"):
+        decide(PendingAutoScaling(reads))
+
+
 @pytest.mark.parametrize("ended", ["Cancelled", "Failed"])
 def test_a_refresh_that_ends_without_having_begun_asks_for_nothing(ended: str) -> None:
     assert decide(PendingAutoScaling([("Pending", None), (ended, None)])) == []
