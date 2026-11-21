@@ -347,6 +347,25 @@ are recorded here as proposed and are part of what the owner approves.
    reads "Issue commands and adopted probes; protected paths; skip accounting". An acceptance-checks
    commit an earlier engine made on a branch still binds CI's loop guard, so before the builder
    works on such a branch the engine releases what it locked, once.
+11. **No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21).** A
+    supervision is bounded by its 10 engine runs and the per-issue ceilings, which keep it
+    finite; it has no deadline of its own, and what sequences supervisions over time runs
+    outside the engine (a caller may still give one with `--max-hours`). An issue that stalls
+    (`ceiling`, `no_progress`, `history`, `main_broken`) is no engine defect and gets no repair
+    run, so it files no `loop:engine-bug` issue: it ends `failed`, its progress comment says why,
+    and the run's `events.jsonl` keeps the cause and the detail. Only an engine exception is
+    filed. A red `required` check is not run again: it goes back to the builder with the failed
+    job's log, as any failed check does, so the factory's GitHub App needs no write access to
+    Actions.
+12. **An examiner bound (2026-11-21).** Issues spent their call ceilings while every round
+    closed the findings it was given and each examination raised new edge cases. From an issue's
+    fourth examination since its latest plan (`Caps.examiner_bound`; a replan, or an edit of the
+    issue, starts the count again), only a finding that names a safety invariant blocks. A
+    finding that names only an item becomes the follow-up issue the engine already files for
+    non-blocking findings, and a commit whose items are all met is certified even when the
+    examiner withholds its certificate; the pull request's "Decisions" section records it, with
+    the examiner's summary. An `unmet` verdict on an item still withholds the certificate, and the
+    examiner is told in each examination which one it is and what blocks in it.
 13. **The steps that decide about a protected path run on the strongest Codex model
     (2026-11-21).** Amendment 3 is answered no: changes to the safety surface wait for no person,
     and the factory runs on its own. The examiner and the policy tests are then the only checks

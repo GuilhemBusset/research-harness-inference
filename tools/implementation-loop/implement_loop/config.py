@@ -142,6 +142,10 @@ class Caps:
     fix_forwards: int = 1             # then a revert PR
     reverts: int = 1
     merge_refusals: int = 3
+    # From this examination of an issue since its latest plan on, only a finding that names a safety
+    # invariant blocks: one that names only an item becomes a follow-up issue, and a withheld
+    # certificate no longer holds a head whose items are met (ADR 0001, amendment 12).
+    examiner_bound: int = 4
     run_ceiling_factor: float = 1.2
     max_parallel_writers: int = 1     # one issue built at a time: three at once ran the host out of memory (2026-11-15)
     max_parallel_agents: int = 6

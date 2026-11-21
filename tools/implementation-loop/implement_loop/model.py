@@ -222,11 +222,13 @@ class IssueState:
     reverts: int = 0
     restarts: int = 0                    # rounds abandoned unmerged (a refused history) since the last accepted one
     merge_refusals: int = 0
-    ci_rerun_heads: list[str] = field(default_factory=list)
     followup: int | None = None          # the follow-up issue filed for non-blocking findings
     extra_deps: list[int] = field(default_factory=list)      # prerequisites found mid-run, kept across runs
     exam_feedback: list[str] = field(default_factory=list)   # what the next examination must supply
     exam_retries: int = 0                # examinations re-asked for missing verdicts or probes
+    # Examinations since the latest plan (`Caps.examiner_bound`); None in a state an earlier engine
+    # wrote, which is counted from the journal instead (`Engine._examinations`).
+    examinations: int | None = None
     # Waiting and failure.
     wait: dict | None = None             # {kind, resume, detail, since, vendor?, version?, env?}
     fail: dict | None = None             # {cause, detail, version, resumed}

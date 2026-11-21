@@ -48,7 +48,7 @@ def render_plan(plan: Plan) -> str:
                      "the same gates)")
     lines += [("  - turn an item into an owner obligation when it needs a capability this host lacks, or defer it to "
                "another open issue"),
-              ("  - under the supervisor, file loop faults and run one repair per fault (never on the loop's safety "
+              ("  - under the supervisor, file engine faults and run one repair per fault (never on the loop's safety "
                "surface), then resume")]
     return "\n".join(lines)
 
@@ -104,7 +104,7 @@ def render_progress(st, root: int) -> str:
                   f"_{WAIT_HINT.get(st.wait.get('kind'), 'It resumes by itself.')}_"]
     if st.phase == Phase.FAILED and st.fail:
         lines += ["", f"**Not delivered ({st.fail.get('cause')}):** {st.fail.get('detail', '')}", "",
-                  "_Filed as a loop fault. The branch keeps the work; a new engine version tries once more._"]
+                  "_The branch keeps the work; a new engine version tries once more._"]
     if st.human_tasks:
         lines += ["", ("**Remaining obligations** (owner items: tick the box in the issue once done; deferred items "
                        "reopen by themselves):")]
@@ -195,7 +195,7 @@ def render_run_summary(root: int, states: dict) -> str:
             f"- #{n} ({(states[n].wait or {}).get('kind')}): {(states[n].wait or {}).get('detail', '')}" for n in waiting]
     failed = by_phase.get(Phase.FAILED, [])
     if failed:
-        lines += ["", "**Not delivered** (filed as loop faults; a new engine version tries once more):"] + [
+        lines += ["", "**Not delivered** (a new engine version tries once more):"] + [
             f"- #{n} ({(states[n].fail or {}).get('cause')}): {(states[n].fail or {}).get('detail', '')}" for n in failed]
     follow = [(n, states[n].followup) for n in states if states[n].followup]
     if follow:

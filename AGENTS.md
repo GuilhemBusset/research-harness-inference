@@ -222,7 +222,8 @@ do not depend on one. In the order a change meets them:
   `main` or `master`, and a hygiene scan of the staged change and of every pushed branch;
 - the implement loop's verifier, in the sandbox, on the exact head: the hygiene scan, the issue's
   commands, the adopted probes and protected paths; then the examiner's certificate for that head,
-  which reviews every change to a test;
+  which reviews every change to a test, and which from an issue's fourth examination on only an
+  unmet item or a finding that names a safety invariant withholds;
 - CI (`.github/workflows/ci.yml`), with no AWS credentials and no secrets: `scripts/check.sh` and
   the history scan, ending in one job, `required`;
 - the GitHub ruleset (`setup/pr-only-main.json`): a pull request for every change to `main`,

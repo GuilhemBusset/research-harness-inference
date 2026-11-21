@@ -40,6 +40,47 @@ repairs a failed issue.
 | `tests/test_codex_escalation.py` | New, against a fake `codex` that refuses a model as `codex exec --json` reports it: which calls escalate (an arbitration; a decision with a `protected_change`; an examination of a change that adds, changes, moves out or removes a protected file, or whose paths cannot be listed), and which do not; the fallback at once, charged to nothing, kept 30 minutes for every role; both models refusing, a refused default model and a crash; what counts as a refusal; the error messages kept from the stream. |
 | `tests/test_agent_git_isolation.py` | Its stand-in for `call` accepts `escalate`. |
 
+## An examiner bound: from the fourth examination, only a safety invariant blocks (2026-11-21)
+
+A local patch, not in upstream. Several issues failed on their call ceiling while every round
+closed the findings it was given and each examination raised new edge cases. From an issue's
+fourth examination since its latest plan, a finding that names only an item becomes a follow-up
+issue, and a head whose items are all met is certified even when the examiner withholds its
+certificate (ADR 0001, amendment 12). The engine's version stays 1.2.21: nothing here repairs a
+failed issue. An issue in flight keeps the examinations it already had, read from the journal.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/config.py` | `Caps` gains `examiner_bound`, 4. |
+| `implement_loop/model.py` | `IssueState` gains `examinations`, the examinations since the latest plan; `None` in a state an earlier engine wrote. |
+| `implement_loop/engine.py` | The plan step sets the count to 0. The examine step counts each examination (`_examinations`, which reads a missing count from the journal: the `examined` events after the issue's last `planned` one) and tells the examiner which one it is and what blocks in it (`_examination_note`, the first line of the examination's feedback). From the bound on, a finding the gate would block and that names no safety invariant becomes `follow_up`, its reason says why, and the `examined` event lists it under `bounded`; a withheld certificate with no unmet item, no missing verdict and no blocking finding certifies the head, with a decision (`examiner-bound-<n>`, quoting the examiner's summary) and the event `certified_by_bound`. The follow-up issue names the item of each finding and says that past the bound only a safety invariant blocks. |
+| `prompts/examine.md` | States the bound, and renders `{{feedback}}`: what the engine tells the examiner. Until now the examination prompt had no such placeholder, so the request to complete an incomplete examination and the note that an examination certifies a revert never reached the examiner. |
+| `implement_loop/agents.py` | The fake examiner can raise another reproduced finding on an item at each examination (`new_findings`), or on a safety invariant (`invariant_findings`); the fake builder handles each one it is shown. |
+| `tests/test_examiner_bound.py` | New: the fourth examination's finding on an item is a follow-up and the issue lands; a finding on a safety invariant still blocks past the bound; a withheld certificate no longer holds a met head there, and an unmet item still does; a replan starts the count again; a state with no count reads it from the journal; the examiner is told which examination it is. |
+
+## No supervision deadline, no fault issue for a stall, no re-run of CI (2026-11-21)
+
+A local patch, not in upstream (ADR 0001, amendment 11). A deadline stops a supervision in the
+middle of an epic, while its runs bound and the per-issue ceilings already keep it finite; what
+sequences supervisions runs outside the engine and may still give one. A stall (`ceiling`,
+`no_progress` and the like) is no engine defect and never got a repair run, so its fault issue
+only waited for the operator to close it. The re-run of a failed `required` check needed write
+access to Actions, which the factory's GitHub App does not have, and a red check goes to the
+builder with its log anyway. The engine's version stays 1.2.21: nothing here repairs a failed
+issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/supervisor.py` | `MAX_HOURS` is gone. `max_hours` is optional (default `None`): with none there is no deadline, `_run_engine` waits for the run however long it takes, and no backoff is cut short. A deadline given by the caller works as before (one for repair and root runs, the run asked to stop, then signalled). The 10-run bound is unchanged. `_stall` stays, for the stall entries `faults.json` still holds. |
+| `implement_loop/cli.py` | `supervise --max-hours` defaults to none, and `--detach` passes it on only when given. |
+| `implement_loop/engine.py` | `_fail` records no fault (the `stall:` fingerprint and its issue body are gone); the event `failed` keeps the cause and the detail. The label `loop:failed` no longer says "filed as a loop fault". The land step no longer re-runs a failed required check (`ci_rerun_heads`, the event `ci_rerun`): its conclusion goes to `_ci_failed` at once. `_wait_required` returns the conclusion only, and its `after` parameter is gone. The builder's feedback no longer says "also after one re-run". |
+| `implement_loop/github.py` | `rerun_failed` is gone from the client's protocol, `GhCli` and `FakeGitHub` (with its `reruns`). |
+| `implement_loop/model.py` | `IssueState.ci_rerun_heads` is gone; a state file that still carries it loads (`from_dict` drops unknown keys). |
+| `implement_loop/report.py` | The progress comment of a failed issue, the run summary and the plan's preview no longer say that a failed issue is filed as a loop fault. |
+| `tests/test_supervisor.py`, `tests/test_review_fixes.py`, `tests/test_sandbox.py` | No deadline without `max_hours`; the CLI passes `--max-hours` on only when given; a stall fault from an earlier engine still gets no repair run; `_fail` files no fault and journals `failed`. |
+| `tests/test_engine.py`, `tests/test_engine_recovery.py`, `tests/test_github.py`, `tests/test_scheduler_state_verify.py` | The re-run tests are gone; a red check goes straight to the builder; a cancelled check waits until it is run again; an old state with `ci_rerun_heads` loads; a failed issue files no fault. |
+| `tests/test_history_checks.py`, `tests/test_redaction.py` | A failed issue's place and rule are read from its progress comment, which is what reaches GitHub, and no `loop:engine-bug` issue is filed. |
+
 ## Nothing locks a test, and no zone restricts the builder (2026-11-21)
 
 A local patch, not in upstream, by the owner's decision of 2026-11-21 (ADR 0001, amendment 10).
