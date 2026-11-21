@@ -33,12 +33,16 @@ scaler alone starts an instance (section 5.1). For each of the starts it is give
    instance was writing when the wake was sent, so these samples come from a launch that began
    after it. **The launch that became ready** is the one, an instance and a transition into service
    (a promotion from the warm pool, or a cold launch), that has both a weights and a hook sample
-   after the wake, and whose instance was still scraped when the pool became ready: a sample taken
-   no more than `FRESH_SECONDS` before readiness (`Pool.launch`). A launch abandoned after its
-   weights loaded has no hook sample. A launch whose completion Auto Scaling did not take still
-   has one, but its instance waits out the hook and is gone before the group launches its
-   replacement: neither is counted, and the replacement is, once its samples reach the workspace.
-   A start with no such launch, or with two, is not counted, and stops the run
+   after the wake, whose instance was still scraped when the pool became ready (a sample taken no
+   more than `FRESH_SECONDS` before readiness), and whose instance reached service: it wrote
+   `rhi_lifecycle_release_info` (`rhi_lifecycle.serving`) after the wake. The agent starts its
+   serving duties, and so exposes that metric, only once Auto Scaling has taken the launch's
+   `CONTINUE` (`rhi_lifecycle.__main__`), and its process starts afresh with every boot
+   (`Pool.launch`). A launch abandoned after its weights loaded has no hook sample. A launch whose completion Auto
+   Scaling did not take still has one, since the agent ends the hook stage whatever the answer, and
+   its instance can still be scraped while it waits out the hook; it never writes the release
+   metric. Neither is counted, and the replacement is, once its samples reach the workspace. A
+   start with no such launch, or with two, is not counted, and stops the run
    (`weights_of_launch`).
 
 **The numbers** (`Number`), posted with the verdict through `common.run_spike`: `starts`, the
@@ -74,6 +78,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import boto3
 
 import common
+from rhi_lifecycle.serving import RELEASE_METRIC
 from rhi_lifecycle.stages import METRIC, Stage, Transition
 
 if TYPE_CHECKING:
@@ -162,11 +167,14 @@ def _launch_of(labels: Mapping[str, str]) -> tuple[str, str] | None:
     return (instance, transition) if instance and transition in INTO_SERVICE else None
 
 
-def weights_of_launch(values: Sequence[common.Series], stamps: Sequence[common.Series], ready_at: float) -> Launch:
+def weights_of_launch(
+    values: Sequence[common.Series], stamps: Sequence[common.Series], serving: Sequence[common.Series], ready_at: float
+) -> Launch:
     """The launch that became ready at `ready_at`, from the weights and hook stages of the pool
-    taken after the wake (`values`) and the times the pool's stage samples were taken (`stamps`):
-    the one launch into service with a weights and a hook sample, whose instance had a sample taken
-    no more than `FRESH_SECONDS` before readiness. NoLaunch when there is none, or more than one."""
+    taken after the wake (`values`), the times the pool's stage samples were taken (`stamps`) and
+    the pool's release samples taken after the wake (`serving`): the one launch into service with a
+    weights and a hook sample, whose instance had a stage sample taken no more than `FRESH_SECONDS`
+    before readiness and has a release sample. NoLaunch when there is none, or more than one."""
     weights: dict[tuple[str, str], float] = {}
     completed: set[tuple[str, str]] = set()
     for one in values:
@@ -183,9 +191,11 @@ def weights_of_launch(values: Sequence[common.Series], stamps: Sequence[common.S
         if (launch := _launch_of(one.labels)) is not None
         and any(taken >= ready_at - FRESH_SECONDS for taken in one.values())
     }
-    ready = sorted(launch for launch in weights if launch in completed and launch in running)
+    in_service = {one.labels.get("instance", "") for one in serving if one.samples}
+    completed &= {launch for launch in running if launch[0] in in_service}
+    ready = sorted(launch for launch in weights if launch in completed)
     if len(ready) != 1:
-        raise NoLaunch(f"{len(ready)} launches into service completed and ran at readiness, not one")
+        raise NoLaunch(f"{len(ready)} launches into service reached service and ran at readiness, not one")
     ((instance, transition),) = ready
     return Launch(instance, transition, weights[(instance, transition)])
 
@@ -265,7 +275,10 @@ class Pool:
         # One query: each value is kept on the test of its own sample's time, both read together.
         values = self.workspace.read_series(f"{stages} and timestamp({stages}) > {woke_at:.3f}", **span)
         stamps = self.workspace.read_series(f"timestamp({self._selector()})", **span)
-        return weights_of_launch(values, stamps, ready_at)
+        # The release metric: written only by an instance whose launch Auto Scaling took into service.
+        release = f'{RELEASE_METRIC}{{pool="{self.name}"}}'
+        serving = self.workspace.read_series(f"{release} and timestamp({release}) > {woke_at:.3f}", **span)
+        return weights_of_launch(values, stamps, serving, ready_at)
 
 
 class Run:
