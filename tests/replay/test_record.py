@@ -368,3 +368,116 @@ def test_a_refused_profile_leaves_the_folder_free(stack: tuple[str, str], tmp_pa
     with pytest.raises(ValueError, match="request profile"):
         record.Session(address, tmp_path, profile="no-such-pool")
     record.Session(address, tmp_path).close()
+
+
+def test_a_refused_request_saves_no_key_from_a_name_written_twice(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    encoded = f"%{ord(key[0]):02x}{key[1:]}"
+    body = '{"system":' + json.dumps(encoded) + ',"system":"Hello",' + json.dumps(messages())[1:]
+    with recording(address, tmp_path) as (session, client):
+        assert client.post("/v1/messages", headers=anthropic(key), content=body).status_code == 400
+    (path,) = session.written
+    assert key not in unquote(harness.load(path).body.decode("utf-8"))
+
+
+def test_a_user_name_that_is_the_stream_terminator_keeps_it(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    body = {
+        "model": smoke.MOCK_POOL,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": [{"role": "user", "content": "Hello."}],
+    }
+    with recording(address, tmp_path, user="done") as (_, client):
+        assert (
+            client.post("/v1/chat/completions", headers={"authorization": f"Bearer {key}"}, json=body).status_code
+            == 200
+        )
+    (capture,) = harness.folder(tmp_path)
+    assert capture.answer.endswith(b"data: [DONE]\n\n")
+    assert_replays(capture)
+
+
+def test_the_user_name_is_removed_from_a_claude_model_name_and_its_data_url(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(4)}"
+    payload = base64.b64encode(_png()).decode("ascii")
+    image = {"type": "input_image", "image_url": f"data:image/png;name={login}.png;base64,{payload}"}
+    body = {"model": smoke.MOCK_POOL, "input": [{"role": "user", "content": [image]}]}
+    with recording(address, tmp_path, user=login, profile="coursework") as (session, client):
+        named = client.post("/v1/messages", headers=anthropic(key), json=messages(model=f"claude-{login}"))
+        attached = client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body)
+    assert (named.status_code, attached.status_code) == (200, 200)
+    first, second = (harness.load(path) for path in session.written)
+    assert json.loads(first.body)["model"] == "claude-user"  # Still a `claude-` name: the same pool.
+    assert first.forward is not None and first.forward["model"] == "coursework"
+    assert_replays(first)
+    saved = json.loads(second.body)["input"][0]["content"][0]["image_url"]
+    assert saved == f"data:image/png;name=user.png;base64,{payload}"
+
+
+def _pdf(author: bytes) -> bytes:
+    """A valid document of one page, whose author is written as given."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        b"<< /Author " + author + b" >>",
+    ]
+    pdf, offsets = b"%PDF-1.4\n", []
+    for number, entry in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf += b"%d 0 obj\n%s\nendobj\n" % (number, entry)
+    table = b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    return (
+        pdf
+        + b"xref\n0 5\n0000000000 65535 f \n%strailer\n<< /Root 1 0 R /Info 4 0 R /Size 5 >>\nstartxref\n%d\n%%%%EOF\n"
+        % (
+            table,
+            len(pdf),
+        )
+    )
+
+
+@pytest.mark.parametrize("written", ["png-compressed", "pdf", "pdf-hexadecimal", "pdf-escaped"])
+def test_a_file_whose_metadata_names_the_user_in_another_form_is_not_written(
+    stack: tuple[str, str], tmp_path: Path, written: str
+) -> None:
+    address, key = stack
+    login = f"tester{secrets.token_hex(8)}".encode("ascii")
+    if written == "png-compressed":
+        text = b"Author\x00\x00" + zlib.compress(login)
+        chunk = struct.pack(">I", len(text)) + b"zTXt" + text + struct.pack(">I", zlib.crc32(b"zTXt" + text))
+        png = _png()
+        data = base64.b64encode(png[:-12] + chunk + png[-12:]).decode("ascii")
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+        path, headers, body = "/v1/messages", anthropic(key), messages(messages=_read_png(image))
+    else:
+        author = {
+            "pdf": b"(" + login + b")",
+            "pdf-hexadecimal": b"<FEFF" + login.decode("ascii").encode("utf-16-be").hex().encode("ascii") + b">",
+            "pdf-escaped": b"(" + b"".join(b"\\%03o" % byte for byte in login) + b")",
+        }[written]
+        file = {"type": "input_file", "filename": "notes.pdf", "file_data": base64.b64encode(_pdf(author)).decode()}
+        path, headers = "/v1/responses", {"authorization": f"Bearer {key}"}
+        body = {"model": smoke.MOCK_POOL, "input": [{"role": "user", "content": [file]}]}
+    with recording(address, tmp_path, user=login.decode("ascii")) as (session, client):
+        assert client.post(path, headers=headers, json=body).status_code == 200
+    assert session.written == [] and list(tmp_path.iterdir()) == []
+
+
+def test_an_inline_file_whose_metadata_names_no_one_is_kept_byte_for_byte(
+    stack: tuple[str, str], tmp_path: Path
+) -> None:
+    address, key = stack
+    data = base64.b64encode(_pdf(b"(nobody)")).decode("ascii")
+    body = {
+        "model": smoke.MOCK_POOL,
+        "input": [{"role": "user", "content": [{"type": "input_file", "file_data": data}]}],
+    }
+    with recording(address, tmp_path) as (_, client):
+        assert client.post("/v1/responses", headers={"authorization": f"Bearer {key}"}, json=body).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    assert json.loads(capture.body)["input"][0]["content"][0]["file_data"] == data
