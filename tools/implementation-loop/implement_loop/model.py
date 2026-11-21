@@ -222,7 +222,6 @@ class IssueState:
     reverts: int = 0
     restarts: int = 0                    # rounds abandoned unmerged (a refused history) since the last accepted one
     merge_refusals: int = 0
-    ci_rerun_heads: list[str] = field(default_factory=list)
     followup: int | None = None          # the follow-up issue filed for non-blocking findings
     extra_deps: list[int] = field(default_factory=list)      # prerequisites found mid-run, kept across runs
     exam_feedback: list[str] = field(default_factory=list)   # what the next examination must supply
