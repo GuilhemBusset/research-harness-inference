@@ -8,7 +8,9 @@ from __future__ import annotations
 import io
 import urllib.request
 from dataclasses import dataclass
+from email.message import Message
 from types import SimpleNamespace
+from urllib.response import addinfourl
 
 import pytest
 
@@ -160,6 +162,26 @@ def test_a_launch_whose_completion_was_not_taken_is_not_counted_while_its_instan
     assert launch == s4.Launch("instance-c", "promotion", 120.0)
 
 
+def test_a_replacement_started_after_readiness_is_not_the_launch_that_became_ready() -> None:
+    # The launch that made the pool ready loaded for 120 s, but its samples reach the workspace late;
+    # a replacement started after readiness loads for 60 s and its samples arrive first.
+    ready = WAKE + 150
+    launch = _one_start(
+        [
+            *(
+                Sample("ready-node", stage, value, ready - 5, available=ready + 140)
+                for stage, value in (("weights", 120.0), ("hook", 1.0), ("release", 1.0))
+            ),
+            *(
+                Sample("replacement-node", stage, value, ready + 100, available=ready + 100)
+                for stage, value in (("weights", 60.0), ("hook", 1.0), ("release", 1.0))
+            ),
+        ],
+        ready_after=150,
+    )
+    assert launch == s4.Launch("ready-node", "promotion", 120.0)
+
+
 def test_a_launch_written_only_before_the_wake_is_no_start() -> None:
     samples = [Sample("instance-a", "weights", 40.0, WAKE - 10), Sample("instance-a", "hook", 1.0, WAKE - 10)]
     with pytest.raises(s4.NoLaunch):
@@ -228,6 +250,27 @@ def test_the_canary_key_is_never_sent_over_plain_http(monkeypatch: pytest.Monkey
     for endpoint in ("http://example.com", "ftp://example.com", ""):
         with pytest.raises(ValueError):
             s4.Gateway(endpoint, "coursework", generate_key()).state()
+
+
+def test_the_canary_key_does_not_follow_a_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = []
+
+    def transport(_: object, __: object, request: urllib.request.Request, **___: object) -> addinfourl:
+        sent.append((request.full_url, request.has_header("Authorization")))
+        headers, body = Message(), b'{"pools":[{"model":"coursework","state":"cold"}]}'
+        if request.type == "https":
+            headers["Location"] = "http://example.com/status"
+            response = addinfourl(io.BytesIO(), headers, request.full_url, 302)
+        else:
+            response = addinfourl(io.BytesIO(body), headers, request.full_url, 200)
+        # urllib reads the reason of a real HTTP answer from `msg`, which the stub of addinfourl leaves out.
+        response.msg = ""  # ty: ignore[unresolved-attribute]
+        return response
+
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    monkeypatch.setattr(urllib.request.AbstractHTTPHandler, "do_open", transport)
+    s4.Gateway("example.com", "coursework", generate_key()).state()
+    assert sent == [("https://example.com/status", True), ("http://example.com/status", False)]
 
 
 def test_the_run_label_is_the_loader_setting() -> None:
