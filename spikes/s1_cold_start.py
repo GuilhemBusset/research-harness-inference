@@ -26,7 +26,8 @@ For each of the starts it is given, 20 unless told otherwise:
 2. **The wake.** It notes the time and sends `POST /wake` for the pool, and repeats it every minute
    while the pool is not ready, as a student's `rhi wait` does: an explicit wake counts as demand
    for 10 minutes only (section 5.3). It reads the status every `POLL_SECONDS` until the pool is
-   `ready`, or until `READY_WAIT_SECONDS` have passed; then it waits `LATE_SECONDS` more before it
+   `ready`, or until `READY_WAIT_SECONDS` have passed (a pool read `ready` only after that is a
+   failed start, as one never ready); then it waits `LATE_SECONDS` more before it
    reads the launches, for the samples taken before the deadline to reach the workspace, and reads
    only those: a stage sampled after the deadline is not one the start reached. A status of
    `unavailable` for `capacity_unavailable` on the way, the scaler's evidence that a launch found no capacity, is
@@ -530,23 +531,26 @@ class Run:
             "kept writing",
         )
         woke_at = woken = self.wall()
+        deadline = woke_at + READY_WAIT_SECONDS
         self.gateway.wake()
         capacity = False
         while True:
             state, cause = self.gateway.status()
             capacity = capacity or cause == CAPACITY_UNAVAILABLE
             now = self.wall()
-            if state == READY or now - woke_at >= READY_WAIT_SECONDS:
+            # Readiness counts only when read by the deadline: a pool ready after it is a failed start.
+            ready = state == READY and now <= deadline
+            if ready or now >= deadline:
                 break
             if now - woken >= WAKE_EVERY_SECONDS:
                 woken = now
                 self.gateway.wake()
-            self.sleep(POLL_SECONDS)
-        if state != READY:
+            # The last read is at the deadline, not up to a poll after it.
+            self.sleep(min(POLL_SECONDS, deadline - now))
+        if not ready:
             # A sample taken before the deadline reaches the workspace up to `LATE_SECONDS` after it,
             # and one taken after it is not read.
             self.sleep(LATE_SECONDS)
-            deadline = woke_at + READY_WAIT_SECONDS
             return Start(None, tuple(self.pool.launches(woke_at, deadline)), capacity=capacity)
         ready_at = self.wall()
         while True:
