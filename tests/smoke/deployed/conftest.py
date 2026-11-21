@@ -20,6 +20,11 @@ tests that read them take `serving`, which sends the pool one stream first. In a
 folder these tests come after `../test_smoke.py` (`../conftest.py` orders them so), and the pool
 is in service already.
 
+**When the run began.** The fixture `run_started` is the time this run's tests were collected,
+before any of them sent the pool a stream: a test that must account for every report of the run,
+the reports of the stream that woke the pool included, reads the workspace from then on. In a
+run of the whole folder that stream is `../test_smoke.py`'s first.
+
 **The workspace lags.** A collector scrapes every 15 seconds and then pushes, and an instant query
 still returns a series for 5 minutes after its last sample. So a read is repeated until it holds
 what the test asks for, or a deadline passes.
@@ -59,6 +64,15 @@ def pytest_pycollect_makeitem() -> list[pytest.Item] | None:
     """While no endpoint is given, nothing in this folder's files is a test: left out, never
     skipped. pytest asks this file about its own folder only."""
     return None if os.environ.get(ENDPOINT_VARIABLE) else []
+
+
+# When this run's tests were collected, kept for `run_started`.
+RUN_STARTED = pytest.StashKey[float]()
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Records when the run began: once its tests are collected, before any of them runs."""
+    session.stash[RUN_STARTED] = time.time()
 
 
 def given(variable: str) -> str:
@@ -108,6 +122,12 @@ class Workspace:
             if not missing or time.monotonic() >= deadline:
                 return missing
             time.sleep(POLL_SECONDS)
+
+
+@pytest.fixture(scope="session")
+def run_started(request: pytest.FixtureRequest) -> float:
+    """The Unix time this run began, before any of its tests sent the pool a stream."""
+    return request.session.stash[RUN_STARTED]
 
 
 @pytest.fixture(scope="module")

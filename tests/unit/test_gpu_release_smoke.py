@@ -1,7 +1,8 @@
 """The GPU release smoke test (tests/smoke/deployed/test_gpu_release.py) takes as served only what
-the pool's lifecycle agents reported after the request: a report from before it, of a stopped or a
-replaced instance, neither passes nor fails it, and a wrong release reported after it fails it,
-however soon its series ages out or is marked stale. A fake workspace stands in for Prometheus,
+the pool's lifecycle agents reported during the run: a report from before it, of a stopped or a
+replaced instance, neither passes nor fails it, and a wrong release reported during it fails it,
+however soon its series ages out or is marked stale, when an earlier test's stream woke the pool,
+and when the collector delivers it only after its retries. A fake workspace stands in for Prometheus,
 answering `count_over_time` over the raw samples that have arrived, and a fake clock for time: no
 account, no network.
 """
@@ -29,7 +30,7 @@ OTHER = ("sha256:" + "c" * 64, "b" * 40)
 HOLD = 60.0
 QUERY = re.compile(r'count_over_time\(rhi_lifecycle_release_info\{pool="coursework"\}\[(\d+)ms\]\)')
 
-# One report: (instance, release, taken, arrived), in seconds from the request.
+# One report: (instance, release, taken, arrived), in seconds from the test's request.
 Sample = tuple[str, tuple[str, str], float, float]
 
 
@@ -48,8 +49,9 @@ class Clock:
     monotonic = time
 
 
-def run_against_samples(monkeypatch: pytest.MonkeyPatch, samples: Sequence[Sample]) -> None:
-    """The smoke test against a coursework pool whose lifecycle agents made `samples`. Like
+def run_against_samples(monkeypatch: pytest.MonkeyPatch, samples: Sequence[Sample], *, wake: float = 0.0) -> None:
+    """The smoke test against a coursework pool whose lifecycle agents made `samples`, in a run that
+    began `wake` seconds before the test's request, while an earlier test's stream woke the pool. Like
     Prometheus, the workspace answers `count_over_time` of the metric over a window ending at the
     query's `time` with the series that have a sample taken in that window, among the samples that
     have arrived; a stale marker is no sample."""
@@ -59,6 +61,8 @@ def run_against_samples(monkeypatch: pytest.MonkeyPatch, samples: Sequence[Sampl
     check = smoke["test_the_woken_pool_completes_a_stream_and_serves_the_deployed_release"]
     workspace_type = runpy.run_path(str(DEPLOYED / "conftest.py"))["Workspace"]
     clock = Clock()
+    run_started = clock.now
+    clock.sleep(wake)
     sent = clock.now
     for namespace in (check.__globals__, workspace_type.series.__globals__):
         monkeypatch.setitem(namespace, "time", clock)
@@ -105,6 +109,7 @@ def run_against_samples(monkeypatch: pytest.MonkeyPatch, samples: Sequence[Sampl
         stack=Stack(),
         workspace=workspace_type(url="https://workspace.example.com", http=http, session=session),
         deployed_release=RELEASE,
+        run_started=run_started,
     )
 
 
@@ -170,6 +175,25 @@ def test_an_instance_stopped_well_before_the_request_does_not_count(monkeypatch:
     instant query returns its series until 80 seconds after it, as with the stale series above."""
     stopped = [("stopped", OTHER, float(taken), float(taken)) for taken in range(-400, -219, 15)]
     run_against_samples(monkeypatch, [*stopped, *every_scrape("woken", RELEASE)])
+
+
+def test_a_wrong_release_reported_while_an_earlier_test_s_stream_woke_the_pool_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The instance that served the waking stream reported another release during that hold and
+    then stopped reporting; the test's own, later stream is served by a partner of the deployed one."""
+    woken = [("woken", OTHER, -10.0, -10.0)]
+    with pytest.raises(AssertionError, match="another release"):
+        run_against_samples(monkeypatch, [*woken, *every_scrape("partner", RELEASE, start=15.0)], wake=HOLD)
+
+
+def test_a_wrong_release_delivered_after_the_collector_s_retries_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The woken instance's report of another release, just before the stream ended, reaches the
+    workspace only after 5 minutes of retries, while a partner's reports of the deployed one arrive
+    at once."""
+    woken = [("woken", OTHER, HOLD - 10, HOLD - 10 + 300)]
+    with pytest.raises(AssertionError, match="another release"):
+        run_against_samples(monkeypatch, [*woken, *every_scrape("partner", RELEASE)])
 
 
 def test_no_report_of_the_deployed_release_fails(monkeypatch: pytest.MonkeyPatch) -> None:
