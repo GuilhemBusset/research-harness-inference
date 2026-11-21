@@ -325,12 +325,19 @@ _DATA = re.compile(r"data: ?")
 # names of a schema's properties (which its `required` list writes as texts).
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+# A schema's keywords whose names are its property names, and whose values name properties too
+# (`dependentRequired`) or are schemas (`dependentSchemas`); `dependencies` is either, by property.
+_DEPENDENCY_MAPS = frozenset({"dependentRequired", "dependentSchemas", "dependencies"})
 # Fields whose values are what a tool or a person wrote, names included: a request's metadata, a
 # tool's input examples, and a schema's instance values.
 _DATA_FIELDS = frozenset({"metadata", "input_examples", "examples", "default", "const", "enum"})
 # Fields whose text values the wire format enumerates (`image`, `image/png`, `assistant`, `end_turn`):
 # the user name is not looked for in them, so that a login that is one of them changes no block.
 _FORMAT_VALUES = frozenset({"type", "role", "media_type", "object", "stop_reason", "finish_reason", "status", "effort"})
+# The fields of a stream's events that carry, piece by piece, what a model wrote.
+_MODEL_TEXTS = frozenset(
+    {"text", "thinking", "partial_json", "content", "reasoning_content", "reasoning", "arguments", "delta", "refusal"}
+)
 # What a stream of Chat Completions ends with: the format's, whatever the user name.
 _STREAM_END = "[DONE]"
 # Headers of the wire format, names and values: the user name is not looked for in them either.
@@ -539,6 +546,47 @@ def _all_texts(value: Any) -> Iterator[str]:
                 yield from _all_texts(held)
 
 
+def _strings(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], str]]:
+    """Every string of a JSON value with the names that lead to it, a list's positions left out."""
+    if isinstance(value, dict):
+        for name, inner in value.items():
+            yield from _strings(inner, (*path, name))
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _strings(inner, path)
+    elif isinstance(value, str):
+        yield path, value
+
+
+def _stream_joins(body: Any) -> Iterator[tuple[str, bool]]:
+    """What a stream's events write in pieces, each joined in the order they came: one text for each field
+    (a block's `thinking`, a call's `arguments`), and one of every delta, whichever field it is in. Each
+    comes with whether it is what a model wrote, rather than the format's (a `type`, an `id`).
+
+    A value split across two events is in none of them whole: it is only seen joined.
+    """
+    lines = body if isinstance(body, list) else str(body).splitlines()
+    by_field: dict[tuple[str, ...], list[str]] = {}
+    deltas: list[str] = []
+    for line in lines:
+        found = _DATA.match(line)
+        if found is None:
+            continue
+        try:
+            event = json.loads(line[found.end() :])
+        except (ValueError, RecursionError):
+            continue
+        for path, text in _strings(event):
+            by_field.setdefault(path, []).append(text)
+            if path[-1] not in _FORMAT_VALUES and "delta" in path:
+                deltas.append(text)
+    for path, texts in by_field.items():
+        if len(texts) > 1:
+            yield "".join(texts), path[-1] in _MODEL_TEXTS
+    if len(deltas) > 1:
+        yield "".join(deltas), True
+
+
 def _spelled(value: str) -> str:
     """A pattern of a literal value, each of its characters written as itself, percent-encoded as in a
     URL, or escaped as in a JSON text a string holds (`\\u0074`, `\\/`), the escapes in either letter case."""
@@ -632,6 +680,12 @@ class Neutral:
         # What a replacement writes is left out of it: a home directory or a key it holds is no one's.
         self._keys_left = [key for key in keys if len(key) >= 8 and key not in KEY_PLACEHOLDER]
         self._homes_left = [value for value in homes if value not in NEUTRAL_HOME]
+        # A user name a stream writes in pieces (`check`): each piece holds none of it whole, so none was
+        # replaced. What a replacement writes is taken out of the joined text before it is read.
+        self._user_left = re.compile(re.escape(user) if user else "(?!)", re.IGNORECASE)
+        self._neutral_values = re.compile(
+            "|".join(re.escape(value) for value in (NEUTRAL_HOME, EXAMPLE_HOST, KEY_PLACEHOLDER, NEUTRAL_USER))
+        )
         # The names of the pools a request may name as its model: the format's, whatever the user name.
         self._pools = frozenset({*(pool.name for pool in harness.POOLS), *pools})
 
@@ -703,6 +757,19 @@ class Neutral:
                 decoded = _decoded(payload)
                 if decoded is not None:
                     self.read_bytes(decoded, "a base64 payload")
+        answer = capture.get("answer")
+        for joined, written_by_model in _stream_joins(answer.get("body") if isinstance(answer, Mapping) else None):
+            for view in (joined, unquote(joined)):
+                if _ANY_KEY_RE.search(view) or any(key in view for key in self._keys_left):
+                    raise scrub.Refused(scrub.KEY, "a stream's events, joined")
+                if any(home in view for home in self._homes_left):
+                    raise scrub.Refused("home directory", "a stream's events, joined")
+                if written_by_model and self._user_left.search(self._without_neutral(view)):
+                    raise scrub.Refused("user name", "a stream's events, joined")
+
+    def _without_neutral(self, text: str) -> str:
+        """A text with what a replacement writes taken out, each in place of a character no name holds."""
+        return self._neutral_values.sub("\0", text)
 
     def name(self, name: str, *, data: bool = False) -> str:
         """A name of a JSON object: a field of the format is renamed only for a host, a key or the home directory."""
@@ -740,6 +807,14 @@ class Neutral:
                 written = {renamed[field]: self.value(schema) for field, schema in inner.items()}
             elif name == "required" and isinstance(inner, list) and renamed:
                 written = [renamed[item] if isinstance(item, str) and item in renamed else self.value(item) for item in inner]
+            elif name in _DEPENDENCY_MAPS and isinstance(inner, dict) and not data:
+                # Its names are the schema's property names, and so are the texts of its lists.
+                written = _distinct(
+                    [
+                        (field, renamed[field] if field in renamed else self.text(field), self._dependency(given, renamed))
+                        for field, given in inner.items()
+                    ]
+                )
             elif name in _SCHEMA_MAPS and isinstance(inner, dict) and not data:
                 written = _distinct([(field, self.text(field), self.value(schema)) for field, schema in inner.items()])
             elif name in _FORMAT_VALUES and isinstance(inner, str) and not data:
@@ -749,6 +824,15 @@ class Neutral:
                 written = self.value(inner, data=data or tool_input or name in _DATA_FIELDS)
             neutral.append((name, self.name(name, data=data), written))
         return _distinct(neutral)
+
+    def _dependency(self, given: Any, renamed: Mapping[str, str]) -> Any:
+        """A property's dependency: a list of property names, named as the schema's properties are, or a schema."""
+        if isinstance(given, list):
+            return [
+                (renamed[item] if item in renamed else self.text(item)) if isinstance(item, str) else self.value(item)
+                for item in given
+            ]
+        return self.value(given)
 
     def json_text(self, text: str, *, data: bool = False) -> str:
         """A text that may be a JSON object or array: rewritten as JSON if it is one, as text if not.
