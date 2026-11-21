@@ -125,7 +125,6 @@ class Agents(L.agents.FakeAgents):
 
     def plan(self, vendor, req, worktree):
         result = super().plan(vendor, req, worktree)
-        result.zones.append(f"docs/repair_{req.issue.number}.txt")
         for item in result.items:
             if item.proof == "owner":
                 item.capability = self.needs[req.issue.number, item.id]

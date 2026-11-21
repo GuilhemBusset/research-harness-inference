@@ -67,7 +67,6 @@ class ItemPlan:
 @dataclass
 class PlanResult:
     items: list[ItemPlan]
-    zones: list[str]
     decisions: list[dict]
     notes: str = ""
 
@@ -104,7 +103,6 @@ class BuildResult:
     note: str = ""
     tests: list[str] = field(default_factory=list)
     commands: list[CheckSpec] = field(default_factory=list)
-    dispositions: dict[str, str] = field(default_factory=dict)
     decisions: list[dict] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
 
@@ -123,7 +121,6 @@ class Decision:
     request: str
     approve: bool
     reason: str
-    dispositions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -279,8 +276,8 @@ class FakeAgents:
                 items.append(ItemPlan(item.id, "judged by the examiner", words, "review"))
             else:
                 items.append(ItemPlan(item.id, "proven by the test", words, "test"))
-        result = PlanResult(items=items, zones=[],
-                            decisions=[{"id": "approach", "choice": "the simplest variant", "rationale": "fake"}])
+        result = PlanResult(items=items, decisions=[{"id": "approach", "choice": "the simplest variant",
+                                                     "rationale": "fake"}])
         return self._metered(n, "plan", vendor, lambda: result)
 
     def triage(self, vendor, req, plan):

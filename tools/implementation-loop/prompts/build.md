@@ -29,7 +29,7 @@ You are the builder. Build this issue in your working directory, following your 
     no test file per issue or per acceptance item, and no issue number in a test's name. A
     defect a finding showed is covered by such a behaviour test; the examiner's probe is never
     committed.
-- `tests`: the test files you wrote or changed. `dispositions`: leave it empty.
+- `tests`: the test files you wrote or changed.
 - Any file is yours to change, tests and commands included, except a protected path the issue
   does not name (below). An item you leave out of `commands` keeps the commands it had; an item
   you list runs exactly the commands you give it from then on. The examiner reviews every change

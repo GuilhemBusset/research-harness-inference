@@ -29,7 +29,7 @@ def plan(a2: str) -> dict:
 
 class Agents:
     def plan(self, vendor, req, wt):
-        return PlanResult(items=[ItemPlan(**i) for i in plan("review")["items"]], zones=[], decisions=[])
+        return PlanResult(items=[ItemPlan(**i) for i in plan("review")["items"]], decisions=[])
 
     def triage(self, vendor, req, plan):
         return []

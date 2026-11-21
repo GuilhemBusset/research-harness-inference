@@ -1115,11 +1115,11 @@ class Engine:
         ledger_ids = [i.id for i in spec.ledger]
         res = self.agents.plan(self.op, req, wt)
         items = [asdict(i) for i in res.items]
-        problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, [])
+        problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue)
         if problems:   # one free retry, then the engine makes it usable itself
             res = self.agents.plan(self.op, replace(req, feedback=req.feedback + problems), wt)
             items = [asdict(i) for i in res.items]
-            problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue, [])
+            problems = gate.lint_plan(items, ledger_ids, item_text, self.lacks, self._lookup_issue)
         st = self.store.issue(n)
         for d in res.decisions:
             self._decide(st, d)
@@ -1129,7 +1129,7 @@ class Engine:
                 self._decide(st, d)
             fixed = []
             for i in items:
-                bad = gate.lint_plan([i], [i["id"]], item_text, self.lacks, self._lookup_issue, [])
+                bad = gate.lint_plan([i], [i["id"]], item_text, self.lacks, self._lookup_issue)
                 if bad and i["proof"] in ("owner", "deferred"):
                     i, d = gate.demote(i, "; ".join(bad))
                     self._decide(st, d)
@@ -1156,7 +1156,7 @@ class Engine:
                     candidate = {**item, "proof": o["proof"], "capability": o.get("capability"),
                                  "depends_on": o.get("depends_on"), "depends_quote": o.get("depends_quote"),
                                  "agent_part": item.get("agent_part") or "the parts agents can do"}
-                    if not gate.lint_plan([candidate], [o["item"]], item_text, self.lacks, self._lookup_issue, []):
+                    if not gate.lint_plan([candidate], [o["item"]], item_text, self.lacks, self._lookup_issue):
                         plan["items"] = [candidate if i["id"] == o["item"] else i for i in plan["items"]]
                         self._decide(st, {"id": f"classification-{o['item']}", "choice": f"{o['item']} is {o['proof']}",
                                           "rationale": f"the arbiter upheld the examiner: {ruling.reason}"})
@@ -1809,10 +1809,9 @@ class Engine:
         closed = self._close_findings(n, st, wt, evidence)
         st = self.store.issue(n)
         still = [f for f in st.findings if f.get("status") == "open"]
-        # The builder may change any file: every changed file is in its lane, so only a protected
-        # path without a grant, or the safety surface in a fault-repair run, is a problem here.
-        changed = self.ws.changed_files(wt, base)
-        problems += gate.zone_problems(changed, st.grants, changed, self.repair)
+        # The builder may change any file: only a protected path without a grant, or the safety
+        # surface in a fault-repair run, is a problem here.
+        problems += gate.protected_problems(self.ws.changed_files(wt, base), st.grants, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
         self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
         st.evidence, st.base_sha = evidence, base

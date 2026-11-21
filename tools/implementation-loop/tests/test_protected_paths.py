@@ -36,14 +36,67 @@ def body(*named: str) -> str:
 
 
 def problems(changed: list[str], st: IssueState, repair: bool = False) -> list[str]:
-    """What the verify step says of these changed files: every one is in the builder's lane."""
-    return gate.zone_problems(changed, st.grants, changed, repair)
+    """What the verify step says of these changed files."""
+    return gate.protected_problems(changed, st.grants, repair)
+
+
+PROTECTED = "protected paths changed without approval: {} (ask with a `protected_change` request)"
+SURFACE = "a fault-repair run may not change the safety surface: {}"
+
+
+class ProtectedProblemsTests(unittest.TestCase):
+    """`gate.protected_problems`, the check the verify step runs on every changed file: what it
+    says, word for word, and when."""
+
+    def test_an_ordinary_file_is_never_a_problem(self):
+        self.assertEqual(gate.protected_problems([], [], False), [])
+        self.assertEqual(gate.protected_problems(["docs/a.md", "src/rhi/stage.py", "infra/stack.py"], [], True), [],
+                         "nothing restricts the builder to declared paths, in a repair run either")
+
+    def test_a_protected_path_without_a_grant_fires(self):
+        changed = ["docs/a.md", "scripts/check.sh", ".github/workflows/ci.yml", "tests/policy/test_iam.py"]
+        self.assertEqual(gate.protected_problems(changed, [], False),
+                         [PROTECTED.format(["scripts/check.sh", ".github/workflows/ci.yml", "tests/policy/test_iam.py"])])
+
+    def test_it_names_eight_paths_at_most(self):
+        changed = [f"tests/policy/test_{k}.py" for k in range(10)]
+        self.assertEqual(gate.protected_problems(changed, [], False), [PROTECTED.format(changed[:8])])
+
+    def test_a_protected_grant_covers_its_path_and_what_lies_under_it(self):
+        grants = [{"path": "tools/hygiene", "protected": True}, {"path": "scripts/check.sh", "protected": True},
+                  {"path": ".claude/skills/", "protected": True}]
+        changed = ["tools/hygiene/scan.py", "tools/hygiene/hygiene.toml", "scripts/check.sh",
+                   ".claude/skills/backlog/SKILL.md", "tools/hygiene-notes/x.md", "scripts/check-loop-guard.sh",
+                   ".claude/settings.json"]
+        self.assertEqual(gate.protected_problems(changed, grants, False),
+                         [PROTECTED.format(["scripts/check-loop-guard.sh", ".claude/settings.json"])],
+                         "a grant covers itself and its subtree, never a sibling that shares its prefix")
+
+    def test_a_grant_that_is_not_marked_protected_approves_nothing(self):
+        grants = [{"path": "scripts", "source": "plan", "protected": False}]   # an earlier engine's zone
+        self.assertEqual(gate.protected_problems(["scripts/check.sh", "scripts/new.sh"], grants, False),
+                         [PROTECTED.format(["scripts/check.sh"])])
+
+    def test_a_repair_run_never_changes_the_safety_surface_even_with_a_grant(self):
+        granted = [{"path": "scripts/check.sh", "protected": True}]
+        self.assertEqual(gate.protected_problems(["scripts/check.sh"], granted, True), [SURFACE.format(["scripts/check.sh"])])
+        self.assertEqual(gate.protected_problems(["scripts/check.sh"], granted, False), [], "only in a repair run")
+        changed = ["tools/hygiene/scan.py", "src/rhi/pipeline/stack.py", "docs/a.md"]
+        self.assertEqual(gate.protected_problems(changed, [], True),
+                         [PROTECTED.format(["tools/hygiene/scan.py", "src/rhi/pipeline/stack.py"]),
+                          SURFACE.format(["tools/hygiene/scan.py"])],
+                         "both problems, the protected one first; the pipeline stack is protected, not the surface")
+
+    def test_a_repair_run_names_eight_surface_paths_at_most(self):
+        changed = [f".githooks/hook_{k}" for k in range(9)]
+        grants = [{"path": ".githooks", "protected": True}]
+        self.assertEqual(gate.protected_problems(changed, grants, True), [SURFACE.format(changed[:8])])
 
 
 class Agents:
     def plan(self, vendor, req, wt):
         items = [ItemPlan(id=k, reading="r", quote=v, proof="review") for k, v in TEXT.items()]
-        return PlanResult(items=items, zones=[".github/workflows/ci.yml", "scripts/check.sh"], decisions=[])
+        return PlanResult(items=items, decisions=[])
 
     def triage(self, vendor, req, plan):
         return []

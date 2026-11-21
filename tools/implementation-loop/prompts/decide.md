@@ -15,5 +15,3 @@ For each request return `approve` and a `reason`:
 - `reclassify`: approve only when the item truly needs a capability this host lacks ({{lacks}}) and
   the request keeps the agents' part.
 - `depends`: approve when the item cannot be delivered without that issue's deliverable.
-
-Leave each decision's `dispositions` empty.

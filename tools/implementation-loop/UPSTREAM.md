@@ -25,6 +25,25 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## What the removed controls left on the safety surface goes (2026-11-21)
+
+A local patch, not in upstream, that finishes the two before it ("Nothing locks a test..." and
+"Nothing runs again on `main`..."), by the same decision of the owner. Those left in place what
+was on the safety surface and no longer used: the zone half of the gate, the `resolve_locked`
+role, and the plan's `zones` and the build's and decisions' `dispositions` in the answers. They
+go. What the gate decides does not change: on every set of changed files and grants the new
+check returns what the old one returned when the engine called it, word for word. The engine's
+version stays 1.2.21: nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/gate.py` | `zone_problems` becomes `protected_problems(changed, grants, repair)`: a protected path changed without a protected grant on it or a directory above it, and in a fault-repair run anything on the safety surface. `path_allowed` and the "outside the plan's zones" problem go, and so do `lint_plan`'s `zones` argument and its check. |
+| `implement_loop/engine.py` | Calls the two as they now are. |
+| `implement_loop/live.py`, `loop.toml`, `prompts/resolve_locked.md` | The `resolve_locked` role goes: its settings, its method, its table and its prompt. A `loop.toml` that still has the table loads, as any unknown role does. |
+| `implement_loop/schemas.py`, `implement_loop/live.py`, `implement_loop/agents.py` | The plan's `zones`, the build's `dispositions`, a decision's `dispositions` and the resolver's schema go from the answers and from `PlanResult`, `BuildResult` and `Decision`. |
+| `prompts/plan.md`, `build.md`, `decide.md` | No longer ask for the fields that went. |
+| `tests/test_protected_paths.py` | New `ProtectedProblemsTests`: an ordinary file is never a problem, a protected path without a grant fires (with the same words, eight paths at most), a grant covers its path and its subtree and no sibling, a grant not marked protected approves nothing, and a repair run never changes the safety surface, granted or not. The other tests lose the fields and the role. |
+
 ## Escalated Codex calls: a protected path is decided on the strongest model (2026-11-21)
 
 A local patch, not in upstream. No person reviews a change to a protected path, so the calls that

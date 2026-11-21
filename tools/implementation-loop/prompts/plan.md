@@ -25,7 +25,7 @@ For **every** ledger item ({{ledger_ids}}) return one entry:
     deselects), it stays the owner's;
   - `deferred`: only when it needs another **open** issue's deliverable. Give `depends_on` and
     `depends_quote`, words from that issue's title or body that show it delivers what you need.
-- `zones`: leave it empty. Any file is yours to change, except a protected path (anything under
+- Any file is yours to change, except a protected path (anything under
   `tools/implementation-loop/`, `tools/hygiene/`, `.github/`, `.githooks/`, `tests/policy/`,
   `.claude/`, `.agents/` or `.codex/`, the pipeline stack under `src/rhi/pipeline/`, the bootstrap
   policies under `setup/bootstrap/`, the gate scripts in `scripts/`, the ruleset): it is yours
