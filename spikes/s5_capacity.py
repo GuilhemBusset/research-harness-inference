@@ -57,10 +57,12 @@ read one scrape after the run's end, from the run's start to then, with Promethe
 range modifier, over a range to the millisecond that starts at the run's start: the increase starts
 from the last sample at or before the run's start, what each counter held when the run began, so
 what the run added before its first scrape is counted, nothing from before the run is, and it is
-not extended past the samples it saw. A series with no sample at or before the run's start (read at
-the start itself), an instance that joined during it, began at zero with its engine: its first
-sample is added to its increase, which `anchored` takes from that sample (`counted_of`); a series
-with one is not, whatever time its first point in the window carries. The quantiles are computed from
+not extended past the samples it saw. A series with no sample within the lookback before the run's
+start (`last_over_time` over it, read at the start itself, which a stale marker does not hide), an
+instance that joined during it, began at zero with its engine: its first sample is added to its
+increase, which `anchored` takes from that sample (`counted_of`); a series with one is not, whatever
+time its first point in the window carries, even one that went stale and resumed in the run, whose
+increase is anchored on the sample before its stale marker. The quantiles are computed from
 the buckets so counted (`quantile_of`), as `histogram_quantile` would. The scrape after the run's
 end holds the tokens of the last answers, which the workspace sees only then; nothing else is sent
 to the pool in it. The gauges are read over the run alone, on a grid of a second (`fine_step`) that
@@ -153,6 +155,9 @@ TURNS_PER_SESSION = 10
 # within a few scrapes, and the job waits that long before it reads.
 SCRAPE_SECONDS = 15
 SETTLE_SECONDS = 4 * SCRAPE_SECONDS
+# Seconds. Prometheus' lookback delta, its default: how far back before a range `anchored` looks
+# for the sample it starts an increase from.
+LOOKBACK_SECONDS = 300
 # Seconds. While the pool wakes: its status is read this often, and the wake repeated this often,
 # as `rhi wait` does; a cold launch may take 40 minutes at worst (spike S1).
 POLL_SECONDS = 5
@@ -493,26 +498,28 @@ def queries(pool: str, engine: str, window_seconds: float, counted_seconds: floa
     return {key: one.query for key, one in reads(pool, engine, window_seconds, counted_seconds).items()}
 
 
-def _identity(one: common.Series) -> frozenset[tuple[str, str]]:
-    return frozenset(one.labels.items())
+def _where(one: common.Series) -> tuple[str, str]:
+    return one.labels.get("instance", ""), one.labels.get("le", "")
 
 
 def counted_of(
     increases: Sequence[common.Series], raw: Sequence[common.Series], at_start: Sequence[common.Series]
 ) -> dict[tuple[str, str], float]:
     """Each instance's increase, by bucket (`le`, empty for none): the anchored increases, plus, for
-    each series of `raw` (read over the window) that `at_start` (the same selector read at the
-    window's start) does not hold, its first value. Such a series had no sample at or before the
-    start: it began at zero with its engine, and with nothing to anchor on, its increase is taken
-    from its first sample, which would leave out what the engine counted before it was first
-    scraped. A series `at_start` holds is anchored on the value it held then, which is counted once.
-    The answers carry the times they were evaluated at, not the times of the samples, so whether a
-    series was there at the start is read at the start, never from the time of its first point."""
+    each series of `raw` (read over the window) whose instance and bucket `at_start` does not hold,
+    its first value. `at_start` is the selector's last sample within the lookback, read at the
+    window's start, as `anchored` looks for the sample it starts from; a stale marker does not hide
+    it. A series without one began at zero with its engine, and with nothing to anchor on, its
+    increase is taken from its first sample, which would leave out what the engine counted before
+    it was first scraped. A series `at_start` holds is anchored on the value it held then, which is
+    counted once, also when it went stale before the start and resumed after it. The answers carry
+    the times they were evaluated at, not the times of the samples, so whether a series was there
+    at the start is read at the start, never from the time of its first point."""
     totals: dict[tuple[str, str], float] = {}
-    there = {_identity(one) for one in at_start if one.samples}
+    there = {_where(one) for one in at_start if one.samples}
 
     def add(one: common.Series, value: float) -> None:
-        where = (one.labels.get("instance", ""), one.labels.get("le", ""))
+        where = _where(one)
         if where[0]:
             totals[where] = totals.get(where, 0.0) + value
 
@@ -520,7 +527,7 @@ def counted_of(
         if one.samples:
             add(one, one.samples[-1][1])
     for one in raw:
-        if one.samples and _identity(one) not in there:
+        if one.samples and _where(one) not in there:
             add(one, min(one.samples)[1])
     return totals
 
@@ -814,7 +821,7 @@ class Job:
             else:
                 step = read_at[after]
                 raw = read(how.raw, grid_before(start, after, step), after, step)
-                there = read(how.raw, start, start, step)
+                there = read(f"last_over_time({how.raw}[{_range(LOOKBACK_SECONDS)}])", start, start, step)
                 counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), raw, there)
                 if how.how is How.SUM:
                     answers[key] = [one(instance, after, value, le) for (instance, le), value in counted.items()]
