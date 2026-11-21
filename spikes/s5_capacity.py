@@ -167,14 +167,15 @@ record holds the whole matrix:
         uv run --locked python spikes/s5_capacity.py record --commit <sha> --instance-type <type>
 
 It reads the pages `gh api --paginate` writes one after the other (`statuses_of`). Each run is read
-from its newest posting alone (`newest_postings`): a retry of a run label, posted in fewer parts
-than the run before it, is not joined to that run's older parts. `--run`, repeated, names the runs
+from its newest posting alone (`postings_of`): a retry of a run label is not joined to that run's
+older parts, and a run is a pass only from one whole posting. `class_size` is the last number a job
+posts, so the part that holds it is a posting's last: a posting whose last part is not listed yet
+is written pending, and one that began before the posting before it had ended, which nothing in
+the statuses tells apart from it, is written pending with no row. `--run`, repeated, names the runs
 to write, every run of S5 on the commit unless given; a run the record already holds measured on
 another pool or instance type is refused, with nothing written, so the runs of each instance type
 are written apart, each with its own. GitHub dates a status to the second: a retry in the same
-second as the run before it is told apart by the statuses' ids. A run posted as a pass that lacks
-a class-size number the verdict reads, a posting read before all its parts were listed, is
-written pending, never as a pass.
+second as the run before it is told apart by the statuses' ids.
 """
 
 from __future__ import annotations
@@ -191,7 +192,7 @@ import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -1225,7 +1226,7 @@ def figures_of(measured: Measured) -> dict[Figure, int | float | None]:
 def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int | float]:
     """The numbers of a job's runs under their declared names, and the class's size. ValueError
     for a run at a number of streams no name is declared for."""
-    numbers: dict[str, int | float] = {CLASS_SIZE: class_size}
+    numbers: dict[str, int | float] = {}
     for one in measured:
         streams = None if one.label.class_size is not None else one.label.streams
         if streams is not None and streams not in DECLARED_STREAMS:
@@ -1233,6 +1234,8 @@ def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int |
         for figure, value in figures_of(one).items():
             if value is not None:
                 numbers[name_of(figure, one.label.shape, streams)] = value
+    # Last, so that the last part of a posting holds it (`ends_posting`).
+    numbers[CLASS_SIZE] = class_size
     return numbers
 
 
@@ -1373,35 +1376,89 @@ def _measured(status: object) -> tuple[tuple[str, str], int, datetime, int | Non
     return (measurement, label), part, posted, number if type(number) is int else None
 
 
-def newest_postings(statuses: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """The statuses without those of a run that an earlier posting of its label left behind. A job
-    posts a run's parts in their order, part 1 first, so a run's newest posting is its newest part
-    1 and the parts posted after it: a retry posted in fewer parts than the run before it is read
-    alone, and none of the earlier parts joins it. GitHub's date of a status is to the second, and
-    its id grows with each status it takes, so when every measurement's status carries its id the
-    statuses are ordered by date then id, and a retry in the same second as the run before it is
-    still told apart; without the ids, by date alone. A status this cannot read is kept, for
+class Posting(StrEnum):
+    """What the statuses of one run label show of its newest posting."""
+
+    WHOLE = "whole"
+    INCOMPLETE = "incomplete"
+    OVERLAPPING = "overlapping"
+
+
+def ends_posting(status: Mapping[str, Any], part: int) -> bool:
+    """Whether a status is the last part of its posting: the one that holds the class's size, the
+    last number the job posts, or a first part with no number, all a job posts that measured
+    nothing."""
+    description = status.get("description") or ""
+    pairs = description.split(" ") if isinstance(description, str) else []
+    return any(pair.startswith(f"{CLASS_SIZE}=") for pair in pairs) or (part == 1 and not description)
+
+
+def postings_of(
+    statuses: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], dict[str, tuple[Posting, datetime]]]:
+    """The statuses of each run of S5 that its newest posting holds, and what they show of it,
+    with the time of the label's newest status. A job posts a run's parts in their order, one
+    after the other, part 1 first and the class's size last (`ends_posting`); a posting carries
+    nothing else that tells it from another of its label. The newest posting is the newest part 1
+    and the parts posted at its time or after it, up to its last part:
+
+    - `WHOLE` when every posting before it had ended before it began, and it holds one status of
+      each part up to its last: a retry is read alone, never joined to an earlier posting's parts;
+    - `INCOMPLETE` when, with the same, its last part is not there yet;
+    - `OVERLAPPING` when an earlier posting had not ended when it began, or two statuses of one
+      part, or a part past its last, were posted from its time on: the postings cannot be told
+      apart, and none of their statuses is returned.
+
+    GitHub's date of a status is to the second, and its id grows with each status it takes, so when
+    every measurement's status carries its id the statuses are ordered by date then id, and a
+    retry in the same second as the run before it is still told apart; without the ids, by date
+    alone, and statuses of one instant may be of either posting. The statuses of other
+    measurements are left out; a measurement's status this cannot read is kept, for
     `tools/measurements/record.py` to refuse."""
     read = [_measured(status) for status in statuses]
     with_ids = all(one[3] is not None for one in read if one is not None)
+    by_label: dict[str, list[tuple[tuple[datetime, int], int, Mapping[str, Any]]]] = {}
+    kept: list[Mapping[str, Any]] = []
+    for status, one in zip(statuses, read, strict=True):
+        if one is None:
+            context = status.get("context") if isinstance(status, dict) else None
+            if isinstance(context, str) and context.startswith(f"measure/{MEASUREMENT}/"):
+                kept.append(status)
+        elif one[0][0] == MEASUREMENT:
+            order = (one[2], (one[3] or 0) if with_ids else 0)
+            by_label.setdefault(one[0][1], []).append((order, one[1], status))
 
-    def order(one: tuple[tuple[str, str], int, datetime, int | None]) -> tuple[datetime, int]:
-        return one[2], (one[3] or 0) if with_ids else 0
-
-    newest: dict[tuple[str, str], tuple[datetime, int]] = {}
-    for one in read:
-        if one is not None and one[1] == 1:
-            newest[one[0]] = max(newest.get(one[0], order(one)), order(one))
-    return [
-        status
-        for status, one in zip(statuses, read, strict=True)
-        if one is None or one[0] not in newest or order(one) >= newest[one[0]]
-    ]
+    found: dict[str, tuple[Posting, datetime]] = {}
+    for label, of_label in by_label.items():
+        firsts = [order for order, part, _ in of_label if part == 1]
+        when = max(order[0] for order, _, _ in of_label)
+        if not firsts:
+            kept += [status for _, _, status in of_label]  # parts with no first: refused when decoded
+            continue
+        newest = max(firsts)
+        before = [(part, status) for order, part, status in of_label if order < newest]
+        begun = sum(part == 1 for part, _ in before)
+        ended = sum(ends_posting(status, part) for part, status in before)
+        since: dict[int, list[Mapping[str, Any]]] = {}
+        for order, part, status in of_label:
+            if order >= newest:
+                since.setdefault(part, []).append(status)
+        last = next((part for part in sorted(since) if ends_posting(since[part][0], part)), None)
+        overlapping = (
+            begun > ended or any(len(one) > 1 for one in since.values()) or (last is not None and max(since) > last)
+        )
+        if overlapping:
+            found[label] = (Posting.OVERLAPPING, when)
+            continue
+        found[label] = (Posting.INCOMPLETE if last is None else Posting.WHOLE, when)
+        kept += [one[0] for one in since.values()]
+    return kept, found
 
 
 # A pass rests on these: a posting that does not hold them all is not all there yet.
 JUDGED_NAMES = frozenset(name_of(figure, shape, None) for shape in Shape for figure in JUDGED)
-INCOMPLETE = "the posting lacks a class-size number its verdict reads"
+INCOMPLETE = "the posting lacks a part"
+OVERLAPPING = "the postings of the run overlap"
 
 
 def record_statuses(
@@ -1414,17 +1471,28 @@ def record_statuses(
     only: Collection[str] | None = None,
 ) -> list[str]:
     """Writes the runs of S5 a commit's statuses hold, each from its newest posting
-    (`newest_postings`), into the record at `path`, with `tools/measurements/record.py`, each row
+    (`postings_of`), into the record at `path`, with `tools/measurements/record.py`, each row
     named after its quantity and labelled with its conditions; returns the run labels written.
     `only` names the runs to write, every run of S5 on the commit unless given. ValueError, with
     nothing written, for no run of S5 to write, one whose label or numbers are not the job's, and
     one the record already holds measured on another pool or instance type: the runs of each
-    instance type are written apart, each with its own. A run posted as a pass whose numbers
-    lack a class-size number the verdict reads is part of a posting not all of whose statuses were
-    read: it is written pending, with that reason, and never as a pass."""
+    instance type are written apart, each with its own.
+
+    A run is never a pass but from one whole posting. A posting whose last part is not there yet
+    is written pending, with the rows of its parts that are, and a reason; a posting that overlaps
+    an earlier one of its label is written pending with no row, since their parts cannot be told
+    apart. A run posted as a pass that lacks a class-size number its verdict reads is written
+    pending as well."""
     tool = record_tool()
-    found = tool.runs_of(newest_postings(statuses), commit)
-    runs = [(run, day) for run, day in found if run.measurement == MEASUREMENT and (only is None or run.label in only)]
+    selected, postings = postings_of(statuses)
+    wanted = {label for label in postings if only is None or label in only}
+    found = [(run, day) for run, day in tool.runs_of(selected, commit) if run.measurement == MEASUREMENT]
+    runs = [(run, day) for run, day in found if run.label in wanted]
+    runs += [
+        (tool.Run(MEASUREMENT, label, Verdict.NOT_MEASURED, {}), when.astimezone(UTC).date())
+        for label, (read, when) in postings.items()
+        if label in wanted and read is Posting.OVERLAPPING
+    ]
     if not runs or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("the statuses hold no run of spike S5 on that commit")
     rows = {run.label: [row_of(run.label, name, pool=pool, instance_type=instance_type) for name in run.numbers]
@@ -1443,9 +1511,13 @@ def record_statuses(
         for row in record["rows"]:
             if row["labels"].get("run") == run.label:
                 row["name"], row["labels"] = next(named)
-        if run.verdict is Verdict.PASS and not JUDGED_NAMES <= run.numbers.keys():
+        read = postings[run.label][0]
+        reason = {Posting.INCOMPLETE: INCOMPLETE, Posting.OVERLAPPING: OVERLAPPING}.get(read)
+        if reason is None and run.verdict is Verdict.PASS and not JUDGED_NAMES <= run.numbers.keys():
+            reason = INCOMPLETE
+        if reason is not None:
             entry = next(entry for entry in record["runs"] if entry.get("run") == run.label)
-            entry["verdict"], entry["reason"] = "pending", INCOMPLETE
+            entry["verdict"], entry["reason"] = "pending", reason
     if record.get("verdict") != "waived":
         record["verdict"] = tool.verdict_of([run.get("verdict") for run in record["runs"]])
     path.write_text(tool.written(record) + rest, encoding="utf-8")
