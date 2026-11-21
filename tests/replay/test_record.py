@@ -250,7 +250,12 @@ def _png() -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
     header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b"")
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
 
 
 def test_an_image_in_a_tool_result_is_kept_byte_for_byte(stack: tuple[str, str], tmp_path: Path) -> None:
@@ -694,3 +699,34 @@ def test_subschemas_of_the_same_instance_follow_the_neutral_property_names(
     assert saved["dependentSchemas"] == {"user": {"required": [renamed]}} and saved["allOf"] == [
         {"required": [renamed]}
     ]
+
+
+def test_an_endpoint_host_a_stream_splits_after_a_neutral_word_is_not_saved() -> None:
+    host = f"user-{secrets.token_hex(4)}.example.com"
+    answer = _restreamed("thinking_delta", "thinking", ["See https://", "user", host[4:] + "/help now."])
+    with pytest.raises(scrub.Refused, match=scrub.HOST):
+        _capture_of("mock-messages-stream", answer, record.Neutral(hosts=(host,), home="", user=""))
+
+
+def test_an_inline_document_naming_the_endpoint_host_is_not_written() -> None:
+    host = f"origin-{secrets.token_hex(4)}.example.com"
+    document = base64.b64encode(_pdf(f"(https://{host}/help)".encode())).decode()
+    original = harness.load(harness.CAPTURES / "mock-responses.json")
+    body = {"model": "mock", "input": [{"role": "user", "content": [{"type": "input_file", "file_data": document}]}]}
+    exchange = record.Exchange(
+        "POST", original.target.encode(), list(original.headers.items()), json.dumps(body).encode(), 200, (), b"{}"
+    )
+    with pytest.raises(scrub.Refused, match=scrub.HOST):
+        asyncio.run(record.capture_of(exchange, record.Neutral(hosts=(host,), home="", user="")))
+
+
+def test_a_property_a_schema_only_requires_keeps_a_name_of_its_own(stack: tuple[str, str], tmp_path: Path) -> None:
+    address, key = stack
+    schema = {"type": "object", "properties": {"user": {"type": "string"}}, "allOf": [{"required": ["operator"]}]}
+    with recording(address, tmp_path, user="operator", profile="coursework") as (_, client):
+        tools = [{"name": "Lookup", "input_schema": schema}]
+        assert client.post("/v1/messages", headers=anthropic(key), json=messages(tools=tools)).status_code == 200
+    (capture,) = harness.folder(tmp_path)
+    saved = json.loads(capture.body)["tools"][0]["input_schema"]
+    (required,) = saved["allOf"][0]["required"]
+    assert required not in ("operator", "user") and list(saved["properties"]) == ["user"]
