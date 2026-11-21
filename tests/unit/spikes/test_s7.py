@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import botocore.exceptions
@@ -248,11 +249,12 @@ def test_the_scale_in_step_records_both_paths_and_one_stream_in_flight_as_the_in
     for line in departures:
         assert line["asked_at"] <= line["asked_read_at"] <= line["out_of_service_read_at"] <= line["gone_read_at"]
 
-    # One stream, held open at the gateway from before the scaler asked for fewer, sent whole once
-    # the job read that decision, before the departing instance stopped, then answered to its end.
+    # One stream, held open at the gateway across the whole scale-in, from before the scaler asked
+    # for fewer until the job read the departing instance gone, then sent whole and answered.
     (stream,) = of(lines, "stream")
     assert (stream["stream"], stream["decision"], stream["ended"], stream["events"]) == ("scale_in", 1, "closing_event", 6)
-    assert stream["sent_at"] < asked[0]["written_at"] <= stream["body_sent_at"] < gone[0]["last_write_at"]
+    assert stream["sent_at"] < asked[0]["written_at"] < out_of_service[0]["read_at"]
+    assert out_of_service[0]["read_at"] <= gone[0]["read_at"] <= stream["body_sent_at"] < asked[1]["written_at"]
     assert stream["body_sent_at"] <= stream["first_event_at"] <= stream["last_event_at"]
     ((received, body),) = gateway.received
     assert received == datetime.fromisoformat(stream["body_sent_at"]).timestamp()
@@ -280,7 +282,11 @@ def test_two_instances_leaving_on_one_idle_note_are_each_recorded() -> None:
     assert [line["decision"] for line in gone] == [1, 1]
     assert sorted(line["instance"] for line in gone) == ["instance-1", "instance-2"]
     # Both stopped into the warm pool: the count rose by two.
-    assert [line["path"] for line in of(lines, "scale_in")] == ["warm_pool", "warm_pool"]
+    told = of(lines, "scale_in")
+    assert [line["path"] for line in told] == ["warm_pool", "warm_pool"]
+    # With no instance left to serve it, the stream across the scale-in waited for the paths.
+    (stream,) = of(lines, "stream")
+    assert stream["body_sent_at"] >= max(line["at"] for line in told)
 
 
 @pytest.mark.parametrize("gap", ["collectors", "in_service", "warm"])
@@ -336,8 +342,7 @@ def test_a_return_to_the_warm_pool_counted_late_is_still_its_departures() -> Non
     assert [line["path"] for line in of(parsed(out, early, late), "scale_in")] == ["terminated", "warm_pool"]
 
 
-@pytest.mark.parametrize(("cut", "ended"), [(False, "closing_event"), (True, "connection_closed")])
-def test_the_stream_across_a_scale_in_reaches_the_pool_before_the_instance_leaves(cut: bool, ended: str) -> None:
+def test_the_stream_across_a_scale_in_is_held_until_the_instance_is_gone_and_a_cut_is_recorded() -> None:
     clock = FakeClock()
     first, second = T0 + 120, T0 + 900
     leaves = first + 30
@@ -348,41 +353,16 @@ def test_the_stream_across_a_scale_in_reaches_the_pool_before_the_instance_leave
         warm=lambda run: int(run > second),
         instances={instance_id(): (T0 - 600, leaves), instance_id(): (T0 - 600, second + 30)},
     )
-    run, gateway, out = a_run(scaler)
-    forwarded: list[float] = []
-
-    class Serving(httpx.AsyncByteStream):
-        """A turn the pool serves while the instance leaves: half before, half after, or cut there."""
-
-        async def __aiter__(self) -> AsyncIterator[bytes]:
-            for event in TURN[:3]:
-                yield event
-            while clock.now() < leaves:
-                await clock.sleep(1)
-            if cut:
-                raise httpx.ReadError("the stub cut the connection")
-            for event in TURN[3:]:
-                yield event
-
-    async def pool(request: httpx.Request) -> httpx.Response:
-        answer = await gateway.handle(request)
-        if request.headers["authorization"] != f"Bearer {run.student}":
-            return answer
-        forwarded.append(clock.now())
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Serving())
-
-    run.transport = httpx.MockTransport(pool)
+    run, gateway, out = a_run(scaler, [Reply(TURN[:3], cut=True)])
     asyncio.run(run.cycle())
 
     lines = parsed(out)
-    (decision, _) = of(lines, "scale_in_asked")
     (stream,) = of(lines, "stream")
-    # The gateway forwarded the whole request after the decision and before the instance stopped,
-    # and the stream was open as it stopped: it finished after, or was cut there, its events counted.
-    (at,) = forwarded
-    assert decision["written_at"] <= s7.utc(at) == stream["body_sent_at"] <= stream["first_event_at"] < s7.utc(leaves)
-    assert (stream["ended"], stream["events"]) == (ended, 3 if cut else 6)
-    assert (stream["last_event_at"] >= s7.utc(leaves)) is not cut
+    (gone, _) = of(lines, "gone")
+    # The gateway had nothing to forward until the instance was gone; then the stub cut the answer.
+    ((received, _),) = gateway.received
+    assert s7.utc(leaves) < gone["read_at"] <= s7.utc(received) == stream["body_sent_at"]
+    assert (stream["ended"], stream["events"], stream["error"]) == ("connection_closed", 3, "protocol_error")
 
 
 def test_a_warm_reading_the_workspace_shows_late_is_waited_for_past_the_settle_time() -> None:
@@ -611,6 +591,11 @@ def test_a_path_is_unknown_unless_the_readings_of_one_scale_in_agree() -> None:
     assert told(runs(0, 0, 0, 0, 1), end=1181.0, **cut).path is s7.Path.WARM_POOL
     assert told(runs(0, 0, 0, 0, 1), end=1121.0, **cut).unknown is s7.Unknown.NOT_SETTLED
     assert told(runs(0, 1, 0, 0, 0, 0, 0)).unknown is s7.Unknown.WARM_COUNT_DIFFERS
+    # A warm slot that empties while the instance still writes, and fills again after it stopped,
+    # may have been filled by it or by a new instance: neither path is told.
+    for counts in [(1.0, 0, 0, 1, 1, 1, 1, 1, 1), (1.0, 0, 0, 2, 2, 2, 2, 2, 2)]:
+        emptied = [(1000.2 + 60 * n, value) for n, value in enumerate(counts)]
+        assert told(emptied, stops=[1125.0]).unknown is s7.Unknown.WARM_COUNT_DIFFERS
     assert told(runs(0, 1), newcomer=True).unknown is s7.Unknown.NEW_INSTANCE
     assert told(runs(0, 1), out_of_service=False).unknown is s7.Unknown.NOT_READ_OUT_OF_SERVICE
     # Two instances leaving on one decision: told only when the count moved for both or for neither.
@@ -715,3 +700,26 @@ def test_the_job_ends_with_a_line_and_no_traceback_when_aws_refuses(
     (line,) = parsed(captured.out.splitlines(), AWS_TEXT, "AccessDenied")
     assert (line["kind"], line["step"], line["error"]) == ("failed", "configuration", "aws_error")
     assert captured.err == ""
+
+
+def test_the_gateway_stack_output_a_host_name_is_reached_over_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = SimpleNamespace(get_credentials=lambda: None, resource=lambda _: SimpleNamespace(Table=lambda _: None))
+    monkeypatch.setattr(s7.boto3, "Session", lambda: session)
+    monkeypatch.setattr(s7.config, "read_ssm", lambda: SimpleNamespace(pools=[MOCK]))
+    monkeypatch.setattr(s7.common, "canary_keys", lambda: SimpleNamespace(students=[generate_key()]))
+    reached: list[httpx.URL] = []
+
+    async def deployment(run: s7.Run) -> None:
+        run.transport = httpx.MockTransport(lambda request: reached.append(request.url) or httpx.Response(200))
+        await run.across_deployment()
+
+    monkeypatch.setattr(s7.Run, "run", deployment)
+    environ = {
+        s7.ENDPOINT_VARIABLE: "gateway.example.com",
+        s7.WORKSPACE_URL_VARIABLE: "https://workspace.example.com",
+        s7.POOL_STATE_TABLE_VARIABLE: "pool-state",
+        s7.DEPLOYMENT_HOLD_VARIABLE: "1",
+        "AWS_REGION": "us-east-1",
+    }
+    assert s7.main(environ, FakeClock()) == 0
+    assert [(url.scheme, url.host, url.path) for url in reached] == [("https", "gateway.example.com", "/v1/messages")]

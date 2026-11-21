@@ -52,16 +52,18 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    A cycle in which both paths were not seen is run again, up to `CYCLES` times; once both were,
    the job goes on to the wakes.
 3. **The stream across a scale-in**, in the first cycle. As the load stops, before the scaler acts,
-   it opens one slow stream, as across the deployment, and holds its body open at the gateway while
-   it watches the pool: a request the gateway has not forwarded keeps no instance busy, so it delays
-   no scale-in. It sends the last byte as soon as it reads the scaler's first decision, so the
-   gateway forwards the request to the pool while the group takes the departing instance out of
-   service and before that instance stops, the window in which a request may meet a deregistering
-   target (section 5.1), and reads the answer to its end, through the departure when it lasts that
-   long. The mock's canned turn lasts under a second and nothing in a request makes it longer, so
-   whether it finished or was cut is what the line records. Its `stream` line holds its times, among
-   them `body_sent_at`, when it was forwarded, and its end, with the first decision's number; the
-   departures' lines hold theirs, so a reader places one against the other.
+   it opens one slow stream, as across the deployment, and holds its body open at the gateway
+   through the whole scale-in: the scaler's first decision, the departing instance out of service
+   and the instance gone. The gateway reads a body whole before it counts the request as demand or
+   forwards it, so the held stream keeps no instance busy and delays no scale-in; and the scaler
+   removes only instances that report nothing running (section 5.1), so a request on the mock pool
+   can be in flight across a scale-in only there. Once the job reads every instance of the first
+   decision gone, it sends the last byte and reads the answer to its end: whether the request held
+   across the scale-in was then served, with an error event or cut, is what the line records. When
+   that decision asked for none, the stream is held to the cycle's end instead, so that it wakes no
+   instance while the paths are told. Its `stream` line holds its times, among them `body_sent_at`,
+   when it was forwarded, and its end, with the first decision's number; the departures' lines hold
+   theirs, so a reader places one against the other.
 4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it waits for a fresh
    transition of the pool to zero: a note that asks for an instance after the last zero it used,
    then a note asking for none and an in-service reading of zero as fresh as it, which the scaler
@@ -85,12 +87,12 @@ bound, the pool's hold and `WAKE_MARGIN_SECONDS`.
 one decision, and is `unknown`, with the reason, otherwise. The in-service and the warm gauges are
 pool totals, so the departure's instance is the one whose collector stopped, the in-service
 reading must have dropped, and the warm count is compared between the reading the scaler decided on
-(`decided_on`) and its readings made after the instance had stopped (its last write and a scrape),
-up to the scaler's next decision (`warm_bound`), that decision's own reading included: the scaler
-read it before it acted (`in_window`). The path is told once `WARM_SETTLE_SECONDS` have passed
+(`decided_on`) and every reading after it up to the scaler's next decision (`warm_bound`), that
+decision's own reading included: the scaler read it before it acted (`in_window`). The path is told once `WARM_SETTLE_SECONDS` have passed
 since the decision's last stop, or at the next decision, whichever comes first, from every reading
 of the window the workspace then shows. An instance stopped into the warm pool may be counted there
-a while after its collector falls silent, so the count may rise late but never fall: once every
+a while after its collector falls silent, so the count may rise late but never fall, not even
+before the instance stopped (a slot emptied then may be refilled by it): once every
 instance of the decision has stopped, ending as many more as left, `warm_pool`; the same all along
 a window that ran at least `WARM_SETTLE_SECONDS`, its readings reaching its end, `terminated`. A
 new instance writing, a decision whose instances the count does not tell apart, no reading on
@@ -105,7 +107,7 @@ window, are read again for `FRESH_SECONDS` before the path is told without them.
 
 | Variable | What it is |
 | --- | --- |
-| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output |
+| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`s4_weights.gateway_address`) |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S7_WAKES` | The wakes it sends; `DEFAULT_WAKES` unless given |
@@ -141,6 +143,7 @@ import httpx
 
 import common
 import loadgen
+import s4_weights
 from rhi import config
 from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.causes import Cause
@@ -493,11 +496,13 @@ def path_of(
     dropped, `newcomer` whether an instance new to the pool wrote meanwhile.
 
     The warm count is a pool total that may rise some time after an instance stops. From the
-    decision's reading, it must never fall and never pass `leaving` more: once every instance has
+    decision's reading, those made before the instances stopped included, it must never fall and
+    never pass `leaving` more: a slot that empties and fills again may have been filled by the
+    departing instance or by a new one, so the readings cannot tell. Once every instance has
     stopped, a last reading `leaving` more is `warm_pool`. Short of that, the readings must cover
     the window (`covers`) up to `WARM_SETTLE_SECONDS` past the last stop, or up to the last run that
     asked for as many before the next decision when `end` comes first, or the workspace has not
-    shown the rest yet. Then every reading since the first stop the same, over a settled window, is
+    shown the rest yet. Then every reading since the decision's the same, over a settled window, is
     `terminated`. Anything else is `unknown`, with its reason: the same count over a window another
     decision cut short cannot tell a terminated instance from a late return, and a count between the
     two, after more than one stop, cannot tell which went where."""
@@ -512,21 +517,23 @@ def path_of(
     if decided is None:
         return Told(Path.UNKNOWN, Unknown.NO_DECISION_READING)
     before = decided[1]
+    # Every count from the decision's reading on, those made while the instance still wrote
+    # included: a warm slot emptied then may have been refilled by the departing instance.
+    counts = tuple(round(value) for moment, value in readings if moment >= decided[0])
     after = tuple(round(value) for moment, value in readings if moment >= min(stops) + SCRAPE_SECONDS)
     last = [round(value) for moment, value in readings if moment >= max(stops) + SCRAPE_SECONDS]
     if not after or not last:
         return Told(Path.UNKNOWN, Unknown.NO_READING_AFTER_STOP, before)
-    pairs = zip((before, *after[:-1]), after, strict=True)
-    steady = all(earlier <= later <= before + leaving for earlier, later in pairs)
+    steady = all(earlier <= later <= before + leaving for earlier, later in itertools.pairwise((before, *counts)))
     if steady and last[-1] == before + leaving:
         return Told(Path.WARM_POOL, None, before, after)
     if not covers(readings, since=decided[0], until=min(max(stops) + WARM_SETTLE_SECONDS, end - NOTE_SECOND)):
         return Told(Path.UNKNOWN, Unknown.WARM_READINGS_END_EARLY, before, after)
-    if set(after) == {before} and settled:
+    if set(counts) == {before} and settled:
         return Told(Path.TERMINATED, None, before, after)
     if len(stops) > 1 or leaving > 1:
         return Told(Path.UNKNOWN, Unknown.ANOTHER_INSTANCE_STOPPED, before, after)
-    if set(after) == {before}:
+    if set(counts) == {before}:
         return Told(Path.UNKNOWN, Unknown.NOT_SETTLED, before, after)
     return Told(Path.UNKNOWN, Unknown.WARM_COUNT_DIFFERS, before, after)
 
@@ -1121,8 +1128,8 @@ class Run:
     async def cycle(self) -> None:
         """Two instances, then the departures down to none, each with its lines. In the first cycle,
         the stream across a scale-in: a slow stream sent as the load stops, before the scaler asks
-        for fewer, held open while the job watches the pool and sent whole as soon as it reads the
-        scaler's first decision, then read to its end."""
+        for fewer, held open while the job watches the pool and sent whole once it reads the first
+        decision's instances gone (`_scaled_in`), then read to its end."""
         if not await self.two_instances():
             self.recorder.line("timeout", waiting_for="two_in_service")
             return
@@ -1143,7 +1150,7 @@ class Run:
                 await self._read_note(watch)
                 await self._read_in_service(watch)
                 await self._read_writes(watch)
-                if watch.decisions:
+                if self._scaled_in(watch):
                     release.set()
                 if streaming is not None and streaming.done() and not self.scale_in_streamed:
                     stream_line(streaming.result())
@@ -1157,12 +1164,23 @@ class Run:
             if streaming is not None and not self.scale_in_streamed:
                 stream_line(await streaming)
 
+    @staticmethod
+    def _scaled_in(watch: Watch) -> bool:
+        """Whether the stream across a scale-in may end: the job has read every instance of the
+        scaler's first decision gone, and that decision left an instance in service to serve it.
+        A first decision that asked for none holds it to the cycle's end, when the paths are told:
+        sent before, it would wake the pool and change the warm count the paths are told from."""
+        if not watch.decisions:
+            return False
+        first = watch.decisions[0]
+        return first.asked > 0 and len(first.departures) >= first.fewer
+
     async def _across_scale_in(self, release: asyncio.Event, hold: float) -> Read:
         """The stream across a scale-in: one slow stream (`slow_stream`), its body held open from
-        now, before the scaler asks for fewer, until `release` is set, as the job reads the scaler's
-        first decision, or for `hold` seconds; then read to its end. The gateway forwards a request
-        once its body is whole, so the request reaches the pool as the group takes the instance out
-        of service, before it stops."""
+        now, before the scaler asks for fewer, until `release` is set, once the job has read the
+        departing instance gone (`_scaled_in`), or for `hold` seconds; then read to its end. Its
+        request is open, at the gateway, through the whole scale-in: the decision, the instance
+        out of service and the instance gone."""
         return await slow_stream(
             self.endpoint,
             self.student,
@@ -1301,6 +1319,8 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
         if wakes < 1 or hold <= 0:
             recorder.line("refused", reason="wakes_or_hold_out_of_range")
             return 1
+        # The gateway stack's output is a host name: every request goes to it over HTTPS.
+        endpoint = s4_weights.gateway_address(environ[ENDPOINT_VARIABLE])
         step = "clients"
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
@@ -1308,7 +1328,7 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
         step = "canary_keys"
         keys = common.canary_keys().students
         step = "run"
-        run = Run(Pool(POOL, workspace, table), environ[ENDPOINT_VARIABLE], keys, settings, wakes, hold, recorder, clock)
+        run = Run(Pool(POOL, workspace, table), endpoint, keys, settings, wakes, hold, recorder, clock)
         asyncio.run(run.run())
     except Exception as error:  # noqa: BLE001 - recorded by its kind: no text of AWS's reaches the log
         recorder.line("failed", step=step, error=error_kind(error).value)
