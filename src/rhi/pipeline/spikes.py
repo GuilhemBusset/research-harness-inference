@@ -114,6 +114,7 @@ JOBS: tuple[SpikeJob, ...] = (
     SpikeJob("s8_stickiness", "s8_stickiness.py"),
     SpikeJob("s2_client_hold", "s2_client_hold.py"),
     SpikeJob("s4_weights", "s4_weights.py"),
+    SpikeJob("s1_cold_start", "s1_cold_start.py"),
 )
 
 
