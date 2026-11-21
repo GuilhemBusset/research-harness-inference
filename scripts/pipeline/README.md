@@ -46,10 +46,11 @@ deployment and needs no import path:
 The script of the weekly GPU canary (`src/rhi/pipeline/canary.py`), a job its schedule starts on
 Sundays at 04:00 UTC, with the repository's package roots in `PYTHONPATH`:
 
-- `canary_result.py` reads the canary's key as `verify.py` does, and the stage's workspace and
-  heartbeats table from the settings of the coursework pool's release parameter, and runs the smoke
-  tests of `tests/smoke` once against the deployed endpoint, on the coursework pool, through
-  `verify.py`'s runner: the tests the verification runs on that pool after a refresh. While they
+- `canary_result.py` reads the canary's key as `verify.py` does, and the stage's workspace from
+  the settings of the coursework pool's release parameter, and runs the smoke tests of
+  `tests/smoke` once against the deployed endpoint, on the coursework pool, through `verify.py`'s
+  runner: the tests the verification runs on that pool after a refresh, less `release-heartbeat`,
+  which reads the heartbeats table, a table the canary's role may not read. While they
   run, it reads the pool's state from `GET /status` to time the wake, from the pool's last `cold`
   to its first `ready`. It then sends the measurement `gpu-canary` (the verdict, `wake_seconds`,
   `smoke_tests_passed`, `smoke_tests_failed`) on the measurement bus, on the commit the job ran

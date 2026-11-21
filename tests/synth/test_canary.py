@@ -1,8 +1,8 @@
 """The weekly GPU canary of `src/rhi/pipeline/canary.py` (system design, sections 8.2, step 6, and
 14): a job of the pipeline's stack that runs the coursework pool's smoke tests against the deployed
 endpoint, a schedule on Sundays at 04:00 UTC whose only target is that job, and a role that reads
-the canary's secret, queries the workspace, reads the pools' release parameters, queries the
-heartbeats table the verification queries, and sends the measurement event, and nothing else.
+the canary's secret, queries the workspace, reads the pools' release parameters and sends the
+measurement event, and nothing else.
 
 The tests read the app's own pipeline, built from the example configuration.
 """
@@ -10,7 +10,7 @@ The tests read the app's own pipeline, built from the example configuration.
 from __future__ import annotations
 
 import json
-import re
+from fnmatch import fnmatchcase
 from typing import Any
 
 import pytest
@@ -25,7 +25,6 @@ JOB_ACTIONS = {
     "secretsmanager:GetSecretValue",
     "aps:QueryMetrics",
     "ssm:GetParameter",
-    "dynamodb:Query",
     "events:PutEvents",
     "codeconnections:GetConnection",
     "codeconnections:GetConnectionToken",
@@ -159,23 +158,16 @@ def test_the_job_s_role_reads_the_canary_s_inputs_and_sends_the_measurement_only
     assert as_list(query["Action"]) == ["aps:QueryMetrics"]
     assert text(query["Resource"]) == "arn:<>:aps:<>:<>:workspace/*"
     assert query["Condition"] == {"StringEquals": {"aws:ResourceTag/rhi-stage": "Rhi"}}
-    # The one table the verification's role queries too, the stage's heartbeats table, by the pools
-    # stack's name and the table's logical ID, and in it the coursework pool's rows only.
-    (heartbeats,) = [statement for statement in allowed if "dynamodb:Query" in as_list(statement["Action"])]
-    assert as_list(heartbeats["Action"]) == ["dynamodb:Query"]
-    (table,) = resources_of("dynamodb:Query")
-    assert re.fullmatch(r"arn:<>:dynamodb:<>:<>:table/Rhi-Pools-TablesHeartbeats[0-9A-F]{8}-\*", table)
-    assert table in queried_by_others(pipeline, role)
-    assert heartbeats["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["coursework"]}}
 
 
-def queried_by_others(pipeline: dict[str, Any], role: str) -> set[str]:
-    """Every table a policy of the pipeline's stack not attached to `role` may query."""
-    return {
-        text(resource)
-        for policy in of_type(pipeline, "AWS::IAM::Policy").values()
-        if {"Ref": role} not in policy["Roles"]
-        for statement in policy["PolicyDocument"]["Statement"]
-        if "dynamodb:Query" in as_list(statement["Action"])
-        for resource in as_list(statement["Resource"])
-    }
+def test_the_job_s_role_reads_no_table(pipeline: dict[str, Any], project: tuple[str, dict[str, Any]]) -> None:
+    # Not even the heartbeats table the verification reads: no action of DynamoDB, by any pattern.
+    _, properties = project
+    role = properties["ServiceRole"]["Fn::GetAtt"][0]
+    granted = [
+        action
+        for statement in statements(pipeline, role)
+        for action in as_list(statement.get("Action", []))
+        if fnmatchcase("dynamodb:query", action.lower()) or action.lower().startswith("dynamodb:")
+    ]
+    assert not granted

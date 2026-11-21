@@ -21,7 +21,7 @@ resource of the stage:
   reads `none` while the endpoint has no HTTPS listener;
 - `RHI_SMOKE_RELEASE_PARAMETERS`: each pool's release parameter, as JSON from the pool's name to
   the parameter's name, which the smoke tests read, and whose settings, for the coursework pool,
-  give the script the stage's Prometheus workspace and heartbeats table when it runs;
+  give the script the stage's Prometheus workspace when it runs;
 - `RHI_MEASUREMENT_BUS`: the measurement bus, through `rhi.pipeline.reporter.measuring_job`;
 - `PYTHONPATH`: the repository's package roots, `rhi.pipeline.synth.import_path`.
 
@@ -31,17 +31,15 @@ resource of the stage:
 - read the canary's secret, `rhi/canary-key`, and no other;
 - query the stage's Prometheus workspace, by the tag that names its stage;
 - read the release parameter of each pool the stage deploys, by its name;
-- query the stage's heartbeats table, as the verification does
-  (`rhi.pipeline.verify.heartbeats_table_arn`), for the coursework pool's rows only (the condition
-  `dynamodb:LeadingKeys`): the smoke test `release-heartbeat`, one of those the verification runs
-  on the coursework pool after a refresh, reads the release each instance reports there;
 - put the measurement event on the measurement bus;
 - use the pipeline's connection to read the repository and write to its own log group: what any
   CodeBuild project needs to run at all.
 
-No action of CodePipeline, Auto Scaling, EC2 or IAM, and of DynamoDB only that one query. The
-project is given the role as one that takes no new statement (`without_policy_updates`), as the
-spike jobs are, so CodeBuild's construct adds nothing to it. It runs CodeBuild's standard image and is not privileged. It keeps
+No action of CodePipeline, DynamoDB, Auto Scaling, EC2 or IAM: the verification's query of the
+heartbeats table is not the canary's, so its run leaves out the one smoke test that reads that table
+(`scripts/pipeline/canary_result.py`). The project is given the role as one that takes no new
+statement (`without_policy_updates`), as the spike jobs are, so CodeBuild's construct adds nothing
+to it. It runs CodeBuild's standard image and is not privileged. It keeps
 no artifact, and what CodeBuild stores of a build is encrypted with the key AWS manages, the
 default, as the promotion job's is: a key of its own would add a monthly cost and a key policy for
 a build that holds nothing but this public repository (`tests/policy/acknowledged/pipeline_canary.toml`).
@@ -64,7 +62,7 @@ from rhi.observability.stack import STAGE_TAG
 from rhi.pipeline import reporter
 from rhi.pipeline.spikes import CONNECTION_ACTIONS
 from rhi.pipeline.synth import UV_VERSION, import_path
-from rhi.pipeline.verify import CANARY_SECRET, heartbeats_table_arn
+from rhi.pipeline.verify import CANARY_SECRET
 from rhi.stage import EndpointStage
 
 # The project's and the rule's fixed name, by which the owner finds the job and its schedule.
@@ -78,9 +76,6 @@ LOG_GROUP_NAME = f"/aws/codebuild/{NAME}"
 LOG_RETENTION = logs.RetentionDays.ONE_YEAR
 # A cold wake of the coursework pool, the hold, the smoke tests and the workspace's lag.
 TIMEOUT = cdk.Duration.hours(2)
-
-# The pool the canary tests, the one whose heartbeat rows its role may read.
-POOL = "coursework"
 
 ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
 RELEASE_PARAMETERS_VARIABLE = "RHI_SMOKE_RELEASE_PARAMETERS"
@@ -200,15 +195,6 @@ class GpuCanary(Construct):
         workspaces = stack.format_arn(service="aps", resource="workspace", resource_name="*")
         tagged = {"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": stage.observability.stage_name}}
         statements.append(iam.PolicyStatement(actions=["aps:QueryMetrics"], resources=[workspaces], conditions=tagged))
-        # The coursework pool's heartbeat rows: a query of that one table, by that one partition
-        # key, and nothing else of it.
-        statements.append(
-            iam.PolicyStatement(
-                actions=["dynamodb:Query"],
-                resources=[heartbeats_table_arn(stack, stage)],
-                conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [POOL]}},
-            )
-        )
         # The release parameter of each pool the stage deploys, by its name, and no other.
         parameters = [
             stack.format_arn(service="ssm", resource="parameter", resource_name=name.lstrip("/"))

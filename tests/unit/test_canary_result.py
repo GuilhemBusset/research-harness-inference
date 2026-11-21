@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -253,10 +254,10 @@ def test_the_job_runs_the_coursework_pool_s_smoke_tests_and_sends_their_result()
     ((env, arguments),) = given
     assert env["RHI_SMOKE_POOL"] == "coursework"
     assert env["RHI_SMOKE_KEY"] == key
-    # The workspace's own query address, under which the tests ask for api/v1/query, and the
-    # heartbeats table, both from the release parameter's settings.
+    # The workspace's own query address, under which the tests ask for api/v1/query, from the
+    # release parameter's settings; and no table, which the canary's role may not read.
     assert env["RHI_SMOKE_WORKSPACE_URL"] == WORKSPACE
-    assert env["RHI_VERIFY_HEARTBEATS_TABLE"] == HEARTBEATS
+    assert "RHI_VERIFY_HEARTBEATS_TABLE" not in env
     assert json.loads(env["RHI_SMOKE_RELEASE_PARAMETERS"]) == {"coursework": PARAMETER}
     assert arguments[-1] == "tests/smoke"
     (entry,) = sent
@@ -297,16 +298,18 @@ def test_an_event_the_bus_refuses_fails_the_script() -> None:
 
 
 def collected(env: Mapping[str, str], arguments: Sequence[str]) -> set[str]:
-    """The smoke tests a run of the verification's runner would make, by their node IDs."""
+    """The smoke tests a run of the verification's runner would make, by their node IDs, with the
+    repository's package roots on the import path, as the canary's job has them."""
     command = [sys.executable, "-m", "pytest", "-q", "--collect-only", "-p", "verify", *arguments]
-    folders = os.pathsep.join(["scripts/pipeline", *filter(None, [os.environ.get("PYTHONPATH")])])
+    roots = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"]
+    folders = os.pathsep.join(["scripts/pipeline", *roots["pythonpath"], *filter(None, [os.environ.get("PYTHONPATH")])])
     answer = subprocess.run(
         command, cwd=REPO, env={**os.environ, **env, "PYTHONPATH": folders}, capture_output=True, text=True, check=True
     )
     return {line for line in answer.stdout.splitlines() if line.startswith("tests/smoke/") and "::" in line}
 
 
-def test_the_run_makes_every_test_the_verification_makes_on_the_coursework_pool() -> None:
+def test_the_run_makes_the_verification_s_tests_on_the_coursework_pool_but_the_heartbeat_one() -> None:
     given: list[tuple[dict[str, str], list[str]]] = []
 
     def run(env: Mapping[str, str], arguments: Sequence[str]) -> int:
@@ -325,8 +328,12 @@ def test_the_run_makes_every_test_the_verification_makes_on_the_coursework_pool(
     ((env, arguments),) = given
     endpoint = {"RHI_SMOKE_ENDPOINT": env["RHI_SMOKE_ENDPOINT"], "RHI_SMOKE_POOL": env["RHI_SMOKE_POOL"]}
     after_a_refresh = collected(endpoint | {"RHI_SMOKE_POOL": "coursework"}, ["tests/smoke"])
-    assert any("release_heartbeats" in test for test in after_a_refresh)
-    assert collected(endpoint, arguments) == after_a_refresh
+    heartbeat = {test for test in after_a_refresh if "release_heartbeats" in test}
+    assert heartbeat
+    assert any("gpu_release" in test for test in after_a_refresh)
+    # Every test of the verification's run after a refresh, the release served among them, but the
+    # one that reads the heartbeats table, which the canary's role may not read.
+    assert collected(endpoint, arguments) == after_a_refresh - heartbeat
 
 
 def test_the_watch_reads_the_coursework_pool_s_state_until_it_is_ready() -> None:

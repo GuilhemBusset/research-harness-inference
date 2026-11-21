@@ -5,15 +5,19 @@ canary's job runs it, on the commit of `main` its schedule started it on
 
 **The run.** The script reads the canary's key from the secret `rhi/canary-key`, as the
 verification does (`verify.canary_key`), and the coursework pool's release parameter, whose
-settings name the stage's Prometheus workspace, by its remote-write address, and the stage's
-heartbeats table (`rhi_lifecycle.release`). It runs the smoke tests of `tests/smoke` once, with
-`RHI_SMOKE_POOL` naming the coursework pool, through the verification's own runner
-(`verify.run_tests`): in a process of their own, the key in its environment and nowhere else, what
-they print in the log without the key, and the tests that must reach the internal load balancer left
-out. These are the tests the verification runs on the coursework pool after a refresh, every one of
-them: the workspace's query address and the heartbeats table are given as the verification gives
-them, `RHI_SMOKE_WORKSPACE_URL` and `RHI_VERIFY_HEARTBEATS_TABLE`. The run records its results as
-JUnit XML, which the script reads back.
+settings name the stage's Prometheus workspace by its remote-write address (`rhi_lifecycle.release`).
+It runs the smoke tests of `tests/smoke` once, with `RHI_SMOKE_POOL` naming the coursework pool,
+through the verification's own runner (`verify.run_tests`): in a process of their own, the key in
+its environment and nowhere else, what they print in the log without the key, and the tests that
+must reach the internal load balancer left out. These are the tests the verification runs on the
+coursework pool after a refresh, the workspace's query address given as the verification gives it,
+`RHI_SMOKE_WORKSPACE_URL`, less one: this file is a plugin of the run as well, which leaves out
+`CANARY_DESELECTED`. `release-heartbeat` reads the stage's heartbeats table, a DynamoDB table, and
+the canary's role may read the canary's secret, query the workspace, read the pools' release
+parameters and send its event, and nothing else (`src/rhi/pipeline/canary.py`). The release the
+pool's instances serve is still compared with the deployed one, through the workspace
+(`release-served`, `gpu-release-served`). The run records its results as JUnit XML, which the
+script reads back.
 
 **The wake.** While the tests run, a thread of this process reads the coursework pool's state from
 `GET /status` every `POLL_SECONDS` (a status read is not demand: it wakes nothing). The wake is the
@@ -73,6 +77,8 @@ from rhi_reporter.measure import BUS_VARIABLE, Verdict, measurement_event
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    import pytest
+
 NAME = "canary_result"
 MEASUREMENT = "gpu-canary"
 POOL = "coursework"
@@ -84,6 +90,10 @@ WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
 REMOTE_WRITE_PATH = "api/v1/remote_write"
 # The exit codes of a run of pytest that ended: every test passed, or some failed.
 FINISHED = (0, 1)
+
+# The tests the canary's run leaves out beside those the verification does, by their IDs: what
+# needs more than the canary's role may do.
+CANARY_DESELECTED: tuple[str, ...] = ("release-heartbeat",)
 
 # The pool's states as `GET /status` gives them (section 5.3).
 COLD = "cold"
@@ -104,6 +114,19 @@ class Number(StrEnum):
 
 
 NAMES: tuple[str, ...] = tuple(Number)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of
+    `CANARY_DESELECTED`."""
+    left_out = [
+        item
+        for item in items
+        if any(set(marker.args) & set(CANARY_DESELECTED) for marker in item.iter_markers(verify.ID_MARKER))
+    ]
+    if left_out:
+        config.hook.pytest_deselected(items=left_out)
+        items[:] = [item for item in items if item not in left_out]
 
 
 @dataclass(frozen=True)
@@ -213,9 +236,8 @@ def send(entry: Mapping[str, str], client: Any) -> None:
 def stage_settings(client: Any, env: Mapping[str, str]) -> dict[str, str]:
     """What the smoke tests are told of the stage, from the settings of the coursework pool's
     release parameter, read with `client`, an SSM client of the AWS SDK: the workspace's query
-    address, its remote-write address without `REMOTE_WRITE_PATH`, and the heartbeats table. Nothing
-    when the parameter cannot be read or holds no release: the tests that need them then fail by
-    the variable's name."""
+    address, its remote-write address without `REMOTE_WRITE_PATH`. Nothing when the parameter
+    cannot be read or holds no release: the tests that need it then fail by the variable's name."""
     # Imported here: the script's own folder and the reporter's are all its import needs elsewhere.
     from rhi_lifecycle.release import read_current
 
@@ -229,7 +251,6 @@ def stage_settings(client: Any, env: Mapping[str, str]) -> dict[str, str]:
         return {}
     return {
         WORKSPACE_URL_VARIABLE: current.settings.workspace_url.removesuffix(REMOTE_WRITE_PATH),
-        verify.HEARTBEATS_TABLE_VARIABLE: current.settings.heartbeat_table,
     }
 
 
@@ -311,7 +332,7 @@ def run_canary(
     with tempfile.TemporaryDirectory() as folder:
         report = Path(folder) / "results.xml"
         with watch(endpoint, key) as watching:
-            exit_code = run(given, (f"--junitxml={report}", verify.SMOKE_TESTS))
+            exit_code = run(given, ("-p", NAME, f"--junitxml={report}", verify.SMOKE_TESTS))
         results = read_results(report.read_text(encoding="utf-8")) if report.is_file() else None
     return results, wake_seconds(watching.readings), exit_code
 
