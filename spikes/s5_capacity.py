@@ -54,10 +54,12 @@ A quantity an engine's row leaves out (the mock's has none of the further ones) 
 zero, as does one with nothing to divide. Counters and histograms are increased per series before
 they are summed per instance: an instance's counters restart from zero with its engine. They are
 read one scrape after the run's end, from the run's start to then, with Prometheus' `anchored`
-range modifier: the increase starts from the last sample at or before the run's start, what each
-counter held when the run began, so what the run added before its first scrape is counted, and it
-is not extended past the samples it saw. A series with no sample at or before the run's start, an
-instance that joined during it, began at zero with its engine: its first sample is added to its
+range modifier, over a range to the millisecond that starts at the run's start: the increase starts
+from the last sample at or before the run's start, what each counter held when the run began, so
+what the run added before its first scrape is counted, nothing from before the run is, and it is
+not extended past the samples it saw. A series with no sample at or before the run's start (read on
+a grid whose first point is at the start or before it), an instance that joined during it, began
+at zero with its engine: its first sample is added to its
 increase, which `anchored` takes from that sample (`counted_of`). The quantiles are computed from
 the buckets so counted (`quantile_of`), as `histogram_quantile` would. The scrape after the run's
 end holds the tokens of the last answers, which the workspace sees only then; nothing else is sent
@@ -69,7 +71,9 @@ the run's seconds.
 start (`rhi_lifecycle.cache.METRIC`), the last reported from a scrape before the run to a scrape
 after it, and its release (`rhi_lifecycle.serving.RELEASE_METRIC`), which an instance writes only
 while in service: the build, its `model_revision`, and from the times of its samples, the seconds
-the instance was in service during the window. The samples are read on the same fine grid to one
+the instance was in service during the window, within a scrape of a sample, so that a warm instance
+stopped between two periods of service is not charged for the gap. The run reports the instances
+that served in it, and only those. The samples are read on the same fine grid to one
 scrape past the window's end, so that an instance in service at the end is seen there, and a run
 shorter than a scrape, whose instances are first scraped after it ends, is still labelled. An
 instance whose last sample is older than a scrape before the window, which the workspace still
@@ -290,13 +294,14 @@ def release_query(pool: str) -> str:
 
 def in_service_of(release: Sequence[common.Series], start: float, end: float) -> dict[str, InService]:
     """Each instance's release from `start` to `end`, from the times of its release samples
-    (`release_query`, read to a scrape past `end`): in service from a scrape before its first
-    sample, or the window's start, to a scrape after its last, or the window's end, since a sample
-    shows the instance in service at some time in the scrape before it. An instance with no sample
-    from a scrape before `start` to a scrape after `end` did not serve in the window and is not in
-    the answer, nor is one whose seconds in it come to none; one first scraped after a short window
-    ended still labels it. ValueError for an
-    instance whose samples carry no instance type or two releases."""
+    (`release_query`, read to a scrape past `end`): in service within a scrape of each sample, since
+    a sample shows the instance in service at some time in the scrape before it, so from a scrape
+    before its first sample to a scrape after its last, inside the window, but not across a gap in
+    its samples longer than two scrapes, a warm instance stopped and started again. An instance with
+    no sample from a scrape before `start` to a scrape after `end` did not serve in the window and
+    is not in the answer, nor is one whose seconds in it come to none; one first scraped after a
+    short window ended still labels it. ValueError for an instance whose samples carry no instance
+    type or two releases."""
     times: dict[str, list[float]] = {}
     kinds: dict[str, set[tuple[str, str]]] = {}
     for one in release:
@@ -313,7 +318,12 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
         if len(kinds[instance]) != 1 or not all(next(iter(kinds[instance]))):
             raise ValueError("an instance reported no instance type, no build, or two of either in the window")
         ((kind, build),) = kinds[instance]
-        seconds = min(end, max(taken) + SCRAPE_SECONDS) - max(start, min(taken) - SCRAPE_SECONDS)
+        # The union, inside the window, of a scrape either side of each sample.
+        seconds, covered = 0.0, start
+        for at in sorted(set(taken)):
+            low, high = max(covered, at - SCRAPE_SECONDS), min(end, at + SCRAPE_SECONDS)
+            if high > low:
+                seconds, covered = seconds + high - low, high
         # An instance first scraped a whole scrape after the window, or last a whole scrape before
         # it, was in service for none of it, and labels nothing.
         if seconds > 0:
@@ -380,7 +390,10 @@ def _selector(name: Name, suffix: str, pool: str) -> str:
 
 
 def _range(seconds: float) -> str:
-    return f"{max(1, math.ceil(seconds))}s"
+    """A range of `seconds` to the millisecond, so that it starts where the run did, not at a whole
+    second before it: in seconds when they are whole, else in milliseconds."""
+    millis = max(1, round(seconds * 1000))
+    return f"{millis // 1000}s" if millis % 1000 == 0 else f"{millis}ms"
 
 
 class How(StrEnum):
@@ -539,6 +552,13 @@ def grid_start(start: float, end: float, step: float) -> float:
     return end - math.floor((end - start) / step) * step
 
 
+def grid_before(start: float, end: float, step: float) -> float:
+    """Where a range query from `start` begins so that `end` is on its grid and its first point is
+    at `start` or before it: `start` or less than a step before it. A series already scraped by
+    then shows at that first point, and only one born after `start` first shows after it."""
+    return end - math.ceil((end - start) / step) * step
+
+
 @dataclass(frozen=True)
 class EngineQuantities:
     """What one instance's engine measured in a run. None where the engine's row has no name for
@@ -642,7 +662,7 @@ class Label:
 class Instance:
     """One instance of a run: what its lifecycle agent reported, and what its engine measured."""
 
-    instance_type: str | None
+    instance_type: str
     seconds_in_service: float
     engine: EngineQuantities
 
@@ -784,7 +804,7 @@ class Job:
                 answers[key] = [one(instance, end, summary(values)) for instance, values in points.items()]
             else:
                 step = read_at[after]
-                born = read(how.raw, grid_start(start, after, step), after, step)
+                born = read(how.raw, grid_before(start, after, step), after, step)
                 counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), born, start)
                 if how.how is How.SUM:
                     answers[key] = [one(instance, after, value, le) for (instance, le), value in counted.items()]
@@ -815,13 +835,15 @@ class Job:
         build = build_of(in_service)
         engine = quantities_of(self._engine(start, end), window)
         experience = experience_of(records)
+        # The instances that served the run, and only those: one the workspace reads after the run,
+        # or that had stopped before it, measured nothing of it.
         instances = {
             instance: Instance(
-                instance_type=in_service[instance].instance_type if instance in in_service else None,
-                seconds_in_service=in_service[instance].seconds if instance in in_service else 0.0,
+                instance_type=served.instance_type,
+                seconds_in_service=served.seconds,
                 engine=engine.get(instance, EngineQuantities()),
             )
-            for instance in sorted({*in_service, *engine})
+            for instance, served in sorted(in_service.items())
         }
         label = Label(
             pool=self.pool,
