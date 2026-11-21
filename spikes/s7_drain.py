@@ -52,14 +52,16 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    A cycle in which both paths were not seen is run again, up to `CYCLES` times; once both were,
    the job goes on to the wakes.
 3. **The stream across a scale-in**, in the first cycle. As the load stops, before the scaler acts,
-   it opens one slow stream, as across the deployment, and holds its body open while it watches the
-   pool; it sends the last byte once it reads the first departing instance gone, and reads the
-   answer to its end. So the one request is open, at the gateway, from before the scaler's decision
-   to after the instance left, and reaches whichever instance then serves. The mock's canned turn
-   lasts under a second and nothing in a request makes it longer, and a request the gateway has not
-   forwarded keeps no instance busy, so it delays no scale-in. Its `stream` line holds its times and
-   its end, with the first decision's number; the departures' lines hold theirs, so a reader places
-   one against the other.
+   it opens one slow stream, as across the deployment, and holds its body open at the gateway while
+   it watches the pool: a request the gateway has not forwarded keeps no instance busy, so it delays
+   no scale-in. It sends the last byte as soon as it reads the scaler's first decision, so the
+   gateway forwards the request to the pool while the group takes the departing instance out of
+   service and before that instance stops, the window in which a request may meet a deregistering
+   target (section 5.1), and reads the answer to its end, through the departure when it lasts that
+   long. The mock's canned turn lasts under a second and nothing in a request makes it longer, so
+   whether it finished or was cut is what the line records. Its `stream` line holds its times, among
+   them `body_sent_at`, when it was forwarded, and its end, with the first decision's number; the
+   departures' lines hold theirs, so a reader places one against the other.
 4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it waits for a fresh
    transition of the pool to zero: a note that asks for an instance after the last zero it used,
    then a note asking for none and an in-service reading of zero as fresh as it, which the scaler
@@ -93,8 +95,11 @@ instance of the decision has stopped, ending as many more as left, `warm_pool`; 
 a window that ran at least `WARM_SETTLE_SECONDS`, its readings reaching its end, `terminated`. A
 new instance writing, a decision whose instances the count does not tell apart, no reading on
 either side, readings that end early, a window the next decision cut short, or readings that
-differ, leave it `unknown`. A reading missing from the workspace, or readings that end early, are
-read again for `FRESH_SECONDS` before the path is told without them.
+differ, leave it `unknown`. The readings cover the window (`covers`) when they reach its end, the
+settle time or the next decision's run, and no two that follow each other in it are further apart
+than `COVER_SECONDS`, one run of the scaler and a step: a later reading the workspace has not shown
+yet may hold the rise. A reading missing from the workspace, or readings that do not cover the
+window, are read again for `FRESH_SECONDS` before the path is told without them.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s7_drain`):
 
@@ -116,6 +121,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import os
@@ -186,9 +192,9 @@ LEAVE_WAIT_SECONDS = 15 * 60
 # told: an instance stopped into the warm pool may be counted there some time after its collector
 # falls silent.
 WARM_SETTLE_SECONDS = 5 * 60
-# Seconds: the warm readings the job has read cover a window when the last of them is no older than
-# this at its end, one run of the scaler and a step of the query; otherwise the workspace has not
-# shown the rest yet.
+# Seconds: the most two warm readings that follow each other may be apart and still cover the time
+# between them, one run of the scaler and a step of the query; otherwise the workspace has not shown
+# a reading between them yet.
 COVER_SECONDS = 60 + STEP_SECONDS
 # Seconds a reading may take to show in the workspace once the scaler has written it.
 INGEST_SECONDS = 30
@@ -434,6 +440,16 @@ def warm_bound(asked: int, notes: Sequence[ScalerNote], decided_at: float) -> tu
     return math.inf, None
 
 
+def covers(readings: Sequence[tuple[float, float]], *, since: float, until: float) -> bool:
+    """Whether the warm readings, each with its time, cover the window from `since`, the reading the
+    scaler decided on, to `until`: one of them made at `until` or after, and none of those from
+    `since` on further from the next than `COVER_SECONDS`."""
+    moments = [moment for moment, _ in readings if moment >= since]
+    if not moments or moments[-1] < until:
+        return False
+    return all(later - earlier <= COVER_SECONDS for earlier, later in itertools.pairwise(moments))
+
+
 def in_window(
     samples: Sequence[tuple[float, float]], end: float, next_at: float | None
 ) -> list[tuple[float, float]]:
@@ -478,8 +494,9 @@ def path_of(
 
     The warm count is a pool total that may rise some time after an instance stops. From the
     decision's reading, it must never fall and never pass `leaving` more: once every instance has
-    stopped, a last reading `leaving` more is `warm_pool`. Short of that, the readings must reach the
-    end of the window, its last no more than `COVER_SECONDS` before it, or the workspace has not
+    stopped, a last reading `leaving` more is `warm_pool`. Short of that, the readings must cover
+    the window (`covers`) up to `WARM_SETTLE_SECONDS` past the last stop, or up to the last run that
+    asked for as many before the next decision when `end` comes first, or the workspace has not
     shown the rest yet. Then every reading since the first stop the same, over a settled window, is
     `terminated`. Anything else is `unknown`, with its reason: the same count over a window another
     decision cut short cannot tell a terminated instance from a late return, and a count between the
@@ -503,7 +520,7 @@ def path_of(
     steady = all(earlier <= later <= before + leaving for earlier, later in pairs)
     if steady and last[-1] == before + leaving:
         return Told(Path.WARM_POOL, None, before, after)
-    if readings[-1][0] < min(max(stops) + WARM_SETTLE_SECONDS, end) - COVER_SECONDS:
+    if not covers(readings, since=decided[0], until=min(max(stops) + WARM_SETTLE_SECONDS, end - NOTE_SECOND)):
         return Told(Path.UNKNOWN, Unknown.WARM_READINGS_END_EARLY, before, after)
     if set(after) == {before} and settled:
         return Told(Path.TERMINATED, None, before, after)
@@ -1104,8 +1121,8 @@ class Run:
     async def cycle(self) -> None:
         """Two instances, then the departures down to none, each with its lines. In the first cycle,
         the stream across a scale-in: a slow stream sent as the load stops, before the scaler asks
-        for fewer, held open while the job watches the pool and sent whole once it reads the first
-        departing instance gone, then read to its end."""
+        for fewer, held open while the job watches the pool and sent whole as soon as it reads the
+        scaler's first decision, then read to its end."""
         if not await self.two_instances():
             self.recorder.line("timeout", waiting_for="two_in_service")
             return
@@ -1126,7 +1143,7 @@ class Run:
                 await self._read_note(watch)
                 await self._read_in_service(watch)
                 await self._read_writes(watch)
-                if any(decision.departures for decision in watch.decisions):
+                if watch.decisions:
                     release.set()
                 if streaming is not None and streaming.done() and not self.scale_in_streamed:
                     stream_line(streaming.result())
@@ -1142,10 +1159,10 @@ class Run:
 
     async def _across_scale_in(self, release: asyncio.Event, hold: float) -> Read:
         """The stream across a scale-in: one slow stream (`slow_stream`), its body held open from
-        now, before the scaler asks for fewer, until `release` is set, as the job reads the first
-        departing instance gone, or for `hold` seconds; then read to its end. The gateway forwards a
-        request once its body is whole, so the request is open at the gateway through the scale-in
-        and reaches the pool after it."""
+        now, before the scaler asks for fewer, until `release` is set, as the job reads the scaler's
+        first decision, or for `hold` seconds; then read to its end. The gateway forwards a request
+        once its body is whole, so the request reaches the pool as the group takes the instance out
+        of service, before it stops."""
         return await slow_stream(
             self.endpoint,
             self.student,
