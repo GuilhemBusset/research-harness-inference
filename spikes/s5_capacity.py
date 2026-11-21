@@ -208,7 +208,7 @@ from rhi import config
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
 from rhi_lifecycle.serving import RELEASE_METRIC
-from rhi_reporter.measure import Verdict, context_parts
+from rhi_reporter.measure import MEASURE_CONTEXT, Verdict, context_parts
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Mapping, Sequence
@@ -1434,7 +1434,8 @@ def postings_of(
     - `WHOLE` when every posting before it had ended before it began (all its numbers, its count
       among them, were there), and it holds one status of each part from 1 and the numbers its
       count says: a retry is read alone, never joined to an earlier posting's parts;
-    - `INCOMPLETE` when, with the same, some of its numbers are not there yet;
+    - `INCOMPLETE` when, with the same, some of its numbers are not there yet: the parts that are
+      there, a part between them missing or not, are returned numbered again from 1;
     - `OVERLAPPING` when an earlier posting had not ended when it began, or two statuses of one
       part, two counts, or more numbers than its count were posted from its time on: the postings
       cannot be told apart, and none of their statuses is returned.
@@ -1500,7 +1501,14 @@ def postings_of(
         if not ended or any(len(one) > 1 for one in since.values()):
             read = Posting.OVERLAPPING
         found[label] = (read, when)
-        if read is not Posting.OVERLAPPING:
+        if read is Posting.INCOMPLETE:
+            # A part not listed yet may lie between two that are: the parts that are, numbered
+            # again from 1, hold its rows, and the decoder joins them.
+            kept += [
+                {**since[part][0], "context": f"{MEASURE_CONTEXT}{MEASUREMENT}/{label}/{at}"}
+                for at, part in enumerate(sorted(since), start=1)
+            ]
+        elif read is Posting.WHOLE:
             kept += [one[0] for one in since.values()]
     return kept, found
 
