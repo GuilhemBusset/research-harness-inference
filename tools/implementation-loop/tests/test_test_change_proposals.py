@@ -50,7 +50,7 @@ class Agents(L.agents.FakeAgents):
     def decide(self, vendor, req, worktree, requests):
         sent = []
         adapter = SimpleNamespace(_issue_vars=live.LiveAgents._issue_vars,
-                                  call=lambda vendor, role, cwd, prompt, issue: sent.append(prompt) or {"decisions": []})
+                                  call=lambda vendor, role, cwd, prompt, issue, escalate=False: sent.append(prompt) or {"decisions": []})
         live.LiveAgents.decide(adapter, vendor, req, worktree, requests)
         mine = worktree / LOCKED
         self.decided.append(SimpleNamespace(
