@@ -103,6 +103,19 @@ PUBLISH_ACTIONS = ["cloudwatch:PutMetricData"]
 STACK_ID_TAG = "aws:cloudformation:stack-id"
 
 
+def log_group(scope: Construct) -> logs.LogGroup:
+    """The scaler's log group, of a fixed name, as the child `Logs` of `scope`: the construct's own, or,
+    for a parked stage, a construct of the same ID that holds the log group alone, so that it keeps
+    its logical ID while what writes to it is gone (system design, section 5.6)."""
+    return logs.LogGroup(
+        scope,
+        "Logs",
+        log_group_name=LOG_GROUP_NAME,
+        retention=LOG_RETENTION,
+        removal_policy=cdk.RemovalPolicy.DESTROY,
+    )
+
+
 class Scaler(Construct):
     """The scaler's function, as `function`, its role, as `role`, its log group, as `log_group`, and
     the rule that invokes it every minute, as `schedule`. Another construct allows its own role to
@@ -128,13 +141,7 @@ class Scaler(Construct):
         lambda_service = iam.ServicePrincipal("lambda.amazonaws.com")
         # Its own role, with no AWS managed policy: what the function may do is listed here, whole.
         self.role = iam.Role(self, "Role", assumed_by=lambda_service)  # ty: ignore[invalid-argument-type]
-        self.log_group = logs.LogGroup(
-            self,
-            "Logs",
-            log_group_name=LOG_GROUP_NAME,
-            retention=LOG_RETENTION,
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-        )
+        self.log_group = log_group(self)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 actions=["logs:CreateLogStream", "logs:PutLogEvents"], resources=[self.log_group.log_group_arn]

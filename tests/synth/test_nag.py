@@ -201,7 +201,9 @@ def test_an_entry_for_a_pool_lists_the_finding_of_each_configured_pool_and_of_no
 
     def synthesize(outdir: Path, also_named: str | None) -> None:
         app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-        role = EndpointStage(app, "Rhi", config=configured).observability.grafana.task_role
+        grafana = EndpointStage(app, "Rhi", config=configured).observability.grafana
+        assert grafana is not None  # An unparked stage has Grafana.
+        role = grafana.task_role
         if also_named is not None:
             log_group = cdk.Stack.of(role).format_arn(
                 service="logs",

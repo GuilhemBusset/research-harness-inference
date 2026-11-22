@@ -9,6 +9,11 @@ The stack declares one output, `Endpoint`: the endpoint's address, which the pip
 verification takes as an input (`rhi.pipeline.verify`). It is the configuration's domain while
 `https_listener` is true and `NO_ENDPOINT` while it is false, when nothing listens there: the
 output is declared either way, so that the verification's inputs never change shape.
+
+Parked (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no gateway service,
+target group or listener rule, and the endpoint's output reads `NO_ENDPOINT`: a parked platform
+answers nothing (section 6.2, step 8). The gateway's log group, whose name is fixed
+(`rhi.gateway.service.log_group`), stays, and the stack then reads nothing of another stack.
 """
 
 from __future__ import annotations
@@ -16,12 +21,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
+from constructs import Construct
 
-from rhi.gateway.service import GatewayService
+from rhi.gateway import service
 
 if TYPE_CHECKING:
-    from constructs import Construct
-
     from rhi.access.stack import AccessStack
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
@@ -36,7 +40,7 @@ class GatewayStack(cdk.Stack):
     """Holds the gateway's service, which a later construct takes from `service`
     (`service.service`, `service.task_role`, `service.log_group`), reached through the network's
     HTTPS listener, or from nowhere while there is none, and the endpoint's address, as the
-    output `endpoint`."""
+    output `endpoint`. Parked, `service` is None."""
 
     def __init__(
         self,
@@ -55,7 +59,29 @@ class GatewayStack(cdk.Stack):
         # cannot remove a pool, or replace its target group, in the deployment that takes the pool
         # out of the gateway's environment, since the stage updates it before this stack.
         cdk.CrossStackReferences.of(self).consume(cdk.ReferenceStrength.STRONG)
-        self.service = GatewayService(
+        self.service: service.GatewayService | None = None
+        if config.parked:
+            # The gateway's log group alone, at the service's path.
+            service.log_group(Construct(self, "Service"))
+        else:
+            self.service = self._service(config, network, access, observability, pools)
+        self.endpoint = cdk.CfnOutput(
+            self,
+            "Endpoint",
+            description="The endpoint's address, or none while it has no HTTPS listener.",
+            value=config.domain if config.https_listener and not config.parked else NO_ENDPOINT,
+        )
+
+    def _service(
+        self,
+        config: Config,
+        network: NetworkStack,
+        access: AccessStack,
+        observability: ObservabilityStack,
+        pools: PoolsStack,
+    ) -> service.GatewayService:
+        assert pools.routing is not None and pools.scaler is not None, "an unparked stage has both"
+        return service.GatewayService(
             self,
             "Service",
             config=config,
@@ -71,10 +97,4 @@ class GatewayStack(cdk.Stack):
             scaler=pools.scaler.function,
             workspace=observability.prometheus,
             listener=network.https_listener,
-        )
-        self.endpoint = cdk.CfnOutput(
-            self,
-            "Endpoint",
-            description="The endpoint's address, or none while it has no HTTPS listener.",
-            value=config.domain if config.https_listener else NO_ENDPOINT,
         )

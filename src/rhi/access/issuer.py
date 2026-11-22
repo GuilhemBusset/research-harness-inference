@@ -100,9 +100,23 @@ class _AccountScopedTarget:
         )
 
 
+def log_group(scope: Construct) -> logs.LogGroup:
+    """The issuer's log group, of a fixed name, as the child `Logs` of `scope`: the construct's own, or,
+    for a parked stage, a construct of the same ID that holds the log group alone, so that it keeps
+    its logical ID while what writes to it is gone (system design, section 5.6)."""
+    return logs.LogGroup(
+        scope,
+        "Logs",
+        log_group_name=LOG_GROUP_NAME,
+        retention=LOG_RETENTION,
+        removal_policy=cdk.RemovalPolicy.DESTROY,
+    )
+
+
 class Issuer(Construct):
-    """The issuer's function, as `function`, and, when `listener` is given, its target group and
-    its rule on that listener, as `target_group` and `rule`; both are None without one."""
+    """The issuer's function, as `function`, its log group, as `log_group`, and, when `listener` is
+    given, its target group and its rule on that listener, as `target_group` and `rule`; both are
+    None without one."""
 
     def __init__(
         self,
@@ -121,16 +135,10 @@ class Issuer(Construct):
         lambda_service = iam.ServicePrincipal("lambda.amazonaws.com")
         # Its own role, with no managed policy: what the function may do is listed here, whole.
         role = iam.Role(self, "Role", assumed_by=lambda_service)  # ty: ignore[invalid-argument-type]
-        log_group = logs.LogGroup(
-            self,
-            "Logs",
-            log_group_name=LOG_GROUP_NAME,
-            retention=LOG_RETENTION,
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-        )
+        self.log_group = log_group(self)
         role.add_to_policy(
             iam.PolicyStatement(
-                actions=["logs:CreateLogStream", "logs:PutLogEvents"], resources=[log_group.log_group_arn]
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"], resources=[self.log_group.log_group_arn]
             )
         )
         role.add_to_policy(iam.PolicyStatement(actions=READ_ACTIONS, resources=[roster.table_arn]))
@@ -149,7 +157,7 @@ class Issuer(Construct):
             handler=HANDLER,
             code=packaging.function_code("issuer", ARCHITECTURE),
             role=role,  # ty: ignore[invalid-argument-type] - as above
-            log_group=log_group,
+            log_group=self.log_group,
             memory_size=MEMORY_MB,
             timeout=TIMEOUT,
             reserved_concurrent_executions=config.issuer_reserved_concurrency,

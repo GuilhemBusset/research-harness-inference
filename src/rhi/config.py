@@ -104,7 +104,7 @@ class Config:
     github_repo: str
     # The login app's client ID, which the issuer serves.
     login_client_id: str
-    # The backstop that latches every pool.
+    # The monthly amount of the cost budget, which alerts and stops nothing.
     monthly_budget_usd: int
     # The schedule: an IANA time zone name, the course end date and the session windows.
     time_zone: str
@@ -164,6 +164,11 @@ class Config:
     # The whole hours a pool may be in service while no session is on before its alarm fires
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
+    # Whether the stage is parked: the whole endpoint switched off, with no load balancer, NAT
+    # gateway, Fargate service, pool group or scaler, and only data and the pipeline left (system
+    # design, sections 5.6 and 11.2). A deployment flag and nothing else: a pool the admin stops is
+    # a record (section 11.3). Only synthesis reads it.
+    parked: bool
 
 
 def _as_stored(text: str) -> object:
@@ -404,6 +409,7 @@ KEYS: dict[str, Key] = {
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "outside_sessions_alarm_hours": _WHOLE_NUMBER,
+    "parked": Key("true or false, without quotes", _boolean, _boolean_from_text),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -451,6 +457,9 @@ DEFAULTS: dict[str, object] = {
     "cost_anomaly_detection": False,
     # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
     "outside_sessions_alarm_hours": 1,
+    # The design gives no default (issue E4-17): unparked, so that a configuration written before
+    # the key loads unchanged and builds the stage as it was.
+    "parked": False,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
