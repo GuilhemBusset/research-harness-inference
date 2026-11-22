@@ -90,6 +90,17 @@ the stage's deployment and is given the same import path as the scripts of the s
   configuration with no GPU pool copies nothing and passes. So moving a pool to another revision
   or another build is a change of its configuration and a committed manifest.
 
+The script of the step that holds the deployment while a session is on
+(`src/rhi/pipeline/hold.py`), which runs after the copy of the weights and before the stage's
+deployment, with the same import path:
+
+- `deploy_hold.py` finds the pool-state table by its logical ID, `RHI_HOLD_TABLE_LOGICAL_ID`, in
+  the pools stack, `RHI_HOLD_POOLS_STACK`, and reads the session switch from it. It exits 0 at once
+  when the switch reads off, when its item is missing, or when the stack or the table does not
+  exist yet; while it reads on, it reads it again every 60 seconds until it reads off. Any other
+  failed read, or a switch that does not read, fails the step, and the deployment waits for the
+  next execution.
+
 The script of the image promotion job (`src/rhi/pipeline/image_promotion.py`), a CodeBuild project
 beside the pipeline, `rhi-promote-image`, which the owner starts by hand and nothing else starts:
 
