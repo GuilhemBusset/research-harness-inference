@@ -27,6 +27,11 @@ login_client_id = "Iv1.0000example0000"
 # The monthly budget, in whole US dollars, whose thresholds e-mail the admin (alerts only).
 monthly_budget_usd = 1000
 
+# The percentages of that amount at which the budget e-mails the admin, on actual cost (system
+# design, sections 11.3 and 17): 1 to 10 whole numbers from 1 to 1000000, none repeated (what
+# one budget can hold). Left out, they are 50, 80 and 100.
+budget_alert_percentages = [50, 80, 100]
+
 # The schedule: the time zone its times are in, the day the course ends, and the session windows.
 time_zone = "Etc/UTC"
 course_end = 2099-12-31

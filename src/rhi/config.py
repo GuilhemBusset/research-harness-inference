@@ -106,6 +106,10 @@ class Config:
     login_client_id: str
     # The monthly amount of the cost budget, which alerts and stops nothing.
     monthly_budget_usd: int
+    # The budget's thresholds, in whole percentages of the monthly amount, each a notification on
+    # actual cost to the alerts topic (`rhi.guardrails.budget`; sections 11.3 and 17). Only
+    # synthesis reads them.
+    budget_alert_percentages: tuple[int, ...]
     # The schedule: an IANA time zone name, the course end date and the session windows.
     time_zone: str
     course_end: datetime.date
@@ -203,6 +207,25 @@ def _whole_dollars(value: object) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError
     return value
+
+
+# What one AWS::Budgets::Budget can hold: at most 10 notifications, each, as a percentage of the
+# budgeted amount, at most 1,000,000 (the CloudFormation resource reference of the notification).
+MOST_BUDGET_ALERTS = 10
+HIGHEST_BUDGET_ALERT_PERCENTAGE = 1_000_000
+
+
+def _percentages(value: object) -> tuple[int, ...]:
+    # From one to MOST_BUDGET_ALERTS, each a whole number above 0 and at most
+    # HIGHEST_BUDGET_ALERT_PERCENTAGE (a TOML boolean is a Python int: it is not one), and no two the
+    # same: the budget has one notification at each.
+    if not isinstance(value, (list, tuple)) or not 0 < len(value) <= MOST_BUDGET_ALERTS:
+        raise ValueError
+    if any(type(item) is not int or not 0 < item <= HIGHEST_BUDGET_ALERT_PERCENTAGE for item in value):
+        raise ValueError
+    if len(set(value)) != len(value):
+        raise ValueError
+    return tuple(value)
 
 
 def _whole_number(value: object) -> int:
@@ -380,6 +403,11 @@ KEYS: dict[str, Key] = {
     "github_repo": _STRING,
     "login_client_id": _STRING,
     "monthly_budget_usd": Key("a whole number of US dollars above zero", _whole_dollars, _number_from_text),
+    "budget_alert_percentages": Key(
+        "a list of 1 to 10 whole percentages from 1 to 1000000, none of them repeated, such as [50, 80, 100]",
+        _percentages,
+        _json_from_text,
+    ),
     "time_zone": Key("an IANA time zone name that this host's time zone database knows", _time_zone),
     "course_end": Key("a date, written YYYY-MM-DD without quotes", _date, _date_from_text),
     "session_windows": _EMPTY_LIST,
@@ -424,6 +452,9 @@ KEYS: dict[str, Key] = {
 # none, the one the issue that added the key chose and stated. It is checked like a value from a
 # source. The owner's keys have no entry.
 DEFAULTS: dict[str, object] = {
+    # Section 17: the budget alerts at 50%, 80% and 100% of the monthly amount. A configuration
+    # written before the key (issue E4-44) loads unchanged, with these.
+    "budget_alert_percentages": [50, 80, 100],
     # The design gives no such key (issue E2-47): off keeps a deployed stage as it was, with no
     # certificate waiting on a domain that does not resolve yet.
     "https_listener": False,
@@ -703,6 +734,8 @@ def _ssm_text(value: object) -> str:
     if table is not None:
         return _json(table)
     if isinstance(value, tuple) and all(isinstance(item, str) for item in value):
+        return _json(list(value))
+    if isinstance(value, tuple) and all(type(item) is int for item in value):
         return _json(list(value))
     raise ValueError
 
