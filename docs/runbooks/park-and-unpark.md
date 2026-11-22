@@ -137,10 +137,6 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    its new shape, so that one runs through. `<execution>` below is the execution whose actions of
    the stage `Rhi` ran, whichever it is.
 
-   **The permissions approval.** Parking removes permissions and adds none, so the permissions
-   check of the stage (`Check.Check`) passes it on and the manual approval `Check.Confirm` does not
-   wait. Should it wait all the same, read and approve it as in step 2.
-
    The stage's stacks deploy in the order parking needs (`src/rhi/stage.py`): the stacks that
    import from others drop their imports first, then the network stack removes the load balancer
    and the NAT gateway. The gateway's tasks drain before they stop, for up to 30 minutes (section
@@ -179,16 +175,9 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    pipeline updates itself again, since the weekly canary and the verification's tests come back,
    and the execution you started may end at the self-update with none started after it.
 
-   **The permissions approval.** Unparking adds back the roles, policies and security group rules
-   that parking removed, so the permissions check of the stage `Rhi` (`Check.Check`) finds that
-   permissions widen, and the execution waits at the manual approval `Check.Confirm`, before
-   anything of the stage is deployed. On the execution's page, open the details of `Check.Check`,
-   which link to its CodeBuild log, and read the security changes it lists: each must belong to
-   what unparking brings back (the load balancers, the gateway's, the issuer's and Grafana's
-   services, the pools' groups and the scaler). Then, on `Check.Confirm`, choose **Review**, then
-   **Approve**. A change that belongs to none of these: **Reject**, and the runbook
-   [a bad deployment](bad-deployment.md) applies. An approval nobody answers expires after seven
-   days, and the execution fails.
+   **No approval.** Unparking adds back the roles, policies and security group rules that parking
+   removed. The pipeline holds no approval (system design, section 8.4, control 6), so the
+   execution deploys them without waiting for you: the merge that set the flag was the review.
 
    The deployment creates the load balancers, the certificate (validated through the hosted
    zone), the NAT gateway, the services, and each pool's group, whose warm pool fills at once: each
