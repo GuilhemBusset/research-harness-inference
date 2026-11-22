@@ -98,9 +98,6 @@ def test_the_step_comes_before_the_stage_s_deployment(step: Step) -> None:
     assert step.action["ActionTypeId"] == {"Category": "Build", "Owner": "AWS", "Provider": "CodeBuild", "Version": "1"}
     deployed_at = step.run_orders("CloudFormation")
     assert deployed_at and step.action["RunOrder"] < min(deployed_at)
-    # And after the approval on widened permissions: the weights of a release that will be deployed.
-    approved_at = step.run_orders("Manual")
-    assert approved_at and step.action["RunOrder"] > max(approved_at)
     # It runs on the source: the manifests of the commit the execution deploys.
     (source,) = step.pipeline["Stages"][0]["Actions"]
     assert step.action["InputArtifacts"] == source["OutputArtifacts"]

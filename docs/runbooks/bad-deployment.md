@@ -91,15 +91,21 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    What each line says:
 
    - `deploy/<stage>` `pending`, "The deployment is running.": not finished yet, or between two
-     of its actions; wait. "The deployment waits for the owner's approval in the pipeline.": a
-     change widened permissions, approve or reject it in the pipeline. "The pipeline's execution
-     is being stopped.": someone stopped it; wait for the end;
+     of its actions; wait. "The deployment waits for the owner's approval in the pipeline.": the
+     pipeline this repository builds holds no approval (system design, section 8.4, control 6).
+     On a commit merged before the approval was removed, the line is that older pipeline's; on a
+     later one, the pipeline in the account is not the one the repository builds. Read the
+     execution's actions in the console and compare them with the reviewed list of
+     `tests/policy/test_pipeline.py`. "The
+     pipeline's execution is being stopped.": someone stopped it; wait for the end;
    - `deploy/<stage>` `success`, "The deployment succeeded.", then `verify/<stage>`: the
      verification's own line says whether its tests ran and passed;
    - `deploy/<stage>` `failure`, "The deployment failed.": an action failed, the deployment of a
-     stack or a step before it (source, synthesis, self-update, assets, the permissions check, the
-     copy of the weights). "The approval was rejected, or it expired: the deployment did not
-     continue.": nothing of the stage was deployed. The report follows (step 2);
+     stack or a step before it (source, synthesis, self-update, assets, the copy of the weights).
+     "The approval was rejected, or it expired: the deployment did not continue.": the pipeline
+     this repository builds holds no approval, so the line does not say what was deployed. Read it
+     as the pending line above, and read from the execution's actions which stacks it updated. The
+     report follows (step 2);
    - `verify/<stage>` `failure`, "The verification failed.": the deployment is in place and its
      smoke tests failed. The report follows (step 2);
    - `error`, "The pipeline's execution was stopped before this step finished." or "... was
@@ -144,10 +150,10 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    - **Verify** (`verify/<stage>`): the deployment **is** in place, and the endpoint did not pass
      its smoke tests with it.
    - **A step before the deployment** (the source, `Synth`, `SelfMutate`, an asset's publication,
-     the permissions check `Check` or its approval, `CopyWeights`): no stack of the stage was
-     touched by that action, and no stack of this execution was updated, since these run before
-     any. There is no rollback to inspect: read the action's own details (its CodeBuild log, or the
-     approval's reviewer) and fix the cause. A stage's stacks still hold the previous deployment.
+     `CopyWeights`): no stack of the stage was touched by that action, and no stack of this
+     execution was updated, since these run before any. There is no rollback to inspect: read the
+     action's own details (its CodeBuild log) and fix the cause. A stage's stacks still hold the
+     previous deployment.
    - **A stack's `Prepare` action** (`<stack>.Prepare`, which makes a change set): the change set
      was refused, so no update of that stack started; the action's error says why.
    - **A stack's `Deploy` action** (`<stack>.Deploy`, which runs the change set), or an execution

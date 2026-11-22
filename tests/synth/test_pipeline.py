@@ -3,8 +3,8 @@
 CodePipeline V2 in queued execution, so that each commit has its own execution. The source is a
 connection the stack creates, on `main`, for the repository the configuration names. The synth
 step synthesizes the app (its own tests are in test_pipeline_synth.py), and the self-update follows
-it. The stage's stacks are deployed only by the pipeline, after the approval CDK Pipelines asks for
-when a change widens permissions.
+it. The stage's stacks are deployed only by the pipeline, after the copy of the weights, and with no
+approval: no person is in the path of a deployment (section 8.4, control 6).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 PIPELINE_TEMPLATE = "RhiPipeline.template.json"
 STAGE = "Rhi"
-SECURITY_DIFF = "cdk diff -a . --security-only --fail $STAGE_PATH/"
+COPY_ACTION = "CopyWeights"
 
 
 def resources_of(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
@@ -103,20 +103,21 @@ def test_the_self_update_follows_the_synth_step(templates: dict[str, dict[str, A
     assert [action["Name"] for action in actions["UpdatePipeline"]] == ["SelfMutate"]
 
 
-def test_the_stage_is_deployed_after_the_approval_on_widened_permissions(templates: dict[str, dict[str, Any]]) -> None:
-    template = templates[PIPELINE_TEMPLATE]
+def test_the_pipeline_holds_no_approval(templates: dict[str, dict[str, Any]]) -> None:
+    stages = actions_of(the_pipeline(templates))
+    assert STAGE in stages
+    categories = {action["ActionTypeId"]["Category"] for actions in stages.values() for action in actions}
+    assert "Approval" not in categories
+
+
+def test_the_stage_is_deployed_after_the_copy_of_the_weights(templates: dict[str, dict[str, Any]]) -> None:
     actions = actions_of(the_pipeline(templates))[STAGE]
-    checks = [
-        action["RunOrder"]
-        for action in actions
-        if provider(action) == "CodeBuild"
-        and any(SECURITY_DIFF in command for command in commands_of(template, action))
-    ]
-    approvals = [action["RunOrder"] for action in actions if provider(action) == "Manual"]
+    (copy,) = [action for action in actions if action["Name"] == COPY_ACTION]
     deployments = [action["RunOrder"] for action in actions if provider(action) == "CloudFormation"]
-    assert checks and approvals and deployments
-    assert max(checks) < min(approvals)
-    assert max(approvals) < min(deployments)
+    assert deployments
+    assert copy["RunOrder"] < min(deployments)
+    # The copy is the first of the stage's actions.
+    assert copy["RunOrder"] == min(action["RunOrder"] for action in actions)
 
 
 def test_every_role_of_the_pipeline_carries_the_boundary(templates: dict[str, dict[str, Any]]) -> None:
