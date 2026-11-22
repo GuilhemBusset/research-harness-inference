@@ -1,0 +1,115 @@
+[
+  {
+    "ghsa_id": "GHSA-hhhh-2222-3333",
+    "cve_id": "CVE-2026-90002",
+    "url": "https://api.github.com/advisories/GHSA-hhhh-2222-3333",
+    "html_url": "https://github.com/advisories/GHSA-hhhh-2222-3333",
+    "summary": "High summary that must not be copied",
+    "description": "High description that must not be copied.",
+    "type": "reviewed",
+    "severity": "high",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": "< 0.31.2",
+        "first_patched_version": "0.31.2",
+        "vulnerable_functions": []
+      }
+    ]
+  },
+  {
+    "ghsa_id": "GHSA-mmmm-2222-3333",
+    "cve_id": "CVE-2026-90003",
+    "url": "https://api.github.com/advisories/GHSA-mmmm-2222-3333",
+    "html_url": "https://github.com/advisories/GHSA-mmmm-2222-3333",
+    "summary": "Moderate summary that must not be copied",
+    "description": "The REST API calls the database's moderate rating medium.",
+    "type": "reviewed",
+    "severity": "medium",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": ">= 0.32.0, <= 0.34.0",
+        "first_patched_version": "0.34.1",
+        "vulnerable_functions": []
+      }
+    ]
+  },
+  {
+    "ghsa_id": "GHSA-pppp-2222-3333",
+    "cve_id": null,
+    "url": "https://api.github.com/advisories/GHSA-pppp-2222-3333",
+    "html_url": "https://github.com/advisories/GHSA-pppp-2222-3333",
+    "summary": "Another package",
+    "description": "Critical, but for another package.",
+    "type": "reviewed",
+    "severity": "critical",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm-plugin"},
+        "vulnerable_version_range": "< 9.0",
+        "first_patched_version": "9.0",
+        "vulnerable_functions": []
+      }
+    ]
+  },
+  {
+    "ghsa_id": "GHSA-cccc-2222-3333",
+    "cve_id": "CVE-2026-90001",
+    "url": "https://api.github.com/advisories/GHSA-cccc-2222-3333",
+    "html_url": "https://github.com/advisories/GHSA-cccc-2222-3333",
+    "summary": "Critical summary that must not be copied",
+    "description": "Critical description that must not be copied.",
+    "type": "reviewed",
+    "severity": "critical",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": ">= 0.30.0, < 0.33.1",
+        "first_patched_version": "0.33.1",
+        "vulnerable_functions": []
+      }
+    ]
+  },
+  {
+    "ghsa_id": "GHSA-wwww-2222-3333",
+    "cve_id": null,
+    "url": "https://api.github.com/advisories/GHSA-wwww-2222-3333",
+    "html_url": "https://github.com/advisories/GHSA-wwww-2222-3333",
+    "summary": "High, with no fixed version yet",
+    "description": "No patch is published.",
+    "type": "reviewed",
+    "severity": "high",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": ">= 0.40.0",
+        "first_patched_version": null,
+        "vulnerable_functions": []
+      }
+    ]
+  },
+  {
+    "ghsa_id": "GHSA-94f4-hr76-p5j6",
+    "cve_id": "CVE-2026-48746",
+    "url": "https://api.github.com/advisories/GHSA-94f4-hr76-p5j6",
+    "html_url": "https://github.com/advisories/GHSA-94f4-hr76-p5j6",
+    "summary": "vLLM: OpenAI auth bypass",
+    "type": "reviewed",
+    "severity": "critical",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": ">= 0.3.0, < 0.22.0",
+        "first_patched_version": "0.22.0",
+        "vulnerable_functions": []
+      }
+    ]
+  }
+]
