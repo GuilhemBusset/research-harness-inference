@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import boto3
 import pytest
-from boto3.dynamodb.types import TypeSerializer
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.stub import ANY, Stubber
+from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
 from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
-from rhi_scaler.aws_io import Clients, PoolSettings, Run, TableNames, apply, memory_from_item, memory_to_item, read
+from rhi_scaler.aws_io import (
+    Clients,
+    PoolSettings,
+    Run,
+    TableNames,
+    apply,
+    memory_from_item,
+    memory_to_item,
+    memory_update,
+    read,
+)
 from rhi_scaler.model import Decision, Memory, PoolDecision, Reason, Supply
 
 NOW = 1_800_000_000
@@ -93,16 +105,23 @@ class Aws:
     def expect(self, operation: str, **parameters: object) -> None:
         self.autoscaling.add_response(operation, {}, {"AutoScalingGroupName": GROUP, **parameters})
 
-    def expect_writes(self, note: dict[str, Any] | None = None, memory: dict[str, Any] | None = None) -> None:
-        for item in (note, memory):
-            self.dynamodb.add_response(
-                "put_item", {}, {"TableName": TABLES.pool_state, "Item": ANY if item is None else serialize(item)}
-            )
+    def expect_writes(self, note: dict[str, Any] | None = None, memory: tuple[Memory, Memory] | None = None) -> None:
+        """The note put whole, then the memory updated from what the run read to what it decided."""
+        self.dynamodb.add_response(
+            "put_item", {}, {"TableName": TABLES.pool_state, "Item": ANY if note is None else serialize(note)}
+        )
+        update = None if memory is None else memory_update(TABLES.pool_state, "coursework", *memory)
+        self.dynamodb.add_response("update_item", {}, update)
 
 
 def serialize(item: dict[str, Any]) -> dict[str, Any]:
     serializer = TypeSerializer()
     return {name: serializer.serialize(value) for name, value in item.items()}
+
+
+def plain(item: dict[str, Any]) -> dict[str, Any]:
+    deserializer = TypeDeserializer()
+    return {name: deserializer.deserialize(value) for name, value in item.items()}
 
 
 def query(table: str) -> dict[str, Any]:
@@ -221,7 +240,7 @@ def test_a_decision_becomes_calls_in_order_and_the_note_carries_no_capacity(aws:
     aws.expect("set_desired_capacity", DesiredCapacity=1, HonorCooldown=False)
     aws.expect("suspend_processes", ScalingProcesses=["Launch"])
     note = {"pool": "coursework", "record": "note", "capacity_asked": 1, "no_capacity_at": NOW - 120, "written_at": NOW}
-    aws.expect_writes(note, memory_to_item("coursework", memory))
+    aws.expect_writes(note, (EMPTY, memory))
     apply(aws.clients, TABLES, run, decision(1, ("instance-b", "instance-c"), suspend=True, memory=memory))
 
 
@@ -235,7 +254,7 @@ def test_no_change_no_call(aws: Aws) -> None:
     run = read_one(aws)
     memory = Memory(launch_suspended=True, suspended_at=NOW - 60)
     # Nothing queued on Auto Scaling: any call there fails the test.
-    aws.expect_writes({"pool": "coursework", "record": "note", "capacity_asked": 1, "written_at": NOW}, memory_to_item("coursework", memory))
+    aws.expect_writes({"pool": "coursework", "record": "note", "capacity_asked": 1, "written_at": NOW}, (EMPTY, memory))
     apply(aws.clients, TABLES, run, decision(1, suspend=True, memory=memory))
 
 
@@ -276,3 +295,52 @@ def test_protection_and_resume(aws: Aws) -> None:
     aws.expect("resume_processes", ScalingProcesses=["Launch"])
     aws.expect_writes()
     apply(aws.clients, TABLES, run, decision(2, memory=Memory(abandons_counted_from=NOW)))
+
+
+def test_the_memory_update_leaves_the_admins_clear_and_what_is_not_the_scalers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    with mock_aws():
+        client = boto3.client("dynamodb")
+        keys = [("pool", "HASH"), ("record", "RANGE")]
+        client.create_table(
+            TableName=TABLES.pool_state,
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": name, "AttributeType": "S"} for name, _ in keys],
+            KeySchema=[{"AttributeName": name, "KeyType": kind} for name, kind in keys],
+        )
+        suspended = Memory(last_request_at=NOW - 60, low_load_since=NOW - 90, launch_suspended=True, suspended_at=NOW - 30)
+        # The admin clears the mark after a run read it set, and before that run writes.
+        cleared = {**memory_to_item("coursework", suspended), "launch_suspended": False, "cleared_by": "user/admin"}
+        client.put_item(TableName=TABLES.pool_state, Item=serialize(cleared))
+        after = Memory(last_request_at=NOW, launch_suspended=True, suspended_at=NOW - 30)
+        client.update_item(**memory_update(TABLES.pool_state, "coursework", suspended, after))
+        key = {"pool": {"S": "coursework"}, "record": {"S": "memory"}}
+        stored = memory_from_item(plain(client.get_item(TableName=TABLES.pool_state, Key=key)["Item"]))
+        # Still cleared, what the scaler holds no more is gone, and the admin's own attribute stays.
+        assert stored == Memory(last_request_at=NOW, suspended_at=NOW - 30)
+        assert client.get_item(TableName=TABLES.pool_state, Key=key)["Item"]["cleared_by"] == {"S": "user/admin"}
+
+        # A run that raises the mark sets it, and every attribute of the memory is stored.
+        full = Memory(
+            last_request_at=NOW - 1,
+            last_in_flight_at=NOW - 2,
+            above_target_since=NOW - 3,
+            waiting_since=(("instance-a", NOW - 4),),
+            last_scale_out_at=NOW - 5,
+            low_load_since=NOW - 6,
+            last_gateway_at=NOW - 7,
+            launch_suspended=True,
+            suspended_at=NOW,
+            abandons_counted_from=NOW - 8,
+            queuing_since=(("instance-b", NOW - 9),),
+            rebalance_number=3,
+            last_rebalance_at=NOW - 10,
+        )
+        assert all(value not in (None, (), 0, False) for value in dataclasses.astuple(full))
+        client.update_item(**memory_update(TABLES.pool_state, "coursework", stored, full))
+        assert memory_from_item(plain(client.get_item(TableName=TABLES.pool_state, Key=key)["Item"])) == full
+
+        # And what it holds no more is removed.
+        client.update_item(**memory_update(TABLES.pool_state, "coursework", full, Memory(launch_suspended=True, suspended_at=NOW)))
+        stored = memory_from_item(plain(client.get_item(TableName=TABLES.pool_state, Key=key)["Item"]))
+        assert stored == Memory(launch_suspended=True, suspended_at=NOW)

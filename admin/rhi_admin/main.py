@@ -1,4 +1,5 @@
-"""The admin CLI: the roster, direct keys, revocation, the canary and the spikes' students (system design, section 6.4).
+"""The admin CLI: the roster, direct keys, revocation, the canary, the spikes' students and the
+pools' operating state (system design, sections 6.4 and 11.3).
 
 There is no public admin API: the admin runs this with their own AWS credentials, from the
 repository, and it reaches the tables directly.
@@ -13,11 +14,22 @@ repository, and it reaches the tables directly.
     key revoke <github-id>                                      every key of the student revoked
     canary                                                      the canary's entry, and a new key in rhi/canary-key
     spike-keys <students>                                       the spikes' students, and new keys in rhi/spike-keys
+    pool status                                                 every pool's mode, who set it and when, its launches
+    pool disable <pool>                                         the mode disabled: the admin's kill switch
+    pool enable <pool>                                          the pool's configured mode again
+    pool clear-suspension <pool>                                the mark launch_suspended cleared
+    pool run                                                    one run of the scaler, now
 
 The account and the region are the caller's, from the AWS SDK's own configuration. Each table is
 found in the deployed access stack by its logical ID, which `tests/policy/stateful_logical_ids.json`
 pins, so this file names no account, region or table. The course end, which a key and an entry
 expire by, is read from the configuration's SSM parameter when a command needs it.
+
+The commands `pool` reach the pools stack the same way, once one of them runs: the pool-state
+table by its logical ID, and the scaler's function by the logical ID of the scaler's construct
+(`tests/synth/test_scaler.py` holds it to the synthesized one), so this file names no function
+either. Each change they make carries who made it, the caller's identity from STS without its
+account, and when (`rhi_admin.pools`).
 """
 
 from __future__ import annotations
@@ -33,6 +45,7 @@ from typing import Any, TextIO
 import boto3
 
 from rhi_admin import keys as admin_keys
+from rhi_admin import pools as admin_pools
 from rhi_admin import roster as admin_roster
 from rhi_admin.canary import CANARY_SECRET, run_canary
 from rhi_admin.roster import AdminError
@@ -43,23 +56,30 @@ from rhi_common.spike_keys import SPIKE_KEYS_SECRET
 STACK_NAME = "Rhi-Access"
 KEYS_LOGICAL_ID = "TablesKeys6B5A3ABF"
 ROSTER_LOGICAL_ID = "TablesRosterDAE02BAB"
+# The deployed stack that holds the pools, the logical ID of the pool-state table in it, and that
+# of the scaler's function.
+POOLS_STACK_NAME = "Rhi-Pools"
+POOL_STATE_LOGICAL_ID = "TablesPoolState68A872F7"
+SCALER_FUNCTION_LOGICAL_ID = "ScalerFunction8891241E"
 # The configuration's key `course_end`, under the prefix `SSM_PREFIX` of src/rhi/config.py.
 COURSE_END_PARAMETER = "/rhi/config/course_end"
 
 
 @dataclass(frozen=True)
 class Admin:
-    """What the commands act on: the two tables, a Secrets Manager client and the course end."""
+    """What the commands act on: the two tables, a Secrets Manager client, the course end, and
+    what the commands `pool` act on, made when one of them runs."""
 
     roster: Any
     keys: Any
     secrets: Any
     course_end: Callable[[], datetime.date]
+    pools: Callable[[], admin_pools.Pools]
 
 
-def table_name(cloudformation: Any, logical_id: str) -> str:
-    """The name of the deployed table with that logical ID in the access stack."""
-    answer = cloudformation.describe_stack_resource(StackName=STACK_NAME, LogicalResourceId=logical_id)
+def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -> str:
+    """The name of the deployed resource with that logical ID in the stack, the access stack unless given."""
+    answer = cloudformation.describe_stack_resource(StackName=stack, LogicalResourceId=logical_id)
     return answer["StackResourceDetail"]["PhysicalResourceId"]
 
 
@@ -75,11 +95,21 @@ def connect(session: Any = None) -> Admin:
         value = ssm.get_parameter(Name=COURSE_END_PARAMETER)["Parameter"]["Value"]
         return datetime.date.fromisoformat(value)
 
+    def pools() -> admin_pools.Pools:
+        sts = session.client("sts")
+        return admin_pools.Pools(
+            table=dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME)),
+            functions=session.client("lambda"),
+            scaler=physical_id(cloudformation, SCALER_FUNCTION_LOGICAL_ID, POOLS_STACK_NAME),
+            caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
+        )
+
     return Admin(
-        roster=dynamodb.Table(table_name(cloudformation, ROSTER_LOGICAL_ID)),
-        keys=dynamodb.Table(table_name(cloudformation, KEYS_LOGICAL_ID)),
+        roster=dynamodb.Table(physical_id(cloudformation, ROSTER_LOGICAL_ID)),
+        keys=dynamodb.Table(physical_id(cloudformation, KEYS_LOGICAL_ID)),
         secrets=session.client("secretsmanager"),
         course_end=course_end,
+        pools=pools,
     )
 
 
@@ -109,12 +139,39 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "spike-keys", help=f"the spikes' students, one of them with no budget, and new keys in {SPIKE_KEYS_SECRET}"
     ).add_argument("students", type=int, help="how many students with the default budget")
+
+    pool = commands.add_parser("pool", help="the pools' operating state").add_subparsers(dest="command", required=True)
+    pool.add_parser("status", help="every pool's mode, who set it and when, and its suspended launches")
+    pool.add_parser("disable", help="disable a pool: the admin's kill switch").add_argument("pool")
+    pool.add_parser("enable", help="set a pool back to its configured mode").add_argument("pool")
+    pool.add_parser("clear-suspension", help="clear the mark launch_suspended of a pool").add_argument("pool")
+    pool.add_parser("run", help="ask the scaler to run now")
     return parser
+
+
+def _pool_command(command: str, arguments: argparse.Namespace, pools: admin_pools.Pools, now: int, out: TextIO) -> None:
+    if command == "status":
+        print("pool\tmode\tset_by\tset_at\tlaunch_suspended", file=out)
+        for state in admin_pools.status(pools):
+            set_by, set_at = ("configured", "-") if state.set_by is None else (state.set_by, str(state.set_at))
+            print(f"{state.pool}\t{state.mode.value}\t{set_by}\t{set_at}\t{str(state.launch_suspended).lower()}", file=out)
+    elif command in ("disable", "enable"):
+        change = admin_pools.disable if command == "disable" else admin_pools.enable
+        state = change(arguments.pool, pools=pools, now=now)
+        print(f"The pool {state.pool} is {state.mode.value}, set by {state.set_by} at {state.set_at}.", file=out)
+    elif command == "clear-suspension":
+        who = admin_pools.clear_suspension(arguments.pool, pools=pools, now=now)
+        print(f"The launches of the pool {arguments.pool} may resume at the scaler's next run, cleared by {who}.", file=out)
+    else:
+        for decision in admin_pools.run_scaler(pools=pools):
+            print(f"{decision['pool']}\t{decision['desired']}\t{decision['reason']}", file=out)
 
 
 def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO) -> None:
     command = (arguments.group, getattr(arguments, "command", None))
-    if command == ("roster", "add"):
+    if arguments.group == "pool":
+        _pool_command(arguments.command, arguments, admin.pools(), now, out)
+    elif command == ("roster", "add"):
         entry = admin_roster.add(
             arguments.github_id,
             arguments.alias,
