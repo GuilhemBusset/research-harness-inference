@@ -1,15 +1,14 @@
-"""The roster: who may log in, under which alias, with what budget (system design, sections 6.4, 6.6 and 17).
+"""The roster: who may log in, under which alias, with what limit (system design, sections 6.4, 6.6 and 17).
 
 An entry is keyed by the student's numeric GitHub ID, which a change of handle does not change,
 and carries the alias that per-student series and logs use instead of the ID. It also carries the
-student's daily token budget (input plus output, cached input included) and their limit of
-concurrent requests. The defaults, 100 million tokens and 4 requests, are the admin CLI's own:
-nothing else reads them, and only when an entry is written. A budget of 0 is kept as 0: it is the
-spent-budget student of the smoke tests.
+student's limit of concurrent requests; there is no per-student token budget (ADR 0003). The
+default, 4 requests, is the admin CLI's own: nothing else reads it, and only when an entry is
+written.
 
-Budgets travel with the keys: the issuer copies the entry's budget and limit into each key it
-mints, and the gateway reads the key item alone. `change` therefore writes the new values to the
-entry and to each of the student's active key items; the gateway applies them within its
+The limit travels with the keys: the issuer copies the entry's limit into each key it mints, and
+the gateway reads the key item alone. `change` therefore writes the new limit to the entry and to
+each of the student's active key items; the gateway applies them within its
 60-second cache. `remove` deletes the entry, so no login can be issued a key any more, and then
 revokes every key of the student.
 
@@ -22,7 +21,7 @@ ID is, so no login and no command reads it as a student, and `entries` lists non
 in the transaction that writes the entry and only if it is not there, naming the entry's GitHub
 ID: of two additions given one alias at once, one is refused. `hold_alias` replaces the entry and
 that item, in one write, by an item that holds the alias and its expiry and nothing else: no
-GitHub ID, no budget. `add` refuses the alias until the table's expiry removes it, `ALIAS_HELD_DAYS`
+GitHub ID, no limit. `add` refuses the alias until the table's expiry removes it, `ALIAS_HELD_DAYS`
 later and never after the course end plus 90 days (`alias_held_until`). A student put
 back on the roster is given another alias.
 
@@ -55,7 +54,6 @@ from rhi_issuer.mint import held_to_validity
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key
 
-DEFAULT_DAILY_TOKEN_BUDGET = 100_000_000
 DEFAULT_CONCURRENCY_LIMIT = 4
 # Every store is kept until the course end plus 90 days (section 6.6); a key stops at the course end.
 RETENTION_DAYS = retention.RETENTION_DAYS
@@ -83,10 +81,9 @@ def _check_alias(alias: str) -> None:
         raise AdminError("an alias is 1 to 32 lower-case letters, digits, '-' or '_', starting with a letter")
 
 
-def _check_numbers(daily_token_budget: int | None, concurrency_limit: int | None) -> None:
-    for number in (daily_token_budget, concurrency_limit):
-        if number is not None and (type(number) is not int or number < 0):
-            raise AdminError("a budget and a limit are whole numbers, 0 or more")
+def _check_limit(concurrency_limit: int | None) -> None:
+    if concurrency_limit is not None and (type(concurrency_limit) is not int or concurrency_limit < 0):
+        raise AdminError("a limit is a whole number, 0 or more")
 
 
 def _failed_condition(error: ClientError) -> bool:
@@ -199,13 +196,12 @@ def add(
     roster: Any,
     course_end: datetime.date,
     now: int,
-    daily_token_budget: int | None = None,
     concurrency_limit: int | None = None,
 ) -> RosterEntry:
     """Adds a student; refused when the GitHub ID is already on the roster or another student has the alias."""
     check_github_id(github_id)
     _check_alias(alias)
-    _check_numbers(daily_token_budget, concurrency_limit)
+    _check_limit(concurrency_limit)
     owner = _alias_owner(alias, roster)
     if owner is not None and owner < 0:
         raise AdminError("that alias was taken off the roster, and is held back while its series and log records are kept")
@@ -214,7 +210,6 @@ def add(
     entry = RosterEntry(
         github_id=github_id,
         alias=alias,
-        daily_token_budget=DEFAULT_DAILY_TOKEN_BUDGET if daily_token_budget is None else daily_token_budget,
         concurrency_limit=DEFAULT_CONCURRENCY_LIMIT if concurrency_limit is None else concurrency_limit,
         added_at=now,
         expires_at=retention.expires_at(course_end),
@@ -298,24 +293,19 @@ def change(
     keys: Any,
     course_end: datetime.date,
     now: int,
-    daily_token_budget: int | None = None,
     concurrency_limit: int | None = None,
 ) -> int:
-    """Writes a new budget, limit or both to the entry and to each active key item; how many keys it changed.
+    """Writes a new limit to the entry and to each active key item; how many keys it changed.
 
     A key revoked in the meantime is left as it is: the write to a key is conditional on it not
     being revoked. The write to the entry also sets its expiry, the course end plus 90 days, as
     every write of an entry does (`add`). A key it writes stays in use, so the write holds the key's
     expiry to the end of its validity, the course end (`rhi_issuer.mint.held_to_validity`).
     """
-    _check_numbers(daily_token_budget, concurrency_limit)
-    values = {
-        name: value
-        for name, value in (("daily_token_budget", daily_token_budget), ("concurrency_limit", concurrency_limit))
-        if value is not None
-    }
-    if not values:
-        raise AdminError("give a budget, a limit or both")
+    _check_limit(concurrency_limit)
+    if concurrency_limit is None:
+        raise AdminError("give a limit")
+    values = {"concurrency_limit": concurrency_limit}
     assignments = ", ".join(f"#{name} = :{name}" for name in values)
     names = {f"#{name}": name for name in values}
     numbers = {f":{name}": value for name, value in values.items()}

@@ -696,8 +696,8 @@ step_roster() {
   cat <<'EOF'
 The students who may log in, by their numeric GitHub ID, entered through the admin CLI with your
 own AWS credentials, once the pipeline has deployed the access stack. Each student gets an alias,
-which their metrics carry instead of the ID, a daily budget of 100 million tokens and 4 concurrent
-requests unless you give others (--budget, --limit). Add each student with the first command; the
+which their metrics carry instead of the ID, and 4 concurrent requests unless you give another
+number (--limit). Add each student with the first command; the
 roster is never written to the repository.
 
 The canary command puts the pipeline's verification on the roster and writes its key into the

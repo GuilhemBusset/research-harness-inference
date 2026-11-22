@@ -8,11 +8,11 @@ reads and writes it. The tables and their keys are in `rhi_common.tables`.
 
 | Table | Item | Attributes |
 | --- | --- | --- |
-| keys | `StudentKey` | `key_hash`, `github_id`, `alias`, `installation`, `issued_at`, `expires_at`, `revoked_at`, `daily_token_budget`, `concurrency_limit` |
-| roster | `RosterEntry` | `github_id`, `alias`, `daily_token_budget`, `concurrency_limit`, `added_at`, `expires_at` |
-| usage | `UsageDay` | `github_id`, `day`, `alias`, `tokens`, `leases`, `expires_at`, `affinity_cookies`, `rebalance_applied` |
+| keys | `StudentKey` | `key_hash`, `github_id`, `alias`, `installation`, `issued_at`, `expires_at`, `revoked_at`, `concurrency_limit` |
+| roster | `RosterEntry` | `github_id`, `alias`, `concurrency_limit`, `added_at`, `expires_at` |
+| usage | `UsageDay` | `github_id`, `day`, `alias`, `leases`, `expires_at`, `affinity_cookies`, `rebalance_applied` |
 
-A lease, one value of the map `leases`, holds `tokens`, `estimate` and `expires`.
+A lease, one value of the map `leases`, holds `expires`.
 
 These are the only attributes an item of this module writes. None can hold a key in clear, a GitHub
 token, a request or a response: a key is stored as its SHA-256 only (`rhi_common.keys.key_hash`),
@@ -22,12 +22,14 @@ An item is in the form boto3's table resource takes and returns, as in `rhi_comm
 `to_item` writes every number as an `int`, `from_item` also takes the `Decimal` boto3 gives back,
 a time is a whole number of seconds since the epoch, and what is not known is `None` or empty in
 the record and absent from the item, except `leases`, which is written even when empty.
-`from_item` refuses, with a `RecordError`, an item with a missing or mistyped attribute, with one
-exception. There is no per-student token budget any more (ADR 0003, decisions 2 and 3), so a key's
-or a roster entry's `daily_token_budget`, a day's `tokens` and a lease's `tokens` and `estimate`
-are read as 0 when absent, for a later change to stop writing them. `to_item` and `to_map` still
-write all four: a gateway task of the release before, which shares the tables during a rollout,
-refuses an item that lacks one.
+`from_item` refuses, with a `RecordError`, an item with a missing or mistyped attribute.
+
+There is no per-student token budget (ADR 0003, decisions 2 and 3). An item written by an earlier
+release can still hold a key's or a roster entry's `daily_token_budget`, a day's `tokens` or a
+lease's `tokens` and `estimate`, until it expires. No record has them and nothing here writes them:
+`from_item` and `from_map` read only the attributes above and ignore any other, so such an item
+reads as one without them. `without_budget` gives an item as it is stored less those attributes
+alone, for a reader that keeps what else the item holds (the privacy export).
 
 `expires_at` is the attribute the table deletes an item by, and whoever writes the item sets it.
 On a key it is the course end, and the key is refused after it whatever the table has deleted.
@@ -54,13 +56,30 @@ def utc_day(at: int) -> str:
     return datetime.fromtimestamp(at, UTC).date().isoformat()
 
 
+_RETIRED = frozenset({"daily_token_budget", "tokens"})
+_RETIRED_FROM_A_LEASE = frozenset({"tokens", "estimate"})
+
+
+def without_budget(item: Mapping[str, object]) -> dict[str, object]:
+    """A stored item less the budget's attributes an earlier release wrote, every other attribute kept as it is.
+
+    It drops a key's or an entry's `daily_token_budget`, a day's `tokens`, and each lease's
+    `tokens` and `estimate`; what the item holds besides, known here or not, stays.
+    """
+    kept = {name: value for name, value in item.items() if name not in _RETIRED}
+    leases = kept.get("leases")
+    if isinstance(leases, Mapping):
+        kept["leases"] = {
+            request: {name: value for name, value in lease.items() if name not in _RETIRED_FROM_A_LEASE}
+            if isinstance(lease, Mapping)
+            else lease
+            for request, lease in leases.items()
+        }
+    return kept
+
+
 def _optional_text(item: Mapping[str, object], name: str) -> str | None:
     return None if item.get(name) is None else _text(item, name)
-
-
-def _whole_or_zero(item: Mapping[str, object], name: str) -> int:
-    """A whole number of the token budget's, read as 0 when the item does not hold it."""
-    return 0 if name not in item else _whole(item, name)
 
 
 def _map[Value](
@@ -81,8 +100,8 @@ class StudentKey:
 
     `installation` is the identifier the CLI sends at login: `None` for a key issued without a
     login. `expires_at` is the course end. `revoked_at` is `None` until the key is revoked. The
-    budget and the concurrency limit are the roster entry's when the key was issued, so that the
-    gateway reads one item per request.
+    concurrency limit is the roster entry's when the key was issued, so that the gateway reads one
+    item per request.
     """
 
     key_hash: str
@@ -92,7 +111,6 @@ class StudentKey:
     issued_at: int
     expires_at: int
     revoked_at: int | None
-    daily_token_budget: int
     concurrency_limit: int
 
     def __post_init__(self) -> None:
@@ -106,7 +124,6 @@ class StudentKey:
             "alias": self.alias,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
-            "daily_token_budget": self.daily_token_budget,
             "concurrency_limit": self.concurrency_limit,
         }
         if self.installation is not None:
@@ -125,7 +142,6 @@ class StudentKey:
             issued_at=_whole(item, "issued_at"),
             expires_at=_whole(item, "expires_at"),
             revoked_at=_optional_time(item, "revoked_at"),
-            daily_token_budget=_whole_or_zero(item, "daily_token_budget"),
             concurrency_limit=_whole(item, "concurrency_limit"),
         )
 
@@ -136,7 +152,6 @@ class RosterEntry:
 
     github_id: int
     alias: str
-    daily_token_budget: int
     concurrency_limit: int
     added_at: int
     expires_at: int
@@ -145,7 +160,6 @@ class RosterEntry:
         return {
             "github_id": self.github_id,
             "alias": self.alias,
-            "daily_token_budget": self.daily_token_budget,
             "concurrency_limit": self.concurrency_limit,
             "added_at": self.added_at,
             "expires_at": self.expires_at,
@@ -156,7 +170,6 @@ class RosterEntry:
         return cls(
             github_id=_whole(item, "github_id"),
             alias=_text(item, "alias"),
-            daily_token_budget=_whole_or_zero(item, "daily_token_budget"),
             concurrency_limit=_whole(item, "concurrency_limit"),
             added_at=_whole(item, "added_at"),
             expires_at=_whole(item, "expires_at"),
@@ -165,29 +178,23 @@ class RosterEntry:
 
 @dataclass(frozen=True)
 class Lease:
-    """One request's concurrency slot and its expiry; `tokens` and `estimate` are 0 but for the release before."""
+    """One request's concurrency slot: when it expires."""
 
-    tokens: int
-    estimate: int
     expires: int
 
     def to_map(self) -> dict[str, int]:
-        return {"tokens": self.tokens, "estimate": self.estimate, "expires": self.expires}
+        return {"expires": self.expires}
 
     @classmethod
     def from_map(cls, value: object) -> Self:
         if not isinstance(value, Mapping):
             raise RecordError("a lease is not a map")
-        return cls(
-            tokens=_whole_or_zero(value, "tokens"),
-            estimate=_whole_or_zero(value, "estimate"),
-            expires=_whole(value, "expires"),
-        )
+        return cls(expires=_whole(value, "expires"))
 
 
 @dataclass(frozen=True)
 class UsageDay:
-    """One student's day: the leases of the requests in flight, and `tokens`, which the gateway writes 0.
+    """One student's day: the leases of the requests in flight, and what keeps the student on an instance.
 
     The concurrency slots live in one item so that one conditional write takes a slot against all
     of them (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
@@ -204,7 +211,6 @@ class UsageDay:
     github_id: int
     day: str
     alias: str
-    tokens: int
     expires_at: int
     leases: dict[str, Lease] = field(default_factory=dict)
     affinity_cookies: dict[str, str] = field(default_factory=dict)
@@ -223,7 +229,6 @@ class UsageDay:
             "github_id": self.github_id,
             "day": self.day,
             "alias": self.alias,
-            "tokens": self.tokens,
             # Written even when empty: a write that adds a lease needs the map to be there.
             "leases": {request: lease.to_map() for request, lease in self.leases.items()},
             "expires_at": self.expires_at,
@@ -240,7 +245,6 @@ class UsageDay:
             github_id=_whole(item, "github_id"),
             day=_text(item, "day"),
             alias=_text(item, "alias"),
-            tokens=_whole_or_zero(item, "tokens"),
             expires_at=_whole(item, "expires_at"),
             leases=_map(item, "leases", lambda leases, request: Lease.from_map(leases[request])),
             affinity_cookies=_map(item, "affinity_cookies", _text),

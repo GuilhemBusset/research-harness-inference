@@ -506,13 +506,13 @@ the commands and offers the last two. The roster is never written to the reposit
 
 ```sh
 admin=(env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main)
-"${admin[@]}" roster add <github-id> <alias>          # 100 million tokens a day and 4 requests; or --budget N --limit N
+"${admin[@]}" roster add <github-id> <alias>          # 4 concurrent requests; or --limit N
 "${admin[@]}" canary                                   # once, before the pipeline's verification is merged
 "${admin[@]}" roster list
 ```
 
-`roster set <github-id> --budget N --limit N` changes a student's numbers on the entry and on each
-of their active keys; the gateway applies them within a minute. `roster remove <github-id>`
+`roster set <github-id> --limit N` changes a student's limit on the entry and on each of their
+active keys; the gateway applies it within a minute. `roster remove <github-id>`
 removes a student and revokes their keys; their alias is held back from any other entry for 91
 days, while what was written under it is kept, so a student put back on the roster takes another
 alias. `key issue <github-id>` issues a key without a login,
@@ -523,7 +523,7 @@ The canary command puts the pipeline's verification on the roster, under the ali
 writes its key into the Secrets Manager secret `rhi/canary-key`, creating the secret if it does not
 exist. It never prints the key. Running it again replaces the key.
 
-**Check.** `roster list` shows each student, and `canary`, with their budget and limit. The
+**Check.** `roster list` shows each student, and `canary`, with their limit. The
 secret exists:
 
 ```sh

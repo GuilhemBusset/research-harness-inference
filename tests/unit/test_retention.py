@@ -115,7 +115,6 @@ def _student() -> StudentKey:
         issued_at=NOW - 86_400,
         expires_at=NOW + 30 * 86_400,
         revoked_at=None,
-        daily_token_budget=1_000_000,
         concurrency_limit=4,
     )
 
@@ -185,9 +184,9 @@ def test_every_roster_row_the_admin_cli_writes_expires_at_the_course_end_plus_90
     aws.roster.update_item(
         Key=entry, UpdateExpression="SET expires_at = :later", ExpressionAttributeValues={":later": EXPIRY + 86_400}
     )
-    assert main.run(["roster", "set", str(GITHUB_ID), "--budget", "5"], aws.admin, now=NOW, out=io.StringIO()) == 0
+    assert main.run(["roster", "set", str(GITHUB_ID), "--limit", "5"], aws.admin, now=NOW, out=io.StringIO()) == 0
     changed = aws.roster.get_item(Key=entry, ConsistentRead=True)["Item"]
-    assert (changed["daily_token_budget"], changed["expires_at"]) == (5, EXPIRY)
+    assert (changed["concurrency_limit"], changed["expires_at"]) == (5, EXPIRY)
 
 
 def test_every_key_row_the_admin_cli_writes_expires_no_later_than_the_course_end_plus_90_days(
@@ -206,7 +205,6 @@ def _entry() -> RosterEntry:
     return RosterEntry(
         github_id=GITHUB_ID,
         alias="otter",
-        daily_token_budget=1_000_000,
         concurrency_limit=4,
         added_at=NOW - 86_400,
         expires_at=EXPIRY,

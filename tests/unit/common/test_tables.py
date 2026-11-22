@@ -30,7 +30,6 @@ ITEMS: list[tuple[Table, Record]] = [
             issued_at=NOW,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=2_000_000,
             concurrency_limit=4,
         ),
     ),
@@ -39,7 +38,6 @@ ITEMS: list[tuple[Table, Record]] = [
         RosterEntry(
             github_id=4242,
             alias="otter",
-            daily_token_budget=2_000_000,
             concurrency_limit=4,
             added_at=NOW,
             expires_at=NOW + 86400,
@@ -51,9 +49,8 @@ ITEMS: list[tuple[Table, Record]] = [
             github_id=4242,
             day="2027-01-15",
             alias="otter",
-            tokens=10,
             expires_at=NOW + 86400,
-            leases={"req-1": Lease(tokens=10, estimate=4, expires=NOW + 1800)},
+            leases={"req-1": Lease(expires=NOW + 1800)},
         ),
     ),
     (POOL_STATE, PoolState(pool="mock", mode=Mode.ENABLED, set_by="admin", set_at=NOW)),
@@ -167,3 +164,17 @@ def test_the_roster_item_carries_the_key_of_by_alias() -> None:
     item = ITEMS[1][1].to_item()
     assert index.sort_key is None
     assert carries(item, index.partition_key)
+
+
+def test_no_item_of_a_student_carries_the_token_budget() -> None:
+    """No key, entry, day or lease is written with a budget's attribute (ADR 0003, decisions 2 and 3)."""
+    for _, record in ITEMS:
+        if isinstance(record, (StudentKey, RosterEntry, UsageDay)):
+            item = record.to_item()
+            names = set(item)
+            leases = item.get("leases", {})
+            assert isinstance(leases, Mapping)
+            for lease in leases.values():
+                assert isinstance(lease, Mapping)
+                names |= set(lease)
+            assert not names & {"daily_token_budget", "tokens", "estimate"}

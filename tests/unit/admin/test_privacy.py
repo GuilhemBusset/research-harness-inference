@@ -197,7 +197,7 @@ def issue(deployed: Deployed, github_id: int) -> str:
 
 
 def use(deployed: Deployed, github_id: int, alias: str, day: str, cookies: dict[str, str] | None = None) -> None:
-    row = UsageDay(github_id, day, alias, tokens=1234, expires_at=NOW + 86_400, affinity_cookies=cookies or {})
+    row = UsageDay(github_id, day, alias, expires_at=NOW + 86_400, affinity_cookies=cookies or {})
     deployed.usage.put_item(Item=row.to_item())
 
 
@@ -233,6 +233,23 @@ def test_the_export_holds_the_student_s_data_and_no_key_and_no_hash(deployed: De
     for key in keys:
         assert key not in printed and key_hash(key) not in printed
     assert re.search(r"rhi_[0-9A-Za-z]{20,}|[0-9a-f]{64}", printed) is None
+
+
+@pytest.mark.parametrize("earlier_release", [True, False], ids=["with-the-budget", "without-it"])
+def test_the_export_keeps_every_attribute_of_a_row_but_the_budget_s(deployed: Deployed, earlier_release: bool) -> None:
+    lease = {"expires": NOW + 120}
+    maps = {"affinity_cookies": {"mock": "AWSALB=cookie-of-otter"}, "rebalance_applied": {"mock": 7}}
+    row: dict[str, object] = {"github_id": OTTER, "day": "2027-01-14", "alias": "otter", "expires_at": NOW + 86_400}
+    row |= {**maps, "carried_maps": maps, "opening": True}
+    budget = {"tokens": 0, "estimate": 0} if earlier_release else {}
+    stored = {**row, "leases": {"request": {**lease, **budget}}} | ({"tokens": 0} if earlier_release else {})
+    deployed.usage.put_item(Item=stored)
+    deployed.stubs["logs"].add_response("filter_log_events", {"events": []})
+
+    status, printed = deployed.run("export", str(OTTER))
+
+    assert status == 0
+    assert json.loads(printed)["usage"] == [{**row, "leases": {"request": lease}}]
 
 
 def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(deployed: Deployed) -> None:

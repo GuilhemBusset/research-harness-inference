@@ -89,7 +89,6 @@ class KeptWaker(Waker):
 class Gateway:
     """The application with the local routes and the wake's parts; the test writes the pools' records."""
 
-    budget: int = 2_000_000
     key: str = field(default_factory=generate_key)
     aws: Doubles = field(default_factory=Doubles)
 
@@ -102,7 +101,6 @@ class Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=self.budget,
             concurrency_limit=4,
         )
         self.readiness = Readiness(
@@ -211,12 +209,6 @@ def test_stopped_pools_are_not_woken(name: str, record: PoolState | None, cause:
         gateway.aws.put(record)
     assert gateway.wake(name) == (200, {"model": name, "state": "unavailable", "cause": cause})
     assert gateway.woken() == (0, 0)
-
-
-def test_a_key_with_a_daily_budget_of_0_still_wakes() -> None:
-    gateway = Gateway(budget=0)
-    assert gateway.wake("mock") == (200, {"model": "mock", "state": "cold"})
-    assert gateway.woken() == (1, 1)
 
 
 def test_no_capacity_still_wakes() -> None:

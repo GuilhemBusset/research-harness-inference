@@ -1,8 +1,8 @@
 """The lookup of a key: one read of the keys table (system design, section 6.2, step 2).
 
 The key item carries everything the gateway needs to answer a request: the issuer copies the
-student's budget and concurrency limit into it when it mints the key, and the admin CLI writes a
-change of either into the student's active keys. So a lookup is one read, by the SHA-256 of the
+student's concurrency limit into it when it mints the key, and the admin CLI writes a change of
+it into the student's active keys. So a lookup is one read, by the SHA-256 of the
 key, and the gateway never reads the roster.
 
 A store answers what the table holds and decides nothing: a revoked key and an expired one come
@@ -35,7 +35,6 @@ class KeyRecord:
 
     github_id: int
     alias: str
-    daily_token_budget: int
     concurrency_limit: int
     expires_at: int
     revoked: bool
@@ -46,7 +45,6 @@ class KeyRecord:
         return cls(
             github_id=key.github_id,
             alias=key.alias,
-            daily_token_budget=key.daily_token_budget,
             concurrency_limit=key.concurrency_limit,
             expires_at=key.expires_at,
             revoked=key.revoked_at is not None,
