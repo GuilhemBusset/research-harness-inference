@@ -7,6 +7,7 @@
 # the digest of each pool's engine image, `pools_release.toml`):
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on every resource, through the
 #   AWS managed policy AWSLambdaBasicExecutionRole: the function writes its own logs.
+# The CDK also chooses that function's runtime, which is why cdk-nag's runtime rule is acknowledged.
 # Each custom resource attaches its own policy to that role, in the module that created it.
 #
 # The stack holds the model bucket (`pools_model_store.toml`) and gives no role an action on it:
@@ -15,6 +16,7 @@
 
 [nag]
 "AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]" = "The CDK gives the function that runs the stack's AWS SDK custom resources the AWS managed policy for writing its own logs, which grants nothing else."
+"AwsSolutions-L1" = "The CDK chooses the runtime of the function that runs the stack's AWS SDK custom resources and moves it when its own default moves, so the project does not override it."
 
 [wildcard_actions]
 "logs:CreateLogGroup" = "The function that runs the stack's AWS SDK custom resources holds the AWS managed policy AWSLambdaBasicExecutionRole, which grants this action on every resource so that the function can create its own log group, whose name is generated at deployment after the role exists."

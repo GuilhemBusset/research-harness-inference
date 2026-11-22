@@ -21,7 +21,7 @@ requires-python = ">=3.12"
 # PyPI also holds older releases of it under version epochs, which sort above every 0.0.x, so the
 # pin is the only thing that selects this one. tests/unit/dashboards/test_build.py checks the pin.
 dependencies = [
-    "aws-cdk-lib==2.276.0",
+    "aws-cdk-lib==2.277.0",
     "constructs==10.8.1",
     "cdk-nag==3.0.2",
     "boto3[crt]==1.44.3",
