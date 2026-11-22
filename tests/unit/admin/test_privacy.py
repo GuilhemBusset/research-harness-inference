@@ -281,7 +281,7 @@ def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_
         patch.setattr(roster, "query", lambda **q: {"Items": []} if "IndexName" in q else query(**q))
         with pytest.raises(admin_roster.AdminError, match="held back"):
             admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW)
-    (held,) = [item for item in roster.scan(ConsistentRead=True)["Items"] if item["alias"] == "otter"]
+    (held,) = [item for item in roster.scan(ConsistentRead=True)["Items"] if item.get("alias") == "otter"]
     # What holds it names no student, and the table's expiry removes it once the telemetry is gone.
     assert held == {"github_id": admin_roster.held_alias_id("otter"), "alias": "otter", "expires_at": held["expires_at"]}
     assert held["github_id"] < 0 and held["expires_at"] == NOW + privacy.ALIAS_HELD_DAYS * 86_400

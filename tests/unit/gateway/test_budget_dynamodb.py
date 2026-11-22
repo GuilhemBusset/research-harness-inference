@@ -360,7 +360,9 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
     assert (written().tokens, written().leases) == (1000, {})
 
 
-def test_a_withdrawal_deletes_a_day_it_opened_that_holds_only_what_the_opening_carried(client: Calls) -> None:
+def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
+    client: Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ledger = DynamoDBLedger(client, TABLE, clock=Clock())
     table = boto3.resource("dynamodb").Table(TABLE)
     before = UsageDay(
@@ -373,20 +375,27 @@ def test_a_withdrawal_deletes_a_day_it_opened_that_holds_only_what_the_opening_c
         affinity_cookies={"coursework": "AWSALB=cookie-of-yesterday"},
         rebalance_applied={"coursework": 3},
     )
-    for opener, other in (("alone", None), ("opener", "other")):
+    deletes: list[dict[str, Any]] = []
+    delete = client.delete_item
+    monkeypatch.setattr(client, "delete_item", lambda **request: deletes.append(request) or delete(**request))
+    for order in (["opener"], ["opener", "other"], ["other", "opener"]):
         table.put_item(Item=before.to_item())
-        opened = reserve(ledger, student(), opener, pool="coursework")
+        held = {"opener": reserve(ledger, student(), "opener", pool="coursework")}
         # The day before goes once the opening has read it, as the admin's erase deletes it.
         table.delete_item(Key={"github_id": 7, "day": "2026-11-14"})
-        if other:
-            reserve(ledger, student(), other, pool="coursework")
-        ledger.withdraw(opened)
-        if other is None:
-            # The stand-in, the cookie and the number it carried go with it.
-            assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
-        else:
-            # What another request wrote since keeps the day.
-            assert set(written().leases) == {"2026-11-14/running", other}
+        if "other" in order:
+            held["other"] = reserve(ledger, student(), "other", pool="coursework")
+        for request in order[:-1]:
+            ledger.withdraw(held[request])
+            # What another request holds keeps the day.
+            assert set(written().leases) == {"2026-11-14/running", order[-1]}
+        ledger.withdraw(held[order[-1]])
+        # The stand-in, the cookie and the number carried from the day before go with the last.
+        assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
+    # Every delete binds only the values its condition names, which DynamoDB requires.
+    assert deletes
+    for request in deletes:
+        assert all(name in request["ConditionExpression"] for name in request["ExpressionAttributeValues"])
 
 
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:

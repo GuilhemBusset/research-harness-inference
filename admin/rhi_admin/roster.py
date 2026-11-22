@@ -16,11 +16,14 @@ revokes every key of the student.
 An alias taken off the roster, by `remove` or by an erase (`rhi_admin.privacy`), stays out of reach
 while what was written under it is kept: the series and the log records under an alias cannot tell
 two students apart, so another student given it would be given the first one's too, and a request
-of the first one still running could add to them. `hold_alias` replaces the entry, in one write,
-by an item that holds the alias and its expiry and nothing else: no GitHub ID, no budget. Its
-partition key is a negative number made from the alias, which no GitHub ID is, so no login and no
-command reads it as a student; `add` refuses the alias until the table's expiry removes the item,
-and `entries` lists none. A student put back on the roster is given another alias.
+of the first one still running could add to them. Each alias therefore has an item of its own,
+whose partition key is a negative number made from the alias (`held_alias_id`), which no GitHub
+ID is, so no login and no command reads it as a student, and `entries` lists none. `add` writes it,
+in the transaction that writes the entry and only if it is not there, naming the entry's GitHub
+ID: of two additions given one alias at once, one is refused. `hold_alias` replaces the entry and
+that item, in one write, by an item that holds the alias and its expiry and nothing else: no
+GitHub ID, no budget. `add` refuses the alias until the table's expiry removes it. A student put
+back on the roster is given another alias.
 
 While an erase runs, `begin_erase` holds the GitHub ID the same way, under a negative key of its
 own and with the erase's own token, until `end_erase`: `add` refuses that GitHub ID meanwhile.
@@ -28,7 +31,8 @@ Every write of the erase checks, in the same transaction, that the item still ho
 (`erasing`), so that an erase run again takes the GitHub ID over, the first one writes nothing more,
 and no erase deletes a key or a usage row of an entry added after the GitHub ID was given back.
 `add` reads both items by their keys, in the transaction that writes the entry, never through the
-alias index, which DynamoDB updates after the write.
+alias index, which DynamoDB updates after the write. That index still finds the alias of an entry
+added before aliases had items of their own.
 
 Every function takes the tables as the table resources of the AWS SDK and the time as whole
 seconds since the epoch. Nothing here prints or logs: the command line (`rhi_admin.main`) does.
@@ -56,6 +60,8 @@ RETENTION_DAYS = 90
 # How long an alias taken off the roster is held back from any other entry: the retention of what
 # was written under it, and a day for the requests still running.
 ALIAS_HELD_DAYS = RETENTION_DAYS + 1
+# The attribute of an alias's own item that names the entry given the alias (`add`).
+CLAIMED_BY = "claimed_by"
 # What an erase that another erase of the same GitHub ID took over says, as it stops.
 ERASE_TAKEN_OVER = "another erase of that GitHub ID took over: this one stopped, and that one finishes the erase"
 
@@ -211,34 +217,40 @@ def add(
         expires_at=expiry(course_end) + RETENTION_DAYS * 86400,
     )
     absent = {"ConditionExpression": "attribute_not_exists(#id)", "ExpressionAttributeNames": {"#id": ROSTER.partition_key.name}}
-
-    def nothing_at(key: int) -> dict[str, Any]:
-        return {"ConditionCheck": {"TableName": roster.name, "Key": {ROSTER.partition_key.name: key}, **absent}}
-
-    # The alias's hold and the GitHub ID's erase are read by their keys, in the write itself.
-    refusals = (
-        "that alias was taken off the roster, and is held back while its series and log records are kept",
-        "that GitHub ID is being erased: wait for the erase, or run it again if it stopped",
-        "that GitHub ID is already on the roster",
-    )
+    # The alias's own item, which the alias's hold replaces (`hold_alias`); it goes with the entry.
+    claim = {ROSTER.partition_key.name: held_alias_id(alias), CLAIMED_BY: github_id, EXPIRES_AT: entry.expires_at}
+    # The alias and the GitHub ID's erase are read by their keys, in the write itself.
+    writes = [
+        {"Put": {"TableName": roster.name, "Item": claim, **absent}},
+        {"ConditionCheck": {"TableName": roster.name, "Key": {ROSTER.partition_key.name: erasing_id(github_id)}, **absent}},
+        {"Put": {"TableName": roster.name, "Item": entry.to_item(), **absent}},
+    ]
     try:
         # The table resource's client, which takes the item's values as the table resource does.
-        roster.meta.client.transact_write_items(
-            TransactItems=[
-                nothing_at(held_alias_id(alias)),
-                nothing_at(erasing_id(github_id)),
-                {"Put": {"TableName": roster.name, "Item": entry.to_item(), **absent}},
-            ]
-        )
+        roster.meta.client.transact_write_items(TransactItems=writes)
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") != "TransactionCanceledException":
             raise
-        reasons = [reason.get("Code") for reason in error.response.get("CancellationReasons") or []]
-        for reason, refusal in zip(reasons, refusals, strict=False):
-            if reason == "ConditionalCheckFailed":
-                raise AdminError(refusal) from None
+        failed = [reason.get("Code") == "ConditionalCheckFailed" for reason in error.response.get("CancellationReasons") or []]
+        if failed[1:2] == [True]:
+            raise AdminError("that GitHub ID is being erased: wait for the erase, or run it again if it stopped") from None
+        if failed[2:3] == [True]:
+            raise AdminError("that GitHub ID is already on the roster") from None
+        if failed[:1] == [True]:
+            raise AdminError(_alias_refusal(alias, github_id, roster)) from None
         raise
     return entry
+
+
+def _alias_refusal(alias: str, github_id: int, roster: Any) -> str:
+    """Why `add` found the alias's item there: the GitHub ID's own entry, another entry, or a hold."""
+    key = {ROSTER.partition_key.name: held_alias_id(alias)}
+    claimed = (roster.get_item(Key=key, ConsistentRead=True).get("Item") or {}).get(CLAIMED_BY)
+    if claimed is None:
+        return "that alias was taken off the roster, and is held back while its series and log records are kept"
+    if int(claimed) == github_id:
+        return "that GitHub ID is already on the roster"
+    return "another roster entry has that alias"
 
 
 def entries(*, roster: Any) -> list[RosterEntry]:

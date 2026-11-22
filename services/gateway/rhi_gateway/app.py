@@ -19,10 +19,11 @@ gives: the estimate of the input, the request's output limit, and the pool, whos
 long the lease lasts. It is still made before anything is sent to the engine. Right after it, the
 key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`): a key revoked or
 erased while the body arrived, or a read that fails, has the reservation taken back, and the day's
-row deleted when nothing else is left in it (`Ledger.withdraw`), so that no request undoes an
-erase and none takes what another request wrote. The reservation names the pool,
-and returns the load balancer's cookie the student's record holds for it: the proxy sends that
-cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`). It
+row deleted when it holds only what its opening carried from the day before (`Ledger.withdraw`),
+so that no request undoes an erase and none takes what another request charged or holds. The
+reservation names the pool, and returns the load balancer's cookie the student's record holds for
+it: the proxy sends that cookie, and the settlement stores the one the request ended with
+(`rhi_gateway.affinity`). It
 returns the last rebalance number the record has applied for the pool as well: the request is
 judged on the pool's number as the gateway holds it then, which may drop the cookie for this
 request, and the settlement stores that number (section 5.5).
