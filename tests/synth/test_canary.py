@@ -1,8 +1,8 @@
 """The weekly GPU canary of `src/rhi/pipeline/canary.py` (system design, sections 8.2, step 6, and
 14): a job of the pipeline's stack that runs the coursework pool's smoke tests against the deployed
 endpoint, a schedule on Sundays at 04:00 UTC whose only target is that job, and a role that reads
-the canary's secret, queries the workspace, reads the pools' release parameters and sends the
-measurement event, and nothing else.
+the canary's secret, queries the workspace, reads the pools' release parameters, queries the
+coursework pool's heartbeat rows and sends the measurement event, and nothing else.
 
 The tests read the app's own pipeline, built from the example configuration. One also builds the
 app parked: no schedule, and no job for one to start, only the job's log group.
@@ -11,6 +11,7 @@ app parked: no schedule, and no job for one to start, only the job's log group.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -33,6 +34,7 @@ JOB_ACTIONS = {
     "secretsmanager:GetSecretValue",
     "aps:QueryMetrics",
     "ssm:GetParameter",
+    "dynamodb:Query",
     "events:PutEvents",
     "codeconnections:GetConnection",
     "codeconnections:GetConnectionToken",
@@ -168,21 +170,48 @@ def test_the_job_s_role_reads_the_canary_s_inputs_and_sends_the_measurement_only
     assert query["Condition"] == {"StringEquals": {"aws:ResourceTag/rhi-stage": "Rhi"}}
 
 
-def test_the_job_s_role_reads_no_table(pipeline: dict[str, Any], project: tuple[str, dict[str, Any]]) -> None:
-    # Not even the heartbeats table the verification reads: no action of DynamoDB, by any pattern.
+def test_the_job_s_role_queries_the_coursework_pool_s_heartbeat_rows_only(
+    templates: dict[str, dict[str, Any]], pipeline: dict[str, Any], project: tuple[str, dict[str, Any]]
+) -> None:
     _, properties = project
     role = properties["ServiceRole"]["Fn::GetAtt"][0]
-    granted = [
-        action
-        for statement in statements(pipeline, role)
-        for action in as_list(statement.get("Action", []))
-        if fnmatchcase("dynamodb:query", action.lower()) or action.lower().startswith("dynamodb:")
+    mine = statements(pipeline, role)
+    # Exactly one statement of DynamoDB, by any pattern, and its only action is the query.
+    (query,) = [
+        statement
+        for statement in mine
+        if any(fnmatchcase(action.lower(), "dynamodb:*") for action in as_list(statement["Action"]))
     ]
-    assert not granted
+    assert as_list(query["Action"]) == ["dynamodb:Query"]
+    # Its one resource is the verification's pattern of the stage's heartbeats table: the pools
+    # stack's name, the logical ID of a table of that stack, and the wildcard of the suffix.
+    (resource,) = as_list(query["Resource"])
+    # The verification step's role, the one that lists the pipeline's executions.
+    verifying = [
+        policy["PolicyDocument"]["Statement"]
+        for policy in of_type(pipeline, "AWS::IAM::Policy").values()
+        if any(
+            "codepipeline:ListPipelineExecutions" in as_list(s["Action"]) for s in policy["PolicyDocument"]["Statement"]
+        )
+    ]
+    verification = {
+        text(resource)
+        for policy in verifying
+        for statement in policy
+        if "dynamodb:Query" in as_list(statement["Action"])
+        for resource in as_list(statement["Resource"])
+    }
+    assert verification == {text(resource)}
+    shape = re.fullmatch(r"arn:<>:dynamodb:<>:<>:table/Rhi-Pools-(TablesHeartbeats\w+)-\*", text(resource))
+    assert shape is not None
+    pools = [t for path, t in templates.items() if path.rsplit("/", 1)[-1].startswith("RhiPools")]
+    assert any(shape[1] in of_type(t, "AWS::DynamoDB::Table") for t in pools)
+    # The coursework pool's partition alone.
+    assert query["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["coursework"]}}
 
 
-def test_parked_the_canary_has_no_schedule_and_no_job(
-    app_module: ModuleType, pipeline: dict[str, Any], tmp_path: Path
+def test_parked_the_canary_has_no_schedule_no_job_and_no_role(
+    app_module: ModuleType, pipeline: dict[str, Any], project: tuple[str, dict[str, Any]], tmp_path: Path
 ) -> None:
     # The app as `app.py` builds it, cdk-nag included, from the example configuration parked.
     data = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
@@ -195,6 +224,15 @@ def test_parked_the_canary_has_no_schedule_and_no_job(
     for kind in ("AWS::Events::Rule", "AWS::Scheduler::Schedule"):
         assert not [p for p in of_type(parked, kind).values() if p.get("Name") == CANARY]
     assert not [p for p in of_type(parked, "AWS::CodeBuild::Project").values() if p.get("Name") == CANARY]
+    # Nor the job's role, nor the schedule's, under the logical IDs they have unparked, nor a policy
+    # attached to either.
+    _, properties = project
+    (schedule,) = [p for p in of_type(pipeline, "AWS::Events::Rule").values() if p.get("Name") == CANARY]
+    roles = {properties["ServiceRole"]["Fn::GetAtt"][0], schedule["Targets"][0]["RoleArn"]["Fn::GetAtt"][0]}
+    assert not roles & set(of_type(parked, "AWS::IAM::Role"))
+    assert not [
+        p for p in of_type(parked, "AWS::IAM::Policy").values() if any(r.get("Ref") in roles for r in p["Roles"])
+    ]
     # The job's log group stays, under its logical ID, with the logs of the runs before.
     groups = {
         k: p
