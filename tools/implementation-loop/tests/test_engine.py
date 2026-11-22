@@ -1,9 +1,13 @@
 """End-to-end runs of the builder/examiner engine (ADR 0012): real git, the real ship.sh, the real
 verifier and real squash merges into a local bare remote. Only the agents and GitHub are fakes."""
 
+import contextlib
 import re
+import sys
 import unittest
 from concurrent.futures import Future
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from helpers import SHIP, TempRepo, issue_body, present
@@ -12,12 +16,58 @@ from implement_loop.config import Caps, Config, Deploy
 from implement_loop.engine import Engine
 from implement_loop.github import FakeGitHub
 from implement_loop.graph import build_plan
-from implement_loop.model import WRITING_PHASES, Phase
+from implement_loop.model import Phase
 from implement_loop.state import RepoClaims, RunStore
 from implement_loop.workspace import Workspace
 
 EPIC = 1
 LACKS = ["hardware:laptop", "human:rehearsal"]
+ENGINE_DIR = Path(__file__).resolve().parents[1]
+_beside: dict = {}   # the engine beside this file and its `helpers`, while the process holds another
+
+
+def _swap(modules: dict) -> dict:
+    """Put `modules` where the engine's modules and `helpers` are in `sys.modules`. Returns what was there."""
+    was = {name: module for name, module in sys.modules.items() if name.partition(".")[0] in ("implement_loop", "helpers")}
+    for name in was:
+        del sys.modules[name]
+    sys.modules.update(modules)
+    return was
+
+
+@contextlib.contextmanager
+def the_engine_beside_these_tests():
+    """The verifier puts the engine that runs it first on PYTHONPATH and loads its pytest plugin
+    from there, so in an xdist worker `implement_loop` is the running engine, not the one beside
+    this file. A test of a change to the engine runs inside this context: `sys.modules` holds the
+    engine beside this file (its lazy imports included) and a `helpers` of its own, and the
+    process's modules are put back after. Where the engine loaded is this one, nothing is done."""
+    loaded = getattr(sys.modules.get("implement_loop"), "__file__", None)
+    if loaded is None or Path(loaded).resolve().parents[1] == ENGINE_DIR:
+        yield
+        return
+    theirs = _swap(_beside)
+    try:
+        yield
+    finally:
+        _beside.update(_swap(theirs))
+
+
+with the_engine_beside_these_tests():   # what DispatchTests drives
+    import helpers as _helpers
+    from implement_loop import agents as _agents
+    from implement_loop import config as _config
+    from implement_loop import engine as _engine
+    from implement_loop import github as _github
+    from implement_loop import graph as _graph
+    from implement_loop import model as _model
+    from implement_loop import state as _state
+    from implement_loop import workspace as _workspace
+here = SimpleNamespace(TempRepo=_helpers.TempRepo, SHIP=_helpers.SHIP, Script=_agents.Script,
+                       FakeAgents=_agents.FakeAgents, Caps=_config.Caps, Config=_config.Config, Engine=_engine.Engine,
+                       FakeGitHub=_github.FakeGitHub, build_plan=_graph.build_plan, Phase=_model.Phase,
+                       WRITING_PHASES=_model.WRITING_PHASES, RunStore=_state.RunStore, Workspace=_workspace.Workspace)
+assert Path(_engine.__file__).resolve().parents[1] == ENGINE_DIR, "DispatchTests are of the engine beside them"
 
 
 class EngineCase(unittest.TestCase):
@@ -293,19 +343,42 @@ class RecordingPool:
         return Future()
 
 
-class DispatchTests(EngineCase):
-    """First plans are admitted for the writer slots they could fill, plus one standby."""
+class DispatchTests(unittest.TestCase):
+    """First plans are admitted for the writer slots they could fill, plus one standby. The tests
+    run on the engine beside this file (`the_engine_beside_these_tests`), as `here` names it."""
 
-    def dispatcher(self, issues, writers=2, fresh=True):
+    def setUp(self):
+        self.enterContext(the_engine_beside_these_tests())
+        self.repo = here.TempRepo()
+        self.addCleanup(self.repo.cleanup)
+        self.gh = here.FakeGitHub(on_merge=self.repo.merge)
+        self.scripts = {}
+
+    def add_work(self, n, path, items=None, **script):
+        deliverables = items or [f"`{path}` contains `x`."]
+        self.gh.add_issue(n, f"Issue {n}", issue_body(f"feat/issue-{n}", deliverables, ["The test passes on main."]),
+                          labels=("size:M",))
+        self.scripts[n] = here.Script(files={path: "x"}, **script)
+
+    def engine_for(self, writers=2, fresh=False):
+        plan = here.build_plan(self.gh, EPIC, self.repo.work)
+        self.store = here.RunStore.for_root(self.repo.work, EPIC, fresh=fresh)
+        ws = here.Workspace(self.repo.work, EPIC, here.SHIP, base_dir=self.repo.loop_dir)
+        self.agents = here.FakeAgents(self.scripts)
+        cfg = here.Config(repo="test/test", caps=here.Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=writers))
+        self.engine = here.Engine(plan, self.store, self.gh, ws, self.agents, cfg, repo_root=self.repo.work,
+                                  log=lambda m: None, sleep=lambda s: None, policy={"lacks": LACKS})
+        return self.engine
+
+    def dispatcher(self, issues, writers=2):
         for n, path in issues.items():
-            self.add_work(n, path, "x")
-        self.epic(*sorted(self.scripts))
-        engine = self.engine_for(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=writers), fresh=fresh)
+            self.add_work(n, path)
+        self.gh.add_issue(EPIC, "Epic", "An epic.\n", subs=sorted(self.scripts))
         self.pool, self.running = RecordingPool(), {}
-        return engine
+        return self.engine_for(writers, fresh=True)
 
     def dispatch(self):
-        self.engine._dispatch(self.pool, self.running)  # ty: ignore[invalid-argument-type]  # test double
+        self.engine._dispatch(self.pool, self.running)   # the recording pool stands in for the executor
         return list(self.pool.submitted)
 
     def put(self, n, phase, plan=True, store=None, **changes):
@@ -324,24 +397,24 @@ class DispatchTests(EngineCase):
         return [n for step, n in self.pool.submitted if step == "plan"]
 
     def writing(self):
-        return [n for n in self.engine.plan.work if self.store.issue(n).phase in WRITING_PHASES]
+        return [n for n in self.engine.plan.work if self.store.issue(n).phase in here.WRITING_PHASES]
 
     def test_two_writers_admit_three_first_plans_until_a_writer_releases_its_slot(self):
         self.dispatcher({n: f"docs/{n}.txt" for n in range(2, 8)})
         for _ in range(3):
             self.dispatch()
         self.assertEqual(self.plans(), [2, 3, 4], "two slots and one standby, however often it dispatches")
-        self.put(2, Phase.PLANNED)          # a completed plan builds at once: the slot is taken, not released
+        self.put(2, here.Phase.PLANNED)     # a completed plan builds at once: the slot is taken, not released
         self.dispatch()
-        self.put(3, Phase.PLANNED)
+        self.put(3, here.Phase.PLANNED)
         self.dispatch()
-        self.put(4, Phase.PLANNED)          # a completed plan awaiting its build still counts
+        self.put(4, here.Phase.PLANNED)     # a completed plan awaiting its build still counts
         self.dispatch()
         self.dispatch()
         self.assertEqual(self.plans(), [2, 3, 4])
         self.assertEqual(self.writing(), [2, 3])
-        self.assertEqual(self.store.issue(4).phase, Phase.PLANNED)
-        self.put(2, Phase.DONE)             # the writer releases its slot
+        self.assertEqual(self.store.issue(4).phase, here.Phase.PLANNED)
+        self.put(2, here.Phase.DONE)        # the writer releases its slot
         self.dispatch()
         self.assertEqual(self.pool.submitted[-2:], [("build", 4), ("plan", 5)])
         self.assertEqual(self.writing(), [3, 4])
@@ -349,33 +422,33 @@ class DispatchTests(EngineCase):
     def test_admission_scans_past_a_path_conflict_and_an_owner_wait(self):
         self.dispatcher({2: "docs/a.txt", 3: "docs/a.txt", 4: "docs/d.txt", 5: "docs/a.txt", 6: "docs/f.txt",
                          7: "docs/g.txt"})
-        self.put(2, Phase.BUILD)
+        self.put(2, here.Phase.BUILD)
         self.running[2] = Future()          # one writer, on `docs/a.txt`
-        self.put(4, Phase.WAITING, wait={"kind": "owner_review", "detail": "the owner reviews it"})
+        self.put(4, here.Phase.WAITING, wait={"kind": "owner_review", "detail": "the owner reviews it"})
         self.dispatch()
         self.assertEqual(self.plans(), [3, 6], "#3 can only be the standby; #6 fills the free slot, #5 and #7 wait")
 
     def test_a_ready_build_goes_before_a_fresh_standby_plan(self):
         self.dispatcher({2: "docs/a.txt", 3: "docs/b.txt", 4: "docs/c.txt", 5: "docs/d.txt"})
-        self.put(3, Phase.PLANNED)
-        self.put(4, Phase.PLANNED)
+        self.put(3, here.Phase.PLANNED)
+        self.put(4, here.Phase.PLANNED)
         self.assertEqual(self.dispatch(), [("build", 3), ("build", 4), ("plan", 2)])
 
     def test_a_prerequisite_found_while_planning_frees_its_place_and_keeps_its_plan(self):
-        self.add_work(2, "docs/a.txt", "x", items=["`docs/a.txt` contains `x`.", "It uses the widget of #4."],
+        self.add_work(2, "docs/a.txt", items=["`docs/a.txt` contains `x`.", "It uses the widget of #4."],
                       deferred=(("D2", 4),))
-        self.add_work(4, "docs/d.txt", "x")
+        self.add_work(4, "docs/d.txt")
         self.gh.issues[4]["title"] = "Prerequisite widget"   # what the fake plan quotes of the issue it needs
         self.dispatcher({3: "docs/c.txt", 5: "docs/e.txt"}, writers=1)
         self.dispatch()
         self.assertEqual(self.plans(), [2, 3], "one slot and one standby")
         del self.running[2]
         self.engine._step_plan(2)          # the plan finds that #2 needs #4, in this run
-        self.assertEqual((self.store.issue(2).phase, self.engine.plan.deps[2]), (Phase.PENDING, {4}))
+        self.assertEqual((self.store.issue(2).phase, self.engine.plan.deps[2]), (here.Phase.PENDING, {4}))
         self.dispatch()
         self.assertEqual(self.plans(), [2, 3, 4], "#2 no longer holds a place: #4 takes it")
-        self.put(4, Phase.DONE)
-        self.put(3, Phase.DONE)
+        self.put(4, here.Phase.DONE)
+        self.put(3, here.Phase.DONE)
         self.dispatch()
         self.assertEqual(self.pool.submitted[-2:], [("build", 2), ("plan", 5)])
         self.assertEqual([c for c in self.agents.calls if c[0] == "plan" and c[2] == 2], [("plan", "claude", 2)],
@@ -385,15 +458,15 @@ class DispatchTests(EngineCase):
         issues = {n: f"docs/{n}.txt" for n in range(2, 8)}
         self.dispatcher(issues)
         for n in (2, 3):
-            self.put(n, Phase.PLANNED)
-        for n in (4, 5):                     # as a stopped run leaves them: planned, not yet moved on
-            self.put(n, Phase.PENDING)
-        self.engine_for(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2))   # the run resumes
+            self.put(n, here.Phase.PLANNED)
+        for n in (4, 5):   # as a stopped run leaves them: planned, not yet moved on
+            self.put(n, here.Phase.PENDING)
+        self.engine_for()   # the run resumes
         self.assertEqual(self.dispatch(), [("build", 2), ("build", 3)])
-        self.assertEqual([self.store.issue(n).phase for n in (4, 5)], [Phase.PLANNED, Phase.PLANNED])
-        self.put(2, Phase.DONE)
+        self.assertEqual([self.store.issue(n).phase for n in (4, 5)], [here.Phase.PLANNED, here.Phase.PLANNED])
+        self.put(2, here.Phase.DONE)
         self.dispatch()
-        self.put(3, Phase.DONE)
+        self.put(3, here.Phase.DONE)
         self.dispatch()
         self.assertEqual(self.pool.submitted, [("build", 2), ("build", 3), ("build", 4), ("build", 5), ("plan", 6)])
         self.assertEqual(self.writing(), [4, 5])
