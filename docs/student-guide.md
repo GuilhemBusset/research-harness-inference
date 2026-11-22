@@ -118,12 +118,17 @@ names the default pool's model. In an SDK script, give the model's name as `mode
 
 ## 5. The endpoint serves during class sessions only
 
-The endpoint answers only while a class session is on. The instructor switches each session on
-before the class and off after it. There is no schedule to look up.
+The model serves students only while a class session is on. The instructor switches each session
+on before the class and off after it. There is no schedule to look up.
 
-Outside a session, every request is answered at once with the cause `no_session`. For homework,
-between sessions, and whenever the endpoint is down or not ready, use your own subscriptions to
-hosted models. The endpoint does not stand in for them.
+Outside a session, a request to the model, and the wake that `rhi wait coursework` sends, are
+answered at once with the cause `no_session`, and `rhi status` lists each pool as unavailable with
+that cause. The rest of `rhi` works at any time: log in before your first session, check
+`rhi status`, and revoke a key whenever you need to. A request already running when the session
+ends is allowed to finish.
+
+For homework, between sessions, and whenever the endpoint is down or not ready, use your own
+subscriptions to hosted models. The endpoint does not stand in for them.
 
 ## 6. Waiting for a cold pool
 
@@ -136,7 +141,14 @@ longer otherwise. While it starts, the endpoint holds your request rather than r
   harness may look stuck: let it wait.
 - **A non-streaming call** (a script that does not stream) is held for up to 4 minutes.
 
-If the pool is still not ready when the hold ends, the request fails with `warming`.
+If the pool is still not ready when the hold ends, the request fails with one of two causes:
+
+- `capacity_unavailable` when the pool's last attempt to start a machine, in the past 10 minutes,
+  found no GPU machine available;
+- `warming` otherwise: a machine is still starting.
+
+A token count, which Claude Code sends often to measure its context, is never held: on a pool that
+is not ready it is answered at once with `warming`. Claude Code carries on without it.
 
 When a session begins, start the pool you will use and wait for it:
 
@@ -173,8 +185,9 @@ A few things your harness does elsewhere do not work here:
 | Running several agents at once | Each agent, and each subagent, takes a stream on the same shared GPU as the rest of the class, and counts toward your concurrent requests (section 9) | Run agents one after another, or limit how many subagents run at once. This leaves room on the GPU for your classmates |
 
 **Harness versions.** The endpoint changes the requests each harness sends so that the model can
-serve them, and a harness update can change those requests. Spike S3 runs the course's task
-against the endpoint with these versions:
+serve them, and a harness update can change those requests. These are the versions the course
+tests the endpoint with: spike S3 installs exactly these, gives each harness a task of the course's
+kind on the coursework model, and runs the task's check on what the harness left:
 
 | Harness | Version |
 | --- | --- |
@@ -182,10 +195,10 @@ against the endpoint with these versions:
 | Codex | 0.169.0 |
 | OpenAI Python SDK, for the SDK script | 3.57.0 |
 
-The spike stops if an installed harness reports another version, and its measurement record under
-[`docs/measurements/`](measurements/README.md) names the versions each run used. With a newer
-version, something may fail that worked before. If it does, tell the instructor which version you
-run.
+The spike stops if an installed harness reports another version, and each run prints the versions
+it used in its log. What those runs show decides which harnesses each model supports, and the
+instructor tells you which those are. With a newer version, something may fail that worked before. If it
+does, tell the instructor which version you run (`claude --version`, `codex --version`).
 
 ## 8. When a request fails: the causes
 
@@ -198,9 +211,11 @@ ask for help, give the cause's name. Never paste your key.
 | `not_found` | The request went to an address the endpoint does not serve | Check the endpoint's address: Claude Code takes it as given, Codex and SDK scripts take it followed by `/v1`. Run `rhi login` again to rewrite the harness settings |
 | `request_refused` | The endpoint refused the body of the request: not JSON, too large, or an image given by URL instead of inline | Send images inline, and split very large inputs. If a harness does this on its own, tell the instructor which harness and version |
 | `concurrency_limit` | You already have as many requests running as you are allowed (section 9) | Wait for one to end: harnesses and SDKs retry by themselves. Run fewer agents at once |
+| `budget_reached` | Your token budget for today is spent. Only an early version of the endpoint has a per-student budget; the course removes it, and sessions limit use instead | Use your own subscription for the rest of the day, and tell the instructor |
+| `pool_ceiling_reached` | This pool has reached its usage ceiling and takes no request for now. Like `budget_reached`, this exists only in an early version of the endpoint | Use another model (`rhi status` lists them), or your own subscription, and tell the instructor |
 | `no_session` | No class session is on | Use your own subscription to a hosted model. The endpoint answers again when the instructor starts the next session |
-| `warming` | The pool was still starting when the hold ended | Run `rhi wait coursework`, with the model's name, then try again |
-| `capacity_unavailable` | No GPU machine is available for this pool at the moment | Retry later. If it lasts, use your own subscription for this session |
+| `warming` | The pool was still starting when the hold ended, or a token count reached a pool that was not ready (section 6) | Run `rhi wait coursework`, with the model's name, then try again |
+| `capacity_unavailable` | The pool's last attempt to start a machine found no GPU machine available | Retry later: the pool keeps trying. If it lasts, use your own subscription for this session |
 | `pool_scheduled_only` | Only the instructor can start this pool | Use another model (`rhi status` lists them), or ask the instructor |
 | `pool_disabled` | The instructor has switched this pool off | Use another model (`rhi status` lists them) |
 | `engine_error` | The model failed, or ended its answer early | Try again. If it keeps happening, start a fresh session of your harness and tell the instructor |
