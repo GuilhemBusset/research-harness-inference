@@ -188,20 +188,24 @@ def test_the_canary_keys_come_from_the_spikes_secret() -> None:
 
     # A secret of another content is refused, and the error repeats nothing of it: not JSON, no
     # students in either shape, a key that is not valid, another set of fields.
+    # The keys that are not valid are refused without being repeated either.
     stray = generate_key()
+    truncated = stray[:-1]
+    unlike = f"unlike-a-key-{secrets.token_hex(8)}"
     for value in (
         stray,
         json.dumps({"students": []}),
         json.dumps({"students": [], "spent": stray}),
-        json.dumps({"students": [stray[:-1]]}),
-        json.dumps({"students": [stray, "not a key"]}),
+        json.dumps({"students": [truncated]}),
+        json.dumps({"students": [stray, unlike]}),
+        json.dumps({"students": [unlike], "spent": stray}),
         json.dumps({"students": [stray], "other": stray}),
         json.dumps({"keys": [stray]}),
     ):
         Secrets.value = value
         with pytest.raises(ValueError, match="keys") as refused:
             common.canary_keys(Secrets())
-        assert stray not in str(refused.value)
+        assert not any(held in str(refused.value) for held in (stray, truncated, unlike))
 
 
 def test_numbers_sent_to_the_bus_decode_into_the_same_run(environ: dict[str, str], commit: str) -> None:
