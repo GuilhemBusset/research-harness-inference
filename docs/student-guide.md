@@ -1,7 +1,7 @@
 # Student guide: the course's inference endpoint
 
 During class sessions, the course runs an open-weight model on its own GPU machines. You reach it
-from Claude Code, Codex or a script of your own, through one small command, `rhi`. This guide
+from Claude Code, Codex, OpenCode, Pi or a script of your own, through one small command, `rhi`. This guide
 covers installing `rhi`, logging in, pointing your tools at the endpoint, and what to do when a
 request fails.
 
@@ -103,6 +103,87 @@ print(reply.choices[0].message.content)
 
 Use the endpoint's address from the course's channel, followed by `/v1`.
 
+### OpenCode
+
+`rhi login` does not write OpenCode's settings: you add the endpoint as a provider yourself. Put
+this entry in OpenCode's configuration file, `~/.config/opencode/opencode.json` (if the file
+already exists, add the `rhi` provider to its `providers`):
+
+```json
+{
+  "providers": {
+    "rhi": {
+      "name": "Course endpoint",
+      "env": ["RHI_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://inference.example.com/v1"
+      },
+      "models": {
+        "coursework": {
+          "name": "Coursework model"
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `https://inference.example.com` with the endpoint's address from the course's channel, and
+keep the `/v1`. The model's name, `coursework`, is the default pool's name, as `rhi status` lists it
+(section 4).
+
+The entry holds no key: it names the environment variable OpenCode reads the key from,
+`RHI_API_KEY`. OpenCode reads that variable in the server process that sends the requests, and
+OpenCode's shared background server, if one is already running, did not start from your shell and
+does not see it. So set the variable from `rhi token` in the shell that starts OpenCode, then start
+OpenCode in that same shell in standalone mode, which runs a private server from this shell, and
+choose `rhi/coursework` with `/models`:
+
+```sh
+export RHI_API_KEY="$(rhi token)"
+opencode --standalone
+```
+
+The key stays in that shell's memory and is never written into a file. Do not put the `export` line
+in a shell startup file, and do not give the key to the shared background server with
+`opencode service set env`: it would keep the key beyond your shell. After a new login, the old key
+stops working: set the variable again from `rhi token` and restart OpenCode.
+
+Spike S3 (section 7) has not yet run OpenCode, so the course has no tested version of it yet.
+
+### Pi
+
+`rhi login` does not write Pi's settings either. Pi reads providers from its `models.json`, in its
+agent folder, `~/.pi/agent/models.json`. Put this entry in it (if the file already exists, add the
+`rhi` provider to its `providers`):
+
+```json
+{
+  "providers": {
+    "rhi": {
+      "baseUrl": "https://inference.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "!rhi token",
+      "models": [
+        { "id": "coursework" }
+      ]
+    }
+  }
+}
+```
+
+Replace `https://inference.example.com` with the endpoint's address from the course's channel, and
+keep the `/v1`. `openai-completions` is Pi's name for OpenAI Chat Completions, which the endpoint
+serves. The model's name, `coursework`, is the default pool's name, as `rhi status` lists it
+(section 4).
+
+The entry holds no key. The leading `!` of `apiKey` tells Pi to run a command for the key: Pi runs
+`rhi token` each time it sends a request, so the key is in no file, and after a new login Pi uses
+the new key with nothing to change. Start Pi as usual and choose `coursework` with `/model`.
+
+Spike S3 (section 7) has not yet run Pi, so the course has no tested version of it yet.
+
 ## 4. Choose a model
 
 Each model the endpoint serves is a **pool** of GPU machines, and you choose a pool by its model
@@ -114,7 +195,8 @@ rhi status
 
 Any model name that starts with `claude-` goes to the default pool, the coursework model. This is
 what Claude Code sends unless you tell it otherwise, so it needs no setting. The Codex profile
-names the default pool's model. In an SDK script, give the model's name as `model`.
+names the default pool's model. The OpenCode and Pi entries name it too (section 3). In an SDK
+script, give the model's name as `model`.
 
 ## 5. The endpoint serves during class sessions only
 
@@ -194,6 +276,8 @@ kind on the coursework model, and runs the task's check on what the harness left
 | Claude Code | 2.1.323 |
 | Codex | 0.169.0 |
 | OpenAI Python SDK, for the SDK script | 3.57.0 |
+| OpenCode | Not yet run by spike S3 |
+| Pi | Not yet run by spike S3 |
 
 The spike stops if an installed harness reports another version, and each run prints the versions
 it used in its log. What those runs show decides which harnesses each model supports, and the
@@ -208,7 +292,7 @@ ask for help, give the cause's name. Never paste your key.
 | Cause | What it means | What to do |
 | --- | --- | --- |
 | `invalid_key` | The key is missing, malformed, unknown, revoked or expired, or the request carried two different keys | Run `rhi login`. If you set an API key of your own for this harness (in an environment variable, say), remove it, so that only the key from `rhi token` is sent |
-| `not_found` | The request went to an address the endpoint does not serve | Check the endpoint's address: Claude Code takes it as given, Codex and SDK scripts take it followed by `/v1`. Run `rhi login` again to rewrite the harness settings |
+| `not_found` | The request went to an address the endpoint does not serve | Check the endpoint's address: Claude Code takes it as given, Codex, OpenCode, Pi and SDK scripts take it followed by `/v1`. Run `rhi login` again to rewrite the settings of Claude Code and Codex; for OpenCode and Pi, check the base URL of their entry (section 3) |
 | `request_refused` | The endpoint refused the body of the request: not JSON, too large, or an image given by URL instead of inline | Send images inline, and split very large inputs. If a harness does this on its own, tell the instructor which harness and version |
 | `concurrency_limit` | You already have as many requests running as you are allowed (section 9) | Wait for one to end: harnesses and SDKs retry by themselves. Run fewer agents at once |
 | `budget_reached` | Your token budget for today is spent. Only an early version of the endpoint has a per-student budget; the course removes it, and sessions limit use instead | Use your own subscription for the rest of the day, and tell the instructor |
