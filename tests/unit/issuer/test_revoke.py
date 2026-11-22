@@ -33,7 +33,6 @@ CLIENT_ID = "Iv1." + secrets.token_hex(8)
 OTTER = RosterEntry(
     github_id=4242,
     alias="otter",
-    daily_token_budget=3_000_000,
     concurrency_limit=3,
     added_at=NOW - 86400,
     expires_at=NOW + 90 * 86400,
@@ -221,3 +220,16 @@ def test_revoking_all_checks_the_roster_and_the_code(env: Env) -> None:
     assert env.post("/auth/revoke-all", {"device_code": secrets.token_hex(20)}) == refused(Refusal.LOGIN_REFUSED)
     assert env.items() == before
     assert env.revoked_at(key) is None
+
+
+def test_a_key_the_release_before_wrote_with_a_budget_is_revoked(env: Env) -> None:
+    key = env.key()
+    # The release before wrote each key with a daily token budget, which this release ignores.
+    env.issuer.keys.update_item(
+        Key={"key_hash": key_hash(key)},
+        UpdateExpression="SET daily_token_budget = :budget",
+        ExpressionAttributeValues={":budget": 100_000_000},
+    )
+
+    assert env.post("/auth/revoke", authorization=f"Bearer {key}") == (200, {"revoked": 1})
+    assert env.revoked_at(key) == NOW

@@ -2,7 +2,7 @@
 
 A spike reaches a pool through the gateway, as a student, and one student is not enough
 (`rhi_common.spike_keys`). `run_spike_keys` is given a number of students. It puts that many on
-the roster with the default budget, under the aliases `spike-1`, `spike-2` and so on, each under
+the roster with the default limit, under the aliases `spike-1`, `spike-2` and so on, each under
 a GitHub ID no GitHub account has, unless the entry is there already. It revokes each student's earlier keys, issues each a new one and
 writes them all into the spikes' secret, `rhi/spike-keys`, which it creates when it does not exist. Run
 again, it replaces every key, in the keys table and in the secret alike. The keys go to the secret

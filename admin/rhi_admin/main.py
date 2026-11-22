@@ -6,9 +6,9 @@ repository, and it reaches the tables directly.
 
     env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main <command>
 
-    roster add <github-id> <alias> [--budget N] [--limit N]   a student, 100 million tokens and 4 unless given
+    roster add <github-id> <alias> [--limit N]                a student, 4 concurrent requests unless given
     roster list                                                 every entry
-    roster set <github-id> [--budget N] [--limit N]             a new budget or limit, on the entry and the keys
+    roster set <github-id> --limit N                            a new limit, on the entry and the keys
     roster remove <github-id>                                   the entry, and every key of the student revoked
     key issue <github-id>                                       a key without a login, printed once
     key revoke <github-id>                                      every key of the student revoked
@@ -176,10 +176,9 @@ def parser() -> argparse.ArgumentParser:
     add = roster.add_parser("add", help="add a student")
     add.add_argument("github_id", type=int)
     add.add_argument("alias")
-    change = roster.add_parser("set", help="change a student's budget or limit")
+    change = roster.add_parser("set", help="change a student's limit")
     change.add_argument("github_id", type=int)
     for command in (add, change):
-        command.add_argument("--budget", type=int, help="daily token budget (default 100000000)")
         command.add_argument("--limit", type=int, help="concurrent requests (default 4)")
     roster.add_parser("list", help="list the roster")
     roster.add_parser("remove", help="remove a student and revoke their keys").add_argument("github_id", type=int)
@@ -281,18 +280,13 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
             roster=admin.roster,
             course_end=admin.course_end(),
             now=now,
-            daily_token_budget=arguments.budget,
             concurrency_limit=arguments.limit,
         )
-        print(
-            f"Added {entry.github_id} as {entry.alias}: {entry.daily_token_budget} tokens a day, "
-            f"{entry.concurrency_limit} concurrent requests.",
-            file=out,
-        )
+        print(f"Added {entry.github_id} as {entry.alias}: {entry.concurrency_limit} concurrent requests.", file=out)
     elif command == ("roster", "list"):
-        print("github_id\talias\tdaily_token_budget\tconcurrency_limit", file=out)
+        print("github_id\talias\tconcurrency_limit", file=out)
         for entry in admin_roster.entries(roster=admin.roster):
-            print(f"{entry.github_id}\t{entry.alias}\t{entry.daily_token_budget}\t{entry.concurrency_limit}", file=out)
+            print(f"{entry.github_id}\t{entry.alias}\t{entry.concurrency_limit}", file=out)
     elif command == ("roster", "set"):
         changed = admin_roster.change(
             arguments.github_id,
@@ -300,7 +294,6 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
             keys=admin.keys,
             course_end=admin.course_end(),
             now=now,
-            daily_token_budget=arguments.budget,
             concurrency_limit=arguments.limit,
         )
         print(f"Changed the entry and {changed} active key(s); the gateway applies it within 60 seconds.", file=out)

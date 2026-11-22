@@ -197,7 +197,7 @@ def issue(deployed: Deployed, github_id: int) -> str:
 
 
 def use(deployed: Deployed, github_id: int, alias: str, day: str, cookies: dict[str, str] | None = None) -> None:
-    row = UsageDay(github_id, day, alias, tokens=1234, expires_at=NOW + 86_400, affinity_cookies=cookies or {})
+    row = UsageDay(github_id, day, alias, expires_at=NOW + 86_400, affinity_cookies=cookies or {})
     deployed.usage.put_item(Item=row.to_item())
 
 

@@ -176,7 +176,6 @@ class Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=2_000_000,
             concurrency_limit=4,
         )
         authenticator = Authenticator(InMemoryKeyStore(student), wall_clock=lambda: float(NOW))

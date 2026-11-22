@@ -331,8 +331,6 @@ class Replayed:
     """Every settlement the ledger was asked for, in order."""
     leases: int
     """The leases still in the student's record at the end."""
-    tokens: int
-    """The tokens of the student's day at the end: 0, since nothing is charged."""
 
 
 class _Ledger(InMemoryLedger):
@@ -491,7 +489,6 @@ async def _replay(
         issued_at=NOW - 3600,
         expires_at=NOW + 86_400,
         revoked_at=None,
-        daily_token_budget=10**9,
         concurrency_limit=1,
     )
     leave_at = None if left_after is None else sum(len(chunk) for chunk in chunks[:left_after])
@@ -525,7 +522,6 @@ async def _replay(
             for observed, removed in zip(gateway_proxy.observed, ledger.settled, strict=True)
         ),
         leases=0 if day is None else len(day.leases),
-        tokens=0 if day is None else day.tokens,
     )
 
 

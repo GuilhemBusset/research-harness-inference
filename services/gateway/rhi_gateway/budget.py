@@ -25,11 +25,10 @@ every store (section 6.6): the ledger is given the course end, and an item writt
 no longer than that. In the table, an item can also carry `opening`, for a minute after midnight at
 most (see "Midnight"); the record leaves it out.
 
-The item's `tokens`, and a lease's `tokens` and `estimate`, are written 0 and never changed. They
-are written at all for a rollout: the gateway's tasks are replaced one by one, and a task of the
-release before, which shares the table meanwhile, refuses a day or a lease that lacks them, and
-may still add to a day's `tokens`. A lease such a task wrote, with its tokens and its estimate, is
-settled and swept here like any other, and the day's `tokens` are left as they are.
+No write here gives a day `tokens` or a lease `tokens` and an `estimate`. An item an earlier
+release wrote can still hold them: a lease such a release wrote is settled and swept here like any
+other, a day's `tokens` are left as they are, and a withdrawal deletes a day written with tokens 0
+on the same terms as one written without them.
 
 **Midnight.** The record is the day's, but the concurrency limit is the student's and does not
 start again at midnight UTC. So the first reservation of a day reads the item of the day before
@@ -96,8 +95,8 @@ settlement that finds nothing to settle stores nothing. Only a withdrawal (`Ledg
 a reservation refused once written) deletes a day with its map, and only a day that holds what its
 opening carried from the day before, which the next opening carries again. The opening records in
 the day it writes the cookies and rebalance numbers it carried (`carried_maps`). A withdrawal
-deletes the day only while its maps still equal that record, with stand-ins alone and no tokens
-(which only a task of the release before can have added). The test reads the stored values, not a mark that every writer would have to maintain. So
+deletes the day only while its maps still equal that record, with stand-ins alone and no tokens but 0
+(which only an earlier release can have added). The test reads the stored values, not a mark that every writer would have to maintain. So
 a settlement stored by a gateway task that predates the record, during a rollout where old and new
 tasks share the table, keeps the day as surely as one stored by a current task. A day written
 without the record, as every day before it existed was, is never deleted. A day's first
@@ -246,10 +245,10 @@ class Ledger(Protocol):
         """Take back a reservation whose key no longer passes.
 
         The day's row is then deleted if what is left in it is only what a day's opening carries
-        from the day before (`_carried_only`): no tokens, no lease but stand-ins, and cookies and
+        from the day before (`_carried_only`): no tokens other than 0, no lease but stand-ins, and cookies and
         rebalance numbers equal to those the opening carried and recorded. All of that a later
         opening carries again from the day before, if that day is still there. A day a request
-        stored a cookie or a number in keeps it, even at no tokens, even one equal to what the opening
+        stored a cookie or a number in keeps it, even one equal to what the opening
         carried, and whichever gateway task wrote it, and so does a day written without the record. A reservation refused after its write (its day
         ended meanwhile) is taken back in the same way. A request whose student was erased while
         its body arrived thus leaves no row behind, however many such requests take theirs back and in
@@ -270,7 +269,7 @@ def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
 
 
 def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expires_at: int) -> UsageDay:
-    """A day as its first reservation finds it: tokens 0, and a stand-in for each live lease of `before`.
+    """A day as its first reservation finds it: a stand-in for each live lease of `before`.
 
     It expires at `expires_at`, the course end plus 90 days (`rhi_common.retention`).
 
@@ -281,10 +280,9 @@ def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expi
         github_id=student.github_id,
         day=day,
         alias=student.alias,
-        tokens=0,
         expires_at=expires_at,
         leases={
-            f"{_day_before(day)}/{request}": Lease(tokens=0, estimate=0, expires=lease.expires)
+            f"{_day_before(day)}/{request}": Lease(expires=lease.expires)
             for request, lease in _live(before, now).items()
         },
         affinity_cookies={} if before is None else dict(before.affinity_cookies),
@@ -293,8 +291,8 @@ def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expi
 
 
 def _new_lease(expires: int) -> Lease:
-    """A lease as this release writes it: tokens and estimate 0, read only by the release before."""
-    return Lease(tokens=0, estimate=0, expires=expires)
+    """A lease as a reservation writes it: its expiry alone."""
+    return Lease(expires=expires)
 
 
 def _expired(day: UsageDay, now: int) -> dict[str, Lease]:
@@ -302,7 +300,7 @@ def _expired(day: UsageDay, now: int) -> dict[str, Lease]:
 
 
 def _without(day: UsageDay, expired: Mapping[str, Lease]) -> UsageDay:
-    """The day once these leases are removed; its tokens stay as they are."""
+    """The day once these leases are removed."""
     leases = {request: lease for request, lease in day.leases.items() if request not in expired}
     return replace(day, leases=leases)
 
@@ -414,18 +412,20 @@ def _carried(reservation: Reservation, answered: int, read: Callable[[int, str],
 _Carried = tuple[Mapping[str, str], Mapping[str, int]]
 
 
-def _carried_only(day: UsageDay, carried: _Carried | None) -> bool:
+def _carried_only(day: UsageDay, carried: _Carried | None, tokens: object = None) -> bool:
     """Whether the day holds only what its opening carries from the day before.
 
-    No tokens (which only a task of the release before can have added), stand-ins alone, and the
-    cookies and rebalance numbers the opening recorded (`carried`). A settlement that stores a
-    cookie or a number, or drops one, also removes the record, even when what it stores equals what
-    the opening carried, and a day without the record (`None`) is never deleted.
+    Stand-ins alone, and the cookies and rebalance numbers the opening recorded (`carried`). A
+    settlement that stores a cookie or a number, or drops one, also removes the record, even when
+    what it stores equals what the opening carried, and a day without the record (`None`) is never
+    deleted. `tokens` is the stored item's `tokens`, which no record holds: `None` where the item
+    has none, as this release writes it, and else what an earlier release wrote, which counts only
+    at 0, the one value a day of the release before held without a request having added to it.
     """
     prefix = _day_before(day.day) + "/"
     return (
         carried is not None
-        and day.tokens == 0
+        and (tokens is None or tokens == 0)
         and all(name.startswith(prefix) for name in day.leases)
         and (day.affinity_cookies, day.rebalance_applied) == carried
     )
@@ -508,7 +508,7 @@ class InMemoryLedger:
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
     ) -> bool:
-        """Remove the lease, if it is still there; the day's tokens stay as they are.
+        """Remove the lease, if it is still there.
 
         The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
         if there is one, and removes the pool's cookie when there is none and it was dropped. When
@@ -583,7 +583,7 @@ def _missing_stand_ins(day: UsageDay, before: UsageDay | None, now: int) -> dict
     """The stand-ins this day lacks: one for each live lease of the day before that has none here."""
     prefix = _day_before(day.day) + "/"
     return {
-        prefix + request: Lease(tokens=0, estimate=0, expires=lease.expires)
+        prefix + request: Lease(expires=lease.expires)
         for request, lease in _live(before, now).items()
         if prefix + request not in day.leases
     }
@@ -593,7 +593,7 @@ def _stand_in_updates(stand_ins: Mapping[str, Lease], values: dict[str, object])
     """The names and the `SET` actions that add these stand-ins to an item; their values go in `values`."""
     names = {f"#carried{number}": name for number, name in enumerate(stand_ins)}
     for number, lease in enumerate(stand_ins.values()):
-        values[f":carried{number}"] = Lease(tokens=0, estimate=0, expires=lease.expires).to_map()
+        values[f":carried{number}"] = Lease(expires=lease.expires).to_map()
     return names, [f"#leases.{name} = :{name[1:]}" for name in names]
 
 
@@ -676,10 +676,10 @@ class DynamoDBLedger:
         key = self._key(reservation.github_id, reservation.day)
         for _ in range(_ATTEMPTS):
             item = self._client.get_item(TableName=self._table, Key=key, ConsistentRead=True).get("Item")
-            if not item or not _carried_only(_day(item), _carried_of(item)):
+            if not item or not _carried_only(_day(item), _carried_of(item), _tokens_of(item)):
                 return
-            # `_carried_only` as read, held by the delete: the same tokens, the same leases and the
-            # same maps, each absent where it was, whichever task wrote to the day since.
+            # `_carried_only` as read, held by the delete: tokens 0 or none, as read, the same leases
+            # and the same maps, each absent where it was, whichever task wrote to the day since.
             names = {**_NAMES, "#tokens": "tokens", "#carriedmaps": _CARRIED}
             values = {":leases": item["leases"]}
             condition = "#leases = :leases AND attribute_exists(#carriedmaps)"
@@ -751,7 +751,7 @@ class DynamoDBLedger:
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
     ) -> bool:
-        """Remove the lease, in one write, if it is still there; the item's tokens stay as they are.
+        """Remove the lease, in one write, if it is still there; what else the item holds stays as it is.
 
         `stand_ins`, given only by the opener of a day that takes its reservation back, are the
         stand-ins it missed; the write carries them into the day and confirms the day. The others
@@ -934,6 +934,11 @@ def _carried_of(item: Mapping[str, Any]) -> _Carried | None:
         return None
     carried = _deserializer.deserialize(item[_CARRIED])
     return carried.get(_COOKIES, {}), {pool: int(number) for pool, number in carried.get(_APPLIED, {}).items()}
+
+
+def _tokens_of(item: Mapping[str, Any]) -> object:
+    """A usage item's `tokens`, which only an earlier release wrote: `None` where it has none."""
+    return None if "tokens" not in item else _deserializer.deserialize(item["tokens"])
 
 
 def _day(item: Mapping[str, Any]) -> UsageDay:

@@ -98,7 +98,6 @@ class Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=0,
             concurrency_limit=4,
         )
         self.readiness = Readiness({p.name: p.name for p in POOLS}, elbv2=self, table=self, clock=self.time)

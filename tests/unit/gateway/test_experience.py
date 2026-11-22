@@ -142,7 +142,6 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=10_000_000,
             concurrency_limit=4,
         )
         for alias, github_id in students
