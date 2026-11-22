@@ -1,8 +1,7 @@
 """The inference performance dashboard: what each pool serves, measured beside what was predicted.
 
 One of the six dashboards of the system design (section 7.3), for requirement R9. One row for
-each pool of the configuration, of the panels of section 7.2's performance table that are about
-speed and latency:
+each pool of the configuration, of the panels of section 7.2's performance table:
 
 | Panel | From the engine | From the gateway |
 | --- | --- | --- |
@@ -13,26 +12,55 @@ speed and latency:
 | Prefill speed | Tokens computed over prefill time | None |
 | Transcript size and output per turn | The median and the 95th percentile of each request's input and output tokens | The same, from the tokens settled |
 | Cached share of input | Cached input tokens over input tokens | None |
+| Cache use against capacity | Each instance's cache use and preemptions; the capacity in tokens the lifecycle agent exports, beside the pool's expected capacity | None |
+| Sessions the cache forgot | The median and the 95th percentile of how long a block sat idle before it was evicted | None |
+| Concurrent streams and the queue | Each instance's running and waiting requests | The requests in flight and held, summed over the gateway's tasks |
+| Students per instance, an average | None | The students with a request in the last five minutes, over the scaler's instances in service |
+| Cost per million output tokens, estimate (two panels) | None | The cost dashboard's estimated dollars over the gateway's output tokens, over the dashboard's range and for the month |
+| Tokens per GPU-hour and per joule | Output throughput over the scaler's instances in service, and over the rate of the DCGM exporter's energy counter | None |
 
 **What a pool's engine does not give is not drawn.** An engine's names come from the per-engine
 table, at the row of the pool's engine (`rhi_common.engine_metrics`). The row names every quantity
 of the contract, and may leave out any further one (the computed input, the queue, prefill and
-decode times, each request's tokens): the mock's leaves out all of them. A series that reads a
-quantity the row leaves out is not drawn, and a panel left with no measured series is not shown.
-So the mock pool's row has no prefill-speed panel. A reference line is not a measured series.
+decode times, each request's tokens, preemptions, how long a block sat idle before it was evicted):
+the mock's leaves out all of them. A series that reads a quantity the row leaves out is not drawn,
+and a panel left with no measured series is not shown. So the mock pool's row has no prefill-speed
+panel and no panel on the sessions the cache forgot, and its cache panel has no preemptions. A
+reference line is not a measured series. A mock instance has no GPU: a pool whose engine is the
+mock has no panel on tokens per GPU-hour and per joule.
 
 **The prediction is on the panel.** A pool's `expected` values (section 4.7) are drawn as
 reference lines: the low and the high bound of its speed per stream on the speed panel, those of
 its time to first token on the first-token panel. The objectives' floors (section 7.3) are drawn
 there too, from the configuration: the median stream's and the slowest tenth's speed, and the
-first token's 95th percentile. A pool that gives no expected values shows only the floors. The
-cached-share panel turns red below the configured share, 85% by default.
+first token's 95th percentile. The cache panel draws the low and the high bound of its expected
+cache capacity in tokens (`cache_tokens`) beside the capacity each instance's lifecycle agent
+reports (`rhi_lifecycle.cache`), on the same axis. A pool that gives no expected values shows only
+the floors, and the reported capacity alone. The cached-share panel turns red below the configured
+share, 85% by default.
+
+**Students are counted once.** The gateway's per-student counter of requests has one series for
+each alias and each gateway task (the collector labels a task's series with its ID): the query
+first takes, for each series, whether it counted a request in the last five minutes (it rose, or
+it appeared), then counts the pool's aliases among those, so two tasks that served one student
+count one. Over the instances in service it is an average: the gateway cannot know which instance
+serves a student (section 5.5). No series drawn carries an alias.
+
+**The cost is the cost dashboard's** (`rhi_dashboards.cost`): Auto Scaling's count of the pool's
+running instances, warm-pool preparation included, summed over the window and times the pool's
+configured hourly price, over the output tokens the gateway settled for the pool in that same
+window, in millions. Each is an estimate, and its title says so. One panel reads the dashboard's
+range; the other the month so far, in UTC, as AWS bills, by its own relative time (`now/M`): a
+Grafana panel has one range, and CloudWatch answers only inside it. So the dashboard is in UTC.
+Grafana keeps a panel's relative time only while the dashboard's range is relative: on fixed dates
+the month's panel reads those dates, and the cost dashboard holds the month.
 
 Every panel follows the rules of `rhi_dashboards.rules`: a rate is taken per series and then
 summed, a percentile comes with the count of requests behind it over the same window and labels,
-and an engine series is kept to the pool in service, the panel reading "asleep" without one. The
-gateway's series are never labelled by student, and are drawn as they are: the gateway runs
-whether or not the pool has an instance.
+and an engine series is kept to the pool in service, the panel reading "asleep" without one. So
+is every series of an instance: the capacity its lifecycle agent reports, its GPUs' energy. The
+gateway's series are never drawn by student, and are drawn as they are: the gateway runs whether
+or not the pool has an instance.
 """
 
 from __future__ import annotations
@@ -44,10 +72,11 @@ from grafana_foundation_sdk.builders import dashboard as dashboard_builders
 from grafana_foundation_sdk.models import common
 from grafana_foundation_sdk.models import dashboard as models
 
-from rhi_common.engine_metrics import Further, Quantity
-from rhi_dashboards import rules
+from rhi_common.engine_metrics import MOCK, Further, Quantity
+from rhi_dashboards import cost, gpu, rules
 
 if TYPE_CHECKING:
+    from grafana_foundation_sdk.builders import stat as stat_builders
     from grafana_foundation_sdk.builders import timeseries as timeseries_builders
 
     from rhi.config import Config
@@ -63,6 +92,17 @@ GATEWAY_INPUT = "rhi_gateway_request_input_tokens"
 GATEWAY_OUTPUT = "rhi_gateway_request_output_tokens"
 GATEWAY_FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 GATEWAY_FIRST_ANSWER = "rhi_gateway_time_to_first_answer_seconds"
+GATEWAY_IN_FLIGHT = "rhi_gateway_requests_in_flight"
+GATEWAY_HELD = "rhi_gateway_requests_held"
+# The gateway's per-student counter of requests, by alias and pool: read only to count the aliases.
+GATEWAY_STUDENTS = "services/gateway/rhi_gateway/metrics.py"
+STUDENT_REQUESTS = "rhi_gateway_student_requests"
+ALIAS = "alias"
+# A student with a request in this window is one at work.
+STUDENT_WINDOW = "5m"
+# The cache capacity in tokens each instance's lifecycle agent exports, a gauge.
+LIFECYCLE_CACHE = "services/engine/lifecycle/rhi_lifecycle/cache.py"
+CACHE_CAPACITY = "rhi_lifecycle_engine_cache_capacity_tokens"
 # The labels of the gateway's two waits: warm or held, and first turn or later.
 WAIT_LABELS = ("start", "turn")
 # The label the collector gives every series of an instance: the instance's ID.
@@ -76,7 +116,29 @@ INPUT = "Input throughput: tokens a second, and the part computed"
 PREFILL = "Prefill speed: tokens computed a second"
 TRANSCRIPT = "Transcript size and output per turn: tokens"
 CACHED_SHARE = "Cached share of input"
-TITLES = (SPEED, THROUGHPUT, FIRST_TOKEN, INPUT, PREFILL, TRANSCRIPT, CACHED_SHARE)
+CACHE = "Cache use against capacity, per instance"
+FORGOT = "Sessions the cache forgot: seconds a block sat idle before it was evicted"
+STREAMS = "Concurrent streams and the queue: requests"
+STUDENTS = "Students per instance, an average: students with a request in the last five minutes"
+PER_GPU = "Tokens per GPU-hour and per joule"
+COST_RANGE = "Cost per million output tokens, dashboard's range, estimate"
+COST_MONTH = "Cost per million output tokens, this month, estimate"
+TITLES = (
+    SPEED,
+    THROUGHPUT,
+    FIRST_TOKEN,
+    INPUT,
+    PREFILL,
+    TRANSCRIPT,
+    CACHED_SHARE,
+    CACHE,
+    FORGOT,
+    STREAMS,
+    STUDENTS,
+    PER_GPU,
+    COST_RANGE,
+    COST_MONTH,
+)
 
 # The legends of the reference lines. Only the expected ones start with EXPECTED.
 EXPECTED = "expected"
@@ -85,6 +147,16 @@ EXPECTED_HIGH = f"{EXPECTED} high"
 FLOOR_MEDIAN = "floor: median stream"
 FLOOR_SLOWEST_TENTH = "floor: slowest tenth"
 FLOOR_FIRST_TOKEN = "floor: 95th percentile"
+REPORTED_CAPACITY = f"reported capacity {{{{{INSTANCE}}}}}"
+
+# The units of the series read on the right-hand axis. Grafana gives each unit its own scale.
+TOKENS = "short"
+PREEMPTIONS_A_SECOND = "reqps"
+TOKENS_A_JOULE = "suffix: tokens/J"
+SECONDS_AN_HOUR = 3600
+# The month's cost panel: the month so far, in the dashboard's time zone, as AWS bills.
+THIS_MONTH = "now/M"
+TIME_ZONE = cost.TIME_ZONE
 
 METRICS: tuple[rules.Declared, ...] = (
     *(
@@ -102,12 +174,29 @@ METRICS: tuple[rules.Declared, ...] = (
             Further.REQUEST_INPUT_TOKENS,
             Further.REQUEST_OUTPUT_TOKENS,
             Further.REQUEST_PREFILL_COMPUTED_TOKENS,
+            Quantity.CACHE_USAGE,
+            Quantity.RUNNING_REQUESTS,
+            Quantity.WAITING_REQUESTS,
+            Further.PREEMPTIONS,
+            Further.BLOCK_IDLE_BEFORE_EVICTION,
         )
     ),
     *(
         rules.EmittedBy(name, GATEWAY)
-        for name in (GATEWAY_SPEED, GATEWAY_INPUT, GATEWAY_OUTPUT, GATEWAY_FIRST_TOKEN, GATEWAY_FIRST_ANSWER)
+        for name in (
+            GATEWAY_SPEED,
+            GATEWAY_INPUT,
+            GATEWAY_OUTPUT,
+            GATEWAY_FIRST_TOKEN,
+            GATEWAY_FIRST_ANSWER,
+            GATEWAY_IN_FLIGHT,
+            GATEWAY_HELD,
+        )
     ),
+    rules.EmittedBy(STUDENT_REQUESTS, GATEWAY_STUDENTS),
+    rules.EmittedBy(CACHE_CAPACITY, LIFECYCLE_CACHE),
+    rules.EmittedBy(gpu.ENERGY, gpu.COUNTERS),
+    *cost.METRICS,
 )
 
 # The colour of the cached-share panel's "asleep": neither the flag's red nor its green.
@@ -126,19 +215,19 @@ def _engine(legend: str, expression: str, axis: str | None = None) -> rules.Seri
     return rules.Series(legend, expression, engine=True, axis=axis)
 
 
-def _line(legend: str, value: float) -> rules.Series:
+def _line(legend: str, value: float, axis: str | None = None) -> rules.Series:
     """A reference line: the same value at every moment, written in full, never rounded."""
     number = float(value)
     written = str(int(number)) if number.is_integer() else repr(number)
-    return rules.Series(legend, f"vector({written})")
+    return rules.Series(legend, f"vector({written})", axis=axis)
 
 
-def _expected(bounds: tuple[float, float] | None) -> list[rules.Series]:
+def _expected(bounds: tuple[float, float] | None, axis: str | None = None) -> list[rules.Series]:
     """The lines of an expected value's low and high bound, or none when the pool gives none."""
     if bounds is None:
         return []
     low, high = bounds
-    return [_line(EXPECTED_LOW, low), _line(EXPECTED_HIGH, high)]
+    return [_line(EXPECTED_LOW, low, axis), _line(EXPECTED_HIGH, high, axis)]
 
 
 def _ratio(pool: Pool, numerator: rules.EngineQuantity, denominator: rules.EngineQuantity, sample: str = "") -> str:
@@ -148,6 +237,16 @@ def _ratio(pool: Pool, numerator: rules.EngineQuantity, denominator: rules.Engin
 
 def _gateway(pool: Pool) -> dict[str, str]:
     return {rules.POOL: pool.name}
+
+
+def _per_instance(selector: str, aggregation: str = "max") -> str:
+    """A gauge's one series for each instance of the pool, whatever other label it carries."""
+    return f"{aggregation} by ({rules.POOL}, {INSTANCE}) ({selector})"
+
+
+def _in_service(pool: Pool) -> str:
+    """The scaler's count of the pool's instances in service, kept where it is above zero."""
+    return f"(sum by ({rules.POOL}) ({rules.in_service(pool.name)}) > 0)"
 
 
 def speed(pool: Pool, config: Config) -> tuple[list[rules.Series], list[rules.Series]]:
@@ -234,6 +333,75 @@ def cached_share(pool: Pool) -> list[rules.Series]:
     return [_engine("cached share", _ratio(pool, Quantity.CACHED_INPUT_TOKENS, Quantity.INPUT_TOKENS))]
 
 
+def cache(pool: Pool) -> tuple[list[rules.Series], list[rules.Series]]:
+    """Each instance's cache use, its preemptions, and its reported capacity beside the expected one."""
+    usage = _per_instance(rules.engine_selector(pool, Quantity.CACHE_USAGE))
+    measured = [_engine(f"cache use {{{{{INSTANCE}}}}}", usage)]
+    if _reports(pool, Further.PREEMPTIONS):
+        preempted = rules.engine_rate(pool, Further.PREEMPTIONS, by=(INSTANCE,))
+        measured.append(_engine(f"preemptions {{{{{INSTANCE}}}}}", preempted, axis=PREEMPTIONS_A_SECOND))
+    capacity = _per_instance(rules.selector(CACHE_CAPACITY, _gateway(pool)))
+    measured.append(_engine(REPORTED_CAPACITY, capacity, axis=TOKENS))
+    expected = pool.expected.cache_tokens if pool.expected else None
+    return measured, _expected(expected, axis=TOKENS)
+
+
+def forgotten(pool: Pool) -> list[rules.Series]:
+    """How long a block of the cache sat idle before it was evicted: none where the engine's row leaves it out."""
+    if not _reports(pool, Further.BLOCK_IDLE_BEFORE_EVICTION):
+        return []
+    return rules.engine_percentile_series(pool, Further.BLOCK_IDLE_BEFORE_EVICTION, legend="idle before eviction ")
+
+
+def streams(pool: Pool) -> list[rules.Series]:
+    """Each instance's running and waiting requests, and the gateway's in flight and held, summed over its tasks."""
+    measured = [
+        _engine(f"{legend} {{{{{INSTANCE}}}}}", _per_instance(rules.engine_selector(pool, quantity), "sum"))
+        for quantity, legend in ((Quantity.RUNNING_REQUESTS, "running"), (Quantity.WAITING_REQUESTS, "waiting"))
+    ]
+    measured += [
+        rules.Series(legend, f"sum by ({rules.POOL}) ({rules.selector(gauge, _gateway(pool))})")
+        for gauge, legend in ((GATEWAY_IN_FLIGHT, "gateway in flight"), (GATEWAY_HELD, "gateway held"))
+    ]
+    return measured
+
+
+def students(pool: Pool) -> str:
+    """The pool's aliases with a request in the last five minutes, each counted once, however many
+    gateway tasks counted its requests: each series whose count rose in the window, or appeared in
+    it (a series appears holding its first request), then one per alias, then the aliases."""
+    series = rules.selector(STUDENT_REQUESTS + rules.COUNTER_SAMPLE, _gateway(pool), matching={ALIAS: ".+"})
+    window = STUDENT_WINDOW
+    active = f"(increase({series}[{window}]) > 0) or ({series} unless {series} offset {window})"
+    return f"count by ({rules.POOL}) (count by ({rules.POOL}, {ALIAS}) ({active}))"
+
+
+def students_per_instance(pool: Pool) -> list[rules.Series]:
+    """The students at work over the instances in service: an average, none while none is in service."""
+    return [rules.Series("students per instance", f"({students(pool)}) / {_in_service(pool)}")]
+
+
+def per_gpu(pool: Pool) -> list[rules.Series]:
+    """Output tokens per GPU-hour, over the instances in service, and per joule, over the energy the
+    GPUs used: none for a pool whose engine is the mock, which has no GPU."""
+    if pool.engine == MOCK:
+        return []
+    output = rules.engine_rate(pool, Quantity.OUTPUT_TOKENS)
+    joules = rules.rate(gpu.ENERGY_SERIES, _gateway(pool))
+    return [
+        _engine("tokens per GPU-hour", f"{output} * {SECONDS_AN_HOUR} / {_in_service(pool)}"),
+        _engine("tokens per joule", f"{output} / ({joules} > 0)", axis=TOKENS_A_JOULE),
+    ]
+
+
+def cost_panels(pool: Pool) -> list[stat_builders.Panel]:
+    """The cost dashboard's estimated cost per million output tokens: over the dashboard's range,
+    and over the month so far, by the panel's own relative time while the range is relative."""
+    over_range = cost.per_million_stat(pool, of_session=True).title(COST_RANGE)
+    month = cost.per_million_stat(pool, of_session=False).title(COST_MONTH).time_from(THIS_MONTH)
+    return [over_range, month]
+
+
 def _flag(panel: timeseries_builders.Panel, threshold: float) -> timeseries_builders.Panel:
     """Red below the threshold, green from it: the line, and the area under it, are drawn.
 
@@ -261,13 +429,14 @@ def _flag(panel: timeseries_builders.Panel, threshold: float) -> timeseries_buil
     )
 
 
-def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel]:
+def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel | stat_builders.Panel]:
     """The row of the pool: each panel that has a measured series, in the order of `TITLES`.
 
     Reference lines are drawn beside the measured series, and do not keep a panel on their own.
     """
     speed_series, speed_lines = speed(pool, config)
     first_series, first_lines = first_token(pool, config)
+    cache_series, cache_lines = cache(pool)
     rows: list[tuple[str, list[rules.Series], list[rules.Series], str]] = [
         (SPEED, speed_series, speed_lines, "short"),
         (THROUGHPUT, throughput(pool), [], "short"),
@@ -276,8 +445,13 @@ def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel]:
         (PREFILL, prefill(pool), [], "short"),
         (TRANSCRIPT, transcript(pool), [], "short"),
         (CACHED_SHARE, cached_share(pool), [], "percentunit"),
+        (CACHE, cache_series, cache_lines, "percentunit"),
+        (FORGOT, forgotten(pool), [], "s"),
+        (STREAMS, streams(pool), [], "short"),
+        (STUDENTS, students_per_instance(pool), [], "short"),
+        (PER_GPU, per_gpu(pool), [], "short"),
     ]
-    found = []
+    found: list[timeseries_builders.Panel | stat_builders.Panel] = []
     for title, measured, references, unit in rows:
         if not measured:
             continue
@@ -285,12 +459,12 @@ def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel]:
         if title == CACHED_SHARE:
             panel = _flag(panel.max(1), config.cached_share_flag_percent / 100)
         found.append(panel)
-    return found
+    return [*found, *cost_panels(pool)]
 
 
 def dashboard(config: Config) -> dashboard_builders.Dashboard:
-    """The dashboard, with one row for each pool of the configuration, in its order."""
-    built = dashboard_builders.Dashboard(TITLE).uid(UID)
+    """The dashboard, with one row for each pool of the configuration, in its order, in UTC."""
+    built = dashboard_builders.Dashboard(TITLE).uid(UID).timezone(TIME_ZONE)
     for pool in config.pools:
         built.with_row(dashboard_builders.Row(pool.name))
         for panel in panels(pool, config):
