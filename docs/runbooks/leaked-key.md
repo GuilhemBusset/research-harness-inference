@@ -1,11 +1,13 @@
 # A leaked key
 
 Over a term, a student will probably leak a key: pushed in a homework branch, pasted in a chat,
-left in a harness's settings file (system design, section 13). A leaked key gives inference
-during sessions, in that student's name, and nothing else: the gateway serves it only while a
-session is on, and a key carries no other privilege. It keeps working until it is revoked, or
-until it expires at the course end. Revoking it is the fix. A revoked key stops working within 60
-seconds, which is the gateway's lookup cache (section 6.4).
+left in a harness's settings file (system design, section 13). A leaked key gives inference in
+that student's name, and nothing else: a key carries no other privilege. Once the gateway enforces
+the session switch (issue E4-41, see the runbook `session-on-and-off.md`), it serves a key only
+while a session is on; until that gateway is deployed, it serves the key at any hour. Either way
+the key keeps working until it is revoked, or until it expires at the course end, so revoke it at
+once, whether a session is on or not. Revoking it is the fix. A revoked key stops working within
+60 seconds, which is the gateway's lookup cache (section 6.4).
 
 This runbook shows no key, not even an invented one: the hygiene scanner refuses anything shaped
 like one. A key starts with the prefix `rhi_`, followed by random characters and a checksum.
@@ -79,8 +81,32 @@ A key that only expired at the course end is not a leak: there is nothing to rev
    The `increase` is taken on each series first, each gateway task's apart, and only then summed:
    a task's counters restart from zero when it starts, and summing first would hide that. Choose
    the "Instant" query type to get one number per pool for the whole range. Prometheus
-   extrapolates at the edges of the range, so the result is an estimate, close enough to tell the
-   student what their alias spent.
+   extrapolates at the edges of the range, so the result is an estimate.
+
+   It can also undercount, down to nothing. A gateway task creates an alias's series for a pool
+   only when it counts that alias's first request there, so the first sample of a series already
+   holds that request, and `increase` sees no change from it: a single request, or the first
+   request of each task, can be missing from the total. A zero or an empty result therefore does
+   not show that the key was not used. When the result is zero, empty or small, cross-check with
+   the gateway's own log, which holds one record per request with the alias, the pool, the time and
+   the tokens, and no prompt: in the AWS console, open CloudWatch, then Logs Insights, select the
+   log group `/rhi/gateway`, set the same time range, and run, with the student's alias in place
+   of `ALIAS`:
+
+   ```text
+   filter alias = "ALIAS"
+   | stats count(*) as requests, sum(input_tokens) as input, sum(output_tokens) as output by pool
+   ```
+
+   When the hours matter, list each request instead:
+
+   ```text
+   filter alias = "ALIAS"
+   | fields time, pool, input_tokens, output_tokens, status, cause
+   | sort time asc
+   ```
+
+   The log group keeps each record for 90 days (section 6.6): older requests are no longer in it.
 
    Read what the panels show as an indicator, never as proof of who sent a request. The dashboard
    counts by alias, not by key, and the student's own key and the leaked key draw under the same
