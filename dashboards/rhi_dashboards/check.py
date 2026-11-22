@@ -5,7 +5,7 @@ without the helpers is held to the same rules as one made with them. It reports:
 
 | Rule | What breaks it |
 | --- | --- |
-| `data-source` | A query, or anything else in the dashboard, that names none of the two fixed data sources, nor one of Grafana's own two: its server-side expressions, or the mixed source of a panel whose queries each name their own |
+| `data-source` | A query, or anything else in the dashboard, that names none of the two fixed data sources, nor one of Grafana's own two: its server-side expressions, or the mixed source of a panel whose queries each name their own; a query that names the mixed source itself |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
 | `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine counter, or a histogram's buckets or count, read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again. An engine gauge always does: it falls as well as rises, and what its samples "added" is no count |
 | `session` | In a panel of one value, a query, shown, that reads the session gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
@@ -401,8 +401,12 @@ def _panel_problems(
     counts: set[tuple[str, frozenset[tuple[str, str, str]], str | None]] = set()
     asleep_for: set[str] = set()
     for target in targets:
-        if target.get("datasource") is None:
+        source = target.get("datasource")
+        if source is None:
             yield Violation("data-source", where, f"query {target.get('refId')!r} names no data source")
+        elif isinstance(source, dict) and source.get("uid") == rules.MIXED.uid:
+            # The mixed source only routes a panel's queries to their own: a query needs a real one.
+            yield Violation("data-source", where, f"query {target.get('refId')!r} names the mixed source, not its own")
         if not _is_prometheus(target):
             continue
         try:

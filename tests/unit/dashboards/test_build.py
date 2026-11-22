@@ -372,6 +372,9 @@ def test_a_query_names_a_fixed_data_source_and_the_row_of_its_pools_engine(examp
     ):
         found = check.violations(document(computed(panel_source, expression_source)), requests, example.pools)
         assert rules_broken(found) == {"data-source"}, (panel_source, expression_source)
+    # The mixed source routes a panel's queries; a query that names it has no source of its own.
+    found = check.violations(document(by_hand(rules.MIXED).datasource(rules.MIXED)), requests, example.pools)
+    assert "data-source" in rules_broken(found)
 
     # An engine's metric is queried for a configured pool, in the names of that pool's engine.
     engine = [rules.FromEngineTable(Quantity.OUTPUT_TOKENS)]

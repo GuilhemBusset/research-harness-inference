@@ -197,12 +197,14 @@ def test_today_is_the_last_utc_day_of_the_months_hourly_points(example: rhi_conf
             day = by_ref["D"]
             count = searched(day["expression"])[0]
             assert day["expression"] == f"IF(DATE({count}) == MAX(DATE({count})), {count})"
-            assert (day["id"], day["hide"], day["region"], day["period"], day["metricEditorMode"]) == (
+            # Grafana's CloudWatch backend refuses a query with no statistic, metric math included.
+            assert (day["id"], day["hide"], day["region"], day["period"], day["metricEditorMode"], day["statistic"]) == (
                 "d",
                 True,
                 "default",
                 "3600",
                 1,
+                "Sum",
             )
 
 
@@ -256,8 +258,14 @@ def test_the_tokens_are_counted_from_the_windows_start_by_the_samples_taken_in_i
     step = f"sum(((({latest} - {before}) >= 0) or {latest}))"
     after_start = "and on () (vector(time()) > ${__from:date:seconds})"
     assert f"sum_over_time(({step} {after_start})[${{__range_ms}}ms:60s])" in expression
-    # From the last minute's step to the window's end; nothing is taken off what the steps counted.
-    since = f"(sum(((({latest} - last_over_time({latest}[60s:60s])) >= 0) or {latest}))) or vector(0)"
+    # From the last minute's step to the window's end, or from its start where no minute falls in
+    # it (a window from 00:30 to 00:50 counts nothing from 00:00); nothing is taken off the steps.
+    no_step = "vector(time() - time() % 60) < ${__from:date:seconds}"
+    last_before = (
+        f"((last_over_time({latest}[60s:60s]) unless on () ({no_step}))"
+        f" or (last_over_time({series}[5m] @ ${{__from:date:seconds}}) and on () ({no_step})))"
+    )
+    since = f"(sum(((({latest} - {last_before}) >= 0) or {latest}))) or vector(0)"
     assert expression.endswith(f" + ({since})) > 0")
     assert not re.search(r"-\s*\(+sum\(", expression)
 

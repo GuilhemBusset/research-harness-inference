@@ -58,7 +58,7 @@ that settled and was removed between two minutes is counted. At every minute of 
 its start, the series' latest sample is compared with its latest a minute before, or, at the first
 minute, with its latest at the window's start, so nothing settled before the start is counted and a
 restart in that first minute keeps what the series settled after it; from the last minute to the
-window's end, the same. A restart inside a minute leaves out what the series settled in that minute
+window's end, the same, from the window's start where no minute falls inside it. A restart inside a minute leaves out what the series settled in that minute
 before it. Grafana's server-side expressions divide the dollars, from CloudWatch, by the tokens,
 from Prometheus, in millions.
 
@@ -220,6 +220,8 @@ def today(pool: Pool, ref_id: str) -> cloudwatch_builders.MetricsQuery:
         .id(ref_id.lower())
         .ref_id(ref_id)
         .hide(True)
+        # Grafana's CloudWatch backend refuses a query with no statistic, even one of metric math.
+        .statistic("Sum")
         .region(OWN_REGION)
         .period(str(PERIOD))
         .datasource(rules.CLOUDWATCH)
@@ -289,7 +291,7 @@ def output_tokens(pool: Pool) -> str:
     """The output tokens the gateway settled for the pool over the panel's window, read at its end:
     summed over the minutes of the window after its start, each step counted from the series' latest
     sample a minute before, or at the window's start for the first, and from its last minute to its
-    end; none where that is no token."""
+    end, or from its start where no minute falls inside it; none where that is no token."""
     series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
     latest = f"last_over_time({series}[{LOOKBACK}])"
     first = f"vector(time()) - {TOKEN_STEP_SECONDS} < {WINDOW_START}"
@@ -299,7 +301,12 @@ def output_tokens(pool: Pool) -> str:
     before = f"(({a_step_before} unless on () ({first})) or ({at_start} and on () ({first})))"
     after_start = f"vector(time()) > {WINDOW_START}"
     steps = f"sum_over_time((sum({settled(latest, before)}) and on () ({after_start}))[{WINDOW}:{TOKEN_STEP}])"
-    since_last_step = f"sum({settled(latest, f'last_over_time({latest}[{TOKEN_STEP}:{TOKEN_STEP}])')})"
+    # From the last step to the end: its latest at the last step, the multiple of a step at or before
+    # the end, unless that is before the start (no step falls in the window); then its latest at the start.
+    at_last_step = f"last_over_time({latest}[{TOKEN_STEP}:{TOKEN_STEP}])"
+    no_step = f"vector(time() - time() % {TOKEN_STEP_SECONDS}) < {WINDOW_START}"
+    last_before = f"(({at_last_step} unless on () ({no_step})) or ({at_start} and on () ({no_step})))"
+    since_last_step = f"sum({settled(latest, last_before)})"
     total = " + ".join(f"(({one}) or vector(0))" for one in (steps, since_last_step))
     return f"({total}) > 0"
 
