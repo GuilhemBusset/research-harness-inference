@@ -103,7 +103,6 @@ def test_pool_deadlines_and_keepalive_parameter(streams: bool) -> None:
 @pytest.mark.parametrize("streams", [True, False])
 @pytest.mark.parametrize(("mode", "cause"), [
     (Mode.DISABLED, Cause.POOL_DISABLED),
-    (Mode.BUDGET_LATCHED, Cause.POOL_CEILING_REACHED),
     (Mode.SCHEDULED_ONLY, Cause.POOL_SCHEDULED_ONLY),
 ])
 def test_stopped_requests_return_only_the_immediate_cause(mode: Mode, cause: Cause, streams: bool) -> None:

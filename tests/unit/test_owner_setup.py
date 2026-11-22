@@ -548,8 +548,9 @@ def test_the_configuration_comes_from_outside_the_tree(walkthrough: Walkthrough)
         assert "inside the working tree" in refused.stderr
         assert walkthrough.called("uv") == []
 
-    # Files outside the tree that the loader refuses: a session window, and a missing key.
-    with_a_window = EXAMPLE.replace("session_windows = []", f'session_windows = ["Monday 09:00 {MARK}"]')
+    # Files outside the tree that the loader refuses: a session window, and a missing key. The
+    # retired key goes first, before the pool tables, where TOML reads it as a key of the file.
+    with_a_window = f'session_windows = ["Monday 09:00 {MARK}"]\n' + EXAMPLE
     without_the_domain = EXAMPLE.replace('domain = "example.com"', "").replace("admin@", f"admin{MARK}@")
     for text, key in ((with_a_window, "session_windows"), (without_the_domain, "domain")):
         assert text != EXAMPLE
@@ -605,6 +606,15 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
     assert owner_config.main(["write", str(file)], written) == 0
     assert written.put == expected.put
     assert {"Name": "/rhi/config/domain", "Value": "example.org", "Type": "String", "Overwrite": True} in written.put
+
+    # A file that still holds the retired session windows, empty, writes the same parameters, and
+    # nothing in the setup writes or asks for them.
+    file.write_text("session_windows = []\n" + EXAMPLE.replace("example.com", "example.org"), encoding="utf-8")
+    retired = Parameters()
+    assert owner_config.main(["write", str(file)], retired) == 0
+    assert retired.put == expected.put
+    assert not any("session_windows" in request["Name"] for request in retired.put)
+    assert "session_windows" not in (REPO / "setup/owner-setup.sh").read_text(encoding="utf-8")
 
     # A check writes nothing, and a file the loader refuses is refused before anything is written.
     assert owner_config.main(["check", str(file)], untouched) == 0

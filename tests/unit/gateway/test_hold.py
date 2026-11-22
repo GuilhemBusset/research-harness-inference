@@ -169,7 +169,6 @@ def test_no_capacity_ends_the_hold_with_capacity_unavailable() -> None:
     ("mode", "scaler_note", "cause"),
     [
         (Mode.DISABLED, note(capacity_asked=1), "pool_disabled"),
-        (Mode.BUDGET_LATCHED, note(capacity_asked=1), "pool_ceiling_reached"),
         (Mode.SCHEDULED_ONLY, note(capacity_asked=0), "pool_scheduled_only"),
         (Mode.SCHEDULED_ONLY, None, "pool_scheduled_only"),
     ],
@@ -182,6 +181,13 @@ def test_stopped_pools_are_not_held(mode: Mode, scaler_note: ScalerNote | None, 
     assert first == (End(Cause(cause)),), "the end and nothing else: no wake, no keep-alive"
     assert run(machine, until=600, mode=mode, scaler_note=scaler_note) == []
     assert machine.next_at is None
+
+
+def test_only_a_disabled_pool_ends_whatever_is_in_service() -> None:
+    # The first rule: a ready pool is forwarded in every mode but `disabled`.
+    for mode in Mode:
+        first = hold().step(START, mode=mode, note=note(capacity_asked=1), ready=True)
+        assert (first == (End(Cause.POOL_DISABLED),)) == (mode is Mode.DISABLED), mode
 
 
 def test_a_scheduled_pool_is_never_woken() -> None:

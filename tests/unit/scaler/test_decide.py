@@ -182,14 +182,14 @@ def test_a_replaced_gateway_task_is_not_idleness() -> None:
 
 def test_stopped_pools_are_not_woken() -> None:
     held = gateway(held=3, last_request_at=NOW)
-    for mode in (Mode.DISABLED, Mode.BUDGET_LATCHED, Mode.SCHEDULED_ONLY):
+    for mode in (Mode.DISABLED, Mode.SCHEDULED_ONLY):
         asleep = decide_one(pool_inputs(AT_ZERO, held, mode=mode))
         assert (asleep.desired, asleep.lift_protection, asleep.reason) == (0, (), Reason.NOT_WOKEN)
 
     # One busy and one idle instance, and a request received this second.
     busy, idle = instance("instance-a", running=1), instance("instance-b")
     demand = gateway(in_flight=1, last_request_at=NOW)
-    for mode in (Mode.DISABLED, Mode.BUDGET_LATCHED):
+    for mode in (Mode.DISABLED,):
         stopped = decide_one(pool_inputs(TWO_IN_SERVICE, demand, mode=mode, instances=(busy, idle)))
         assert (stopped.desired, stopped.lift_protection, stopped.reason) == (1, ("instance-b",), Reason.STOPPED)
         # Waiting requests, or a report that is no longer fresh, keep an instance.
@@ -202,6 +202,10 @@ def test_stopped_pools_are_not_woken() -> None:
     # Nobody asked to stop a scheduled-only pool: only idleness lowers it.
     scheduled = pool_inputs(TWO_IN_SERVICE, demand, mode=Mode.SCHEDULED_ONLY, instances=(busy, idle))
     assert (decide_one(scheduled).desired, decide_one(scheduled).lift_protection) == (2, ())
+    # The disabled mode is the only one that stops a pool.
+    for mode in Mode:
+        reason = decide_one(pool_inputs(TWO_IN_SERVICE, demand, mode=mode, instances=(busy, idle))).reason
+        assert (reason is Reason.STOPPED) == (mode is Mode.DISABLED), mode
 
 
 def test_the_decision_is_a_function_of_its_inputs_alone() -> None:

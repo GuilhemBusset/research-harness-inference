@@ -32,11 +32,10 @@ monthly_budget_usd = 1000
 # one budget can hold). Left out, they are 50, 80 and 100.
 budget_alert_percentages = [50, 80, 100]
 
-# The schedule: the time zone its times are in, the day the course ends, and the session windows.
+# The schedule: the time zone its times are in, and the day the course ends. Sessions have no
+# schedule: the instructor switches them on and off.
 time_zone = "Etc/UTC"
 course_end = 2099-12-31
-# Entries have no shape yet: the loader refuses any.
-session_windows = []
 
 # Whether the public load balancer has its certificate, its HTTPS listener on 443 and the domain's
 # alias record. Left out, it reads false: the owner turns it on once the domain resolves through
@@ -211,8 +210,7 @@ parked = false
 # publisher's 8-bit build (evidence E28), at the revision its manifest pins
 # (models/manifests/qwen--qwen3.8-27b-fp8.json), served by vLLM on g7e.2xlarge, one 96 GB GPU at
 # 3.36 dollars an hour (evidence E5), with no fallback type. Two instances at most, both kept warm.
-# The hold, the idle time and the drain are the defaults of section 17, written out. The daily
-# ceiling covers two instances through a four-hour session (section 11.3). The context is the
+# The hold, the idle time and the drain are the defaults of section 17, written out. The context is the
 # model's full 262,144 tokens, which keeps Claude Code clear of a context error it cannot recover
 # from (sections 4.2 and 6.1); the largest output is the 32,000 tokens Claude Code asks for
 # (evidence E15).
@@ -240,7 +238,6 @@ target_concurrency = 8
 hold_seconds = 420
 idle_minutes = 20
 drain_seconds = 300
-gpu_hours_per_day = 16
 context_length = 262144
 largest_output = 32000
 kv_cache_bits = 8

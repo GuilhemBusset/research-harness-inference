@@ -16,8 +16,8 @@ time is in seconds on the clock of the scaler's note, since the epoch.
 
 The rules, in the order a step applies them while the request is held:
 
-1. A pool in mode `disabled` or `budget-latched` takes no request, whatever is in service: the
-   request ends with `pool_disabled` or `pool_ceiling_reached`.
+1. A pool in mode `disabled` takes no request, whatever is in service: the request ends with
+   `pool_disabled`.
 2. A ready pool has the request forwarded. The hold's deadline no longer applies.
 3. Students cannot wake a `scheduled-only` pool. With no capacity asked for by a schedule or the
    admin, the request ends with `pool_scheduled_only`; with some, it is held and no wake is asked.
@@ -60,8 +60,8 @@ HELD_HEADER = "x-rhi-held"
 _PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 _COMMENT = b": keep-alive\n\n"
 
-# The modes of a pool that will not start for anyone, and the cause each gives.
-_STOPPED = {Mode.DISABLED: Cause.POOL_DISABLED, Mode.BUDGET_LATCHED: Cause.POOL_CEILING_REACHED}
+# The modes of a pool that will not start for anyone, and the cause each gives: `disabled` alone.
+_STOPPED = {Mode.DISABLED: Cause.POOL_DISABLED}
 
 
 @dataclass(frozen=True)

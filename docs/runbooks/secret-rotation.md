@@ -416,7 +416,7 @@ the next run uses the new key.
        pool must stop serving meanwhile.
    - `invalid_key`: the canary's key, not the pool's secret: the canary has no valid key (its
      part, below).
-   - `concurrency_limit`, `capacity_unavailable`, `pool_ceiling_reached`, `time_limit`: nothing
+   - `concurrency_limit`, `capacity_unavailable`, `time_limit`: nothing
      to do with the bearer secret; the rotation is not tested yet. Send the request again once the
      cause has passed (for capacity, runbook [a capacity failure](capacity-failure.md)).
 

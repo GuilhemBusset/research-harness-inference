@@ -20,7 +20,6 @@ DESIGN = {
     "not_found": (404, None),
     "request_refused": (400, None),
     "concurrency_limit": (429, 5),
-    "pool_ceiling_reached": (402, None),
     "warming": (503, 30),
     "capacity_unavailable": (503, 60),
     "pool_scheduled_only": (503, None),
@@ -53,7 +52,7 @@ def read_event(raw: bytes) -> tuple[str | None, object]:
 
 def test_statuses_are_the_designs() -> None:
     assert {cause.value: (cause.status, cause.retry_after) for cause in Cause} == DESIGN
-    assert len(Cause) == 11
+    assert len(Cause) == 10
 
     for name, (status, seconds) in DESIGN.items():
         for wire in FORMATS:

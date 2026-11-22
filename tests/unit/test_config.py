@@ -31,7 +31,6 @@ OWNERS_KEYS = {
     "monthly_budget_usd",
     "time_zone",
     "course_end",
-    "session_windows",
     "pools",
 }
 
@@ -109,7 +108,6 @@ def test_the_two_sources_give_the_same_typed_object(tmp_path: Path) -> None:
     assert from_example.domain == "example.com"
     assert type(from_example.monthly_budget_usd) is int
     assert type(from_example.course_end) is datetime.date
-    assert from_example.session_windows == ()
     assert [pool.name for pool in from_example.pools] == ["coursework", "mock"]
     # The file source reads its own file, not the example.
     assert load_text(tmp_path, example_with(github_owner='"another-owner"')).github_owner == "another-owner"
@@ -203,7 +201,6 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("time_zone", f'"../zone{MARK}"'),
         ("course_end", f'"{MARK}-01-01"'),
         ("course_end", f"{MARK}-01-01T10:00:00"),
-        ("session_windows", f'"{MARK}"'),
         ("pools", f'"{MARK}"'),
         ("pools", f"[{MARK}]"),
         ("allowed_instance_types", f'"{MARK}"'),
@@ -237,6 +234,24 @@ def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) 
     assert repr(key) in message
     assert "'file'" in message
     assert MARK not in message
+
+
+def test_the_retired_session_windows_load_only_as_an_empty_list(tmp_path: Path) -> None:
+    # The deployed configuration may still hold the key (ADR 0003, decision 2): an empty list loads
+    # as if the source did not hold it, and nothing else does. The key goes before the pool tables,
+    # where TOML reads it as a key of the configuration.
+    assert not hasattr(config.load({"RHI_CONFIG": "example"}), "session_windows")
+    assert "session_windows" not in config.KEYS
+    assert load_text(tmp_path, "session_windows = []\n" + example_with()) == load_text(tmp_path, example_with())
+    for text in (
+        f'session_windows = ["Monday 09:00 {MARK}"]\n' + example_with(),
+        f'session_windows = [{{ name = "entry{MARK}" }}]\n' + example_with(),
+        f'session_windows = "{MARK}"\n' + example_with(),
+        example_with() + f'[[session_windows]]\nname = "entry{MARK}"\n',
+    ):
+        message = refusal(tmp_path, text)
+        assert repr("session_windows") in message
+        assert MARK not in message
 
 
 def test_a_default_fills_a_missing_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,14 +434,9 @@ def test_only_the_owners_keys_are_required(tmp_path: Path, monkeypatch: pytest.M
     assert config.required_keys() == OWNERS_KEYS
     assert {field.name for field in dataclasses.fields(config.Config)} == set(config.KEYS)
 
-    # A valid pool entry is accepted, as a table or inline; a session window is not, in either spelling.
+    # A valid pool entry is accepted, as a table or inline.
     assert [pool.name for pool in load_text(tmp_path, example_with()).pools] == ["coursework", "mock"]
     assert [pool.name for pool in load_text(tmp_path, with_the_mock_pool_alone()).pools] == ["mock"]
-    for text in (example_with(session_windows=f'[{{ name = "entry{MARK}" }}]'),
-                 example_with(session_windows=None) + f'[[session_windows]]\nname = "entry{MARK}"\n'):
-        message = refusal(tmp_path, text)
-        assert repr("session_windows") in message
-        assert MARK not in message
 
     # The set is derived: a key added with no default, and not optional, would be required.
     monkeypatch.setitem(config.KEYS, "later_key", config.KEYS["domain"])
@@ -518,7 +528,7 @@ def test_the_example_coursework_pool() -> None:
     assert (coursework.instance_types, coursework.prices) == (("g7e.2xlarge",), {"g7e.2xlarge": 3.36})
     assert "g7e.2xlarge" in loaded.allowed_instance_types
     assert (coursework.max_instances, coursework.warm_instances, coursework.wake) == (2, 2, "on-demand")
-    assert (coursework.target_concurrency, coursework.gpu_hours_per_day) == (8, 16)
+    assert coursework.target_concurrency == 8
     assert (coursework.hold_seconds, coursework.idle_minutes, coursework.drain_seconds) == (420, 20, 300)
     assert (coursework.context_length, coursework.largest_output) == (262144, 32000)
     # The estimates of section 4.7, and no measured start until spike S1 has one.

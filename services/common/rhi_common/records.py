@@ -70,7 +70,6 @@ class Mode(StrEnum):
     ENABLED = "enabled"
     SCHEDULED_ONLY = "scheduled-only"
     DISABLED = "disabled"
-    BUDGET_LATCHED = "budget-latched"
 
 
 # The mode of a pool that has no mode record, by the `wake` of its configuration (section 11.3):

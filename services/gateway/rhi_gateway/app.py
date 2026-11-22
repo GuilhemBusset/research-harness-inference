@@ -32,9 +32,9 @@ request, and the settlement stores that number (section 5.5).
 the pool can serve is read from the values the gateway keeps of it (`rhi_gateway.readiness`),
 never from AWS, and what to do is the hold's rule (`rhi_gateway.hold`), stepped on the gateway's
 clock at each moment the rule names and at least once a second. The rule's first step is taken
-before the reservation: a request it ends at once (`pool_disabled`, `pool_ceiling_reached`,
-`pool_scheduled_only`) is refused with nothing reserved, and a pool already ready is forwarded with
-no hold. Otherwise the reservation is made, and only then is the scaler asked to wake the pool
+before the reservation: a request it ends at once (`pool_disabled`, `pool_scheduled_only`) is
+refused with nothing reserved, and a pool already ready is forwarded with no hold. Otherwise the
+reservation is made, and only then is the scaler asked to wake the pool
 (`rhi_gateway.waker.Waker.ask`), at once and every 15 seconds while the request is held:
 
 - a stream is answered 200 at once with the keep-alives of its format, and the engine's stream

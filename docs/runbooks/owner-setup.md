@@ -277,16 +277,15 @@ repository and nothing else is part of the trust boundary (section 8.4; ADR 0001
 | `login_client_id` | The client ID of the student login App of step 3 |
 | `monthly_budget_usd` | The monthly budget, in whole US dollars |
 | `time_zone`, `course_end` | The IANA time zone of the schedule, and the day the course ends |
-| `session_windows` | An empty list for now: `[]` |
 | `pools` | An empty table for now: `pools = {}` |
 
-The loader requires every one of these keys. It refuses a session window until the change that
-gives windows their shape, so that list stays empty. A pool is a `[pools.<name>]` table, which
-the loader checks with the pool parser; the mock pool of `config.example.toml` is the first one
-added. Three keys go with the pools and may be left out: `allowed_instance_types` (by default the
+The loader requires every one of these keys. Sessions have no schedule in the configuration: the
+instructor switches them on and off ([session on and off](session-on-and-off.md)). A pool is a
+`[pools.<name>]` table, which the loader checks with the pool parser; the mock pool of
+`config.example.toml` is the first one added. Three keys go with the pools and may be left out: `allowed_instance_types` (by default the
 instance types the pools list), `on_demand_price_limit` (5 dollars an hour by default) and
-`default_pool` (by default the only pool; with two pools or more it must be given). The windows
-and each pool, with its GPU-hour ceilings, are added later, by running this step again.
+`default_pool` (by default the only pool; with two pools or more it must be given). Each pool is
+added later, by running this step again.
 
 **Command.**
 
@@ -319,9 +318,8 @@ object: none while the table is empty.
 aws ssm get-parameters-by-path --path /rhi/config/ --recursive --query 'Parameters[].Name' --output text
 ```
 
-**Decision.** 10, for the domain. 1, dates, for the course end date and, later, the session
-windows. 6, money, for the monthly budget and, later, each pool's GPU-hour ceilings. 9, for the
-region the parameters are written in. The first deployment of step 6 reads this configuration.
+**Decision.** 10, for the domain. 1, dates, for the course end date. 6, money, for the monthly
+budget. 9, for the region the parameters are written in. The first deployment of step 6 reads this configuration.
 
 ## 4b. Write the list of real values the scanner checks for
 

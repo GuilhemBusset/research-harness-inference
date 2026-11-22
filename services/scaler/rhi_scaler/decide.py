@@ -13,7 +13,7 @@ The rules here take a pool from zero, grow it, even its load out, and take it ba
 | rebalance | An instance in service that has reported waiting requests for 60 seconds, while another instance in service runs fewer requests than half of `target_concurrency`: the pool's rebalance number goes up by one, at most once every `rebalance_interval_seconds`. The size is what the other rules make it |
 | n to n - 1 | Two instances or more in service and none starting or leaving, the requests in flight at most (n - 1) times half of `target_concurrency` for 10 minutes, 15 minutes after the last scale-out, in a pool nobody stopped: one instance fewer, one that reports nothing running and nothing waiting, and none when no instance does |
 | to 0 | No request received and none in flight or held for `idle_minutes`, in any mode: zero, naming every instance |
-| stop | Mode `disabled` or `budget-latched`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
+| stop | Mode `disabled`: never woken; each instance that reports nothing running and nothing waiting is released at once, and one that reports work is kept, whatever the gateways report |
 | gateway silent | No fresh gateway heartbeat for 10 minutes, in any mode: zero, naming every instance, even one that reports work |
 | launch loop | Three launches abandoned in a row: suspend the group's launches and set the mark; nothing wakes or grows the pool until the admin clears it |
 
@@ -71,8 +71,8 @@ from __future__ import annotations
 from rhi_common.records import Mode, is_fresh
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
-# The modes of a pool somebody stopped: the admin, or the budget.
-STOPPED_MODES = frozenset({Mode.DISABLED, Mode.BUDGET_LATCHED})
+# The modes of a pool somebody stopped: the admin's `disabled`, and nothing else.
+STOPPED_MODES = frozenset({Mode.DISABLED})
 # How long the instances in service must have been full before the pool grows.
 SCALE_OUT_SECONDS = 60
 # How long an instance must have reported waiting requests before the pool is lopsided.

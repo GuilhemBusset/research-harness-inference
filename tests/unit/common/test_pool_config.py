@@ -30,7 +30,6 @@ COURSEWORK = {
     "hold_seconds": 420,
     "idle_minutes": 20,
     "drain_seconds": 300,
-    "gpu_hours_per_day": 16,
     "context_length": 262144,
     "largest_output": 32000,
 }
@@ -60,8 +59,17 @@ def test_coursework_entry_parses_to_section_4_2() -> None:
     assert (pool.max_instances, pool.warm_instances, pool.wake) == (2, 2, "on-demand")
     assert pool.target_concurrency == 8
     assert (pool.hold_seconds, pool.idle_minutes, pool.drain_seconds) == (420, 20, 300)
-    assert pool.gpu_hours_per_day == 16
     assert (pool.context_length, pool.largest_output) == (262144, 32000)
+
+
+def test_the_retired_gpu_hours_per_day_is_read_into_nothing() -> None:
+    # An entry written before the field was removed loads to the same pool as one without it.
+    (without,) = parse_pools({"coursework": COURSEWORK})
+    for value in (16, 0):
+        (with_hours,) = parse_pools({"coursework": changed(COURSEWORK, {"gpu_hours_per_day": value})})
+        assert with_hours == without
+    assert not hasattr(without, "gpu_hours_per_day")
+    assert "gpu_hours_per_day" not in pool_entry(without)
 
 
 def test_defaults_of_section_17() -> None:
@@ -80,7 +88,7 @@ def test_optional_fields() -> None:
     measured = changed(MOCK, {"measured_start_seconds": 95})
     mock, second = parse_pools({"mock": changed(MOCK, {"hold_seconds_non_streaming": 120}), "mock-2": measured})
     assert (mock.name, mock.engine, second.name) == ("mock", "mock", "mock-2")
-    assert (mock.model, mock.revision, mock.gpu_hours_per_day, mock.measured_start_seconds) == (None,) * 4
+    assert (mock.model, mock.revision, mock.measured_start_seconds) == (None,) * 3
     assert mock.hold_seconds_non_streaming == 120
     assert (mock.context_length, mock.largest_output) == (8192, 1024)
     assert second.measured_start_seconds == 95
@@ -103,7 +111,11 @@ def test_optional_fields() -> None:
         pytest.param("coursework", {"revision": REVISION[:39]}, "revision", id="revision-39-characters"),
         pytest.param("coursework", {"revision": ABSENT}, "revision", id="vllm-without-revision"),
         pytest.param("coursework", {"model": ABSENT}, "model", id="vllm-without-model"),
-        pytest.param("coursework", {"gpu_hours_per_day": ABSENT}, "gpu_hours_per_day", id="vllm-without-gpu-hours"),
+        # The retired field is still checked: a whole number not below 0, and nothing else.
+        *(
+            pytest.param("coursework", {"gpu_hours_per_day": value}, "gpu_hours_per_day", id=f"gpu-hours-{value}")
+            for value in (-1, 16.5, True, "16")
+        ),
         pytest.param("coursework", {"wake": "always"}, "wake", id="wake-unknown"),
         pytest.param("coursework", {"max_instances": 0, "warm_instances": 0}, "max_instances", id="max-below-1"),
         pytest.param("coursework", {"target_concurrency": 0}, "target_concurrency", id="concurrency-below-1"),
