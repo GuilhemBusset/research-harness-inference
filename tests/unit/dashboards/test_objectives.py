@@ -168,6 +168,40 @@ def test_the_targets_follow_the_configuration(example: rhi_config.Config) -> Non
     assert "above 85.4% " in objectives.cached_share(dataclasses.replace(other, cached_share_flag_percent=85.4)).measures[0].goal
 
 
+def test_a_target_between_two_boundaries_is_read_between_their_buckets(tmp_path: Path) -> None:
+    # A revised target the configuration takes, whose boundary the gateway does not count.
+    text = Path("config.example.toml").read_text(encoding="utf-8")
+    for key, value in (("target_ttft_p95_seconds", "6"), ("target_stream_median_tokens_per_second", "16")):
+        text = re.sub(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
+    (tmp_path / "revised.toml").write_text(text, encoding="utf-8")
+    config = rhi_config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(tmp_path / "revised.toml")})
+    found = by_name(config)
+    for objective, histogram, matchers, lower, upper, measure in (
+        ("Time to first token, warm pool", experience.FIRST_TOKEN, {"start": "warm", "turn": "first"}, 5, 7.5, 0),
+        ("Output speed per stream, warm pool", experience.SPEED, {"pool": "coursework", "start": "warm"}, 15, 17.5, 0),
+    ):
+        expression = found[objective].measures[measure].expression
+        bucket, count = (
+            rules.over_sessions(rules.minute_increase(f"{histogram}_{kind}", {**matchers, **extra}))
+            for kind, extra in (("bucket", {"le": objectives.boundary(lower)}), ("count", {}))
+        )
+        high = rules.over_sessions(rules.minute_increase(f"{histogram}_bucket", {**matchers, "le": objectives.boundary(upper)}))
+        # The two buckets the gateway counts around it, the target 0.4 of the way from the lower.
+        under = f"({bucket}) + (({high}) - ({bucket})) * 0.4"
+        assert expression in (f"({under}) / ({count})", f"(({count}) - ({under})) / ({count})")
+
+
+@pytest.mark.parametrize(("target", "selected"), [(4, {"4"}), (6, {"5", "7.5"}), (0.1, {"0.25"}), (2000, {"1800"})])
+def test_a_first_token_target_is_read_at_the_gateways_boundaries(
+    example: rhi_config.Config, target: float, selected: set[str]
+) -> None:
+    # At a boundary, its bucket; between two, both; under the first, the first; beyond the last, the last.
+    first, _ = objectives.first_token(dataclasses.replace(example, target_ttft_p95_seconds=target)).measures
+    read = {one["le"] for one in selectors(first.expression)[f"{experience.FIRST_TOKEN}_bucket"]}
+    assert read == selected
+    assert read <= {objectives.boundary(bound) for bound in experience.WAIT_BUCKETS}
+
+
 def test_a_percentile_is_judged_exactly_at_its_floor(example: rhi_config.Config) -> None:
     found = by_name(example)
     first, _ = found["Time to first token, warm pool"].measures
@@ -192,7 +226,7 @@ def test_a_boundary_is_selected_as_the_collector_writes_it() -> None:
     ]
 
 
-def test_the_floors_are_boundaries_the_gateway_counts_strictly_under(example: rhi_config.Config) -> None:
+def test_the_example_floors_are_boundaries_the_gateway_counts_strictly_under(example: rhi_config.Config) -> None:
     registry = CollectorRegistry()
     made = experience.Experience(registry)
     made.speed.labels("coursework", "messages", "warm").observe(1)

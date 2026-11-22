@@ -59,8 +59,7 @@ The objectives of section 7.3 are read from this histogram against floors held i
 the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
 a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
 waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
-read exactly, so each floor is a bucket boundary: the configuration takes as a floor, of a wait
-or of a speed, only a boundary of its histogram (`rhi_common.boundaries`, `rhi.config`).
+read exactly, so each floor of section 17 is a bucket boundary (`rhi_common.boundaries`).
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
@@ -109,8 +108,7 @@ INPUT_BUCKETS = (0, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 50_000, 75_000,
 OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000)
 
 # The seconds of both waits, and the tokens per second of a stream, are counted in the buckets of
-# `rhi_common.boundaries`, whose boundaries include the objectives' floors: the configuration takes
-# no other floor.
+# `rhi_common.boundaries`, whose boundaries include the objectives' floors.
 
 _LABELS = ("pool", "wire_format")
 _SPEED_LABELS = (*_LABELS, "start")

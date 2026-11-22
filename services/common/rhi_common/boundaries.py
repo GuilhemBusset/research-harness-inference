@@ -3,8 +3,9 @@ stream's speed (system design, sections 7.2 and 7.3).
 
 The gateway counts what students experience in these buckets (`rhi_gateway.experience`), and the
 objectives of section 7.3 are read at their floors (`rhi_dashboards.objectives`). A histogram
-reads a share exactly only at one of its boundaries, so the configuration takes as a floor only a
-boundary of its histogram (`rhi.config`): the two lists are here so that both read the same ones.
+reads a share exactly only at one of its boundaries, so the floors of section 17 are boundaries; a
+floor the configuration revises to fall between two is read between them. The two lists are here so
+that both read the same ones.
 """
 
 from __future__ import annotations

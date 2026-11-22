@@ -291,23 +291,13 @@ def test_the_provisional_targets_read_the_defaults_of_section_17_when_left_out(t
     example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
     assert {key: example.get(key) for key in TARGET_KEYS} == TARGET_KEYS
     moved = {
-        "target_ttft_p95_seconds": 4,
+        "target_ttft_p95_seconds": 3.5,
         "target_stream_median_tokens_per_second": 20,
         "target_stream_p10_tokens_per_second": 12.5,
         "cached_share_flag_percent": 90,
     }
     given = load_text(tmp_path, example_with(**{key: str(value) for key, value in moved.items()}))
     assert {key: getattr(given, key) for key in TARGET_KEYS} == moved
-
-
-@pytest.mark.parametrize(
-    ("key", "between"),
-    [("target_ttft_p95_seconds", 6), ("target_stream_median_tokens_per_second", 16), ("target_stream_p10_tokens_per_second", 11)],
-)
-def test_a_floor_between_two_boundaries_of_its_histogram_is_refused(tmp_path: Path, key: str, between: float) -> None:
-    # The objective would select a bucket the gateway never counts, and read no data.
-    with pytest.raises(config.ConfigError, match=f"the key '{key}' .* must be .* boundary of the gateway's histogram"):
-        load_text(tmp_path, example_with(**{key: str(between)}))
 
 
 def test_pipeline_events_retention_days_reads_90_when_left_out(tmp_path: Path) -> None:
