@@ -1,12 +1,14 @@
-"""What the admin CLI's tests run against: tables, secrets and a parameter that moto holds.
+"""What the admin CLI's tests run against: tables, secrets and a configuration that moto holds.
 
 The tables are found as a real run finds them, through the access stack's resources by logical
-ID, which a stub of CloudFormation answers. pytest finds the fixture `admin` by its name, so a
+ID, which a stub of CloudFormation answers. The configuration in SSM is the example's, written
+whole by the configuration's own writer, with the course end `COURSE_END`. pytest finds the fixture `admin` by its name, so a
 test file imports nothing from here.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import secrets
 from typing import TYPE_CHECKING, Any
@@ -16,6 +18,7 @@ import pytest
 from botocore.stub import Stubber
 from moto import mock_aws
 
+from rhi import config
 from rhi_admin import main
 from rhi_common.tables import KEYS, ROSTER, KeyAttribute, Table
 
@@ -73,7 +76,8 @@ def admin(monkeypatch: pytest.MonkeyPatch) -> Iterator[main.Admin]:
             main.ROSTER_LOGICAL_ID: _create(dynamodb, ROSTER).name,
             main.KEYS_LOGICAL_ID: _create(dynamodb, KEYS).name,
         }
-        real.client("ssm").put_parameter(Name=main.COURSE_END_PARAMETER, Value=COURSE_END.isoformat(), Type="String")
+        example = config.load({"RHI_CONFIG": "example"})
+        config.write_ssm(dataclasses.replace(example, course_end=COURSE_END), real.client("ssm"))
         cloudformation = real.client("cloudformation")
         with Stubber(cloudformation) as stub:
             for logical_id, name in names.items():

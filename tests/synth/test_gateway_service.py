@@ -267,6 +267,9 @@ def test_the_environment_is_what_the_gateway_reads(gateway: Gateway) -> None:
     assert read.pools == EXAMPLE.pools
     # The pool `claude-*` model names reach (section 6.2, step 4).
     assert read.default_pool is not None and read.default_pool.name == EXAMPLE.default_pool == "coursework"
+    # The course end the usage rows expire by (section 6.6), as the configuration gives it.
+    assert environment[gateway_settings.COURSE_END] == EXAMPLE.course_end.isoformat()
+    assert read.course_end == EXAMPLE.course_end
 
     stands_for = gateway.deployment.stands_for
     pools_path, pools = find(gateway.deployment.templates, "RhiPools")

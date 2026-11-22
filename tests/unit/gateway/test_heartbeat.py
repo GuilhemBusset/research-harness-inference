@@ -9,6 +9,7 @@ handler that answers when the test lets it. Every key is generated when the test
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from collections.abc import Callable
 from typing import Any
@@ -35,6 +36,8 @@ from rhi_gateway.readiness import Readiness
 from rhi_gateway.waker import EXPLICIT_WAKE_SECONDS, Waker
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 TASK = "0123456789abcdef"
 POOLS = parse_pools(
     {
@@ -177,7 +180,7 @@ class Gateway:
             concurrency_limit=4,
         )
         authenticator = Authenticator(InMemoryKeyStore(student), wall_clock=lambda: float(NOW))
-        ledger = InMemoryLedger(clock=lambda: float(NOW))
+        ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         forwarding = Forwarding(
             authenticator=authenticator,
             ledger=ledger,

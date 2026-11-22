@@ -121,6 +121,7 @@ def environment(**profiles: list[str]) -> dict[str, str]:
         "RHI_HEARTBEAT_TABLE": "heartbeats-of-the-test",
         "RHI_POOL_STATE_TABLE": "pool-state-of-the-test",
         "RHI_SCALER_FUNCTION": "scaler-of-the-test",
+        "RHI_COURSE_END": "2027-01-15",
     }
 
 

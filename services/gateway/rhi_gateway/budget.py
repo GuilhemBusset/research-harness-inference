@@ -25,8 +25,9 @@ reads the tokens a student has left of the day (`tokens_left`), and that writes 
 **The record** is the usage item of `rhi_common.students`, one per student and UTC day: `tokens`
 holds what was charged and what is reserved, `leases` the requests in flight. A request belongs
 to the day it started: its lease stays in that day's item, and its settlement goes there even
-after midnight. The item expires 90 days after the key's course end, the retention of every store
-(section 6.6). In the table, an item can also carry `opening`, for a minute after midnight at most
+after midnight. Every write of an item sets its expiry, `expires_at`, to the course end plus 90
+days (`rhi_common.retention`), the retention of every store (section 6.6): the ledger is given the
+course end, and an item written before keeps it no longer than that. In the table, an item can also carry `opening`, for a minute after midnight at most
 (see "Midnight"); the record leaves it out.
 
 **Midnight.** The budget is the day's and starts again at midnight UTC; the concurrency limit is
@@ -139,15 +140,15 @@ from typing import Any, Protocol
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
+from rhi_common import retention
 from rhi_common.causes import Cause
 from rhi_common.students import Lease, UsageDay, utc_day
+from rhi_common.tables import EXPIRES_AT
 from rhi_gateway.errors import GatewayError
 
 BYTES_PER_TOKEN = 4
 # What a lease lasts beyond the longest hold and the longest request.
 LEASE_MARGIN_SECONDS = 60
-# The retention of every store: the course end plus 90 days (section 6.6).
-USAGE_RETENTION_SECONDS = 90 * 86_400
 # How long after midnight a reservation of the day before may still count without a stand-in in
 # the new day, when that day is not opened yet (see "Midnight" above).
 OPENING_SECONDS = 60
@@ -174,7 +175,7 @@ class Student(Protocol):
     """What the ledger reads of a student: the fields a key item and the gateway's lookup of it share.
 
     `rhi_common.students.StudentKey` and `rhi_gateway.keystore.KeyRecord` both have them.
-    `expires_at` is the course end, which the retention of the usage item counts from.
+    `expires_at` is when the key stops; the usage item expires by the course end the ledger is given.
     """
 
     @property
@@ -295,8 +296,10 @@ def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
     return {} if day is None else {request: lease for request, lease in day.leases.items() if lease.expires > now}
 
 
-def _new_day(student: Student, day: str, before: UsageDay | None, now: int) -> UsageDay:
+def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expires_at: int) -> UsageDay:
     """A day as its first reservation finds it: no tokens, and a stand-in for each live lease of `before`.
+
+    It expires at `expires_at`, the course end plus 90 days (`rhi_common.retention`).
 
     It starts with the load balancer's cookies `before` held, and with the rebalance numbers it
     had applied, so that midnight moves no student.
@@ -306,7 +309,7 @@ def _new_day(student: Student, day: str, before: UsageDay | None, now: int) -> U
         day=day,
         alias=student.alias,
         tokens=0,
-        expires_at=student.expires_at + USAGE_RETENTION_SECONDS,
+        expires_at=expires_at,
         leases={
             f"{_day_before(day)}/{request}": Lease(tokens=0, estimate=0, expires=lease.expires)
             for request, lease in _live(before, now).items()
@@ -490,11 +493,13 @@ def _left(day: UsageDay | None, student: Student, now: int) -> int:
 class InMemoryLedger:
     """The ledger in memory: for tests and for a gateway run without a table.
 
-    `writes` counts the writes to the students' records. `day` returns a record as it is written.
+    `course_end` is the course's end date: every record it writes expires at the course end plus 90
+    days. `writes` counts the writes to the students' records. `day` returns a record as it is written.
     """
 
-    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, *, course_end: date, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
+        self._expires_at = retention.expires_at(course_end)
         self._lock = threading.Lock()
         self._days: dict[tuple[int, str], UsageDay] = {}
         # What each day's opening carried here: the table's `carried_maps` attribute.
@@ -525,9 +530,9 @@ class InMemoryLedger:
                 day = self._days.get(key)
                 opened = day is None
                 if day is None:
-                    day = _new_day(student, reservation.day, before(), now)
+                    day = _new_day(student, reservation.day, before(), now, self._expires_at)
                 gone = _to_remove(day, student, request_id, reservation.lease, now, before)
-                written = _reserved(day, request_id, reservation.lease, gone)
+                written = replace(_reserved(day, request_id, reservation.lease, gone), expires_at=self._expires_at)
                 self._write(written)
                 if opened:
                     self._carried[key] = (dict(day.affinity_cookies), dict(day.rebalance_applied))
@@ -600,6 +605,7 @@ class InMemoryLedger:
                     leases=leases,
                     affinity_cookies=cookies,
                     rebalance_applied=applied,
+                    expires_at=self._expires_at,
                 )
             )
         return True
@@ -668,8 +674,10 @@ def _stand_in_updates(stand_ins: Mapping[str, Lease], values: dict[str, object])
 class DynamoDBLedger:
     """The ledger in the usage table (`rhi_common.tables.USAGE`).
 
-    `client` is a DynamoDB client of the AWS SDK, which threads may share, and `table_name` the
-    deployed table's name. A reservation is one call, and more only when that call writes
+    `client` is a DynamoDB client of the AWS SDK, which threads may share, `table_name` the
+    deployed table's name, and `course_end` the course's end date. Every write to an item, the
+    reservation's and the settlement's, sets its expiry to the course end plus 90 days, so an item
+    written before by another rule keeps it no longer than that. A reservation is one call, and more only when that call writes
     nothing: for the student's first request of a day, whose item is not there yet and is written
     after a read of the day before (and, within a minute of midnight, followed by a second read and
     taken back in one more call if the day before gained a live lease in between), for the first
@@ -694,10 +702,13 @@ class DynamoDBLedger:
     no cause, so the gateway renders it as `engine_error`, and none of its text leaves the gateway.
     """
 
-    def __init__(self, client: Any, table_name: str, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, client: Any, table_name: str, *, course_end: date, clock: Callable[[], float] = time.time
+    ) -> None:
         self._client = client
         self._table = table_name
         self._clock = clock
+        self._expires_at = retention.expires_at(course_end)
 
     def reserve(
         self,
@@ -785,7 +796,8 @@ class DynamoDBLedger:
             return self._read(reservation.github_id, _day_before(reservation.day))
 
         # What no day admits is refused before any call.
-        _to_remove(_new_day(student, reservation.day, None, now), student, request_id, lease, now, before)
+        empty = _new_day(student, reservation.day, None, now, self._expires_at)
+        _to_remove(empty, student, request_id, lease, now, before)
         gone: dict[str, Lease] = {}
         carried: dict[str, Lease] | None = None
         for _ in range(_ATTEMPTS):
@@ -831,10 +843,13 @@ class DynamoDBLedger:
         it stores `cookie` and `rebalance_number`, each if there is one, and removes the pool's
         cookie when there is none and it was dropped. When it stores or drops one, it also removes
         the record of what the day's opening carried, so that a withdrawal keeps the day
-        (`_carried_only`) even when what it stored equals what the opening carried.
+        (`_carried_only`) even when what it stored equals what the opening carried. Like every write
+        of the ledger, it sets the item's expiry.
         """
-        values: dict[str, object] = {":change": charge - reservation.lease.tokens}
+        values: dict[str, object] = {":change": charge - reservation.lease.tokens, ":expires": self._expires_at}
         names, sets = _stand_in_updates(stand_ins or {}, values)
+        names["#expires"] = EXPIRES_AT
+        sets.append("#expires = :expires")
         removals = ["#leases.#request"]
         condition = "attribute_exists(#leases.#request)"
         if stand_ins is not None:
@@ -888,7 +903,7 @@ class DynamoDBLedger:
         confirmed day, unless `carried` is given: then the write confirms the day itself, adding
         those stand-ins, which take their slots, and holds only while the day is still unconfirmed.
         For a reservation that names a pool, it leaves an empty map of cookies where there is none,
-        and an empty map of rebalance numbers.
+        and an empty map of rebalance numbers. Like every write of the ledger, it sets the item's expiry.
         Returns the day as this write left it, which the write itself returns, or `None` and the
         item it found when it wrote nothing.
         """
@@ -898,8 +913,11 @@ class DynamoDBLedger:
             ":change": lease.tokens - _released(gone),
             ":room": student.daily_token_budget - lease.tokens + _released(gone),
             ":slots": student.concurrency_limit + len(gone) - len(carried or {}),
+            ":expires": self._expires_at,
         }
         names, sets = _stand_in_updates(carried or {}, values)
+        names["#expires"] = EXPIRES_AT
+        sets.append("#expires = :expires")
         if reservation.pool is not None:
             names |= {"#cookies": _COOKIES, "#applied": _APPLIED}
             sets += ["#cookies = if_not_exists(#cookies, :none)", "#applied = if_not_exists(#applied, :none)"]
@@ -945,7 +963,7 @@ class DynamoDBLedger:
         """
         yesterday = _day_before(reservation.day)
         before = self._read(reservation.github_id, yesterday)
-        fresh = _new_day(student, reservation.day, before, now)
+        fresh = _new_day(student, reservation.day, before, now, self._expires_at)
         _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
         day = _reserved(fresh, reservation.request_id, reservation.lease, {})
         opening = now < _midnight(reservation.day) + OPENING_SECONDS

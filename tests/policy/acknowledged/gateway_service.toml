@@ -34,7 +34,7 @@
 
 [nag]
 "AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeTargetHealth, in the task role, and GetAuthorizationToken, in the execution role, only on every resource, and each statement on every resource holds that one action alone."
-"AwsSolutions-ECS2" = "The task definition gives the gateway its settings as environment variables, which is the only way its settings reader takes them, and none holds a secret: they are names, ARNs, addresses and numbers, and the gateway reads each pool's secret from Secrets Manager at start."
+"AwsSolutions-ECS2" = "The task definition gives the gateway its settings as environment variables, which is the only way its settings reader takes them, and none holds a secret: they are names, ARNs, addresses, numbers and the course end date, and the gateway reads each pool's secret from Secrets Manager at start."
 "AwsSolutions-ECS4" = "The gateway's metrics go to the Managed Prometheus workspace through the collector of its task, and its logs to its log group, so Container Insights would be a second, paid store of metrics that no dashboard of the design reads."
 
 [wildcard_actions]

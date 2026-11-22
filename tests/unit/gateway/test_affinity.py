@@ -9,6 +9,7 @@ duration-based stickiness does (evidence E13). The students' keys are generated 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -32,6 +33,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 OTTER, HERON = 4242, 4343
 MOCK = {
     "engine": "mock",
@@ -132,7 +135,7 @@ class Gateway:
 
     def __init__(self, views: Callable[[], dict[str, PoolView]] | None = None) -> None:
         self.balancer = LoadBalancer()
-        self.ledger = InMemoryLedger(clock=lambda: float(NOW))
+        self.ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.keys = {OTTER: generate_key(), HERON: generate_key()}
         students = [
             StudentKey(

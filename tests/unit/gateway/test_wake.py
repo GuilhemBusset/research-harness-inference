@@ -7,6 +7,7 @@ in-memory one. Every key is generated when the tests run.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ from rhi_gateway.readiness import Readiness
 from rhi_gateway.waker import Waker
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 GITHUB_ID = 4242
 
 
@@ -91,7 +94,7 @@ class Gateway:
     budget: int = 2_000_000
     key: str = field(default_factory=generate_key)
     aws: Doubles = field(default_factory=Doubles)
-    ledger: InMemoryLedger = field(default_factory=lambda: InMemoryLedger(clock=lambda: NOW))
+    ledger: InMemoryLedger = field(default_factory=lambda: InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: NOW))
     writes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:

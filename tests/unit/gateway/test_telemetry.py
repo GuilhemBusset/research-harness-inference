@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import httpx
@@ -35,6 +35,8 @@ from rhi_gateway.readiness import PoolView, Readiness
 from rhi_gateway.waker import Waker
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = date(2027, 6, 30)
 GITHUB_ID = 98_765_431
 MARKER = "marker-5c1e-not-for-the-log"
 FIELDS = {"alias", "time", "pool", "wire_format", "input_tokens", "output_tokens", "latency_ms", "status", "cause"}
@@ -109,7 +111,7 @@ def gateway() -> tuple[Starlette, str]:
         concurrency_limit=4,
     )
     authenticator = Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW))
-    ledger = InMemoryLedger(clock=lambda: float(NOW))
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     # The coursework pool is ready; the evening pool, scheduled only, is not.
     ready = lambda: {"coursework": PoolView(ready=True)}
     engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))

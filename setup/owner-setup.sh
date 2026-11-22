@@ -705,7 +705,7 @@ The canary command puts the pipeline's verification on the roster and writes its
 secret rhi/canary-key, creating it: run it once before the verification is merged. Running it
 again replaces the key, which it never prints.
 EOF
-  local tool=(env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main)
+  local tool=(env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main)
   say ""
   show "${tool[@]}" roster add "<github-id>" "<alias>"
   run "${tool[@]}" canary || true

@@ -153,6 +153,7 @@ def environment(*pools: str) -> tuple[dict[str, str], dict[str, str]]:
         "RHI_TARGET_GROUPS": json.dumps({pool: target_group(pool) for pool in pools}),
         "RHI_POOL_SECRETS": json.dumps(arns),
         "RHI_SCALER_FUNCTION": SCALER,
+        "RHI_COURSE_END": "2027-01-15",
         **{variable: name for variable, (_, name) in TABLES.items()},
     }
     if pools:

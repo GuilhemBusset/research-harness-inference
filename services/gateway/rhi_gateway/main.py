@@ -15,7 +15,7 @@ request profile that names an entry the gateway does not have (`rhi_gateway.prof
 names the pool and the entry.
 
 **The parts** (`build`). The keys table is read through `DynamoKeyStore`, the usage table is the
-`DynamoDBLedger`'s, the pool-state table and the target groups are the `Readiness` reader's, the
+`DynamoDBLedger`'s, given the course end its rows expire by, the pool-state table and the target groups are the `Readiness` reader's, the
 scaler function is the `Waker`'s, and the heartbeats table is the `Heartbeat`'s. The body filters
 are the three formats', with the body limit of the settings and, on each forwarded route, every
 pool's request profile, which is built first; the proxy has the upstream address,
@@ -188,7 +188,7 @@ def build(
 
     keys = DynamoKeyStore(aws.tables.Table(settings.keys_table))
     authenticator = Authenticator(keys)
-    ledger = DynamoDBLedger(aws.dynamodb, settings.usage_table)
+    ledger = DynamoDBLedger(aws.dynamodb, settings.usage_table, course_end=settings.course_end)
     readiness = Readiness(settings.target_groups, elbv2=aws.elbv2, table=aws.tables.Table(settings.pool_state_table))
     waker = Waker(readiness, lambda_client=aws.lambda_client, function_name=settings.scaler_function)
     heartbeat = Heartbeat(
