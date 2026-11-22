@@ -33,8 +33,10 @@ During a session, a pool does not come up:
 
 - `rhi wait` stops and prints the cause `capacity_unavailable`, or is still `warming` well past the
   13 minutes a cold launch is estimated to take (section 5.2);
-- `rhi status` lists the pool as `unavailable` with the cause `capacity_unavailable`: its last
-  launch found no capacity in the past 10 minutes (section 5.3);
+- `rhi status` lists the pool as `unavailable` with the cause `capacity_unavailable`: the pool has
+  no healthy instance, and a launch of the pool found no capacity in the past 10 minutes (section
+  5.3). That launch need not be the latest: a newer one may already have found an instance that is
+  still starting, and the pool then reads `ready` as soon as that instance is healthy;
 - students report that their harness waited, then failed with `capacity_unavailable` (section
   6.2). How it shows depends on the kind of call. A streaming call, which harnesses use for chat,
   is answered HTTP 200 at once and kept alive while the gateway holds it; at the deadline (the
@@ -44,8 +46,11 @@ During a session, a pool does not come up:
   (`hold_seconds_non_streaming`, 4 minutes by default) it is answered HTTP 503 with
   `Retry-After: 60` and `capacity_unavailable` in the error body. Either way, the cause at the
   deadline depends on the pool's last launches: `capacity_unavailable` when a launch of the pool
-  found no capacity in the past 10 minutes, and `warming` when none did, which means the pool is
-  still starting and is not this runbook (section 5.3).
+  found no capacity in the zones in the past 10 minutes, and `warming` otherwise (section 5.3).
+  `warming` at the deadline does not prove a launch is under way: the scaler records only a
+  shortage in the zones, so a launch refused for the account's vCPU quota leaves the cause
+  `warming`, and `rhi status` lists the pool as `warming` while no instance is starting. Check,
+  step 3, tells a slow start, a shortage in the zones and a quota refusal apart.
 
 ## Check
 
@@ -71,11 +76,21 @@ During a session, a pool does not come up:
    not this one. While it reads `false`, the scaler keeps asking for capacity: each wake on a pool
    unavailable for capacity is passed to it, and it tries again.
 
-3. **The quota is not the limit.** A request refused for the vCPU quota looks the same to a
-   student. In the EC2 console, the Auto Scaling group of the pool lists its recent launch attempts
-   under **Activity**; an attempt refused for the quota, rather than for capacity in the zones, is
-   fixed by the quota step of the runbook [a session switched on and off](session-on-and-off.md),
-   and not during the class.
+3. **What the launches met: a slow start, a shortage in the zones, or the quota.** A launch refused
+   for the vCPU quota does not show as `capacity_unavailable`: students' held calls end with
+   `warming`, and `rhi status` and `rhi wait` read `warming` until `rhi wait` gives up at its
+   timeout, as if the pool were only slow to start. In the EC2 console, open the Auto Scaling group
+   of the pool and read its recent launch attempts under **Activity**:
+
+   - an attempt in progress or successful, and no failed one: a slow start, not this runbook; wait
+     for `ready` (Verify);
+   - failed attempts whose status message names insufficient instance capacity: a shortage in the
+     zones, this runbook (Act);
+   - failed attempts whose status message names the vCPU limit or quota: the quota is the limit.
+     Waking the pool again does not help, since every launch is refused the same way until the
+     quota is raised. It is fixed by the quota step of the runbook
+     [a session switched on and off](session-on-and-off.md), which can take days, so not during
+     the class: tell the students to work with their own subscriptions (Act, step 1).
 
 ## Act
 
@@ -85,12 +100,14 @@ During a session, a pool does not come up:
 
 2. **Keep asking for the pool.** A wake on a pool unavailable for capacity still reaches the
    scaler, which launches again (section 5.3). Run `rhi wait` again every ten minutes or so: each
-   run sends a wake. A launch that found no capacity stays visible for 10 minutes: until then the
-   pool reads `unavailable` with `capacity_unavailable`, and `rhi wait` stops at once with that
-   cause, even when a later launch has found an instance that is still starting. Only once those 10
-   minutes have passed does a pool that is starting read `warming`, and `rhi wait` then waits until
-   it is ready. So neither `capacity_unavailable` nor `warming` says whether a launch has
-   succeeded; `ready` is the one sign that the pool is up (Verify).
+   run sends a wake. A launch that found no capacity is remembered for 10 minutes, and it is a
+   signal only for a pool with no healthy instance. During those minutes such a pool reads
+   `unavailable` with `capacity_unavailable`, and `rhi wait` stops at once with that cause, even
+   when a newer launch has found an instance that is still starting. As soon as an instance of the
+   pool is healthy, the pool reads `ready`, inside the 10 minutes too, and `rhi status` and
+   `rhi wait` say so. After the 10 minutes, a pool still starting reads `warming`, and `rhi wait`
+   waits until it is ready. So neither `capacity_unavailable` nor `warming` says whether a launch
+   has succeeded; `ready` is the one sign that the pool is up (Verify).
 
    ```sh
    rhi wait coursework

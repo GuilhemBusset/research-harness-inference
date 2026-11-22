@@ -86,13 +86,24 @@ Do these the day before the class, while no session is on.
    The quota of step 1 must cover the new maximum plus one. The new value takes effect only once a
    pipeline run has deployed it. Note the time once the script has written the configuration, then
    start a run with **Release change** on the pipeline's page in the CodePipeline console. Check
-   that run itself, not a status left by an earlier one: in the pipeline's execution history, the
-   execution whose start time is after the time you noted must have succeeded, with its status
-   Succeeded and every stage up to and including the stage the class uses Succeeded. An edit of
-   SSM changes no commit, so the `deploy/<stage>` status of step 3 can still be an earlier run's
-   success; only this execution says the edit is deployed. If it failed or stopped, the new value
-   is not deployed: fix the cause and start another run, and switch the session on only once one
-   has succeeded.
+   that run itself, not a status left by an earlier one: in the pipeline's execution history, open
+   the execution whose start time is after the time you noted. An edit of SSM changes no commit, so
+   the `deploy/<stage>` status of step 3 can still be an earlier run's success; only this execution
+   says what happened to the edit. In the stage the class uses, it runs the deployment actions
+   first and the verification (the action Verify, the smoke tests against the deployed endpoint)
+   after them, so read the two apart:
+
+   - The execution Succeeded, with every action of that stage Succeeded, Verify included: the new
+     value is deployed and the endpoint passed its smoke tests.
+   - A deployment action of that stage failed, or the execution failed or was stopped before
+     reaching them: the new value may not be deployed, or only partly. Fix the cause and start
+     another run.
+   - Every deployment action Succeeded and Verify failed: the new value **is** deployed, and the
+     endpoint did not pass its smoke tests with it. Do not start the class on it. Fix the cause (or
+     put the previous value back, by the same configuration step) and start another run.
+
+   Switch the session on only once an execution started after your last configuration change has
+   succeeded through Verify.
 
 3. **Every configuration change has landed, and no deployment is running.** A deployment that has
    passed the deployment hold's check runs to its end even after the session is switched on, so
@@ -134,8 +145,15 @@ Do these the day before the class, while no session is on.
    rhi wait coursework
    ```
 
-   **A scheduled-only pool is not woken this way.** `rhi_admin pool status` shows which pools are in
-   mode `scheduled-only` (configured `wake = "scheduled-only"`, such as an upgrade pool). Students
+   **A scheduled-only pool is not woken this way.** The admin CLI shows which pools are in mode
+   `scheduled-only` (configured `wake = "scheduled-only"`, such as an upgrade pool) in the mode
+   column of:
+
+   ```sh
+   rhi_admin pool status
+   ```
+
+   Students
    cannot wake such a pool, and neither can `rhi wait`: while nothing has asked for its capacity, a
    wake asks for nothing, and `rhi wait` stops at once with the cause `pool_scheduled_only` (section
    5.3). The admin starts it separately, by asking for its capacity; this repository has no command
@@ -165,8 +183,10 @@ Do these the day before the class, while no session is on.
    ```
 
 4. **After the class, switch the session off.** Students' requests and wakes are then refused at
-   once with `no_session`; requests already running finish, and each pool falls to zero
-   `idle_minutes` after its last request, by its idle rule (section 5.6). The deployment hold's
+   once with `no_session`; requests already running finish, and each pool falls to zero by its idle
+   rule (section 5.6): `idle_minutes` after the last moment the scaler saw a request of the pool
+   held or in flight, so a long request that was still running delays it by its whole remaining
+   time. The deployment hold's
    check passes from now on, so a pipeline execution that was waiting at it goes on to deploy.
 
    ```sh
@@ -198,8 +218,14 @@ Do these the day before the class, while no session is on.
    rhi status
    ```
 
-4. Within `idle_minutes` of the last request, plus a few minutes for the scaler to act, each pool
-   has no instance in service: in Grafana, the panel Instances of the fleet and scaling dashboard
-   shows no instance in service and a desired capacity of zero for each pool.
+4. Each pool falls to zero once it has been idle for its whole `idle_minutes`, counted from when
+   its last held or in-flight request cleared, not from when that request arrived: a request that
+   was still running when you switched the session off (one may run up to 30 minutes) keeps the
+   pool up until it ends, and the idle interval starts only then. So first wait until no request
+   of the pool is held or in flight: in Grafana, the panel of concurrent streams and the queue
+   shows the gateway's requests in flight and held for the pool at zero (section 7.2). Then allow
+   the full `idle_minutes` (20 for the example's coursework), plus a few minutes for the scaler to
+   act, before checking that each pool has no instance in service: in Grafana, the panel Instances of the fleet and scaling dashboard shows no instance in
+   service and a desired capacity of zero for each pool.
 
 Walked through on the deployed system: not yet.
