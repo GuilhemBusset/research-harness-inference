@@ -46,8 +46,9 @@ def read(text: str) -> tuple[list[str], list[list[Word]]]:
     """The level-2 headings outside the code blocks, and the words of every line of every fenced code
     block (backticks or tildes) that is shell, then of every substitution's command in it: a `\\`
     continues a line, and blank and comment lines are left out. In a block whose info string names
-    another language (`text` for a query, `toml`), only a line that starts a command of this
-    repository (`rhi`, the admin CLI, a path) is read as shell: its label does not hide it."""
+    another language (`text` for a query, `toml`), only a line that shows a command of this
+    repository (`rhi`, the admin CLI, a path, anywhere a command may start) is read as shell: its
+    label does not hide it."""
     headings: list[str] = []
     lines: list[list[Word]] = []
     fence, pending, shell = "", "", True
@@ -63,7 +64,7 @@ def read(text: str) -> tuple[list[str], list[list[Word]]]:
         if opening and opening[1][0] == fence[0] and len(opening[1]) >= len(fence) and line.strip() == opening[1]:
             fence = ""
             continue
-        if not shell and not pending and not _starts_a_repository_command(line):
+        if not shell and not pending and not _shows_a_repository_command(line):
             continue
         pending += line.strip().removeprefix("$ ")
         if pending.endswith("\\"):
@@ -219,15 +220,20 @@ def commands(words: list[Word]) -> list[list[Word]]:
 CLI_NAMES = {"rhi", admin_main.parser().prog}
 
 
-def _starts_a_repository_command(line: str) -> bool:
-    """Whether a line of a block of another language, read as shell, has a command whose first word
-    is a CLI of this repository or a path in it. A line the shell could not read (a query's
-    brackets, a sentence) is that language's, not a command."""
-    try:
-        found = commands(split(line.strip().removeprefix("$ ")))
-    except ValueError:
-        return False
-    return any(words[0].text in CLI_NAMES or _is_repository_path(words[0].text) for words in found)
+_NAMES = "|".join(re.escape(name) for name in sorted(CLI_NAMES))
+# A CLI of this repository named as a word anywhere, or a path of the repository where a word starts
+# (after a blank, an operator, an assignment or a substitution's opening): what makes a line of a
+# block of another language one the shell reads, whether or not the shell then accepts it.
+SHOWS_A_COMMAND = re.compile(
+    rf"(?<![\w./-])(?:{_NAMES})(?![\w./-])"
+    r"|(?:^|[\s;&|(`=])(?:\./)?[\w.-]+/(?!/)"
+)
+
+
+def _shows_a_repository_command(line: str) -> bool:
+    """Whether a line of a block of another language (a query, a setting) shows a command of this
+    repository: its label does not hide it, and the line is then checked as any shell line is."""
+    return bool(SHOWS_A_COMMAND.search(line.strip().removeprefix("$ ")))
 
 
 def problems(text: str, root: Path = ROOT) -> list[str]:
@@ -303,6 +309,15 @@ def test_detects_an_unknown_command() -> None:
         "the admin CLI refuses: rhi_admin roster list unexpected",
         "no such path in the repository: scripts/no-such-script.sh",
     ]
+    # Behind an assignment, inside a substitution, or unterminated, such a line is read as in a shell block.
+    hidden = "```text\nX=1 rhi status\nx=$(rhi_admin roster list unexpected)\ncat <(scripts/no-such-script.sh)\n```\n"
+    assert problems(sections + hidden) == [
+        "a command of this repository the check cannot read: X=1 rhi status",
+        "the admin CLI refuses: rhi_admin roster list unexpected",
+        "no such path in the repository: scripts/no-such-script.sh",
+    ]
+    with pytest.raises(ValueError, match="no closing quotation"):
+        problems(sections + '```text\nrhi "status\n```\n')
 
 
 def test_refuses_arguments_the_shell_decides_and_checks_commands_inside_substitutions() -> None:

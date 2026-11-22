@@ -323,13 +323,19 @@ that `rhi_admin roster list` prints.
       Its series can no longer be queried once the workspace is deleted, and AWS deletes the data
       it ingested for good within a month after; nothing more is yours to do for it.
 
-      The admin's sign-in, first without its deletion protection (should the second command refuse
-      because the pool still has its sign-in domain, delete the domain with
-      `aws cognito-idp delete-user-pool-domain` first):
+      The admin's sign-in, first without its deletion protection:
 
       ```sh
       aws cognito-idp update-user-pool --user-pool-id <user-pool> --deletion-protection INACTIVE
       aws cognito-idp delete-user-pool --user-pool-id <user-pool>
+      ```
+
+      Should the second command refuse because the pool still has its sign-in domain, read the
+      domain's prefix, delete the domain, then run the second command again:
+
+      ```sh
+      aws cognito-idp describe-user-pool --user-pool-id <user-pool> --query UserPool.Domain --output text
+      aws cognito-idp delete-user-pool-domain --user-pool-id <user-pool> --domain <domain-prefix>
       ```
 
       The three buckets, the access logs', the model bucket and the pipeline's artifact bucket,
