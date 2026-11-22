@@ -19,6 +19,7 @@ from test_deploying import DEPLOYED, GPU, LEFT_OUT, NEEDS_GPU, PARKED, SIGNS_IN,
 
 RHI = "verify/Rhi"
 EPIC = 1
+LATER = "tests/smoke/deployed/test_later.py"   # a smoke test that lands after the issue
 # What the discharge may call on the GitHub client: its reads, and the writes of the evidence step.
 READS = {"get_pr", "deploy_status", "list_comments", "get_issue"}
 WRITES = {"edit_issue", "create_comment", "update_comment"}
@@ -482,3 +483,98 @@ def test_runs_of_two_roots_discharging_at_once_keep_each_ticked_item_s_row(held)
         assert all(f"- [x] {text} {link}" in body for text, _ in owner) and run.fake.issues[2]["state"] == "closed"
     finally:
         run.repo.cleanup()
+
+
+@contextmanager
+def two_roots():
+    """Issue #2, owing D2 (its change's smoke test) and D3 (`LATER`), delivered by the epic's run
+    and adopted by a run of the issue alone."""
+    run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
+    run.deploy = dataclasses.replace(run.deploy, discharge_contexts=(RHI,))
+    try:
+        run.add_work(2, owner=((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, LATER), DEPLOYED)), files=(SMOKE,))
+        run.run(root=EPIC)
+        run.run(root=2)
+        yield run
+    finally:
+        run.repo.cleanup()
+
+
+def rows(run, item="D2"):
+    pr = present(run.issue(2).pr)
+    return [line for line in run.comment(pr, L.report.EVIDENCE_MARKER).splitlines() if line.startswith(f"| {item} ")]
+
+
+def test_a_proof_saved_and_not_written_never_replaces_the_one_another_run_published():
+    with two_roots() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        update = run.fake.update_comment
+
+        def unanswered(number, body):
+            if L.report.EVIDENCE_MARKER in body:
+                raise L.github.GitHubUnavailable("HTTP 502")
+            return update(number, body)
+        run.fake.update_comment = unanswered
+        run.run(root=EPIC)   # saves D2's proof on the merge commit, writes nothing of it
+        run.fake.update_comment = update
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        later = push_main(run)
+        run.fake.set_status(later, RHI, "success", VERIFIED)
+        run.run(root=2)   # proves D2 on the later main, and ticks it
+        published = rows(run)
+        assert len(published) == 1 and later[:12] in published[0]
+        run.run(root=EPIC)
+        assert rows(run) == published
+        assert [e["head_sha"] for e in run.issue(2).evidence if e["criterion"] == "D2"] == [later]
+
+
+def test_the_first_write_of_the_comment_keeps_the_row_of_a_box_already_ticked():
+    with two_roots() as run:
+        first = push_main(run)
+        run.fake.set_status(first, RHI, "success", VERIFIED)
+        edit, update = run.fake.edit_issue, run.fake.update_comment
+
+        def tick_reply_lost(number, **fields):
+            answer = edit(number, **fields)
+            if "body" in fields:
+                raise L.github.GitHubUnavailable("the reply was lost")
+            return answer
+        run.fake.edit_issue = tick_reply_lost
+        run.run(root=EPIC)   # D2's row and tick are written; the epic's run never hears it
+        run.fake.edit_issue = edit
+        assert f"- [x] {SIGNS_IN} ([evidence]" in run.fake.issues[2]["body"]
+        ticked = rows(run)
+        second = push_main(run, files=(LATER,), removed=(SMOKE,))
+        run.fake.set_status(second, RHI, "success", VERIFIED)
+
+        def comment_reply_lost(number, body):
+            update(number, body)
+            raise L.github.GitHubUnavailable("the reply was lost")
+        run.fake.update_comment = comment_reply_lost
+        run.run(root=2)   # proves D3; its first write of the comment is applied, its reply lost
+        run.fake.update_comment = update
+        assert rows(run) == ticked and first[:12] in ticked[0]
+        run.run(root=2)
+        assert rows(run) == ticked and rows(run, "D3") and run.fake.issues[2]["state"] == "closed"
+
+
+def test_a_row_never_ticked_is_withdrawn_once_its_test_is_left_out():
+    with delivered() as run:
+        before = snapshot(run)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        edit = run.fake.edit_issue
+
+        def unanswered(number, **fields):
+            if "body" in fields:
+                raise L.github.GitHubError("HTTP 502")
+            return edit(number, **fields)
+        run.fake.edit_issue = unanswered
+        run.run()   # D2's row is written, its tick is not
+        run.fake.edit_issue = edit
+        assert rows(run)
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        run.deploy = dataclasses.replace(run.deploy, unverified_tests=(SMOKE,))   # no item is left to discharge
+        run.run()
+        assert not rows(run) and snapshot(run) == before
