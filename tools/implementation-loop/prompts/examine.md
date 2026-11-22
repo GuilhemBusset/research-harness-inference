@@ -29,8 +29,9 @@ Findings from earlier examinations and what became of them (do not repeat closed
 The builder may change any test and any command, its own and those already on `main`: nothing
 locks them. Read every change to a test in the diff. One that weakens what an item or a safety
 invariant needs proven (an assertion removed or loosened, a test skipped, deselected or made
-vacuous, a command that no longer runs it) is a finding under the safety invariant "check or gate
-bypass".
+vacuous, a command that no longer runs it) is a finding: under the safety invariant about a weakened
+check when the test proves a gate or a safety invariant, and otherwise quoting the item it no longer
+proves.
 
 A `hygiene: allow <rule> (<reason>)` marker that this change adds lets one value past the
 public-repository scan. Read each one: unless the value is public on purpose and its reason says
