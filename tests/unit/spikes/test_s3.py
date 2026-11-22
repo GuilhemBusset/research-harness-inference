@@ -354,11 +354,11 @@ def claude_session(
 
 
 def test_a_refusal_s_cause_is_kept_only_when_it_is_a_published_name() -> None:
-    names = ["budget_reached", "overloaded_error", "PrivateBackendDiagnostic"]
+    names = ["pool_disabled", "overloaded_error", "PrivateBackendDiagnostic"]
     refused = [exchange("/v1/messages", {}, 1.0, 503, cause=name) for name in names]
     rows = s3.refusals_of(claude_session(s3.Step.TASK, [], refused))
     assert [(row["status"], row["cause"]) for row in rows] == [
-        (503, "budget_reached"),
+        (503, "pool_disabled"),
         (503, "overloaded_error"),
         (503, "other"),
     ]
@@ -405,9 +405,9 @@ def test_only_a_grown_turn_refused_as_too_long_shows_the_window() -> None:
     short = {"tools": tools, "messages": [{"role": "user", "content": "Read the files."}]}
     grown = {"tools": tools, "messages": [{"role": "user", "content": "Read the files. " * 50}]}
     cases = [
-        # A budget refusal on the first, short request: no evidence of the window.
-        ([exchange("/v1/messages", short, 1.0, 402, cause="budget_reached")], False),
-        # A grown turn refused for a budget or a limit: still none.
+        # A refusal of the first, short request: no evidence of the window.
+        ([exchange("/v1/messages", short, 1.0, 402, cause="pool_ceiling_reached")], False),
+        # A grown turn refused for a limit: still none.
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 429, cause="concurrency_limit")], False),
         # A grown turn refused with a cause that names a length.
         ([exchange("/v1/messages", short, 1.0), exchange("/v1/messages", grown, 2.0, 400, cause="context_length_exceeded")], True),

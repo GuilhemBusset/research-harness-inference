@@ -1,4 +1,4 @@
-"""The twelve causes, and an error rendered in each wire format (`rhi_common.causes`, `rhi_gateway.errors`).
+"""The eleven causes, and an error rendered in each wire format (`rhi_common.causes`, `rhi_gateway.errors`).
 
 The statuses and the Retry-After seconds are written here from the table of the system design,
 section 6.2, and not read from the enumeration. The sentences are the enumeration's: a test here
@@ -20,7 +20,6 @@ DESIGN = {
     "not_found": (404, None),
     "request_refused": (400, None),
     "concurrency_limit": (429, 5),
-    "budget_reached": (402, None),
     "pool_ceiling_reached": (402, None),
     "warming": (503, 30),
     "capacity_unavailable": (503, 60),
@@ -54,7 +53,7 @@ def read_event(raw: bytes) -> tuple[str | None, object]:
 
 def test_statuses_are_the_designs() -> None:
     assert {cause.value: (cause.status, cause.retry_after) for cause in Cause} == DESIGN
-    assert len(Cause) == 12
+    assert len(Cause) == 11
 
     for name, (status, seconds) in DESIGN.items():
         for wire in FORMATS:
@@ -116,7 +115,7 @@ def test_an_exception_renders_as_the_cause_it_carries_or_as_engine_error() -> No
     assert cause_of(RuntimeError("anything")) is Cause.ENGINE_ERROR
 
     for wire in WireFormat:
-        assert render_json(GatewayError(Cause.BUDGET_REACHED), wire) == render_json(Cause.BUDGET_REACHED, wire)
+        assert render_json(GatewayError(Cause.POOL_DISABLED), wire) == render_json(Cause.POOL_DISABLED, wire)
         assert render_json(TimeoutError(), wire) == render_json(Cause.ENGINE_ERROR, wire)
         assert render_stream_event(GatewayError(Cause.TIME_LIMIT), wire) == render_stream_event(Cause.TIME_LIMIT, wire)
         assert render_stream_event(KeyError("pool"), wire) == render_stream_event(Cause.ENGINE_ERROR, wire)

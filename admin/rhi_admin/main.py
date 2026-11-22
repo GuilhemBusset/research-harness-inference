@@ -190,8 +190,8 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser("canary", help=f"the canary's entry, and a new key in {CANARY_SECRET}")
     commands.add_parser(
-        "spike-keys", help=f"the spikes' students, one of them with no budget, and new keys in {SPIKE_KEYS_SECRET}"
-    ).add_argument("students", type=int, help="how many students with the default budget")
+        "spike-keys", help=f"the spikes' students, and new keys in {SPIKE_KEYS_SECRET}"
+    ).add_argument("students", type=int, help="how many students")
 
     pool = commands.add_parser("pool", help="the pools' operating state").add_subparsers(dest="command", required=True)
     pool.add_parser("status", help="every pool's mode, who set it and when, and its suspended launches")
@@ -329,8 +329,7 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
         )
         # The count and the secret's name: the keys are in the secret and nowhere else.
         print(
-            f"The spikes have new keys for {arguments.students} student(s) and for one with no budget, "
-            f"in the secret {SPIKE_KEYS_SECRET}.",
+            f"The spikes have new keys for {arguments.students} student(s), in the secret {SPIKE_KEYS_SECRET}.",
             file=out,
         )
     else:

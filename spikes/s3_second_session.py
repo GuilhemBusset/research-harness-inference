@@ -677,7 +677,7 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
     workspace = common.Workspace(
         environ[s3.WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], boto3.Session().get_credentials()
     )
-    lines = s3.Lines((*keys.students, keys.spent), out=out)
+    lines = s3.Lines(keys.students, out=out)
     with tempfile.TemporaryDirectory(prefix="rhi-s3s-") as work:
         failures = Job(
             pool=name,

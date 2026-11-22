@@ -161,7 +161,7 @@ def test_a_recorded_answer_of_the_workspace_reads_back_as_its_series() -> None:
 
 
 def test_the_canary_keys_come_from_the_spikes_secret() -> None:
-    held = SpikeKeys(students=(generate_key(), generate_key()), spent=generate_key())
+    held = SpikeKeys(students=(generate_key(), generate_key()))
     asked: list[str] = []
 
     class Secrets:
@@ -171,18 +171,41 @@ def test_the_canary_keys_come_from_the_spikes_secret() -> None:
             asked.append(SecretId)
             return {"SecretString": self.value}
 
+    # The secret is written with the students alone.
+    assert set(json.loads(held.to_json())) == {"students"}
     assert common.canary_keys(Secrets()) == held
     assert asked == [SPIKE_KEYS_SECRET]
     # A reading does not show its keys.
-    assert not any(key in repr(held) for key in (*held.students, held.spent))
+    assert not any(key in repr(held) for key in held.students)
 
-    # A secret of another content is refused, and the error repeats nothing of it.
+    # A secret of the earlier shape, with a spent student's key, reads to the same students; that
+    # key is ignored, and kept nowhere.
+    spent = generate_key()
+    Secrets.value = json.dumps({"students": list(held.students), "spent": spent})
+    earlier = common.canary_keys(Secrets())
+    assert earlier == held
+    assert spent not in repr(vars(earlier))
+
+    # A secret of another content is refused, and the error repeats nothing of it: not JSON, no
+    # students in either shape, a key that is not valid, another set of fields.
+    # The keys that are not valid are refused without being repeated either.
     stray = generate_key()
-    for value in (stray, json.dumps({"students": [], "spent": stray}), json.dumps({"students": [stray]})):
+    truncated = stray[:-1]
+    unlike = f"unlike-a-key-{secrets.token_hex(8)}"
+    for value in (
+        stray,
+        json.dumps({"students": []}),
+        json.dumps({"students": [], "spent": stray}),
+        json.dumps({"students": [truncated]}),
+        json.dumps({"students": [stray, unlike]}),
+        json.dumps({"students": [unlike], "spent": stray}),
+        json.dumps({"students": [stray], "other": stray}),
+        json.dumps({"keys": [stray]}),
+    ):
         Secrets.value = value
         with pytest.raises(ValueError, match="keys") as refused:
             common.canary_keys(Secrets())
-        assert stray not in str(refused.value)
+        assert not any(held in str(refused.value) for held in (stray, truncated, unlike))
 
 
 def test_numbers_sent_to_the_bus_decode_into_the_same_run(environ: dict[str, str], commit: str) -> None:
