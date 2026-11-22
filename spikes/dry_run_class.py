@@ -69,8 +69,9 @@ before; a new launch shows where a sample gives a stage another number of second
 before, which a new launch does: it empties the metric and sets each stage as it ends. Its samples
 are taken whatever their transition label, because the agent takes a launch into service for a
 promotion until it finds no image on the disk, and then moves its stages to `cold-launch`: the
-launch is written once, under its last label (`launches_of`). It began, at the latest, when it was
-seen less the seconds of the stages it had ended by then; each later sample of it, with more stages
+launch is written once, under its last label (`launches_of`). It began, at the latest, when the
+sample that showed it was scraped, which the job reads with `timestamp()` rather than taking the
+query's step, less the seconds of the stages it had ended by then; each later sample of it, with more stages
 ended, can only make that earlier (`Launch.began`), and it is written when that is in the hour.
 A launch shows no stage before its boot has ended, so one that began near the hour's end is seen
 only after it: the job goes on reading for `DISCOVERY_SECONDS` after the hour, and a launch that
@@ -215,22 +216,41 @@ def _same_launch(earlier: Snapshot, later: Snapshot) -> bool:
     return all(abs(earlier[stage] - later[stage]) <= _SAME_SECONDS for stage in earlier.keys() & later.keys())
 
 
-def launches_of(series: Iterable[common.Series], start: float) -> list[Launch]:
+def _identity(labels: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((name, value) for name, value in labels.items() if name != "__name__"))
+
+
+def launches_of(
+    series: Iterable[common.Series], start: float, scraped: Iterable[common.Series] = ()
+) -> list[Launch]:
     """The launches seen after `start` in the stage metric's `series`, read from before it.
 
-    Per instance, the stages of each step form a snapshot, whatever their transition label. The last
-    one at or before `start` is the launch from before the hour; each later snapshot that gives a
-    stage other seconds than the launch it follows begins a new one, and one that agrees with it adds
-    the stages it ended since and gives it its label. A launch began, at the latest, at the earliest
-    of its samples' times less the seconds of the stages it had ended by each. A label outside the agent's fixed
-    stages and transitions is not read."""
+    `scraped` is the same metric read through `timestamp()`: at each step of the range query, when
+    the sample it returns was scraped. A range query returns, at each of its steps, the last sample
+    scraped before it, so the step is only the latest the sample can have been taken at; each sample
+    is placed at its scrape time, and at its step where `scraped` does not give one.
+
+    Per instance, the stages scraped at one time form a snapshot, whatever their transition label.
+    The last one at or before `start` is the launch from before the hour; each later snapshot that
+    gives a stage other seconds than the launch it follows begins a new one, and one that agrees with
+    it adds the stages it ended since and gives it its label. A launch began, at the latest, at the
+    earliest of its samples' times less the seconds of the stages it had ended by each. A label
+    outside the agent's fixed stages and transitions is not read."""
+    scrapes = {
+        (_identity(one.labels), at): taken
+        for one in scraped
+        for at, taken in one.samples
+        if math.isfinite(taken)
+    }
     steps: dict[str, dict[float, tuple[set[str], Snapshot]]] = {}
     for one in series:
         instance, transition, stage = (one.labels.get(label, "") for label in ("instance", "transition", "stage"))
         if not instance or transition not in _TRANSITIONS or stage not in _STAGES:
             continue
-        for at, seconds in one.samples:
+        identity = _identity(one.labels)
+        for step, seconds in one.samples:
             if math.isfinite(seconds):
+                at = min(step, scrapes.get((identity, step), step))
                 labels, snapshot = steps.setdefault(instance, {}).setdefault(at, (set(), {}))
                 labels.add(transition)
                 snapshot[stage] = seconds
@@ -379,8 +399,10 @@ class Rehearsal:
     async def _launches(self, start: float, deadline: float) -> list[Launch]:
         """The launches that began between `start` and `deadline`, with every stage they ended up to now."""
         until = max(deadline, self.clock.now())
-        series = await self._read(f'{STAGE_METRIC}{{pool="{POOL}"}}', start - LOOKBACK_SECONDS, until)
-        return [launch for launch in launches_of(series, start) if start < launch.began <= deadline]
+        selector = f'{STAGE_METRIC}{{pool="{POOL}"}}'
+        series = await self._read(selector, start - LOOKBACK_SECONDS, until)
+        scraped = await self._read(f"timestamp({selector})", start - LOOKBACK_SECONDS, until)
+        return [launch for launch in launches_of(series, start, scraped) if start < launch.began <= deadline]
 
     async def started_instances(self, start: float, deadline: float, *, wait: float = 0.0) -> None:
         """A line for each launch that began between `start` and `deadline`, from the stage metric

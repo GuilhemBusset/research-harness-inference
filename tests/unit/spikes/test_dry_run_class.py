@@ -171,7 +171,11 @@ class Workspace:
         self.queries.append(query)
         both = [self.before, self.during] if end > START + 45 else [self.before]
         if dry.STAGE_METRIC in query:
-            return self._stages(start, end)
+            # These stubs' samples are scraped on the query's grid: each step's sample was taken then.
+            stages = self._stages(start, end)
+            if query.startswith("timestamp("):
+                return [_series(dict(one.labels), *((t, t) for t, _ in one.samples)) for one in stages]
+            return stages
         if "timestamp(rhi_lifecycle_release_info" in query:
             return [_series({"instance": one}, (end, end - 5)) for one in both]
         if dry.INSTANCES_IN_SERVICE in query:
@@ -353,6 +357,40 @@ def test_a_launch_that_began_just_before_the_hour_ended_is_written(boot: float) 
     assert started["stages"] == stages
     # The latest it can have begun, which its later samples bring down into the hour.
     assert dry.utc(START + rehearsal.duration - 3) <= started["began_at"] <= hour["ends_at"]
+
+
+@pytest.mark.parametrize(("kernel", "written"), [(-2.0, 0), (58.0, 1)], ids=["just-before", "just-inside"])
+def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_step(
+    kernel: float, written: int
+) -> None:
+    lines: list[str] = []
+    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    stages = {"boot": 20.0, "image": 2.0, "release-check": 1.0, "container-start": 3.0, "weights": 17.0}
+    stages |= {"warm-up": 3.0, "hook": 1.0}
+    ends = list(itertools.accumulate(stages.values(), initial=START + kernel))[1:]
+
+    class OutOfPhase(Workspace):
+        """The collector scrapes 4 seconds after each step of the query's grid; at each step the
+        query returns the last sample scraped before it."""
+
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if dry.STAGE_METRIC not in query:
+                return []
+            series = []
+            for (stage, seconds), ended in zip(stages.items(), ends, strict=True):
+                steps = [start + n * step for n in range(int((end - start) // step) + 1)]
+                scrapes = {t: START + 4 + ((t - START - 4) // 15) * 15 for t in steps}
+                taken = [(t, scrapes[t]) for t in steps if scrapes[t] >= ended]
+                values = [(t, scrape if query.startswith("timestamp(") else seconds) for t, scrape in taken]
+                series.append(_series({"instance": self.after, "transition": "promotion", "stage": stage}, *values))
+            return [one for one in series if one.samples]
+
+    rehearsal.workspace = OutOfPhase(*instances)
+    rehearsal.clock.at = START + 180  # ty: ignore[unresolved-attribute] - the test's clock
+    asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
+    started = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
+    assert len(started) == written
+    assert all(line["stages"] == stages for line in started)
 
 
 def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:
