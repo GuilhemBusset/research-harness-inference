@@ -1508,9 +1508,13 @@ def test_detects_a_missing_and_a_moved_action(cdk: ModuleType, tmp_path: Path) -
     assert differences(templates, longer) == [(MISSING, "stage Verify"), (MISSING, f"Verify/Smoke: {CODEBUILD}")]
     assert [what for what, _ in differences(templates, [BUILT[1], BUILT[0], *BUILT[2:]])] == [ANOTHER_ORDER]
 
-    # The order is the one the actions run in: this step comes before the deployment, the
-    # verification after it.
+    # The order is the one the actions run in, not the one the template declares them in: this
+    # step comes before the deployment, the verification after it, whichever the template writes
+    # first.
     both = built(cdk, tmp_path / "both", step=("Extra", ["true"]), verification=True)
+    (pipeline,) = [properties for _, _, properties, _ in resources(both, "AWS::CodePipeline::Pipeline")]
+    (rhi,) = [stage for stage in pipeline["Stages"] if stage["Name"] == "Rhi"]
+    rhi["Actions"].reverse()
     extra, verify = ("Extra", CODEBUILD), (VERIFY_ACTION, CODEBUILD)
     assert differences(both, [*BUILT[:3], ("Rhi", [extra, verify])]) == []
     assert [what for what, _ in differences(both, [*BUILT[:3], ("Rhi", [verify, extra])])] == [ANOTHER_ORDER]

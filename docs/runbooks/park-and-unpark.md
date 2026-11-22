@@ -177,7 +177,9 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
    **No approval.** Unparking adds back the roles, policies and security group rules that parking
    removed. The pipeline holds no approval (system design, section 8.4, control 6), so the
-   execution deploys them without waiting for you: the merge that set the flag was the review.
+   execution deploys them without waiting for you: they are the ones the stage's code declares,
+   which the examiner and `tests/policy/` held when that code merged, under the bounded
+   bootstrap's boundary.
 
    The deployment creates the load balancers, the certificate (validated through the hosted
    zone), the NAT gateway, the services, and each pool's group, whose warm pool fills at once: each

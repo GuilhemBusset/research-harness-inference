@@ -92,17 +92,18 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
    - `deploy/<stage>` `pending`, "The deployment is running.": not finished yet, or between two
      of its actions; wait. "The deployment waits for the owner's approval in the pipeline.": the
-     pipeline this repository builds holds no approval (system design, section 8.4, control 6), so
-     an approval action was added to it outside the repository; read the execution's actions in
-     the console and compare them with the reviewed list of `tests/policy/test_pipeline.py`. "The
+     pipeline this repository builds holds no approval (system design, section 8.4, control 6).
+     On a commit merged before the approval was removed, the line is that older pipeline's; on a
+     later one, the pipeline in the account is not the one the repository builds. Read the
+     execution's actions in the console and compare them with the reviewed list of
+     `tests/policy/test_pipeline.py`. "The
      pipeline's execution is being stopped.": someone stopped it; wait for the end;
    - `deploy/<stage>` `success`, "The deployment succeeded.", then `verify/<stage>`: the
      verification's own line says whether its tests ran and passed;
    - `deploy/<stage>` `failure`, "The deployment failed.": an action failed, the deployment of a
      stack or a step before it (source, synthesis, self-update, assets, the copy of the weights).
      "The approval was rejected, or it expired: the deployment did not continue.": nothing of the
-     stage was deployed, and the approval was not one this repository builds, as for the pending
-     line above. The report follows (step 2);
+     stage was deployed; read it as the pending line above. The report follows (step 2);
    - `verify/<stage>` `failure`, "The verification failed.": the deployment is in place and its
      smoke tests failed. The report follows (step 2);
    - `error`, "The pipeline's execution was stopped before this step finished." or "... was

@@ -238,7 +238,6 @@ that `rhi_admin roster list` prints.
       | `Rhi-Pools` | `AWS::Logs::LogGroup` | The retained log group `/aws/lambda/...` of the function a custom resource of the stack runs, 90 days' retention | No |
       | `Rhi-Guardrails` | `AWS::KMS::Key` | The alerts key, which encrypts the alerts topic | No |
       | `RhiPipeline` | `AWS::S3::Bucket` | The pipeline's artifact bucket | No |
-      | `RhiPipeline` | `AWS::Logs::LogGroup` | The log group of the pipeline's permissions check | No |
 
       A line that is not in this table is retained too: it is deleted or kept like the line of its
       type in step d. Steps d and the Verify section use these identifiers, and only these.
@@ -298,12 +297,22 @@ that `rhi_admin roster list` prints.
 
       A backup of a table that step a did not list is not the stage's: leave it.
 
-      The retained log groups, each by its name from step a (the `/aws/lambda/...` group of
-      `Rhi-Pools` and the permissions check's group of `RhiPipeline`). Neither holds a student's
-      data; deleting them removes their records at once, rather than after their retention:
+      The retained log group, by its name from step a (the `/aws/lambda/...` group of
+      `Rhi-Pools`). It holds no student's data; deleting it removes its records at once, rather
+      than after its retention:
 
       ```sh
       aws logs delete-log-group --log-group-name <log-group>
+      ```
+
+      A pipeline stack once deployed with the approval on widened permissions, which the pipeline
+      no longer holds (system design, section 8.4, control 6), retained the log group of that
+      approval's function when the approval went. It belongs to no stack since, so step a does not
+      list it. It holds no student's data. List it by its prefix, and delete each group that lists
+      with the command above:
+
+      ```sh
+      aws logs describe-log-groups --log-group-name-prefix /aws/lambda/RhiPipeline-PipelinePipelinesSecurityCheck --query 'logGroups[].logGroupName' --output text
       ```
 
       The alerts key of `Rhi-Guardrails`, by its key ID from step a. Nothing uses it once its stack
