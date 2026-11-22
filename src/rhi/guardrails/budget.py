@@ -3,7 +3,8 @@ admin, through the alerts topic, at thresholds of a monthly amount, and nothing 
 
 - **A monthly budget of cost** for the configuration's monthly_budget_usd, in US dollars, read at
   synthesis from the configuration in SSM, never from the repository.
-- **One notification on actual cost at each threshold**, 50%, 80% and 100% of the amount (section
+- **One notification on actual cost at each threshold**, each percentage of the amount that the
+  configuration's budget_alert_percentages lists (50%, 80% and 100% when it is left out, section
   17), each to the alerts topic. Budgets' data is updated about once a day (evidence E27).
 - **A statement of the topic's policy** that lets `budgets.amazonaws.com` call `sns:Publish` on the
   topic, when the request comes from the stack's own account (`aws:SourceAccount`). The topic's key
@@ -29,8 +30,6 @@ if TYPE_CHECKING:
     from rhi.config import Config
 
 PRINCIPAL = "budgets.amazonaws.com"
-# The thresholds, in percent of the monthly amount (section 17).
-THRESHOLDS = (50, 80, 100)
 
 
 class Budget(Construct):
@@ -63,12 +62,12 @@ class Budget(Construct):
                     notification=budgets.CfnBudget.NotificationProperty(
                         notification_type="ACTUAL",
                         comparison_operator="GREATER_THAN",
-                        threshold=threshold,
+                        threshold=percentage,
                         threshold_type="PERCENTAGE",
                     ),
                     subscribers=[budgets.CfnBudget.SubscriberProperty(address=topic.topic_arn, subscription_type="SNS")],
                 )
-                for threshold in THRESHOLDS
+                for percentage in config.budget_alert_percentages
             ],
         )
         if grant.policy_dependable is not None:

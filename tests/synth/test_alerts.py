@@ -67,6 +67,24 @@ def test_the_topic_has_one_e_mail_subscription_to_the_admin_address(templates: T
     assert EXAMPLE.admin_email == "admin@example.com"
 
 
+def synthesized(app_module: ModuleType, outdir: Path, configuration: config.Config) -> Templates:
+    """The templates of the app's own build under this configuration, so that cdk-nag runs on it."""
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app_module.build(configuration, outdir=str(outdir), context=context).synth()
+    return {p.name: json.loads(p.read_text(encoding="utf-8")) for p in outdir.rglob("*.template.json")}
+
+
+def budget_thresholds(template: dict[str, Any]) -> list[int]:
+    """The budget's thresholds, each checked to be a percentage of actual cost sent to the topic."""
+    (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    (budget,) = of_type(template, "AWS::Budgets::Budget").values()
+    notifications = budget["NotificationsWithSubscribers"]
+    for n in notifications:
+        assert (n["Notification"]["NotificationType"], n["Notification"]["ThresholdType"]) == ("ACTUAL", "PERCENTAGE")
+        assert n["Subscribers"] == [{"Address": {"Ref": topic_id}, "SubscriptionType": "SNS"}]
+    return sorted(n["Notification"]["Threshold"] for n in notifications)
+
+
 def test_the_budget_alerts_the_topic_at_each_threshold_of_the_monthly_amount(templates: Templates) -> None:
     template = guardrails(templates)
     (topic_id,) = of_type(template, "AWS::SNS::Topic")
@@ -74,17 +92,21 @@ def test_the_budget_alerts_the_topic_at_each_threshold_of_the_monthly_amount(tem
     data = budget["Budget"]
     assert (data["BudgetType"], data["TimeUnit"]) == ("COST", "MONTHLY")
     assert data["BudgetLimit"] == {"Amount": EXAMPLE.monthly_budget_usd, "Unit": "USD"}
-    notifications = budget["NotificationsWithSubscribers"]
-    assert sorted(n["Notification"]["Threshold"] for n in notifications) == [50, 80, 100]
-    for n in notifications:
-        assert (n["Notification"]["NotificationType"], n["Notification"]["ThresholdType"]) == ("ACTUAL", "PERCENTAGE")
-        assert n["Subscribers"] == [{"Address": {"Ref": topic_id}, "SubscriptionType": "SNS"}]
+    assert budget_thresholds(template) == sorted(EXAMPLE.budget_alert_percentages) == [50, 80, 100]
     # AWS Budgets may publish, from the stack's own account, before the budget exists.
     ((policy_id, policy),) = of_type(template, "AWS::SNS::TopicPolicy").items()
     (grant,) = [s for s in policy["PolicyDocument"]["Statement"] if services(s) == {"budgets.amazonaws.com"}]
     assert (grant["Effect"], grant["Action"], grant["Resource"]) == ("Allow", "sns:Publish", {"Ref": topic_id})
     assert grant["Condition"] == {"StringEquals": {"aws:SourceAccount": {"Ref": "AWS::AccountId"}}}
     assert policy_id in template["Resources"][budget_id]["DependsOn"]
+
+
+def test_the_budget_alerts_at_the_percentages_the_configuration_gives(
+    app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    configuration = dataclasses.replace(EXAMPLE, budget_alert_percentages=(25, 90))
+    template = guardrails(synthesized(app_module, tmp_path_factory.mktemp("percentages"), configuration))
+    assert budget_thresholds(template) == [25, 90]
 
 
 def test_without_the_flag_there_is_no_anomaly_monitor(templates: Templates) -> None:
@@ -118,13 +140,8 @@ def test_the_stack_creates_no_resource_of_its_own_and_nothing_reads_it(app: cdk.
 
 def test_anomaly_detection_behind_its_flag(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> None:
     # Through the app's own build, so cdk-nag runs on the monitor and its subscription too.
-    outdir = tmp_path_factory.mktemp("anomaly")
-    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    app = app_module.build(
-        dataclasses.replace(EXAMPLE, cost_anomaly_detection=True), outdir=str(outdir), context=context
-    )
-    app.synth()
-    template = guardrails({p.name: json.loads(p.read_text(encoding="utf-8")) for p in outdir.rglob("*.template.json")})
+    configuration = dataclasses.replace(EXAMPLE, cost_anomaly_detection=True)
+    template = guardrails(synthesized(app_module, tmp_path_factory.mktemp("anomaly"), configuration))
 
     ((monitor_id, monitor),) = of_type(template, "AWS::CE::AnomalyMonitor").items()
     assert (monitor["MonitorType"], monitor["MonitorDimension"]) == ("DIMENSIONAL", "SERVICE")
