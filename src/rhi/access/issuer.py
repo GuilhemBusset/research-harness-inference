@@ -67,7 +67,7 @@ TIMEOUT = cdk.Duration.seconds(30)
 MEMORY_MB = 256
 
 LOG_GROUP_NAME = "/rhi/issuer"
-LOG_RETENTION = logs.RetentionDays.ONE_MONTH
+LOG_RETENTION = logs.RetentionDays.THREE_MONTHS  # Section 6.6 (`rhi.retention`).
 
 # The listener's rules need distinct priorities; the design gives none (gateway 10, Grafana 30).
 PRIORITY = 20

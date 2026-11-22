@@ -1,6 +1,7 @@
 """The web ACL of the public load balancer (system design, section 6.5): three rate limits and the
-AWS IP reputation list, no rule that reads a request's body (evidence E18), and no request sampling,
-which would show the key headers in cleartext (evidence E26).
+AWS IP reputation list, no rule that reads a request's body (evidence E18), no request sampling,
+which would show the key headers in cleartext (evidence E26), and logs to a log group of its stack
+that hold neither key header (section 6.6).
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
 """
@@ -70,6 +71,20 @@ def unredacted(logging: dict[str, Any]) -> set[str]:
     return KEY_HEADERS - {field["SingleHeader"]["Name"].lower() for field in redacted if "SingleHeader" in field}
 
 
+def unprotected(acl: dict[str, Any]) -> set[str]:
+    """The key headers the ACL's data protection does not replace by `REDACTED` everywhere WAF writes
+    a request, a rule's match details and a rate rule's keys included."""
+    protections = acl["Properties"].get("DataProtectionConfig", {}).get("DataProtections", [])
+    protected: set[str] = set()
+    for protection in protections:
+        field = protection["Field"]
+        everywhere = not protection.get("ExcludeRuleMatchDetails") and not protection.get("ExcludeRateBasedDetails")
+        if field["FieldType"] == "SINGLE_HEADER" and protection["Action"] == "SUBSTITUTION" and everywhere:
+            # A protection with no keys covers every header.
+            protected |= {key.lower() for key in field.get("FieldKeys", KEY_HEADERS)}
+    return KEY_HEADERS - protected
+
+
 def acl_of(templates: dict[str, dict[str, Any]]) -> dict[str, Any]:
     (acl,) = resources(templates, "AWS::WAFv2::WebACL")
     return acl
@@ -94,15 +109,14 @@ def rate_rules(acl: dict[str, Any]) -> dict[str | None, int]:
 
 
 def built_acl(
-    app_module: ModuleType, extra_rule: dict[str, Any] | None = None, *, logging: bool = False
+    app_module: ModuleType, extra_rule: dict[str, Any] | None = None, *, unprotected: bool = False
 ) -> dict[str, Any]:
-    """The template of a stack, built here, that holds the app's ACL, one more rule if given, and an
-    unredacted logging configuration if asked."""
+    """The template of a stack, built here, that holds the app's ACL, one more rule if given, and,
+    if asked, neither its logging redaction nor its data protection."""
     del app_module  # started jsii
     import aws_cdk as cdk
     from aws_cdk import assertions
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
-    from aws_cdk import aws_wafv2 as wafv2
 
     from rhi.network.waf import WebAcl
 
@@ -114,11 +128,12 @@ def built_acl(
         load_balancer_arn=stack.format_arn(service="elasticloadbalancing", resource="loadbalancer", resource_name="app/b/0"),
         security_group_id="security-group",
     )
-    acl = WebAcl(stack, "Waf", load_balancer=balancer, rate_limits=EXAMPLE.rate_limits).web_acl
+    waf = WebAcl(stack, "Waf", load_balancer=balancer, rate_limits=EXAMPLE.rate_limits)
     if extra_rule is not None:
-        acl.add_property_override("Rules.4", extra_rule)  # after the four rules of the construct
-    if logging:
-        wafv2.CfnLoggingConfiguration(stack, "Logs", resource_arn=acl.attr_arn, log_destination_configs=["logs"])
+        waf.web_acl.add_property_override("Rules.4", extra_rule)  # after the four rules of the construct
+    if unprotected:
+        waf.logging.add_property_deletion_override("RedactedFields")
+        waf.web_acl.add_property_deletion_override("DataProtectionConfig")
     return dict(assertions.Template.from_stack(stack).to_json())
 
 
@@ -164,7 +179,7 @@ def test_no_body_inspection(templates: dict[str, Any], app_module: ModuleType) -
     assert body_inspection(acl_of({"built": built_acl(app_module, xss)})) == ["xss: XssMatchStatement", "xss: a match on the body"]
 
 
-def test_no_request_is_sampled_and_any_logging_redacts_the_key_headers(
+def test_no_request_is_sampled_and_the_logs_hold_neither_key_header(
     templates: dict[str, Any], app_module: ModuleType
 ) -> None:
     acl = acl_of(templates)
@@ -174,11 +189,33 @@ def test_no_request_is_sampled_and_any_logging_redacts_the_key_headers(
     sampled["Properties"]["Rules"][0]["VisibilityConfig"]["SampledRequestsEnabled"] = True
     assert sampling_on(sampled) == [acl["Properties"]["Rules"][0]["Name"]]
 
-    # The app logs nothing from WAF today; a logging configuration added later must redact both.
-    assert [unredacted(logging) for logging in resources(templates, "AWS::WAFv2::LoggingConfiguration")
-            if unredacted(logging)] == []
-    (built,) = resources({"built": built_acl(app_module, logging=True)}, "AWS::WAFv2::LoggingConfiguration")
-    assert unredacted(built) == KEY_HEADERS
+    # Both key headers are redacted from the logs, and replaced wherever WAF writes a request,
+    # whichever rule matches.
+    (logging,) = resources(templates, "AWS::WAFv2::LoggingConfiguration")
+    assert unredacted(logging) == set()
+    assert unprotected(acl) == set()
+    built = {"built": built_acl(app_module, unprotected=True)}
+    (built_logging,) = resources(built, "AWS::WAFv2::LoggingConfiguration")
+    assert unredacted(built_logging) == KEY_HEADERS
+    assert unprotected(acl_of(built)) == KEY_HEADERS
+    # An exception for a rule's match details leaves the headers there in cleartext.
+    excepted = json.loads(json.dumps(acl))
+    excepted["Properties"]["DataProtectionConfig"]["DataProtections"][0]["ExcludeRuleMatchDetails"] = True
+    assert unprotected(excepted) == KEY_HEADERS
+
+
+def test_the_acl_logs_to_a_waf_log_group_of_its_stack(templates: dict[str, Any]) -> None:
+    acl = acl_of(templates)
+    (network,) = [t for t in templates.values() if acl in t["Resources"].values()]
+    (acl_id,) = [name for name, r in network["Resources"].items() if r is acl]
+    (logging,) = resources({"network": network}, "AWS::WAFv2::LoggingConfiguration")
+    assert logging["Properties"]["ResourceArn"] == {"Fn::GetAtt": [acl_id, "Arn"]}
+    # The destination is the ARN of a log group of the stack, as WAF takes it: ending in its name.
+    (destination,) = logging["Properties"]["LogDestinationConfigs"]
+    *_, name = destination["Fn::Join"][1]
+    group = network["Resources"][name["Ref"]]
+    assert group["Type"] == "AWS::Logs::LogGroup"
+    assert group["Properties"]["LogGroupName"].startswith("aws-waf-logs-")
 
 
 def test_the_acl_takes_its_limits_from_the_configuration_with_the_listener_off(
