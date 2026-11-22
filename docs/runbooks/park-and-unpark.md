@@ -89,14 +89,11 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
 3. **Before unparking only:**
 
-   - **The course end is still ahead.** Every key, the canary's too, expires at the course end. For
-     a new cohort, set its `course_end` in the same edit as `parked` (Act, step 2), then, once the
-     execution has ended, give the canary a new key, which the verification of the next execution
-     uses, and put the new cohort on the roster (runbook [owner setup](owner-setup.md), step 9):
-
-     ```sh
-     rhi_admin canary
-     ```
+   - **The course end is still ahead, or this is a new cohort.** Every key, the canary's too,
+     expires at the course end. Unparking for the cohort that was parked keeps its keys, the
+     canary's included. Unparking for a new cohort needs its `course_end` and a new key for the
+     canary before the execution starts (Act, step 2): the verification of the unpark reads the
+     canary's key, and the old one expired with the old course.
 
    - **The GPU quota covers each pool's `max_instances` plus one** (runbook
      [a session switched on and off](session-on-and-off.md), Check, step 1). Unparking launches
@@ -122,10 +119,27 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    An edit of SSM changes no commit, so nothing starts on its own: start an execution with
    **Release change** on the pipeline's page in the CodePipeline console. Note the execution's ID:
    it is the first row of the pipeline's execution history, with the trigger
-   `StartPipelineExecution` and your identity. The flag also changes the pipeline itself (the
-   weekly canary goes, and the verification no longer runs tests), so its self-update action
-   updates the pipeline, and CodePipeline then runs the change again in a new execution, with the
-   pipeline's update as its trigger: follow the newest execution from then on, `<execution>` below.
+   `StartPipelineExecution` and your identity:
+
+   ```sh
+   aws codepipeline list-pipeline-executions --pipeline-name <pipeline> --max-items 5 \
+       --query 'pipelineExecutionSummaries[].[pipelineExecutionId,status,startTime,trigger.triggerType]' \
+       --output text
+   ```
+
+   **The pipeline's self-update.** The flag also changes the pipeline itself (the weekly canary
+   goes, and the verification no longer runs tests), so the execution's self-update (the stage
+   `UpdatePipeline`, its action `SelfMutate`) updates the pipeline. The pipeline is not set to
+   restart an execution when it is updated: the execution you started can end at or after the
+   self-update without reaching the stage `Rhi`, and no other execution starts on its own. Read
+   its actions (Verify, step 1). When none of the stage `Rhi` ran, and the history above shows no
+   newer execution in progress, start one more with **Release change**: the pipeline already has
+   its new shape, so that one runs through. `<execution>` below is the execution whose actions of
+   the stage `Rhi` ran, whichever it is.
+
+   **The permissions approval.** Parking removes permissions and adds none, so the permissions
+   check of the stage (`Check.Check`) passes it on and the manual approval `Check.Confirm` does not
+   wait. Should it wait all the same, read and approve it as in step 2.
 
    The stage's stacks deploy in the order parking needs (`src/rhi/stage.py`): the stacks that
    import from others drop their imports first, then the network stack removes the load balancer
@@ -138,15 +152,45 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    parked = false
    ```
 
+   For a new cohort, set its course end in the same edit (the date below is the example's):
+
+   ```toml
+   course_end = 2099-12-31
+   ```
+
    and write it to SSM the same way:
 
    ```sh
    setup/owner-setup.sh --step configuration --config "$HOME/.config/rhi/config.toml"
    ```
 
-   Then start an execution with **Release change**, and follow the newest execution as in step 1:
-   the pipeline updates itself again, since the weekly canary and the verification's tests come
-   back. The deployment creates the load balancers, the certificate (validated through the hosted
+   **For a new cohort, give the canary a new key now,** before any execution: the command reads
+   the course end from SSM, so the key it writes expires at the new one, and the verification of
+   the unpark reads it. It works while the stage is parked, since its tables are there:
+
+   ```sh
+   rhi_admin canary
+   ```
+
+   The new cohort joins the roster as runbook [owner setup](owner-setup.md), step 9, says, before
+   or after the unpark.
+
+   Then start an execution with **Release change**, and find `<execution>` as in step 1: the
+   pipeline updates itself again, since the weekly canary and the verification's tests come back,
+   and the execution you started may end at the self-update with none started after it.
+
+   **The permissions approval.** Unparking adds back the roles, policies and security group rules
+   that parking removed, so the permissions check of the stage `Rhi` (`Check.Check`) finds that
+   permissions widen, and the execution waits at the manual approval `Check.Confirm`, before
+   anything of the stage is deployed. On the execution's page, open the details of `Check.Check`,
+   which link to its CodeBuild log, and read the security changes it lists: each must belong to
+   what unparking brings back (the load balancers, the gateway's, the issuer's and Grafana's
+   services, the pools' groups and the scaler). Then, on `Check.Confirm`, choose **Review**, then
+   **Approve**. A change that belongs to none of these: **Reject**, and the runbook
+   [a bad deployment](bad-deployment.md) applies. An approval nobody answers expires after seven
+   days, and the execution fails.
+
+   The deployment creates the load balancers, the certificate (validated through the hosted
    zone), the NAT gateway, the services, and each pool's group, whose warm pool fills at once: each
    warm instance runs for the minutes it takes to pull the engine's image and check its release,
    billed at its GPU price, then stops.
@@ -195,9 +239,9 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    `rhi status` fails to reach the endpoint's address; `rhi_admin roster list` lists every entry
    as before.
 
-3. **After unparking, the verification's tests ran and passed with a key issued before parking.**
-   The canary's key is one: the canary command wrote it before the stage was parked, unless Check,
-   step 3 gave it a new one. In the execution's detail page, in the stage the endpoint deploys
+3. **After unparking, the verification's tests ran and passed with the canary's key.** For the
+   cohort that was parked, that key was issued before parking, so this also shows that such a key
+   still works; for a new cohort, it is the key of Act, step 2. In the execution's detail page, in the stage the endpoint deploys
    from, open the details of the action Verify, which link to its CodeBuild log, and read the end of
    the log:
 
@@ -206,15 +250,21 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    - the line `verify: no test was run:` followed by `listener-off` or `canary-missing`: the
      endpoint is not verified, even though Verify succeeded. For `canary-missing`, run
      `rhi_admin canary`, start another execution and read its log again; for `listener-off`, the
-     configuration's `https_listener` is off.
+     configuration's `https_listener` is off;
+   - a summary with tests `failed`: the verification failed. On a new cohort's unpark, first make
+     sure the canary's key is the new one: run `rhi_admin canary`, start another execution and
+     read its log again. If its tests fail too, the runbook [a bad deployment](bad-deployment.md)
+     applies.
 
    The unpark creates each pool's group anew, and an instance refresh is what tells the
    verification that a GPU pool's release changed, so the log also reads
    `gpu-verification: the smoke tests run on no GPU pool`: this execution tested the mock pool,
    not the coursework pool. The coursework pool is first tested at its next start (step 5).
 
-4. **A student's key still works.** With a key issued to your own roster entry before parking, the
-   status of the pools is answered, which the gateway does only for a valid key:
+4. **A student's key still works.** For the cohort that was parked: with a key issued to your own
+   roster entry before parking, the status of the pools is answered, which the gateway does only
+   for a valid key. For a new cohort, whose keys are issued after the unpark, log in first with
+   `rhi login` and use that key:
 
    ```sh
    rhi status

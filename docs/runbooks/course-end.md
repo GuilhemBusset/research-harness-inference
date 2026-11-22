@@ -99,8 +99,14 @@ that `rhi_admin roster list` prints.
 2. **Export what you keep,** for each student of Check, step 3, into the folder made there:
 
    ```sh
-   rhi_admin privacy export 1234567 > "$HOME/rhi-course-end/1234567.json"
+   rhi_admin privacy export 1234567 > "$HOME/rhi-course-end/1234567.json.part" && mv "$HOME/rhi-course-end/1234567.json.part" "$HOME/rhi-course-end/1234567.json" && echo "1234567: exported" || echo "1234567: NOT exported"
    ```
+
+   The export is written beside the kept file and takes its name only once the command succeeded,
+   so a failed run, a first one or a retry, leaves any copy you already had as it was. It ends with
+   `exported` or `NOT exported`: erase a student whose data you keep (step 3) only after the line
+   for them read `exported`. After `NOT exported`, delete the `.part` file it left and run the line
+   again.
 
    The export is one JSON document: the roster entry, each key's issue, expiry and revocation times
    (no key and no SHA-256), the usage rows, the gateway's log records under the student's alias,
@@ -108,7 +114,7 @@ that `rhi_admin roster list` prints.
    days. It reads the logs and the workspace, so it takes a while for each student. A student who is
    no longer on the roster is refused: `Refused: that GitHub ID is not on the roster.`
 
-3. **Erase each student's data,** once their export, if any, is written:
+3. **Erase each student's data,** once their export, if any, read `exported`:
 
    ```sh
    rhi_admin privacy erase 1234567
@@ -123,14 +129,32 @@ that `rhi_admin roster list` prints.
    data has expired. When it prints that rows of the student were written during the erase, run it
    again for that student.
 
+   **Check the erases now,** before step 4: the admin CLI finds its tables through the stage's
+   stacks, so once the stage is deleted it cannot run. The roster holds the canary's entry and the
+   spikes' students only, or nothing at all:
+
+   ```sh
+   rhi_admin roster list
+   ```
+
+   and an export of each erased student is refused, since the entry is gone:
+
+   ```sh
+   rhi_admin privacy export 1234567
+   ```
+
+   It prints `Refused: that GitHub ID is not on the roster.`
+
 4. **Park or delete the stage.**
 
    - **Park it** when another cohort will use the endpoint: runbook
      [park and unpark](park-and-unpark.md), Act, step 1. The data that is left expires by its
      retention (step 5); the pipeline, the tables and the workspace stay for the next cohort.
-   - **Delete it** when the endpoint is not used again. This removes the data at once rather than
-     by retention. It is written out in full, and you run it with your own credentials, in the
-     region of the endpoint.
+   - **Delete it** when the endpoint is not used again. The tables, the logs and the buckets go
+     when they are deleted, rather than by retention; the workspace's series stop being readable
+     when the workspace is deleted, and AWS deletes them for good within a month after (step d).
+     It is written out in full, and you run it with your own credentials, in the region of the
+     endpoint.
 
    **Deleting the stage.** The stacks are named as the CloudFormation console lists them: the
    pipeline stack `RhiPipeline`, and the stage's stacks `Rhi-Network`, `Rhi-Access`,
@@ -144,6 +168,11 @@ that `rhi_admin roster list` prints.
       ```sh
       for stack in Rhi-Access Rhi-Pools Rhi-Observability Rhi-Network; do aws cloudformation describe-stack-resources --stack-name "$stack" --query "StackResources[?ResourceType=='AWS::DynamoDB::Table' || ResourceType=='AWS::S3::Bucket' || ResourceType=='AWS::Cognito::UserPool' || ResourceType=='AWS::APS::Workspace'].[ResourceType,PhysicalResourceId]" --output text; done
       ```
+
+      Each line is a type and an identifier: a table's name, a bucket's name, the user pool's ID,
+      and, for the workspace, its ARN, whose last part, after `workspace/`, is the workspace's ID
+      (the admin CLI reads it the same way). Steps d and the Verify section use these identifiers,
+      and only these.
 
    b. **Delete the pipeline stack first.** Otherwise the next merge to `main` deploys the stage
       again:
@@ -172,18 +201,24 @@ that `rhi_admin roster list` prints.
       ```
 
       A table with point-in-time recovery leaves a system backup when it is deleted, which
-      DynamoDB keeps for 35 days. List those backups and delete each:
+      DynamoDB keeps for 35 days. For each table of step a, and no other, list its system backups
+      by the table's name, then delete each backup that lists:
 
       ```sh
-      aws dynamodb list-backups --backup-type SYSTEM --query 'BackupSummaries[].[TableName,BackupArn]' --output text
+      aws dynamodb list-backups --table-name <table> --backup-type SYSTEM --query 'BackupSummaries[].BackupArn' --output text
       aws dynamodb delete-backup --backup-arn <backup>
       ```
 
-      The workspace, with every series in it:
+      A backup of a table that step a did not list is not the stage's: leave it.
+
+      The workspace, by its workspace ID from step a (the end of its ARN, not the whole ARN):
 
       ```sh
-      aws amp delete-workspace --workspace-id <workspace>
+      aws amp delete-workspace --workspace-id <workspace-id>
       ```
+
+      Its series can no longer be queried once the workspace is deleted, and AWS deletes the data
+      it ingested for good within a month after; nothing more is yours to do for it.
 
       The admin's sign-in, first without its deletion protection (should the second command refuse
       because the pool still has its sign-in domain, delete the domain with
@@ -222,40 +257,69 @@ that `rhi_admin roster list` prints.
 
 ## Verify
 
-1. **No student is on the roster any more.** The list holds the canary's entry and the spikes'
-   students only, or nothing at all:
-
-   ```sh
-   rhi_admin roster list
-   ```
-
-2. **An erased student has nothing left that the erase could delete.** An export is refused, since
-   the entry is gone:
-
-   ```sh
-   rhi_admin privacy export 1234567
-   ```
-
-   It prints `Refused: that GitHub ID is not on the roster.`
-
-3. **Each export you keep is there,** outside the working tree, readable by you alone:
+1. **Each export you keep is there,** outside the working tree, readable by you alone, and no
+   `.part` file is left:
 
    ```sh
    ls -l "$HOME/rhi-course-end"
    ```
 
-4. **The stage is parked or deleted.** Parked: the runbook [park and unpark](park-and-unpark.md),
-   Verify, step 2. Deleted: no stack of the endpoint is left (an empty list), and none of the
-   retained resources of Act, step 4a, is listed any more by its service:
+2. **On a parked stage, the erases held and the stage is parked.** The roster still holds the
+   canary's entry and the spikes' students only, or nothing at all, as the check of Act, step 3
+   found:
+
+   ```sh
+   rhi_admin roster list
+   ```
+
+   and the stage is parked: the runbook [park and unpark](park-and-unpark.md), Verify, step 2.
+
+3. **On a deleted stage, nothing of it is left.** The admin CLI cannot run any more (its stacks
+   are gone), so this reads each service. No stack of the endpoint is left (an empty list):
 
    ```sh
    aws cloudformation describe-stacks --query "Stacks[?starts_with(StackName, 'Rhi')].StackName"
    ```
 
-5. **After the course end plus 90 days,** on a stage parked since the course end: in the AWS
-   console, CloudWatch, Logs Insights, on the log group `/rhi/gateway`, over the last 90 days, the
-   query `stats count(*)` counts no record. A record older than 90 days that is still there means a
-   log group whose retention is not set: delete the record's log group by hand, and file the fault
-   as an issue.
+   Each identifier of Act, step 4a, is gone. Each of these commands, run with the identifier, fails
+   because what it names does not exist, and each `list-backups` lists nothing:
+
+   ```sh
+   aws dynamodb describe-table --table-name <table> --query Table.TableName
+   aws dynamodb list-backups --table-name <table> --backup-type SYSTEM --query 'BackupSummaries[].BackupArn' --output text
+   aws cognito-idp describe-user-pool --user-pool-id <user-pool> --query UserPool.Id
+   aws s3api head-bucket --bucket <bucket>
+   ```
+
+   The workspace, by its workspace ID, either no longer exists or reads `DELETING`:
+
+   ```sh
+   aws amp describe-workspace --workspace-id <workspace-id> --query workspace.status.statusCode
+   ```
+
+4. **Retention is set on every log group that holds a student's records,** on a parked stage, the
+   day you park it. Each fixed log group, and the web ACL's, whose name starts with
+   `aws-waf-logs-`, reads `90`:
+
+   ```sh
+   aws logs describe-log-groups --log-group-name-prefix /rhi/ --query 'logGroups[].[logGroupName,retentionInDays]' --output text
+   aws logs describe-log-groups --log-group-name-prefix aws-waf-logs- --query 'logGroups[].[logGroupName,retentionInDays]' --output text
+   ```
+
+   A group that reads `None` keeps its records for ever: set its retention, and file the fault as
+   an issue:
+
+   ```sh
+   aws logs put-retention-policy --log-group-name <group> --retention-in-days 90
+   ```
+
+5. **The records are gone, after the course end plus 90 days and a week,** on a stage parked since
+   the course end. CloudWatch Logs deletes an expired record some time after it expires, not at
+   the instant, hence the week. In the AWS console, CloudWatch, Logs Insights, on the log group
+   `/rhi/gateway`, with an absolute time range from the course's first day to the day the stage was
+   parked, so that it covers every record the course wrote, the query `stats count(*)` counts no
+   record. A count above zero: read the group's retention again (step 4). With `90` set, the
+   records are still waiting for their deletion; look again a week later, and file the fault as an
+   issue if they are still there. With none set, the step 4 fault applies.
 
 Walked through on the deployed system: not yet.

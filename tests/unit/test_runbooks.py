@@ -40,11 +40,11 @@ SECTIONS = ["when", "check", "act", "verify"]
 FENCE = re.compile(r"^(`{3,}|~{3,})")
 
 
-def read(text: str) -> tuple[list[str], list[list[str]]]:
+def read(text: str) -> tuple[list[str], list[list[tuple[str, bool]]]]:
     """The level-2 headings outside the code blocks, and the words of every line of every fenced code
     block (backticks or tildes): a `\\` continues a line, and blank and comment lines are left out."""
     headings: list[str] = []
-    lines: list[list[str]] = []
+    lines: list[list[tuple[str, bool]]] = []
     fence, pending = "", ""
     for line in text.splitlines():
         opening = FENCE.match(line.strip())
@@ -61,7 +61,7 @@ def read(text: str) -> tuple[list[str], list[list[str]]]:
         if pending.endswith("\\"):
             pending = pending[:-1] + " "
             continue
-        words = shlex.split(pending, comments=True)
+        words = split(pending)
         if words:
             lines.append(words)
         pending = ""
@@ -85,17 +85,31 @@ CONTROL = {"|", "||", "&&", ";"}
 REDIRECTION = {">", ">>", "<", "2>"}
 
 
-def commands(words: list[str]) -> list[list[str]]:
+def split(line: str) -> list[tuple[str, bool]]:
+    """The words of a shell line, as `shlex.split` gives them, each with whether it is an operator:
+    a control operator or a redirection the shell reads as one, unquoted. A quoted `'|'` is a word."""
+    stream = io.StringIO(line)
+    lexer = shlex.shlex(stream, posix=True)
+    lexer.whitespace_split, lexer.commenters = True, "#"
+    found, start = [], 0
+    for word in lexer:
+        end = stream.tell()
+        found.append((word, word in CONTROL | REDIRECTION and line[start:end].strip() == word))
+        start = end
+    return found
+
+
+def commands(words: list[tuple[str, bool]]) -> list[list[str]]:
     """The commands of a line: the words between its control operators, each without its
     redirections and their files, so that each command of a pipeline is checked on its own."""
     found: list[list[str]] = [[]]
     target = False
-    for word in words:
+    for word, operator in words:
         if target:
             target = False
-        elif word in CONTROL:
+        elif operator and word in CONTROL:
             found.append([])
-        elif word in REDIRECTION:
+        elif operator:
             target = True
         else:
             found[-1].append(word)
@@ -139,6 +153,8 @@ def test_detects_an_unknown_command() -> None:
     # A redirection is not an argument, and each command of a pipeline or a list is checked.
     redirected = "```sh\nrhi_admin privacy export 1234567 > \"$HOME/export.json\"\nrhi status | cat && rhi frobnicate\n```\n"
     assert problems(sections + redirected) == ["the rhi CLI refuses: rhi frobnicate"]
+    # A quoted operator is an argument, which the CLI is given.
+    assert problems(sections + "```sh\nrhi status '|'\n```\n") == ["the rhi CLI refuses: rhi status '|'"]
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:

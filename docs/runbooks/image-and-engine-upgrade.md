@@ -138,19 +138,35 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    The canary start is one GPU start, at one instance's price for its minutes; the job terminates
    the canary whatever came of it.
 
-3. **Find the execution the job started,** and note its ID as `<execution>`. The job prints no ID:
-   it is the first execution that started after the job's `pipeline started`, with the trigger
-   `StartPipelineExecution`:
+3. **Find the execution the job started,** and note its ID as `<execution>`. The job prints no
+   ID. Its execution started while the job's build ran, between the build's start and end times,
+   with the trigger `StartPipelineExecution` and, as the trigger's detail, the job's own role
+   rather than your identity. The build's times, `<build>` being the build's ID, which
+   `start-build` printed as `build.id` and the build's page shows:
 
    ```sh
-   aws codepipeline list-pipeline-executions --pipeline-name <pipeline> --max-items 5 \
-       --query 'pipelineExecutionSummaries[].[pipelineExecutionId,status,startTime,trigger.triggerType]' \
+   aws codebuild batch-get-builds --ids <build> --query 'builds[0].[startTime,endTime]' --output text
+   ```
+
+   The pipeline's latest executions, with their trigger and its detail (the detail names a role
+   with the account: read it in your terminal and never paste it anywhere):
+
+   ```sh
+   aws codepipeline list-pipeline-executions --pipeline-name <pipeline> --max-items 10 \
+       --query 'pipelineExecutionSummaries[].[pipelineExecutionId,status,startTime,trigger.triggerType,trigger.triggerDetail]' \
        --output text
    ```
 
-   Should its self-update action change the pipeline, CodePipeline runs it again in a newer
-   execution, and that one is `<execution>`. That execution deploys the commit at the head of `main` again, which other executions may have
-   deployed before: what the commit's statuses say can be theirs. Verify reads this execution only.
+   The one execution whose start falls inside the build's times and whose trigger's detail names
+   the job's role is `<execution>`. It deploys the commit at the head of `main` again, which
+   other executions may have deployed before: what the commit's statuses say can be theirs.
+   Verify reads this execution only.
+
+   The pipeline is not set to restart an execution when its self-update (the stage
+   `UpdatePipeline`, its action `SelfMutate`) changes it. Read the execution's actions (Verify,
+   step 1): when it ended without any action of the stage `Rhi`, and no newer execution is in
+   progress, start one with **Release change** on the pipeline's page in the CodePipeline console,
+   and that execution, the newest with your identity as its trigger's detail, is `<execution>`.
 
 ### The engine
 
@@ -165,12 +181,36 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    Code): one draft whose deliverables are the `FROM` line of `services/engine/vllm/Dockerfile`
    with the new tag and digest, `services/engine/vllm/VERSION` with the new version, and the
    metric names and flags of Check, step 4 at the new version; its context names the advisory's
-   identifier, the pinned version and the fixed one. Check it and publish it:
+   identifier, the pinned version and the fixed one. Check it:
 
    ```sh
    scripts/backlog.sh lint
+   ```
+
+   The draft is committed and merged like any change (`backlog/README.md`, "Lifecycle"). Then,
+   from `main`, preview what publishing would create; it sends nothing:
+
+   ```sh
+   scripts/backlog.sh publish
+   ```
+
+   Publishing works on every draft under `backlog/drafts/`, not on yours alone: each draft that is
+   not on GitHub yet becomes an issue. Read every issue the preview lists. Each one that is not
+   your draft must already be on GitHub, which the publisher knows by its marker and never creates
+   again; look each up by its title:
+
+   ```sh
+   gh issue list --repo OWNER/REPOSITORY --state all --search "<title> in:title"
+   ```
+
+   Only when every other draft the preview lists is already an issue, publish:
+
+   ```sh
    scripts/backlog.sh publish --apply
    ```
+
+   When another draft is not on GitHub yet, do not publish: that work is not meant to be sent
+   now. Take the branch below instead.
 
    The implement loop then builds it and opens its pull request, once you launch it on the new
    issue (`/implement <n>`, `docs/factory/operating.md`). For a security fix that cannot wait for the loop, make the change
@@ -196,9 +236,14 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
        --query "pipelineExecutionSummaries[?sourceRevisions[0].revisionId=='<sha>'].[pipelineExecutionId,status,startTime]"
    ```
 
-   When the pipeline updates itself on the way (its self-update action changes the pipeline, and
-   CodePipeline runs the change again), the query lists more than one execution of the commit:
-   `<execution>` is the newest, the one that ran past the self-update to the stage's deployment.
+   A new engine image changes the pipeline's asset steps, so the execution's self-update (the
+   stage `UpdatePipeline`, its action `SelfMutate`) updates the pipeline, and the pipeline is not
+   set to restart an execution when it is updated: the execution can end there without any action
+   of the stage `Rhi` (Verify, step 1, lists them), and no other execution starts on its own. Then,
+   when no newer execution is in progress, start one with **Release change** on the pipeline's
+   page in the CodePipeline console; it deploys the head of `main`, which is `<sha>` while nothing
+   was merged after it, and the query above lists it too. `<execution>` is the execution of
+   `<sha>` whose actions of the stage `Rhi` ran.
    The pipeline builds the new engine image into ECR, and every pool served by vLLM gets a new
    release, which starts a refresh of each one that has instances.
 
@@ -230,19 +275,25 @@ larger pools included, while a machine image refreshes only the promoted pool.
    [a bad deployment](bad-deployment.md); for a machine image, its Act, step 2 promotes the image of
    Check, step 3 back.
 
-2. **The release assertion ran on the coursework pool, and passed.** A Verify that succeeded does
-   not say it: Verify also succeeds when it ran no test, and the commit's `verify/<stage>` status
-   can describe another execution of the same commit. In the detail page of `<execution>`, open the
-   details of the action Verify, which link to its CodeBuild log, and read it:
+2. **The refreshes ended, and the release assertion ran on the coursework pool and passed.** A
+   Verify that succeeded does not say it: Verify also succeeds when it ran no test, and the
+   commit's `verify/<stage>` status can describe another execution of the same commit. In the
+   detail page of `<execution>`, open the details of the action Verify, which link to its
+   CodeBuild log, and read it:
 
-   - `gpu-verification: the instance refresh of the pool coursework ended Successful` (one such
-     line for each GPU pool that was refreshed), then `gpu-verification: the smoke tests run on
-     coursework`: the decision found the refreshes this execution started, and waited for them;
+   - `gpu-verification: the instance refresh of the pool <pool> ended Successful`, one such line
+     for each GPU pool this execution refreshed: the promoted pool for a machine image, each pool
+     served by vLLM that has instances for the engine. Then `gpu-verification: the smoke tests run
+     on coursework`: the decision found the refreshes this execution started and waited for them,
+     and the smoke tests run on the coursework pool whichever pool was refreshed;
    - then two of pytest's summaries that each report tests `passed` and none `failed` or `error`:
      the run on the mock pool, and the run on the coursework pool, whose tests
      `gpu-release-served` and `release-heartbeat` (`tests/smoke/ids.py`) compare the image digest
-     and model revision the pool's instances serve with the deployed release. Both passed: the
-     coursework pool serves the new release.
+     and model revision the coursework pool's instances serve with its deployed release. When the
+     coursework pool was one of the refreshed pools, it serves the new release. A refreshed pool
+     other than coursework, a promoted `upgrade` or `xl` pool included, is not what these tests
+     read: its refresh line above says its instances were replaced, and step 3 checks what it
+     serves.
 
    Any other end means the release is not verified:
 
@@ -253,8 +304,9 @@ larger pools included, while a machine image refreshes only the promoted pool.
      `Successful`: the verification failed, and the runbook [a bad deployment](bad-deployment.md)
      applies.
 
-3. **Another pool that was refreshed,** an engine change's larger pools (`upgrade`, `xl`): the
-   verification tests the coursework pool whichever GPU pool's refresh it found, never that pool.
+3. **Another pool that was refreshed,** an engine change's larger pools (`upgrade`, `xl`), or a
+   promoted pool other than coursework: the verification tests the coursework pool whichever GPU
+   pool's refresh it found, never that pool.
    At that pool's next start, in Grafana, on the dashboard "Deployments and releases", the panel
    "Release each instance serves: image digest and model revision" shows its instances' image
    digest and model revision; they equal what its release parameter holds:
@@ -263,8 +315,9 @@ larger pools included, while a machine image refreshes only the promoted pool.
    aws ssm get-parameter --name /rhi/pools/upgrade/release --query Parameter.Value --output text
    ```
 
-4. **For a machine image, the instances run it.** Every instance of the pool, the stopped warm ones
-   included, shows the candidate's ID:
+4. **For a machine image, the instances run it.** Every instance of the promoted pool
+   (`coursework` below, or the pool's name in its place), the stopped warm ones included, shows the
+   candidate's ID:
 
    ```sh
    aws ec2 describe-instances --filters Name=tag:rhi-pool,Values=coursework \
