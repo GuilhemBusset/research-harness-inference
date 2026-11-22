@@ -242,6 +242,19 @@ that `rhi_admin roster list` prints.
       A line that is not in this table is retained too: it is deleted or kept like the line of its
       type in step d. Steps d and the Verify section use these identifiers, and only these.
 
+      One more retained resource is not in the list. A pipeline stack once deployed with the
+      approval on widened permissions, which the pipeline no longer holds (system design, section
+      8.4, control 6), retained the log group of that approval's function when the approval went.
+      It belongs to no stack since, so no template names it; the pipeline stack's events still do,
+      by its logical ID. Read its name before step b deletes the pipeline stack, and write it down
+      with the list:
+
+      ```sh
+      aws cloudformation describe-stack-events --stack-name RhiPipeline --query "StackEvents[?LogicalResourceId=='PipelinePipelinesSecurityCheckCDKPipelinesAutoApproveLogGroupD3E51322' && ResourceStatus=='DELETE_SKIPPED'].PhysicalResourceId" --output text
+      ```
+
+      It prints that one group's name, or nothing when the pipeline stack never held the approval.
+
    b. **Delete the pipeline stack first.** Otherwise the next merge to `main` deploys the stage
       again:
 
@@ -305,15 +318,10 @@ that `rhi_admin roster list` prints.
       aws logs delete-log-group --log-group-name <log-group>
       ```
 
-      A pipeline stack once deployed with the approval on widened permissions, which the pipeline
-      no longer holds (system design, section 8.4, control 6), retained the log group of that
-      approval's function when the approval went. It belongs to no stack since, so step a does not
-      list it. It holds no student's data. List it by its prefix, and delete each group that lists
-      with the command above:
-
-      ```sh
-      aws logs describe-log-groups --log-group-name-prefix /aws/lambda/RhiPipeline-PipelinePipelinesSecurityCheck --query 'logGroups[].logGroupName' --output text
-      ```
+      The log group of the former approval's function, only by the name step a read from the
+      pipeline stack's events, and only when it printed one: delete that one group with the command
+      above. It holds no student's data. A group whose name merely resembles it is not shown to be
+      the stage's: leave it.
 
       The alerts key of `Rhi-Guardrails`, by its key ID from step a. Nothing uses it once its stack
       is deleted. KMS deletes a key only after a waiting period, at least 7 days, during which it

@@ -102,8 +102,10 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      verification's own line says whether its tests ran and passed;
    - `deploy/<stage>` `failure`, "The deployment failed.": an action failed, the deployment of a
      stack or a step before it (source, synthesis, self-update, assets, the copy of the weights).
-     "The approval was rejected, or it expired: the deployment did not continue.": nothing of the
-     stage was deployed; read it as the pending line above. The report follows (step 2);
+     "The approval was rejected, or it expired: the deployment did not continue.": the pipeline
+     this repository builds holds no approval, so the line does not say what was deployed. Read it
+     as the pending line above, and read from the execution's actions which stacks it updated. The
+     report follows (step 2);
    - `verify/<stage>` `failure`, "The verification failed.": the deployment is in place and its
      smoke tests failed. The report follows (step 2);
    - `error`, "The pipeline's execution was stopped before this step finished." or "... was
