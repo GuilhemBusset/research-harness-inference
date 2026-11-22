@@ -14,8 +14,8 @@ resource of every stack of the stage, those the CDK adds for its own custom reso
 a function added later all the same:
 
 - every log group gets a retention of 90 days, whatever its construct asked for;
-- every function whose logging configuration names no log group gets one of its stack,
-  `FunctionLogs`, beside it, and names it there.
+- every function whose logging configuration names no log group of its own stack (none, or one
+  imported from elsewhere) gets one of its stack, `FunctionLogs`, beside it, and names it there.
 
 The CDK's own function for AWS SDK custom resources comes with a log group of the default name,
 `/aws/lambda/<function>`, which is retained. It cannot be named in the function's logging
@@ -62,18 +62,35 @@ def _property(properties: dict[str, Any], name: str) -> Any:
     return next((value for key, value in properties.items() if key.lower() == name.lower()), None)
 
 
-def _names_a_log_group(function: cdk.CfnResource) -> bool:
-    """Whether the function's logging configuration names a log group."""
-    properties = cdk.Stack.of(function).resolve(function._cfn_properties)
-    logging = _property(properties or {}, "LoggingConfig")
-    return isinstance(logging, dict) and _property(logging, "LogGroup") is not None
+def _stack_log_group(function: cdk.CfnResource) -> Any:
+    """The log group the function's logging configuration names, as its template writes it, if
+    that is a log group of the function's own stack: by a reference to it, or by the name its
+    template gives it. None for no log group, or one of another stack or of no template."""
+    stack = cdk.Stack.of(function)
+    logging = _property(stack.resolve(function._cfn_properties) or {}, "LoggingConfig")
+    resolved = _property(logging, "LogGroup") if isinstance(logging, dict) else None
+    if resolved is None:
+        return None
+    for group in stack.node.find_all():
+        if not (isinstance(group, cdk.CfnResource) and group.cfn_resource_type == LOG_GROUP):
+            continue
+        if cdk.Stack.of(group) is not stack:
+            continue
+        name = _property(stack.resolve(group._cfn_properties) or {}, "LogGroupName")
+        if resolved == stack.resolve(group.ref) or (isinstance(name, str) and resolved == name):
+            return resolved
+    return None
 
 
 @jsii.implements(cdk.IAspect)
 class Retention:
     """Gives every log group of the scope it is added to a retention of `RETENTION_DAYS`, and every
-    function that names no log group one of its stack, `FunctionLogs`, named in its logging
-    configuration."""
+    function a log group of its stack named in its logging configuration: the one it names, if it
+    is of its stack, or else one added beside it, `FunctionLogs`.
+
+    Both are written as property overrides, which CloudFormation's template takes over the typed
+    properties and over any override a construct wrote before: what the aspect sets is what the
+    template holds."""
 
     def visit(self, node: IConstruct) -> None:
         if not isinstance(node, cdk.CfnResource):
@@ -81,16 +98,18 @@ class Retention:
         if node.cfn_resource_type == LOG_GROUP:
             if isinstance(node, logs.CfnLogGroup):
                 node.retention_in_days = RETENTION_DAYS
-            else:
-                node.add_property_override("RetentionInDays", RETENTION_DAYS)
-        elif node.cfn_resource_type == FUNCTION and not _names_a_log_group(node):
-            scope = node.node.scope
-            if not isinstance(scope, Construct):
-                msg = f"the function {node.node.path} has no scope to hold its log group"
-                raise TypeError(msg)
-            existing = scope.node.try_find_child(FUNCTION_LOGS_ID)
-            function_logs = existing if isinstance(existing, FunctionLogs) else FunctionLogs(scope, FUNCTION_LOGS_ID)
-            node.add_property_override("LoggingConfig.LogGroup", function_logs.log_group.ref)
+            node.add_property_override("RetentionInDays", RETENTION_DAYS)
+        elif node.cfn_resource_type == FUNCTION:
+            named = _stack_log_group(node)
+            if named is None:
+                scope = node.node.scope
+                if not isinstance(scope, Construct):
+                    msg = f"the function {node.node.path} has no scope to hold its log group"
+                    raise TypeError(msg)
+                existing = scope.node.try_find_child(FUNCTION_LOGS_ID)
+                function_logs = existing if isinstance(existing, FunctionLogs) else FunctionLogs(scope, FUNCTION_LOGS_ID)
+                named = function_logs.log_group.ref
+            node.add_property_override("LoggingConfig.LogGroup", named)
 
 
 def apply(stage: cdk.Stage) -> None:

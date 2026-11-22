@@ -6,8 +6,8 @@ metrics (system design, section 6.6; evidence E27).
   one for a function that names none, at run time, outside every template and with no retention.
 - The metrics workspace keeps at most 90 days; with no retention set, it keeps the service's
   default, which is longer.
-- No CloudWatch alarm, metric or metric filter has a dimension that identifies a student: alias,
-  student or github_id, whatever its case. CloudWatch metrics cannot be deleted for 15 months; the
+- No CloudWatch alarm, metric (a dashboard's included) or metric filter has a dimension that
+  identifies a student: alias, student or github_id, whatever its case. CloudWatch metrics cannot be deleted for 15 months; the
   per-student series live in Prometheus only.
 
 These hold for the stage's templates, those of its nested assembly. The pipeline's own stack is not
@@ -16,6 +16,7 @@ in the stage: its logs hold no student data.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ LOG_GROUP = "AWS::Logs::LogGroup"
 FUNCTION = "AWS::Lambda::Function"
 WORKSPACE = "AWS::APS::Workspace"
 METRIC_FILTER = "AWS::Logs::MetricFilter"
+DASHBOARD = "AWS::CloudWatch::Dashboard"
 
 
 def stage_templates(templates: Mapping[str, Any]) -> dict[str, Any]:
@@ -76,7 +78,8 @@ def workspaces_kept_too_long(template: Mapping[str, Any]) -> list[str]:
 
 def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
     """Every dimension that identifies a student, with the resource that has it, in a CloudWatch
-    resource (an alarm, its metrics, an anomaly detector) or in a metric filter's metrics."""
+    resource (an alarm, its metrics, an anomaly detector, a dashboard's metrics) or in a metric
+    filter's metrics."""
     found: list[tuple[str, str]] = []
 
     def walk(node: object, resource: str) -> None:
@@ -93,11 +96,39 @@ def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
         for value in node.values():
             walk(value, resource)
 
+    def walk_dashboard(node: object, resource: str) -> None:
+        # A dashboard's metric is an array: namespace, metric name, then each dimension's name and
+        # value, and last its options.
+        if isinstance(node, dict):
+            for value in node.values():
+                walk_dashboard(value, resource)
+        if not isinstance(node, list):
+            return
+        if node and all(isinstance(item, str) for item in node[:2]):
+            pairs = [item for item in node[2:] if not isinstance(item, dict)]
+            found.extend((resource, name) for name in pairs[::2] if str(name).lower() in STUDENT_DIMENSIONS)
+        for item in node:
+            walk_dashboard(item, resource)
+
     for name, resource in template.get("Resources", {}).items():
         kind = resource.get("Type", "")
         if kind.startswith("AWS::CloudWatch::") or kind == METRIC_FILTER:
             walk(resource.get("Properties", {}), name)
+        if kind == DASHBOARD:
+            walk_dashboard(dashboard_body(resource.get("Properties", {}).get("DashboardBody")), name)
     return found
+
+
+def dashboard_body(body: object) -> object:
+    """A dashboard's body, as JSON, read from the string the template writes it as or joins it
+    from. Each value the template joins in at deploy time stands as `TOKEN`."""
+    if isinstance(body, dict) and "Fn::Join" in body:
+        separator, parts = body["Fn::Join"]
+        body = separator.join(part if isinstance(part, str) else "TOKEN" for part in parts)
+    elif isinstance(body, dict) and "Fn::Sub" in body:
+        body = body["Fn::Sub"] if isinstance(body["Fn::Sub"], str) else body["Fn::Sub"][0]
+    assert isinstance(body, str), f"a dashboard body this check cannot read: {body!r}"
+    return json.loads(body)
 
 
 def findings(templates: Mapping[str, Any], check: Callable[[Mapping[str, Any]], list[Any]]) -> dict[str, list[Any]]:
@@ -203,9 +234,14 @@ def test_detects_a_student_dimension(cdk: ModuleType) -> None:
             metric_name="requests",
             dimensions={"GitHub_ID": "$.github_id"},
         )
+        dashboard = cloudwatch.Dashboard(stack, "Dashboard")
+        for dimensions in ({"pool": "coursework"}, {"pool": "coursework", "student": "a-student"}):
+            metric = cloudwatch.Metric(namespace="rhi", metric_name="requests", dimensions_map=dimensions)
+            dashboard.add_widgets(cloudwatch.GraphWidget(left=[metric]))
 
     found = student_dimensions(synthesize(cdk, build))
     assert sorted((resource[:-8], name) for resource, name in found) == [
+        ("Dashboard", "student"),
         ("PerGithubId", "GitHub_ID"),
         ("PerStudent", "Alias"),
     ]

@@ -80,8 +80,8 @@ def unprotected(acl: dict[str, Any]) -> set[str]:
         field = protection["Field"]
         everywhere = not protection.get("ExcludeRuleMatchDetails") and not protection.get("ExcludeRateBasedDetails")
         if field["FieldType"] == "SINGLE_HEADER" and protection["Action"] == "SUBSTITUTION" and everywhere:
-            # A protection with no keys covers every header.
-            protected |= {key.lower() for key in field.get("FieldKeys", KEY_HEADERS)}
+            # Only the headers it names count: each key header is named, not left to a default.
+            protected |= {key.lower() for key in field.get("FieldKeys", [])}
     return KEY_HEADERS - protected
 
 
