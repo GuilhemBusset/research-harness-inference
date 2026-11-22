@@ -34,13 +34,9 @@ reference inside a tool result), and its `Tool` object.
 
 - what speaks to Anthropic's own service, which this endpoint does not have: `container`,
   `diagnostics`, `inference_geo`, `service_tier` and `speed`; the tools Anthropic defines or runs
-  (every kind of `tools` entry but `Tool`), and the blocks that carry their calls and results
-  (`server_tool_use`, the `..._tool_result` blocks of web search, web fetch and code execution,
-  `container_upload`, `browser_state`), and what only a citation of a web search result has
-  (`CitationWebSearchResultLocationParam`: `encrypted_index` and `url`). Such a block keeps the fields it shares with the blocks
-  above and loses the others. One whose `content` is an object is refused, by the shared filter's
-  rule for an object that stands where an array is described; the engine refuses every one of
-  them by its type `[E28]`;
+  (every kind of `tools` entry but `Tool`), and what only a citation of a web search result has
+  (`CitationWebSearchResultLocationParam`: `encrypted_index` and `url`). The blocks that carry
+  those tools' calls and results never reach the allow-list: they are replaced (below);
 - the rest of the beta reference: `context_management`, which Claude Code sends with every
   request and the engine does not read, `mcp_servers`, `fallbacks`, `compaction`, `thread`, a
   system message's `clear_at` and `output_config`, the references to an MCP server's tools;
@@ -61,14 +57,108 @@ document block. This list refuses none of them, whatever the pool's model does w
 - `source` is described as the object of an image or a document. On a search result it is a
   string, which the filter keeps as it is.
 
+**Blocks this endpoint cannot serve are replaced, never refused** (section 6.2, step 4; ADR 0003,
+decision 7). A block the engine refuses stays in the conversation's history, so every later
+request of the session would be refused too. Three kinds are replaced in their place by a text
+block holding one fixed sentence of their kind, by `blocks_as_text`, which both Messages routes
+give the shared filter as its replacement: it runs for every pool, before the allow-list and the
+media rule. The kinds are:
+
+- a search result (`SearchResultBlockParam`), which the engine refuses `[E28]`;
+- a block of a tool Anthropic's service runs (`SERVER_TOOL_BLOCKS`), which the engine refuses by
+  its type `[E28]`; no engine behind this gateway runs those tools;
+- a document whose source is a URL (`URLPDFSource`), which the media rule would refuse; no engine
+  behind this gateway fetches a URL.
+
+As in the request profile's entry for documents (`rhi_gateway.profile.document_as_text`), the
+content of each message and the content of each tool result in it are looked at. Every other block
+keeps its place and its content, a content written as one string is left as sent, and an image
+given by URL, or any other reference that is not inline data, is still refused by the media rule.
+
 Nothing here reads configuration, the environment or the network.
 """
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 from rhi_gateway.body import KEEP, Fields, Items, Limit, Shapes, Spec
+
+# What the engine reads where a block of each kind was. No number, no name of the deployment.
+SEARCH_RESULT_SENTENCE: Final = (
+    "A search result was given here, but this endpoint cannot read search results: give its text instead."
+)
+SERVER_TOOL_SENTENCE: Final = (
+    "A block of a tool that Anthropic's service runs was here, but this endpoint runs no such tool and cannot read it."
+)
+DOCUMENT_URL_SENTENCE: Final = (
+    "A document given by URL was attached here, but this endpoint cannot fetch a URL: attach it as text instead."
+)
+
+# The block types of the tools Anthropic's service runs, from *Create a Message* (read on
+# 2026-11-22): a server tool's call, the results of web search, web fetch, code execution (its
+# three result blocks) and tool search, a file uploaded to the code execution container, and the
+# state of a browser, which the service renders for the model.
+SERVER_TOOL_BLOCKS: Final = frozenset(
+    {
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+        "container_upload",
+        "browser_state",
+    }
+)
+
+
+def _sentence_for(block: object) -> str | None:
+    """The sentence that replaces a block, or None for a block that is kept."""
+    if not isinstance(block, dict):
+        return None
+    kind = block.get("type")
+    if kind == "search_result":
+        return SEARCH_RESULT_SENTENCE
+    if kind in SERVER_TOOL_BLOCKS:
+        return SERVER_TOOL_SENTENCE
+    if kind == "document":
+        source = block.get("source")
+        if isinstance(source, dict) and source.get("type") == "url":
+            return DOCUMENT_URL_SENTENCE
+    return None
+
+
+def _blocks(content: object) -> object:
+    """A content list with each block of the three kinds replaced by its sentence, and each tool result's own content too."""
+    if not isinstance(content, list):
+        return content
+    replaced: list[object] = []
+    for block in content:
+        sentence = _sentence_for(block)
+        if sentence is not None:
+            replaced.append({"type": "text", "text": sentence})
+        elif isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+            replaced.append({**block, "content": _blocks(block["content"])})
+        else:
+            replaced.append(block)
+    return replaced
+
+
+def blocks_as_text(body: dict[str, Any]) -> dict[str, Any]:
+    """The body with every block this endpoint cannot serve, in a message or in a tool result, replaced in its place."""
+    conversation = body.get("messages")
+    if not isinstance(conversation, list):
+        return body
+    replaced = [
+        {**message, "content": _blocks(message["content"])}
+        if isinstance(message, dict) and "content" in message
+        else message
+        for message in conversation
+    ]
+    return {**body, "messages": replaced}
+
 
 # `CacheControlEphemeral`: a cache breakpoint, on the request, a block or a tool.
 _CACHE_CONTROL: Final = Fields({"type": KEEP, "ttl": KEEP})
