@@ -193,8 +193,8 @@ def test_the_role_may_do_what_a_run_does_and_nothing_else(pools: Template, templ
         for action in as_list(statement["Action"]):
             for resource in as_list(statement["Resource"]):
                 granted.setdefault(action, set()).add(resolve(resource, templates))
-            if action in GROUP_WRITES:
-                conditions[action] = statement.get("Condition")
+            if action in GROUP_WRITES or action == "cloudwatch:PutMetricData":
+                conditions.setdefault(action, []).append(statement.get("Condition"))
 
     log_group = function["LoggingConfig"]["LogGroup"]["Ref"]
     observability = find_template(templates, "RhiObservability")
@@ -216,15 +216,20 @@ def test_the_role_may_do_what_a_run_does_and_nothing_else(pools: Template, templ
         "logs:CreateLogStream": {f"getatt:{log_group}.Arn"},
         "logs:PutLogEvents": {f"getatt:{log_group}.Arn"},
         "aps:RemoteWrite": {f"getatt:{workspace}.Arn"},
+        "cloudwatch:PutMetricData": {"*"},
     }
     # The groups by pattern, narrowed to those this stack created for the stage's pools.
-    for condition in conditions.values():
-        assert condition == {
-            "StringEquals": {
-                "autoscaling:ResourceTag/aws:cloudformation:stack-id": {"Ref": "AWS::StackId"},
-                "autoscaling:ResourceTag/rhi-pool": [pool.name for pool in EXAMPLE.pools],
+    for action in GROUP_WRITES:
+        assert conditions[action] == [
+            {
+                "StringEquals": {
+                    "autoscaling:ResourceTag/aws:cloudformation:stack-id": {"Ref": "AWS::StackId"},
+                    "autoscaling:ResourceTag/rhi-pool": [pool.name for pool in EXAMPLE.pools],
+                }
             }
-        }
+        ]
+    # Metrics, in every statement that grants them, to the scaler's namespace and no other.
+    assert conditions["cloudwatch:PutMetricData"] == [{"StringEquals": {"cloudwatch:namespace": "rhi/scaler"}}]
 
 
 def test_the_stage_reaches_the_function_and_nothing_else_may_invoke_it(app: cdk.App, pools: Template) -> None:

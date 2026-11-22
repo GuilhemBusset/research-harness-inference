@@ -87,10 +87,12 @@ class Edge:
             autoscaling=boto3.client("autoscaling", **options),
             elbv2=boto3.client("elbv2", **options),
             dynamodb=boto3.client("dynamodb", **options),
+            cloudwatch=boto3.client("cloudwatch", **options),
         )
         self.autoscaling = Stubber(self.clients.autoscaling)
         self.elbv2 = Stubber(self.clients.elbv2)
         self.dynamodb = Stubber(self.clients.dynamodb)
+        self.cloudwatch = Stubber(self.clients.cloudwatch)
         # Each UpdateItem call made, as the scaler made it.
         self.updates: list[dict[str, Any]] = []
         self.clients.dynamodb.meta.events.register(
@@ -128,12 +130,16 @@ class Edge:
                 "ConsistentRead": True,
             }
             self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
+        # No session switch.
+        self.dynamodb.add_response("get_item", {}, {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True})
 
     def expect_writes(self, note: dict[str, Any]) -> None:
-        """The note put whole, then the memory updated: what it stores is in `updates`."""
+        """The note put whole, then the memory updated: what it stores is in `updates`. Then the
+        run's data points published to CloudWatch (`rhi_scaler.cloudwatch`)."""
         self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
         update = ("Key", "UpdateExpression", "ExpressionAttributeNames", "ExpressionAttributeValues")
         self.dynamodb.add_response("update_item", {}, {"TableName": "pool-state-table", **dict.fromkeys(update, ANY)})
+        self.cloudwatch.add_response("put_metric_data", {}, {"Namespace": "rhi/scaler", "MetricData": ANY})
 
     def queue_first_run(self) -> None:
         """A pool at zero, a request held: one instance asked for, and the memory stored."""
@@ -147,11 +153,12 @@ class Edge:
 @pytest.fixture
 def edge() -> Iterator[Edge]:
     edge = Edge()
-    with edge.autoscaling, edge.elbv2, edge.dynamodb:
+    with edge.autoscaling, edge.elbv2, edge.dynamodb, edge.cloudwatch:
         yield edge
         edge.autoscaling.assert_no_pending_responses()
         edge.elbv2.assert_no_pending_responses()
         edge.dynamodb.assert_no_pending_responses()
+        edge.cloudwatch.assert_no_pending_responses()
 
 
 def series(body: bytes) -> dict[tuple[str, tuple[tuple[str, str], ...]], list[float]]:

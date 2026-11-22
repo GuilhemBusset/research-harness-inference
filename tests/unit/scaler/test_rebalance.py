@@ -143,7 +143,7 @@ def test_the_number_reaches_the_note() -> None:
     tables = TableNames(heartbeats="heartbeats-table", pool_state="pool-state-table")
     settings = PoolSettings(config=POOL, group="group", target_group="targets", configured_mode=Mode.ENABLED)
     options = {"region_name": "us-east-1", "aws_access_key_id": "stub", "aws_secret_access_key": "stub"}
-    clients = Clients(*(boto3.client(name, **options) for name in ("autoscaling", "elbv2", "dynamodb")))
+    clients = Clients(*(boto3.client(name, **options) for name in ("autoscaling", "elbv2", "dynamodb", "cloudwatch")))
     autoscaling, elbv2, dynamodb = Stubber(clients.autoscaling), Stubber(clients.elbv2), Stubber(clients.dynamodb)
     name = {"AutoScalingGroupName": "group"}
     placed = {"AvailabilityZone": "us-east-1a", "HealthStatus": "Healthy", "ProtectedFromScaleIn": True}
@@ -179,6 +179,8 @@ def test_the_number_reaches_the_note() -> None:
             # The pool-state table holds what the run before stored.
             for table, items in ((tables.pool_state, stored), (tables.heartbeats, heartbeats)):
                 dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, {"TableName": table, **query})
+            # No session switch.
+            dynamodb.add_response("get_item", {}, {"TableName": tables.pool_state, "Key": ANY, "ConsistentRead": True})
             read_run = read(clients, tables, [settings], now)
             decision = decide(read_run.inputs)
             # The two items the table must receive, exactly. No Auto Scaling call is queued: one would fail.

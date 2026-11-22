@@ -33,6 +33,9 @@ reason:
 - writing its own logs, to its own log group.
 - `aps:RemoteWrite` on the metrics workspace alone, the action of the workspace's `write_policy`,
   written in the role's own policy: a run pushes the fleet's metrics.
+- `cloudwatch:PutMetricData` on every resource, the only way AWS grants it, under the condition
+  that the namespace is `rhi_scaler.cloudwatch.NAMESPACE` and no other: a run publishes what the
+  alarms read (section 7.3).
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ from rhi.access.issuer import READ_ACTIONS, WRITE_ACTIONS
 from rhi.config import pool_entry
 from rhi.observability import prometheus
 from rhi.pools.group import POOL_TAG
+from rhi_scaler.cloudwatch import NAMESPACE as METRICS_NAMESPACE
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -93,6 +97,8 @@ DESCRIBE_ACTIONS = [
     "autoscaling:DescribeWarmPool",
     "elasticloadbalancing:DescribeTargetHealth",
 ]
+# Granted on every resource only, and narrowed by its condition to the scaler's namespace.
+PUBLISH_ACTIONS = ["cloudwatch:PutMetricData"]
 # The tag CloudFormation puts on every group it creates, with the ID of the group's stack.
 STACK_ID_TAG = "aws:cloudformation:stack-id"
 
@@ -163,6 +169,13 @@ class Scaler(Construct):
         # invariants of this stack's template cannot read.
         self.role.add_to_policy(
             iam.PolicyStatement(actions=list(prometheus.WRITE_ACTIONS), resources=[workspace.workspace.attr_arn])
+        )
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                actions=PUBLISH_ACTIONS,
+                resources=["*"],
+                conditions={"StringEquals": {"cloudwatch:namespace": METRICS_NAMESPACE}},
+            )
         )
 
         settings = {

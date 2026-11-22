@@ -4,14 +4,16 @@ The gateway calls it when a request needs a cold pool, a one-minute schedule cal
 the admin CLI. Whoever calls, a run does the same thing, and the event is never read:
 
 1. read the settings (`rhi_scaler.settings`) and the inputs (`rhi_scaler.aws_io.read`);
-2. decide (`rhi_scaler.decide`), from the inputs alone;
+2. decide (`rhi_scaler.decide`), from the inputs alone, and note in each pool's memory how long it
+   has been in service outside a session (`rhi_scaler.outside_sessions`), which only reports;
 3. apply: the Auto Scaling calls that change something, then each pool's note and memory record;
-4. log one record per pool with its decision and its reason, and send the fleet's metrics
-   (`rhi_scaler.metrics`).
+4. log one record per pool with its decision and its reason, send the fleet's metrics
+   (`rhi_scaler.metrics`), and publish to CloudWatch what the alarms read (`rhi_scaler.cloudwatch`).
 
 A run that fails before its writes leaves the pool as it was; the next run reads the world again.
-A metrics push that fails does not fail the run: the decision is already applied, and the log
-holds it.
+A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is what the alarm
+reads. A metrics push or a publication that fails does not fail the run: the decision is already
+applied, and the log holds it.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from typing import Any
 
 import boto3
 
-from rhi_scaler import aws_io
+from rhi_scaler import aws_io, cloudwatch, outside_sessions
 from rhi_scaler.decide import decide
 from rhi_scaler.metrics import DecisionCounts, RemoteWriter, fleet_series
 from rhi_scaler.model import Decision
@@ -65,19 +67,24 @@ def run_cycle(
     counts: DecisionCounts,
     milliseconds: int | None = None,
 ) -> Decision:
-    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics.
+    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics,
+    publish to CloudWatch.
 
     `now` is the decision clock, in whole seconds; `milliseconds`, the run's time for the
     metrics' samples (by default, `now`'s second).
     """
     run = aws_io.read(clients, settings.tables, settings.pools, now)
-    decision = decide(run.inputs)
+    decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session)
     aws_io.apply(clients, settings.tables, run, decision)
     log_decisions(run, decision)
     try:
         writer.push(fleet_series(run.inputs, decision, counts, milliseconds))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
+    try:
+        cloudwatch.publish(clients.cloudwatch, decision, now)
+    except Exception as error:  # noqa: BLE001 - the decision is applied; a lost data point only leaves a gap
+        LOGGER.warning(json.dumps({"event": "cloudwatch-not-published", "error": type(error).__name__}))
     return decision
 
 
@@ -88,6 +95,7 @@ def connect(settings: Settings) -> tuple[aws_io.Clients, RemoteWriter]:
         autoscaling=session.client("autoscaling"),
         elbv2=session.client("elbv2"),
         dynamodb=session.client("dynamodb"),
+        cloudwatch=session.client("cloudwatch"),
     )
     return clients, RemoteWriter(settings.workspace_url, settings.region, session.get_credentials())
 

@@ -15,14 +15,17 @@
 #   a run reads the heartbeats and the pool's state, and writes its note and its memory.
 # - logs:CreateLogStream and logs:PutLogEvents on its own log group, /rhi/scaler.
 # - aps:RemoteWrite on the metrics workspace only, by its ARN: a run pushes the fleet's metrics.
+# - cloudwatch:PutMetricData on every resource, with the condition that cloudwatch:namespace is
+#   rhi/scaler: a run publishes what the CloudWatch alarms read, and nothing else.
 
 [nag]
 "AwsSolutions-L1" = "The scaler runs on the Lambda runtime of the Python that .python-version names, the one its tests and its bundle's libraries are built for, which packaging.RUNTIME holds for every function of the app."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its conditions on the tags aws:cloudformation:stack-id and rhi-pool narrow it to the pool groups of this stack."
-"AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeAutoScalingGroups, DescribeWarmPool, DescribeScalingActivities and DescribeTargetHealth only on every resource, and the statement holds those four actions alone."
+"AwsSolutions-IAM5[Resource::*]" = "AWS grants DescribeAutoScalingGroups, DescribeWarmPool, DescribeScalingActivities, DescribeTargetHealth and PutMetricData only on every resource: one statement holds those four reads alone, and another holds PutMetricData alone, under the condition that the namespace is rhi/scaler."
 
 [wildcard_actions]
 "autoscaling:DescribeAutoScalingGroups" = "AWS grants this action only on every resource, and the scaler reads with it each pool group's capacity, instances, protection and suspended processes."
 "autoscaling:DescribeWarmPool" = "AWS grants this action only on every resource, and the scaler reads with it the stopped instances of each pool's warm pool."
 "autoscaling:DescribeScalingActivities" = "AWS grants this action only on every resource, and the scaler reads with it the launches of each pool group that were abandoned or found no capacity."
 "elasticloadbalancing:DescribeTargetHealth" = "AWS grants this action only on every resource, and the scaler reads with it which instances of each pool's target group serve."
+"cloudwatch:PutMetricData" = "AWS grants this action only on every resource, and the statement's condition on cloudwatch:namespace limits it to rhi/scaler, where the scaler publishes what the CloudWatch alarms read."

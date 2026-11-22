@@ -15,6 +15,10 @@ What is read, for each pool:
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
 | Mode (the configured mode when no record exists) and the scaler's memory | the pool-state table, by pool |
 
+And once for the whole run, the session switch (`rhi_common.records.SessionSwitch`), from its item
+in the pool-state table. It only reports (`rhi_scaler.outside_sessions`) and `decide` never sees it.
+A missing item reads as no record; so does one nobody can read, which a run does not fail over.
+
 The supply, from the lifecycle states and target health:
 
 | State | Supply |
@@ -77,9 +81,10 @@ from rhi_common.records import (
     PoolState,
     RecordError,
     ScalerNote,
+    SessionSwitch,
     is_fresh,
 )
-from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD
+from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD, SESSION_SWITCH_KEY
 from rhi_scaler.model import Decision, Inputs, Memory, PoolInputs, Supply
 
 # The process a launch loop suspends, and the only one this module ever names.
@@ -131,19 +136,23 @@ class GroupState:
 
 @dataclass(frozen=True)
 class Run:
-    """What one run read: the decision's inputs, and each pool's group by pool name."""
+    """What one run read: the decision's inputs, each pool's group by pool name, and the session
+    switch, `None` when it has no record."""
 
     inputs: Inputs
     groups: Mapping[str, GroupState]
+    session: SessionSwitch | None = None
 
 
 @dataclass(frozen=True)
 class Clients:
-    """The AWS SDK clients a run uses: `autoscaling`, `elbv2` and `dynamodb` (low-level clients)."""
+    """The AWS SDK clients a run uses: `autoscaling`, `elbv2`, `dynamodb` and `cloudwatch`
+    (low-level clients)."""
 
     autoscaling: Any
     elbv2: Any
     dynamodb: Any
+    cloudwatch: Any
 
 
 # Reading.
@@ -301,6 +310,7 @@ _MEMORY_TIMES = (
     "suspended_at",
     "abandons_counted_from",
     "last_rebalance_at",
+    "outside_sessions_since",
 )
 # The attributes of the memory record that the scaler alone writes: all of them but the keys and
 # `launch_suspended`, which the admin clears.
@@ -335,6 +345,7 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
         # A record stored before the scaler kept a number holds none.
         rebalance_number=_time(item, "rebalance_number") or 0,
         last_rebalance_at=_time(item, "last_rebalance_at"),
+        outside_sessions_since=_time(item, "outside_sessions_since"),
     )
 
 
@@ -397,12 +408,26 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
     return inputs, state
 
 
+def read_session(clients: Clients, tables: TableNames) -> SessionSwitch | None:
+    """The session switch; `None` when it has no record, or one that is not a switch."""
+    key = {name: {"S": value} for name, value in SESSION_SWITCH_KEY.items()}
+    item = clients.dynamodb.get_item(TableName=tables.pool_state, Key=key, ConsistentRead=True).get("Item")
+    if item is None:
+        return None
+    try:
+        return SessionSwitch.from_item(_plain(item))
+    except RecordError:
+        return None
+
+
 def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:
-    """Everything one run decides from, at the time `now`, for each pool in the order given."""
+    """Everything one run decides from, at the time `now`, for each pool in the order given, and the
+    session switch."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
     return Run(
         inputs=Inputs(now=now, pools=tuple(inputs for inputs, _ in read_pools)),
         groups={inputs.config.name: state for inputs, state in read_pools},
+        session=read_session(clients, tables),
     )
 
 
