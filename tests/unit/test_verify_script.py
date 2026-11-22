@@ -1,6 +1,6 @@
 """The verification script (scripts/pipeline/verify.py): with no listener or no canary key it runs
-no test, exits 0 and leaves its reason; with a key it runs the smoke tests, all but those that
-must reach the internal load balancer, a failed test is a non-zero exit and leaves its ID, and
+no test, exits 0 and leaves its reason; with a key it runs the smoke tests, on the mock pool all but
+those of the coursework pool's run, a failed test is a non-zero exit and leaves its ID, and
 what the tests print reaches the log without the key. After a failed run it leaves the last
 lifecycle stage each instance of the tested pools reached, and nothing else of a heartbeat's row.
 When the decision on the coursework pool left that pool, the smoke tests run again on it, with the
@@ -314,9 +314,7 @@ def run_tests_in(tmp_path: Path, tests: list[str], *, more: Mapping[str, str] | 
 
 
 @pytest.mark.parametrize("pool", [None, "coursework"], ids=["the mock pool's run", "the coursework pool's run"])
-def test_the_tests_through_the_internal_load_balancer_are_deselected_and_no_other(
-    tmp_path: Path, pool: str | None
-) -> None:
+def test_only_the_mock_pool_s_run_deselects_and_only_the_gpu_pass_tests(tmp_path: Path, pool: str | None) -> None:
     (tmp_path / "recorder.py").write_text(RECORDER, encoding="utf-8")
     recorded = tmp_path / "recorded.json"
     # Collection only: nothing is run, so nothing is reached.
@@ -330,10 +328,9 @@ def test_the_tests_through_the_internal_load_balancer_are_deselected_and_no_othe
     assert run_tests_in(tmp_path, [verify.SMOKE_TESTS], more=more) == 0
 
     found = json.loads(recorded.read_text(encoding="utf-8"))
-    internal = {test_id for test_id in SMOKE_TEST_IDS if test_id.startswith("internal-")}
-    assert len(internal) == 5 and sorted(internal) == sorted(verify.DESELECTED)
     # The tests of the coursework pool's run are left out of the mock pool's run, and only there.
-    left_out = internal | (set() if pool else {"gpu-release-served"})
+    left_out = set() if pool else set(verify.GPU_PASS_ONLY)
+    assert "gpu-release-served" in verify.GPU_PASS_ONLY
     assert sorted(found["deselected"]) == sorted(left_out)
     # Every other smoke test is kept, the deployed-only ones and the forbidden routes at the
     # gateway's hop among them, and on the coursework pool the first stream's wake and hold.
@@ -371,7 +368,7 @@ def test_the_ids_of_the_tests_that_failed_are_left_one_per_line_and_nothing_else
         "@pytest.mark.smoke_id('hello')\ndef test_passes() -> None:\n    pass\n\n\n"
         "@pytest.mark.smoke_id('no-key')\ndef test_fails() -> None:\n    assert False, 'nor is this'\n\n\n"
         "@pytest.mark.smoke_id('environment')\ndef test_fails_before_it_starts(broken: None) -> None:\n    pass\n\n\n"
-        "@pytest.mark.smoke_id('internal-health')\ndef test_is_left_out() -> None:\n    assert False\n",
+        "@pytest.mark.smoke_id('gpu-release-served')\ndef test_is_left_out() -> None:\n    assert False\n",
         encoding="utf-8",
     )
     quiet = "-q -p no:cacheprovider -W ignore::pytest.PytestUnknownMarkWarning"
