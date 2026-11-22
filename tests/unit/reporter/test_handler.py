@@ -131,11 +131,16 @@ def assembly() -> bytes:
 
 
 class Stub:
-    """CodePipeline, CloudFormation, S3 and Secrets Manager, for one execution of one commit."""
+    """CodePipeline, CloudFormation, S3 and Secrets Manager, for one execution of one commit, and
+    the manual approvals of any execution it is told of."""
 
     def __init__(self, execution: str, commit: str) -> None:
         self.execution = execution
         self.commit = commit
+        # Other executions, by their ID, with their commit.
+        self.others: dict[str, str] = {}
+        # The runs of the stage's approval `Check.Confirm`, by execution: their status and start.
+        self.approvals: dict[str, list[tuple[str, datetime.datetime]]] = {}
         self.secret: dict[str, str] | None = {"app_id": "1", "installation_id": "2", "private_key": "not a key"}
         self.stage_states: dict[str, str] = {}
         self.status = "InProgress"
@@ -157,19 +162,30 @@ class Stub:
 
     # CodePipeline.
     def get_pipeline_execution(self, pipelineName: str, pipelineExecutionId: str) -> dict[str, Any]:
-        assert (pipelineName, pipelineExecutionId) == (PIPELINE, self.execution)
-        revisions = [{"name": "example_owner_example_repository_Source", "revisionId": self.commit}]
-        record = {"pipelineExecutionId": self.execution, "status": self.status, "artifactRevisions": revisions}
+        assert pipelineName == PIPELINE and pipelineExecutionId in {self.execution, *self.others}
+        commit = self.others.get(pipelineExecutionId, self.commit)
+        revisions = [{"name": "example_owner_example_repository_Source", "revisionId": commit}]
+        record = {"pipelineExecutionId": pipelineExecutionId, "status": self.status, "artifactRevisions": revisions}
         return {"pipelineExecution": record}
 
     def get_pipeline_state(self, name: str) -> dict[str, Any]:
+        """The stages' latest executions, all this one's; an approval's latest run of this execution
+        holds the token of its request while it waits."""
         assert name == PIPELINE
-        return {
-            "stageStates": [
-                {"stageName": stage, "latestExecution": {"pipelineExecutionId": self.execution, "status": status}}
-                for stage, status in self.stage_states.items()
-            ]
-        }
+        runs = self.approvals.get(self.execution, [])
+        stages = self.stage_states | ({STAGE: self.stage_states.get(STAGE, "InProgress")} if runs else {})
+        states = []
+        for stage, status in stages.items():
+            state: dict[str, Any] = {
+                "stageName": stage,
+                "latestExecution": {"pipelineExecutionId": self.execution, "status": status},
+            }
+            if stage == STAGE and runs:
+                latest, _ = max(runs, key=lambda run: run[1])
+                token = {"token": str(uuid.uuid4())} if latest == "InProgress" else {}
+                state["actionStates"] = [{"actionName": "Check.Confirm", "latestExecution": {"status": latest} | token}]
+            states.append(state)
+        return {"stageStates": states}
 
     def list_pipeline_executions(self, pipelineName: str, maxResults: int) -> dict[str, Any]:
         assert pipelineName == PIPELINE
@@ -178,7 +194,22 @@ class Stub:
         return {"pipelineExecutionSummaries": [summary | {"sourceRevisions": revisions}]}
 
     def list_action_executions(self, pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
-        assert (pipelineName, filter) == (PIPELINE, {"pipelineExecutionId": self.execution})
+        assert pipelineName == PIPELINE and set(filter) == {"pipelineExecutionId"}
+        execution = filter["pipelineExecutionId"]
+        approvals = [
+            {
+                "stageName": STAGE,
+                "actionName": "Check.Confirm",
+                "status": status,
+                "startTime": started,
+                "input": {"actionTypeId": {"category": "Approval", "provider": "Manual"}, "configuration": {}},
+                "output": {},
+            }
+            for status, started in self.approvals.get(execution, [])
+        ]
+        if execution != self.execution:
+            assert execution in self.others
+            return {"actionExecutionDetails": approvals}
         synth = {
             "stageName": "Build",
             "actionName": "Synth",
@@ -200,7 +231,7 @@ class Stub:
             },
             "output": {},
         }
-        return {"actionExecutionDetails": [deploy, synth]}
+        return {"actionExecutionDetails": [deploy, *approvals, synth]}
 
     # S3: the artifact store. It lists under verification/ only, as the function's role may, and
     # answers a read of an object that is not there as it answers a role that may not list it.
@@ -573,6 +604,178 @@ def test_a_late_step_before_the_stage_does_not_hide_its_failure(
     run(events, stub, client)
     assert client.posted[0][1:3] == ("failure", DEPLOY)
     assert all(state == "failure" for _, state, _, _ in client.posted)
+
+
+def deliver(events: list[dict[str, Any]], stub: Stub, client: Client) -> None:
+    """Hands each event to the function as it arrives, late or out of order: CodePipeline's state
+    is the one the test set, not the one the event tells."""
+    aws = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub)
+    for event in events:
+        assert handler.handle(event, aws=aws, client=client, stages=[STAGE], artifacts=BUCKET) is None
+
+
+def deployment(client: Client, commit: str) -> list[tuple[str, str]]:
+    """The states and descriptions posted to the deployment's context of `commit`, in order."""
+    return [(state, text) for on, state, context, text in client.posted if (on, context) == (commit, DEPLOY)]
+
+
+def approval(execution: str, state: str) -> dict[str, Any]:
+    return action_event(execution, STAGE, "Check.Confirm", "Approval", state)
+
+
+def progress(execution: str) -> list[dict[str, Any]]:
+    """Ordinary pending events of an execution whose stage reached its approval."""
+    return [
+        stage_event(execution, STAGE, "STARTED"),
+        action_event(execution, STAGE, "Check.Check", "Build", "SUCCEEDED"),
+        action_event(execution, "Build", "Synth", "Build", "SUCCEEDED"),
+    ]
+
+
+LATER = STARTED + datetime.timedelta(minutes=5)
+WAITING = ("pending", Description.APPROVAL_WAITING)
+RUNNING = ("pending", Description.DEPLOYING)
+
+
+@pytest.mark.parametrize("start_first", [True, False], ids=["the approval's start first", "the approval's start last"])
+@pytest.mark.parametrize(
+    "runs",
+    [[("InProgress", STARTED)], [("InProgress", LATER), ("Failed", STARTED)]],
+    ids=["its first run", "its run after a rejection and a retry"],
+)
+def test_ordinary_progress_leaves_the_approval_visible_while_it_waits(
+    stub: Stub, commit: str, start_first: bool, runs: list[tuple[str, datetime.datetime]]
+) -> None:
+    stub.approvals[stub.execution] = runs
+    events = progress(stub.execution)
+    events.insert(0 if start_first else len(events), approval(stub.execution, "STARTED"))
+    client = Client()
+    deliver(events, stub, client)
+    assert deployment(client, commit) == [WAITING] * 4
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [[("Succeeded", STARTED)], [("Failed", STARTED), ("Succeeded", LATER)]],
+    ids=["its first run", "its run after a rejection and a retry"],
+)
+def test_progress_resumes_once_the_approval_resolves(
+    stub: Stub, commit: str, runs: list[tuple[str, datetime.datetime]]
+) -> None:
+    (*before, (_, started)) = runs
+    stub.approvals[stub.execution] = [*before, ("InProgress", started)]
+    client = Client()
+    deliver([approval(stub.execution, "STARTED")], stub, client)
+    stub.approvals[stub.execution] = runs
+    events = [
+        approval(stub.execution, "SUCCEEDED"),
+        action_event(stub.execution, STAGE, "Network.Deploy", "Deploy", "STARTED"),
+    ]
+    # The resolved attempt's start, delayed, before and after the progress that followed it.
+    deliver([approval(stub.execution, "STARTED"), *events, approval(stub.execution, "STARTED")], stub, client)
+    stub.stage_states[STAGE] = "Succeeded"
+    deliver([stage_event(stub.execution, STAGE, "SUCCEEDED"), approval(stub.execution, "STARTED")], stub, client)
+    assert deployment(client, commit) == [WAITING, RUNNING, RUNNING, ("success", Description.DEPLOYED)]
+
+
+def without_input(stub: Stub, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CodePipeline's records may omit `input`: the stub's records say no action's type."""
+    listed = stub.list_action_executions
+
+    def listed_without_input(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+        details = listed(pipelineName, filter)["actionExecutionDetails"]
+        return {"actionExecutionDetails": [{k: v for k, v in run.items() if k != "input"} for run in details]}
+
+    monkeypatch.setattr(stub, "list_action_executions", listed_without_input)
+
+
+@pytest.mark.parametrize("start_first", [True, False], ids=["the approval's start first", "the approval's start last"])
+def test_a_waiting_approval_without_its_input_stays_visible(
+    stub: Stub, commit: str, start_first: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without_input(stub, monkeypatch)
+    stub.approvals[stub.execution] = [("InProgress", STARTED)]
+    events = progress(stub.execution)
+    events.insert(0 if start_first else len(events), approval(stub.execution, "STARTED"))
+    client = Client()
+    deliver(events, stub, client)
+    assert deployment(client, commit) == [WAITING] * 4
+
+
+def test_a_resolved_approval_without_its_input_does_not_restore_the_wait(
+    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without_input(stub, monkeypatch)
+    stub.approvals[stub.execution] = [("Succeeded", STARTED)]
+    client = Client()
+    deliver([action_event(stub.execution, STAGE, "Network.Deploy", "Deploy", "STARTED")], stub, client)
+    deliver([approval(stub.execution, "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING]
+
+
+def test_a_step_that_runs_unnamed_is_not_an_approval(stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    listed = stub.list_action_executions
+
+    def with_unnamed_step(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+        # `actionName` is optional in a record too.
+        kind = {"actionTypeId": {"category": "Build", "provider": "CodeBuild"}}
+        record = {"stageName": STAGE, "status": "InProgress", "startTime": LATER, "input": kind}
+        return {"actionExecutionDetails": [*listed(pipelineName, filter)["actionExecutionDetails"], record]}
+
+    monkeypatch.setattr(stub, "list_action_executions", with_unnamed_step)
+    stub.approvals[stub.execution] = [("Succeeded", STARTED)]
+    client = Client()
+    deliver([stage_event(stub.execution, STAGE, "STARTED")], stub, client)
+    deliver([action_event(stub.execution, STAGE, "CopyWeights", "Build", "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING] * 2
+
+
+def test_an_approval_of_another_execution_changes_nothing(stub: Stub, commit: str) -> None:
+    other, other_commit = str(uuid.uuid4()), secrets.token_hex(20)
+    stub.others[other] = other_commit
+    stub.approvals[other] = [("InProgress", LATER)]
+    # This execution's own approval was resolved.
+    stub.approvals[stub.execution] = [("Succeeded", STARTED)]
+    client = Client()
+    deliver([approval(other, "STARTED"), *progress(stub.execution), approval(stub.execution, "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING] * 3
+    # The other execution's wait is posted on its own commit only.
+    assert deployment(client, other_commit) == [WAITING]
+
+
+def test_an_approval_of_another_stage_is_a_step_that_runs(
+    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed = stub.list_action_executions
+
+    def with_preflight(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+        answer = listed(pipelineName, filter)
+        kind = {"actionTypeId": {"category": "Approval", "provider": "Manual"}}
+        record = {"stageName": "Preflight", "actionName": "Confirm", "status": "InProgress", "startTime": STARTED}
+        return {"actionExecutionDetails": [*answer["actionExecutionDetails"], record | {"input": kind}]}
+
+    monkeypatch.setattr(stub, "list_action_executions", with_preflight)
+    client = Client()
+    deliver([action_event(stub.execution, "Preflight", "Confirm", "Approval", "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING]
+
+
+@pytest.mark.parametrize("resolved", [False, True], ids=["while it waits", "once it resolved"])
+def test_unreadable_approvals_leave_the_last_status_in_place(
+    stub: Stub, commit: str, resolved: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stub.approvals[stub.execution] = [("Succeeded" if resolved else "InProgress", STARTED)]
+    client = Client()
+    deliver([stage_event(stub.execution, STAGE, "STARTED")], stub, client)
+
+    def throttled(**_: object) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": MARKER}}, "ListActionExecutions")
+
+    monkeypatch.setattr(stub, "list_action_executions", throttled)
+    with caplog.at_level(logging.WARNING):
+        deliver([approval(stub.execution, "STARTED"), *progress(stub.execution)], stub, client)
+    assert deployment(client, commit) == [RUNNING if resolved else WAITING]
+    assert handler.NO_APPROVALS in caplog.messages and MARKER not in caplog.text
 
 
 @pytest.mark.parametrize("secret", [None, {"app_id": "1", "installation_id": "2"}], ids=["absent", "no private_key"])
