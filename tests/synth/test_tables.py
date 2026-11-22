@@ -7,8 +7,9 @@ No deployment writes an item of the pool-state table (section 11.3): a pool with
 is in its configured mode, and what the admin set there, a disabled pool or a cleared mark, only
 the admin changes. What a deployment runs is a custom resource, so `pool_state_writes` looks for
 one that writes an item of the table: by an SDK call that its properties name with the table, or
-through what serves it, a function or a state machine whose role may write an item of the table,
-by a reference to it or by an ARN pattern that its name matches, or may run one that may (a
+through what serves it, a function or a state machine whose role may write an item of the table
+(by its inline policies, a policy resource of any kind that names the role, or a managed policy it
+attaches, AWS's included), by a reference to the table or by an ARN pattern that its name matches, or may run one that may (a
 provider's framework, which runs a handler or a waiter), reached directly or through what stands
 for it (an alias or a version of a function, a topic a function subscribes to). A table created from an import is written
 by its deployment too.
@@ -71,6 +72,23 @@ RUNNERS = {"AWS::Lambda::Function": "Role", "AWS::StepFunctions::StateMachine": 
 # What stands for a function, so that a custom resource or a role reaches the function through it:
 # an alias or a version of it, or a topic it subscribes to.
 STAND_INS = ("AWS::Lambda::Alias", "AWS::Lambda::Version", "AWS::SNS::Topic")
+# The AWS managed policies that allow writing an item of any table, as the statement each amounts to.
+_EVERYTHING = {"Effect": "Allow", "Action": "*", "Resource": "*"}
+_ALL_OF_DYNAMODB = {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}
+AWS_MANAGED_WRITERS = {
+    "AdministratorAccess": _EVERYTHING,
+    "PowerUserAccess": _EVERYTHING,
+    "AmazonDynamoDBFullAccess": _ALL_OF_DYNAMODB,
+    "AmazonDynamoDBFullAccess_v2": _ALL_OF_DYNAMODB,
+    "AmazonDynamoDBFullAccesswithDataPipeline": _ALL_OF_DYNAMODB,
+}
+
+
+def managed_name(value: Any) -> str | None:
+    """The name of the AWS managed policy an ARN of `ManagedPolicyArns` names, if it names one."""
+    text = pattern(value)
+    found = re.fullmatch(r"arn:[^:]*:iam::aws:policy/(?:.*/)?([^/]+)", text)
+    return found.group(1) if found else None
 
 
 def key_schema(partition: KeyAttribute, sort: KeyAttribute | None) -> list[dict[str, str]]:
@@ -196,8 +214,16 @@ class Assembly:
             return named | self.references(variables, path)
         return set().union(*(self.references(part, path) for part in value.values()))
 
+    def names(self, value: Any, path: str, role: Node) -> bool:
+        """Whether a value names the role: by a reference to it, or by its name written out."""
+        role_name = self.templates[role[0]]["Resources"].get(role[1], {}).get("Properties", {}).get("RoleName")
+        written = {part for part in as_list(value) if isinstance(part, str)}
+        return role in self.references(value, path) or (isinstance(role_name, str) and role_name in written)
+
     def statements(self, role: Node) -> list[tuple[str, dict[str, Any]]]:
-        """Each statement of a role's policies, with the path of the template that holds it."""
+        """Each statement of a role's policies, with the path of the template that holds it: its
+        inline policies, a policy resource that names it (`AWS::IAM::Policy`, `AWS::IAM::RolePolicy`
+        or `AWS::IAM::ManagedPolicy`), and a managed policy it attaches, an AWS one included."""
         path, name = role
         properties = self.templates[path]["Resources"].get(name, {}).get("Properties", {})
         found = [
@@ -205,12 +231,18 @@ class Assembly:
             for policy in properties.get("Policies", [])
             for statement in as_list(policy["PolicyDocument"]["Statement"])
         ]
-        attached = self.references(properties.get("ManagedPolicyArns", []), path)
+        arns = as_list(properties.get("ManagedPolicyArns", []))
+        found += [(path, AWS_MANAGED_WRITERS[p]) for p in map(managed_name, arns) if p in AWS_MANAGED_WRITERS]
+        attached = self.references(arns, path)
         for node, resource in self.resources():
-            if resource["Type"] not in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
-                continue
             policy = resource.get("Properties", {})
-            if node in attached or role in self.references(policy.get("Roles", []), node[0]):
+            if resource["Type"] == "AWS::IAM::RolePolicy":
+                named = self.names(policy.get("RoleName"), node[0], role)
+            elif resource["Type"] in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
+                named = node in attached or self.names(policy.get("Roles", []), node[0], role)
+            else:
+                continue
+            if named:
                 found += [(node[0], statement) for statement in as_list(policy["PolicyDocument"]["Statement"])]
         return found
 
@@ -416,6 +448,35 @@ def _a_provider_that_invokes_an_alias(table: str, scaler: str) -> dict[str, Reso
     }
 
 
+def _a_handler_whose_role(policies: dict[str, Resource], role: Resource | None = None) -> dict[str, Resource]:
+    """A function serving the custom resource, whose role is given its permissions by `policies`."""
+    function = {"Type": FUNCTION, "Properties": {"Role": {"Fn::GetAtt": ["HandlerRole", "Arn"]}}}
+    role = role or {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {}}}
+    return {"Handler": function, "HandlerRole": role, **policies, "Injected": _served_by("Handler")}
+
+
+def _a_role_policy(table: str, scaler: str) -> dict[str, Resource]:
+    del scaler
+    statement = {"Effect": "Allow", "Action": "dynamodb:PutItem", "Resource": {"Fn::GetAtt": [table, "Arn"]}}
+    policy = {"PolicyName": "Seed", "RoleName": {"Ref": "HandlerRole"}, "PolicyDocument": {"Statement": [statement]}}
+    return _a_handler_whose_role({"HandlerPolicy": {"Type": "AWS::IAM::RolePolicy", "Properties": policy}})
+
+
+def _a_policy_that_names_the_role(table: str, scaler: str) -> dict[str, Resource]:
+    del scaler
+    statement = {"Effect": "Allow", "Action": "dynamodb:PutItem", "Resource": {"Fn::GetAtt": [table, "Arn"]}}
+    policy = {"PolicyName": "Seed", "Roles": ["seed-role"], "PolicyDocument": {"Statement": [statement]}}
+    role = {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {}, "RoleName": "seed-role"}}
+    return _a_handler_whose_role({"HandlerPolicy": {"Type": "AWS::IAM::Policy", "Properties": policy}}, role)
+
+
+def _an_aws_managed_policy(table: str, scaler: str) -> dict[str, Resource]:
+    del table, scaler
+    arn = {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":iam::aws:policy/AmazonDynamoDBFullAccess"]]}
+    role = {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {}, "ManagedPolicyArns": [arn]}}
+    return _a_handler_whose_role({}, role)
+
+
 def _table_name_arns(table: str) -> tuple[Any, Any]:
     """An ARN pattern that the pool-state table's name matches, built the two ways a template does."""
     name = f"table/{POOLS_STACK_NAME}-{table}-*"
@@ -473,6 +534,9 @@ def test_a_pattern_finds_only_the_tables_it_names() -> None:
         _an_alias_of_the_scaler,
         _a_topic_the_scaler_subscribes_to,
         _a_provider_that_invokes_an_alias,
+        _a_role_policy,
+        _a_policy_that_names_the_role,
+        _an_aws_managed_policy,
     ],
 )
 def test_a_deployment_that_writes_pool_state_is_found(
