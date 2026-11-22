@@ -13,6 +13,7 @@ import aws_cdk as cdk
 
 from rhi.access.stack import AccessStack
 from rhi.gateway.stack import GatewayStack
+from rhi.guardrails.stack import GuardrailsStack
 from rhi.network.stack import NetworkStack
 from rhi.observability.stack import ObservabilityStack
 from rhi.pools.stack import PoolsStack
@@ -70,3 +71,6 @@ class EndpointStage(cdk.Stage):
             observability=self.observability,
             pools=self.pools,
         )
+        # The alerts topic and what reports to it. Its alarms read the stacks above, so no stack
+        # reads it (`rhi.guardrails.stack`).
+        self.guardrails = GuardrailsStack(self, "Guardrails", config=config)

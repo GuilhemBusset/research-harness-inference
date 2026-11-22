@@ -156,6 +156,11 @@ class Config:
     # The days the pipeline's log group keeps its state changes (`rhi.pipeline.events`), a period
     # CloudWatch Logs takes. Only synthesis of the pipeline stack reads it.
     pipeline_events_retention_days: int
+    # Whether the guardrails stack holds a Cost Anomaly Detection monitor of the services dimension
+    # and its subscription (`rhi.guardrails.anomaly`). Off until the owner has removed the monitor of
+    # that dimension that Cost Explorer may already have made: an account holds only one, and a
+    # second fails the deployment. Only synthesis reads it.
+    cost_anomaly_detection: bool
 
 
 def _as_stored(text: str) -> object:
@@ -394,6 +399,7 @@ KEYS: dict[str, Key] = {
         _log_retention_days,
         _number_from_text,
     ),
+    "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -436,6 +442,9 @@ DEFAULTS: dict[str, object] = {
     # The design gives no period for the pipeline's events, which hold no personal data (issue
     # E4-30): 90 days, the period of every log group of the stage (section 6.6).
     "pipeline_events_retention_days": 90,
+    # The design gives no such key (issue E4-36): off keeps a deployed stage deployable in an
+    # account that already holds Cost Explorer's monitor of the services dimension.
+    "cost_anomaly_detection": False,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two
