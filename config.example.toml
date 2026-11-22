@@ -24,7 +24,7 @@ github_repo = "example-repository"
 # The client ID of the GitHub App students log in with.
 login_client_id = "Iv1.0000example0000"
 
-# The monthly budget, in whole US dollars, that latches every pool.
+# The monthly budget, in whole US dollars, whose thresholds e-mail the admin (alerts only).
 monthly_budget_usd = 1000
 
 # The schedule: the time zone its times are in, the day the course ends, and the session windows.

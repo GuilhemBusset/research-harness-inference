@@ -371,8 +371,20 @@ def test_parked_keeps_what_must_stay_under_its_logical_id(stages: dict[bool, Sta
         for stack, logical_id, resource in resources(stages[False])
         if resource["Type"] in KEPT
     }
-    assert {kind for _, _, kind in must_stay} >= KEPT - {"AWS::Budgets::Budget"}
+    assert {kind for _, _, kind in must_stay} >= KEPT
     assert sorted((stack, logical_id) for stack, logical_id, _ in must_stay if (stack, logical_id) not in kept) == []
+
+
+def test_parked_keeps_the_budget_under_its_logical_id(stages: dict[bool, Stage]) -> None:
+    budgets = {
+        parked: {
+            (stack, logical_id)
+            for stack, logical_id, resource in resources(stage)
+            if resource["Type"] == "AWS::Budgets::Budget"
+        }
+        for parked, stage in stages.items()
+    }
+    assert budgets[True] and budgets[True] == budgets[False], budgets
 
 
 def test_parked_keeps_every_log_group_of_a_fixed_name(stages: dict[bool, Stage]) -> None:

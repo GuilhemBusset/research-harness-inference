@@ -104,7 +104,7 @@ class Config:
     github_repo: str
     # The login app's client ID, which the issuer serves.
     login_client_id: str
-    # The backstop that latches every pool.
+    # The monthly amount of the cost budget, which alerts and stops nothing.
     monthly_budget_usd: int
     # The schedule: an IANA time zone name, the course end date and the session windows.
     time_zone: str
