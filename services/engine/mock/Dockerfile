@@ -8,7 +8,7 @@
 # linux/arm64 and linux/amd64 among others. No platform is fixed here: `--platform linux/arm64`
 # (the pipeline, for the mock pool) and a build with none (CI, on its runner's own platform) each
 # take their own image from the same index. An update is a change to this line.
-FROM python:3.13.14-slim-trixie@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
+FROM python:3.15.2-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
