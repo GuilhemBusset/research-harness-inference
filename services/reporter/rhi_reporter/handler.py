@@ -587,10 +587,11 @@ def _as_approvals_stand(
     try:
         latest: dict[object, Mapping[str, Any]] = {}
         for run in runs():
-            category = run.get("input", {}).get("actionTypeId", {}).get("category")
-            if run.get("stageName") != stage or category != APPROVAL_CATEGORY:
-                continue
+            # `input` is optional in a record: the event's own approval is known by its name alone.
+            category = (run.get("input") or {}).get("actionTypeId", {}).get("category")
             name = run.get("actionName")
+            if run.get("stageName") != stage or (category != APPROVAL_CATEGORY and name != own):
+                continue
             # A stage that is retried runs its approval again: the latest run is the one that counts.
             if name not in latest or run["startTime"] > latest[name]["startTime"]:
                 latest[name] = run
