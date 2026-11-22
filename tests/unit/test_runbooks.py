@@ -36,6 +36,7 @@ RUNBOOKS = [
     "course-end.md",
 ]
 SECTIONS = ["when", "check", "act", "verify"]
+SHELLS = {"sh", "bash", "shell", "console"}  # a fence's info string, or none, that marks commands
 
 
 FENCE = re.compile(r"^(`{3,}|~{3,})")
@@ -43,21 +44,25 @@ FENCE = re.compile(r"^(`{3,}|~{3,})")
 
 def read(text: str) -> tuple[list[str], list[list[Word]]]:
     """The level-2 headings outside the code blocks, and the words of every line of every fenced code
-    block (backticks or tildes), then of every substitution's command in it: a `\\` continues a
-    line, and blank and comment lines are left out."""
+    block (backticks or tildes) that is shell, then of every substitution's command in it: a `\\`
+    continues a line, and blank and comment lines are left out. A block whose info string names
+    another language (`text` for a query, `toml`) holds no command."""
     headings: list[str] = []
     lines: list[list[Word]] = []
-    fence, pending = "", ""
+    fence, pending, shell = "", "", True
     for line in text.splitlines():
         opening = FENCE.match(line.strip())
         if not fence:
             if opening:
-                fence, pending = opening[1], ""
+                language = line.strip()[len(opening[1]) :].split(maxsplit=1)
+                fence, pending, shell = opening[1], "", not language or language[0] in SHELLS
             elif match := re.match(r"^##\s+(.+)$", line):
                 headings.append(match[1].strip().lower())
             continue
         if opening and opening[1][0] == fence[0] and len(opening[1]) >= len(fence) and line.strip() == opening[1]:
             fence = ""
+            continue
+        if not shell:
             continue
         pending += line.strip().removeprefix("$ ")
         if pending.endswith("\\"):
@@ -190,18 +195,23 @@ def split(line: str, bodies: list[str] | None = None) -> list[Word]:
 
 def commands(words: list[Word]) -> list[list[Word]]:
     """The commands of a line: the words between its control operators, each without its
-    redirections and their files, so that each command of a pipeline is checked on its own."""
+    redirections and their files, so that each command of a pipeline is checked on its own. As in
+    the shell, a subshell's `(` only starts a command, and a word does not follow its `)`."""
     found: list[list[Word]] = [[]]
-    target = False
+    target = started = closed = False  # a redirection's file is next; the command has begun; a `)` ended it
     for word in words:
+        opening = word.operator and word.text == "("
+        if (closed and not word.operator and not target) or (opening and started):
+            raise ValueError(f"the shell refuses `{word.text}` in: {shlex.join(w.text for w in words)}")
         if target:
             target = False
         elif word.operator and word.text in CONTROL:
             found.append([])
-        elif word.operator:
-            target = True
+            closed = started = word.text == ")"
         else:
-            found[-1].append(word)
+            target, started = word.operator, True
+            if not word.operator:
+                found[-1].append(word)
     return [command for command in found if command]
 
 
@@ -268,6 +278,10 @@ def test_detects_an_unknown_command() -> None:
     # A line the shell refuses for an unterminated quote is refused here too.
     with pytest.raises(ValueError, match="no closing quotation"):
         problems(sections + '```sh\nrhi "status\n```\n')
+    # A block of another language (a query) holds no command; a shell block, named or not, does.
+    assert problems(sections + "```text\nsum by (pool) (rate(x[5m]))\n```\n```bash\nrhi frobnicate\n```\n") == [
+        "the rhi CLI refuses: rhi frobnicate"
+    ]
 
 
 def test_refuses_arguments_the_shell_decides_and_checks_commands_inside_substitutions() -> None:
@@ -279,6 +293,11 @@ def test_refuses_arguments_the_shell_decides_and_checks_commands_inside_substitu
     # A command that runs inside a substitution or a subshell is checked; one behind a prefix cannot be read.
     nested = "```sh\nx=$(rhi frobnicate)\ncat <(rhi frobnicate) \"`rhi frobnicate`\"\n( rhi frobnicate )\n```\n"
     assert problems(sections + nested) == ["the rhi CLI refuses: rhi frobnicate"] * 4
+    assert problems(sections + "```sh\n( ( rhi status ) ) > /dev/null && (rhi status)\n```\n") == []
+    # A `(` that starts no command, or a word after a subshell's `)`, is a syntax error of the shell.
+    for line in ["rhi status (unexpected)", "rhi_admin roster list (x)", "(rhi status) unexpected", "rhi status > f (x)"]:
+        with pytest.raises(ValueError, match="the shell refuses"):
+            problems(sections + f"```sh\n{line}\n```\n")
     assert problems(sections + "```sh\nX=1 rhi status\n```\n") == [
         "a command of this repository the check cannot read: X=1 rhi status"
     ]

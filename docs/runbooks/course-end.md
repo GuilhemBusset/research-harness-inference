@@ -43,8 +43,13 @@ that `rhi_admin roster list` prints.
 
 - **The course is over:** after its last session, on or before the configured `course_end`. A
   course that ends before that date still has working keys until it: revoke them (Act, step 1).
-- **One student asks** for their data, or for its deletion, during the course: Act, steps 2 and 3,
-  for that student alone. The erase revokes their keys too.
+- **One student asks for a copy** of their data during the course: Act, step 2 alone, for that
+  student, into the folder of Check, step 3; then give them the file. Nothing is erased and no key
+  is revoked: the student keeps their access, and their data stays until the course end like
+  everyone's. Do not run step 1 or step 3 for a copy.
+- **One student asks for the deletion** of their data during the course: Act, step 3, for that
+  student alone, preceded by step 2 only if they asked for a copy as well. The erase revokes their
+  keys too.
 
 ## Check
 
