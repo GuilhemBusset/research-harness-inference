@@ -5,7 +5,7 @@ defects that decide whether a session works (evidence E28). The gateway works ar
 defects with its **request profile**, a short table of rewrites that stay inside one wire format.
 The pool's configuration names the entries, in the order they apply
 (`rhi_common.pool_config`, `request_profile`), and the body filter runs them on the filtered body,
-after its shared rewrites and before it serializes (`rhi_gateway.body`, step 7). A pool that names
+after its shared rewrites and before it serializes (`rhi_gateway.body`, step 8). A pool that names
 none has an empty profile, and its filtered body is forwarded unchanged.
 
 **An entry** is one module of this package, named as the configuration names the entry. The module
