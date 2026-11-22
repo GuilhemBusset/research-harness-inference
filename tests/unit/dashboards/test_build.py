@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import pytest
 from grafana_foundation_sdk.builders import dashboard as sdk
+from grafana_foundation_sdk.builders import expr as sdk_expr
 from grafana_foundation_sdk.builders import prometheus as sdk_prometheus
 from grafana_foundation_sdk.builders import stat as sdk_stat
 from grafana_foundation_sdk.builders import timeseries as sdk_timeseries
@@ -171,6 +172,23 @@ def test_a_module_that_defines_a_dashboard_is_found_without_being_listed(
         assert json.loads(content)["uid"] == name.removesuffix(".json")
     # The package's own modules of helpers define none.
     assert not {"build", "check", "rules"} & {module.__name__.rpartition(".")[2] for module in build.modules()}
+
+
+def test_a_module_may_define_a_dashboard_and_its_companions(
+    package: Callable[[dict[str, str]], ModuleType], example: rhi_config.Config, tmp_path: Path
+) -> None:
+    pair = STUDENTS_MODULE.replace("def dashboard(config):", "def one(config):") + (
+        "\n\ndef dashboard(config):\n"
+        "    companion = one(config).uid('sample-companion').title('Sample: companion')\n"
+        "    return one(config), companion\n"
+    )
+    written = build.write(example, tmp_path, package({"pair": pair}))
+    assert [path.name for path in written] == ["sample-students.json", "sample-companion.json"]
+
+    # Within one module too, two dashboards never share an identifier.
+    clash = pair.replace("uid('sample-companion')", "uid('sample-students')")
+    with pytest.raises(build.BuildError):
+        build.dashboards(example, package({"pair": clash}))
 
 
 def test_a_dashboard_is_built_from_the_configuration(
@@ -339,6 +357,24 @@ def test_a_query_names_a_fixed_data_source_and_the_row_of_its_pools_engine(examp
     ):
         found = check.violations(document(by_hand(source)), requests, example.pools)
         assert "data-source" in rules_broken(found), source
+
+    # Grafana's own two: a panel of mixed sources, and a server-side expression on its query.
+    def computed(panel_source: sdk_common.DataSourceRef, expression_source: sdk_common.DataSourceRef) -> sdk_stat.Panel:
+        math = sdk_expr.TypeMath().expression("$A * 2").ref_id("B").datasource(expression_source)
+        return by_hand(rules.PROMETHEUS).datasource(panel_source).with_target(math)
+
+    assert check.violations(document(computed(rules.MIXED, rules.EXPRESSIONS)), requests, example.pools) == []
+    for panel_source, expression_source in (
+        (sdk_common.DataSourceRef(type_val="datasource", uid="-- Other --"), rules.EXPRESSIONS),
+        (sdk_common.DataSourceRef(type_val="prometheus", uid="-- Mixed --"), rules.EXPRESSIONS),
+        (rules.MIXED, sdk_common.DataSourceRef(type_val="__expr__", uid="expressions")),
+        (rules.MIXED, sdk_common.DataSourceRef(type_val="cloudwatch", uid="__expr__")),
+    ):
+        found = check.violations(document(computed(panel_source, expression_source)), requests, example.pools)
+        assert rules_broken(found) == {"data-source"}, (panel_source, expression_source)
+    # The mixed source routes a panel's queries; a query that names it has no source of its own.
+    found = check.violations(document(by_hand(rules.MIXED).datasource(rules.MIXED)), requests, example.pools)
+    assert "data-source" in rules_broken(found)
 
     # An engine's metric is queried for a configured pool, in the names of that pool's engine.
     engine = [rules.FromEngineTable(Quantity.OUTPUT_TOKENS)]

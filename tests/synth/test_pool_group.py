@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from rhi import config
+from rhi_common.pool_config import group_name
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -95,6 +96,16 @@ def test_the_mock_pool_group(pools: dict[str, Any], group: tuple[str, dict[str, 
     (target_group,) = of_mock(pools, "AWS::ElasticLoadBalancingV2::TargetGroup")
     assert properties["TargetGroupARNs"] == [{"Ref": target_group}]
     assert of_type(pools, "AWS::AutoScaling::ScalingPolicy") == {}
+
+
+def test_each_pools_group_has_the_fixed_name_the_cost_dashboard_reads(pools: dict[str, Any]) -> None:
+    """A group deleted and created again keeps its name, so its metrics keep theirs."""
+    groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
+    names = {properties["AutoScalingGroupName"]: properties["Tags"] for properties in groups.values()}
+    assert len(names) == len(groups) == len(EXAMPLE.pools) == 2
+    for pool in EXAMPLE.pools:
+        assert [tag["Value"] for tag in names[group_name(pool.name)] if tag["Key"] == "rhi-pool"] == [pool.name]
+    assert group_name("mock") == "rhi-pool-mock"
 
 
 def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
