@@ -763,6 +763,7 @@ class Engine:
         steps = {Phase.PLAN: self._step_plan, Phase.BUILD: self._step_build, Phase.VERIFY: self._step_verify,
                  Phase.EXAMINE: self._step_examine, Phase.MERGED: self._step_accept}
         fresh: list[int] = []   # dependency-ready issues with no saved plan: admitted after the runnable work
+        foreign: set[int] = set()   # issues another run holds: they take none of this run's planning room
         # An issue that waits for its deployment verdict takes the merge queue before any issue lands.
         for n in sorted(self.plan.work, key=lambda m: phases.get(m) != DEPLOYING):
             if n in running:
@@ -771,6 +772,7 @@ class Engine:
             if ph in TERMINAL or ph == Phase.WAITING:
                 continue
             if not self._claim_issue(n):
+                foreign.add(n)
                 continue
             if ph in (Phase.PENDING, Phase.PLAN) and not self.store.issue(n).plan:
                 # a first plan, or one a stopped run left unfinished
@@ -806,36 +808,43 @@ class Engine:
             elif ph in steps:
                 running[n] = pool.submit(steps[ph], n)
         if fresh:
-            self._admit_plans(pool, running, fresh)
+            self._admit_plans(pool, running, fresh, foreign)
 
-    def _admit_plans(self, pool: ThreadPoolExecutor, running: dict[int, Future], fresh: list[int]) -> None:
+    def _admit_plans(self, pool: ThreadPoolExecutor, running: dict[int, Future], fresh: list[int],
+                     foreign: set[int]) -> None:
         """Plan close to when a writer can take the issue: first plans are admitted, after every
-        runnable step, only for a writer slot the issue could fill and for one standby. Plans in
-        flight and completed plans awaiting a build fill those first, so the count holds across
-        passes. A plan fills a slot only when it can write alongside the writers and the plans
-        already counted for the other slots; any other plan is the standby."""
+        runnable step, for the free writer slots plus one standby, and no more. Plans in flight and
+        completed plans awaiting a build of this run take that room first, so the count holds
+        across passes, whatever their paths. A plan fills a slot only when it can write alongside
+        the writers and the plans already counted for the other slots; any other plan can only be
+        the standby."""
         phases = self._phases()
         held = [n for n in self.plan.work if phases.get(n) in WRITING_PHASES]
+        room = max(self.caps.max_parallel_writers - len(held), 0) + STANDBY_PLANS
         standby = 0
 
         def fits(n: int) -> bool:
             return scheduler.can_start_writing(self.plan, n, held, self.caps.max_parallel_writers)
 
         for n in self.plan.work:   # an issue waiting on a prerequisite found while planning is not counted
-            if n not in fresh and phases.get(n) in (Phase.PLAN, Phase.PLANNED):
-                if fits(n):
-                    held.append(n)
-                else:
-                    standby += 1
-        for n in fresh:
+            if n in fresh or n in foreign or phases.get(n) not in (Phase.PLAN, Phase.PLANNED):
+                continue
+            room -= 1
             if fits(n):
                 held.append(n)
-            elif standby < STANDBY_PLANS:
-                standby += 1
             else:
+                standby += 1
+        for n in fresh:
+            slot = room > 0 and fits(n)
+            if not slot and not (room > 0 and standby < STANDBY_PLANS):
                 if phases.get(n) == Phase.PLAN:
                     self._set_phase(n, Phase.PENDING)   # an unfinished plan waits for its turn like a first one
                 continue
+            room -= 1
+            if slot:
+                held.append(n)
+            else:
+                standby += 1
             self._set_phase(n, Phase.PLAN)
             running[n] = pool.submit(self._step_plan, n)
 

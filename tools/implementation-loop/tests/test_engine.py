@@ -428,6 +428,22 @@ class DispatchTests(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.plans(), [3, 6], "#3 can only be the standby; #6 fills the free slot, #5 and #7 wait")
 
+    def test_a_build_that_conflicts_with_the_plans_in_flight_adds_no_planning_room(self):
+        self.dispatcher({2: "docs/a.txt", 3: "docs/b.txt", 4: "docs/", 5: "src/f.txt"})
+        for n in (2, 3):
+            self.put(n, here.Phase.PLAN, plan=False)
+            self.running[n] = Future()      # two plans in flight
+        self.put(4, here.Phase.PLANNED)     # the third finished first, and its build overlaps both
+        self.assertEqual(self.dispatch(), [("build", 4)], "three admitted: #5 waits for a writer to release its slot")
+
+    def test_unfinished_plans_another_run_holds_leave_the_writer_slot_to_this_run(self):
+        self.dispatcher({n: f"docs/{n}.txt" for n in (2, 3, 4, 5)}, writers=1)
+        for n in (2, 3):   # a stopped run's unfinished plans, which another run has claimed since
+            self.put(n, here.Phase.PLAN, plan=False)
+            self.engine.claims.acquire(f"issue-{n}", "other-run")
+        self.engine_for(writers=1)   # this run resumes
+        self.assertEqual(self.dispatch(), [("plan", 4), ("plan", 5)])
+
     def test_a_ready_build_goes_before_a_fresh_standby_plan(self):
         self.dispatcher({2: "docs/a.txt", 3: "docs/b.txt", 4: "docs/c.txt", 5: "docs/d.txt"})
         self.put(3, here.Phase.PLANNED)
