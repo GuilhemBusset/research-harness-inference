@@ -438,6 +438,34 @@ def test_a_first_scrape_long_after_its_stages_ended_leaves_the_earliest_unknown(
     assert (started["in_hour"], started["began_after_at"], started["stages"]) == ("uncertain", None, stages)
 
 
+@pytest.mark.parametrize("kernel", [-3.0, 55.0], ids=["just-before", "just-before-the-end"])
+def test_a_launch_without_its_boot_is_not_bounded_from_below_by_its_own_scrapes(kernel: float) -> None:
+    lines: list[str] = []
+    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    # The agent could not read the uptime, so it wrote no boot: the kernel started 20 seconds before
+    # the image stage, which no sample shows. Each stage is scraped on the grid after it ends.
+    stages = {"image": 5.0, "release-check": 12.0, "hook": 1.0}
+    ends = list(itertools.accumulate(stages.values(), initial=START + kernel + 20))[1:]
+
+    class Unbooted(Workspace):
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if dry.STAGE_METRIC not in query:
+                return []
+            timed = query.startswith("timestamp(")
+            labels = {"instance": self.after, "transition": "entry"}
+            return [
+                _series({**labels, "stage": stage}, *((t, t if timed else seconds) for t in grid))
+                for (stage, seconds), ended in zip(stages.items(), ends, strict=True)
+                if (grid := [t for t in range(int(START), int(end) + 1, 15) if t >= max(start, ended)])
+            ]
+
+    rehearsal.workspace = Unbooted(*instances)
+    rehearsal.clock.at = START + 120  # ty: ignore[unresolved-attribute] - the test's clock
+    asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
+    (started,) = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
+    assert (started["in_hour"], started["began_after_at"], started["stages"]) == ("uncertain", None, stages)
+
+
 def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:
     lines: list[str] = []
     rehearsal, _, _ = _rehearsal(lines)

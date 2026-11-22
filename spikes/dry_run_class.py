@@ -77,7 +77,9 @@ the agent does, so its first scrape may come well after the stages it shows had 
 observation bounds when the launch began from below (`Launch.began_after`). A scrape of the launch
 that lacks a stage it ends later says the stage had not ended then, so the launch began after that
 scrape less the seconds of the stages up to that one, in the order a launch goes through them; and a
-scrape of the instance's launch before says the new one had not begun then. Where nothing bounds it,
+scrape of the instance's launch before says the new one had not begun then. A launch without its boot
+stage, which the agent omits when it cannot read the uptime, counts its stages from an unknown time
+after the kernel's start, so its own scrapes bound nothing from below. Where nothing bounds it,
 `began_after_at` is null. A launch is written when these two bounds may overlap the hour, with
 both: `in_hour` is `certain` when both are in it, and `uncertain` when the hour's start or end
 falls between them or the earliest is unknown, as for a launch that began in the hour's last
@@ -242,8 +244,13 @@ class Launch:
 def _began_after(stages: Snapshot, floor: float | None, seen: Iterable[tuple[float, frozenset[str]]]) -> float | None:
     """The latest of the bounds the observations give from below a launch with `stages`, or None:
     `floor`, and for each scrape `seen` at a time with the stages it showed, its time less the seconds
-    of the stages up to the first one it lacked."""
+    of the stages up to the first one it lacked. The stages count from the kernel's start only with
+    the boot among them: the agent writes no boot when it cannot read the uptime, and then the time
+    from the kernel's start to the first stage it measured is unknown, so a scrape of the launch
+    bounds nothing from below, and only `floor` does."""
     bounds = [] if floor is None else [floor]
+    if Stage.BOOT.value not in stages:
+        return floor
     for at, ended in seen:
         through = 0.0
         for stage in _ORDER:
