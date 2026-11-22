@@ -1,13 +1,13 @@
 """The wake (`POST /wake`, `rhi_gateway.local`), through the application.
 
-The waker is the real one, over a real readiness whose AWS clients are doubles; the ledger is the
-in-memory one. Every key is generated when the tests run.
+The waker is the real one, over a real readiness whose AWS clients are doubles. The wake is given
+no ledger: it takes no concurrency slot and refuses no student for a budget. Every key is generated
+when the tests run.
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -19,18 +19,16 @@ from starlette.types import Message
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
 from rhi_common.records import Mode, PoolState, ScalerNote
-from rhi_common.students import StudentKey, utc_day
+from rhi_common.students import StudentKey
 from rhi_gateway.app import build_app
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.budget import InMemoryLedger
+from rhi_gateway.budget import DynamoDBLedger, InMemoryLedger
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import Readiness
 from rhi_gateway.waker import Waker
 
 NOW = 1_800_000_000
-# The course end the ledger's rows expire by.
-COURSE_END_DATE = datetime.date(2027, 6, 30)
 GITHUB_ID = 4242
 
 
@@ -94,8 +92,6 @@ class Gateway:
     budget: int = 2_000_000
     key: str = field(default_factory=generate_key)
     aws: Doubles = field(default_factory=Doubles)
-    ledger: InMemoryLedger = field(default_factory=lambda: InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: NOW))
-    writes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.student = StudentKey(
@@ -114,8 +110,6 @@ class Gateway:
         )
         self.waker = KeptWaker(self.readiness, lambda_client=self.aws, function_name="scaler", clock=lambda: NOW)
         self.asks = self.waker.asks
-        for name in ("reserve", "settle"):
-            setattr(self.ledger, name, lambda *_, _name=name, **__: self.writes.append(_name))
         local = LocalRoutes(
             Authenticator(InMemoryKeyStore(self.student), wall_clock=lambda: NOW),
             POOLS,
@@ -123,7 +117,6 @@ class Gateway:
             default_pool=POOLS[0],
             clock=lambda: NOW,
             waker=self.waker,
-            ledger=self.ledger,
         )
         self.app = build_app(local=local)
 
@@ -182,13 +175,18 @@ def test_refused_without_a_valid_key(headers: dict[str, str]) -> None:
     assert gateway.woken() == (0, 0)
 
 
-def test_a_cold_pool_is_woken_once_and_its_record_answered() -> None:
+def test_a_cold_pool_is_woken_once_and_its_record_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    written: list[str] = []
+    for ledger in (InMemoryLedger, DynamoDBLedger):
+        for name in ("reserve", "settle", "withdraw"):
+            monkeypatch.setattr(ledger, name, lambda *_, _name=name, **__: written.append(_name))
     gateway = Gateway()
     assert gateway.wake("mock") == (200, {"model": "mock", "state": "cold"})
     assert gateway.woken() == (1, 1)
     assert gateway.waker.pending("mock") == 1
     assert json.loads(gateway.scaler_calls()[0]["Payload"]) == {"pool": "mock"}
-    assert gateway.writes == []
+    # No concurrency slot is taken, by any ledger.
+    assert written == []
 
 
 def test_a_claude_name_wakes_the_default_pool_and_an_unknown_name_is_refused() -> None:
@@ -216,26 +214,10 @@ def test_stopped_pools_are_not_woken(name: str, record: PoolState | None, cause:
     assert gateway.woken() == (0, 0)
 
 
-def test_a_spent_budget_wakes_nothing() -> None:
-    spent = Gateway(budget=1000)
-    reservation = InMemoryLedger.reserve(
-        spent.ledger, spent.student, "earlier", b"{}", output_limit=0, hold_seconds=420, longest_request_seconds=1800
-    )
-    InMemoryLedger.settle(spent.ledger, reservation, input_tokens=1000, output_tokens=0, ended_cleanly=True)
-    assert spent.ledger.tokens_left(spent.student) == 0
-    status, body = spent.wake("mock")
-    assert (status, body["error"]["type"]) == (402, "budget_reached")
-    assert spent.woken() == (0, 0)
-
-    accepted = Gateway()
-    left = accepted.ledger.tokens_left(accepted.student)
-    assert accepted.wake("mock")[0] == 200
-    assert accepted.woken() == (1, 1)
-    # No reservation and no slot: the ledger was read, never written.
-    assert accepted.writes == []
-    assert accepted.ledger.writes == 0
-    assert accepted.ledger.day(GITHUB_ID, utc_day(NOW)) is None
-    assert accepted.ledger.tokens_left(accepted.student) == left
+def test_a_key_with_a_daily_budget_of_0_still_wakes() -> None:
+    gateway = Gateway(budget=0)
+    assert gateway.wake("mock") == (200, {"model": "mock", "state": "cold"})
+    assert gateway.woken() == (1, 1)
 
 
 def test_no_capacity_still_wakes() -> None:

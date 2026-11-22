@@ -67,8 +67,8 @@ FAULT_STATUS = 500
 class RequestRecord:
     """What is logged of one request. Every field is metadata: none comes from a body or a header's value.
 
-    `student` is not logged: it is the record of the accepted key, by which the metrics read the
-    student's budget from the ledger (`rhi_gateway.metrics`). Nor are `cached_input_tokens`, the
+    `key_hash` is not logged: it is the hash of the accepted key, by which the metrics stop an
+    erased student's series (`rhi_gateway.metrics`). Nor are `cached_input_tokens`, the
     part of the input the engine reported read from the cache, and `token_count`, whether the
     request is a token count (`POST /v1/messages/count_tokens`), whose input is a count asked and
     not a generation's: the metrics count both apart.
@@ -83,7 +83,7 @@ class RequestRecord:
     latency_ms: int = 0
     status: int | None = None
     cause: str | None = None
-    student: KeyRecord | None = field(default=None, repr=False)
+    key_hash: str | None = field(default=None, repr=False)
     cached_input_tokens: int = 0
     token_count: bool = False
 
@@ -109,7 +109,7 @@ def note_student(student: KeyRecord) -> None:
     record = _CURRENT.get()
     if record is not None:
         record.alias = student.alias
-        record.student = student
+        record.key_hash = student.key_hash
 
 
 def note_pool(name: str) -> None:

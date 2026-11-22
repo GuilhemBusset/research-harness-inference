@@ -287,7 +287,7 @@ def test_a_reservation_refused_at_midnight_after_an_erase_leaves_no_usage_row(de
 
     ledger = DynamoDBLedger(boto3.client("dynamodb"), deployed.usage.name, course_end=COURSE_END, clock=clock)
     with pytest.raises(GatewayError):
-        ledger.reserve(student, "late", b"{}", output_limit=10, hold_seconds=420, longest_request_seconds=1800)
+        ledger.reserve(student, "late", hold_seconds=420, longest_request_seconds=1800)
     assert deployed.rows(OTTER) == []
 
 

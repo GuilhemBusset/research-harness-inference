@@ -135,7 +135,6 @@ def gateway() -> tuple[Starlette, str]:
         default_pool=POOLS[0],
         clock=lambda: float(NOW),
         waker=Waker(readiness, lambda_client=Aws(), function_name="scaler", clock=lambda: float(NOW)),
-        ledger=ledger,
     )
     return build_app(forwarding_handlers(forwarding), local=local), key
 

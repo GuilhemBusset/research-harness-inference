@@ -149,7 +149,7 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
     ]
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     heartbeat = Heartbeat(Table(), "task", [pool.name for pool in POOLS], clock=lambda: float(NOW))
-    made = Gateway(Starlette(), metrics.Metrics(ledger), heartbeat, keys, ready=ready)
+    made = Gateway(Starlette(), metrics.Metrics(), heartbeat, keys, ready=ready)
 
     async def engine(request: httpx.Request) -> httpx.Response:
         body = json.loads(await request.aread())
@@ -358,7 +358,7 @@ def test_served_with_the_gateway_metrics_with_the_floors_as_boundaries() -> None
     assert post(made, routes.MESSAGES, stream=True) == 200
 
     families = {family.name for family in text_string_to_metric_families(scrape(made))}
-    assert families >= {*SERIES, metrics.REQUESTS, metrics.BUDGET_LEFT}
+    assert families >= {*SERIES, metrics.REQUESTS}
     boundaries = {float(sample.labels["le"]) for sample in served(made) if sample.name == SPEED + "_bucket"}
     # The floors of the objectives, 10 and 15 tokens per second, are read exactly.
     assert boundaries >= {10.0, 15.0}

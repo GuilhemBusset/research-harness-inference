@@ -1,44 +1,45 @@
-"""Reserve budget before a request, settle after it (system design, section 6.2, step 3).
+"""Take a concurrency slot before a request, release it after (system design, section 6.2, step 3).
 
-Checking a budget only at admission, or counting tokens only at the end, lets a client overspend
-by opening many streams or by hanging up early. So a request writes its student's record twice,
-and this module is the one place where it does:
+Checking the concurrency limit only at admission lets a client exceed it by opening many streams at
+once. So a request writes its student's record twice, and this module is the one place where it
+does:
 
-1. **The reservation**, before anything is sent to the engine. One conditional write adds the
-   estimate of the input plus the request's output limit to the tokens of the student's day, and
-   adds a lease under the request's ID. Its condition is the budget and the limit themselves: the
-   day's tokens and this amount fit the daily budget, and the leases are fewer than the
-   concurrency limit. Both numbers are the ones the key's lookup gave (`Student`). Requests
-   sent at once therefore cannot be admitted beyond either. A refusal is a `GatewayError`: for the
-   budget, with the cause `budget_reached`; for the limit, with `concurrency_limit`. A student
-   over both is told `budget_reached`, the one no retry cures.
-2. **The settlement**, when the request has ended. One conditional write removes the lease and
-   replaces the tokens it reserved by the charge. A clean end is charged the usage the engine
-   reported, input plus output, the input counted whole, cached or not (sections 11.3 and 17). Any
-   other end (a disconnect, a timeout, an error) is charged the tokens observed, and never less
-   than the input estimate. Its condition is that the lease is still there, so a reservation is
-   settled once: a second settlement writes nothing and charges nothing.
+1. **The reservation**, before anything is sent to the engine. One conditional write adds a lease
+   under the request's ID. Its condition is the limit itself: the leases are fewer than the
+   concurrency limit the key's lookup gave (`Student`). Requests sent at once therefore cannot be
+   admitted beyond it. A refusal is a `GatewayError` with the cause `concurrency_limit`, which the
+   client retries.
+2. **The settlement**, when the request has ended. One conditional write removes the lease,
+   however the request ended. Its condition is that the lease is still there, so a reservation is
+   settled once: a second settlement writes nothing.
 
-A write whose condition fails changes nothing and is not a write to the record. The ledger also
-reads the tokens a student has left of the day (`tokens_left`), and that writes nothing.
+Nothing is reserved or charged against a count of tokens: there is no per-student token budget
+(ADR 0003, decisions 2 and 3). The tokens a request used are logged (`rhi_gateway.telemetry`), not
+written here. A write whose condition fails changes nothing and is not a write to the record.
 
-**The record** is the usage item of `rhi_common.students`, one per student and UTC day: `tokens`
-holds what was charged and what is reserved, `leases` the requests in flight. A request belongs
-to the day it started: its lease stays in that day's item, and its settlement goes there even
-after midnight. Every write of an item sets its expiry, `expires_at`, to the course end plus 90
-days (`rhi_common.retention`), the retention of every store (section 6.6): the ledger is given the
-course end, and an item written before keeps it no longer than that. In the table, an item can also carry `opening`, for a minute after midnight at most
-(see "Midnight"); the record leaves it out.
+**The record** is the usage item of `rhi_common.students`, one per student and UTC day: `leases`
+holds the requests in flight. A request belongs to the day it started: its lease stays in that
+day's item, and its settlement goes there even after midnight. Every write of an item sets its
+expiry, `expires_at`, to the course end plus 90 days (`rhi_common.retention`), the retention of
+every store (section 6.6): the ledger is given the course end, and an item written before keeps it
+no longer than that. In the table, an item can also carry `opening`, for a minute after midnight at
+most (see "Midnight"); the record leaves it out.
 
-**Midnight.** The budget is the day's and starts again at midnight UTC; the concurrency limit is
-the student's and does not. So the first reservation of a day reads the item of the day before
+The item's `tokens`, and a lease's `tokens` and `estimate`, are written 0 and never changed. They
+are written at all for a rollout: the gateway's tasks are replaced one by one, and a task of the
+release before, which shares the table meanwhile, refuses a day or a lease that lacks them, and
+may still add to a day's `tokens`. A lease such a task wrote, with its tokens and its estimate, is
+settled and swept here like any other, and the day's `tokens` are left as they are.
+
+**Midnight.** The record is the day's, but the concurrency limit is the student's and does not
+start again at midnight UTC. So the first reservation of a day reads the item of the day before
 and writes the new day's item with a stand-in for each lease still live there: a lease under the
-day and the request's ID (`2026-11-15/<request>`) that reserves no tokens and expires when the
-request's own lease does. The reservation's condition counts it like any lease, so a request
-still running at midnight keeps its slot in the new day, at no extra call for the requests that
-follow. Its settlement is still one write, to the item of its own day, which leaves the stand-in
-behind: a reservation that stand-ins refuse reads the day before again and removes, in its own
-single write, those whose request has ended.
+day and the request's ID (`2026-11-15/<request>`) that expires when the request's own lease does.
+The reservation's condition counts it like any lease, so a request still running at midnight keeps
+its slot in the new day, at no extra call for the requests that follow. Its settlement is still one
+write, to the item of its own day, which leaves the stand-in behind: a reservation that stand-ins
+refuse reads the day before again and removes, in its own single write, those whose request has
+ended.
 
 A stand-in is never missing, because no reservation counts in a day once the next day is
 open without it. A write can be sent before midnight and made after it, when another task has
@@ -46,8 +47,8 @@ already read the day and opened the next one. So when a write answers, the ledge
 again, and if the day has changed it reads the next day's item: the reservation counts if that
 item holds its stand-in, or if it is not there yet and the write answered within `OPENING_SECONDS`
 (60) of midnight, so that whoever opens the day can still find the lease. If not, one more write
-takes the lease and its tokens back, as a settlement that charges nothing, and the request is
-refused with `concurrency_limit`, which the client retries.
+takes the lease back, as a settlement does, and the request is refused with `concurrency_limit`,
+which the client retries.
 
 "Not there yet" is not enough on its own: whoever opens the day may have read the day before
 already and not written yet. A day opened within those 60 seconds is therefore written
@@ -65,25 +66,17 @@ into it, and from then on they can only go. That rests on the clocks of the gate
 agreeing on the time: a reservation that a task whose clock is behind confirms in the old day,
 after another task has read that day, has no stand-in.
 
-**The input estimate** is computed from the request body alone, before any call to the engine: a
-token for every four bytes, rounded up. The design gives no rule. Four bytes a token is the usual
-ratio for text; the estimate is the least a request that ends badly is charged, and the
-settlement of a clean end replaces it by the engine's count.
-
 **The lease.** A reservation is taken before the hold (section 6.2, steps 3 and 5), so a lease
 outlasts the longest hold and then the longest request: `lease_seconds` is the pool's
 `hold_seconds` plus the longest request plus 60 seconds, 2,280 seconds with the defaults of
-section 17. From its expiry on, a lease holds no slot and is worth its input estimate, for every
-reader and writer of the record:
+section 17. From its expiry on, a lease holds no slot, for every writer of the record:
 
-- the read counts it so;
-- a reservation that the record as written would refuse removes the expired leases, each charged
-  its estimate, in its own single write, and is admitted if that makes room; an expired stand-in
-  goes the same way, and gives back no tokens, having reserved none;
-- a settlement that comes after the expiry removes the lease and charges the estimate.
+- a reservation that the record as written would refuse removes the expired leases in its own
+  single write, and is admitted if that makes room; an expired stand-in goes the same way;
+- a settlement that comes after the expiry removes the lease as any settlement does.
 
 An expired lease can thus stay in the item until one of these writes removes it, and it never
-refuses a request nor lowers the tokens left by more than its estimate.
+refuses a request.
 
 **Two ledgers.** `InMemoryLedger` keeps the days in memory, and `DynamoDBLedger` in the usage
 table. Both decide with the same functions over a `UsageDay`. The in-memory one applies them under
@@ -103,8 +96,8 @@ settlement that finds nothing to settle stores nothing. Only a withdrawal (`Ledg
 a reservation refused once written) deletes a day with its map, and only a day that holds what its
 opening carried from the day before, which the next opening carries again. The opening records in
 the day it writes the cookies and rebalance numbers it carried (`carried_maps`). A withdrawal
-deletes the day only while its maps still equal that record, at no tokens and with stand-ins
-alone. The test reads the stored values, not a mark that every writer would have to maintain. So
+deletes the day only while its maps still equal that record, with stand-ins alone and no tokens
+(which only a task of the release before can have added). The test reads the stored values, not a mark that every writer would have to maintain. So
 a settlement stored by a gateway task that predates the record, during a rollout where old and new
 tasks share the table, keeps the day as surely as one stored by a current task. A day written
 without the record, as every day before it existed was, is never deleted. A day's first
@@ -146,7 +139,6 @@ from rhi_common.students import Lease, UsageDay, utc_day
 from rhi_common.tables import EXPIRES_AT
 from rhi_gateway.errors import GatewayError
 
-BYTES_PER_TOKEN = 4
 # What a lease lasts beyond the longest hold and the longest request.
 LEASE_MARGIN_SECONDS = 60
 # How long after midnight a reservation of the day before may still count without a stand-in in
@@ -157,11 +149,6 @@ OPENING_SECONDS = 60
 _ATTEMPTS = 10
 # What the name of a stand-in begins with: the day of the request it stands for.
 _STAND_IN = re.compile(r"\d{4}-\d{2}-\d{2}/", re.ASCII)
-
-
-def estimate_input_tokens(body: bytes) -> int:
-    """The estimate of a request's input, from its body alone: a token for every four bytes."""
-    return -(-len(body) // BYTES_PER_TOKEN)
 
 
 def lease_seconds(hold_seconds: int, longest_request_seconds: int) -> int:
@@ -188,9 +175,6 @@ class Student(Protocol):
     def expires_at(self) -> int: ...
 
     @property
-    def daily_token_budget(self) -> int: ...
-
-    @property
     def concurrency_limit(self) -> int: ...
 
 
@@ -214,20 +198,18 @@ class Reservation:
 
 
 class Ledger(Protocol):
-    """A student's budget and concurrency slots: the two writes of a request, and one read."""
+    """A student's concurrency slots: the two writes of a request, and the withdrawal."""
 
     def reserve(
         self,
         student: Student,
         request_id: str,
-        body: bytes,
         *,
-        output_limit: int,
         hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
     ) -> Reservation:
-        """Reserve the estimate of `body` plus `output_limit`, and a slot, or raise the refusal.
+        """Take a slot for the request, or raise the refusal, `concurrency_limit`.
 
         `request_id` is the gateway's own ID for the request, `hold_seconds` the pool's, and
         `longest_request_seconds` the gateway's setting. An ID that is empty, that holds a
@@ -242,31 +224,26 @@ class Ledger(Protocol):
         self,
         reservation: Reservation,
         *,
-        input_tokens: int,
-        output_tokens: int,
-        ended_cleanly: bool,
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
-    ) -> int | None:
-        """Free the slot and charge the request: the tokens charged, or `None` if nothing was.
+    ) -> bool:
+        """Free the slot, however the request ended: whether this call removed the lease.
 
-        `input_tokens` is the whole input, cached or not. After a clean end the two counts are the
-        usage the engine reported; after any other end, the tokens observed. Nothing is charged
-        when the reservation is settled already, by an earlier call or by a reservation that
-        removed it after its expiry. `cookie` is the load balancer's cookie the request ended
-        with: the same write stores it for the reservation's pool. `None`, for a request that
+        Nothing is written, and `False` returned, when the reservation is settled already, by an
+        earlier call or by a reservation that removed it after its expiry. Nothing is charged
+        either way. `cookie` is the load balancer's cookie the request ended with: the same write stores it for the reservation's pool. `None`, for a request that
         ended with none, leaves the record's cookies as they are, unless `cookie_dropped` says
         that the request's rebalance number dropped its cookie: the write then removes the
         pool's cookie from the record. `rebalance_number` is the pool's rebalance number the
         request was judged on, which the same write stores as the last one applied for the
         reservation's pool; `None`, for a request that was not judged, leaves the record's
-        numbers as they are. A settlement that charges nothing stores and removes nothing.
+        numbers as they are. A settlement that finds no lease stores and removes nothing.
         """
         ...
 
     def withdraw(self, reservation: Reservation) -> None:
-        """Take back a reservation whose key no longer passes, charging nothing.
+        """Take back a reservation whose key no longer passes.
 
         The day's row is then deleted if what is left in it is only what a day's opening carries
         from the day before (`_carried_only`): no tokens, no lease but stand-ins, and cookies and
@@ -276,16 +253,12 @@ class Ledger(Protocol):
         carried, and whichever gateway task wrote it, and so does a day written without the record. A reservation refused after its write (its day
         ended meanwhile) is taken back in the same way. A request whose student was erased while
         its body arrived thus leaves no row behind, however many such requests take theirs back and in
-        whatever order, and what other requests charged or hold stays.
+        whatever order, and what other requests hold or stored stays.
         """
         ...
 
-    def tokens_left(self, student: Student) -> int:
-        """The tokens of today's budget neither charged nor reserved. Writes nothing."""
-        ...
 
-
-# What both ledgers decide with: what a reservation, a settlement and a read do to a day.
+# What both ledgers decide with: what a reservation and a settlement do to a day.
 
 
 def _day_before(day: str) -> str:
@@ -297,7 +270,7 @@ def _live(day: UsageDay | None, now: int) -> dict[str, Lease]:
 
 
 def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expires_at: int) -> UsageDay:
-    """A day as its first reservation finds it: no tokens, and a stand-in for each live lease of `before`.
+    """A day as its first reservation finds it: tokens 0, and a stand-in for each live lease of `before`.
 
     It expires at `expires_at`, the course end plus 90 days (`rhi_common.retention`).
 
@@ -319,35 +292,24 @@ def _new_day(student: Student, day: str, before: UsageDay | None, now: int, expi
     )
 
 
-def _new_lease(body: bytes, output_limit: int, expires: int) -> Lease:
-    if output_limit < 0:
-        raise ValueError("the output limit is negative")
-    estimate = estimate_input_tokens(body)
-    return Lease(tokens=estimate + output_limit, estimate=estimate, expires=expires)
+def _new_lease(expires: int) -> Lease:
+    """A lease as this release writes it: tokens and estimate 0, read only by the release before."""
+    return Lease(tokens=0, estimate=0, expires=expires)
 
 
 def _expired(day: UsageDay, now: int) -> dict[str, Lease]:
     return {request: lease for request, lease in day.leases.items() if lease.expires <= now}
 
 
-def _released(expired: Mapping[str, Lease]) -> int:
-    """The tokens that settling these leases at their estimates gives back."""
-    return sum(lease.tokens - lease.estimate for lease in expired.values())
-
-
 def _without(day: UsageDay, expired: Mapping[str, Lease]) -> UsageDay:
-    """The day once these leases are removed, each charged its estimate."""
+    """The day once these leases are removed; its tokens stay as they are."""
     leases = {request: lease for request, lease in day.leases.items() if request not in expired}
-    return replace(day, tokens=day.tokens - _released(expired), leases=leases)
+    return replace(day, leases=leases)
 
 
-def _refusal(day: UsageDay, student: Student, amount: int) -> Cause | None:
-    """Why this day cannot take `amount` more tokens and one more lease, if it cannot."""
-    if day.tokens + amount > student.daily_token_budget:
-        return Cause.BUDGET_REACHED
-    if len(day.leases) >= student.concurrency_limit:
-        return Cause.CONCURRENCY_LIMIT
-    return None
+def _admits(day: UsageDay, student: Student) -> bool:
+    """Whether this day can take one more lease: its leases are fewer than the concurrency limit."""
+    return len(day.leases) < student.concurrency_limit
 
 
 def _ended(day: UsageDay, before: Callable[[], UsageDay | None], now: int) -> dict[str, Lease]:
@@ -367,7 +329,6 @@ def _to_remove(
     day: UsageDay,
     student: Student,
     request_id: str,
-    lease: Lease,
     now: int,
     before: Callable[[], UsageDay | None],
 ) -> dict[str, Lease]:
@@ -380,29 +341,25 @@ def _to_remove(
         raise ValueError("a reservation needs the request's ID, and one that is not a stand-in's")
     if request_id in day.leases:
         raise ValueError("this request holds a reservation already")
-    if _refusal(day, student, lease.tokens) is None:
+    if _admits(day, student):
         return {}
     gone = _expired(day, now)
-    cause = _refusal(_without(day, gone), student, lease.tokens)
-    if cause is Cause.CONCURRENCY_LIMIT:
+    if not _admits(_without(day, gone), student):
         gone |= _ended(day, before, now)
-        cause = _refusal(_without(day, gone), student, lease.tokens)
-    if cause is not None:
-        raise GatewayError(cause, "the student's day does not admit this request")
+    if not _admits(_without(day, gone), student):
+        raise GatewayError(Cause.CONCURRENCY_LIMIT, "the student's day does not admit this request")
     return gone
 
 
 def _reserved(day: UsageDay, request_id: str, lease: Lease, expired: Mapping[str, Lease]) -> UsageDay:
     swept = _without(day, expired)
-    return replace(swept, tokens=swept.tokens + lease.tokens, leases={**swept.leases, request_id: lease})
+    return replace(swept, leases={**swept.leases, request_id: lease})
 
 
 def _reserve_within_the_day(
     clock: Callable[[], float],
     student: Student,
     request_id: str,
-    body: bytes,
-    output_limit: int,
     seconds: int,
     pool: str | None,
     write: Callable[[Reservation, int], UsageDay],
@@ -416,10 +373,10 @@ def _reserve_within_the_day(
     holds the cookie that record has for `pool`, and the rebalance number it has applied for it.
     The clock is read again when `write` returns. If
     the day has changed and the next day was opened without this lease, `take_back` removes the
-    lease and its tokens, and the request is refused.
+    lease, and the request is refused.
     """
     now = int(clock())
-    lease = _new_lease(body, output_limit, now + seconds)
+    lease = _new_lease(now + seconds)
     reservation = Reservation(student.github_id, utc_day(now), request_id, lease, pool)
     held = write(reservation, now)
     if pool is not None:
@@ -453,16 +410,6 @@ def _carried(reservation: Reservation, answered: int, read: Callable[[int, str],
     return f"{reservation.day}/{reservation.request_id}" in found.leases
 
 
-def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: bool, now: int) -> int:
-    """What a request is charged when it is settled at `now`."""
-    if input_tokens < 0 or output_tokens < 0:
-        raise ValueError("a count of tokens is negative")
-    if lease.expires <= now:
-        return lease.estimate
-    used = input_tokens + output_tokens
-    return used if ended_cleanly else max(used, lease.estimate)
-
-
 # What a day's opening carried from the day before: its cookies and its rebalance numbers, by pool.
 _Carried = tuple[Mapping[str, str], Mapping[str, int]]
 
@@ -470,10 +417,10 @@ _Carried = tuple[Mapping[str, str], Mapping[str, int]]
 def _carried_only(day: UsageDay, carried: _Carried | None) -> bool:
     """Whether the day holds only what its opening carries from the day before.
 
-    No tokens, stand-ins alone, and the cookies and rebalance numbers the opening recorded
-    (`carried`). A settlement that stores a cookie or a number, or drops one, also removes the
-    record, even when what it stores equals what the opening carried, and a day without the record
-    (`None`) is never deleted.
+    No tokens (which only a task of the release before can have added), stand-ins alone, and the
+    cookies and rebalance numbers the opening recorded (`carried`). A settlement that stores a
+    cookie or a number, or drops one, also removes the record, even when what it stores equals what
+    the opening carried, and a day without the record (`None`) is never deleted.
     """
     prefix = _day_before(day.day) + "/"
     return (
@@ -482,12 +429,6 @@ def _carried_only(day: UsageDay, carried: _Carried | None) -> bool:
         and all(name.startswith(prefix) for name in day.leases)
         and (day.affinity_cookies, day.rebalance_applied) == carried
     )
-
-
-def _left(day: UsageDay | None, student: Student, now: int) -> int:
-    if day is None:
-        return max(0, student.daily_token_budget)
-    return max(0, student.daily_token_budget - _without(day, _expired(day, now)).tokens)
 
 
 class InMemoryLedger:
@@ -514,9 +455,7 @@ class InMemoryLedger:
         self,
         student: Student,
         request_id: str,
-        body: bytes,
         *,
-        output_limit: int,
         hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
@@ -531,7 +470,7 @@ class InMemoryLedger:
                 opened = day is None
                 if day is None:
                     day = _new_day(student, reservation.day, before(), now, self._expires_at)
-                gone = _to_remove(day, student, request_id, reservation.lease, now, before)
+                gone = _to_remove(day, student, request_id, now, before)
                 written = replace(_reserved(day, request_id, reservation.lease, gone), expires_at=self._expires_at)
                 self._write(written)
                 if opened:
@@ -542,8 +481,6 @@ class InMemoryLedger:
             self._clock,
             student,
             request_id,
-            body,
-            output_limit,
             lease_seconds(hold_seconds, longest_request_seconds),
             pool,
             write,
@@ -555,29 +492,23 @@ class InMemoryLedger:
         self,
         reservation: Reservation,
         *,
-        input_tokens: int,
-        output_tokens: int,
-        ended_cleanly: bool,
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
-    ) -> int | None:
-        charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
-        stored = self._remove(
-            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+    ) -> bool:
+        return self._remove(
+            reservation, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
         )
-        return charge if stored else None
 
     def _remove(
         self,
         reservation: Reservation,
-        charge: int,
         *,
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
     ) -> bool:
-        """Remove the lease and replace its tokens by `charge`, if the lease is still there.
+        """Remove the lease, if it is still there; the day's tokens stay as they are.
 
         The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
         if there is one, and removes the pool's cookie when there is none and it was dropped. When
@@ -601,7 +532,6 @@ class InMemoryLedger:
             self._write(
                 replace(
                     day,
-                    tokens=day.tokens + charge - reservation.lease.tokens,
                     leases=leases,
                     affinity_cookies=cookies,
                     rebalance_applied=applied,
@@ -611,7 +541,7 @@ class InMemoryLedger:
         return True
 
     def withdraw(self, reservation: Reservation) -> None:
-        self._remove(reservation, 0)
+        self._remove(reservation)
         with self._lock:
             key = (reservation.github_id, reservation.day)
             day = self._days.get(key)
@@ -620,10 +550,6 @@ class InMemoryLedger:
                 self._carried.pop(key, None)
                 self.writes += 1
 
-    def tokens_left(self, student: Student) -> int:
-        now = int(self._clock())
-        return _left(self.day(student.github_id, utc_day(now)), student, now)
-
     def _write(self, day: UsageDay) -> None:
         self._days[(day.github_id, day.day)] = day
         self.writes += 1
@@ -631,7 +557,7 @@ class InMemoryLedger:
 
 # The attributes of the usage item, each under a placeholder: `day` is a reserved word of
 # DynamoDB's expressions, and a placeholder for every name needs no list of the others.
-_NAMES = {"#tokens": "tokens", "#leases": "leases"}
+_NAMES = {"#leases": "leases"}
 # The attribute that holds the load balancer's cookies, by pool. A reservation that names a pool
 # writes it empty where there is none, so that the settlement has a map to store its cookie in.
 _COOKIES = "affinity_cookies"
@@ -686,8 +612,7 @@ class DynamoDBLedger:
     before). It gives up, with
     `concurrency_limit`, after ten calls that each found the record changed by another request. A
     reservation whose write answers after its day has ended reads the next day's item, and is
-    taken back, in one call, only if that day was opened without it. A settlement is one call,
-    and the read one consistent read.
+    taken back, in one call, only if that day was opened without it. A settlement is one call.
 
     The reservation's write returns the item as it wrote it, which holds the student's cookies, so
     the cookie costs no call. The settlement's write stores the request's cookie under its pool's
@@ -714,9 +639,7 @@ class DynamoDBLedger:
         self,
         student: Student,
         request_id: str,
-        body: bytes,
         *,
-        output_limit: int,
         hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
@@ -725,8 +648,6 @@ class DynamoDBLedger:
             self._clock,
             student,
             request_id,
-            body,
-            output_limit,
             lease_seconds(hold_seconds, longest_request_seconds),
             pool,
             lambda reservation, now: self._write_reservation(student, reservation, now),
@@ -738,21 +659,16 @@ class DynamoDBLedger:
         self,
         reservation: Reservation,
         *,
-        input_tokens: int,
-        output_tokens: int,
-        ended_cleanly: bool,
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
-    ) -> int | None:
-        charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
-        stored = self._remove(
-            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+    ) -> bool:
+        return self._remove(
+            reservation, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
         )
-        return charge if stored else None
 
     def withdraw(self, reservation: Reservation) -> None:
-        self._remove(reservation, 0)
+        self._remove(reservation)
         self._drop_if_carried_only(reservation)
 
     def _drop_if_carried_only(self, reservation: Reservation) -> None:
@@ -764,9 +680,14 @@ class DynamoDBLedger:
                 return
             # `_carried_only` as read, held by the delete: the same tokens, the same leases and the
             # same maps, each absent where it was, whichever task wrote to the day since.
-            names = {**_NAMES, "#carriedmaps": _CARRIED}
-            values = {":zero": _serializer.serialize(0), ":leases": item["leases"]}
-            condition = "#tokens = :zero AND #leases = :leases AND attribute_exists(#carriedmaps)"
+            names = {**_NAMES, "#tokens": "tokens", "#carriedmaps": _CARRIED}
+            values = {":leases": item["leases"]}
+            condition = "#leases = :leases AND attribute_exists(#carriedmaps)"
+            if "tokens" in item:
+                condition += " AND #tokens = :zero"
+                values[":zero"] = _serializer.serialize(0)
+            else:
+                condition += " AND attribute_not_exists(#tokens)"
             for placeholder, name in (("cookies", _COOKIES), ("applied", _APPLIED)):
                 names[f"#{placeholder}"] = name
                 if name in item:
@@ -784,20 +705,16 @@ class DynamoDBLedger:
             if deleted:
                 return
 
-    def tokens_left(self, student: Student) -> int:
-        now = int(self._clock())
-        return _left(self._read(student.github_id, utc_day(now)), student, now)
-
     def _write_reservation(self, student: Student, reservation: Reservation, now: int) -> UsageDay:
         """Add the reservation to the item of its day and return the day as written, or raise the refusal."""
-        request_id, lease = reservation.request_id, reservation.lease
+        request_id = reservation.request_id
 
         def before() -> UsageDay | None:
             return self._read(reservation.github_id, _day_before(reservation.day))
 
         # What no day admits is refused before any call.
         empty = _new_day(student, reservation.day, None, now, self._expires_at)
-        _to_remove(empty, student, request_id, lease, now, before)
+        _to_remove(empty, student, request_id, now, before)
         gone: dict[str, Lease] = {}
         carried: dict[str, Lease] | None = None
         for _ in range(_ATTEMPTS):
@@ -819,23 +736,22 @@ class DynamoDBLedger:
                 yesterday = before()
                 carried = _missing_stand_ins(found, yesterday, now)
                 found = replace(found, leases={**found.leases, **carried})
-                gone = _to_remove(found, student, request_id, lease, now, lambda read=yesterday: read)
+                gone = _to_remove(found, student, request_id, now, lambda read=yesterday: read)
             else:
-                gone = _to_remove(found, student, request_id, lease, now, before)
+                gone = _to_remove(found, student, request_id, now, before)
         # Every attempt found a record that another request had just changed.
         raise GatewayError(Cause.CONCURRENCY_LIMIT, "the student's day kept changing under this request")
 
     def _remove(
         self,
         reservation: Reservation,
-        charge: int,
         *,
         stand_ins: Mapping[str, Lease] | None = None,
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
     ) -> bool:
-        """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there.
+        """Remove the lease, in one write, if it is still there; the item's tokens stay as they are.
 
         `stand_ins`, given only by the opener of a day that takes its reservation back, are the
         stand-ins it missed; the write carries them into the day and confirms the day. The others
@@ -846,7 +762,7 @@ class DynamoDBLedger:
         (`_carried_only`) even when what it stored equals what the opening carried. Like every write
         of the ledger, it sets the item's expiry.
         """
-        values: dict[str, object] = {":change": charge - reservation.lease.tokens, ":expires": self._expires_at}
+        values: dict[str, object] = {":expires": self._expires_at}
         names, sets = _stand_in_updates(stand_ins or {}, values)
         names["#expires"] = EXPIRES_AT
         sets.append("#expires = :expires")
@@ -870,7 +786,7 @@ class DynamoDBLedger:
         if reservation.pool is not None and (cookie is not None or rebalance_number is not None or cookie_dropped):
             names["#carriedmaps"] = _CARRIED
             removals.append("#carriedmaps")
-        update = "REMOVE " + ", ".join(removals) + " ADD #tokens :change"
+        update = "REMOVE " + ", ".join(removals)
         if sets:
             update += " SET " + ", ".join(sets)
         written, _ = self._conditional(
@@ -896,10 +812,9 @@ class DynamoDBLedger:
         gone: Mapping[str, Lease],
         carried: Mapping[str, Lease] | None,
     ) -> tuple[UsageDay | None, Mapping[str, Any] | None]:
-        """The reservation as one write to an item that is there: `_refusal` and `_reserved`, restated.
+        """The reservation as one write to an item that is there: `_admits` and `_reserved`, restated.
 
-        Removing `gone` gives back their tokens and their slots, so the condition allows for
-        both, and holds only while each of them is still in the item. The item must be a
+        Removing `gone` gives back their slots, so the condition allows for them, and holds only while each of them is still in the item. The item must be a
         confirmed day, unless `carried` is given: then the write confirms the day itself, adding
         those stand-ins, which take their slots, and holds only while the day is still unconfirmed.
         For a reservation that names a pool, it leaves an empty map of cookies where there is none,
@@ -910,8 +825,6 @@ class DynamoDBLedger:
         lease = reservation.lease
         values: dict[str, object] = {
             ":lease": lease.to_map(),
-            ":change": lease.tokens - _released(gone),
-            ":room": student.daily_token_budget - lease.tokens + _released(gone),
             ":slots": student.concurrency_limit + len(gone) - len(carried or {}),
             ":expires": self._expires_at,
         }
@@ -923,8 +836,9 @@ class DynamoDBLedger:
             sets += ["#cookies = if_not_exists(#cookies, :none)", "#applied = if_not_exists(#applied, :none)"]
             values[":none"] = {}
         removed = {f"#gone{number}": request for number, request in enumerate(gone)}
-        update = "SET " + ", ".join(["#leases.#request = :lease", *sets]) + " ADD #tokens :change"
-        condition = "#tokens <= :room AND size(#leases) < :slots AND attribute_not_exists(#leases.#request)"
+        update = "SET " + ", ".join(["#leases.#request = :lease", *sets])
+        # The day must be there: the condition never relies on `size` of an attribute the item lacks.
+        condition = "attribute_exists(#leases) AND size(#leases) < :slots AND attribute_not_exists(#leases.#request)"
         condition += " AND attribute_not_exists(#opening)" if carried is None else " AND attribute_exists(#opening)"
         removals = [f"#leases.{name}" for name in removed] + ([] if carried is None else ["#opening"])
         if removals:
@@ -964,7 +878,7 @@ class DynamoDBLedger:
         yesterday = _day_before(reservation.day)
         before = self._read(reservation.github_id, yesterday)
         fresh = _new_day(student, reservation.day, before, now, self._expires_at)
-        _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
+        _to_remove(fresh, student, reservation.request_id, now, lambda: before)
         day = _reserved(fresh, reservation.request_id, reservation.lease, {})
         opening = now < _midnight(reservation.day) + OPENING_SECONDS
         item = {
@@ -989,7 +903,7 @@ class DynamoDBLedger:
         # found no item of this day when it checked: it counts, and its stand-in is not here.
         late = _missing_stand_ins(fresh, self._read(reservation.github_id, yesterday), now)
         if late:
-            self._remove(reservation, 0, stand_ins=late)
+            self._remove(reservation, stand_ins=late)
             self._drop_if_carried_only(reservation)
             raise GatewayError(Cause.CONCURRENCY_LIMIT, "the day before changed while this day was opened")
         return day, None

@@ -80,7 +80,7 @@ def assert_replays(capture: Capture) -> None:
     replayed = harness.replay(capture)
     assert (replayed.status, replayed.received) == (capture.status, capture.answer), capture.name
     usage = capture.usage
-    assert replayed.settled == (Settled(usage.input_tokens, usage.output_tokens, True, usage.total),), capture.name
+    assert replayed.settled == (Settled(usage.input_tokens, usage.output_tokens, True, True),), capture.name
 
 
 def test_a_session_is_saved_in_order_and_replays(tmp_path: Path) -> None:

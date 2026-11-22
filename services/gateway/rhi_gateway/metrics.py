@@ -14,7 +14,6 @@ configuration scrapes. Any other route answers 404.
 | `rhi_gateway_student_output_tokens_total` | counter | `alias`, `pool` | The output tokens their settlements observed |
 | `rhi_gateway_student_counted_tokens_total` | counter | `alias`, `pool` | The tokens the token counts answered |
 | `rhi_gateway_student_errors_total` | counter | `alias`, `pool`, `cause` | The requests the gateway gave a cause |
-| `rhi_gateway_student_budget_left_tokens` | gauge | `alias` | The tokens the student has left of the day |
 | `rhi_gateway_own_faults_total` | counter | none | The answers of 500 or above that named no cause: the gateway's own faults |
 
 **One request, one count.** `Metrics.count` is given the log record of each request when it ends
@@ -42,12 +41,6 @@ label, so these series are of no student. Every value of a label is the gateway'
 from the keys table, a configured pool's name, a cause of the fixed list. Nothing a client sends
 becomes a label.
 
-**The budget left** is the ledger's read (`rhi_gateway.budget.Ledger.tokens_left`), made when the
-endpoint is scraped, for each student whose key this task has accepted since it started: the value
-is then right after midnight, and after a request another task served, with no request here. A
-read that fails gives no sample for that student at that scrape, never an old value, and the
-counters are served still.
-
 **An erased student's series stop** (section 6.6). At every scrape, before anything is read, the
 key last accepted for each alias is read again from the keys table; when the table no longer holds
 it, as the admin's erase leaves it (`rhi_admin.privacy`), every series of that alias is dropped
@@ -72,7 +65,6 @@ from typing import TYPE_CHECKING, Any
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from prometheus_client import CollectorRegistry, Counter, make_wsgi_app
-from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.exposition import ThreadingWSGIServer
 from prometheus_client.registry import Collector
 
@@ -81,8 +73,7 @@ from rhi_gateway.telemetry import NO_CAUSE
 if TYPE_CHECKING:
     from prometheus_client import Metric
 
-    from rhi_gateway.budget import Ledger
-    from rhi_gateway.keystore import KeyRecord, KeyStore
+    from rhi_gateway.keystore import KeyStore
     from rhi_gateway.telemetry import RequestRecord
 
 HOST = "127.0.0.1"
@@ -96,7 +87,6 @@ CACHED_INPUT_TOKENS = "rhi_gateway_student_cached_input_tokens"
 OUTPUT_TOKENS = "rhi_gateway_student_output_tokens"
 COUNTED_TOKENS = "rhi_gateway_student_counted_tokens"
 ERRORS = "rhi_gateway_student_errors"
-BUDGET_LEFT = "rhi_gateway_student_budget_left_tokens"
 OWN_FAULTS = "rhi_gateway_own_faults"
 # The first status of a server's error.
 SERVER_ERROR = 500
@@ -106,59 +96,49 @@ _Application = Callable[[dict[str, Any], _StartResponse], Iterable[bytes]]
 
 
 class _Students(Collector):
-    """The students whose key this task has accepted, by alias: pruned, then their budget read, at every scrape.
+    """The students whose key this task has accepted, by alias: pruned of the erased at every scrape.
 
     It is registered before the counters, and a registry collects in the order of registration, so
-    an erased student's counters are dropped before the scrape reads them.
+    an erased student's counters are dropped before the scrape reads them. It serves no series.
     """
 
-    def __init__(self, ledger: Ledger | None, keys: KeyStore | None) -> None:
-        self._ledger, self._keys = ledger, keys
+    def __init__(self, keys: KeyStore | None) -> None:
+        self._keys = keys
         self._lock = threading.Lock()
-        # By alias, the label: the record of the key last accepted for it, and its labelled children.
-        self._students: dict[str, KeyRecord] = {}
+        # By alias, the label: the hash of the key last accepted for it, and its labelled children.
+        self._students: dict[str, str] = {}
         self._children: dict[str, set[tuple[Counter, tuple[str, ...]]]] = {}
 
-    def seen(self, student: KeyRecord, children: Iterable[tuple[Counter, tuple[str, ...]]]) -> None:
+    def seen(self, alias: str, key_hash: str, children: Iterable[tuple[Counter, tuple[str, ...]]]) -> None:
         with self._lock:
-            self._students[student.alias] = student
-            self._children.setdefault(student.alias, set()).update(children)
+            self._students[alias] = key_hash
+            self._children.setdefault(alias, set()).update(children)
 
     def describe(self) -> Iterable[Metric]:
-        # The registry asks the family's name when the collector is registered: no read for that.
-        return [] if self._ledger is None else [_budget_family()]
+        # The registry asks the families' names when the collector is registered: it has none.
+        return []
 
     def collect(self) -> Iterable[Metric]:
         with self._lock:
             students = dict(self._students)
-        for alias, student in list(students.items()):
-            if self._gone(student):
-                self._drop(alias, student)
-                del students[alias]
-        if self._ledger is None:
-            return []
-        family = _budget_family()
-        for alias, student in students.items():
-            try:
-                left = self._ledger.tokens_left(student)
-            except Exception:  # noqa: BLE001, S112 - a read that fails gives no sample; the scrape and the counters go on.
-                continue
-            family.add_metric([alias], left)
-        return [family]
+        for alias, key_hash in students.items():
+            if self._gone(key_hash):
+                self._drop(alias, key_hash)
+        return []
 
-    def _gone(self, student: KeyRecord) -> bool:
+    def _gone(self, key_hash: str) -> bool:
         if self._keys is None:
             return False
         try:
-            record = self._keys.lookup(student.key_hash)
+            record = self._keys.lookup(key_hash)
         except Exception:  # noqa: BLE001 - a read that fails drops nothing; the next scrape reads again.
             return False
         return record is None
 
-    def _drop(self, alias: str, student: KeyRecord) -> None:
+    def _drop(self, alias: str, key_hash: str) -> None:
         with self._lock:
             # A request of the same alias with another key, accepted since the read, keeps the series.
-            if self._students.get(alias) is not student:
+            if self._students.get(alias) != key_hash:
                 return
             del self._students[alias]
             children = self._children.pop(alias, set())
@@ -167,22 +147,17 @@ class _Students(Collector):
                 counter.remove(*labels)
 
 
-def _budget_family() -> GaugeMetricFamily:
-    return GaugeMetricFamily(BUDGET_LEFT, "Tokens of today's budget neither charged nor reserved.", labels=["alias"])
-
-
 class Metrics:
     """The gateway's registry and what it counts of each request.
 
-    `ledger` is the one the requests reserve in and settle with: without it there is no budget
-    series. `keys` is the store the keys are looked up in: without it no student's series are
-    dropped. The registry is the gateway's own, not prometheus-client's default one, which also
-    describes the process.
+    `keys` is the store the keys are looked up in: without it no student's series are dropped.
+    The registry is the gateway's own, not prometheus-client's default one, which also describes
+    the process.
     """
 
-    def __init__(self, ledger: Ledger | None = None, keys: KeyStore | None = None) -> None:
+    def __init__(self, keys: KeyStore | None = None) -> None:
         self.registry = CollectorRegistry()
-        self._students = _Students(ledger, keys)
+        self._students = _Students(keys)
         self.registry.register(self._students)
         self._requests = Counter(REQUESTS, "Requests answered.", ["alias", "pool"], registry=self.registry)
         self._input_tokens = Counter(
@@ -203,9 +178,7 @@ class Metrics:
             ["alias", "pool", "cause"],
             registry=self.registry,
         )
-        self._own_faults = Counter(
-            OWN_FAULTS, "Answers of 500 or above that named no cause.", registry=self.registry
-        )
+        self._own_faults = Counter(OWN_FAULTS, "Answers of 500 or above that named no cause.", registry=self.registry)
 
     def count(self, record: RequestRecord) -> None:
         """Count one request that has ended, from its log record. Reads nothing and never waits."""
@@ -225,8 +198,8 @@ class Metrics:
             children.append((self._errors, (alias, pool, record.cause)))
         for counter, labels in children:
             counter.labels(*labels).inc(amounts.get(counter, 1))
-        if record.student is not None:
-            self._students.seen(record.student, children)
+        if record.alias is not None and record.key_hash is not None:
+            self._students.seen(record.alias, record.key_hash, children)
         if record.cause == NO_CAUSE and record.status is not None and record.status >= SERVER_ERROR:
             self._own_faults.inc()
 

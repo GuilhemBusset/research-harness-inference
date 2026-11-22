@@ -1,7 +1,7 @@
 """Token usage read from a Chat Completions answer (system design, section 6.2, steps 3 and 6).
 
-The gateway settles a student's reservation to the usage the engine reports, and a stream that
-ends badly is charged the tokens observed. So this parser can be asked at any moment what it has
+The gateway logs the usage the engine reports for each request, and for a stream that ends badly
+the tokens observed. So this parser can be asked at any moment what it has
 seen so far, and whether the stream has ended cleanly.
 
 Where Chat Completions reports usage:
@@ -14,7 +14,7 @@ Where Chat Completions reports usage:
 How the counts are made:
 
 - The input is `prompt_tokens` as reported. In OpenAI's reference it already includes the tokens
-  read from the cache, which `prompt_tokens_details.cached_tokens` details apart. The daily budget
+  read from the cache, which `prompt_tokens_details.cached_tokens` details apart. The log
   counts every input token, cached or not (sections 11.3 and 17), so the cached part is not added
   again: it is read apart, as `cached_input_tokens`, 0 when the usage details none.
 - The output is `completion_tokens` as reported; it already includes the reasoning tokens that

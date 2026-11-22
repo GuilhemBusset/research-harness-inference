@@ -48,9 +48,9 @@ is set, a `type` of `error`, a `status` of `failed`).
 **How a request ends** (section 6.2, steps 3, 7 and 8). Each forwarded request is settled exactly
 once, by the `on_end` it was given, with one `Observed`: the tokens observed and whether the answer
 ended cleanly. A clean end is one whose answer was read whole and reported its usage (a stream: the
-format's own clean end). The ledger charges a clean end the usage reported, and any other end the
-tokens observed, never less than the input estimate (`rhi_gateway.budget`). The tokens observed
-are what the bytes received report, the bytes of an answer that broke off included. The other
+format's own clean end). The settlement frees the request's concurrency slot and charges nothing
+(`rhi_gateway.budget`); the tokens are logged (`rhi_gateway.telemetry`). The tokens observed are
+what the bytes received report, the bytes of an answer that broke off included. The other
 ends:
 
 - **the engine fails**: it cannot be reached, answers with a status that is not a success, breaks
@@ -1047,7 +1047,7 @@ def _observed_of(route: Route, body: bytes) -> Observed:
     """What an answer that is not a stream reported; nothing, should reading it fail, so that it is settled still."""
     try:
         return read_whole_answer(route, body)
-    except Exception:  # noqa: BLE001 - the settlement must be made whatever the engine sent; it then charges the estimate.
+    except Exception:  # noqa: BLE001 - the settlement must be made whatever the engine sent; it then observes nothing.
         return Observed(0, 0, ended_cleanly=False)
 
 

@@ -1,6 +1,7 @@
 """Every end of a forwarded request: settled once, and told to the client by its cause (`rhi_gateway.proxy`).
 
-The gateway runs whole, over the in-memory key store and a ledger that records each settlement.
+The gateway runs whole, over the in-memory key store and a ledger that records each settlement
+with what the proxy observed at that end.
 The upstream is an `httpx.MockTransport` handler written here, which can end well, fail, stop early
 or stall. Time is a clock the test advances: the proxy waits for its limit with the clock's `sleep`.
 The client is driven over raw ASGI, so that it can leave in the middle of a stream.
@@ -11,22 +12,24 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
 import pytest
 from starlette.applications import Starlette
-from starlette.types import Message
+from starlette.responses import Response
+from starlette.types import Message, Receive
 
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
+from rhi_gateway.affinity import Affinity
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import BodyFilter
+from rhi_gateway.body import BodyFilter, Forwarded
 from rhi_gateway.budget import InMemoryLedger, Reservation
 from rhi_gateway.errors import WireFormat, render_json, render_stream_event
 from rhi_gateway.formats import messages, responses
@@ -141,35 +144,48 @@ async def idle() -> None:
 
 
 class Ledger(InMemoryLedger):
-    """The in-memory ledger, recording each reservation and each settlement with what it charged."""
+    """The in-memory ledger, recording each settlement: what the proxy observed, and whether the lease was removed."""
 
     def __init__(self) -> None:
         super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
-        self.reserved: list[Reservation] = []
-        self.settled: list[tuple[int, int, bool, int | None]] = []
+        # What the proxy observed at each end, noted by `Observing` before the settlement is made.
+        self.observed: list[proxy.Observed] = []
+        self.settled: list[tuple[int, int, bool, bool]] = []
 
-    def reserve(self, *arguments: Any, **named: Any) -> Reservation:
-        reservation = super().reserve(*arguments, **named)
-        self.reserved.append(reservation)
-        return reservation
-
-    def settle(
-        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool, **named: Any
-    ) -> int | None:
-        charge = super().settle(
-            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly, **named
-        )
-        self.settled.append((input_tokens, output_tokens, ended_cleanly, charge))
-        return charge
-
-    @property
-    def estimate(self) -> int:
-        return self.reserved[0].lease.estimate
+    def settle(self, reservation: Reservation, **named: Any) -> bool:
+        removed = super().settle(reservation, **named)
+        observed = self.observed[len(self.settled)]
+        self.settled.append((observed.input_tokens, observed.output_tokens, observed.ended_cleanly, removed))
+        return removed
 
     def leases(self) -> dict[str, Any]:
         day = self.day(STUDENT, utc_day(NOW))
         assert day is not None
         return dict(day.leases)
+
+
+class Observing(proxy.Proxy):
+    """The gateway's proxy, noting in the ledger what each end of a request observed."""
+
+    def __init__(self, ledger: Ledger, *arguments: Any, **named: Any) -> None:
+        super().__init__(*arguments, **named)
+        self._ledger = ledger
+
+    async def forward(
+        self,
+        route: routes.Route,
+        forwarded: Forwarded,
+        on_end: Callable[[proxy.Observed], Awaitable[None]],
+        *,
+        receive: Receive | None = None,
+        token_sent: proxy.TokenSent | None = None,
+        affinity: Affinity | None = None,
+    ) -> Response:
+        async def noted(observed: proxy.Observed) -> None:
+            self._ledger.observed.append(observed)
+            await on_end(observed)
+
+        return await super().forward(route, forwarded, noted, receive=receive, token_sent=token_sent, affinity=affinity)
 
 
 def gateway(upstream: Upstream, clock: Clock) -> tuple[Starlette, str, Ledger]:
@@ -197,7 +213,7 @@ def gateway(upstream: Upstream, clock: Clock) -> tuple[Starlette, str, Ledger]:
         authenticator=Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW)),
         ledger=ledger,
         filters=filters,
-        proxy=proxy.Proxy(client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=clock.sleep),
+        proxy=Observing(ledger, client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=clock.sleep),
         # Every pool is ready: these requests are forwarded at once, with no hold.
         holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
     )
@@ -282,14 +298,13 @@ def test_every_end_settles_once(end: str) -> None:
 
         assert len(ledger.settled) == 1
         assert ledger.leases() == {}
-        input_tokens, output_tokens, clean, charge = ledger.settled[0]
+        input_tokens, output_tokens, clean, removed = ledger.settled[0]
+        assert removed is True
         if end.startswith("clean"):
-            assert (input_tokens, output_tokens, clean, charge) == (5000, 7, True, 5007)
+            assert (input_tokens, output_tokens, clean) == (5000, 7, True)
         else:
-            # The tokens observed (the start reported 5,000 in and 1 out), never less than the estimate.
+            # The tokens observed: the start reported 5,000 in and 1 out.
             assert (input_tokens, output_tokens, clean) == (5000, 1, False)
-            assert charge == max(5001, ledger.estimate)
-            assert charge is not None and charge >= ledger.estimate
 
     run(scenario)
 
@@ -340,7 +355,7 @@ def test_time_limit(entry: routes.Route) -> None:
         await clock.advance_to(LIMIT)
         await call.ended()
         assert (call.status, call.body) == (504, render_json(Cause.TIME_LIMIT, wire_format).body)
-        assert [charge for *_, charge in ledger.settled] == [ledger.estimate]
+        assert ledger.settled == [(0, 0, False, True)]
 
         # A stream that has started, then goes quiet.
         clock = Clock()
@@ -403,18 +418,18 @@ def test_an_answer_that_is_not_whole_is_an_engine_error(entry: routes.Route, ans
         call = Call(app, key, entry, stream=False)
         await call.ended()
         assert (call.status, call.body) == (502, render_json(Cause.ENGINE_ERROR, wire_format).body)
-        assert [(clean, charge) for _, _, clean, charge in ledger.settled] == [(False, ledger.estimate)]
+        assert [(clean, removed) for _, _, clean, removed in ledger.settled] == [(False, True)]
 
     run(scenario)
 
 
-def test_an_answer_that_breaks_off_is_charged_what_it_reported() -> None:
+def test_an_answer_that_breaks_off_is_settled_with_what_it_reported() -> None:
     async def scenario() -> None:
         app, key, ledger = gateway(Upstream([WHOLE_ANSWER], "fail", content_type="application/json"), Clock())
         call = Call(app, key, routes.MESSAGES, stream=False)
         await call.ended()
         assert call.status == 502
-        assert ledger.settled == [(5000, 7, False, max(5007, ledger.estimate))]
+        assert ledger.settled == [(5000, 7, False, True)]
 
     run(scenario)
 
@@ -427,7 +442,7 @@ def test_a_client_that_leaves_before_its_answer_is_settled_at_once() -> None:
         await upstream.reached.wait()
         call.leave()
         await call.ended()  # The clock never moves: only the client's leaving can end it.
-        assert [charge for *_, charge in ledger.settled] == [ledger.estimate]
+        assert ledger.settled == [(0, 0, False, True)]
         assert ledger.leases() == {}
 
     run(scenario)
@@ -578,7 +593,6 @@ def test_the_limit_is_told_after_a_write_given_up(blocked: str) -> None:
             # The clean end never reached the client: the answer did not end cleanly.
             assert call.body == MESSAGES_START + render_stream_event(Cause.TIME_LIMIT, WireFormat.MESSAGES)
         assert len(ledger.settled) == 1
-        assert ledger.settled[0][2] is False
-        assert ledger.settled[0][3] is not None and ledger.settled[0][3] >= ledger.estimate
+        assert ledger.settled[0][2:] == (False, True)
 
     run(scenario)

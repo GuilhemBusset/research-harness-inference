@@ -13,12 +13,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
 import pytest
-from starlette.types import Message
+from starlette.responses import Response
+from starlette.types import Message, Receive
 
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
@@ -26,9 +27,10 @@ from rhi_common.pool_config import parse_pools
 from rhi_common.records import MODE_RECORD, Mode, PoolState
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
+from rhi_gateway.affinity import Affinity
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import BodyFilter
+from rhi_gateway.body import BodyFilter, Forwarded
 from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.errors import WireFormat, render_json, render_stream_event
 from rhi_gateway.formats import messages, responses
@@ -212,28 +214,74 @@ class Engine:
 
 
 class Ledger(InMemoryLedger):
-    """The in-memory ledger, recording each settlement."""
+    """The in-memory ledger, recording each settlement with what the proxy observed at that end."""
 
     def __init__(self) -> None:
         super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.reservations = 0
-        self.settled: list[tuple[int, int, bool]] = []
+        # What the proxy observed at each end, noted by `Observing` before the settlement is made.
+        self.observed: list[proxy.Observed] = []
+        self.settled: list[tuple[int, int, bool] | None] = []
 
     def reserve(self, *arguments: Any, **named: Any) -> Any:
         self.reservations += 1
         return super().reserve(*arguments, **named)
 
-    def settle(
-        self, reservation: Any, *, input_tokens: int, output_tokens: int, ended_cleanly: bool, **named: Any
-    ) -> int | None:
-        self.settled.append((input_tokens, output_tokens, ended_cleanly))
-        return super().settle(
-            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly, **named
+    def settle(self, reservation: Any, **named: Any) -> bool:
+        # A settlement the proxy made follows its observation; one the gateway made itself, when a
+        # hold ended a call that was not a stream, has none: it is recorded as `None`.
+        observed = self.observed[len(self.settled)] if len(self.observed) > len(self.settled) else None
+        self.settled.append(
+            None if observed is None else (observed.input_tokens, observed.output_tokens, observed.ended_cleanly)
         )
+        return super().settle(reservation, **named)
 
     def open_leases(self) -> dict[str, Any]:
         day = self.day(STUDENT, utc_day(NOW))
         return {} if day is None else dict(day.leases)
+
+
+class Observing(proxy.Proxy):
+    """The gateway's proxy, noting in the ledger what each end of a request observed, held or not."""
+
+    def __init__(self, ledger: Ledger, *arguments: Any, **named: Any) -> None:
+        super().__init__(*arguments, **named)
+        self._ledger = ledger
+
+    def _noted(
+        self, on_end: Callable[[proxy.Observed], Awaitable[None]]
+    ) -> Callable[[proxy.Observed], Awaitable[None]]:
+        async def noted(observed: proxy.Observed) -> None:
+            self._ledger.observed.append(observed)
+            await on_end(observed)
+
+        return noted
+
+    async def forward(
+        self,
+        route: routes.Route,
+        forwarded: Forwarded,
+        on_end: Callable[[proxy.Observed], Awaitable[None]],
+        *,
+        receive: Receive | None = None,
+        token_sent: proxy.TokenSent | None = None,
+        affinity: Affinity | None = None,
+    ) -> Response:
+        noted = self._noted(on_end)
+        return await super().forward(route, forwarded, noted, receive=receive, token_sent=token_sent, affinity=affinity)
+
+    def held(
+        self,
+        route: routes.Route,
+        forwarded: Forwarded,
+        on_end: Callable[[proxy.Observed], Awaitable[None]],
+        held: proxy.HeldRequest,
+        *,
+        token_sent: proxy.TokenSent | None = None,
+        affinity: Affinity | None = None,
+    ) -> Response:
+        return super().held(route, forwarded, self._noted(on_end), held, token_sent=token_sent, affinity=affinity)
+
 
 
 class Gateway:
@@ -274,8 +322,8 @@ class Gateway:
             authenticator=Authenticator(InMemoryKeyStore(student), wall_clock=lambda: float(NOW)),
             ledger=self.ledger,
             filters=filters,
-            proxy=proxy.Proxy(
-                client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=self.clock.sleep
+            proxy=Observing(
+                self.ledger, client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=self.clock.sleep
             ),
             holding=Holding(
                 views=self.readiness.views,
@@ -457,7 +505,8 @@ def test_the_deadline_ends_cleanly(entry: routes.Route) -> None:
         assert (call.status, call.body) == (503, warming.body)
         assert call.headers["retry-after"] == str(Cause.WARMING.retry_after)
         assert gateway.engine.reached_at == []
-        assert gateway.ledger.settled == [(0, 0, False)]
+        # Settled once, by the gateway itself: nothing reached the proxy.
+        assert gateway.ledger.settled == [None]
         assert gateway.ledger.open_leases() == {}
 
     run(scenario)
@@ -575,7 +624,8 @@ def test_a_client_that_leaves_during_the_hold_is_settled_once(stream: bool) -> N
         await gateway.advance_to(60)
         assert gateway.wakes == [0, 15]  # No wake once the client has gone.
         assert gateway.engine.reached_at == []
-        assert gateway.ledger.settled == [(0, 0, False)]
+        # A held stream is the proxy's, which observed nothing; a call that is not a stream, the gateway's own.
+        assert gateway.ledger.settled == [(0, 0, False) if stream else None]
         assert gateway.ledger.open_leases() == {}
 
     run(scenario)

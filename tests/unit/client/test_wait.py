@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import datetime
 import io
 import json
 import secrets
@@ -36,7 +35,6 @@ from rhi_common.records import Mode, PoolState, ScalerNote
 from rhi_common.students import StudentKey
 from rhi_gateway.app import build_app
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import Readiness
@@ -44,8 +42,6 @@ from rhi_gateway.waker import Waker
 
 ENDPOINT = "https://example.com"
 NOW = 1_800_000_000
-# The course end the ledger's rows expire by.
-COURSE_END_DATE = datetime.date(2027, 6, 30)
 INTERVAL = 7
 
 
@@ -89,7 +85,6 @@ class Gateway:
     clock: Clock = field(default_factory=Clock)
     ready_at: dict[str, float] = field(default_factory=dict)
     disabled_at: dict[str, float] = field(default_factory=dict)
-    budget: int = 2_000_000
     key: str = field(default_factory=generate_key)
 
     def __post_init__(self) -> None:
@@ -103,10 +98,9 @@ class Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=self.budget,
+            daily_token_budget=0,
             concurrency_limit=4,
         )
-        self.ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=self.time)
         self.readiness = Readiness({p.name: p.name for p in POOLS}, elbv2=self, table=self, clock=self.time)
         local = LocalRoutes(
             Authenticator(InMemoryKeyStore(self.student), wall_clock=self.time),
@@ -115,7 +109,6 @@ class Gateway:
             default_pool=POOLS[0],
             clock=self.time,
             waker=Waker(self.readiness, lambda_client=self, function_name="scaler", clock=self.time),
-            ledger=self.ledger,
         )
         self.app = build_app(local=local)
 
@@ -334,15 +327,12 @@ def test_an_unavailable_pool_stops_the_wait(
     assert [path for _, path, _ in disabled.calls] == ["/wake", "/status"]
     assert "pool_disabled" in capsys.readouterr().err
 
-    spent = Gateway(budget=1000, key=gateway.key)
-    reservation = spent.ledger.reserve(
-        spent.student, "earlier", b"{}", output_limit=0, hold_seconds=420, longest_request_seconds=1800
-    )
-    spent.ledger.settle(reservation, input_tokens=1000, output_tokens=0, ended_cleanly=True)
-    monkeypatch.setattr(login, "http_transport", spent)
-    assert main.main(["wait", "mock"]) != 0
-    assert spent.calls == [("POST", "/wake", 0)]
-    assert "budget_reached" in capsys.readouterr().err
+    # A wake the gateway refuses with an error stops it at once.
+    refused = Gateway(key=gateway.key)
+    monkeypatch.setattr(login, "http_transport", refused)
+    assert main.main(["wait", "no-such-pool"]) != 0
+    assert refused.calls == [("POST", "/wake", 0)]
+    assert "request_refused" in capsys.readouterr().err
 
 
 def test_a_wait_for_a_claude_name_follows_the_default_pool(capsys: pytest.CaptureFixture[str]) -> None:

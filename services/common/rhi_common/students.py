@@ -1,7 +1,7 @@
 """A student's key, roster entry and day of usage (system design, sections 6.2, 6.4 and 6.6).
 
 The issuer and the admin CLI write keys, the admin CLI keeps the roster, the gateway reads a key on
-every request and reserves and settles budget, and the export, erasure and retention commands read
+every request and takes and releases a concurrency slot, and the export, erasure and retention commands read
 all three. Five components write the same items, so their attributes are decided here and nowhere
 else. Nothing here calls AWS: an item converts to and from its record, and whoever holds a table
 reads and writes it. The tables and their keys are in `rhi_common.tables`.
@@ -22,7 +22,12 @@ An item is in the form boto3's table resource takes and returns, as in `rhi_comm
 `to_item` writes every number as an `int`, `from_item` also takes the `Decimal` boto3 gives back,
 a time is a whole number of seconds since the epoch, and what is not known is `None` or empty in
 the record and absent from the item, except `leases`, which is written even when empty.
-`from_item` refuses, with a `RecordError`, an item with a missing or mistyped attribute.
+`from_item` refuses, with a `RecordError`, an item with a missing or mistyped attribute, with one
+exception. There is no per-student token budget any more (ADR 0003, decisions 2 and 3), so a key's
+or a roster entry's `daily_token_budget`, a day's `tokens` and a lease's `tokens` and `estimate`
+are read as 0 when absent, for a later change to stop writing them. `to_item` and `to_map` still
+write all four: a gateway task of the release before, which shares the tables during a rollout,
+refuses an item that lacks one.
 
 `expires_at` is the attribute the table deletes an item by, and whoever writes the item sets it.
 On a key it is the course end, and the key is refused after it whatever the table has deleted.
@@ -51,6 +56,11 @@ def utc_day(at: int) -> str:
 
 def _optional_text(item: Mapping[str, object], name: str) -> str | None:
     return None if item.get(name) is None else _text(item, name)
+
+
+def _whole_or_zero(item: Mapping[str, object], name: str) -> int:
+    """A whole number of the token budget's, read as 0 when the item does not hold it."""
+    return 0 if name not in item else _whole(item, name)
 
 
 def _map[Value](
@@ -115,7 +125,7 @@ class StudentKey:
             issued_at=_whole(item, "issued_at"),
             expires_at=_whole(item, "expires_at"),
             revoked_at=_optional_time(item, "revoked_at"),
-            daily_token_budget=_whole(item, "daily_token_budget"),
+            daily_token_budget=_whole_or_zero(item, "daily_token_budget"),
             concurrency_limit=_whole(item, "concurrency_limit"),
         )
 
@@ -146,7 +156,7 @@ class RosterEntry:
         return cls(
             github_id=_whole(item, "github_id"),
             alias=_text(item, "alias"),
-            daily_token_budget=_whole(item, "daily_token_budget"),
+            daily_token_budget=_whole_or_zero(item, "daily_token_budget"),
             concurrency_limit=_whole(item, "concurrency_limit"),
             added_at=_whole(item, "added_at"),
             expires_at=_whole(item, "expires_at"),
@@ -155,7 +165,7 @@ class RosterEntry:
 
 @dataclass(frozen=True)
 class Lease:
-    """One request's concurrency slot: the tokens it reserved, the estimate of its input, its expiry."""
+    """One request's concurrency slot and its expiry; `tokens` and `estimate` are 0 but for the release before."""
 
     tokens: int
     estimate: int
@@ -168,15 +178,19 @@ class Lease:
     def from_map(cls, value: object) -> Self:
         if not isinstance(value, Mapping):
             raise RecordError("a lease is not a map")
-        return cls(tokens=_whole(value, "tokens"), estimate=_whole(value, "estimate"), expires=_whole(value, "expires"))
+        return cls(
+            tokens=_whole_or_zero(value, "tokens"),
+            estimate=_whole_or_zero(value, "estimate"),
+            expires=_whole(value, "expires"),
+        )
 
 
 @dataclass(frozen=True)
 class UsageDay:
-    """One student's day: the tokens reserved and charged, and the leases of the requests in flight.
+    """One student's day: the leases of the requests in flight, and `tokens`, which the gateway writes 0.
 
-    The budget and the concurrency slots live in one item so that one conditional write reserves
-    against both (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
+    The concurrency slots live in one item so that one conditional write takes a slot against all
+    of them (section 6.2, step 3). `leases` maps a request's ID to its lease, and a lease
     stays in the item of the day its request started. `affinity_cookies` maps a pool's name to the
     cookie the internal load balancer last set for this student, as it set it (section 5.5).
     `rebalance_applied` maps a pool's name to the last rebalance number of that pool the gateway
@@ -226,7 +240,7 @@ class UsageDay:
             github_id=_whole(item, "github_id"),
             day=_text(item, "day"),
             alias=_text(item, "alias"),
-            tokens=_whole(item, "tokens"),
+            tokens=_whole_or_zero(item, "tokens"),
             expires_at=_whole(item, "expires_at"),
             leases=_map(item, "leases", lambda leases, request: Lease.from_map(leases[request])),
             affinity_cookies=_map(item, "affinity_cookies", _text),
