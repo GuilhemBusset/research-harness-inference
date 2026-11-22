@@ -246,9 +246,16 @@ def test_deploy_status_is_the_latest_status_of_the_context():
     assert fake.deploy_status("def456", DEPLOY) is None, "another commit's statuses are not this commit's"
 
 
-def test_loop_toml_has_the_table_with_neutral_values_and_no_other_key_is_read():
+# What the committed table discharges with, never waiting: the reporter's description and the file
+# its verification leaves a test out of (`tests/unit/test_deploy_settings.py` holds them to both).
+COMMITTED_VERIFIED, GPU_RELEASE = "The verification's tests ran and passed.", "tests/smoke/deployed/test_gpu_release.py"
+
+
+def test_loop_toml_waits_for_nothing_discharges_from_verify_rhi_and_no_other_key_is_read():
     committed = L.config.load_policy(HERE.parent / "loop.toml")["deploy"]
-    assert committed == L.config.Deploy(contexts=(), timeout_s=3600, approval_description="")
+    assert committed == L.config.Deploy(contexts=(), timeout_s=3600, approval_description="",
+                                        verified_description=COMMITTED_VERIFIED, unverified_tests=(GPU_RELEASE,),
+                                        discharge_contexts=("verify/Rhi",))
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "loop.toml"
 
@@ -264,16 +271,26 @@ def test_loop_toml_has_the_table_with_neutral_values_and_no_other_key_is_read():
             read('[deploy]\ntimeout_s = "an hour"\n')
 
 
-def test_loop_toml_has_an_empty_verified_description_and_a_set_one_is_read():
+def test_loop_toml_has_the_verified_description_and_the_discharge_contexts_and_both_are_read():
     committed = tomllib.loads((HERE.parent / "loop.toml").read_text())["deploy"]
-    assert committed["verified_description"] == "", "the key is there, and the loop never fills it"
+    assert (committed["verified_description"], committed["discharge_contexts"]) == (COMMITTED_VERIFIED, ["verify/Rhi"])
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "loop.toml"
-        path.write_text(f'[deploy]\nverified_description = "{VERIFIED}"\n')
-        assert L.config.load_policy(path)["deploy"] == L.config.Deploy(verified_description=VERIFIED)
+        path.write_text(f'[deploy]\nverified_description = "{VERIFIED}"\ndischarge_contexts = ["{VERIFY}"]\n')
+        assert L.config.load_policy(path)["deploy"] == L.config.Deploy(verified_description=VERIFIED,
+                                                                        discharge_contexts=(VERIFY,))
         path.write_text("[deploy]\nverified_description = true\n")
         with pytest.raises(TypeError, match="verified_description"):
             L.config.load_policy(path)
+        for not_a_list_of_contexts in (f'"{VERIFY}"', "[1]"):
+            path.write_text(f"[deploy]\ndischarge_contexts = {not_a_list_of_contexts}\n")
+            with pytest.raises(TypeError, match="discharge_contexts"):
+                L.config.load_policy(path)
+        for another_form in (DEPLOY, "verify/", "Verify/beta", "verify/a stage", "verify/beta/x", "verify/beta:blue",
+                             "verify/" + "b" * 101, ""):   # a stage's name as CodePipeline accepts it
+            path.write_text(f'[deploy]\ndischarge_contexts = ["{VERIFY}", "{another_form}"]\n')
+            with pytest.raises(ValueError, match="discharge_contexts"):
+                L.config.load_policy(path)
 
 
 def test_the_tests_a_verification_leaves_out_are_read_from_the_table():

@@ -122,9 +122,11 @@ names = [
 # commit status per stage on each merge commit, and the engine reads them between the merge and
 # the evidence step: every context listed here must report success before the issue's evidence is
 # recorded, a failure or an error takes the broken-main path, and nothing else lands meanwhile.
-# The values below are neutral: with no context nothing is read and nothing waits. The owner sets
-# them, through a pull request of their own, once statuses appear on merge commits
-# (docs/factory/green-light.md, step 11). No other key is accepted in this table.
+# `contexts` stays empty: with no context nothing is waited for and every merge lands at once. The
+# owner sets it, through a pull request of their own, if the merge queue should wait for the
+# pipeline (docs/factory/green-light.md, step 11). The verification still proves smoke-test items,
+# after the fact and with nothing held, through `discharge_contexts`. No other key is accepted in
+# this table.
 [deploy]
 # The contexts to wait for, such as "deploy/<stage>" and later "verify/<stage>".
 contexts = []
@@ -135,22 +137,31 @@ timeout_s = 3600
 # the owner's approval. A pending status that carries it makes the issue wait with the kind
 # `owner_approval`, with no timeout, and lets other issues land meanwhile. Empty: never.
 approval_description = ""
+# The verification contexts ("verify/<stage>", and no other form) the engine reads only to
+# discharge, after the fact, and never waits for: on each run, for each delivered issue that still
+# owes an item needing aws:deployed-environment that names a test under `tests/smoke/`, it reads
+# them on the issue's merge commit, and, failing a verified success there, on the head of `main`
+# when that commit's history holds the merge commit. A success with exactly `verified_description`
+# proves the item, on the terms `unverified_tests` adds: its box is ticked, its evidence
+# recorded, and the issue closes once every box is. Nothing is held and nothing waits:
+# what is not there yet is read again by the next run. `tests/unit/test_deploy_settings.py` holds
+# each to a verification context the reporter posts. "verify/Rhi" is the stage the pipeline deploys.
+discharge_contexts = ["verify/Rhi"]
 # The description the reporter gives the success of a "verify/<stage>" status when the
 # verification's smoke tests ran and passed. A verification also succeeds without running a test
 # (no canary key, no listener, a parked system), with another description. When a configured
-# "verify/<stage>" succeeded on the merge commit with exactly this description, an item that needs
+# "verify/<stage>" succeeded with exactly this description, an item that needs
 # aws:deployed-environment and names a test under `tests/smoke/` is proven by that status and is
-# not left to the owner. Empty: never. The owner sets it with the contexts, and
-# `tests/unit/test_deploy_settings.py` holds both descriptions equal to the reporter's constants.
-verified_description = ""
+# not left to the owner. Empty: never. `tests/unit/test_deploy_settings.py` holds both
+# descriptions equal to the reporter's constants.
+verified_description = "The verification's tests ran and passed."
 # The smoke test files of which the verification leaves a test out (`scripts/pipeline/verify.py`
-# deselects the tests that must reach the internal load balancer): an item that names one of them
-# stays the owner's, whatever the verification's status says. Absent, as here: the table does not
-# say what the verification leaves out, and a verified deployment discharges nothing. The owner
-# sets it with `verified_description`, and `tests/unit/test_deploy_settings.py` then holds it
-# equal to the files of the tests the verification's own run deselects, and names them when it
-# fails. An empty list says that every smoke test is run.
-# unverified_tests = ["tests/smoke/deployed/<file>.py"]
+# deselects, in its run on the mock pool, the test that only a GPU pool passes): an item that
+# names one of them stays the owner's, whatever the verification's status says. Absent: the table
+# does not say what the verification leaves out, and a verification discharges nothing.
+# `tests/unit/test_deploy_settings.py` holds it equal to the files of the tests the verification's
+# own run deselects, and names them when it fails. An empty list says that every smoke test is run.
+unverified_tests = ["tests/smoke/deployed/test_gpu_release.py"]
 
 # The sandbox every agent call and every check command runs in (ADR 0001, decision 3;
 # docs/factory/isolation.md). The root filesystem is read-only, `/tmp` and the home directory
