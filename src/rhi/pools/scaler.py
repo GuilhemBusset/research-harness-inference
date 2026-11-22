@@ -74,7 +74,7 @@ SCHEDULE = events.Schedule.rate(cdk.Duration.minutes(1))
 MAX_EVENT_AGE = cdk.Duration.minutes(1)
 
 LOG_GROUP_NAME = "/rhi/scaler"
-LOG_RETENTION = logs.RetentionDays.ONE_MONTH
+LOG_RETENTION = logs.RetentionDays.THREE_MONTHS  # Section 6.6 (`rhi.retention`).
 
 SETTINGS_VARIABLE = "RHI_SCALER_SETTINGS"
 # The workspace's endpoint ends with a slash.

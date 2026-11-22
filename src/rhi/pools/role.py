@@ -71,7 +71,7 @@ LIFECYCLE_ACTIONS = ("autoscaling:CompleteLifecycleAction", "autoscaling:RecordL
 WEIGHTS_READ_ACTION = "s3:GetObject"
 WEIGHTS_LIST_ACTION = "s3:ListBucket"
 
-LOG_RETENTION = logs.RetentionDays.ONE_MONTH
+LOG_RETENTION = logs.RetentionDays.THREE_MONTHS  # Section 6.6 (`rhi.retention`).
 
 # The IAM path of every GPU pool's instance role, and of no other role.
 GPU_ROLE_PATH = "/rhi/gpu-pools/"
