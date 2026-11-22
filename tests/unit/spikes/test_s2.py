@@ -39,7 +39,20 @@ if TYPE_CHECKING:
 Client, Kind = s2.Client, s2.Kind
 RECORD = Path(__file__).resolve().parents[3] / "docs" / "measurements" / "s2.md"
 MARKER = "rhi-s2-aaaaaaaa"
-VERSIONS = {"claude_code": "2.1.323", "codex": "0.169.0", "openai_sdk": "3.57.0", "anthropic_sdk": "2.11.0"}
+VERSIONS = {
+    "claude_code": "2.1.323",
+    "codex": "0.169.0",
+    "opencode": "1.19.5",
+    "pi": "1.5.2",
+    "openai_sdk": "3.57.0",
+    "anthropic_sdk": "2.11.0",
+}
+PACKAGES = {
+    "claude_code": ("@anthropic-ai/claude-code", "claude"),
+    "codex": ("@openai/codex", "codex"),
+    "opencode": ("opencode-ai", "opencode"),
+    "pi": ("@earendil-works/pi-coding-agent", "pi"),
+}
 
 
 def holds(gave_up: set[tuple[s2.Client, s2.Kind]]) -> list[s2.HoldOutcome]:
@@ -116,13 +129,15 @@ def test_the_record_still_reads_once_a_run_is_written_into_it() -> None:
 
 
 def test_the_harnesses_are_pinned(tmp_path: Path) -> None:
+    assert len(harnesses.HARNESSES) == 4
     for harness in harnesses.HARNESSES:
         assert harnesses.is_exact(harness.version), harness
-    assert {harness.package for harness in harnesses.HARNESSES} == {"@anthropic-ai/claude-code", "@openai/codex"}
-    for written in ("^2.1.323", "~2.1.323", ">=2.1.0", "2.1.x", "2.x", "*", "latest", "next", "2.1", "v2.1.323", ""):
-        assert not harnesses.is_exact(written), written
-        with pytest.raises(ValueError, match="exact version"):
-            harnesses.Harness("claude_code", "@anthropic-ai/claude-code", written, "claude")
+    assert {harness.name: (harness.package, harness.command) for harness in harnesses.HARNESSES} == PACKAGES
+    for name, (package, command) in PACKAGES.items():
+        for written in ("^1.5.2", "~1.5.2", ">=1.5.0", "1.5.x", "1.x", "*", "latest", "next", "1.5", "v1.5.2", ""):
+            assert not harnesses.is_exact(written), written
+            with pytest.raises(ValueError, match="exact version"):
+                harnesses.Harness(name, package, written, command)
     assert harnesses.is_exact("0.170.0-alpha.4")
 
     # The job installs exactly the pins, and reports each harness's and each SDK's version.
@@ -130,16 +145,19 @@ def test_the_harnesses_are_pinned(tmp_path: Path) -> None:
 
     def run(argv: Any) -> str:
         ran.append(list(argv))
-        return {"claude": "2.1.323 (Claude Code)\n", "codex": "codex-cli 0.169.0\n"}.get(Path(argv[0]).name, "")
+        printed = {"claude": "2.1.323 (Claude Code)\n", "codex": "codex-cli 0.169.0\n", "opencode": "1.19.5\n"}
+        return (printed | {"pi": "1.5.2\n"}).get(Path(argv[0]).name, "")
 
     binaries = harnesses.install(tmp_path, run)
     assert ran == [harnesses.install_command(tmp_path)]
     assert ran[0][:2] == ["npm", "install"]
-    assert ran[0][-2:] == ["@anthropic-ai/claude-code@2.1.323", "@openai/codex@0.169.0"]
-    assert binaries == {
-        "claude_code": tmp_path / "node_modules/.bin/claude",
-        "codex": tmp_path / "node_modules/.bin/codex",
-    }
+    assert ran[0][-4:] == [
+        "@anthropic-ai/claude-code@2.1.323",
+        "@openai/codex@0.169.0",
+        "opencode-ai@1.19.5",
+        "@earendil-works/pi-coding-agent@1.5.2",
+    ]
+    assert binaries == {name: tmp_path / "node_modules/.bin" / command for name, (_, command) in PACKAGES.items()}
     assert harnesses.versions(binaries, run, {"openai": "3.57.0", "anthropic": "2.11.0"}.__getitem__) == VERSIONS
     with pytest.raises(RuntimeError, match="not its pin"):
         harnesses.versions(binaries, lambda argv: "codex-cli 0.170.0", lambda name: "1.0.0")

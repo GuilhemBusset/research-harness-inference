@@ -1,29 +1,36 @@
 """The harnesses the spikes run, at pinned versions (system design, sections 12, 13 and 17).
 
 The student guide names the harness versions the endpoint was tried with (section 13), so a spike
-that runs a harness runs a pinned one and says which. This module holds the pins of the two
-harnesses, each one's npm package at one exact version, and installs them into the job: spike S2
-(`spikes/s2_client_hold.py`) runs them, and spike S3 runs the same versions from here.
+that runs a harness runs a pinned one and says which. This module holds the pins of the four
+harnesses installed from npm, each one's npm package at one exact version, and installs them into
+the job: spike S2 (`spikes/s2_client_hold.py`) runs Claude Code and Codex, and spike S3 runs all
+four at the versions from here.
 
 **The pins.** Each is the newest release of its package that had been published for at least 7
-days when the pin was chosen, the cooling-off section 17 asks before an update is adopted. Read
-from the npm registry's publication times on 2026-11-20:
+days when the pin was chosen, the cooling-off section 17 asks before an update is adopted, read
+from the npm registry's publication times on the day given:
 
-| Harness | Package | Version | Published (UTC) |
-| --- | --- | --- | --- |
-| Claude Code | `@anthropic-ai/claude-code` | 2.1.323 | 2026-11-12 |
-| Codex | `@openai/codex` | 0.169.0 | 2026-11-13 |
+| Harness | Package | Version | Published (UTC) | Read on |
+| --- | --- | --- | --- | --- |
+| Claude Code | `@anthropic-ai/claude-code` | 2.1.323 | 2026-11-12 | 2026-11-20 |
+| Codex | `@openai/codex` | 0.169.0 | 2026-11-13 | 2026-11-20 |
+| OpenCode | `opencode-ai` | 1.19.5 | 2026-10-28 | 2026-11-22 |
+| Pi | `@earendil-works/pi-coding-agent` | 1.5.2 | 2026-11-10 | 2026-11-22 |
+
+OpenCode's pin skips the `0.0.0-dev-…` snapshots its project publishes between releases: they are
+builds of a branch, not releases.
 
 A pin is an exact version, `MAJOR.MINOR.PATCH` with an optional pre-release, never a range (`^`,
 `~`, `>=`, `1.x`, `*`) or a tag (`latest`, `next`): `Harness` refuses any other. A bump is a change
 of this table and of the constants below, together.
 
-**Installing.** `install` runs `npm install` of the two pinned packages into a folder of the job,
-with no lock file of its own and no saved manifest. Both packages ship their binary as an optional
-dependency for each platform, which npm picks. Codex launches it from its own script; Claude Code's
-command is a placeholder until the package's install script copies the native binary over it, so
-the install runs the packages' install scripts: without them `claude` cannot start. The harnesses
-are then the folder's `node_modules/.bin/claude` and `node_modules/.bin/codex`.
+**Installing.** `install` runs `npm install` of the four pinned packages into a folder of the job,
+with no lock file of its own and no saved manifest. Claude Code, Codex and OpenCode ship their
+binary as an optional dependency for each platform, which npm picks. Codex launches it from its own
+script; the commands of Claude Code and OpenCode are placeholders until the package's install script
+puts the native binary in place, so the install runs the packages' install scripts: without them
+`claude` and `opencode` cannot start. Pi is a Node program. The harnesses are then the folder's
+`node_modules/.bin/claude`, `codex`, `opencode` and `pi`.
 
 **Reporting.** `versions` gives the version of each harness, as the installed binary prints it with
 `--version`, and of each SDK the SDK scripts call, the OpenAI and Anthropic SDKs of the group
@@ -85,7 +92,9 @@ class Harness:
 
 CLAUDE_CODE = Harness("claude_code", "@anthropic-ai/claude-code", "2.1.323", "claude")
 CODEX = Harness("codex", "@openai/codex", "0.169.0", "codex")
-HARNESSES = (CLAUDE_CODE, CODEX)
+OPENCODE = Harness("opencode", "opencode-ai", "1.19.5", "opencode")
+PI = Harness("pi", "@earendil-works/pi-coding-agent", "1.5.2", "pi")
+HARNESSES = (CLAUDE_CODE, CODEX, OPENCODE, PI)
 
 
 def run_command(argv: Sequence[str]) -> str:
