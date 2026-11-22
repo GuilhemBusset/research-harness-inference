@@ -148,6 +148,7 @@ def example_settings() -> Settings:
         "RHI_TARGET_GROUPS": json.dumps({name: target_group(name) for name in names}),
         "RHI_POOL_SECRETS": json.dumps(arns),
         "RHI_SCALER_FUNCTION": "scaler-of-the-test",
+        "RHI_COURSE_END": "2027-01-15",
         **{variable: name for variable, (_, name) in TABLES.items()},
     }
     return read_settings(environ)

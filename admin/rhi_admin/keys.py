@@ -3,7 +3,8 @@
 GitHub confirms at most 50 device codes an hour per app, so an admin command that issues a key
 without a login is the fallback. The key is the same item a login stores (`rhi_common.students`):
 its SHA-256 and no clear key, the roster entry's alias, budget and limit, no installation, and the
-course end as its expiry. The key is written only while the entry it was read from is still on the
+course end as its expiry, which `rhi_issuer.mint.expiry` holds to the course end plus 90 days, as
+for every key item. The key is written only while the entry it was read from is still on the
 roster, so an erase, or a removal followed by a new entry, that runs between the read of the entry
 and the write leaves no key. `issue` returns the key, which the command line prints once; it is in
 no table and no log. `revoke` revokes every key of a student, as `rhi revoke --all` does, whether

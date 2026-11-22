@@ -507,7 +507,7 @@ the configuration of step 4.
 the commands and offers the last two. The roster is never written to the repository.
 
 ```sh
-admin=(env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main)
+admin=(env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main)
 "${admin[@]}" roster add <github-id> <alias>          # 100 million tokens a day and 4 requests; or --budget N --limit N
 "${admin[@]}" canary                                   # once, before the pipeline's verification is merged
 "${admin[@]}" roster list

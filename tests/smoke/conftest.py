@@ -247,6 +247,7 @@ def _gateway_environment(pool: str) -> dict[str, str]:
         "RHI_TARGET_GROUPS": json.dumps({pool: target_group}),
         "RHI_POOL_SECRETS": json.dumps({pool: secret["ARN"]}),
         "RHI_SCALER_FUNCTION": "smoke-scaler",
+        "RHI_COURSE_END": "2027-01-15",
         "RHI_KEEPALIVE_SECONDS": str(KEEPALIVE_SECONDS),
         **{variable: name for variable, (_, name) in _TABLES.items()},
     }

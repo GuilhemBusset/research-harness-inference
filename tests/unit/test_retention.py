@@ -1,0 +1,239 @@
+"""Every row of personal data expires by the course end plus 90 days (system design, section 6.6).
+
+The usage rows and the roster rows expire then; a key row, whose validity ends at the course end
+(section 6.4), expires no later. Each writer is run against tables that moto holds. The admin CLI
+is run as a real run is, with the course end read from a configuration that moto's SSM holds. A
+key a test needs is generated when it runs.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime
+import io
+import secrets
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+import boto3
+import pytest
+from moto import mock_aws
+
+from rhi import config
+from rhi_admin import main
+from rhi_admin import roster as admin_roster
+from rhi_common import retention
+from rhi_common.keys import generate_key, key_hash
+from rhi_common.students import RosterEntry, StudentKey
+from rhi_common.tables import KEYS, ROSTER, USAGE, Table
+from rhi_gateway.budget import DynamoDBLedger, InMemoryLedger, Ledger, Reservation
+from rhi_issuer import rules
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+COURSE_END = datetime.date(2027, 1, 15)
+# 15 April 2027, the course end plus 90 days, as DynamoDB's expiry reads it.
+EXPIRY = int(datetime.datetime(2027, 4, 15, tzinfo=datetime.UTC).timestamp())
+NOW = int(datetime.datetime(2026, 11, 15, 12, tzinfo=datetime.UTC).timestamp())
+DAY = "2026-11-15"
+GITHUB_ID = 7
+
+
+def test_a_personal_row_of_a_course_that_ends_on_15_january_2027_expires_on_15_april_2027() -> None:
+    assert retention.expires_at(COURSE_END) == EXPIRY
+
+
+def _create(dynamodb: Any, table: Table) -> Any:
+    keyed = {table.partition_key, table.sort_key} | {
+        key for index in table.indexes for key in (index.partition_key, index.sort_key)
+    }
+
+    def schema(*keys: Any) -> list[dict[str, str]]:
+        present = [key for key in keys if key is not None]
+        return [{"AttributeName": key.name, "KeyType": kind} for key, kind in zip(present, ("HASH", "RANGE"))]
+
+    indexes = [
+        {"IndexName": i.name, "KeySchema": schema(i.partition_key, i.sort_key), "Projection": {"ProjectionType": "ALL"}}
+        for i in table.indexes
+    ]
+    return dynamodb.create_table(
+        TableName=f"{table.name}-{secrets.token_hex(4)}",
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": k.name, "AttributeType": k.type.value} for k in keyed if k is not None],
+        KeySchema=schema(table.partition_key, table.sort_key),
+        **({"GlobalSecondaryIndexes": indexes} if indexes else {}),
+    )
+
+
+class _Stacks:
+    """CloudFormation as the admin CLI reads it: each table's name, by its logical ID."""
+
+    def __init__(self, names: dict[str, str]) -> None:
+        self.names = names
+
+    def describe_stack_resource(self, *, StackName: str, LogicalResourceId: str) -> dict[str, Any]:
+        return {"StackResourceDetail": {"PhysicalResourceId": self.names[LogicalResourceId]}}
+
+
+class _Session:
+    """The admin's session: moto for everything, but CloudFormation."""
+
+    def __init__(self, stacks: _Stacks) -> None:
+        self.real, self.stacks = boto3.session.Session(), stacks
+
+    def client(self, name: str) -> Any:
+        return self.stacks if name == "cloudformation" else self.real.client(name)
+
+    def resource(self, name: str) -> Any:
+        return self.real.resource(name)
+
+
+@pytest.fixture
+def aws(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    with mock_aws():
+        dynamodb = boto3.resource("dynamodb")
+        usage, roster, keys = (_create(dynamodb, table) for table in (USAGE, ROSTER, KEYS))
+        # The owner's configuration, whose course end is 15 January 2027.
+        example = config.load({"RHI_CONFIG": "example"})
+        config.write_ssm(dataclasses.replace(example, course_end=COURSE_END), boto3.client("ssm"))
+        stacks = _Stacks({main.ROSTER_LOGICAL_ID: roster.name, main.KEYS_LOGICAL_ID: keys.name})
+        yield SimpleNamespace(usage=usage, roster=roster, keys=keys, admin=main.connect(_Session(stacks)))
+
+
+def _student() -> StudentKey:
+    return StudentKey(
+        key_hash=key_hash(generate_key()),
+        github_id=GITHUB_ID,
+        alias="otter",
+        installation=None,
+        issued_at=NOW - 86_400,
+        expires_at=NOW + 30 * 86_400,
+        revoked_at=None,
+        daily_token_budget=1_000_000,
+        concurrency_limit=4,
+    )
+
+
+def _reserve(ledger: Ledger, request: str) -> Reservation:
+    return ledger.reserve(
+        _student(), request, b"x" * 400, output_limit=100, hold_seconds=420, longest_request_seconds=1800, pool="mock"
+    )
+
+
+def test_every_usage_row_the_in_memory_ledger_writes_expires_at_the_course_end_plus_90_days() -> None:
+    ledger = InMemoryLedger(course_end=COURSE_END, clock=lambda: float(NOW))
+    expiries = []
+    first = _reserve(ledger, "request-1")
+    expiries.append(ledger.day(GITHUB_ID, DAY))
+    second = _reserve(ledger, "request-2")
+    expiries.append(ledger.day(GITHUB_ID, DAY))
+    ledger.settle(first, input_tokens=100, output_tokens=10, ended_cleanly=True, cookie="a-cookie")
+    expiries.append(ledger.day(GITHUB_ID, DAY))
+    ledger.settle(second, input_tokens=100, output_tokens=10, ended_cleanly=True)
+    expiries.append(ledger.day(GITHUB_ID, DAY))
+
+    assert [day.expires_at if day else None for day in expiries] == [EXPIRY] * 4
+
+
+def test_every_usage_row_the_dynamodb_ledger_writes_expires_at_the_course_end_plus_90_days(
+    aws: SimpleNamespace,
+) -> None:
+    ledger = DynamoDBLedger(boto3.client("dynamodb"), aws.usage.name, course_end=COURSE_END, clock=lambda: float(NOW))
+    key = {"github_id": GITHUB_ID, "day": DAY}
+
+    def stored() -> int:
+        return int(aws.usage.get_item(Key=key, ConsistentRead=True)["Item"]["expires_at"])
+
+    def written_before(expires_at: int) -> None:
+        """The row as an earlier rule left it: the key's course end plus 91 days."""
+        aws.usage.update_item(
+            Key=key, UpdateExpression="SET expires_at = :later", ExpressionAttributeValues={":later": expires_at}
+        )
+
+    # The day's first reservation writes the row whole.
+    first = _reserve(ledger, "request-1")
+    assert stored() == EXPIRY
+    # Every later write of the row sets it again: a reservation, a settlement and a withdrawal.
+    written_before(EXPIRY + 86_400)
+    second = _reserve(ledger, "request-2")
+    assert stored() == EXPIRY
+    written_before(EXPIRY + 86_400)
+    ledger.settle(first, input_tokens=100, output_tokens=10, ended_cleanly=True, cookie="a-cookie")
+    assert stored() == EXPIRY
+    written_before(EXPIRY + 86_400)
+    ledger.withdraw(second)
+    assert stored() == EXPIRY
+
+
+def test_every_roster_row_the_admin_cli_writes_expires_at_the_course_end_plus_90_days(aws: SimpleNamespace) -> None:
+    # The CLI reads the course end from the configuration in SSM.
+    assert aws.admin.course_end() == COURSE_END
+
+    assert main.run(["roster", "add", str(GITHUB_ID), "otter"], aws.admin, now=NOW, out=io.StringIO()) == 0
+    entry = {ROSTER.partition_key.name: GITHUB_ID}
+    claim = {ROSTER.partition_key.name: admin_roster.held_alias_id("otter")}
+    added = [aws.roster.get_item(Key=item, ConsistentRead=True)["Item"]["expires_at"] for item in (entry, claim)]
+    assert added == [EXPIRY, EXPIRY]
+
+    # A change writes the entry, and its expiry with it.
+    aws.roster.update_item(
+        Key=entry, UpdateExpression="SET expires_at = :later", ExpressionAttributeValues={":later": EXPIRY + 86_400}
+    )
+    assert main.run(["roster", "set", str(GITHUB_ID), "--budget", "5"], aws.admin, now=NOW, out=io.StringIO()) == 0
+    changed = aws.roster.get_item(Key=entry, ConsistentRead=True)["Item"]
+    assert (changed["daily_token_budget"], changed["expires_at"]) == (5, EXPIRY)
+
+
+def test_every_key_row_the_admin_cli_writes_expires_no_later_than_the_course_end_plus_90_days(
+    aws: SimpleNamespace,
+) -> None:
+    assert main.run(["roster", "add", str(GITHUB_ID), "otter"], aws.admin, now=NOW, out=io.StringIO()) == 0
+    printed = io.StringIO()
+
+    assert main.run(["key", "issue", str(GITHUB_ID)], aws.admin, now=NOW, out=printed) == 0
+
+    item = aws.keys.get_item(Key={KEYS.partition_key.name: key_hash(printed.getvalue().strip())})["Item"]
+    assert NOW < item["expires_at"] <= EXPIRY
+
+
+def _entry() -> RosterEntry:
+    return RosterEntry(
+        github_id=GITHUB_ID,
+        alias="otter",
+        daily_token_budget=1_000_000,
+        concurrency_limit=4,
+        added_at=NOW - 86_400,
+        expires_at=EXPIRY,
+    )
+
+
+def test_every_key_row_the_issuer_writes_expires_no_later_than_the_course_end_plus_90_days(
+    aws: SimpleNamespace,
+) -> None:
+    first = rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW, keys=aws.keys)
+    second = rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW + 60, keys=aws.keys)
+
+    # The first key is revoked by the second, in the write that stores it: both rows are there.
+    items = [aws.keys.get_item(Key={KEYS.partition_key.name: key_hash(m.key)})["Item"] for m in (first, second)]
+    assert ["revoked_at" in item for item in items] == [True, False]
+    assert all(NOW < item["expires_at"] <= EXPIRY for item in items)
+
+
+def test_the_lock_a_stopped_login_leaves_in_the_keys_table_expires_no_later_than_the_course_end_plus_90_days(
+    aws: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def stops(*_arguments: object, **_keywords: object) -> None:
+        raise RuntimeError("the function stopped")
+
+    # The function stops after it took the student's lock and before the write that deletes it.
+    monkeypatch.setattr(rules, "mint", stops)
+    with pytest.raises(RuntimeError):
+        rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW, keys=aws.keys)
+
+    lock = aws.keys.get_item(Key=rules.lock_key(GITHUB_ID), ConsistentRead=True)["Item"]
+    assert NOW < lock["expires_at"] <= EXPIRY

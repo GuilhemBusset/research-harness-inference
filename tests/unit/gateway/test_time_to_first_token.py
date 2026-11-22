@@ -10,6 +10,7 @@ student is made when the tests run.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import secrets
 from collections.abc import AsyncIterator
@@ -38,6 +39,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 POOL = "coursework"
 POOLS = parse_pools(
     {
@@ -166,7 +169,7 @@ def gateway(*students: tuple[str, int]) -> Gateway:
         )
         for alias, github_id in students
     ]
-    ledger = InMemoryLedger(clock=lambda: float(NOW))
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     made = Gateway(Starlette(), metrics.Metrics(ledger), keys)
 
     async def engine(request: httpx.Request) -> httpx.Response:

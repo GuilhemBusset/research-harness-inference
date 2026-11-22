@@ -45,6 +45,7 @@ or AWS.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import itertools
 import json
 import random
@@ -96,6 +97,8 @@ STREAM_TYPE = "text/event-stream"
 # The student of every replay, and the moment the gateway's clocks stand at. Both are invented.
 STUDENT = 1
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 # No replay may wait this long, in seconds: one that does has hung, and fails.
 GUARD_SECONDS = 30.0
 
@@ -333,7 +336,7 @@ class _Ledger(InMemoryLedger):
     """The gateway's in-memory ledger, noting each reservation and each settlement it is asked for."""
 
     def __init__(self) -> None:
-        super().__init__(clock=lambda: float(NOW))
+        super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.reserved: list[Reservation] = []
         self.settled: list[Settled] = []
 

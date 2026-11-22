@@ -47,16 +47,16 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from rhi_common import retention
 from rhi_common.students import RosterEntry
 from rhi_common.tables import BY_ALIAS, BY_STUDENT, EXPIRES_AT, KEYS, ROSTER
-from rhi_issuer.mint import expiry
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key
 
 DEFAULT_DAILY_TOKEN_BUDGET = 100_000_000
 DEFAULT_CONCURRENCY_LIMIT = 4
 # Every store is kept until the course end plus 90 days (section 6.6); a key stops at the course end.
-RETENTION_DAYS = 90
+RETENTION_DAYS = retention.RETENTION_DAYS
 # How long an alias taken off the roster is held back from any other entry: the retention of what
 # was written under it, and a day for the requests still running.
 ALIAS_HELD_DAYS = RETENTION_DAYS + 1
@@ -214,7 +214,7 @@ def add(
         daily_token_budget=DEFAULT_DAILY_TOKEN_BUDGET if daily_token_budget is None else daily_token_budget,
         concurrency_limit=DEFAULT_CONCURRENCY_LIMIT if concurrency_limit is None else concurrency_limit,
         added_at=now,
-        expires_at=expiry(course_end) + RETENTION_DAYS * 86400,
+        expires_at=retention.expires_at(course_end),
     )
     absent = {"ConditionExpression": "attribute_not_exists(#id)", "ExpressionAttributeNames": {"#id": ROSTER.partition_key.name}}
     # The alias's own item, which the alias's hold replaces (`hold_alias`); it goes with the entry.
@@ -287,6 +287,7 @@ def change(
     *,
     roster: Any,
     keys: Any,
+    course_end: datetime.date,
     now: int,
     daily_token_budget: int | None = None,
     concurrency_limit: int | None = None,
@@ -294,7 +295,8 @@ def change(
     """Writes a new budget, limit or both to the entry and to each active key item; how many keys it changed.
 
     A key revoked in the meantime is left as it is: the write to a key is conditional on it not
-    being revoked.
+    being revoked. The write to the entry also sets its expiry, the course end plus 90 days, as
+    every write of an entry does (`add`).
     """
     _check_numbers(daily_token_budget, concurrency_limit)
     values = {
@@ -310,10 +312,10 @@ def change(
     try:
         roster.update_item(
             Key={ROSTER.partition_key.name: github_id},
-            UpdateExpression=f"SET {assignments}",
+            UpdateExpression=f"SET {assignments}, #expires = :expires",
             ConditionExpression="attribute_exists(#id)",
-            ExpressionAttributeNames={**names, "#id": ROSTER.partition_key.name},
-            ExpressionAttributeValues=numbers,
+            ExpressionAttributeNames={**names, "#id": ROSTER.partition_key.name, "#expires": EXPIRES_AT},
+            ExpressionAttributeValues={**numbers, ":expires": retention.expires_at(course_end)},
         )
     except ClientError as error:
         if _failed_condition(error):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime
 import io
 import json
 import secrets
@@ -43,6 +44,8 @@ from rhi_gateway.waker import Waker
 
 ENDPOINT = "https://example.com"
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 INTERVAL = 7
 
 
@@ -103,7 +106,7 @@ class Gateway:
             daily_token_budget=self.budget,
             concurrency_limit=4,
         )
-        self.ledger = InMemoryLedger(clock=self.time)
+        self.ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=self.time)
         self.readiness = Readiness({p.name: p.name for p in POOLS}, elbv2=self, table=self, clock=self.time)
         local = LocalRoutes(
             Authenticator(InMemoryKeyStore(self.student), wall_clock=self.time),

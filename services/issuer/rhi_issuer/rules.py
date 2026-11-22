@@ -25,8 +25,10 @@ cancelled login reads the keys again, following `successor` with consistent read
 the rules to what it now finds. A student with no key from a login has no latest key to name:
 the first issuance holds a short lock instead, an item under `lock#` and the student's GitHub ID,
 taken before the keys are read again and deleted in the write that stores the key. A lock older
-than `LOCK_SECONDS` is taken over. A login that loses this race `ATTEMPTS` times is refused with
-`Refusal.LOGIN_CONFLICT`.
+than `LOCK_SECONDS` is taken over. Its key holds the student's GitHub ID, so a lock that a login
+left behind expires like every personal row: `LOCK_SECONDS` after it was taken, and never later
+than the course end plus 90 days (`rhi_common.retention`). A login that loses this race
+`ATTEMPTS` times is refused with `Refusal.LOGIN_CONFLICT`.
 
 The index by student is updated after the table, so it may not show yet a key stored a moment
 before, or show only some of the student's keys. The rules do not rest on it alone:
@@ -52,9 +54,10 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from rhi_common import retention
 from rhi_common.records import RecordError
 from rhi_common.students import RosterEntry, StudentKey
-from rhi_common.tables import BY_STUDENT, KEYS
+from rhi_common.tables import BY_STUDENT, EXPIRES_AT, KEYS
 from rhi_issuer.mint import Minted, mint
 from rhi_issuer.redeem import Refusal, Refused
 
@@ -214,12 +217,16 @@ def lock_key(github_id: int) -> dict[str, str]:
     return {KEYS.partition_key.name: f"{_LOCK_PREFIX}{github_id}"}
 
 
-def _take_lock(github_id: int, now: int, keys: Any) -> str | None:
-    """Takes the student's lock, unless another login holds it; the holder's token, or `None`."""
+def _take_lock(github_id: int, now: int, keys: Any, course_end: datetime.date) -> str | None:
+    """Takes the student's lock, unless another login holds it; the holder's token, or `None`.
+
+    The lock expires once it may be taken over, and never after the course end plus 90 days.
+    """
     holder = secrets.token_hex(16)
+    expires = min(now + LOCK_SECONDS, retention.expires_at(course_end))
     try:
         keys.put_item(
-            Item={**lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder},
+            Item={**lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder, EXPIRES_AT: expires},
             ConditionExpression="attribute_not_exists(#hash) OR #locked < :stale",
             ExpressionAttributeNames={"#hash": KEYS.partition_key.name, "#locked": _LOCKED_AT},
             ExpressionAttributeValues={":stale": now - LOCK_SECONDS},
@@ -383,7 +390,7 @@ def issue(
             found = _scanned_keys(entry.github_id, keys)
             latest = _latest(found, keys, consistent=consistent)
         if latest is None:
-            holder = _take_lock(entry.github_id, now, keys)
+            holder = _take_lock(entry.github_id, now, keys, course_end)
             if holder is None:
                 continue
             # What another login stored before the lock was taken.
