@@ -91,6 +91,11 @@ target_stream_median_tokens_per_second = 15
 target_stream_p10_tokens_per_second = 10
 cached_share_flag_percent = 85
 
+# The days the pipeline's log group keeps its state changes, which the deployments dashboard reads
+# (system design, sections 6.6 and 7.2). A period CloudWatch Logs takes (1, 3, 5, 7, 14, 30, 60,
+# 90, 120, 150, 180, 365 and longer ones). Left out, it is 90, the period of the stage's log groups.
+pipeline_events_retention_days = 90
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They
 # are in the order of their names, which is the order the configuration in SSM is read in.

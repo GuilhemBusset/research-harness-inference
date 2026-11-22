@@ -38,6 +38,10 @@ measurement bus and a rule on it that invokes the same function, through which a
 canary's job hands its numbers to the reporter as events (sections 8.4 and 12). It adds no step to
 the pipeline.
 
+Beside the pipeline as well, the log group of `rhi.pipeline.events`, which keeps the pipeline's state
+changes for the deployments dashboard, with the rule that sends them there and the log group's
+resource policy (section 7.2). It adds no function and no role.
+
 Beside the pipeline too, the spike jobs of `rhi.pipeline.spikes`, one CodeBuild project for each
 entry of its list, which the owner starts on a commit of `main` and nothing else starts (sections
 8.4 and 12); the weekly GPU canary of `rhi.pipeline.canary`, a job that runs the coursework pool's
@@ -70,6 +74,7 @@ from aws_cdk import aws_lambda as lambda_
 from aws_cdk import pipelines
 
 from rhi.pipeline.canary import GpuCanary
+from rhi.pipeline.events import PipelineEvents
 from rhi.pipeline.image_promotion import ImagePromotion
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
@@ -205,6 +210,10 @@ class PipelineStack(cdk.Stack):
             stage=stage,
             # ty reads the CDK's generated topic as unlike its protocol: jsii passes a renamed parameter by position.
             topic=self.owner_topic.topic,  # ty: ignore[invalid-argument-type]
+        )
+        # The same state changes, kept in a log group that Grafana reads by its name.
+        self.events = PipelineEvents(
+            self, "Events", config=config, pipeline=underlying  # ty: ignore[invalid-argument-type] - as above
         )
         # Started by the owner, by hand: it writes a pool's image parameter, then starts the pipeline.
         self.image_promotion = ImagePromotion(self, "ImagePromotion", config=config, pipeline=underlying)
