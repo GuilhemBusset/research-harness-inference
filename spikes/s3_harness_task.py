@@ -17,7 +17,20 @@ script of this module (`sdk_script`), with the OpenAI SDK of the group `spikes`:
 - Codex with the profile `rhi` that `rhi login` writes, with no sandbox of its own (the job's
   machine is a throwaway build's, and Codex's sandbox needs what a build's container may not have);
 - the SDK script: a loop of Chat Completions calls with four tools (list, read and write a file of
-  the folder, run a Python file of it), until the model answers without a tool call.
+  the folder, run a Python file of it), until the model answers without a tool call;
+- OpenCode, run once with `opencode run`, its tools approved without asking (`--auto`), with a
+  provider of its own on the endpoint's Chat Completions route (`@ai-sdk/openai-compatible`), given
+  by a configuration file the job writes in a folder of its own (`OPENCODE_CONFIG`), with updates
+  off;
+- Pi, run once with `pi --print`, with no network of its own beyond the endpoint (`--offline`, so no
+  update or catalog check) and no session kept, with a provider of its own on the endpoint's Chat
+  Completions route (`openai-completions`), given by the `models.json` the job writes in an agent
+  folder of its own (`PI_CODING_AGENT_DIR`).
+
+Neither OpenCode nor Pi is set up by `rhi login` (section 6.1): each takes a provider entry, the
+endpoint's `/v1`, the model's name and the key. The key reaches each only through its environment,
+`KEY_VARIABLE`, which its configuration names (`{env:…}` for OpenCode, `$…` for Pi): no file of
+their homes holds it.
 
 Each runs in a home of its own, through a forwarder of its own (`s2_client_hold.Forwarder`), which
 sends every request on to the gateway with the pool's name as its model, so that every request,
@@ -48,7 +61,9 @@ keeps (`Lines`). Every line has `at`, its UTC time, and `kind`:
 its side queries and token counts left out; when it gave no result, because it was stopped, the
 turns of its main loop it printed. Codex and the SDK script send no side query, so theirs are the
 requests on their inference route that carry the run's marker, the random word of the prompt, a
-request sent again with the same body (a retry) counted once.
+request sent again with the same body (a retry) counted once. OpenCode also asks its model for a
+title for the session, a request that carries the prompt and declares no tool: for OpenCode and Pi,
+a turn is a request that declares tools.
 
 **A refused request** is one the forwarder saw answered with a status other than 200, or with a
 stream that an error event ended (`s2_client_hold.refused`): the gateway answers a held stream 200
@@ -108,7 +123,8 @@ runs with none of the job's credentials, nor the variables that say where CodeBu
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
 
 The pool's engine comes from the deployed configuration (`rhi.config.read_ssm`), the region from
-CodeBuild's `AWS_REGION`. The canary students need four keys with the default budget. The build the
+CodeBuild's `AWS_REGION`. The canary students need six keys with the default budget, one for
+each harness and one for the replay. The build the
 pool serves is the owner's to set (the 8-bit, then the 4-bit build) before starting the job.
 """
 
@@ -167,6 +183,10 @@ DEFAULT_POOL = "coursework"
 PROMPT_VARIABLE = "RHI_S3_PROMPT"
 MODEL_VARIABLE = "RHI_S3_MODEL"
 SDK_FLAG = "--sdk"
+# The variable that gives OpenCode and Pi the key, which their configurations name.
+KEY_VARIABLE = "RHI_S3_API_KEY"
+# The provider the configurations of OpenCode and Pi declare.
+PROVIDER = "rhi"
 
 HERE = Path(__file__).resolve().parent
 TASK = HERE / "s3_task"
@@ -289,6 +309,8 @@ class Harness(StrEnum):
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
     SDK_SCRIPT = "sdk_script"
+    OPENCODE = "opencode"
+    PI = "pi"
 
 
 class Step(StrEnum):
@@ -304,14 +326,21 @@ ROUTE_OF = {
     Harness.CLAUDE_CODE: MESSAGES_ROUTE,
     Harness.CODEX: "/v1/responses",
     Harness.SDK_SCRIPT: "/v1/chat/completions",
+    Harness.OPENCODE: "/v1/chat/completions",
+    Harness.PI: "/v1/chat/completions",
 }
+# The harnesses whose turns are the requests that declare tools: a side request does not.
+TURNS_DECLARE_TOOLS = frozenset({Harness.OPENCODE, Harness.PI})
 # Where each harness's version is, in what `harnesses.versions` gives.
 VERSION_OF = {
     Harness.CLAUDE_CODE: harnesses.CLAUDE_CODE.name,
     Harness.CODEX: harnesses.CODEX.name,
     Harness.SDK_SCRIPT: "openai_sdk",
+    Harness.OPENCODE: harnesses.OPENCODE.name,
+    Harness.PI: harnesses.PI.name,
 }
-# The home `rhi login` writes for each harness (`s2_client_hold.write_home`).
+# The home `rhi login` writes for each harness it sets up (`s2_client_hold.write_home`); OpenCode
+# and Pi have none: the job writes their configuration (`opencode_config`, `pi_models`).
 HOME_OF = {
     Harness.CLAUDE_CODE: s2.Client.CLAUDE_CODE,
     Harness.CODEX: s2.Client.CODEX_PROFILE,
@@ -450,6 +479,49 @@ def environment_of(home: Path) -> dict[str, str]:
     }
 
 
+def opencode_config(endpoint: str, model: str) -> dict[str, Any]:
+    """OpenCode's configuration: a provider on the Chat Completions route at `endpoint`, serving
+    `model`, whose key is read from `KEY_VARIABLE`; its model for side requests the same one, and no
+    update."""
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "autoupdate": False,
+        "share": "disabled",
+        "model": f"{PROVIDER}/{model}",
+        "small_model": f"{PROVIDER}/{model}",
+        "provider": {
+            PROVIDER: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": PROVIDER,
+                "options": {"baseURL": f"{endpoint}/v1", "apiKey": f"{{env:{KEY_VARIABLE}}}"},
+                "models": {model: {"name": model}},
+            }
+        },
+    }
+
+
+def pi_models(endpoint: str, model: str) -> dict[str, Any]:
+    """Pi's `models.json`: a provider on the Chat Completions route at `endpoint`, serving `model`,
+    whose key is read from `KEY_VARIABLE`."""
+    return {
+        "providers": {
+            PROVIDER: {
+                "baseUrl": f"{endpoint}/v1",
+                "api": "openai-completions",
+                "apiKey": f"${KEY_VARIABLE}",
+                "models": [{"id": model}],
+            }
+        }
+    }
+
+
+def write_json(path: Path, value: dict[str, Any]) -> Path:
+    """Writes `value` as JSON at `path`, in a folder of its own that it makes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def command_of(
     harness: Harness,
     *,
@@ -461,7 +533,8 @@ def command_of(
     prompt: str,
     binaries: Mapping[str, Path],
 ) -> Command:
-    """The command that gives `prompt` to `harness` in `folder`, through the forwarder at `endpoint`."""
+    """The command that gives `prompt` to `harness` in `folder`, through the forwarder at `endpoint`.
+    For OpenCode and Pi, it writes their configuration under `home`, each in a folder of its own."""
     environment = environment_of(home)
     if harness is Harness.CLAUDE_CODE:
         environment |= {"CLAUDE_CONFIG_DIR": str(home / ".claude"), "DISABLE_AUTOUPDATER": "1"}
@@ -485,6 +558,31 @@ def command_of(
             "--skip-git-repo-check",
             "--sandbox",
             "danger-full-access",
+            prompt,
+        ]
+    elif harness is Harness.OPENCODE:
+        config_file = write_json(home / "opencode" / "opencode.json", opencode_config(endpoint, model))
+        environment |= {"OPENCODE_CONFIG": str(config_file), KEY_VARIABLE: key}
+        argv = [
+            str(binaries[harnesses.OPENCODE.name]),
+            "run",
+            "--model",
+            f"{PROVIDER}/{model}",
+            "--auto",
+            prompt,
+        ]
+    elif harness is Harness.PI:
+        agent = write_json(home / "pi" / "models.json", pi_models(endpoint, model)).parent
+        environment |= {"PI_CODING_AGENT_DIR": str(agent), KEY_VARIABLE: key}
+        argv = [
+            str(binaries[harnesses.PI.name]),
+            "--print",
+            "--offline",
+            "--no-session",
+            "--provider",
+            PROVIDER,
+            "--model",
+            model,
             prompt,
         ]
     else:
@@ -563,18 +661,21 @@ def turns_of(session: Session, marker: str) -> int | None:
     """The turns the harness took: Claude Code's own count of its main loop's turns, or, when it
     gave no result (it was stopped), the turns of its main loop it printed whole; for the others,
     their requests on their inference route that carry the run's marker, a request sent again
-    (a retry) counted once."""
+    (a retry) counted once; for OpenCode and Pi, only those that declare tools."""
     if session.harness is Harness.CLAUDE_CODE:
         turns = session.result().get("num_turns")
         if isinstance(turns, int) and not isinstance(turns, bool):
             return turns
         return main_turns(session)
-    route = ROUTE_OF[session.harness]
+    route, tools = ROUTE_OF[session.harness], session.harness in TURNS_DECLARE_TOOLS
     return len(
         {
             _same(one.json(), one.body)
             for one in session.exchanges
-            if one.method == "POST" and one.route == route and carries(one, marker)
+            if one.method == "POST"
+            and one.route == route
+            and carries(one, marker)
+            and (not tools or bool((one.json() or {}).get("tools")))
         }
     )
 
@@ -984,7 +1085,8 @@ class Job:
         home = Path(tempfile.mkdtemp(prefix=f"{harness}-{step}-", dir=self.work))
         key = self.key_of(harness)
         with s2.Forwarder(self.endpoint, self.pool, self.wall) as forwarder:
-            s2.write_home(home, HOME_OF[harness], forwarder.url, self.pool, key)
+            if harness in HOME_OF:
+                s2.write_home(home, HOME_OF[harness], forwarder.url, self.pool, key)
             command = command_of(
                 harness,
                 home=home,
@@ -1141,7 +1243,7 @@ class Job:
         self.lines.write(Line.VERSIONS, versions=dict(self.versions))
         self.ready()
         claude = self._step("task_claude_code", lambda: self.task(Harness.CLAUDE_CODE))
-        for harness in (Harness.CODEX, Harness.SDK_SCRIPT):
+        for harness in (Harness.CODEX, Harness.SDK_SCRIPT, Harness.OPENCODE, Harness.PI):
             self._step(f"task_{harness}", lambda harness=harness: self.task(harness))
         self._step("image", lambda: self.image_step(self.work / f"task-{Harness.CLAUDE_CODE}"))
         self._step("compaction", self.compaction)
