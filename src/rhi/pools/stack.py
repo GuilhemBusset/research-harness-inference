@@ -89,6 +89,12 @@ class PoolsStack(cdk.Stack):
         # stack imports them through exports, the CDK's default, stated here. Network cannot drop an
         # export while this stack imports it.
         cdk.CrossStackReferences.of(self).consume(cdk.ReferenceStrength.STRONG)
+        # The internal load balancer's access logs go to the network stack's bucket, whose policy
+        # must let Elastic Load Balancing write before the load balancer's attributes are set: this
+        # stack deploys after the network stack, whatever it imports from it.
+        self.add_stack_dependency(
+            network, "The internal load balancer logs to a bucket whose policy is in the network stack."
+        )
         self.tables = PoolTables(self, "Tables")
         # The heartbeat table's name, which the deployment generates, for the pipeline's verification.
         self.heartbeats_table_output = cdk.CfnOutput(
@@ -106,6 +112,7 @@ class PoolsStack(cdk.Stack):
             "Routing",
             vpc=network.vpc,
             security_group=network.security_groups.internal_load_balancer,
+            access_logs_bucket=network.access_logs.bucket,
             pools=config.pools,
         )
         # One instance role per pool, with its log group, by the pool's name. A GPU pool's role is

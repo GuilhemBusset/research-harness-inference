@@ -72,6 +72,7 @@ def test_each_pool_gets_its_own_duration(app_module: ModuleType) -> None:
         "Routing",
         vpc=vpc,
         security_group=ec2.SecurityGroup(stack, "Internal", vpc=vpc),
+        access_logs_bucket=cdk.aws_s3.Bucket(stack, "AccessLogs"),
         pools=(MOCK, dataclasses.replace(MOCK, name="short", stickiness_seconds=600)),
     )
     template = assertions.Template.from_stack(stack).to_json()
