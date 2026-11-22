@@ -15,6 +15,10 @@ What is read, for each pool:
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
 | Mode (the configured mode when no record exists) and the scaler's memory | the pool-state table, by pool |
 
+And once a run, for the session gauge (`rhi_scaler.metrics`), not for the decision: the session
+switch, the pool-state item `_session` / `switch` (`rhi_common.records.SessionSwitch`), by
+`read_session`. A missing item reads as off.
+
 The supply, from the lifecycle states and target health:
 
 | State | Supply |
@@ -71,6 +75,8 @@ from rhi_common.records import (
     GATEWAY_SOURCE,
     INSTANCE_SOURCE,
     MODE_RECORD,
+    SESSION_POOL,
+    SWITCH_RECORD,
     GatewayHeartbeat,
     InstanceHeartbeat,
     Mode,
@@ -78,6 +84,7 @@ from rhi_common.records import (
     RecordError,
     ScalerNote,
     is_fresh,
+    session_is_on,
 )
 from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD
 from rhi_scaler.model import Decision, Inputs, Memory, PoolInputs, Supply
@@ -395,6 +402,18 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
         no_capacity_at=history.no_capacity_at,
     )
     return inputs, state
+
+
+def read_session(clients: Clients, tables: TableNames) -> bool:
+    """Whether the session switch reads on. A missing item reads as off; one that is not the
+    switch's record raises `RecordError`."""
+    found = clients.dynamodb.get_item(
+        TableName=tables.pool_state,
+        Key={"pool": {"S": SESSION_POOL}, "record": {"S": SWITCH_RECORD}},
+        ConsistentRead=True,
+    )
+    item = found.get("Item")
+    return session_is_on(None if item is None else _plain(item))
 
 
 def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:

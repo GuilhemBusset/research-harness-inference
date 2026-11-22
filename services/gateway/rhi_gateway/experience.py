@@ -9,7 +9,7 @@ registry, so the one endpoint serves both:
 | --- | --- | --- | --- |
 | `rhi_gateway_time_to_first_token_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The seconds from a streamed request accepted to its first token sent |
 | `rhi_gateway_time_to_first_answer_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The same, to its first token that is not reasoning |
-| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format` | The output speed of each streamed request |
+| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format`, `start` | The output speed of each streamed request |
 | `rhi_gateway_request_input_tokens` | histogram | `pool`, `wire_format` | The input tokens of each request settled: the transcript's size |
 | `rhi_gateway_request_output_tokens` | histogram | `pool`, `wire_format` | The output tokens of each request settled: the output of a turn |
 | `rhi_gateway_requests_in_flight` | gauge | `pool` | The requests this task has forwarded and not yet ended |
@@ -50,8 +50,10 @@ the last call are the two times, read on this module's clock. The output tokens 
 settlement observed.
 
 The objectives of section 7.3 are read from this histogram against floors held in configuration:
-the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17). A
-floor that falls between two buckets cannot be read exactly, so each floor is a bucket boundary.
+the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
+a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
+waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
+read exactly, so each floor is a bucket boundary.
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
@@ -105,7 +107,8 @@ OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_0
 WAIT_BUCKETS = (0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 1800)
 
 _LABELS = ("pool", "wire_format")
-_WAIT_LABELS = (*_LABELS, "start", "turn")
+_SPEED_LABELS = (*_LABELS, "start")
+_WAIT_LABELS = (*_SPEED_LABELS, "turn")
 
 
 class Turn:
@@ -116,7 +119,8 @@ class Turn:
     ) -> None:
         self._experience = experience
         self._labels = (pool, wire_format.value)
-        self._wait_labels = (*self._labels, "held" if held else "warm", "first" if first_turn else "later")
+        self._speed_labels = (*self._labels, "held" if held else "warm")
+        self._wait_labels = (*self._speed_labels, "first" if first_turn else "later")
         self._accepted_at = experience.clock()
         self._first_token_at: float | None = None
         self._last_token_at: float | None = None
@@ -142,7 +146,7 @@ class Turn:
         first, last = self._first_token_at, self._last_token_at
         if first is None or last is None or last <= first or output_tokens < 2:
             return
-        series.speed.labels(*self._labels).observe((output_tokens - 1) / (last - first))
+        series.speed.labels(*self._speed_labels).observe((output_tokens - 1) / (last - first))
 
 
 class _Demand:
@@ -203,7 +207,7 @@ class Experience:
         self.speed = Histogram(
             SPEED,
             "Output tokens after the first, over the seconds from the first token sent to the last, per stream.",
-            _LABELS,
+            _SPEED_LABELS,
             buckets=SPEED_BUCKETS,
             registry=registry,
         )

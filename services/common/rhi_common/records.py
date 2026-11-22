@@ -7,7 +7,7 @@ holds a table reads and writes it.
 
 | Table | Partition key | Sort key | Items |
 | --- | --- | --- | --- |
-| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote` |
+| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote`. Under the pool `_session`, `switch`: `SessionSwitch` |
 | heartbeats | `pool` | `source` | `gateway#<task ID>`: `GatewayHeartbeat`. `instance#<instance ID>`: `InstanceHeartbeat` |
 
 An item is in the form boto3's table resource takes and returns: attribute names to plain values,
@@ -22,8 +22,14 @@ A heartbeat is rewritten every 5 seconds and ignored once it is older than 20 se
 hour after it was written, which only clears the rows of tasks and instances that are gone. The
 pool-state items carry no expiry: they survive deployments (section 11.3).
 
+**The session switch** (section 5.6) is one item of the pool-state table, beside the pools' records
+under a key no pool can have: partition key `_session`, sort key `switch`. A pool's name is
+lower-case letters, digits and hyphens, so `_session` is never one. The item says whether a session
+is on (`on`, a boolean), who set it and when; the admin sets it, no deployment writes it, and a
+missing item reads as off (`session_is_on`).
+
 `from_item` refuses, with a `RecordError`, an item that is not the record asked for: another key,
-a missing or mistyped attribute, a mode outside the four.
+a missing or mistyped attribute, a mode outside the four, a switch whose `on` is not a boolean.
 """
 
 from __future__ import annotations
@@ -37,6 +43,9 @@ from typing import Self
 # The sort keys of the pool-state table that this module owns.
 MODE_RECORD = "mode"
 NOTE_RECORD = "note"
+# The keys of the session switch's item in the pool-state table: a partition no pool can take.
+SESSION_POOL = "_session"
+SWITCH_RECORD = "switch"
 # What comes before the task's or the instance's ID in the sort key of the heartbeats table.
 GATEWAY_SOURCE = "gateway#"
 INSTANCE_SOURCE = "instance#"
@@ -256,6 +265,33 @@ class ScalerNote:
             # A note written before the scaler raised a number, or before it kept one, holds none.
             rebalance_number=0 if item.get("rebalance_number") is None else _whole(item, "rebalance_number"),
         )
+
+
+@dataclass(frozen=True)
+class SessionSwitch:
+    """Whether a session is on, and who set the switch and when. Only the admin changes it."""
+
+    on: bool
+    set_by: str
+    set_at: int
+
+    def to_item(self) -> Item:
+        return {"pool": SESSION_POOL, "record": SWITCH_RECORD, "on": self.on, "set_by": self.set_by, "set_at": self.set_at}
+
+    @classmethod
+    def from_item(cls, item: Mapping[str, object]) -> Self:
+        _record(item, SWITCH_RECORD)
+        if item.get("pool") != SESSION_POOL:
+            raise RecordError(f"the item is not under the pool `{SESSION_POOL}`")
+        on = item.get("on")
+        if not isinstance(on, bool):
+            raise RecordError("`on` is not a boolean")
+        return cls(on=on, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
+
+
+def session_is_on(item: Mapping[str, object] | None) -> bool:
+    """Whether the switch's item, as read, says a session is on: a missing item reads as off."""
+    return item is not None and SessionSwitch.from_item(item).on
 
 
 def is_fresh(heartbeat: GatewayHeartbeat | InstanceHeartbeat, now: int) -> bool:

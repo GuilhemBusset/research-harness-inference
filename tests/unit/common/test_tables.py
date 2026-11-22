@@ -8,13 +8,15 @@ from collections.abc import Mapping
 import pytest
 
 from rhi_common import records, students, tables
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, PoolState, ScalerNote
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, PoolState, ScalerNote, SessionSwitch
 from rhi_common.students import Lease, RosterEntry, StudentKey, UsageDay
 from rhi_common.tables import HEARTBEATS, KEYS, POOL_STATE, ROSTER, USAGE, AttributeType, KeyAttribute, Table
 
 NOW = 1_800_000_000
 
-type Record = StudentKey | RosterEntry | UsageDay | PoolState | ScalerNote | GatewayHeartbeat | InstanceHeartbeat
+type Record = (
+    StudentKey | RosterEntry | UsageDay | PoolState | ScalerNote | SessionSwitch | GatewayHeartbeat | InstanceHeartbeat
+)
 
 # One of every item of `rhi_common.students` and `rhi_common.records`, with the table it goes to.
 ITEMS: list[tuple[Table, Record]] = [
@@ -56,6 +58,7 @@ ITEMS: list[tuple[Table, Record]] = [
     ),
     (POOL_STATE, PoolState(pool="mock", mode=Mode.ENABLED, set_by="admin", set_at=NOW)),
     (POOL_STATE, ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=NOW)),
+    (POOL_STATE, SessionSwitch(on=True, set_by="instructor", set_at=NOW)),
     (
         HEARTBEATS,
         GatewayHeartbeat(task="0f3a9c", pool="mock", in_flight=1, held=0, last_request_at=None, written_at=NOW),
@@ -145,7 +148,9 @@ def test_every_item_carries_its_tables_keys(table: Table, record: Record) -> Non
 def test_the_pool_state_items_are_records_of_the_table() -> None:
     for table, record in ITEMS:
         if table is POOL_STATE:
-            assert record.to_item()["record"] in tables.POOL_STATE_RECORDS
+            item = record.to_item()
+            # A pool's record, or the session switch under the partition no pool can take.
+            assert item["record"] in tables.POOL_STATE_RECORDS or (item["pool"], item["record"]) == tables.SESSION_SWITCH
 
 
 def test_the_key_item_carries_the_keys_of_by_student() -> None:

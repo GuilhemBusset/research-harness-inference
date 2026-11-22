@@ -18,7 +18,7 @@ from moto import mock_aws
 from rhi_common.records import GatewayHeartbeat
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
-from rhi_scaler.metrics import DECISIONS, GAUGES, DecisionCounts, RemoteWriter, decode
+from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
 from rhi_scaler.model import Memory, Reason
 from rhi_scaler.settings import read_settings
 
@@ -129,19 +129,25 @@ class Edge:
             }
             self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
 
-    def expect_writes(self, note: dict[str, Any]) -> None:
-        """The note put whole, then the memory updated: what it stores is in `updates`."""
+    def expect_writes(self, note: dict[str, Any], switch: dict[str, Any] | None = None) -> None:
+        """The note put whole, then the memory updated: what it stores is in `updates`. Then the
+        session switch read for the session gauge: `switch` is its item, none by default."""
         self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
         update = ("Key", "UpdateExpression", "ExpressionAttributeNames", "ExpressionAttributeValues")
         self.dynamodb.add_response("update_item", {}, {"TableName": "pool-state-table", **dict.fromkeys(update, ANY)})
+        key = {"pool": {"S": "_session"}, "record": {"S": "switch"}}
+        found = {} if switch is None else {"Item": serialize(switch)}
+        self.dynamodb.add_response(
+            "get_item", found, {"TableName": "pool-state-table", "Key": key, "ConsistentRead": True}
+        )
 
-    def queue_first_run(self) -> None:
+    def queue_first_run(self, switch: dict[str, Any] | None = None) -> None:
         """A pool at zero, a request held: one instance asked for, and the memory stored."""
         self.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)])
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
-        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW})
+        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, switch)
 
 
 @pytest.fixture
@@ -184,6 +190,8 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
         "rhi_scaler_warm_instances": 1.0,
     }
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
+    # The session switch has no record: the session gauge reads 0.
+    assert sent[(SESSION_ON, ())] == [0.0]
     # The pool and the reason are the only labels: nothing names a student.
     assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason"}
 

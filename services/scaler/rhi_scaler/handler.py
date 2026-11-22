@@ -6,12 +6,12 @@ the admin CLI. Whoever calls, a run does the same thing, and the event is never 
 1. read the settings (`rhi_scaler.settings`) and the inputs (`rhi_scaler.aws_io.read`);
 2. decide (`rhi_scaler.decide`), from the inputs alone;
 3. apply: the Auto Scaling calls that change something, then each pool's note and memory record;
-4. log one record per pool with its decision and its reason, and send the fleet's metrics
-   (`rhi_scaler.metrics`).
+4. log one record per pool with its decision and its reason, read the session switch, and send
+   the fleet's metrics with the session gauge (`rhi_scaler.metrics`).
 
 A run that fails before its writes leaves the pool as it was; the next run reads the world again.
 A metrics push that fails does not fail the run: the decision is already applied, and the log
-holds it.
+holds it. Nor does a switch that cannot be read: the push then carries no session sample.
 """
 
 from __future__ import annotations
@@ -57,6 +57,15 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
         LOGGER.info(json.dumps(record, sort_keys=True))
 
 
+def read_switch(clients: aws_io.Clients, tables: aws_io.TableNames) -> bool | None:
+    """What the session switch reads, or `None`, logged, when it cannot be read."""
+    try:
+        return aws_io.read_session(clients, tables)
+    except Exception as error:  # noqa: BLE001 - the decision does not depend on the switch; only its sample is lost
+        LOGGER.warning(json.dumps({"event": "session-switch-not-read", "error": type(error).__name__}))
+        return None
+
+
 def run_cycle(
     settings: Settings,
     clients: aws_io.Clients,
@@ -74,8 +83,9 @@ def run_cycle(
     decision = decide(run.inputs)
     aws_io.apply(clients, settings.tables, run, decision)
     log_decisions(run, decision)
+    session_on = read_switch(clients, settings.tables)
     try:
-        writer.push(fleet_series(run.inputs, decision, counts, milliseconds))
+        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session_on=session_on))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     return decision

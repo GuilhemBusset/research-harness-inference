@@ -13,7 +13,9 @@ from rhi_common.records import (
     PoolState,
     RecordError,
     ScalerNote,
+    SessionSwitch,
     is_fresh,
+    session_is_on,
 )
 
 NOW = 1_800_000_000
@@ -139,3 +141,15 @@ def test_a_time_that_is_not_a_whole_number_of_seconds_is_refused(written_at: obj
             read({**item, "written_at": written_at})
     with pytest.raises(RecordError):
         PoolState.from_item({**STATE.to_item(), "set_at": written_at})
+
+
+def test_the_session_switch_reads_back_and_reads_off_when_missing() -> None:
+    for on in (True, False):
+        switch = SessionSwitch(on=on, set_by="instructor", set_at=NOW)
+        item = switch.to_item()
+        assert (item["pool"], item["record"]) == ("_session", "switch")
+        assert SessionSwitch.from_item(item) == switch
+        assert session_is_on(item) is on
+    assert session_is_on(None) is False
+    with pytest.raises(RecordError):
+        session_is_on({**SessionSwitch(on=True, set_by="instructor", set_at=NOW).to_item(), "on": 1})

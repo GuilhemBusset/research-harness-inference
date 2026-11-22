@@ -13,6 +13,7 @@ configuration scrapes. Any other route answers 404.
 | `rhi_gateway_student_output_tokens_total` | counter | `alias`, `pool` | The output tokens their settlements observed |
 | `rhi_gateway_student_errors_total` | counter | `alias`, `pool`, `cause` | The requests the gateway gave a cause |
 | `rhi_gateway_student_budget_left_tokens` | gauge | `alias` | The tokens the student has left of the day |
+| `rhi_gateway_own_faults_total` | counter | none | The answers of 500 or above that named no cause: the gateway's own faults |
 
 **One request, one count.** `Metrics.count` is given the log record of each request when it ends
 (`rhi_gateway.telemetry`), so the counters and the log agree: every request the gateway answers
@@ -21,6 +22,12 @@ those the request's settlement observed. A request counts as an error when its r
 cause: one of `rhi_common.causes`, or `none` for the gateway's own fault, which is what the error
 rate reads (section 7.3). An answer that states a cause is counted under it whatever its status,
 so the error event that ends a stream answered 200 counts too.
+
+**The gateway's own faults** (section 7.3) are counted apart, with no label at all: an answer of
+500 or above whose record names no cause of section 6.2 (`none`), which the objective of the
+gateway's answers reads. A stream answered 200 that then fails is an error of cause `none`, not a
+5xx answer, and is not one of them. With no label the counter is served from the task's start, at
+zero, so that an increase counts the first fault too.
 
 **The student is the alias** (section 6.6). `alias` is the roster alias of the accepted key, and
 no series carries another name of a student: no GitHub ID, no key, no hash of one. A request
@@ -64,6 +71,8 @@ from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.exposition import ThreadingWSGIServer
 from prometheus_client.registry import Collector
 
+from rhi_gateway.telemetry import NO_CAUSE
+
 if TYPE_CHECKING:
     from prometheus_client import Metric
 
@@ -81,6 +90,9 @@ INPUT_TOKENS = "rhi_gateway_student_input_tokens"
 OUTPUT_TOKENS = "rhi_gateway_student_output_tokens"
 ERRORS = "rhi_gateway_student_errors"
 BUDGET_LEFT = "rhi_gateway_student_budget_left_tokens"
+OWN_FAULTS = "rhi_gateway_own_faults"
+# The first status of a server's error.
+SERVER_ERROR = 500
 
 _StartResponse = Callable[[str, list[tuple[str, str]]], object]
 _Application = Callable[[dict[str, Any], _StartResponse], Iterable[bytes]]
@@ -178,6 +190,9 @@ class Metrics:
             ["alias", "pool", "cause"],
             registry=self.registry,
         )
+        self._own_faults = Counter(
+            OWN_FAULTS, "Answers of 500 or above that named no cause.", registry=self.registry
+        )
 
     def count(self, record: RequestRecord) -> None:
         """Count one request that has ended, from its log record. Reads nothing and never waits."""
@@ -194,6 +209,8 @@ class Metrics:
             counter.labels(*labels).inc(amounts.get(counter, 1))
         if record.student is not None:
             self._students.seen(record.student, children)
+        if record.cause == NO_CAUSE and record.status is not None and record.status >= SERVER_ERROR:
+            self._own_faults.inc()
 
     def serve(self, *, port: int = PORT) -> WSGIServer:
         """Start serving the endpoint, in a thread that ends with the gateway, and return its server.

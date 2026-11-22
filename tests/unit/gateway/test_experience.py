@@ -242,9 +242,12 @@ def test_speed_per_request(wire_format: WireFormat, held: bool) -> None:
     assert post(made, TURNS[wire_format], stream=True) == 200
 
     labels = {"pool": POOL, "wire_format": wire_format.value}
+    # A request that waited for its pool is apart from those of a warm pool.
+    speed = {**labels, "start": "held" if held else "warm"}
     # 401 tokens, the first sent at 2 seconds and the last at 22: the 400 after the first, over 20 seconds.
-    assert value(made, SPEED + "_sum", **labels) == 20
-    assert value(made, SPEED + "_count", **labels) == 1
+    assert value(made, SPEED + "_sum", **speed) == 20
+    assert value(made, SPEED + "_count", **speed) == 1
+    assert value(made, SPEED + "_count", **labels, start="warm" if held else "held") is None
     assert value(made, OUTPUT_TOKENS + "_sum", **labels) == STREAMED
 
 
@@ -262,7 +265,7 @@ def test_no_speed_without_two_tokens_sent_at_two_moments(sent_at: tuple[float, .
     turn.settled(INPUT, output_tokens)
 
     labels = {"pool": POOL, "wire_format": "messages"}
-    assert registry.get_sample_value(SPEED + "_count", labels) is None
+    assert registry.get_sample_value(SPEED + "_count", {**labels, "start": "warm"}) is None
     assert registry.get_sample_value(OUTPUT_TOKENS + "_sum", labels) == output_tokens
 
 
@@ -277,7 +280,7 @@ def test_tokens_per_turn(wire_format: WireFormat) -> None:
     assert value(made, INPUT_TOKENS + "_count", **labels) == value(made, OUTPUT_TOKENS + "_count", **labels) == 1
     # An answer that is not a stream has no speed, and no other pool or format has this turn.
     assert {sample.labels["wire_format"] for sample in served(made) if "wire_format" in sample.labels} == {wire_format}
-    assert value(made, SPEED + "_count", **labels) is None
+    assert value(made, SPEED + "_count", **labels, start="warm") is None
 
 
 def test_every_request_that_settles_is_observed_once() -> None:

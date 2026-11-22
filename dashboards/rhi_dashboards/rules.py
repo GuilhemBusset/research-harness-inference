@@ -17,6 +17,17 @@ showing a wrong number. Three belong to every panel, and are built here:
   `engine_percentile_timeseries` add, beside the quantiles, the increase of the histogram's count
   over the same window.
 
+**An objective is read over the minutes a session was on** (section 7.3). PromQL knows nothing of
+the session switch, so the scaler sends a gauge, `rhi_scaler_session_on`, 1 while the switch reads
+on. `in_session` keeps an expression only where that gauge is 1, and `over_sessions` evaluates it
+so at every minute of the dashboard's range, a subquery of one-minute steps, and reduces those
+minutes to one value: the sum of each minute's increase, or another `*_over_time`. What is gated is
+each minute's own contribution, an increase over that one minute, never a rate whose window could
+reach back before the session; counts and buckets are summed over the session's minutes before a
+ratio or a percentile is taken of them. An engine series read so is kept to the pool in service at
+each minute (`awake`, inside the gate): a value over a past range has no "now" to read "asleep" at,
+and reads no data when no minute had an instance.
+
 An engine names its metrics its own way, so an engine query never writes a name: `engine_series`
 reads it from the per-engine table (`rhi_common.engine_metrics`), at the row of the engine the
 pool's configuration names. That holds for the contract's quantities (`Quantity`) and for the
@@ -100,8 +111,18 @@ class ExportedBy:
 
 type Declared = FromEngineTable | EmittedBy | ExportedBy
 
+# The scaler's gauge of the session switch: 1 while it reads on, 0 otherwise (section 7.3).
+SESSION_ON = "rhi_scaler_session_on"
+# The subquery an objective is read over: every minute of the dashboard's range. Each minute's
+# increase is taken over that minute alone, so the minutes tile the range and none is counted twice.
+SESSION_STEP = "1m"
+SESSION_RANGE = "$__range"
+
 # What the helpers themselves query. `rhi_dashboards.check` adds it to every module's own.
-METRICS: tuple[Declared, ...] = (EmittedBy(IN_SERVICE, "services/scaler/rhi_scaler/metrics.py"),)
+METRICS: tuple[Declared, ...] = (
+    EmittedBy(IN_SERVICE, "services/scaler/rhi_scaler/metrics.py"),
+    EmittedBy(SESSION_ON, "services/scaler/rhi_scaler/metrics.py"),
+)
 
 
 def selector(metric: str, matchers: Mapping[str, str] | None = None) -> str:
@@ -249,6 +270,25 @@ def awake(pool: str, expression: str) -> str:
 def asleep(pool: str) -> str:
     """One series, of value zero, while the scaler counts no instance in service; none otherwise."""
     return f"{in_service(pool)} == 0"
+
+
+def in_session(expression: str) -> str:
+    """The expression's series where the scaler's session gauge is 1, and none elsewhere."""
+    return f"({expression}) and on () ({SESSION_ON} == 1)"
+
+
+def over_sessions(expression: str, function: str = "sum_over_time") -> str:
+    """The expression kept to the session, at every minute of the dashboard's range, reduced by
+    `function` (a `*_over_time`) to one value for each of its series. Give it each minute's
+    contribution: `minute_increase`, a gauge."""
+    return f"{function}(({in_session(expression)})[{SESSION_RANGE}:{SESSION_STEP}])"
+
+
+def minute_increase(metric: str, matchers: Mapping[str, str] | None = None, *, by: Sequence[str] = ()) -> str:
+    """The increase of a counter over one step of `over_sessions`, taken for each series, then
+    summed by `by` alone (no pool unless named)."""
+    labels = ", ".join(by)
+    return f"sum by ({labels}) (increase({selector(metric, matchers)}[{SESSION_STEP}]))"
 
 
 def query(expression: str, legend: str, ref_id: str, *, instant: bool = False) -> prometheus_builders.Dataquery:

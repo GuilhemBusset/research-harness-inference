@@ -9,8 +9,19 @@ What the fleet dashboard shows of the scaler (section 7.2), per pool, on every r
 | `rhi_scaler_warm_instances` | gauge | `pool` | The instances in the warm pool the run read |
 | `rhi_scaler_decisions_total` | counter | `pool`, `reason` | The decisions made with that reason |
 
+And once for the whole system, on every run:
+
+| Series | Kind | Labels | Value |
+| --- | --- | --- | --- |
+| `rhi_scaler_session_on` | gauge | none | 1 while the session switch reads on; 0 while it reads off or has no record |
+
 The only labels are the pool's name and the decision's reason, a fixed vocabulary
 (`rhi_scaler.model.Reason`): no metric can carry a student.
+
+**The session gauge** (system design, sections 5.6 and 7.3). PromQL knows nothing of the session
+switch, so the scaler, which runs every minute, says what it read: the objectives keep only the
+samples taken while this gauge is 1 (`rhi_dashboards.objectives`). A run that could not read the
+switch sends no sample of it, rather than a value it does not know.
 
 The function keeps nothing between runs but what its process holds, so the counter counts from
 the process's start, and Prometheus reads a smaller value as a restart (as it does for any
@@ -45,6 +56,7 @@ INSTANCES_IN_SERVICE = "rhi_scaler_instances_in_service"
 WARM_INSTANCES = "rhi_scaler_warm_instances"
 DECISIONS = "rhi_scaler_decisions_total"
 GAUGES = (DESIRED_CAPACITY, INSTANCES_IN_SERVICE, WARM_INSTANCES)
+SESSION_ON = "rhi_scaler_session_on"
 
 SERVICE = "aps"
 # How long one push may take: the function's own timeout bounds the run.
@@ -122,15 +134,24 @@ class DecisionCounts:
 
 
 def fleet_series(
-    inputs: Inputs, decision: Decision, counts: DecisionCounts, milliseconds: int | None = None
+    inputs: Inputs,
+    decision: Decision,
+    counts: DecisionCounts,
+    milliseconds: int | None = None,
+    *,
+    session_on: bool | None = None,
 ) -> list[Series]:
     """Counts this run's decisions, and returns every series to send for it, pool by pool.
 
-    `milliseconds` is the run's time; without it, the decision clock's second.
+    `milliseconds` is the run's time; without it, the decision clock's second. `session_on` is
+    what the run read of the session switch, and gives the session gauge; `None`, a switch the run
+    could not read, gives no sample of it.
     """
     milliseconds = counts.stamp(inputs.now * 1000 if milliseconds is None else milliseconds)
     supplies = {pool.config.name: pool.supply for pool in inputs.pools}
     out: list[Series] = []
+    if session_on is not None:
+        out.append(Series(SESSION_ON, (), ((1.0 if session_on else 0.0, milliseconds),)))
     for pool in decision.pools:
         supply = supplies[pool.pool]
         gauges = {
