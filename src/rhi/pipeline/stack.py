@@ -1,7 +1,7 @@
 """The pipeline stack: CDK Pipelines on CodePipeline V2, in queued execution, from `main` (system
 design, section 8.2).
 
-The only thing that deploys the endpoint is this pipeline (requirement R6). It has six steps:
+The only thing that deploys the endpoint is this pipeline (requirement R6). It has seven steps:
 
 - its source is this repository, on `main`, through a CodeConnections connection the stack
   creates. The connection starts pending until the owner authorizes it once (section 8.6).
@@ -16,6 +16,11 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
   stage's deployment: each GPU pool's model, at its pinned revision, copied into the model bucket,
   so that a release finds its weights when its instances start. A copy that fails fails the
   execution before anything is deployed.
+- the hold of `rhi.pipeline.hold`, after the copy of the weights and before the stage's
+  deployment: it reads the session switch from the stage's pool-state table and passes once it
+  reads off, so a deployment never refreshes a pool or drains the gateway during a class
+  (sections 5.6 and 8.2). A session left on for longer than CodeBuild's limit for one build, 36
+  hours, fails the execution.
 - the verification of `rhi.pipeline.verify`, after the stage's deployment: the smoke tests against
   the deployed endpoint, with the canary's key. A failed test fails the execution. In its
   post-build phase the step writes its marks to this pipeline's artifact bucket, under
@@ -77,6 +82,7 @@ from aws_cdk import pipelines
 
 from rhi.pipeline.canary import GpuCanary
 from rhi.pipeline.events import PipelineEvents
+from rhi.pipeline.hold import hold_step
 from rhi.pipeline.image_promotion import ImagePromotion
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
@@ -84,7 +90,7 @@ from rhi.pipeline.spikes import JOBS, SpikeJobs
 from rhi.pipeline.synth import synth_step
 from rhi.pipeline.verify import verify_step
 from rhi.pipeline.weights import copy_weights_step
-from rhi.stage import PERMISSIONS_BOUNDARY
+from rhi.stage import PERMISSIONS_BOUNDARY, EndpointStage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -186,7 +192,15 @@ class PipelineStack(cdk.Stack):
         # The first of the stage's steps, before any deployment action of it: the weights of a
         # release that will be deployed, in the model bucket before an instance asks for them.
         copy_weights = copy_weights_step(self, source)
-        self.pipeline.add_stage(stage, pre=[copy_weights], post=[verify])
+        pre: list[pipelines.Step] = [copy_weights]
+        if isinstance(stage, EndpointStage):
+            # After the copy and before any deployment action of the stage: the hold, which passes
+            # once no session is on. It takes the pools stack's name and the pool-state table's
+            # logical ID from the stage as text.
+            hold = hold_step(self, source, stage)
+            hold.add_step_dependency(copy_weights)
+            pre.append(hold)
+        self.pipeline.add_stage(stage, pre=pre, post=[verify])
         self.pipeline.build_pipeline()
         self._builds_images_for_both_platforms()
 

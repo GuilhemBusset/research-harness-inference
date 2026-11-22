@@ -71,6 +71,17 @@ Rules hold those two, and every action:
   a read of the artifact bucket, and its own log group and report groups. Nothing else: every
   action it is allowed is one of `VERIFICATION_MAY`, each on resources of its kind only, read as
   the reporter's are, so no other action of Auto Scaling or CodePipeline, on any resource;
+- the role of the hold, the project of a CodeBuild action named `Hold` (sections 5.6 and 8.2), which
+  passes once the session switch reads off, may read the one stack resource that names the stage's
+  pool-state table, `cloudformation:DescribeStackResource` on a stack that the stage the action is
+  in deploys and whose template holds the pool-state table, by its name, `stack/<name>/*`; and read
+  that table's items, `dynamodb:GetItem` on the pool-state table of that stack and of no other
+  stack, named as CloudFormation names a table that has no name of its own, the stack's name, a
+  hyphen, the table's logical ID, a hyphen and a wildcard for the suffix it generates, in the
+  deploying account and region. Beside those it holds what CDK Pipelines gives every project: a
+  read of the artifact bucket, and its own log group and report groups. Nothing else: every action
+  it is allowed is one of `HOLD_MAY`, each on resources of its kind only, read as the reporter's
+  are;
 - no role of any template but the reporter's may read the reporter's secret (section 8.4): the
   App's key is the only GitHub credential in the account. A statement reaches the secret when one
   of its actions matches a read of a secret (`SECRET_READS`) and one of its resources may name the
@@ -168,8 +179,10 @@ REVIEWED: Reviewed = [
     (
         "Rhi",
         [
-            # Before the stage's deployment actions, which the list leaves out.
+            # Before the stage's deployment actions, which the list leaves out: the copy of the
+            # weights, then the hold, which passes once no session is on.
             ("CopyWeights", "Build/AWS/CodeBuild"),
+            ("Hold", "Build/AWS/CodeBuild"),
             # After them.
             ("Verify", "Build/AWS/CodeBuild"),
         ],
@@ -284,6 +297,24 @@ VERIFICATION_MAY = {
     "codebuild:CreateReportGroup": "reports",
     "codebuild:UpdateReport": "reports",
 }
+# The hold: the name of its action, and the actions its role may be allowed, each with the kind of
+# resource it may be allowed on. The last three groups are what CDK Pipelines gives every project.
+HOLD_ACTION = "Hold"
+HOLD_MAY = {
+    "cloudformation:DescribeStackResource": "pools stack",
+    "dynamodb:GetItem": "pool-state",
+    "s3:GetBucket*": "artifacts",
+    "s3:GetObject*": "artifacts",
+    "s3:List*": "artifacts",
+    "logs:CreateLogGroup": "logs",
+    "logs:CreateLogStream": "logs",
+    "logs:PutLogEvents": "logs",
+    "codebuild:BatchPutCodeCoverages": "reports",
+    "codebuild:BatchPutTestCases": "reports",
+    "codebuild:CreateReport": "reports",
+    "codebuild:CreateReportGroup": "reports",
+    "codebuild:UpdateReport": "reports",
+}
 # What reads a secret, and every ARN of the reporter's secret and of the measurement bus, as patterns
 # that a resource of a statement must overlap to reach them (`overlaps`): any partition, region and
 # account, and the six characters Secrets Manager chooses and adds to a secret's name. `FIELD` stands
@@ -335,6 +366,10 @@ VERIFIES_MORE = (
     "a verification's role that may do more than read the canary's secret, query its stage's workspace,"
     " read its stage's release parameters, query its stage's heartbeats table, write under verification/,"
     " describe groups and their refreshes, and list its own pipeline's executions"
+)
+HOLDS_MORE = (
+    "a hold's role that may do more than read the stage's pools stack's resources and the session switch of its"
+    " pool-state table"
 )
 SECRET_ELSEWHERE = "a role other than the reporter function's that may read the reporter's secret"
 MEASURES_AND_READS = "a role that may put events on the measurement bus and read the reporter's secret"
@@ -990,6 +1025,72 @@ def verifies_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pa
     return not (isinstance(value, str) and value in tags)
 
 
+def holds(template: Mapping[str, Any]) -> list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]]:
+    """The CodeBuild actions named `Hold` of the pipelines of a template, each as `verifications`
+    gives the actions named `Verify`."""
+    held = template.get("Resources", {})
+    found: list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]] = []
+    for _, _, pipeline, _ in resources({"": template}, "AWS::CodePipeline::Pipeline"):
+        for stage, actions in stages_of(pipeline):
+            for action in actions:
+                if action["Name"] != HOLD_ACTION or type_of(action) != CODEBUILD:
+                    continue
+                named = action.get("Configuration", {}).get("ProjectName")
+                project = named.get("Ref") if isinstance(named, dict) else None
+                if not isinstance(project, str) or held.get(project, {}).get("Type") != "AWS::CodeBuild::Project":
+                    found.append((actions, pipeline, f"{stage}/{action['Name']}", None))
+                    continue
+                role = held[project].get("Properties", {}).get("ServiceRole")
+                role_id = role["Fn::GetAtt"][0] if isinstance(role, dict) and "Fn::GetAtt" in role else None
+                held_role = role_id if isinstance(role_id, str) and role_id in held else None
+                found.append((actions, pipeline, project, held_role))
+    return found
+
+
+def stage_pool_state(templates: Templates, actions: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """The pool-state tables of the stacks a stage's CloudFormation actions deploy, each as `(the
+    stack's name, the table's logical ID)`: a table with no name of its own whose logical ID begins
+    with the pool tables' construct ID, after its parents'."""
+    found = []
+    deployments = [action for action in actions if type_of(action) == CLOUDFORMATION]
+    for stack in sorted({str(action["Configuration"].get("StackName")) for action in deployments}):
+        of_the_stack = [action for action in deployments if action["Configuration"].get("StackName") == stack]
+        for template in deployed_by(of_the_stack, templates):
+            for _, logical_id, table, _ in resources({"": template}, "AWS::DynamoDB::Table"):
+                if "TableName" not in table and re.fullmatch(rf"\w*{POOL_STATE}[0-9A-F]{{8}}", logical_id):
+                    found.append((stack, logical_id))
+    return sorted(set(found))
+
+
+def hold_resources(
+    templates: Templates, actions: list[dict[str, Any]], pipeline: Mapping[str, Any], project: str
+) -> dict[str, list[re.Pattern[str]]]:
+    """For each kind of resource of `HOLD_MAY`, what the role of the hold of a stage may name, as
+    `arn_text` writes it: the stacks of the stage that hold its pool-state table, that table, the
+    pipeline's artifact bucket and its objects, and the project's own log group and report groups."""
+    tables = stage_pool_state(templates, actions)
+    stores = [
+        re.escape(store["Ref"])
+        for store in [pipeline.get("ArtifactStore", {}).get("Location")]
+        + [entry.get("ArtifactStore", {}).get("Location") for entry in pipeline.get("ArtifactStores", [])]
+        if isinstance(store, dict) and isinstance(store.get("Ref"), str)
+    ]
+    own = rf"\$\{{{re.escape(project)}\}}"
+    return {
+        "pools stack": [
+            re.compile(rf"{PARTITION}:cloudformation:{HERE}:stack/{re.escape(stack)}/\*")
+            for stack in sorted({stack for stack, _ in tables})
+        ],
+        "pool-state": [
+            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(f'{stack}-{logical_id}')}-\*")
+            for stack, logical_id in tables
+        ],
+        "artifacts": [re.compile(rf"\$\{{{store}\.Arn\}}(/\*)?") for store in stores],
+        "logs": [re.compile(rf"{PARTITION}:logs:{HERE}:log-group:/aws/codebuild/{own}(:\*)?")],
+        "reports": [re.compile(rf"{PARTITION}:codebuild:{HERE}:report-group/{own}-\*")],
+    }
+
+
 def promotions(template: Mapping[str, Any]) -> list[tuple[str, str | None]]:
     """The CodeBuild projects named `PROMOTION_PROJECT` of a template that holds a pipeline, each as
     `(its logical ID, its role)`, the role None when the template does not hold it."""
@@ -1340,6 +1441,12 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
             statements = statements_of(template, role) if role is not None else None
             if statements is None or any(verifies_more(statement, allowed, tags) for statement in statements):
                 found.append((path, role or named, VERIFIES_MORE))
+    for path, template in sorted(templates.items()):
+        for actions, pipeline, named, role in holds(template):
+            allowed = hold_resources(templates, actions, pipeline, named)
+            statements = statements_of(template, role) if role is not None else None
+            if statements is None or any(reports_more(statement, allowed, HOLD_MAY) for statement in statements):
+                found.append((path, role or named, HOLDS_MORE))
     # The reporter's secret, read by its function's role and by no other; never by a role that may
     # also put events on the measurement bus.
     for path, template in sorted(templates.items()):
@@ -1397,6 +1504,7 @@ def built(
     step: tuple[str, list[str]] | None = None,
     stack_with_an_asset: str | None = None,
     verification: bool = False,
+    hold: bool = False,
     change: Change | None = None,
 ) -> dict[str, dict[str, Any]]:
     """The templates of an app, built in the test, whose pipeline CDK Pipelines makes as the
@@ -1416,6 +1524,8 @@ def built(
       stage's stack what it reads, a workspace tagged with the stage's name, the release
       parameter of the pool `mock` and the table `Heartbeats`, whose name the stack declares as
       an output that the step is given. Its role holds what CDK Pipelines gives it, until `change`;
+    - a hold: a CodeBuild step named `Hold` before the stage's deployment, and in the stage's stack
+      a pool-state table, `PoolState`. Its role holds what CDK Pipelines gives it, until `change`;
     - anything `change` does to the pipeline's stack and to the pipeline once it is built.
     """
     pipelines, iam = cdk.pipelines, cdk.aws_iam
@@ -1459,6 +1569,9 @@ def built(
             billing_mode="PAY_PER_REQUEST",
         )
         told = {HEARTBEATS_TABLE: cdk.CfnOutput(endpoint, "HeartbeatsTable", value=table.ref)}
+    if hold:
+        pool = cdk.aws_dynamodb.Attribute(name="pool", type=cdk.aws_dynamodb.AttributeType.STRING)
+        cdk.aws_dynamodb.Table(endpoint, POOL_STATE, partition_key=pool)
     if stack_with_an_asset is not None:
         other = cdk.Stack(stage, "Other")
         (folder / "asset.txt").write_text("An asset.\n", encoding="utf-8")
@@ -1477,7 +1590,8 @@ def built(
     verify = (
         [pipelines.CodeBuildStep(VERIFY_ACTION, commands=["true"], env_from_cfn_outputs=told)] if verification else []
     )
-    pipeline.add_stage(stage, pre=gate + more, post=verify)
+    held = [pipelines.CodeBuildStep(HOLD_ACTION, commands=["true"])] if hold else []
+    pipeline.add_stage(stage, pre=gate + more + held, post=verify)
     pipeline.build_pipeline()
     if change is not None:
         change(cdk, stack, pipeline.pipeline)
@@ -2196,6 +2310,96 @@ def test_refuses_a_verification_that_writes_to_every_resource(cdk: ModuleType, t
     # Every resource holds the model bucket's objects too, which only the copy step's role may write.
     change = a_verification(("s3:PutObject", every_resource, None))
     assert refused(built(cdk, tmp_path, verification=True, change=change)) == {VERIFIES_MORE, WRITES_WEIGHTS}
+
+
+def test_the_hold_s_role_is_the_one_held(templates: dict[str, dict[str, Any]]) -> None:
+    # The rule holds a role only once it finds it: the app's hold is found, with its role, and so is
+    # the stage's pool-state table, by the logical ID recorded for it.
+    (found,) = [found for template in templates.values() for found in holds(template)]
+    actions, pipeline, project, role = found
+    assert role is not None
+    recorded = json.loads((Path(__file__).resolve().parent / "stateful_logical_ids.json").read_text(encoding="utf-8"))
+    ((stack, logical_id),) = stage_pool_state(templates, actions)
+    assert logical_id in recorded[stack]
+    # Its role reads that one stack's resources and that one table's items, and nothing else of
+    # CloudFormation or DynamoDB.
+    allowed = hold_resources(templates, actions, pipeline, project)
+    (template,) = [template for template in templates.values() if role in template["Resources"]]
+
+    def of(service: str) -> list[tuple[Any, str]]:
+        return [
+            (s["Action"], arn_text(s["Resource"]) or "")
+            for s in statements_of(template, role) or []
+            if any(str(action).lower().startswith(f"{service}:") for action in as_list(s.get("Action")))
+        ]
+
+    ((stacks,), (tables,)) = allowed["pools stack"], allowed["pool-state"]
+    ((action, resource),) = of("cloudformation")
+    assert action == "cloudformation:DescribeStackResource" and stacks.fullmatch(resource)
+    ((action, resource),) = of("dynamodb")
+    assert action == "dynamodb:GetItem" and tables.fullmatch(resource)
+
+
+def the_pool_state(suffix: str = "-*") -> Names:
+    """The pool-state table of the stage of `built`, by the name CloudFormation gives it, with
+    `suffix` after its logical ID."""
+
+    def arn(cdk: ModuleType, stack: Any, _pipeline: Any) -> str:
+        endpoint = stack.node.find_child("Rhi").node.find_child("Endpoint")
+        table = endpoint.node.find_child(POOL_STATE).node.default_child
+        name = f"Rhi-Endpoint-{endpoint.resolve(table.logical_id)}{suffix}"
+        return stack.format_arn(service="dynamodb", resource="table", resource_name=name)
+
+    return arn
+
+
+# The narrow role: what the hold of the stage of `built` reads.
+HOLDS: list[tuple[str, Names]] = [
+    ("cloudformation:DescribeStackResource", the_stack("Rhi-Endpoint")),
+    ("dynamodb:GetItem", the_pool_state()),
+]
+
+
+def a_hold(more: tuple[str, Names] | None = None) -> Change:
+    """Gives the role of the hold of `built` the narrow statements and, when asked, one more."""
+
+    def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
+        (project,) = [
+            node
+            for node in stack.node.find_all()
+            if isinstance(node, cdk.aws_codebuild.Project) and f"/Rhi/{HOLD_ACTION}" in node.node.path
+        ]
+        for action, arn in [*HOLDS, *([more] if more is not None else [])]:
+            project.role.add_to_principal_policy(
+                cdk.aws_iam.PolicyStatement(actions=[action], resources=[arn(cdk, stack, pipeline)])
+            )
+
+    return change
+
+
+def test_keeps_a_hold_with_the_narrow_role(cdk: ModuleType, tmp_path: Path) -> None:
+    templates = built(cdk, tmp_path, hold=True, change=a_hold())
+    ((_, _, _, role),) = [found for template in templates.values() for found in holds(template)]
+    assert role is not None
+    assert breaches(templates) == []
+
+
+@pytest.mark.parametrize(
+    "more",
+    [
+        pytest.param(("cloudformation:DescribeStackResource", the_stack("Rhi-Other")), id="another stack"),
+        pytest.param(("cloudformation:DescribeStackResource", every_resource), id="every stack"),
+        pytest.param(("cloudformation:DescribeStacks", the_stack("Rhi-Endpoint")), id="another action on the stack"),
+        pytest.param(("dynamodb:GetItem", the_table("Rhi-Endpoint-Other-*")), id="another table"),
+        pytest.param(("dynamodb:GetItem", the_pool_state("*")), id="every table whose name starts as the table's"),
+        pytest.param(("dynamodb:PutItem", the_pool_state()), id="a write to the table"),
+        pytest.param(("dynamodb:Scan", the_pool_state()), id="a scan of the table"),
+        pytest.param(("secretsmanager:GetSecretValue", the_secret(f"{CANARY_SECRET}-??????")), id="a secret"),
+    ],
+)
+def test_refuses_a_hold_that_may_do_more(cdk: ModuleType, tmp_path: Path, more: tuple[str, Names]) -> None:
+    assert refused(built(cdk, tmp_path / "kept", hold=True, change=a_hold())) == set()
+    assert refused(built(cdk, tmp_path / "breached", hold=True, change=a_hold(more))) == {HOLDS_MORE}
 
 
 def a_role(

@@ -58,6 +58,22 @@
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
 #   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
 #   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
+#
+# What the role of the step that holds the deployment while a session is on
+# (`src/rhi/pipeline/hold.py`) may do, held the same way: that module creates no resource, so the
+# step's project and role are this file's too. `tests/synth/test_pipeline_hold.py` and
+# `tests/policy/test_pipeline.py` hold the role to it.
+#
+# - cloudformation:DescribeStackResource on the pools stack, stack/<pools stack's name>/*, and on no
+#   other stack: the job finds the pool-state table's name by its logical ID in that stack.
+# - dynamodb:GetItem on the pool-state table of the stage, and on no other table: the job reads the
+#   session switch, one item of it. The table is named by the pattern
+#   table/<pools stack's name>-<the table's logical ID>-*, the name CloudFormation gives it.
+# - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
+#   CDK Pipelines' grant to a project that takes an input, here the source the job runs from.
+# - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
+#   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
+#   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
 
 [nag]
 "AwsSolutions-S1" = "The pipeline's artifact bucket keeps no server access logs: only the pipeline's own roles reach it, CloudTrail records who changes it, and a bucket of access logs would add storage and its cost that nothing in the design reads."
@@ -85,6 +101,11 @@
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/*]" = "CDK Pipelines shares one role among the asset-publishing projects, whose number grows with the assets, so the role writes to the CodeBuild report groups of the account rather than to one project's."
 "AwsSolutions-IAM5[Resource::arn:*:iam::<AWS::AccountId>:role/*]" = "The self-update assumes the bootstrap roles of the deploying account, which its condition selects by their bootstrap tag, so that the CDK CLI can publish the pipeline's assets and deploy the pipeline stack."
 "AwsSolutions-IAM5[Resource::*]" = "CDK Pipelines writes these statements on every resource, each action listed with its reason in the wildcard_actions table of this module; the bounded bootstrap's permissions boundary still caps every role that holds one."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineRhiHoldC6295550>:*]" = "The project that holds the deployment while a session is on writes to the streams of its own log group, whose names CodeBuild chooses for each build."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineRhiHoldC6295550>-*]" = "The project that holds the deployment while a session is on writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Pools/*]" = "The hold step finds the pool-state table's name by its logical ID in the pools stack, which it names by the stack's name; the wildcard stands for the stack's ID, which CloudFormation generates when the stack is created, so the pattern matches that one stack."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "The hold step reads the session switch from the stage's pool-state table, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."
+
 
 [wildcard_actions]
 "cloudformation:DescribeStacks" = "The self-update reads the state of the stacks it deploys, the pipeline stack and the bootstrap stack, whose names the CDK CLI resolves when it runs."
