@@ -382,8 +382,29 @@ def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: C
     assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
 
 
-def test_a_withdrawal_keeps_a_zero_token_day_written_before_settlements_were_marked(client: Calls) -> None:
-    # A day an earlier gateway settled into at no tokens holds its cookie, and no mark of either.
+def test_a_withdrawal_keeps_a_settlement_from_a_draining_gateway(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    opening = reserve(ledger, student(), "opening", pool="coursework")
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    # During a rollout, an older task settles a request into a day a newer task opened. It writes
+    # only the attributes it knows.
+    boto3.resource("dynamodb").Table(TABLE).update_item(
+        Key={"github_id": 7, "day": completed.day},
+        UpdateExpression=(
+            "REMOVE leases.completed ADD tokens :delta "
+            "SET affinity_cookies.coursework = :cookie, rebalance_applied.coursework = :number"
+        ),
+        ExpressionAttributeValues={":delta": -completed.lease.tokens, ":cookie": "kept-cookie", ":number": 7},
+    )
+
+    ledger.withdraw(opening)
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
+
+
+def test_a_withdrawal_keeps_a_zero_token_day_written_without_what_its_opening_carried(client: Calls) -> None:
+    # A day an earlier gateway opened and settled into at no tokens holds its cookie, and no record.
     day = UsageDay(
         7,
         "2026-11-15",
