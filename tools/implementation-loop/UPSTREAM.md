@@ -25,6 +25,28 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## A later verification discharges a smoke-test item, with nothing held (2026-11-22)
+
+A local patch, not in upstream, that extends "A verified deployment discharges a smoke-test item"
+below. That discharge reads the verdict the deploying phase recorded on the merge commit, and that
+phase holds the merge queue until the pipeline answers, so with `[deploy] contexts` empty, as it
+stays, every item that needs `aws:deployed-environment` was left to the owner. Here the same proof
+is read after the fact, on each run, and nothing waits for it. The engine's version stays 1.2.21:
+nothing here repairs a failed issue.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/config.py` | `Deploy` gains `discharge_contexts`, empty by default. `load_deploy` reads it as a list of contexts of the form `verify/<stage>` (`DISCHARGE_CONTEXT`): another type is refused (`TypeError`), and so is another form (`ValueError`). The key and the code that reads it land together, since `load_deploy` refuses a key it does not know. |
+| `implement_loop/engine.py` | `run` calls the new `_discharge_delivered` before `_reconcile_delivered`. For each delivered issue of the plan that owes an item `_smoke_items` accepts (the item conditions of `_verified_discharged`, moved into that helper), it reads each discharge context on the merge commit of the issue's pull request, as GitHub records it, and, when none there is a success with exactly `verified_description`, on the fetched head of `main` if that commit's history holds the merge commit. Each item whose smoke tests are files of that commit (`_holds_tests`, which now also requires a blob and not a directory of that name, for both discharges) gets a `commit_status` evidence record, its row in the pull request's evidence comment, its box ticked with a link to that comment, and its obligation removed; the event `obligations_discharged` journals it, and `_reconcile_delivered` closes the issue once every box is ticked. Reads and writes are made directly, not through `_safe`, so a call GitHub does not answer (a comment list included, which `_upsert_comment` would take for an empty one) discharges nothing and is journaled (`discharge_unread`); the next run tries again. It never enters the deploying phase, takes no claim and does not poll. The fields are read with `getattr` and a default, so this `engine.py` beside an older `config.py` discharges nothing; the fallback `Deploy` gains the field. The client makes no new kind of write: an issue's body and state, and a pull request's comment, as the evidence step does. |
+| `loop.toml` | `[deploy]` sets `discharge_contexts = ["verify/Rhi"]`, `verified_description` to the reporter's `VERIFIED_DESCRIPTION`, and `unverified_tests` to the GPU-only smoke test's file, which the verification's run on the mock pool leaves a test out of. `contexts` stays empty and `approval_description` keeps its value; the comments describe the new key. |
+| `tests/test_discharge.py` | New: no merge waits on a discharge context and no status is read before delivery; a later verification on the merge commit, or on a `main` that holds it, ends the issue `done`; what discharges nothing (another description, pending, failed, a test left out, one the commit does not hold or holds as a directory, another capability, another context, a `main` without the merge commit, an unanswered read); and an unanswered read or write is tried again with a single evidence comment. |
+| `tests/test_deploying.py` | The two tests that held the committed table to its neutral values hold it to the new ones, and read and refuse `discharge_contexts`. |
+
+Behaviour an upstream reader would not expect: a delivered issue can end `done`, with no action of
+the owner, on a later run, after the pipeline verified a commit that holds its merge.
+`tests/unit/test_deploy_settings.py`, a product test, holds each discharge context to a
+`verify/<stage>` context the reporter posts.
+
 ## What the removed controls left on the safety surface goes (2026-11-21)
 
 A local patch, not in upstream, that finishes the two before it ("Nothing locks a test..." and

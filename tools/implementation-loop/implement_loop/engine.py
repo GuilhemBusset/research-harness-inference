@@ -120,6 +120,7 @@ except (ImportError, AttributeError):   # pragma: no cover - older config.py and
         approval_description: str = ""
         verified_description: str = ""
         unverified_tests: tuple[str, ...] | None = None
+        discharge_contexts: tuple[str, ...] = ()
 
 try:   # the wait for the owner's push and merge arrives with its kind, and with its record, in model.py
     from .model import WAIT_OWNER_LANDING
@@ -289,6 +290,7 @@ class Engine:
                 self.store.event("run_ceiling", error=str(e))
             finally:
                 self._release_claims()
+            self._discharge_delivered()
             self._reconcile_delivered()
             for n in list(self._unpublished):   # a phase that changed outside a step
                 self._withhold(n)
@@ -2844,23 +2846,145 @@ class Engine:
                         and descriptions.get(c) == said), None)
         if not context:
             return {}
-        sha, texts, out = d["sha"], self._item_text(n), {}
+        sha = d["sha"]
+        return {item: self._status_record(item, tests, sha, context, said, f"the merge commit `{sha[:12]}`")
+                for item, tests in self._smoke_items(n, st, left_out).items() if self._holds_tests(sha, tests)}
+
+    def _smoke_items(self, n: int, st: IssueState, left_out: tuple[str, ...]) -> dict[str, list[str]]:
+        """The items of issue `n` a verification's success can prove, whatever the commit, each with
+        the smoke tests its text names: the plan gives it to the owner for `aws:deployed-environment`,
+        its text ends with no other capability, and it names a smoke test (`SMOKE_TEST`), none of
+        which is among `left_out` (`[deploy] unverified_tests`)."""
+        texts, out = self._item_text(n), {}
         unverified = {SMOKE_TEST.sub(r"\1", t) for t in left_out}   # as an item's text is read: no leading `./`
         for i in self._items(st):
             text = texts.get(i["id"], "")
             needs = NEEDS_END.search(text)
             tests = sorted({m.group(1) for m in SMOKE_TEST.finditer(text)})
-            if (i["proof"] != "owner" or i.get("capability") != DEPLOYED_ENVIRONMENT or not tests
-                    or (needs and needs.group(1) != DEPLOYED_ENVIRONMENT) or unverified & set(tests)
-                    or not all(self.ws.git("ls-tree", "--name-only", sha, "--", t, check=False) == t for t in tests)):
-                continue
-            record = Evidence(criterion=i["id"], kind=COMMIT_STATUS_EVIDENCE, command=None, cwd=".", head_sha=sha,
-                              exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
-                              note=(f"the commit status `{context}` succeeded on the merge commit `{sha[:12]}` with the "
-                                    f"description `{said}`: the verification ran {', '.join(f'`{t}`' for t in tests)}"),
-                              verifier="commit status")
-            out[i["id"]] = asdict(record) | {"context": context, "description": said}
+            if (i["proof"] == "owner" and i.get("capability") == DEPLOYED_ENVIRONMENT and tests
+                    and not (needs and needs.group(1) != DEPLOYED_ENVIRONMENT) and not unverified & set(tests)):
+                out[i["id"]] = tests
         return out
+
+    def _holds_tests(self, sha: str, tests: list[str]) -> bool:
+        """Whether each of `tests` is a file of the commit `sha`: a blob at that path, and not a
+        directory of that name, which `ls-tree --name-only` would list as well."""
+        for t in tests:
+            entry = self.ws.git("ls-tree", sha, "--", t, check=False)
+            meta, _, path = entry.partition("\t")
+            if path != t or meta.split(" ")[1:2] != ["blob"]:
+                return False
+        return True
+
+    @staticmethod
+    def _status_record(item: str, tests: list[str], sha: str, context: str, said: str, where: str) -> dict:
+        """The evidence record of an item the success of `context` on the commit `sha` proved."""
+        record = Evidence(criterion=item, kind=COMMIT_STATUS_EVIDENCE, command=None, cwd=".", head_sha=sha,
+                          exit_code=None, passed=True, duration_s=0.0, output_tail="", output_sha256="",
+                          note=(f"the commit status `{context}` succeeded on {where} with the description "
+                                f"`{said}`: the verification ran {', '.join(f'`{t}`' for t in tests)}"),
+                          verifier="commit status")
+        return asdict(record) | {"context": context, "description": said}
+
+    def _discharge_delivered(self) -> None:
+        """The owner items a later verification proves (ADR 0001, decision 6), after the fact: on
+        each run, for each delivered issue of the plan that holds an obligation for
+        `aws:deployed-environment` on an item `_smoke_items` accepts, the status of each context of
+        `[deploy] discharge_contexts` is read on the issue's merge commit (its pull request's, as
+        GitHub records it), and, when none there is a success with exactly `verified_description`,
+        on the head of `main` this run fetched, if that commit's history holds the merge commit. An
+        item whose smoke tests are all files of the commit that carries such a success is proven:
+        its evidence record (kind `commit_status`) joins the issue's, its row the evidence comment of
+        the pull request, its box is ticked with a link to that comment, its obligation is removed,
+        and the event `obligations_discharged` journals it; `_reconcile_delivered` then closes the
+        issue once every box is ticked. Nothing here enters the deploying phase, holds the merge
+        queue, or waits: what is not there yet is read again by the next run. Anything less
+        discharges nothing and the obligation stays the owner's: no context, no description, a table
+        that does not say what the verification leaves out (an older config.py reads none of the
+        three keys), no merged pull request with a merge commit, or a read or a write GitHub does not
+        answer, which the next run tries again."""
+        contexts = tuple(getattr(self.deploy, "discharge_contexts", ()) or ())
+        said = getattr(self.deploy, "verified_description", "")
+        left_out = getattr(self.deploy, "unverified_tests", None)
+        if not contexts or not said or left_out is None:
+            return
+        head: list[str] = []   # the head of `main`, fetched once, when an issue needs it
+        for n in self.plan.work:
+            st = self.store.issue(n)
+            if st.phase != Phase.DELIVERED:
+                continue
+            owed = {o["item"] for o in st.obligations
+                    if o.get("kind") == "capability" and o.get("detail") == DEPLOYED_ENVIRONMENT}
+            items = {i: tests for i, tests in self._smoke_items(n, st, left_out).items() if i in owed}
+            if not items:
+                continue
+            try:
+                self._discharge_later(n, items, contexts, said, head)
+            except (GitHubError, GitError, OSError) as e:   # with RedactionUnavailable: nothing of it was published
+                self.store.event("discharge_unread", issue=n, error=str(e)[:300])
+
+    def _discharge_later(self, n: int, items: dict[str, list[str]], contexts: tuple[str, ...], said: str,
+                         head: list[str]) -> None:
+        """`_discharge_delivered` for issue `n`, whose `items` it found. A read GitHub does not
+        answer is raised, and so is a write: nothing is ticked, recorded or removed before the
+        evidence comment is written, and the issue's state is recorded last."""
+        st = self.store.issue(n)
+        number = st.pr
+        pr = self.gh.find_pr(st.branch) if number and st.branch else None
+        merge = (pr or {}).get("merge_commit_sha")
+        if not number or not pr or pr.get("number") != number or not (pr.get("merged") or pr.get("merged_at")) or not merge:
+            return
+        if not head:   # the merge commit and the head of `main`, as this run fetched them
+            self.ws.fetch()
+            head.append(self.ws.git("rev-parse", self.ws.base_ref()))
+
+        def verified(sha: str) -> str | None:
+            return next((c for c in contexts if VERIFY_CONTEXT.fullmatch(c)
+                         and (s := self.gh.deploy_status(sha, c) or {}).get("state") == "success"
+                         and s.get("description") == said), None)
+        sha, where, context = merge, f"the merge commit `{merge[:12]}`", verified(merge)
+        if not context:
+            sha, where = head[0], f"`main` at `{head[0][:12]}`, whose history holds the merge commit `{merge[:12]}`"
+            if sha == merge or not self.ws.is_ancestor(self.ws.repo, merge, sha):
+                return
+            context = verified(sha)
+            if not context:
+                return
+        proven = {item: self._status_record(item, tests, sha, context, said, where)
+                  for item, tests in items.items() if self._holds_tests(sha, tests)}
+        if not proven:
+            return
+        records = [e for e in st.evidence if e.get("criterion") not in proven] + list(proven.values())
+        evidence_head = st.verified_sha or next((e["head_sha"] for e in st.evidence if e.get("kind") == "command"), "")
+        verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
+        comment = self._upsert_comment_answered(number, report.EVIDENCE_MARKER,
+                                                report.render_evidence(n, records, evidence_head, verdicts))
+        link = (comment or {}).get("html_url", "")
+        if not link:
+            return
+        body = self.gh.get_issue(n).get("body") or ""
+        ticked = issue_parser.tick(body, dict.fromkeys(proven, link))
+        if ticked != body:
+            self.gh.edit_issue(n, body=ticked)
+        st = self.store.issue(n)
+        st.evidence = records
+        st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in proven)]
+        st.human_tasks = [self._obligation_text(o) for o in st.obligations]
+        self.store.put(st)
+        self.store.event("obligations_discharged", issue=n, head=sha, items=dict.fromkeys(proven, context))
+        if st.obligations:   # it stays delivered: its progress comment no longer lists the items
+            try:
+                self._announce(n, st, Phase.DELIVERED)
+            except RedactionUnavailable as e:
+                self.store.event("progress_not_published", issue=n, phase=Phase.DELIVERED.value, error=str(e)[:300])
+
+    def _upsert_comment_answered(self, n: int, marker: str, body: str) -> dict:
+        """`_upsert_comment`, where a read or a write GitHub does not answer is raised: a list of
+        comments that could not be read is not an empty one, which would add a second comment."""
+        for c in self.gh.list_comments(n):
+            if marker in (c.get("body") or ""):
+                return self.gh.update_comment(c["id"], body)
+        return self.gh.create_comment(n, body)
 
     def _obligation_text(self, o: dict) -> str:
         if o["kind"] == "deferred":

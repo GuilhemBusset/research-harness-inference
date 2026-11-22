@@ -1,5 +1,6 @@
 """Caps, ceilings and repo-specific constants (ADR 0012; this repository's values: ADR 0001)."""
 
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -179,6 +180,13 @@ class Deploy:
     # The smoke test files of which the verification leaves a test out, from the repository's root. None:
     # the table does not say, and a verified deployment then discharges nothing.
     unverified_tests: tuple[str, ...] | None = None
+    # Verification contexts (`verify/<stage>`) read only to discharge, after the fact, an item a
+    # later verification of the merge commit, or of a `main` that holds it, proved; never waited for.
+    discharge_contexts: tuple[str, ...] = ()
+
+
+# A context `discharge_contexts` accepts: a stage's verification, as the pipeline's reporter posts it.
+DISCHARGE_CONTEXT = re.compile(r"verify/[^/\s]+")
 
 
 def load_deploy(table) -> Deploy:
@@ -212,8 +220,15 @@ def load_deploy(table) -> Deploy:
     unverified = table.get("unverified_tests")
     if unverified is not None and not (isinstance(unverified, list) and all(isinstance(t, str) for t in unverified)):
         raise TypeError("loop.toml: [deploy] unverified_tests must be a list of test files")
+    discharge = table.get("discharge_contexts", [])
+    if not isinstance(discharge, list) or not all(isinstance(c, str) for c in discharge):
+        raise TypeError("loop.toml: [deploy] discharge_contexts must be a list of verify/<stage> contexts")
+    wrong = [c for c in discharge if not DISCHARGE_CONTEXT.fullmatch(c)]
+    if wrong:
+        raise ValueError(f"loop.toml: [deploy] discharge_contexts holds {wrong!r}, not of the form verify/<stage>")
     return Deploy(contexts=tuple(contexts), timeout_s=timeout_s, approval_description=approval,
-                  verified_description=verified, unverified_tests=None if unverified is None else tuple(unverified))
+                  verified_description=verified, unverified_tests=None if unverified is None else tuple(unverified),
+                  discharge_contexts=tuple(discharge))
 
 
 def load_ci_jobs(host) -> dict[str, str]:
