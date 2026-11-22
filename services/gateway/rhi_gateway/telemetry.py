@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rhi_common.causes import Cause
-from rhi_gateway.routes import match
+from rhi_gateway.routes import COUNT_TOKENS, match
 
 if TYPE_CHECKING:
     from rhi_gateway.keystore import KeyRecord
@@ -68,7 +68,10 @@ class RequestRecord:
     """What is logged of one request. Every field is metadata: none comes from a body or a header's value.
 
     `student` is not logged: it is the record of the accepted key, by which the metrics read the
-    student's budget from the ledger (`rhi_gateway.metrics`).
+    student's budget from the ledger (`rhi_gateway.metrics`). Nor are `cached_input_tokens`, the
+    part of the input the engine reported read from the cache, and `token_count`, whether the
+    request is a token count (`POST /v1/messages/count_tokens`), whose input is a count asked and
+    not a generation's: the metrics count both apart.
     """
 
     time: str
@@ -81,6 +84,8 @@ class RequestRecord:
     status: int | None = None
     cause: str | None = None
     student: KeyRecord | None = field(default=None, repr=False)
+    cached_input_tokens: int = 0
+    token_count: bool = False
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -113,12 +118,13 @@ def note_pool(name: str) -> None:
         record.pool = name
 
 
-def note_tokens(input_tokens: int, output_tokens: int) -> None:
-    """The tokens the request's settlement observed."""
+def note_tokens(input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> None:
+    """The tokens the request's settlement observed, and the part of the input read from the cache."""
     record = _CURRENT.get()
     if record is not None:
         record.input_tokens = input_tokens
         record.output_tokens = output_tokens
+        record.cached_input_tokens = cached_input_tokens
 
 
 def note_cause(cause: Cause) -> None:
@@ -165,7 +171,7 @@ class Telemetry:
             return
         entry = match(scope["method"], scope.get("raw_path"))
         wire_format = None if entry is None or entry.wire_format is None else entry.wire_format.value
-        record = RequestRecord(time=_arrival(self._clock()), wire_format=wire_format)
+        record = RequestRecord(time=_arrival(self._clock()), wire_format=wire_format, token_count=entry == COUNT_TOKENS)
         started = self._monotonic()
 
         faulted = False

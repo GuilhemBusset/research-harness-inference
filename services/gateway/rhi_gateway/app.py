@@ -625,7 +625,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         token_sent = None if turn is None else turn.token_sent
 
         async def settle(observed: Observed) -> None:
-            telemetry.note_tokens(observed.input_tokens, observed.output_tokens)
+            telemetry.note_tokens(observed.input_tokens, observed.output_tokens, observed.cached_input_tokens)
             if demand is not None:
                 demand.end()
             if turn is not None:

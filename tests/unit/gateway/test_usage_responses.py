@@ -28,7 +28,7 @@ STREAM = (
     b'"response":{"id":"resp_1","object":"response","status":"completed","output":[],' + USAGE + b"}}\r\n\r\n"
 )
 ANSWER = b'{"id":"resp_1","object":"response","status":"completed","output":[],' + USAGE + b"}"
-TOTALS = Usage(input_tokens=425, output_tokens=15)
+TOTALS = Usage(input_tokens=425, output_tokens=15, cached_input_tokens=300)
 
 
 def read(*chunks: bytes) -> tuple[Usage | None, bool]:
@@ -55,10 +55,14 @@ def test_a_stream_cut_before_its_terminal_event_reports_nothing_observed_and_no_
     assert reported == []
 
 
-def test_cached_input_is_counted_once() -> None:
+def test_cached_input_is_counted_once_and_read_apart() -> None:
     usage = b'{"input_tokens":82000,"input_tokens_details":{"cached_tokens":80000},"output_tokens":40}'
-    assert read(terminal("response.completed", usage)) == (Usage(input_tokens=82_000, output_tokens=40), True)
-    assert read_answer(b'{"object":"response","usage":' + usage + b"}") == Usage(input_tokens=82_000, output_tokens=40)
+    counted_once = Usage(input_tokens=82_000, output_tokens=40, cached_input_tokens=80_000)
+    assert read(terminal("response.completed", usage)) == (counted_once, True)
+    assert read_answer(b'{"object":"response","usage":' + usage + b"}") == counted_once
+    # A usage that details no cached part reports 0 of it.
+    for none in (b'{"input_tokens":82000,"output_tokens":40}', usage.replace(b"80000", b"null")):
+        assert read_answer(b'{"usage":' + none + b"}") == Usage(input_tokens=82_000, output_tokens=40)
 
 
 def test_a_non_streaming_answer_gives_its_usage_object() -> None:
@@ -69,7 +73,7 @@ def test_a_non_streaming_answer_gives_its_usage_object() -> None:
 
 
 def test_an_answer_cut_short_at_a_limit_ends_cleanly_and_a_failed_one_does_not() -> None:
-    usage = b'{"input_tokens":425,"output_tokens":15}'
+    usage = b'{"input_tokens":425,"input_tokens_details":{"cached_tokens":300},"output_tokens":15}'
     assert read(terminal("response.incomplete", usage)) == (TOTALS, True)
     # An event that comes without its `event` line is known by the type in its data.
     assert read(terminal("response.incomplete", usage).partition(b"\n")[2]) == (TOTALS, True)

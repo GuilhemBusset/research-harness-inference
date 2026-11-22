@@ -17,8 +17,8 @@ How the counts are made:
 
 - The input is `input_tokens` as reported. In OpenAI's reference it already includes the tokens
   read from the cache, which `input_tokens_details.cached_tokens` details apart. The daily budget
-  counts every input token, cached or not (sections 11.3 and 17), so the detail is not read and
-  the cached part is not added again.
+  counts every input token, cached or not (sections 11.3 and 17), so the cached part is not added
+  again: it is read apart, as `cached_input_tokens`, 0 when the usage details none.
 - The output is `output_tokens` as reported; it already includes the reasoning tokens that
   `output_tokens_details` details apart.
 - A usage object counts when both fields are whole numbers that are not negative. Anything else
@@ -54,6 +54,8 @@ class Usage:
     input_tokens: int
     """The whole input as reported, the tokens read from the cache included."""
     output_tokens: int
+    cached_input_tokens: int = 0
+    """The part of the input read from the cache, `input_tokens_details.cached_tokens`; 0 when not reported."""
 
 
 class ResponsesStreamUsage:
@@ -99,7 +101,9 @@ def _usage(usage: object) -> Usage | None:
     tokens_in, tokens_out = _count(usage.get("input_tokens")), _count(usage.get("output_tokens"))
     if tokens_in is None or tokens_out is None:
         return None
-    return Usage(input_tokens=tokens_in, output_tokens=tokens_out)
+    details = usage.get("input_tokens_details")
+    cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
+    return Usage(input_tokens=tokens_in, output_tokens=tokens_out, cached_input_tokens=cached or 0)
 
 
 def _count(value: object) -> int | None:

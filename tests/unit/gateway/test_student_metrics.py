@@ -67,6 +67,7 @@ HERON = ("heron", 600_600_707, 500_000)
 REQUESTS, INPUT, OUTPUT, ERRORS = (
     f"{name}_total" for name in (metrics.REQUESTS, metrics.INPUT_TOKENS, metrics.OUTPUT_TOKENS, metrics.ERRORS)
 )
+CACHED, COUNTED = (f"{name}_total" for name in (metrics.CACHED_INPUT_TOKENS, metrics.COUNTED_TOKENS))
 
 
 def body(entry: routes.Route, pool: str = "coursework") -> dict[str, Any] | None:
@@ -110,6 +111,8 @@ class Gateway:
     aws: Aws
     # The usage the engine reports for the next request: input and output tokens.
     usage: list[int] = field(default_factory=lambda: [5000, 7])
+    # The part of that input the engine reports read from the cache, in the formats of OpenAI.
+    cached: int = 0
     store: InMemoryKeyStore = field(default_factory=InMemoryKeyStore)
 
 
@@ -141,6 +144,8 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
             "output_tokens": used_out,
             "prompt_tokens": used_in,
             "completion_tokens": used_out,
+            "prompt_tokens_details": {"cached_tokens": made.cached},
+            "input_tokens_details": {"cached_tokens": made.cached},
         }
         return httpx.Response(200, json={"type": "message", "input_tokens": used_in, "usage": usage})
 
@@ -259,6 +264,22 @@ def test_two_students_are_counted_apart(capsys: pytest.CaptureFixture[str]) -> N
     # The log says the same of each request as the counters do.
     logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert sum(record["input_tokens"] for record in logged) == 5000 + 1200 + 800 + 40
+
+
+def test_a_token_count_is_counted_apart_from_a_generation_and_its_cached_part() -> None:
+    made = gateway(OTTER)
+    key = made.keys["otter"]
+    made.usage, made.cached = [5000, 7], 4000
+    assert call(made.app, "POST", routes.RESPONSES.path, key=key, body=body(routes.RESPONSES)) == 200
+    made.usage, made.cached = [900, 0], 0
+    assert call(made.app, "POST", routes.COUNT_TOKENS.path, key=key, body=body(routes.COUNT_TOKENS)) == 200
+
+    labels = {"alias": "otter", "pool": "coursework"}
+    assert value(made.metrics, REQUESTS, **labels) == 2
+    # The input and output hold the generation's tokens only, and the token count's are counted apart.
+    assert (value(made.metrics, INPUT, **labels), value(made.metrics, OUTPUT, **labels)) == (5000, 7)
+    assert value(made.metrics, CACHED, **labels) == 4000
+    assert value(made.metrics, COUNTED, **labels) == 900
 
 
 def test_a_student_whose_key_is_gone_is_served_no_more(monkeypatch: pytest.MonkeyPatch) -> None:

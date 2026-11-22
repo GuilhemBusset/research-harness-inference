@@ -15,8 +15,8 @@ How the counts are made:
 
 - The input is `prompt_tokens` as reported. In OpenAI's reference it already includes the tokens
   read from the cache, which `prompt_tokens_details.cached_tokens` details apart. The daily budget
-  counts every input token, cached or not (sections 11.3 and 17), so the detail is not read and
-  the cached part is not added again.
+  counts every input token, cached or not (sections 11.3 and 17), so the cached part is not added
+  again: it is read apart, as `cached_input_tokens`, 0 when the usage details none.
 - The output is `completion_tokens` as reported; it already includes the reasoning tokens that
   `completion_tokens_details` details apart.
 - A usage object counts when both fields are whole numbers that are not negative. Anything else
@@ -72,6 +72,8 @@ class Usage:
     output_tokens: int
     ended_cleanly: bool
     """Whether the answer is complete: a stream's `[DONE]` after its usage and no error, or a whole answer."""
+    cached_input_tokens: int = 0
+    """The part of the input read from the cache, `prompt_tokens_details.cached_tokens`; 0 when not reported."""
 
 
 class ChatStreamUsage:
@@ -82,7 +84,7 @@ class ChatStreamUsage:
         self._reader = SseReader()
         self._event = bytearray()  # The whole lines of the event that has not ended yet.
         self._line = bytearray()  # The line that has not ended yet.
-        self._counts: tuple[int, int] | None = None
+        self._counts: tuple[int, int, int] | None = None
         self._failed = False  # Whether a chunk has reported an error.
         self._ended = False
 
@@ -123,8 +125,8 @@ class ChatStreamUsage:
     @property
     def observed(self) -> Usage:
         """The tokens of the last usage read so far, and whether the stream has ended cleanly."""
-        tokens_in, tokens_out = self._counts or (0, 0)
-        return Usage(input_tokens=tokens_in, output_tokens=tokens_out, ended_cleanly=self._ended)
+        tokens_in, tokens_out, cached = self._counts or (0, 0, 0)
+        return Usage(tokens_in, tokens_out, ended_cleanly=self._ended, cached_input_tokens=cached)
 
     def _read(self, event: SseEvent) -> bool:
         """Read an event the stream has ended, and say whether it is a usage chunk."""
@@ -142,8 +144,8 @@ class ChatStreamUsage:
 def read_answer(body: bytes | bytearray | str) -> Usage:
     """Read the usage object of a non-streaming answer from its whole body."""
     counts = _counts(_json_object(body).get("usage"))
-    tokens_in, tokens_out = counts or (0, 0)
-    return Usage(input_tokens=tokens_in, output_tokens=tokens_out, ended_cleanly=counts is not None)
+    tokens_in, tokens_out, cached = counts or (0, 0, 0)
+    return Usage(tokens_in, tokens_out, ended_cleanly=counts is not None, cached_input_tokens=cached)
 
 
 def _is_usage_chunk(payload: dict[str, object]) -> bool:
@@ -151,12 +153,16 @@ def _is_usage_chunk(payload: dict[str, object]) -> bool:
     return isinstance(payload.get("usage"), dict) and not payload.get("choices")
 
 
-def _counts(usage: object) -> tuple[int, int] | None:
-    """The input and output tokens of this usage object, or `None` if it is not one."""
+def _counts(usage: object) -> tuple[int, int, int] | None:
+    """The input, output and cached input tokens of this usage object, or `None` if it is not one."""
     if not isinstance(usage, dict):
         return None
     tokens_in, tokens_out = _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
-    return None if tokens_in is None or tokens_out is None else (tokens_in, tokens_out)
+    if tokens_in is None or tokens_out is None:
+        return None
+    details = usage.get("prompt_tokens_details")
+    cached = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
+    return tokens_in, tokens_out, cached or 0
 
 
 def _count(value: object) -> int | None:
