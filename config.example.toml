@@ -28,7 +28,7 @@ login_client_id = "Iv1.0000example0000"
 monthly_budget_usd = 1000
 
 # The percentages of that amount at which the budget e-mails the admin, on actual cost (system
-# design, sections 11.3 and 17): 1 to 10 whole numbers from 1 to 1000000000, none repeated (what
+# design, sections 11.3 and 17): 1 to 10 whole numbers from 1 to 1000000, none repeated (what
 # one budget can hold). Left out, they are 50, 80 and 100.
 budget_alert_percentages = [50, 80, 100]
 

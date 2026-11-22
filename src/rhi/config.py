@@ -209,10 +209,10 @@ def _whole_dollars(value: object) -> int:
     return value
 
 
-# What one AWS::Budgets::Budget can hold: at most 10 notifications, each at a threshold of at most
-# 1,000,000,000 (the CloudFormation resource reference and its schema).
+# What one AWS::Budgets::Budget can hold: at most 10 notifications, each, as a percentage of the
+# budgeted amount, at most 1,000,000 (the CloudFormation resource reference of the notification).
 MOST_BUDGET_ALERTS = 10
-HIGHEST_BUDGET_ALERT_PERCENTAGE = 1_000_000_000
+HIGHEST_BUDGET_ALERT_PERCENTAGE = 1_000_000
 
 
 def _percentages(value: object) -> tuple[int, ...]:
@@ -404,7 +404,7 @@ KEYS: dict[str, Key] = {
     "login_client_id": _STRING,
     "monthly_budget_usd": Key("a whole number of US dollars above zero", _whole_dollars, _number_from_text),
     "budget_alert_percentages": Key(
-        "a list of 1 to 10 whole percentages from 1 to 1000000000, none of them repeated, such as [50, 80, 100]",
+        "a list of 1 to 10 whole percentages from 1 to 1000000, none of them repeated, such as [50, 80, 100]",
         _percentages,
         _json_from_text,
     ),
