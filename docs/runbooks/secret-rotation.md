@@ -416,10 +416,9 @@ the next run uses the new key.
        pool must stop serving meanwhile.
    - `invalid_key`: the canary's key, not the pool's secret: the canary has no valid key (its
      part, below).
-   - `budget_reached`, `concurrency_limit`, `capacity_unavailable`, `pool_ceiling_reached`,
-     `time_limit`: nothing to do with the bearer secret; the rotation is not tested yet. Send the
-     request again once the cause has passed (for capacity, runbook
-     [a capacity failure](capacity-failure.md)).
+   - `concurrency_limit`, `capacity_unavailable`, `pool_ceiling_reached`, `time_limit`: nothing
+     to do with the bearer secret; the rotation is not tested yet. Send the request again once the
+     cause has passed (for capacity, runbook [a capacity failure](capacity-failure.md)).
 
    The weekly canary tests the coursework pool and no other, so it can stand in for this request
    only for coursework (step 5 says how to read its result).

@@ -1,5 +1,4 @@
-"""Spike S2: does each client survive the hold, and how does it show a 402 (system design, sections
-5.3, 6.2, 12 and 13)?
+"""Spike S2: does each client survive the hold (system design, sections 5.3, 6.2, 12 and 13)?
 
 The hold is sized from the clients (section 5.3): Claude Code tolerates a stream of pings for about
 12 minutes; Codex's idle timer ignores SSE comments and stops a stream after 300 seconds by default,
@@ -33,8 +32,7 @@ rewrite changes nothing they do.
 
 A client's **request** is the first one it sends on its inference route that carries the run's
 marker, the random word of the prompt, and is of the kind measured (`intended`): a model list, a
-token count or a request of another kind is not it. A **repeat** of it is a later request on the
-same route with the same body (`repeats`).
+token count or a request of another kind is not it.
 
 **The hold.** The owner sets the mock pool's `start_delay_seconds` so that a cold start of the pool,
 through the gateway, lasts just under the pool's `hold_seconds` (420 seconds by default): the
@@ -65,18 +63,9 @@ moment it closed the request, or to the end of the exchange or of the process wh
 request a client dropped and then sent again counts as given up, at the drop, whatever the repeat
 did. A completed request has 0 seconds.
 
-**The 402.** Each client then sends one request with the key of the canary student whose daily
-budget is 0 (`rhi_common.spike_keys`), whom the gateway answers 402 with the cause `budget_reached`
-on the first request (`RefusalOutcome`). The forwarder confirms that the client's request was
-answered so; a client whose request was not, or that sent none, leaves the run not measured. The
-job records whether the client **retried** it (a repeat of the request followed), and whether it
-**showed** the user that the budget was spent: whether what it printed holds the cause's sentence
-or its name (`rhi_common.causes`).
-
 **The numbers** (`Number`), one per row of the record `docs/measurements/s2.md`: for each client and
-kind of call, `<client>_<kind>_completed` (1 or 0) and `<client>_<kind>_seconds_before_giving_up`;
-for each client, `<client>_402_retried` and `<client>_402_shown` (1 or 0). They are posted with the
-verdict through `common.run_spike`; the versions are printed with the outcomes, for the record.
+kind of call, `<client>_<kind>_completed` (1 or 0) and `<client>_<kind>_seconds_before_giving_up`.
+They are posted with the verdict through `common.run_spike`; the versions are printed with the outcomes, for the record.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s2_client_hold`):
 
@@ -88,7 +77,7 @@ verdict through `common.run_spike`; the versions are printed with the outcomes, 
 
 The pool's deadlines and its `start_delay_seconds` come from the deployed configuration
 (`rhi.config.read_ssm`): a pool whose delay is 0, or that is not a mock pool, stops the job before
-it sends anything. The canary students need five keys with the default budget, and the spent one.
+it sends anything. The canary students need five keys, one for each client.
 Run it while nothing else sends to the pool: the job needs it to go cold between its attempts.
 """
 
@@ -127,7 +116,6 @@ import harnesses
 from rhi import config
 from rhi_cli import harness as login_files
 from rhi_cli import store
-from rhi_common.causes import Cause
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -233,16 +221,6 @@ class Number(StrEnum):
     ANTHROPIC_SDK_STREAM_SECONDS_BEFORE_GIVING_UP = "anthropic_sdk_stream_seconds_before_giving_up"
     ANTHROPIC_SDK_CALL_COMPLETED = "anthropic_sdk_call_completed"
     ANTHROPIC_SDK_CALL_SECONDS_BEFORE_GIVING_UP = "anthropic_sdk_call_seconds_before_giving_up"
-    CLAUDE_CODE_402_RETRIED = "claude_code_402_retried"
-    CLAUDE_CODE_402_SHOWN = "claude_code_402_shown"
-    CODEX_DEFAULT_402_RETRIED = "codex_default_402_retried"
-    CODEX_DEFAULT_402_SHOWN = "codex_default_402_shown"
-    CODEX_PROFILE_402_RETRIED = "codex_profile_402_retried"
-    CODEX_PROFILE_402_SHOWN = "codex_profile_402_shown"
-    OPENAI_SDK_402_RETRIED = "openai_sdk_402_retried"
-    OPENAI_SDK_402_SHOWN = "openai_sdk_402_shown"
-    ANTHROPIC_SDK_402_RETRIED = "anthropic_sdk_402_retried"
-    ANTHROPIC_SDK_402_SHOWN = "anthropic_sdk_402_shown"
 
 
 def completed(client: Client, kind: Kind) -> Number:
@@ -253,16 +231,6 @@ def completed(client: Client, kind: Kind) -> Number:
 def seconds_before_giving_up(client: Client, kind: Kind) -> Number:
     """The name of the seconds `client` held its request of `kind` before giving up; 0 when it completed."""
     return Number(f"{client}_{kind}_seconds_before_giving_up")
-
-
-def retried_402(client: Client) -> Number:
-    """The name of whether `client` retried the 402."""
-    return Number(f"{client}_402_retried")
-
-
-def shown_402(client: Client) -> Number:
-    """The name of whether `client` showed that the budget was spent."""
-    return Number(f"{client}_402_shown")
 
 
 # The verdict.
@@ -290,30 +258,15 @@ class HoldOutcome:
     seconds_before_giving_up: float
 
 
-@dataclass(frozen=True)
-class RefusalOutcome:
-    """What one client did with the 402 `budget_reached`."""
-
-    client: Client
-    version: str
-    retried: bool
-    shown: bool
-
-
-def numbers_of(holds: Sequence[HoldOutcome], refusals: Sequence[RefusalOutcome]) -> dict[str, int | float]:
+def numbers_of(holds: Sequence[HoldOutcome]) -> dict[str, int | float]:
     """The numbers the job posts. ValueError unless there is exactly one outcome for each client and
-    kind of call, and one refusal for each client."""
+    kind of call."""
     if sorted((hold.client, hold.kind) for hold in holds) != sorted(PAIRS):
         raise ValueError("the outcomes are not one for each client and kind of call")
-    if sorted(refusal.client for refusal in refusals) != sorted(Client):
-        raise ValueError("the refusals are not one for each client")
     numbers: dict[str, int | float] = {}
     for hold in holds:
         numbers[completed(hold.client, hold.kind)] = int(hold.completed)
         numbers[seconds_before_giving_up(hold.client, hold.kind)] = round(hold.seconds_before_giving_up, 1)
-    for refusal in refusals:
-        numbers[retried_402(refusal.client)] = int(refusal.retried)
-        numbers[shown_402(refusal.client)] = int(refusal.shown)
     return numbers
 
 
@@ -366,23 +319,6 @@ def intended(exchanges: Sequence[Exchange], client: Client, kind: Kind, marker: 
     return None
 
 
-def _same_request(body: dict[str, Any] | None) -> dict[str, Any] | None:
-    # What differs between two sends of one request is not the request: an SDK's metadata.
-    return None if body is None else {key: value for key, value in body.items() if key != "metadata"}
-
-
-def repeats(exchanges: Sequence[Exchange], first: Exchange) -> int:
-    """How many times the client sent `first` again: later requests on its route with its body."""
-    later = exchanges[exchanges.index(first) + 1 :]
-    same = _same_request(first.json())
-    return sum(
-        1
-        for exchange in later
-        if exchange.route == first.route
-        and (exchange.body == first.body or (same is not None and _same_request(exchange.json()) == same))
-    )
-
-
 def _cause_in(held: object) -> str | None:
     error = held.get("error") if isinstance(held, dict) else None
     if not isinstance(error, dict):
@@ -410,11 +346,6 @@ def stream_error(event: bytes) -> str | None:
     if isinstance(held, dict) and held.get("type") == "response.failed":
         held = held.get("response")
     return _cause_in(held)
-
-
-def shows_budget(output: str) -> bool:
-    """Whether a client's output tells the user that the budget is spent: the cause's sentence or name."""
-    return Cause.BUDGET_REACHED.sentence in output or Cause.BUDGET_REACHED.value in output
 
 
 # The forwarder.
@@ -697,17 +628,6 @@ def call_delay(cold_start: float, deadline: float) -> float:
     return max(0.0, cold_start - (deadline - CALL_AIM_SECONDS))
 
 
-def refusal_outcome(client: Client, version: str, attempt: Attempt, marker: str) -> RefusalOutcome:
-    """What the client did with the 402. NotExercised when its request was not answered 402 `budget_reached`."""
-    kind = KINDS[client][0]
-    request = intended(attempt.exchanges, client, kind, marker)
-    if request is None or request.status != Cause.BUDGET_REACHED.status or request.cause != Cause.BUDGET_REACHED:
-        raise NotExercised(f"{client}'s request was not answered 402 {Cause.BUDGET_REACHED}")
-    return RefusalOutcome(
-        client, version, retried=repeats(attempt.exchanges, request) > 0, shown=shows_budget(attempt.output)
-    )
-
-
 class NotExercised(RuntimeError):
     """The run did not ask the question: it is not measured."""
 
@@ -925,7 +845,7 @@ class Deadlines:
 
 
 class Run:
-    """One run of the spike: the 402 of each client, then the holds of the streams and the calls."""
+    """One run of the spike: the holds of the streams, then those of the calls."""
 
     def __init__(
         self,
@@ -940,7 +860,7 @@ class Run:
         log: Callable[[str], None] = print,
     ) -> None:
         if len(keys.students) < len(Client):
-            raise ValueError("spike S2 needs a canary student with the default budget for each client")
+            raise ValueError("spike S2 needs a canary student for each client")
         self.gateway, self.deadlines, self.start, self.keys = gateway, deadlines, start, keys
         self.versions, self.clock, self.sleep, self.log = versions, clock, sleep, log
         # The last cold start measured: from the first request, or the wake, to readiness.
@@ -948,13 +868,6 @@ class Run:
 
     def version(self, client: Client) -> str:
         return self.versions[VERSION_OF[client]]
-
-    def refusal(self, client: Client) -> RefusalOutcome:
-        marker = f"rhi-s2-{secrets.token_hex(4)}"
-        running = self.start(client, KINDS[client][0], self.keys.spent, f"Reply with one word. {marker}")
-        while not running.done():
-            self.sleep(POLL_SECONDS)
-        return refusal_outcome(client, self.version(client), running.result(), marker)
 
     def _wait_cold(self) -> None:
         waited = 0.0
@@ -1025,14 +938,11 @@ class Run:
         raise NotExercised(f"no hold of a {kind} exercised the question for {', '.join(remaining)}")
 
     def measure(self) -> dict[str, int | float]:
-        refusals = [self.refusal(client) for client in Client]
         holds = self.holds(Kind.STREAM) + self.holds(Kind.CALL)
         for hold in holds:
             given_up = "completed" if hold.completed else f"gave up after {hold.seconds_before_giving_up:.0f} s"
             self.log(f"{hold.client} {hold.version} {hold.kind}: {given_up}")
-        for refusal in refusals:
-            self.log(f"{refusal.client} {refusal.version} 402: retried {refusal.retried}, shown {refusal.shown}")
-        return numbers_of(holds, refusals)
+        return numbers_of(holds)
 
 
 # The SDK scripts.

@@ -5,12 +5,12 @@ while the tests run: none is written in this file.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import TYPE_CHECKING
 
 from rhi_admin import main, roster
 from rhi_admin.roster import DEFAULT_DAILY_TOKEN_BUDGET
-from rhi_admin.spikes import SPENT_ALIAS
 from rhi_common import spike_keys
 from rhi_common.keys import KEY_PATTERN, is_valid_key, key_hash
 from rhi_common.students import StudentKey
@@ -42,28 +42,31 @@ def test_the_command_fills_the_spikes_secret_and_prints_no_key(
         runs.append(spike_keys.read(admin.secrets))
     first, second = runs
 
-    # Three students with the default budget and one whose budget is 0, each under its fixed alias.
+    # The secret holds the students' keys and nothing else.
+    value = admin.secrets.get_secret_value(SecretId=spike_keys.SPIKE_KEYS_SECRET)["SecretString"]
+    assert set(json.loads(value)) == {"students"}
+
+    # Three students with the default budget, each under its fixed alias, and no one else.
     assert len(second.students) == 3
-    assert all(is_valid_key(key) for key in (*second.students, second.spent))
+    assert all(is_valid_key(key) for key in second.students)
     students = [stored(admin, key) for key in second.students]
     assert [(record.alias, record.daily_token_budget) for record in students] == [
         (f"spike-{number}", DEFAULT_DAILY_TOKEN_BUDGET) for number in (1, 2, 3)
     ]
-    spent = stored(admin, second.spent)
-    assert (spent.alias, spent.daily_token_budget) == (SPENT_ALIAS, 0)
-    assert len({record.github_id for record in (*students, spent)}) == 4
-    assert all(record.revoked_at is None for record in (*students, spent))
+    assert len({record.github_id for record in students}) == 3
+    assert all(record.revoked_at is None for record in students)
 
-    # The second run replaced all four: none is kept, and the first run's are revoked.
-    earlier = (*first.students, first.spent)
-    assert not set(earlier) & {*second.students, second.spent}
-    assert [stored(admin, key).revoked_at for key in earlier] == [NOW + 1] * 4
-    # The same four students both times.
-    assert len(roster.entries(roster=admin.roster)) == 4
+    # The second run replaced all three: none is kept, and the first run's are revoked.
+    earlier = first.students
+    assert not set(earlier) & set(second.students)
+    assert [stored(admin, key).revoked_at for key in earlier] == [NOW + 1] * 3
+    # The same three students both times, and only they are on the roster.
+    entries = roster.entries(roster=admin.roster)
+    assert sorted(entry.alias for entry in entries) == ["spike-1", "spike-2", "spike-3"]
 
     assert "3 student" in printed
     assert re.search(KEY_PATTERN, printed) is None
-    assert not any(key in printed for key in (*earlier, *second.students, second.spent))
+    assert not any(key in printed for key in (*earlier, *second.students))
 
 
 def test_a_run_for_no_student_is_refused_and_writes_nothing(
