@@ -11,25 +11,30 @@ rewrites a few fields and sends its own serialization of the result. The order i
 3. **Find the pool** the `model` names. A configured pool's name selects that pool; a name that
    starts with `claude-` selects the default pool when the filter was given one; any other name,
    and a `claude-` name with no default pool, is refused.
-4. **Keep the allow-list**: at each level it describes, a field it does not name is dropped. A
+4. **Replace what the format cannot serve**: the replacement the caller gives for its wire
+   format gets the parsed body and returns the body the next steps read. Messages gives one
+   (`rhi_gateway.formats.messages.blocks_as_text`): a block no engine behind this gateway can
+   read becomes a line of text, before the allow-list or the media rule could drop or refuse it.
+   A filter given no replacement applies none.
+5. **Keep the allow-list**: at each level it describes, a field it does not name is dropped. A
    number it marks with a `Limit` is clamped to that limit of the pool.
-5. **Refuse a media reference that is not inline data** (below).
-6. **Write the gateway's own fields**, whatever the client sent and whatever the allow-list
+6. **Refuse a media reference that is not inline data** (below).
+7. **Write the gateway's own fields**, whatever the client sent and whatever the allow-list
    names: `model` is the pool's name, the name the engine serves the model under (section 4.2);
    `request_id` is the gateway's ID for the request; `cache_salt` is derived from the student, so
    that one student's cached prefixes cannot be probed by another (section 6.6). A pool whose
    `cache_salt_scope` is `class` asked for the other side of that trade (section 4.7): its salt is
    derived from the pool's name alone, so that its students share the prefixes they have in common.
-7. **Apply the pool's request profile**: the rewrite given under the pool's name gets the
+8. **Apply the pool's request profile**: the rewrite given under the pool's name gets the
    filtered body and returns the body to send. It is the pool's profile on this filter's route
    (`rhi_gateway.profile`): the entries the pool's configuration names, in that order, built when
-   the gateway starts. The gateway's own fields of step 6 are then written again, so that no
+   the gateway starts. The gateway's own fields of step 7 are then written again, so that no
    entry changes the pool a request is for. A pool whose profile is empty is given no rewrite, and
    is sent the filtered body unchanged.
-8. **Serialize** the result. What `Forwarded.body` holds was written by this module.
+9. **Serialize** the result. What `Forwarded.body` holds was written by this module.
 
 Every refusal is a `GatewayError` with the cause `request_refused`, which the renderers of
-`rhi_gateway.errors` turn into the 400 of step 8. Its message is one of this module's constants,
+`rhi_gateway.errors` turn into the 400 of the design's step 8. Its message is one of this module's constants,
 for the gateway's own use: nothing the client sent is in it.
 
 **The allow-list** is given by the caller: each wire format has its own, written elsewhere. It is
@@ -142,6 +147,7 @@ class Shapes:
 type Spec = Fields | Items | Shapes | Limit | _Keep
 
 # A pool's request profile on one route: it gets the filtered body and returns the body to serialize.
+# A format's replacement (step 4) has the same shape: it gets the parsed body and returns the body to filter.
 type Rewrite = Callable[[dict[str, Any]], dict[str, Any]]
 
 
@@ -357,7 +363,8 @@ class BodyFilter:
     `default_pool` is the pool of the `claude-` names; a deployment may have none, and the filter
     is then given none. `profiles` holds the request profile of each pool that has one, under the
     pool's name: what `rhi_gateway.profile.rewrites` gives for the filter's route. `maximum` is the
-    largest body `read` takes, in bytes.
+    largest body `read` takes, in bytes. `replacement` is the wire format's step 4, for every
+    pool; with none, the parsed body goes to the allow-list as it is.
     """
 
     allow_list: Fields
@@ -365,6 +372,7 @@ class BodyFilter:
     default_pool: Pool | None = None
     profiles: Mapping[str, Rewrite] = field(default_factory=dict)
     maximum: int = MAX_BODY_BYTES
+    replacement: Rewrite | None = None
 
     async def read(self, source: BodySource, *, student: str, request_id: str) -> Forwarded:
         """Read a request's body, never past the maximum, and give what to forward for it."""
@@ -383,6 +391,8 @@ class BodyFilter:
         body = parse(raw)
         pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
         try:
+            if self.replacement is not None:
+                body = self.replacement(body)
             kept = _keep(body, self.allow_list, pool)
             _refuse_references(kept, self.allow_list)
             own = {MODEL_FIELD: pool.name, REQUEST_ID_FIELD: request_id, CACHE_SALT_FIELD: _salt(pool, student)}

@@ -238,8 +238,16 @@ def filters(stated: Mapping[str, Any] | None = None) -> dict[routes.Route, Filte
         return profile.rewrites(profiles, route)
 
     return {
-        routes.MESSAGES: BodyFilter(messages.MESSAGES, replayed, default_pool, rewrites(routes.MESSAGES)),
-        routes.COUNT_TOKENS: BodyFilter(messages.COUNT_TOKENS, replayed, default_pool, rewrites(routes.COUNT_TOKENS)),
+        routes.MESSAGES: BodyFilter(
+            messages.MESSAGES, replayed, default_pool, rewrites(routes.MESSAGES), replacement=messages.blocks_as_text
+        ),
+        routes.COUNT_TOKENS: BodyFilter(
+            messages.COUNT_TOKENS,
+            replayed,
+            default_pool,
+            rewrites(routes.COUNT_TOKENS),
+            replacement=messages.blocks_as_text,
+        ),
         routes.CHAT_COMPLETIONS: ChatBodyFilter(replayed, default_pool, rewrites(routes.CHAT_COMPLETIONS)),
         routes.RESPONSES: BodyFilter(responses.RESPONSES, replayed, default_pool, rewrites(routes.RESPONSES)),
     }
