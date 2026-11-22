@@ -1,0 +1,97 @@
+"""The gateway's error-rate alarm in the guardrails stack, over the example configuration (`rhi.guardrails.alarms_gateway`)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from rhi import config
+from rhi_gateway.telemetry import FAULT_STATUS, NO_CAUSE
+
+EXAMPLE = config.load({"RHI_CONFIG": "example"})
+
+Templates = dict[str, dict[str, Any]]
+
+
+def template(templates: Templates, prefix: str) -> dict[str, Any]:
+    (path,) = [path for path in templates if Path(path).name.startswith(prefix)]
+    return templates[path]
+
+
+def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
+    return {name: r["Properties"] for name, r in template["Resources"].items() if r["Type"] == kind}
+
+
+def output(templates: Templates, reference: dict[str, Any]) -> Any:
+    """What a value read from another stack's output is in that stack."""
+    read = reference["Fn::GetStackOutput"]
+    return template(templates, read["StackName"].replace("-", ""))["Outputs"][read["OutputName"]]["Value"]
+
+
+def depends_on(cloud_assembly: Path, stack_name: str) -> set[str]:
+    """The stacks the stack named `stack_name` deploys after, by their names."""
+    artifacts = {
+        artifact_id: artifact
+        for manifest in cloud_assembly.rglob("manifest.json")
+        for artifact_id, artifact in json.loads(manifest.read_text(encoding="utf-8")).get("artifacts", {}).items()
+    }
+    names = {i: a["properties"]["stackName"] for i, a in artifacts.items() if "stackName" in a.get("properties", {})}
+    (stack,) = [artifacts[i] for i, name in names.items() if name == stack_name]
+    return {names[i] for i in stack.get("dependencies", []) if i in names}
+
+
+def gateway_alarm(templates: Templates) -> dict[str, Any]:
+    alarms = of_type(template(templates, "RhiGuardrails"), "AWS::CloudWatch::Alarm")
+    (alarm,) = [a for a in alarms.values() if "Metrics" in a and any(q.get("Id") == "own" for q in a["Metrics"])]
+    return alarm
+
+
+def test_the_filter_counts_the_gateways_own_faults_with_no_dimension(
+    templates: Templates, cloud_assembly: Path
+) -> None:
+    (metric_filter,) = of_type(template(templates, "RhiGuardrails"), "AWS::Logs::MetricFilter").values()
+    pattern = metric_filter["FilterPattern"]
+    assert FAULT_STATUS == 500 and NO_CAUSE == "none"
+    assert "$.status >= 500" in pattern and '$.cause = "none"' in pattern and "&&" in pattern
+    (transformation,) = metric_filter["MetricTransformations"]
+    assert transformation["MetricNamespace"] == "rhi/gateway"
+    assert "Dimensions" not in transformation
+    # The gateway stack's log group, by its fixed name, and the gateway stack deploys first.
+    gateway_logs = of_type(template(templates, "RhiGateway"), "AWS::Logs::LogGroup").values()
+    assert metric_filter["LogGroupName"] in {group.get("LogGroupName") for group in gateway_logs}
+    assert "Rhi-Gateway" in depends_on(cloud_assembly, "Rhi-Guardrails")
+
+
+def test_the_alarm_compares_the_failed_share_of_the_load_balancers_requests_with_5_percent_over_5_minutes(
+    templates: Templates,
+) -> None:
+    assert (EXAMPLE.gateway_error_alarm_percent, EXAMPLE.gateway_error_alarm_minutes) == (5, 5)
+    alarm = gateway_alarm(templates)
+    stats = {q["Id"]: q["MetricStat"] for q in alarm["Metrics"] if "MetricStat" in q}
+    (metric_filter,) = of_type(template(templates, "RhiGuardrails"), "AWS::Logs::MetricFilter").values()
+    (transformation,) = metric_filter["MetricTransformations"]
+    assert stats["own"]["Metric"] == {"Namespace": "rhi/gateway", "MetricName": transformation["MetricName"]}
+    # The public load balancer's own 5xx answers and its requests.
+    (balancer_id,) = of_type(template(templates, "RhiNetwork"), "AWS::ElasticLoadBalancingV2::LoadBalancer")
+    for query, name in (("elb5xx", "HTTPCode_ELB_5XX_Count"), ("requests", "RequestCount")):
+        metric = stats[query]["Metric"]
+        assert (metric["Namespace"], metric["MetricName"]) == ("AWS/ApplicationELB", name)
+        (dimension,) = metric["Dimensions"]
+        assert dimension["Name"] == "LoadBalancer"
+        assert output(templates, dimension["Value"]) == {"Fn::GetAtt": [balancer_id, "LoadBalancerFullName"]}
+    assert {(s["Stat"], s["Period"]) for s in stats.values()} == {("Sum", 300)}
+    (share,) = [q for q in alarm["Metrics"] if q.get("ReturnData")]
+    # The two 5xx counts over the requests, the ones the load balancer answered itself included.
+    assert share["Expression"].replace(" ", "") == (
+        "100*(FILL(own,0)+FILL(elb5xx,0))/(FILL(requests,0)+FILL(elb5xx,0))"
+    )
+    assert (alarm["ComparisonOperator"], alarm["Threshold"]) == ("GreaterThanThreshold", 5)
+    assert (alarm["EvaluationPeriods"], alarm["DatapointsToAlarm"]) == (1, 1)
+    # A period with no request has no share, and the alarm clears.
+    assert alarm["TreatMissingData"] == "notBreaching"
+
+
+def test_the_alarm_acts_on_the_alerts_topic(templates: Templates) -> None:
+    (topic_id,) = of_type(template(templates, "RhiGuardrails"), "AWS::SNS::Topic")
+    assert gateway_alarm(templates)["AlarmActions"] == [{"Ref": topic_id}]

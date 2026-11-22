@@ -210,6 +210,8 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         *(("cost_anomaly_detection", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(("parked", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(("outside_sessions_alarm_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
+        *(("gateway_error_alarm_minutes", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
+        *(("gateway_error_alarm_percent", value) for value in (f'"{MARK}"', "0", f"100.{MARK}", f"-{MARK}", "true")),
         *(
             (key, value)
             for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
@@ -267,6 +269,16 @@ def test_outside_sessions_alarm_hours_reads_1_when_left_out(tmp_path: Path) -> N
     assert load_text(tmp_path, example_with(outside_sessions_alarm_hours=None)).outside_sessions_alarm_hours == 1
     assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["outside_sessions_alarm_hours"] == 1
     assert load_text(tmp_path, example_with(outside_sessions_alarm_hours="3")).outside_sessions_alarm_hours == 3
+
+
+def test_the_gateway_error_alarm_reads_5_percent_over_5_minutes_when_left_out(tmp_path: Path) -> None:
+    # Section 17, so that a configuration written before the keys loads unchanged.
+    left_out = load_text(tmp_path, example_with(gateway_error_alarm_percent=None, gateway_error_alarm_minutes=None))
+    assert (left_out.gateway_error_alarm_percent, left_out.gateway_error_alarm_minutes) == (5, 5)
+    example = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    assert (example["gateway_error_alarm_percent"], example["gateway_error_alarm_minutes"]) == (5, 5)
+    given = load_text(tmp_path, example_with(gateway_error_alarm_percent="2.5", gateway_error_alarm_minutes="10"))
+    assert (given.gateway_error_alarm_percent, given.gateway_error_alarm_minutes) == (2.5, 10)
 
 
 def test_parked_reads_false_when_left_out(tmp_path: Path) -> None:

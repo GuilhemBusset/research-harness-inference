@@ -164,6 +164,11 @@ class Config:
     # The whole hours a pool may be in service while no session is on before its alarm fires
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
+    # The share of the gateway's requests, in percent, that may fail for its own fault over the whole
+    # minutes of the period before its alarm fires (`rhi.guardrails.alarms_gateway`; sections 7.3
+    # and 17). Only synthesis reads them.
+    gateway_error_alarm_percent: float
+    gateway_error_alarm_minutes: int
     # Whether the stage is parked: the whole endpoint switched off, with no load balancer, NAT
     # gateway, Fargate service, pool group or scaler, and only data and the pipeline left (system
     # design, sections 5.6 and 11.2). A deployment flag and nothing else: a pool the admin stops is
@@ -409,6 +414,8 @@ KEYS: dict[str, Key] = {
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "outside_sessions_alarm_hours": _WHOLE_NUMBER,
+    "gateway_error_alarm_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
+    "gateway_error_alarm_minutes": _WHOLE_NUMBER,
     "parked": Key("true or false, without quotes", _boolean, _boolean_from_text),
 }
 
@@ -457,6 +464,10 @@ DEFAULTS: dict[str, object] = {
     "cost_anomaly_detection": False,
     # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
     "outside_sessions_alarm_hours": 1,
+    # Section 17: the gateway's alarm fires when more than 5% of its requests fail for its own fault
+    # over 5 minutes.
+    "gateway_error_alarm_percent": 5,
+    "gateway_error_alarm_minutes": 5,
     # The design gives no default (issue E4-17): unparked, so that a configuration written before
     # the key loads unchanged and builds the stage as it was.
     "parked": False,

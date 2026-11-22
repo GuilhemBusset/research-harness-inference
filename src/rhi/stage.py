@@ -91,7 +91,16 @@ class EndpointStage(cdk.Stage):
         )
         # The alerts topic and what reports to it. Its alarms read the stacks above, so no stack
         # reads it (`rhi.guardrails.stack`).
-        self.guardrails = GuardrailsStack(self, "Guardrails", config=config, groups=self.pools.groups)
+        self.guardrails = GuardrailsStack(
+            self,
+            "Guardrails",
+            config=config,
+            groups=self.pools.groups,
+            load_balancer=self.network.load_balancer,
+        )
+        if self.guardrails.alarms_gateway is not None:
+            # The gateway's error-rate alarm counts in the gateway's log group, by its fixed name.
+            self.guardrails.add_dependency(self.gateway, "The gateway's log group exists before its metric filter.")
         if config.parked:
             for first, later in PARKED_ORDER.items():
                 for stack in later:
