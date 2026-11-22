@@ -96,6 +96,12 @@ cached_share_flag_percent = 85
 # 90, 120, 150, 180, 365 and longer ones). Left out, it is 90, the period of the stage's log groups.
 pipeline_events_retention_days = 90
 
+# Whether the guardrails stack holds a Cost Anomaly Detection monitor of the services dimension,
+# which sends every anomaly to the alerts topic at once (system design, section 11.3). An account
+# holds only one such monitor and Cost Explorer may already have made one, so the owner removes
+# that one first, then turns this on. Left out, it is false.
+cost_anomaly_detection = false
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They
 # are in the order of their names, which is the order the configuration in SSM is read in.
