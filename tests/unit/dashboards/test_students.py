@@ -41,14 +41,13 @@ def targets(panel: dict[str, Any]) -> list[dict[str, Any]]:
 def test_each_quantity_has_its_panel_and_the_gateway_serves_its_series(example: rhi_config.Config) -> None:
     assert students in build.modules()
     panels = [panel for panel in built(example).document()["panels"] if panel["type"] != "row"]
+    # Panel by panel: each queries exactly one quantity, and no two panels the same one.
     queried = [
-        {family for family in QUANTITIES if f"{family}_total{{" in target["expr"]}
+        {family for family in QUANTITIES for target in targets(panel) if f"{family}_total{{" in target["expr"]}
         for panel in panels
-        for target in targets(panel)
     ]
-    assert sorted(len(one) for one in queried) == [1] * len(QUANTITIES)
+    assert [len(one) for one in queried] == [1] * len(panels)
     assert sorted(family for (family,) in queried) == sorted(QUANTITIES)
-    assert len(panels) == len(QUANTITIES)
     # Each family is one the gateway's registry serves, the cached and counted tokens included.
     served = {family.name for family in metrics.Metrics().registry.collect()}
     assert set(QUANTITIES) <= served
