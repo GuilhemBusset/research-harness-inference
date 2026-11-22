@@ -341,7 +341,7 @@ class Lines:
         self._keys = tuple(key for key in keys if key)
         self.wall, self.out = wall, out
 
-    def write(self, kind: Line, **fields: Any) -> None:
+    def write(self, kind: StrEnum, **fields: Any) -> None:
         """Writes one line. ValueError, with nothing written, for one that would hold a key."""
         line = json.dumps({"at": utc(self.wall()), "kind": kind.value, **fields}, separators=(",", ":"))
         if any(key in line for key in self._keys):
