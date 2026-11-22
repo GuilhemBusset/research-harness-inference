@@ -104,18 +104,21 @@ def test_a_change_read_during_the_run_takes_effect_no_earlier_than_the_change(on
     assert sent(earlier)[SESSION_ON][1] == [(value, NOW * 1000)]
 
 
-def test_an_off_read_during_a_run_keeps_the_scrapes_before_its_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The run starts at NOW + 60. The admin's command took its time at NOW + 48, but its off write
+@pytest.mark.parametrize("on", [True, False], ids=["turned on", "turned off"])
+def test_a_change_read_during_a_run_keeps_the_scrapes_before_its_write(
+    monkeypatch: pytest.MonkeyPatch, on: bool
+) -> None:
+    # The run starts at NOW + 60. The admin's command took its time at NOW + 48, but its write
     # commits only at NOW + 64, and the run's read of the switch returns at NOW + 66: a scrape at
-    # NOW + 62 still saw the session on, and must stay inside it.
+    # NOW + 62 still saw the switch as before (on before an off, off before an on), and must stay so.
     clock = [float(NOW + 60)]
     monkeypatch.setattr(time, "time", lambda: clock[0])
-    off = SessionSwitch(on=False, set_by="instructor", set_at=NOW + 48).to_item()
+    changed = SessionSwitch(on=on, set_by="instructor", set_at=NOW + 48).to_item()
 
     class DynamoDB:
         def get_item(self, **_: Any) -> dict[str, Any]:
             clock[0] = NOW + 66
-            return {"Item": {name: TypeSerializer().serialize(value) for name, value in off.items()}}
+            return {"Item": {name: TypeSerializer().serialize(value) for name, value in changed.items()}}
 
     class CloudWatch:
         def put_metric_data(self, **_: Any) -> None:
@@ -128,4 +131,4 @@ def test_an_off_read_during_a_run_keeps_the_scrapes_before_its_write(monkeypatch
     settings = Settings((), TABLES, writer.url, "us-east-1")
     handler.run_cycle(settings, clients, writer, NOW + 60, DecisionCounts(), (NOW + 60) * 1000)
     (gauge,) = [s for s in decode(pushes[-1]).timeseries if s.labels[0].value == SESSION_ON]
-    assert [(s.value, s.timestamp) for s in gauge.samples] == [(0.0, (NOW + 66) * 1000)]
+    assert [(s.value, s.timestamp) for s in gauge.samples] == [(1.0 if on else 0.0, (NOW + 66) * 1000)]

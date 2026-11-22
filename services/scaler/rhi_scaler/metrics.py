@@ -27,9 +27,10 @@ A reading takes effect no earlier than the change it reads. A run reads the swit
 after it starts, and the switch may have changed in between: its sample then carries the first
 millisecond of the second after the switch's own time (`set_at`, a whole second, so the change
 falls within it), not the run's time, and every scrape before that still reads the state before.
-An off reading carries, at the earliest, the time its read returned: the admin's command takes
-`set_at` before its write, which may commit later still, and the gateway serves until it does, so
-a scrape taken before the read returned keeps the session's last on reading.
+A reading, on or off, carries at the earliest the time its read returned: the admin's command
+takes `set_at` before its write, which may commit later still, and until it does the switch still
+reads as before, so a scrape taken before the read returned keeps the session's last reading (an
+off stays off, and an on stays on).
 
 The function keeps nothing between runs but what its process holds, so the counter counts from
 the process's start, and Prometheus reads a smaller value as a restart (as it does for any
@@ -161,14 +162,14 @@ def session_series(switch: SessionSwitch | None, milliseconds: int, read_at: int
     """The session gauge's sample: 1 while the switch reads on, 0 while it reads off or has no record.
 
     It carries the run's time `milliseconds`, or, when the switch changed later than that, the
-    first millisecond of the second after its change: never a time before the change it reads. An
-    off reading carries no time before `read_at`, when the read returned, if it is given: the write
-    it reads committed by then, and maybe only just.
+    first millisecond of the second after its change: never a time before the change it reads. A
+    reading, on or off, carries no time before `read_at`, when the read returned, if it is given:
+    the write it reads committed by then, and maybe only just.
     """
     on = session_is_on(switch)
     if switch is not None:
         milliseconds = max(milliseconds, (switch.set_at + 1) * 1000)
-    if not on and read_at is not None:
+    if read_at is not None:
         milliseconds = max(milliseconds, read_at)
     return Series(SESSION_ON, (), ((1.0 if on else 0.0, milliseconds),))
 
