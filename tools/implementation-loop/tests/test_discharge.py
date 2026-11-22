@@ -7,7 +7,9 @@ The engine runs are real and the fakes are those of `test_deploying.py`: the fak
 pipeline, and the test posts the verification's status where and when it chooses."""
 
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Event
 
 import pytest
 
@@ -261,6 +263,8 @@ def test_an_unconfirmed_close_leaves_the_issue_delivered_until_github_closes_it(
         run.run()
         assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DELIVERED, "open")
         assert not run.issue(2).obligations, "discharged all the same"
+        done = L.report.render_progress(dataclasses.replace(run.issue(2), phase=Phase.DONE), EPIC).splitlines()[1]
+        assert done not in run.comment(2, L.report.PROGRESS_MARKER).splitlines(), "the open issue does not say done"
         run.fake.edit_issue = edit
         run.run()
         assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DONE, "closed")
@@ -286,5 +290,64 @@ def test_a_discharge_keeps_the_rows_another_root_s_run_published():
         run.run(root=EPIC)   # the epic's run, which never saw D2 proven, proves D3
         assert {"D2", "D3"} <= rows()
         assert run.fake.issues[2]["state"] == "closed"
+    finally:
+        run.repo.cleanup()
+
+
+def test_a_tick_github_applied_without_its_reply_is_recorded_before_the_issue_closes():
+    with delivered() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        edit = run.fake.edit_issue
+
+        def reply_lost(n, **fields):
+            answer = edit(n, **fields)
+            if "body" in fields:
+                raise L.github.GitHubUnavailable("the reply was lost")
+            return answer
+        run.fake.edit_issue = reply_lost
+        run.run()
+        assert "- [x]" in run.fake.issues[2]["body"] and run.fake.issues[2]["state"] == "open"
+        run.fake.edit_issue = edit
+        run.run()
+        st = run.issue(2)
+        assert (st.phase, run.fake.issues[2]["state"], st.obligations) == (Phase.DONE, "closed", [])
+        assert [e["head_sha"] for e in st.evidence if e["criterion"] == "D2"] == [merge]
+        assert run.events("obligations_discharged", 2)
+
+
+def test_runs_of_two_roots_discharging_at_once_keep_each_ticked_item_s_row():
+    later = "tests/smoke/deployed/test_later.py"
+    owner = ((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, later), DEPLOYED))
+    run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
+    run.deploy = dataclasses.replace(run.deploy, discharge_contexts=(RHI,))
+    try:
+        run.add_work(2, owner=owner, files=(SMOKE,))
+        run.run(root=EPIC)
+        run.run(root=2)
+        run.fake.set_status(push_main(run), RHI, "success", VERIFIED)   # proves D2 alone
+        update, writing, resume = run.fake.update_comment, Event(), Event()
+
+        def held(number, body):   # the epic's run writes its D2 row once the issue's run has written D3's
+            if L.report.EVIDENCE_MARKER in body and not writing.is_set():
+                writing.set()
+                resume.wait(10)
+            return update(number, body)
+        run.fake.update_comment = held
+        with ThreadPoolExecutor() as pool:
+            epic = pool.submit(run.run, root=EPIC)
+            assert writing.wait(10)
+            run.fake.set_status(push_main(run, files=(later,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+            try:
+                run.run(root=2)   # proves D3
+            finally:
+                resume.set()
+            epic.result()
+        pr = present(run.issue(2).pr)
+        comment = next(c for c in run.fake.comments[pr] if L.report.EVIDENCE_MARKER in c["body"])
+        rows = {line.split("|")[1].strip() for line in comment["body"].splitlines() if line.startswith("| D")}
+        assert {"D2", "D3"} <= rows
+        body, link = run.fake.issues[2]["body"], f"([evidence]({comment['html_url']}))"
+        assert all(f"- [x] {text} {link}" in body for text, _ in owner) and run.fake.issues[2]["state"] == "closed"
     finally:
         run.repo.cleanup()
