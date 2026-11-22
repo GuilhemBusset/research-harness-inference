@@ -84,7 +84,7 @@ from .model import (
     IssueState,
     Phase,
 )
-from .state import FaultOutbox, RepoClaims, RunStore, runs_root
+from .state import FaultOutbox, RepoClaims, RunLock, RunStore, runs_root
 from .workspace import AgentCall, GitError, MergeConflict, UpdateResult, Workspace
 
 try:   # BranchHeld arrives with the workspace that adds a deleted worktree again
@@ -225,6 +225,9 @@ SMOKE_TEST = re.compile(r"(?<![\w./-])(?:\./)?(tests/smoke/(?:(?!\.\.?/)[\w.-]+/
 VERIFY_CONTEXT = re.compile(r"verify/[^/\s]+")
 COMMIT_STATUS_EVIDENCE = "commit_status"   # the kind of the evidence record of an item a verified deployment proved
 DISCHARGE_WRITES = 3   # the writes of an evidence comment a discharge makes while other roots' runs write it too
+# The key of a discharge's proof saved before it is written to GitHub, until it is recorded: "writing"
+# while its run writes it, "failed" once that run gave up on a write GitHub did not answer.
+PUBLISHING = "publishing"
 # A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
@@ -2906,14 +2909,24 @@ class Engine:
                 if o.get("kind") == "capability" and o.get("detail") == DEPLOYED_ENVIRONMENT}
         return {i: tests for i, tests in self._smoke_items(n, st, left_out).items() if i in owed}
 
+    @staticmethod
+    def _unrecorded(st: IssueState) -> set[str]:
+        """The items of which the issue's records hold a proof a discharge saved before writing it
+        (`PUBLISHING`) and never recorded, while their obligation is still owed."""
+        owed = {o["item"] for o in st.obligations if o.get("kind") == "capability"}
+        return {e["criterion"] for e in st.evidence
+                if e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get(PUBLISHING) and e.get("criterion") in owed}
+
     def _kept_proofs(self, st: IssueState, items: dict[str, list[str]]) -> dict[str, dict]:
         """The proofs of `items` a discharge saved for the issue's pull request and did not record:
-        a write GitHub did not answer, or applied without its reply (a ticked box). A proof once read
-        is kept, for the same smoke tests and the same description, and the next run records it
-        whatever the statuses then say; until then the issue is not closed (`_reconcile_delivered`)."""
-        said = self._discharge_table()[1]
+        a write GitHub did not answer, or applied without its reply (a ticked box), for the same
+        smoke tests and the same description. Until the next discharge settles them, the issue is
+        not closed (`_reconcile_delivered`): one whose box GitHub ticked is recorded, whatever the
+        statuses then say; any other is dropped, and the statuses of then are read again."""
+        said, unpublished = self._discharge_table()[1], self._unrecorded(st)
         return {e["criterion"]: e for e in st.evidence
                 if e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get("passed") and e.get("criterion") in items
+                and e["criterion"] in unpublished and e.get(PUBLISHING)
                 and st.pr and e.get("pr") == st.pr and e.get("smoke_tests") == items[e["criterion"]]
                 and e.get("description") == said}
 
@@ -2935,7 +2948,8 @@ class Engine:
         older config.py reads none of the three keys), no merged pull request with a merge commit,
         an issue edited since it was delivered (its items are not the ones proven), or a read
         GitHub does not answer, which the next run tries again. A proof read before a write GitHub
-        did not answer is kept, and the next run records it (`_kept_proofs`)."""
+        did not answer is recorded by the next run only if GitHub ticked its box; otherwise it is
+        read again (`_kept_proofs`)."""
         contexts, said, _ = self._discharge_table()
         head: list[str] = []   # the head of `main`, fetched once, when an issue needs it
         for n in self.plan.work:
@@ -2953,38 +2967,55 @@ class Engine:
     def _discharge_later(self, n: int, items: dict[str, list[str]], contexts: tuple[str, ...], said: str,
                          head: list[str]) -> None:
         """`_discharge_delivered` for issue `n`, whose `items` it found. A read or a write GitHub
-        does not answer is raised. The proofs are saved before anything is written, and kept: a
-        box GitHub ticked without its reply is recorded by the next run from the proof it published,
-        whatever the statuses then say, and the issue is not closed before. The issue is read again
-        after the statuses and before the tick: an issue edited meanwhile, whose items may no
-        longer be the ones proven, is left as it is."""
+        does not answer is raised. The proofs are saved before anything is written (`PUBLISHING`),
+        and marked failed when a write is not answered. A box GitHub ticked without its reply is
+        recorded by the next run from the proof saved for it, whatever the statuses then say: its
+        row was written before its tick. A proof whose box is not ticked was never published: the
+        next run drops it and reads the statuses of the contexts then configured again. The issue
+        is read before and after the statuses: an issue edited meanwhile, whose items may no longer
+        be the ones proven, is left as it is."""
         st = self.store.issue(n)
-        if not st.pr:
+        body = self._as_delivered(n, st) if st.pr else None
+        if body is None:
             return
-        proven = self._kept_proofs(st, items)
+        ticked = {i.id for i in issue_parser.ledger(body) if i.checked}
+        proven = {i: e for i, e in self._kept_proofs(st, items).items() if i in ticked}
+        stale = self._unrecorded(st) - set(proven)
+        if stale:   # never published: proven again, by the statuses of now, or not at all
+            st.evidence = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE
+                                                         and e.get(PUBLISHING) and e.get("criterion") in stale)]
+            self.store.put(st)
         todo = {i: tests for i, tests in items.items() if i not in proven}
         if todo:
             proven |= self._read_proofs(st, todo, contexts, said, head)
-        if not proven or not self._as_delivered(n, st):
+        if not proven or self._as_delivered(n, st) is None:
             return
         # The verifier's records of an item's agent part stay: only a status record of the item is replaced.
         mine = {e.get("criterion") for e in st.evidence if e.get("kind") == COMMIT_STATUS_EVIDENCE}
         base = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get("criterion") in proven)]
-        base += proven.values()
+        base += [{**e, PUBLISHING: "writing"} for e in proven.values()]
         # Saved before the comment and the body are written, with the obligations still owed: a run of
         # another root that writes them meanwhile then finds the records (`_status_elsewhere`) once it
         # has written, and writes their rows and their ticks again.
         st.evidence = base
         self.store.put(st)
-        adopted, link = self._publish_status_rows(n, st, base, proven, mine)
-        if not link:
-            return
-        done = {*proven, *adopted}
-        st = self.store.issue(n)
-        st.evidence = [*base, *adopted.values()]
-        st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in done)]
-        st.human_tasks = [self._obligation_text(o) for o in st.obligations]
-        self.store.put(st)
+        recorded = False
+        try:
+            adopted, link = self._publish_status_rows(n, st, base, proven, mine)
+            if not link:
+                return
+            done = {*proven, *adopted}
+            st = self.store.issue(n)
+            st.evidence = [{k: v for k, v in e.items() if k != PUBLISHING} for e in [*base, *adopted.values()]]
+            st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in done)]
+            st.human_tasks = [self._obligation_text(o) for o in st.obligations]
+            self.store.put(st)
+            recorded = True
+        finally:
+            if not recorded:   # published in part or not at all: no other run adopts it unless its box is ticked
+                st = self.store.issue(n)
+                st.evidence = [{**e, PUBLISHING: "failed"} if e.get(PUBLISHING) == "writing" else e for e in st.evidence]
+                self.store.put(st)
         self.store.event("obligations_discharged", issue=n, head=next(iter(proven.values()))["head_sha"],
                          items={i: e["context"] for i, e in proven.items()},
                          heads={i: e["head_sha"] for i, e in proven.items()}, adopted=sorted(adopted))
@@ -3033,16 +3064,18 @@ class Engine:
         row or tick these writes may have erased, is adopted and both are written again. As each
         run saves its records before it writes, the last write of the comment and of the body holds
         every record saved before it, whichever run finishes last (`DISCHARGE_WRITES` bounds the
-        rounds; past them, the next run tries again)."""
-        def elsewhere() -> dict[str, dict]:
-            out: dict[str, dict] = {}
-            for e in self._status_elsewhere(n, st.pr or 0):
-                if e["criterion"] not in proven and e["criterion"] not in mine:
+        rounds; past them, the next run tries again). A record another run saved and did not
+        publish, its run having given up or ended, is adopted only if its box is ticked on GitHub:
+        what that run never published is not proven by this one."""
+        def elsewhere(body: str) -> dict[str, dict]:
+            ticked, out = {i.id for i in issue_parser.ledger(body) if i.checked}, {}
+            for e, published in self._status_elsewhere(n, st.pr or 0):
+                if e["criterion"] not in proven and e["criterion"] not in mine and (published or e["criterion"] in ticked):
                     out.setdefault(e["criterion"], e)
             return out
         evidence_head = st.verified_sha or next((e["head_sha"] for e in st.evidence if e.get("kind") == "command"), "")
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
-        adopted = elsewhere()
+        adopted = elsewhere(self.gh.get_issue(n).get("body") or "")
         for _ in range(DISCHARGE_WRITES):
             comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, report.render_evidence(
                 n, [*base, *adopted.values()], evidence_head, verdicts))
@@ -3053,7 +3086,7 @@ class Engine:
             ticked = issue_parser.tick(body, dict.fromkeys({*proven, *adopted}, link))
             if ticked != body:
                 self.gh.edit_issue(n, body=ticked)
-            missing = {c: e for c, e in elsewhere().items() if c not in adopted}
+            missing = {c: e for c, e in elsewhere(ticked).items() if c not in adopted}
             if not missing:
                 return adopted, link
             adopted |= missing
@@ -3072,17 +3105,21 @@ class Engine:
                     break
         return out
 
-    def _as_delivered(self, n: int, st: IssueState) -> bool:
-        """Whether issue `n` on GitHub still says what was delivered: an edit made while the
-        statuses were read changes the items, which are then not the ones proven."""
-        if issue_parser.body_hash(self.gh.get_issue(n).get("body") or "") == st.body_hash:
-            return True
+    def _as_delivered(self, n: int, st: IssueState) -> str | None:
+        """The body of issue `n` on GitHub, if it still says what was delivered: an edit made while
+        the statuses were read changes the items, which are then not the ones proven (None)."""
+        body = self.gh.get_issue(n).get("body") or ""
+        if issue_parser.body_hash(body) == st.body_hash:
+            return body
         self.store.event("discharge_edited", issue=n)
-        return False
+        return None
 
-    def _status_elsewhere(self, n: int, pr: int) -> list[dict]:
+    def _status_elsewhere(self, n: int, pr: int) -> list[tuple[dict, bool]]:
         """The commit status records another root's run holds for issue `n` and its pull request
-        `pr`, which that run wrote in the pull request's evidence comment (`_delivered_elsewhere`)."""
+        `pr`, which that run wrote in the pull request's evidence comment (`_delivered_elsewhere`),
+        each with whether it is published or being published: recorded by that run, or saved while
+        it writes it (`PUBLISHING`) by a run that is still alive. One that run gave up on, or left
+        when it ended, is not."""
         out = []
         for d in sorted(runs_root(self.repo_root).glob("issue-*")):
             if d.resolve() == self.store.dir.resolve():
@@ -3092,8 +3129,15 @@ class Engine:
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
             if isinstance(raw, dict) and raw.get("pr") == pr:
-                out += [e for e in raw.get("evidence") or [] if isinstance(e, dict) and e.get("passed")
-                        and e.get("kind") == COMMIT_STATUS_EVIDENCE and isinstance(e.get("criterion"), str)]
+                alive: list[bool] = []   # whether that run holds its lock, asked once
+                for e in raw.get("evidence") or []:
+                    if not (isinstance(e, dict) and e.get("passed") and e.get("kind") == COMMIT_STATUS_EVIDENCE
+                            and isinstance(e.get("criterion"), str)):
+                        continue
+                    state = e.get(PUBLISHING)
+                    if state == "writing" and not alive:
+                        alive.append(RunLock(d / "lock").held())
+                    out.append((e, not state or (state == "writing" and alive[0])))
         return out
 
     def _upsert_comment_answered(self, n: int, marker: str, body: str) -> dict:

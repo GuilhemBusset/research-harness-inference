@@ -195,6 +195,48 @@ def test_an_unanswered_read_or_write_is_tried_again_by_the_next_run(failing, dis
             "a list of comments that was not read is not an empty one"
 
 
+@pytest.mark.parametrize("then", ["the-status-failed", "the-context-was-removed"])
+def test_a_proof_never_published_is_read_again_and_must_still_hold(then, discharge):
+    with delivered() as run:
+        before = snapshot(run)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        discharge.failing.add("list_comments")   # saved, then neither its row nor its tick is written
+        run.run()
+        discharge.failing.clear()
+        if then == "the-status-failed":
+            run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        else:
+            run.deploy = dataclasses.replace(run.deploy, discharge_contexts=("verify/Other",))
+        run.run()
+        assert snapshot(run) == before and not run.events("obligations_discharged", 2)
+
+
+def test_another_root_s_proof_never_published_ticks_nothing(discharge):
+    other = "tests/smoke/deployed/test_other.py"
+    owner = ((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, other), DEPLOYED))
+    run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
+    run.deploy = dataclasses.replace(run.deploy, discharge_contexts=(RHI,))
+    try:
+        run.add_work(2, owner=owner, files=(SMOKE,))
+        run.run(root=EPIC)
+        run.run(root=2)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        discharge.failing.add("list_comments")   # the epic's run saves D2's proof and publishes nothing of it
+        run.run(root=EPIC)
+        discharge.failing.clear()
+        run.deploy = dataclasses.replace(run.deploy, unverified_tests=(SMOKE,))   # D2's test is now left out
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        run.fake.set_status(push_main(run, files=(other,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+        run.run(root=2)   # proves D3
+        body = run.fake.issues[2]["body"]
+        assert f"- [x] {owner[1][0]}" in body and f"- [ ] {SIGNS_IN}" in body
+        assert run.fake.issues[2]["state"] == "open" and [o["item"] for o in run.issue(2, root=2).obligations] == ["D2"]
+    finally:
+        run.repo.cleanup()
+
+
 def test_an_issue_edited_while_the_statuses_are_read_is_left_as_it_is():
     with delivered() as run:
         [merge] = run.fake.commits[2]
