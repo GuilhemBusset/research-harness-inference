@@ -126,6 +126,7 @@ def expires_within(bucket: Mapping[str, Any] | None, days: int) -> bool:
         return False
     kept = min(expiries)
     if properties.get("VersioningConfiguration", {}).get("Status") in ("Enabled", "Suspended"):
+        # A noncurrent-version expiry that retains the newest versions keeps those forever.
         noncurrent = [
             n
             for rule in rules
@@ -133,7 +134,7 @@ def expires_within(bucket: Mapping[str, Any] | None, days: int) -> bool:
                 rule.get("NoncurrentVersionExpiration", {}).get("NoncurrentDays"),
                 rule.get("NoncurrentVersionExpirationInDays"),
             )
-            if isinstance(n, int)
+            if isinstance(n, int) and not rule.get("NoncurrentVersionExpiration", {}).get("NewerNoncurrentVersions")
         ]
         if not noncurrent:
             return False
@@ -312,19 +313,26 @@ def test_detects_an_access_log_bucket_kept_too_long(cdk: ModuleType) -> None:
 
     def build(stack: Any) -> None:
         cases = (
-            ("NoExpiry", None, False, None),
-            ("Year", 365, False, None),
-            ("Kept", MAX_DAYS, False, None),
+            ("NoExpiry", None, False, None, None),
+            ("Year", 365, False, None, None),
+            ("Kept", MAX_DAYS, False, None, None),
             # Versioned: an expired object stays as a noncurrent version.
-            ("Versioned", MAX_DAYS, True, None),
-            ("VersionedLonger", MAX_DAYS, True, 1),
-            ("VersionedKept", MAX_DAYS - 1, True, 1),
+            ("Versioned", MAX_DAYS, True, None, None),
+            ("VersionedLonger", MAX_DAYS, True, 1, None),
+            ("VersionedKept", MAX_DAYS - 1, True, 1, None),
+            # The newest noncurrent version, retained, is never removed.
+            ("VersionedRetained", MAX_DAYS - 1, True, 1, 1),
         )
-        for name, days, versioned, noncurrent in cases:
+        for name, days, versioned, noncurrent, retained in cases:
             rules = None
             if days:
                 kept = cdk.Duration.days(noncurrent) if noncurrent else None
-                rules = [s3.LifecycleRule(expiration=cdk.Duration.days(days), noncurrent_version_expiration=kept)]
+                rule = s3.LifecycleRule(
+                    expiration=cdk.Duration.days(days),
+                    noncurrent_version_expiration=kept,
+                    noncurrent_versions_to_retain=retained,
+                )
+                rules = [rule]
             bucket = s3.Bucket(stack, name, lifecycle_rules=rules, versioned=versioned)
             attribute = elbv2.CfnLoadBalancer.LoadBalancerAttributeProperty
             elbv2.CfnLoadBalancer(
@@ -339,7 +347,13 @@ def test_detects_an_access_log_bucket_kept_too_long(cdk: ModuleType) -> None:
         s3.Bucket(stack, "Other")
 
     found = log_buckets_kept_too_long({"Built": synthesize(cdk, build)})
-    assert [name.removeprefix("Built:")[:-8] for name in found] == ["NoExpiry", "Versioned", "VersionedLonger", "Year"]
+    assert [name.removeprefix("Built:")[:-8] for name in found] == [
+        "NoExpiry",
+        "Versioned",
+        "VersionedLonger",
+        "VersionedRetained",
+        "Year",
+    ]
 
 
 def test_detects_a_student_dimension(cdk: ModuleType) -> None:
