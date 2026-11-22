@@ -145,15 +145,18 @@ Do these the day before the class, while no session is on.
 3. **Every configuration change has landed, and no deployment is running.** A deployment that has
    passed the deployment hold's check runs to its end even after the session is switched on, so
    none may be under way when you switch it on. A change merged to `main` has landed when the
-   latest commit of `main` carries a `deploy/<stage>` status that reads success; it has also been
-   tested only when the commit's `verify/<stage>` status reads success with the description "The
-   verification's tests ran and passed.", not one that begins "No test ran", which is the
-   reporter's word for the Verify log's `verify: no test was run:` of step 2. A change made in SSM alone has landed only when the execution of step 2 succeeded, which
-   the `deploy/<stage>` status cannot show. On GitHub:
+   latest commit of `main` carries a `deploy/<stage>` status that reads success. A change made in
+   SSM alone has landed only when the execution of step 2 succeeded, which the `deploy/<stage>`
+   status cannot show. On GitHub, this prints each status's context, state and description:
 
    ```sh
-   gh api repos/OWNER/REPOSITORY/commits/main/status --jq '.statuses[] | "\(.context) \(.state)"'
+   gh api repos/OWNER/REPOSITORY/commits/main/status --jq '.statuses[] | "\(.context) \(.state) \(.description)"'
    ```
+
+   A merged change has also been tested only when the line of `verify/<stage>` reads `success`
+   followed by the description "The verification's tests ran and passed." A `success` whose
+   description begins "No test ran" means no test ran: it is the reporter's word for the Verify
+   log's `verify: no test was run:` of step 2, and the deployment is not verified.
 
    On the pipeline's page in the CodePipeline console, no execution is in progress. Check this
    again on the day, just before Act, step 1; if one is, wait for it to finish.
@@ -260,17 +263,16 @@ Do these the day before the class, while no session is on.
 4. Each pool falls to zero once it has been idle for its whole `idle_minutes`, counted from when
    its last held or in-flight request cleared, not from when that request arrived: a request that
    was still running when you switched the session off (one may run up to 30 minutes) keeps the
-   pool up until it ends, and the idle interval starts only then. So first wait until no request
-   of the pool is running: in Grafana, on the dashboard "Fleet and scaling", in the pool's row, the
-   panel "Engine requests: running and waiting, per instance" reads zero running and zero waiting
-   for every instance. With the session off, the gateway takes no new request, but one it was
-   already holding while the pool started stays held until the pool is ready or the hold's deadline
-   passes (7 minutes for a stream, 4 for a call, section 5.3), and the scaler counts it as demand.
-   So also wait until the gateway holds none for the pool: in Grafana's Explore, on the Prometheus
-   data source, the query `sum by (pool) (rhi_gateway_requests_held)` reads zero, or no data, for
-   the pool. Then allow the full `idle_minutes` (20 for the example's coursework), plus a few minutes
-   for the scaler to act, before checking that each pool has no instance in service: on the same
-   dashboard, in each pool's row, the panel "Instances: desired, in service, warm" reads zero for
-   desired and for in service.
+   pool up until it ends, and the idle interval starts only then. With the session off, the gateway
+   takes no new request, but one it was already holding while the pool started stays held until the
+   pool is ready or the hold's deadline passes (7 minutes for a stream, 4 for a call, section 5.3),
+   and the scaler counts it as demand, as it counts a request the gateway has forwarded and not yet
+   ended. A held request can be forwarded between two separate checks, so wait on one query that
+   counts both: in Grafana's Explore, on the Prometheus data source, wait until
+   `sum by (pool) (rhi_gateway_requests_held + rhi_gateway_requests_in_flight)` reads zero, or no
+   data, for the pool. Only then allow the full `idle_minutes` (20 for the example's coursework),
+   plus a few minutes for the scaler to act, before checking that each pool has no instance in
+   service: in Grafana, on the dashboard "Fleet and scaling", in each pool's row, the panel
+   "Instances: desired, in service, warm" reads zero for desired and for in service.
 
 Walked through on the deployed system: not yet.
