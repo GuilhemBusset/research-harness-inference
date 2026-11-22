@@ -310,6 +310,10 @@ def test_an_answer_after_the_pdf_needs_the_pdf_read_or_sent() -> None:
 
     assert not present(answer("The folder is ready."))
     assert present(calls("m1", ("Read", {"file_path": job.PDF_FILE})), answer("It cannot be read here."))
+    assert present(calls("m1", ("Bash", {"command": f"pdftotext {job.PDF_FILE} -"})), answer("Done."))
+    # Writing about the PDF into another file is not reading it.
+    note = ("Write", {"file_path": "summary.txt", "content": f"Could not read {job.PDF_FILE}."})
+    assert not present(calls("m1", note), returned("m1-0", "Created summary.txt"), answer("I wrote a note."))
 
 
 def test_an_agent_the_harness_refused_is_asked_for_but_not_started(tmp_path: Path) -> None:
@@ -338,6 +342,8 @@ def test_only_an_address_the_web_search_returned_is_a_search_answer() -> None:
     # A host in any case is the same host; a path in another case may be another page.
     assert search(asked, returned("m1-0", links), answer(FOUND.replace("example.com", "Example.COM")))["result_present"]
     assert not search(asked, returned("m1-0", links), answer(FOUND.replace("highs", "HiGHS")))["result_present"]
+    # An address urlsplit cannot read beside the cited page leaves the page cited.
+    assert search(asked, returned("m1-0", links), answer(f"{FOUND}, or http://[::1]/demo."))["result_present"]
 
 
 def test_the_echo_server_answers_a_call_with_the_text_it_was_given() -> None:

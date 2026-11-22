@@ -111,6 +111,9 @@ SKILL_WORD = "lanternfish"
 ECHO_SERVER_NAME = "rhi_echo"
 ECHO_TOOL = f"mcp__{ECHO_SERVER_NAME}__echo"
 PDF_FILE = "notes.pdf"
+# The tools that can access a file, each with the field of its input that names what it reads or
+# runs: a call that names the PDF there tried to read it (a command may convert it to text first).
+PDF_READS = {"Read": "file_path", "Bash": "command", "Grep": "path"}
 FIGURE_FILE = "figure.svg"
 # Claude Code's tools that start an agent, by their names in its versions.
 AGENT_TOOLS = frozenset({"Task", "Agent"})
@@ -281,7 +284,10 @@ def addresses(text: str | None) -> set[str]:
     lower case, which name the same thing in any case, and the rest as written, which may not."""
     found = set()
     for one in _ADDRESS.findall(text or ""):
-        parts = urlsplit(one.rstrip(".,;:!?'\"/"))
+        try:
+            parts = urlsplit(one.rstrip(".,;:!?'\"/"))
+        except ValueError:  # not an address urlsplit can read, such as a cut bracketed host: none
+            continue
         found.add(urlunsplit(parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower())))
     return found
 
@@ -354,13 +360,22 @@ def echo_of(turn: Turn, text: str, servers: Mapping[str, str]) -> dict[str, Any]
     }
 
 
+def reads_pdf(block: Mapping[str, Any]) -> bool:
+    """Whether a tool call accesses the PDF: its file named where the tool reads (`PDF_READS`), not
+    anywhere in its input, which may be text written to another file."""
+    field = PDF_READS.get(block.get("name"))
+    held = block.get("input")
+    named = held.get(field) if field is not None and isinstance(held, dict) else None
+    return isinstance(named, str) and PDF_FILE in named
+
+
 def pdf_of(turn: Turn, word: str) -> dict[str, Any]:
     """An answer after the PDF is an answer of a turn that shows the PDF was read, or tried: a tool
-    call that names its file, or a request that carries a document block. A reply to the prompt
-    alone is recorded as `answered`, and is none."""
+    call that accesses its file, or a request that carries a document block. A reply to the prompt
+    alone, or one after only writing about the PDF, is recorded as `answered`, and is none."""
     answer = turn.answer()
     document = any(carries_document(one) for one in turn.exchanges)
-    read = any(PDF_FILE in json.dumps(block.get("input")) for _, block in turn.tool_uses())
+    read = any(reads_pdf(block) for _, block in turn.tool_uses())
     return {
         "result_present": answer is not None and (document or read),
         "answered": answer is not None,
