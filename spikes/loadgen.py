@@ -52,15 +52,15 @@ sessions, run at once. Both draw their sizes from a seed, so a run can be repeat
 - the student, the session, whether the request was its session's first turn, and the status of
   the answer;
 - the time on the replay's clock the request was sent, and the seconds from then to its last token;
-- whether the gateway sent a keep-alive before the engine's first event, which only a held stream
-  gets (`rhi_gateway.hold`): a `ping` event on Messages, an SSE comment on the OpenAI formats. A hold
-  that ends before its first keep-alive is due leaves none, so its absence does not say a request
-  was not held;
+- whether the gateway held the request, which its answer says with its header
+  (`rhi_gateway.hold.HELD_HEADER`), and whether it sent a keep-alive before the engine's first
+  event, which only a held stream gets: a `ping` event on Messages, an SSE comment on the OpenAI
+  formats. A hold that ends before its first keep-alive is due leaves none;
 - the gateway's cause, when the answer is one of its errors, a refusal or an error event, and the
   cause is one of its own (`rhi_common.causes.Cause`); nothing else of an error is kept.
 
-A session ends at its first request that is not answered 200: a transcript cannot grow by an
-answer that did not come. A connection that fails raises, and ends the replay: a run with one is
+A session ends at its first request that is not answered 200, that failed, or whose stream carried
+the gateway's error event: a transcript cannot grow by an answer that did not come. A connection that fails raises, and ends the replay: a run with one is
 not a measurement. A replay given `keep_failures` records such a request instead, with what was
 seen of it before it failed and the fixed kind of its failure (`Failure`), ends its session alone,
 and goes on with the others. `on_record` is given each record as soon as it is made, so that what a
@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from rhi_common.causes import Cause
+from rhi_gateway.hold import HELD_HEADER
 from rhi_gateway.sse import SseEvent, SseReader
 
 if TYPE_CHECKING:
@@ -419,6 +420,8 @@ class Record:
     """From the request sent to its last token; `None` when the answer streamed none."""
     kept_alive: bool = False
     """Whether the gateway sent a keep-alive before the engine's first event: the stream was held."""
+    held: bool = False
+    """Whether the gateway held the request: its answer's header said so, or a keep-alive came."""
     cause: str | None = None
     """The gateway's cause, when the answer was one of its errors and the cause one of its own."""
     failure: Failure | None = None
@@ -479,13 +482,14 @@ async def _send(
     reader, usage, text, whole = SseReader(), {}, [], bytearray()
     first = answered = last = None
     status: int | None = None
-    streamed = engine = kept_alive = False
+    streamed = engine = kept_alive = marked = False
     cause: str | None = None
     failure: Failure | None = None
     sent = clock()
     try:
         async with http.stream(request.method, request.path, headers=headers, content=request.body) as answer:
             status = answer.status_code
+            marked = answer.headers.get(HELD_HEADER, "").lower() == "true"
             streamed = answer.headers.get("content-type", "").startswith(STREAM_TYPE)
             async for chunk in answer.aiter_bytes():
                 if not streamed:
@@ -531,6 +535,7 @@ async def _send(
         "sent_at": sent,
         "last_token_seconds": None if last is None else last - sent,
         "kept_alive": kept_alive,
+        "held": marked or kept_alive,
         "cause": cause,
         "failure": failure,
     }
@@ -581,7 +586,8 @@ async def replay(
                 if on_record is not None:
                     on_record(record)
                 try:
-                    step = requests.send(text) if read["status"] == httpx.codes.OK else None
+                    answered = read["status"] == httpx.codes.OK and read["failure"] is None and read["cause"] is None
+                    step = requests.send(text) if answered else None
                 except StopIteration:
                     step = None
         return records

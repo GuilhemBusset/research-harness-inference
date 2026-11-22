@@ -17,7 +17,10 @@ import pytest
 import common
 import dry_run_class as dry
 import loadgen
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
+from rhi_gateway.errors import WireFormat, render_stream_event
+from rhi_gateway.hold import HELD_HEADER
 from s5_capacity import Shape
 from s7_drain import Recorder
 
@@ -28,6 +31,8 @@ START = 1_800_000_000.0
 # Turns of the event loop that let every task of a run go on until it waits on the clock.
 YIELDS = 50
 STAGES = {"boot": 20.0, "image": 1.5, "release-check": 0.5, "container-start": 2.0, "weights": 70.0, "hook": 1.0}
+# The stages a launch has ended by the time its engine starts loading the weights.
+EARLY = ("boot", "image", "release-check", "container-start")
 
 
 class Clock:
@@ -99,8 +104,8 @@ def _stream(*, ping: bool) -> bytes:
 
 
 class Pool(httpx.AsyncBaseTransport):
-    """The gateway's answers by student: the first held (a keep-alive first), the second warm with its
-    third request cut, the third refused for its budget."""
+    """The gateway's answers by student: the first held, with a keep-alive first on its first request
+    only, the second warm with its third request cut, the third refused for its budget."""
 
     def __init__(self, keys: list[str], clock: Clock) -> None:
         self.keys, self.clock, self.sent = keys, clock, 0
@@ -114,14 +119,15 @@ class Pool(httpx.AsyncBaseTransport):
             return httpx.Response(402, json=body)
         if student == 1 and self.by_student[1] == 3:
             raise httpx.ReadError("cut")
-        stream, clock = _stream(ping=student == 0), self.clock
+        stream, clock = _stream(ping=student == 0 and self.by_student[0] == 1), self.clock
+        headers = {"content-type": "text/event-stream", **({HELD_HEADER: "true"} if student == 0 else {})}
 
         async def paced() -> Any:
             for event in stream.split(b"\n\n")[:-1]:
                 await clock.sleep(0.25)
                 yield event + b"\n\n"
 
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=paced())
+        return httpx.Response(200, headers=headers, content=paced())
 
 
 def _series(labels: dict[str, str], *samples: tuple[float, float]) -> common.Series:
@@ -129,40 +135,45 @@ def _series(labels: dict[str, str], *samples: tuple[float, float]) -> common.Ser
 
 
 class Workspace:
-    """The workspace: two instances in service, the second's launch inside the hour; the first, from
-    before it, still exporting its stages."""
+    """The workspace, answering each query as it stood at the query's end: two instances in service,
+    the second's launch inside the hour, a third's launch after it. The first, from before the hour,
+    still exports its stages. The second's launch is taken for a promotion, then moved to a cold
+    launch, and ends its last stages after the hour. A counter's value is the second it is read at."""
 
-    def __init__(self, before: str, during: str) -> None:
-        self.before, self.during = before, during
+    def __init__(self, before: str, during: str, after: str) -> None:
+        self.before, self.during, self.after = before, during, after
         self.queries: list[str] = []
+
+    def _stages(self, start: float, end: float) -> list[common.Series]:
+        launched = {stage: seconds + 3 for stage, seconds in STAGES.items()}
+        rows = [({"instance": self.before, "transition": "promotion"}, STAGES, START - 600)]
+        rows.append(({"instance": self.during, "transition": "promotion"}, {"boot": launched["boot"]}, START + 45))
+        cold = {"instance": self.during, "transition": "cold-launch"}
+        rows.append((cold, {stage: launched[stage] for stage in EARLY}, START + 60))
+        rows.append((cold, {stage: launched[stage] for stage in launched if stage not in EARLY}, START + 155))
+        rows.append(({"instance": self.after, "transition": "promotion"}, {"boot": 10.0}, START + 90))
+        series = []
+        for labels, stages, first in rows:
+            # A promotion's labels last until the launch turns out to be a cold one.
+            last = START + 45 if labels == {"instance": self.during, "transition": "promotion"} else end
+            at = [at for at in range(int(START) - 600, int(end) + 1, 15) if max(start, first) <= at <= min(end, last)]
+            series += [
+                _series({**labels, "stage": stage}, *((t, seconds) for t in at)) for stage, seconds in stages.items()
+            ]
+        return [one for one in series if one.samples]
 
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
         self.queries.append(query)
-        late = start > START + 30
-        both = [self.before, self.during] if late else [self.before]
+        both = [self.before, self.during] if end > START + 45 else [self.before]
         if dry.STAGE_METRIC in query:
-            old = [
-                _series(
-                    {"instance": self.before, "transition": "promotion", "stage": stage},
-                    *((at, seconds) for at in (start, START, START + 30, end)),
-                )
-                for stage, seconds in STAGES.items()
-            ]
-            new = [
-                _series(
-                    {"instance": self.during, "transition": "promotion", "stage": stage},
-                    *((at, seconds + 3) for at in (START + 45, end)),
-                )
-                for stage, seconds in STAGES.items()
-            ]
-            return old + new
+            return self._stages(start, end)
         if "timestamp(rhi_lifecycle_release_info" in query:
             return [_series({"instance": one}, (end, end - 5)) for one in both]
         if dry.INSTANCES_IN_SERVICE in query:
             return [_series({}, (end, float(len(both))))]
         if dry.CACHE_CAPACITY_METRIC in query:
             return [_series({"instance": self.before}, (end, 250_000.0))]
-        return [_series({"instance": one}, (end, 1000.0)) for one in both]
+        return [_series({"instance": one}, (end, end - START)) for one in both]
 
 
 def _conversation(seed: int) -> loadgen.Session:
@@ -175,7 +186,7 @@ def _rehearsal(
 ) -> tuple[dry.Rehearsal, list[str], list[str]]:
     clock = Clock()
     keys = [generate_key() for _ in range(3)]
-    instances = [f"i-{secrets.token_hex(8)}" for _ in range(2)]
+    instances = [f"i-{secrets.token_hex(8)}" for _ in range(3)]
 
     async def inline(action: Callable[[], Any]) -> Any:
         return action()
@@ -217,7 +228,7 @@ def test_each_step_writes_lines_with_a_time_and_a_kind_and_no_identifier_or_key(
     assert all(isinstance(line, dict) and line["at"].endswith("Z") and line["kind"] for line in written)
     kinds = {line["kind"] for line in written}
     assert {"start", "pool_ready", "hour_started", "engine_counters", "cache_capacity", "in_service"} <= kinds
-    assert {"pool_state", "request", "hour_ended", "instance_started", "end"} <= kinds
+    assert {"request", "hour_ended", "instance_started", "end"} <= kinds
     assert not any(secret in line for line in lines for secret in (*keys, *instances))
 
     (start,) = [line for line in written if line["kind"] == "start"]
@@ -240,9 +251,12 @@ def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
     # Each session of the hour goes on with new conversations: both kinds of turn are there.
     assert {line["first_turn"] for line in answered} == {True, False}
     assert {line["conversation"] for line in answered if line["session"] == 0} >= {0, 1, 2}
-    # The held student's streams had a keep-alive; the warm student's had none.
-    assert all(line["held"] and line["kept_alive"] for line in answered if line["session"] == 0)
-    assert any(not line["held"] for line in answered if line["session"] == 1)
+    # The gateway said it held the first student's requests, whether a keep-alive came or not; the
+    # warm student's answers did not say so.
+    held = [line for line in answered if line["session"] == 0]
+    assert all(line["held"] for line in held)
+    assert {line["kept_alive"] for line in held} == {True, False}
+    assert not any(line["held"] or line["kept_alive"] for line in answered if line["session"] == 1)
 
     refused = [line for line in requests if line["session"] == 2]
     assert refused
@@ -256,16 +270,28 @@ def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
     assert all(line["sent_at"] < hour["ends_at"] for line in requests)
 
 
-def test_a_request_sent_while_the_status_said_not_ready_is_held_without_a_keep_alive() -> None:
+@pytest.mark.parametrize("cut", [True, False], ids=["cut-after-headers", "error-event"])
+def test_an_answer_that_never_came_ends_its_conversation(cut: bool) -> None:
     lines: list[str] = []
-    # Ready for the wait, then warming at the hour's first status read.
-    rehearsal, _, _ = _rehearsal(lines, after_wake=["ready", "warming"])
-    _run(rehearsal)
-    written = _kinds(lines)
+    rehearsal, _, _ = _rehearsal(lines, after_wake=[])
+    rehearsal.class_size = 1
 
-    assert [line["state"] for line in written if line["kind"] == "pool_state"] == ["warming", "ready"]
-    first_warm = next(line for line in written if line["kind"] == "request" and line["session"] == 1)
-    assert (first_warm["held"], first_warm["kept_alive"], first_warm["pool_not_ready_read"]) == (True, False, True)
+    async def broken() -> Any:
+        yield _event("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 10}}})
+        if cut:
+            raise httpx.ReadError("cut")
+        yield render_stream_event(Cause.ENGINE_ERROR, WireFormat.MESSAGES)
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=broken())
+
+    rehearsal.transport = httpx.MockTransport(answer)
+    _run(rehearsal)
+    requests = [line for line in _kinds(lines) if line["kind"] == "request"]
+    assert len(requests) > 1
+    # No answer to grow the transcript by: each next request opens a new conversation.
+    assert all(line["first_turn"] for line in requests)
+    assert {line["failure"] or line["cause"] for line in requests} == {"read_error" if cut else "engine_error"}
 
 
 def test_the_readings_name_instances_and_tell_a_launch_in_the_hour_from_one_before_it() -> None:
@@ -274,20 +300,48 @@ def test_the_readings_name_instances_and_tell_a_launch_in_the_hour_from_one_befo
     _run(rehearsal)
     written = _kinds(lines)
 
-    counters = {line["moment"]: line["instances"] for line in written if line["kind"] == "engine_counters"}
-    assert set(counters["start"]) == {"instance-1"}
-    assert set(counters["end"]) == {"instance-1", "instance-2"}
-    assert {"input_tokens", "cached_input_tokens", "preemptions"} <= set(counters["end"]["instance-2"])
+    hour = next(line for line in written if line["kind"] == "hour_started")
+    counters = {line["moment"]: line for line in written if line["kind"] == "engine_counters"}
+    assert set(counters["start"]["instances"]) == {"instance-1"}
+    assert set(counters["end"]["instances"]) == {"instance-1", "instance-2"}
+    assert {"input_tokens", "cached_input_tokens", "preemptions"} <= set(counters["end"]["instances"]["instance-2"])
+    # The counters are as they stood at the hour's two bounds, whenever they were read.
+    for moment, bound in (("start", "started_at"), ("end", "ends_at")):
+        assert counters[moment]["read_at"] == hour[bound]
+        assert dry.utc(START + counters[moment]["instances"]["instance-1"]["input_tokens"]) == hour[bound]
     (capacity,) = [line for line in written if line["kind"] == "cache_capacity"]
     assert capacity["instances"] == {"instance-1": 250_000.0}
     in_service = {line["moment"]: line for line in written if line["kind"] == "in_service"}
     assert (in_service["start"]["scaler_in_service"], in_service["start"]["serving"]) == (1, ["instance-1"])
     assert (in_service["end"]["scaler_in_service"], in_service["end"]["serving"]) == (2, ["instance-1", "instance-2"])
 
-    # The instance from before the hour still exports its stages in it: only the new launch is written.
+    # The instance from before the hour still exports its stages in it, and the third began after it:
+    # only the launch in the hour is written, once, under its settled label, with the stages it
+    # ended after the hour.
     (started,) = [line for line in written if line["kind"] == "instance_started"]
-    assert (started["instance"], started["transition"]) == ("instance-2", "promotion")
+    assert (started["instance"], started["transition"]) == ("instance-2", "cold-launch")
     assert started["stages"] == {stage: seconds + 3 for stage, seconds in STAGES.items()}
+    assert hour["started_at"] < started["began_at"] <= hour["ends_at"]
+
+
+def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:
+    lines: list[str] = []
+    rehearsal, _, _ = _rehearsal(lines)
+
+    class Failing(Workspace):
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if "num_preemptions" in query:
+                raise TimeoutError
+            return super().read_series(query, start=start, end=end, step=step)
+
+    rehearsal.workspace = Failing(*(f"i-{secrets.token_hex(8)}" for _ in range(3)))
+    _run(rehearsal)
+    written = _kinds(lines)
+    for counters in (line for line in written if line["kind"] == "engine_counters"):
+        assert counters["unread"] == ["preemptions"]
+        assert {"input_tokens", "cached_input_tokens"} <= set(counters["instances"]["instance-1"])
+    errors = [(line["step"], line["quantity"]) for line in written if line["kind"] == "error"]
+    assert errors == [("start_counters", "preemptions"), ("end_counters", "preemptions")]
 
 
 def test_several_agents_run_at_once_inside_each_of_the_class_sessions() -> None:
@@ -313,11 +367,14 @@ def test_the_job_refuses_a_class_it_was_not_given_or_cannot_key(capsys: pytest.C
     assert dry.main({dry.SHAPE_VARIABLE: "hands-on"}, clock) == 1
     assert dry.main({dry.CLASS_SIZE_VARIABLE: "0", dry.SHAPE_VARIABLE: "hands-on"}, clock) == 1
     assert dry.main({dry.CLASS_SIZE_VARIABLE: "12", dry.SHAPE_VARIABLE: "lecture"}, clock) == 1
+    # A character `isdigit` takes and `int` does not.
+    assert dry.main({dry.CLASS_SIZE_VARIABLE: "\u00b2", dry.SHAPE_VARIABLE: "hands-on"}, clock) == 1
     refused = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [(line["kind"], line["reason"]) for line in refused] == [
         ("refused", "no_class_size"),
         ("refused", "no_class_size"),
         ("refused", "no_shape"),
+        ("refused", "no_class_size"),
     ]
     with pytest.raises(ValueError, match="more students than"):
         dry.Rehearsal(
@@ -327,7 +384,7 @@ def test_the_job_refuses_a_class_it_was_not_given_or_cannot_key(capsys: pytest.C
             keys=[generate_key() for _ in range(3)],
             endpoint="https://gateway.example.com",
             gateway=Gateway([]),
-            workspace=Workspace("a", "b"),
+            workspace=Workspace("a", "b", "c"),
             recorder=Recorder(clock, lines.append),
             clock=clock,
         )

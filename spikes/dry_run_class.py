@@ -27,16 +27,18 @@ section 4.7's longest row, and when it ends the agent starts the next one after 
 (`loadgen.PAUSE_SECONDS`), a new task of the same student, whose first request is a first turn
 again. No request is sent once the hour has passed, and the hour ends when the requests in flight
 have. A conversation that ends on a request not answered 200, or that failed, is followed by the
-next after `AFTER_REFUSAL_SECONDS`.
+next after `AFTER_REFUSAL_SECONDS`. A request that failed, or whose stream carried the gateway's
+error event, ends its conversation as a refusal does: the next one opens with a first turn.
 
-**Whether a request was held.** The gateway holds a request for a pool that is not ready, and a
-held stream gets a keep-alive every few seconds until the engine's first event
-(`rhi_gateway.hold`); a hold that ends before its first keep-alive is due leaves none. So the job
-also reads the pool's state from the gateway's status every `POLL_SECONDS` through the hour, the
-view of readiness the hold itself decides on, and writes a `pool_state` line each time it changes.
-A request answered 200 is `held` when a keep-alive came before the engine's first event
-(`kept_alive`), or when the status read last before it was sent, or any read after it up to its
-first token, said the pool was not ready (`pool_not_ready_read`). Both are written with it.
+**Whether a request was held** is the gateway's own decision, which its answer carries in the
+header `rhi_gateway.hold.HELD_HEADER` (`loadgen.Record.held`), whether or not the hold lasted long
+enough for a keep-alive; whether one came before the engine's first event is written beside it
+(`kept_alive`).
+
+**The hour's bounds.** The hour starts once the pool is ready and ends `duration` seconds later,
+both written in `hour_started`. The readings of the start and the end are of the workspace as it
+stood at those two moments, whenever they are made: the start's while the class begins, the end's
+once the answers in flight have ended and `SETTLE_SECONDS` have let their samples arrive.
 
 **What it records.** One JSON object per line on standard output, which the spike jobs' log group
 keeps (`s7_drain.Recorder`). Each has `at`, the UTC time to the millisecond, and `kind`; every other
@@ -54,19 +56,23 @@ number and its cause only when that is one of the gateway's own (`rhi_common.cau
 | `engine_counters` | At the hour's `start` and `end`: each instance's counters of the engine's row of the per-engine table (`rhi_common.engine_metrics`), cached and input tokens and preemptions among them where the row has them; a quantity the row leaves out is not written |
 | `cache_capacity` | At the start: the cache capacity in tokens each instance's engine reported (`rhi_lifecycle.cache`) |
 | `in_service` | At the start and the end: the scaler's count of the pool's instances in service, and the instances that write their release, which only one in service does (`rhi_lifecycle.serving`) |
-| `pool_state` | The pool's state as the gateway's status gave it, each time it changes; `unread` when it could not be read |
 | `request` | One request: its session (the student), agent and conversation, whether it was the conversation's first turn, when it was sent and its first and last token came, its input, cached and output tokens, whether it was held, its status, its cause and its failure |
-| `instance_started` | An instance whose launch began during the hour: its transition and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
-| `error` | A reading that could not be made, by its step and kind; the hour goes on |
+| `instance_started` | An instance whose launch began during the hour: its transition, when it began at the latest, and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
+| `error` | A reading that could not be made, by its step, its quantity for a counter, and its kind; the hour goes on, and the counters read are written with the names of those that were not (`unread`) |
 | `end` | The requests recorded |
 
 **Which instances started during the hour.** The lifecycle agent keeps exporting the stages of its
 last launch for as long as it runs, so an instance that was serving before the hour also writes
-stage samples in it. The job reads the stage metric from `LOOKBACK_SECONDS` before the hour to its
-end. For each instance and transition, the stages it exported at the hour's start are its launch
-from before; a launch began in the hour where a sample in it gives a stage another number of
-seconds than the launch before, which a new launch does: it empties the metric and sets each stage
-as it ends (`launches_of`).
+stage samples in it. The job reads the stage metric from `LOOKBACK_SECONDS` before the hour to the
+moment it reads. For each instance, the stages it exported at the hour's start are its launch from
+before; a new launch shows where a sample gives a stage another number of seconds than the launch
+before, which a new launch does: it empties the metric and sets each stage as it ends. Its samples
+are taken whatever their transition label, because the agent takes a launch into service for a
+promotion until it finds no image on the disk, and then moves its stages to `cold-launch`: the
+launch is written once, under its last label (`launches_of`). It began, at the latest, when it was
+first seen less the seconds of the stages it had ended by then, and it is written when that is in
+the hour. A launch that began in the hour keeps the stages it ends after it: the job waits for each
+to end its `hook`, the last stage, for at most `LAUNCH_WAIT_SECONDS` after the hour.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-dry_run_class`):
 
@@ -124,9 +130,8 @@ SHAPE_VARIABLE = "RHI_DRY_RUN_SHAPE"
 POOL = "coursework"
 HOUR_SECONDS = 3600.0
 
-# Seconds. While the pool wakes, and through the hour: its status is read this often, and the wake
-# repeated this often while it is not ready, as `rhi wait` does; a cold launch may take 40 minutes
-# at worst (spike S1).
+# Seconds. While the pool wakes, its status is read this often, and the wake repeated this often
+# while it is not ready, as `rhi wait` does; a cold launch may take 40 minutes at worst (spike S1).
 POLL_SECONDS = 5.0
 WAKE_EVERY_SECONDS = 60.0
 READY_WAIT_SECONDS = 40 * 60.0
@@ -136,6 +141,9 @@ AFTER_REFUSAL_SECONDS = 10.0
 # workspace within a few scrapes, and the job waits that long before its end readings.
 SCRAPE_SECONDS = 15.0
 SETTLE_SECONDS = 4 * SCRAPE_SECONDS
+# Seconds the job waits, after the hour, for a launch that began in it to end its last stage: a cold
+# launch at worst (spike S1).
+LAUNCH_WAIT_SECONDS = READY_WAIT_SECONDS
 # Seconds. Prometheus' lookback: how far back a reading at a time finds a series' last sample.
 LOOKBACK_SECONDS = 300.0
 # Seconds a series' last sample may be old and still be read as written now: four scrapes. The
@@ -146,9 +154,10 @@ SCALER_FRESH_SECONDS = 120.0
 _SAME_SECONDS = 1e-6
 
 _STAGES = frozenset(stage.value for stage in Stage)
-_TRANSITIONS = frozenset(transition.value for transition in Transition)
-_STATES = frozenset(state.value for state in State)
-UNREAD = "unread"
+# The transitions in the order a launch's label may move along: a launch into service is taken for a
+# promotion before it may turn out to be a cold launch. A step that shows two takes the later.
+_TRANSITIONS = tuple(transition.value for transition in Transition)
+_LAST_STAGE = Stage.HOOK.value
 
 
 class Gateway(Protocol):
@@ -179,14 +188,16 @@ async def _off_loop[Result](action: Callable[[], Result]) -> Result:
 type Snapshot = dict[str, float]
 
 
-@dataclass(frozen=True)
+@dataclass
 class Launch:
-    """One launch of an instance, as the stage metric showed it: its transition, the step it was
-    first seen at, and the seconds of each stage it had ended by its last sample."""
+    """One launch of an instance, as the stage metric showed it: its last transition label, the step
+    it was first seen at, the latest it can have begun, and the seconds of each stage it had ended by
+    its last sample."""
 
     instance: str
     transition: str
     first_seen: float
+    began: float
     stages: Snapshot
 
 
@@ -196,33 +207,37 @@ def _same_launch(earlier: Snapshot, later: Snapshot) -> bool:
 
 
 def launches_of(series: Iterable[common.Series], start: float) -> list[Launch]:
-    """The launches that began after `start` in the stage metric's `series`, read from before it.
+    """The launches seen after `start` in the stage metric's `series`, read from before it.
 
-    Per instance and transition, the stages of each step form a snapshot. The last one at or before
-    `start` is the launch from before the hour; each later snapshot that gives a stage other seconds
-    than the launch it follows begins a new one, and one that agrees with it adds the stages it ended
-    since. A label outside the agent's fixed stages and transitions is not read."""
-    steps: dict[tuple[str, str], dict[float, Snapshot]] = {}
+    Per instance, the stages of each step form a snapshot, whatever their transition label. The last
+    one at or before `start` is the launch from before the hour; each later snapshot that gives a
+    stage other seconds than the launch it follows begins a new one, and one that agrees with it adds
+    the stages it ended since and gives it its label. A launch began, at the latest, when it was
+    first seen less the seconds of the stages it had ended by then. A label outside the agent's fixed
+    stages and transitions is not read."""
+    steps: dict[str, dict[float, tuple[set[str], Snapshot]]] = {}
     for one in series:
         instance, transition, stage = (one.labels.get(label, "") for label in ("instance", "transition", "stage"))
         if not instance or transition not in _TRANSITIONS or stage not in _STAGES:
             continue
         for at, seconds in one.samples:
             if math.isfinite(seconds):
-                steps.setdefault((instance, transition), {}).setdefault(at, {})[stage] = seconds
+                labels, snapshot = steps.setdefault(instance, {}).setdefault(at, (set(), {}))
+                labels.add(transition)
+                snapshot[stage] = seconds
     launches: list[Launch] = []
-    for (instance, transition), snapshots in steps.items():
+    for instance, snapshots in steps.items():
         current: Launch | None = None
         for at in sorted(snapshots):
-            snapshot = snapshots[at]
-            if at <= start:
-                current = Launch(instance, transition, at, dict(snapshot))
-                continue
+            labels, snapshot = snapshots[at]
+            transition = max(labels, key=_TRANSITIONS.index)
             if current is not None and _same_launch(current.stages, snapshot):
                 current.stages.update(snapshot)
+                current.transition = transition
                 continue
-            current = Launch(instance, transition, at, dict(snapshot))
-            launches.append(current)
+            current = Launch(instance, transition, at, at - sum(snapshot.values()), dict(snapshot))
+            if at > start:
+                launches.append(current)
     return sorted(launches, key=lambda launch: launch.first_seen)
 
 
@@ -254,7 +269,6 @@ class Rehearsal:
     names: Names = field(default_factory=Names)
     step: str = "start"
     requests: int = 0
-    _states: list[tuple[float, bool]] = field(default_factory=list)
     _seeds: Iterator[int] = field(default_factory=itertools.count)
 
     def __post_init__(self) -> None:
@@ -288,29 +302,6 @@ class Rehearsal:
                 await self.clock.sleep(POLL_SECONDS)
         self.recorder.line("pool_ready", woke=waking, waited_seconds=round(self.clock.now() - started, 3))
 
-    async def _watch(self, done: asyncio.Event) -> None:
-        """Reads the pool's state from the gateway's status every `POLL_SECONDS` until `done`, and
-        writes it each time it changes."""
-        last: str | None = None
-        while not done.is_set():
-            state = await self.offload(self.gateway.state)
-            read_at = self.clock.now()
-            if state in _STATES:
-                self._states.append((read_at, state == State.READY))
-            else:
-                state = UNREAD
-            if state != last:
-                self.recorder.line("pool_state", state=state, read_at=utc(read_at))
-                last = state
-            await self.clock.sleep(POLL_SECONDS)
-
-    def _not_ready_read(self, sent: float, until: float) -> bool:
-        """Whether the status read last at or before `sent`, or any read after it up to `until`, said
-        the pool was not ready."""
-        before = [ready for at, ready in self._states if at <= sent]
-        during = [ready for at, ready in self._states if sent < at <= until]
-        return not all(before[-1:] + during)
-
     # The workspace.
 
     async def _read(self, query: str, start: float, end: float, step: float = SCRAPE_SECONDS) -> list[common.Series]:
@@ -332,14 +323,22 @@ class Rehearsal:
         return {str(quantity): name for quantity, name in names.items() if name.kind is Kind.COUNTER}
 
     async def engine_counters(self, moment: str, at: float) -> None:
-        """Each instance's counters of the engine's row at `at`, as they stand: one line."""
+        """Each instance's counters of the engine's row at `at`, as they stood: one line. A counter
+        that could not be read is an `error` line, and is named in `unread`; the others are kept."""
         instances: dict[str, dict[str, float]] = {}
+        unread: list[str] = []
         for quantity, name in self._counters().items():
             matchers = [f'pool="{POOL}"', *(f'{label}="{value}"' for label, value in name.labels.items())]
             query = f"sum by (instance) ({name}_total{{{','.join(matchers)}}})"
-            for instance, value in (await self._per_instance(query, at)).items():
+            try:
+                found = await self._per_instance(query, at)
+            except Exception as error:  # noqa: BLE001 - recorded by its kind: no text of AWS's reaches the log
+                unread.append(quantity)
+                self.recorder.line("error", step=f"{moment}_counters", quantity=quantity, error=error_kind(error).value)
+                continue
+            for instance, value in found.items():
                 instances.setdefault(instance, {})[quantity] = value
-        self.recorder.line("engine_counters", moment=moment, read_at=utc(at), instances=instances)
+        self.recorder.line("engine_counters", moment=moment, read_at=utc(at), instances=instances, unread=unread)
 
     async def cache_capacity(self, at: float) -> None:
         """The cache capacity in tokens each instance's engine reported, as it stood at `at`: one line."""
@@ -367,21 +366,34 @@ class Rehearsal:
             serving=serving,
         )
 
-    async def started_instances(self, start: float, end: float) -> None:
-        """A line for each launch that began in the hour, from the stage metric (`launches_of`)."""
-        series = await self._read(f'{STAGE_METRIC}{{pool="{POOL}"}}', start - LOOKBACK_SECONDS, end)
-        for launch in launches_of(series, start):
+    async def _launches(self, start: float, deadline: float) -> list[Launch]:
+        """The launches that began between `start` and `deadline`, with every stage they ended up to now."""
+        until = max(deadline, self.clock.now())
+        series = await self._read(f'{STAGE_METRIC}{{pool="{POOL}"}}', start - LOOKBACK_SECONDS, until)
+        return [launch for launch in launches_of(series, start) if start < launch.began <= deadline]
+
+    async def started_instances(self, start: float, deadline: float, *, wait: float = 0.0) -> None:
+        """A line for each launch that began between `start` and `deadline`, from the stage metric
+        (`launches_of`), once each has ended its last stage or `wait` seconds have passed."""
+        waited_from = self.clock.now()
+        launches = await self._launches(start, deadline)
+        while any(_LAST_STAGE not in launch.stages for launch in launches):
+            if self.clock.now() - waited_from >= wait:
+                break
+            await self.clock.sleep(SCRAPE_SECONDS)
+            launches = await self._launches(start, deadline)
+        for launch in launches:
             self.recorder.line(
                 "instance_started",
                 instance=self.names(launch.instance),
                 transition=launch.transition,
+                began_at=utc(launch.began),
                 first_seen_at=utc(launch.first_seen),
                 stages=launch.stages,
             )
 
     async def _guarded(self, step: str, reading: Awaitable[None]) -> None:
         """Makes one reading; one that fails is written as an `error` line, and the run goes on."""
-        self.step = step
         try:
             await reading
         except Exception as error:  # noqa: BLE001 - recorded by its kind: no text of AWS's reaches the log
@@ -395,9 +407,6 @@ class Rehearsal:
         def at(seconds: float | None) -> str | None:
             return None if seconds is None else utc(sent + seconds)
 
-        until = sent + record.first_token_seconds if record.first_token_seconds is not None else self.clock.now()
-        accepted = record.status == httpx.codes.OK
-        not_ready = accepted and self._not_ready_read(sent, until)
         self.requests += 1
         self.recorder.line(
             "request",
@@ -412,9 +421,8 @@ class Rehearsal:
             input_tokens=record.input_tokens,
             cached_input_tokens=record.cached_input_tokens,
             output_tokens=record.output_tokens,
-            held=accepted and (record.kept_alive or not_ready),
+            held=record.held,
             kept_alive=record.kept_alive,
-            pool_not_ready_read=not_ready,
             status=record.status,
             cause=record.cause,
             failure=None if record.failure is None else record.failure.value,
@@ -447,31 +455,27 @@ class Rehearsal:
                     session, agent, conversation, record
                 ),
             )
-            if records and (records[-1].failure is not None or records[-1].status != httpx.codes.OK):
+            last = records[-1] if records else None
+            if last is not None and (
+                last.failure is not None or last.cause is not None or last.status != httpx.codes.OK
+            ):
                 await self.clock.sleep(AFTER_REFUSAL_SECONDS)
 
-    async def replay(self) -> tuple[float, float]:
-        """The class for the hour: every agent of every session, while the pool's state is watched.
-        Returns when the hour started and when its last request ended."""
-        self.step = "replay"
-        start = self.clock.now()
-        deadline = start + self.duration
-        self.recorder.line("hour_started", started_at=utc(start), ends_at=utc(deadline))
-        done = asyncio.Event()
-        async with asyncio.TaskGroup() as group:
-            watch = group.create_task(self._watch(done))
-            async with asyncio.TaskGroup() as agents:
-                for session in range(self.class_size):
-                    for agent in range(self.agents):
-                        agents.create_task(self._agent(session, agent, deadline))
-            done.set()
-            await watch
-        end = self.clock.now()
-        self.recorder.line("hour_ended", ended_at=utc(end), requests=self.requests)
-        return start, end
+    async def replay(self, deadline: float) -> None:
+        """The class until `deadline`: every agent of every session, to the end of its last request."""
+        async with asyncio.TaskGroup() as agents:
+            for session in range(self.class_size):
+                for agent in range(self.agents):
+                    agents.create_task(self._agent(session, agent, deadline))
+
+    async def _start_readings(self, start: float) -> None:
+        await self._guarded("start_counters", self.engine_counters("start", start))
+        await self._guarded("cache_capacity", self.cache_capacity(start))
+        await self._guarded("start_in_service", self.in_service("start", start))
 
     async def run(self) -> None:
-        """The pool made ready, the start readings, the hour, then the end readings and the launches."""
+        """The pool made ready; the hour, while the start readings are made of its first moment; then
+        the end readings, of its last moment, and the launches that began in it."""
         self.recorder.line(
             "start",
             pool=POOL,
@@ -482,23 +486,29 @@ class Rehearsal:
             duration_seconds=self.duration,
         )
         await self.ready()
-        at = self.clock.now()
-        await self._guarded("start_counters", self.engine_counters("start", at))
-        await self._guarded("cache_capacity", self.cache_capacity(at))
-        await self._guarded("start_in_service", self.in_service("start", at))
-        start, end = await self.replay()
+        self.step = "replay"
+        start = self.clock.now()
+        deadline = start + self.duration
+        self.recorder.line("hour_started", started_at=utc(start), ends_at=utc(deadline))
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._start_readings(start))
+            group.create_task(self.replay(deadline))
+        self.recorder.line("hour_ended", ended_at=utc(self.clock.now()), requests=self.requests)
         self.step = "settle"
         await self.clock.sleep(SETTLE_SECONDS)
-        await self._guarded("end_counters", self.engine_counters("end", end + SCRAPE_SECONDS))
-        await self._guarded("end_in_service", self.in_service("end", end))
-        await self._guarded("started_instances", self.started_instances(start, end))
+        self.step = "end_readings"
+        await self._guarded("end_counters", self.engine_counters("end", deadline))
+        await self._guarded("end_in_service", self.in_service("end", deadline))
+        launches = self.started_instances(start, deadline, wait=LAUNCH_WAIT_SECONDS)
+        await self._guarded("started_instances", launches)
         self.recorder.line("end", requests=self.requests)
 
 
 def class_size_of(environ: Mapping[str, str]) -> int | None:
     """The class size the owner gave, or None when it is missing or not a whole number of one or more."""
     given = environ.get(CLASS_SIZE_VARIABLE, "").strip()
-    return int(given) if given.isdigit() and int(given) >= 1 else None
+    # ASCII digits only: `int` refuses some characters `isdigit` takes, such as a superscript.
+    return int(given) if given.isascii() and given.isdigit() and int(given) >= 1 else None
 
 
 def shape_of(environ: Mapping[str, str]) -> Shape | None:
@@ -513,13 +523,13 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
     run or failed, with a `refused` or `failed` line and no traceback."""
     clock = SystemClock() if clock is None else clock
     recorder = Recorder(clock)
-    class_size, shape = class_size_of(environ), shape_of(environ)
-    if class_size is None or shape is None:
-        recorder.line("refused", reason="no_class_size" if class_size is None else "no_shape")
-        return 1
     step = "configuration"
     rehearsal: Rehearsal | None = None
     try:
+        class_size, shape = class_size_of(environ), shape_of(environ)
+        if class_size is None or shape is None:
+            recorder.line("refused", reason="no_class_size" if class_size is None else "no_shape")
+            return 1
         pools = [pool for pool in config.read_ssm().pools if pool.name == POOL]
         if len(pools) != 1:
             recorder.line("refused", reason="no_coursework_pool")
