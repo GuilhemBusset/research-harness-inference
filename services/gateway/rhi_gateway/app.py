@@ -72,8 +72,12 @@ path of the table, which would tell a client that the path exists.
 refusal and a path outside the table included, gives one log record of metadata
 (`rhi_gateway.telemetry`), written by the middleware `build_app` installs. Each part that decides
 something of a request notes it there: the alias once the key is accepted, the pool once the body
-names it, the tokens at the settlement, and the cause wherever an error is rendered. An exception
-that escapes a handler is answered 500 with no body and logged with the cause `none`.
+names it, the tokens at the settlement, and the cause wherever an error is rendered. A forwarded
+request also notes how long it waited, whether or not the gateway has metrics: the time from its
+acceptance to its first token sent, read at the two moments the time-to-first-token histogram reads
+them (on `Forwarding.clock`), and the time it was held, from the hold's start to its end, on the
+hold's own clock. An exception that escapes a handler is answered 500 with no body and logged with
+the cause `none`.
 
 **The metrics** (sections 6.6 and 7.2): `build_app` given the gateway's metrics
 (`rhi_gateway.metrics.Metrics`) counts each of these requests once, from its finished record: per
@@ -333,6 +337,8 @@ class Forwarding:
     longest a request may run is the proxy's. `heartbeat`, when given, counts the demand.
     `retry_after` gives the seconds of `Retry-After` for the causes it names, in place of the
     design's (`rhi_gateway.errors.render_json`): only a cause that carries the header may be named.
+    `clock` gives the seconds, on a clock that never goes back, of a request's acceptance and of
+    its first token sent, for its log record (`rhi_gateway.telemetry`): a test gives its own.
     """
 
     authenticator: Authenticator
@@ -342,6 +348,7 @@ class Forwarding:
     holding: Holding
     heartbeat: Heartbeat | None = None
     retry_after: Mapping[Cause, int] = field(default_factory=dict)
+    clock: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
         # Refused when the gateway is built, not at the first refusal it would render.
@@ -389,11 +396,12 @@ class _Held:
         self._holding = holding
         self._pool = pool
         self.streams = streams
+        self._started_at = holding.clock()
         self._hold = Hold(
             pool,
             wire_format,
             streams=streams,
-            started_at=holding.clock(),
+            started_at=self._started_at,
             keepalive_seconds=holding.keepalive_seconds,
         )
         self._first = self._step()
@@ -402,6 +410,7 @@ class _Held:
                 raise GatewayError(action.cause)
         self.ready = any(isinstance(action, Forward) for action in self._first)
         self.demand: Demand | None = None  # Set once the request is received: it is forwarded when the hold ends.
+        self._ended = False
 
     def _step(self) -> tuple[Action, ...]:
         view = self._holding.view(self._pool)
@@ -418,25 +427,38 @@ class _Held:
         """The hold: its keep-alives, each as it is due, and its wakes, until the pool is ready.
 
         Ends when the request may be forwarded; raises `GatewayError` with the cause that ends it.
+        However it ends, the time held, from the hold's start, is noted on the request's record.
         """
         actions, self._first = self._first, ()
-        while True:
-            for action in actions:
-                if isinstance(action, KeepAlive):
-                    yield action.data
-                elif isinstance(action, Wake):
-                    self._holding.wake(self._pool.name)
-                elif isinstance(action, Forward):
-                    if self.demand is not None:
-                        self.demand.forwarded()
-                    return
-                else:
-                    raise GatewayError(action.cause)
-            # A pool found ready since the last step is acted on at once, never after one more wait:
-            # the hold may first run, or resume from a keep-alive, well after its last step.
-            if not self._holding.view(self._pool).ready:
-                await self._until_next()
-            actions = self._step()
+        try:
+            while True:
+                for action in actions:
+                    if isinstance(action, KeepAlive):
+                        yield action.data
+                    elif isinstance(action, Wake):
+                        self._holding.wake(self._pool.name)
+                    elif isinstance(action, Forward):
+                        if self.demand is not None:
+                            self.demand.forwarded()
+                        return
+                    else:
+                        raise GatewayError(action.cause)
+                # A pool found ready since the last step is acted on at once, never after one more wait:
+                # the hold may first run, or resume from a keep-alive, well after its last step.
+                if not self._holding.view(self._pool).ready:
+                    await self._until_next()
+                actions = self._step()
+        finally:
+            self.ended()
+
+    def ended(self) -> None:
+        """The hold is over: the time held, from its start, is noted on the request's record, once.
+
+        `waiting` notes it when it ends; the settlement, for a request that ended before its hold ran.
+        """
+        if not self._ended:
+            self._ended = True
+            telemetry.note_held(self._holding.clock() - self._started_at)
 
     async def next_keep_alive(self) -> bytes:
         """Once forwarded: the next keep-alive, when it is due. None follows the engine's first event."""
@@ -590,18 +612,29 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         # its waits from this moment, warm or held, and is told its tokens at its settlement.
         experience = _experience(request)
         wire_format = entry.wire_format or WireFormat.MESSAGES
+        # The turn is classified before the acceptance is read: the log and the histogram read it at the same moment.
+        first = experience is not None and first_turn(wire_format, forwarded)
+        accepted_at = forwarding.clock()
         turn = None
         if experience is not None:
             turn = experience.request(
                 forwarded.pool.name,
                 wire_format,
                 held=held is not None and not held.ready,
-                first_turn=first_turn(wire_format, forwarded),
+                first_turn=first,
             )
-        token_sent = None if turn is None else turn.token_sent
+
+        def token_sent(answer: bool) -> None:
+            # The log's time to first token is read at the moments the histogram reads its own, with or without it.
+            telemetry.note_first_token(forwarding.clock() - accepted_at)
+            if turn is not None:
+                turn.token_sent(answer)
 
         async def settle(observed: Observed) -> None:
             telemetry.note_tokens(observed.input_tokens, observed.output_tokens, observed.cached_input_tokens)
+            if held is not None and not held.ready:
+                # A request that ended before its hold ran, or while it ran, was held until now.
+                held.ended()
             if demand is not None:
                 demand.end()
             if turn is not None:
