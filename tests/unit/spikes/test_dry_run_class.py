@@ -155,8 +155,10 @@ class Workspace:
         rows.append(({"instance": self.during, "transition": "promotion"}, {"boot": launched["boot"]}, START + 45))
         cold = {"instance": self.during, "transition": "cold-launch"}
         rows.append((cold, {stage: launched[stage] for stage in EARLY}, START + 60))
-        rows.append((cold, {stage: launched[stage] for stage in launched if stage not in EARLY}, START + 155))
+        rows.append((cold, {stage: launched[stage] for stage in launched if stage not in EARLY}, START + 135))
+        # The third's scrape that lacks its image places its launch after the hour.
         rows.append(({"instance": self.after, "transition": "promotion"}, {"boot": 10.0}, START + 105))
+        rows.append(({"instance": self.after, "transition": "promotion"}, {"image": 1.5}, START + 120))
         series = []
         for labels, stages, first in rows:
             # A promotion's labels last until the launch turns out to be a cold one.
@@ -401,6 +403,39 @@ def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_ste
     assert all(line["stages"] == stages for line in started)
     if in_hour == ["uncertain"]:
         assert started[0]["began_after_at"] <= dry.utc(deadline) < started[0]["began_at"]
+
+
+@pytest.mark.parametrize("kernel", [-5.0, 55.0], ids=["just-before", "just-before-the-end"])
+def test_a_first_scrape_long_after_its_stages_ended_leaves_the_earliest_unknown(kernel: float) -> None:
+    lines: list[str] = []
+    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    stages = {"boot": 20.0, "image": 5.0, "release-check": 1.0, "container-start": 4.0, "weights": 5.0}
+    stages |= {"warm-up": 4.0, "hook": 1.0}
+    hooked = START + kernel + sum(stages.values())
+
+    class Late(Workspace):
+        """The node's collector starts with the agent: its first scrape comes 25 seconds after the
+        hook, with every stage already ended, then one every 15 seconds."""
+
+        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+            if dry.STAGE_METRIC not in query:
+                return []
+            scrapes = itertools.takewhile(lambda t: t <= end, itertools.count(hooked + 25, 15))
+            at = [t for t in scrapes if t >= start]
+            timed = query.startswith("timestamp(")
+            labels = {"instance": self.after, "transition": "promotion"}
+            return [
+                _series({**labels, "stage": stage}, *((t, t if timed else seconds) for t in at))
+                for stage, seconds in stages.items()
+            ]
+
+    rehearsal.workspace = Late(*instances)
+    rehearsal.clock.at = START + 300  # ty: ignore[unresolved-attribute] - the test's clock
+    asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
+    # Its latest is after the hour's start and nothing bounds it from below: it may have begun in the
+    # hour, so it is written with its stages, and not as certain.
+    (started,) = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
+    assert (started["in_hour"], started["began_after_at"], started["stages"]) == ("uncertain", None, stages)
 
 
 def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:

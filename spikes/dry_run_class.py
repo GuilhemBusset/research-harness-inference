@@ -57,7 +57,7 @@ number and its cause only when that is one of the gateway's own (`rhi_common.cau
 | `cache_capacity` | At the start: the cache capacity in tokens each instance's engine reported (`rhi_lifecycle.cache`) |
 | `in_service` | At the start and the end: the scaler's count of the pool's instances in service, and the instances that write their release, which only one in service does (`rhi_lifecycle.serving`) |
 | `request` | One request: its session (the student), agent and conversation, whether it was the conversation's first turn, when it was sent and its first and last token came, its input, cached and output tokens, whether it was held, its status, its cause and its failure |
-| `instance_started` | An instance whose launch may have begun during the hour: its transition, when it began at the earliest and at the latest, whether that is in the hour for certain, and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
+| `instance_started` | An instance whose launch may have begun during the hour: its transition, when it began at the latest and, where an observation bounds it, at the earliest, whether that is in the hour for certain, and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
 | `error` | A reading that could not be made, by its step, its quantity for a counter, and its kind; the hour goes on, and the counters read are written with the names of those that were not (`unread`) |
 | `end` | The requests recorded |
 
@@ -72,11 +72,16 @@ promotion until it finds no image on the disk, and then moves its stages to `col
 launch is written once, under its last label (`launches_of`). It began, at the latest, when the
 sample that showed it was scraped, which the job reads with `timestamp()` rather than taking the
 query's step, less the seconds of the stages it had ended by then; each later sample of it, with more stages
-ended, can only make that earlier (`Launch.began`). A stage's seconds are scraped at most one scrape
-after it ended, so the launch began no earlier than that less `SCRAPE_SECONDS`
-(`Launch.began_after`). A launch is written when these two bounds overlap the hour, with both:
-`in_hour` is `certain` when both are in it, and `uncertain` when the hour's start or end falls
-between them, as for a launch that began in the hour's last seconds and was first scraped after it.
+ended, can only make that earlier (`Launch.began`). The node's collector starts with the instance, as
+the agent does, so its first scrape may come well after the stages it shows had ended: only an
+observation bounds when the launch began from below (`Launch.began_after`). A scrape of the launch
+that lacks a stage it ends later says the stage had not ended then, so the launch began after that
+scrape less the seconds of the stages up to that one, in the order a launch goes through them; and a
+scrape of the instance's launch before says the new one had not begun then. Where nothing bounds it,
+`began_after_at` is null. A launch is written when these two bounds may overlap the hour, with
+both: `in_hour` is `certain` when both are in it, and `uncertain` when the hour's start or end
+falls between them or the earliest is unknown, as for a launch that began in the hour's last
+seconds and was first scraped after it.
 A launch shows no stage before its boot has ended, so one that began near the hour's end is seen
 only after it: the job goes on reading for `DISCOVERY_SECONDS` after the hour, and a launch that
 began in the hour keeps the stages it ends after it: the job waits for each to end its `hook`, the
@@ -166,6 +171,20 @@ SCALER_FRESH_SECONDS = 120.0
 _SAME_SECONDS = 1e-6
 
 _STAGES = frozenset(stage.value for stage in Stage)
+# The stages in the order a launch goes through them (`rhi_lifecycle.stages`), each ending where the
+# next starts.
+_ORDER = tuple(
+    stage.value
+    for stage in (
+        Stage.BOOT,
+        Stage.IMAGE,
+        Stage.RELEASE_CHECK,
+        Stage.CONTAINER_START,
+        Stage.WEIGHTS,
+        Stage.WARM_UP,
+        Stage.HOOK,
+    )
+)
 # The transitions in the order a launch's label may move along: a launch into service is taken for a
 # promotion before it may turn out to be a cold launch. A step that shows two takes the later.
 _TRANSITIONS = tuple(transition.value for transition in Transition)
@@ -206,18 +225,35 @@ class Launch:
     it was first seen at, the latest it can have begun, and the seconds of each stage it had ended by
     its last sample. The stages follow each other from the kernel's start, so at each sample the
     launch began no later than the sample's time less the seconds of the stages ended by then: the
-    latest it can have begun is the earliest of these."""
+    latest it can have begun is the earliest of these.
+
+    `began_after` is what the observations say it began after, None when none says it: the last
+    scrape of the instance's launch before, and each scrape of this one that lacked a stage it ended
+    later, less the seconds of the stages up to that one (`launches_of`)."""
 
     instance: str
     transition: str
     first_seen: float
     began: float
     stages: Snapshot
+    began_after: float | None = None
 
-    @property
-    def began_after(self) -> float:
-        """The earliest it can have begun: each stage's seconds are scraped within one scrape of its end."""
-        return self.began - SCRAPE_SECONDS
+
+def _began_after(stages: Snapshot, floor: float | None, seen: Iterable[tuple[float, frozenset[str]]]) -> float | None:
+    """The latest of the bounds the observations give from below a launch with `stages`, or None:
+    `floor`, and for each scrape `seen` at a time with the stages it showed, its time less the seconds
+    of the stages up to the first one it lacked."""
+    bounds = [] if floor is None else [floor]
+    for at, ended in seen:
+        through = 0.0
+        for stage in _ORDER:
+            if stage not in stages:
+                continue
+            through += stages[stage]
+            if stage not in ended:
+                bounds.append(at - through)
+                break
+    return max(bounds, default=None)
 
 
 def _same_launch(earlier: Snapshot, later: Snapshot) -> bool:
@@ -251,7 +287,8 @@ def launches_of(
         for at, taken in one.samples
         if math.isfinite(taken)
     }
-    steps: dict[str, dict[float, tuple[set[str], Snapshot]]] = {}
+    # Per instance and time, the labels and stages seen then, and whether the time is a scrape's.
+    steps: dict[str, dict[float, tuple[set[str], Snapshot, list[bool]]]] = {}
     for one in series:
         instance, transition, stage = (one.labels.get(label, "") for label in ("instance", "transition", "stage"))
         if not instance or transition not in _TRANSITIONS or stage not in _STAGES:
@@ -259,25 +296,37 @@ def launches_of(
         identity = _identity(one.labels)
         for step, seconds in one.samples:
             if math.isfinite(seconds):
-                at = min(step, scrapes.get((identity, step), step))
-                labels, snapshot = steps.setdefault(instance, {}).setdefault(at, (set(), {}))
+                taken = scrapes.get((identity, step))
+                at = step if taken is None else min(step, taken)
+                labels, snapshot, scraped_then = steps.setdefault(instance, {}).setdefault(at, (set(), {}, [False]))
                 labels.add(transition)
                 snapshot[stage] = seconds
-    launches: list[Launch] = []
+                scraped_then[0] = scraped_then[0] or taken is not None
+    # Each launch after `start`, with what bounds it from below: the last scrape of the launch before
+    # it, and the scrapes of it with the stages each showed. A time that is only a step is no scrape's:
+    # the sample it shows was scraped at it or before, so it bounds nothing from below.
+    found: list[tuple[Launch, float | None, list[tuple[float, frozenset[str]]]]] = []
     for instance, snapshots in steps.items():
         current: Launch | None = None
+        seen: list[tuple[float, frozenset[str]]] = []
         for at in sorted(snapshots):
-            labels, snapshot = snapshots[at]
+            labels, snapshot, (scraped_then,) = snapshots[at]
             transition = max(labels, key=_TRANSITIONS.index)
             if current is not None and _same_launch(current.stages, snapshot):
                 current.stages.update(snapshot)
                 current.transition = transition
                 current.began = min(current.began, at - sum(current.stages.values()))
+                if scraped_then:
+                    seen.append((at, frozenset(snapshot)))
                 continue
+            floor = max((time for time, _ in seen), default=None)
             current = Launch(instance, transition, at, at - sum(snapshot.values()), dict(snapshot))
+            seen = [(at, frozenset(snapshot))] if scraped_then else []
             if at > start:
-                launches.append(current)
-    return sorted(launches, key=lambda launch: launch.first_seen)
+                found.append((current, floor, seen))
+    for launch, floor, seen in found:
+        launch.began_after = _began_after(launch.stages, floor, seen)
+    return sorted((launch for launch, _, _ in found), key=lambda launch: launch.first_seen)
 
 
 # The run.
@@ -407,13 +456,18 @@ class Rehearsal:
 
     async def _launches(self, start: float, deadline: float) -> list[Launch]:
         """The launches that may have begun between `start` and `deadline`, with every stage they ended
-        up to now: those whose bounds, `began_after` to `began`, overlap the hour."""
+        up to now: those whose bounds, `began_after` to `began`, may overlap the hour; one whose earliest
+        is unknown may have begun at any time before its latest."""
         until = max(deadline, self.clock.now())
         selector = f'{STAGE_METRIC}{{pool="{POOL}"}}'
         series = await self._read(selector, start - LOOKBACK_SECONDS, until)
         scraped = await self._read(f"timestamp({selector})", start - LOOKBACK_SECONDS, until)
         launches = launches_of(series, start, scraped)
-        return [launch for launch in launches if start < launch.began and launch.began_after <= deadline]
+        return [
+            launch
+            for launch in launches
+            if start < launch.began and (launch.began_after is None or launch.began_after < deadline)
+        ]
 
     async def started_instances(self, start: float, deadline: float, *, wait: float = 0.0) -> None:
         """A line for each launch that may have begun between `start` and `deadline`, from the stage metric
@@ -431,13 +485,14 @@ class Rehearsal:
             await self.clock.sleep(SCRAPE_SECONDS)
             launches = await self._launches(start, deadline)
         for launch in launches:
+            after = launch.began_after
             self.recorder.line(
                 "instance_started",
                 instance=self.names(launch.instance),
                 transition=launch.transition,
                 began_at=utc(launch.began),
-                began_after_at=utc(launch.began_after),
-                in_hour="certain" if start < launch.began_after and launch.began <= deadline else "uncertain",
+                began_after_at=None if after is None else utc(after),
+                in_hour="certain" if after is not None and start <= after and launch.began <= deadline else "uncertain",
                 first_seen_at=utc(launch.first_seen),
                 stages=launch.stages,
             )
