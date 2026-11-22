@@ -174,6 +174,23 @@ def test_a_module_that_defines_a_dashboard_is_found_without_being_listed(
     assert not {"build", "check", "rules"} & {module.__name__.rpartition(".")[2] for module in build.modules()}
 
 
+def test_a_module_may_define_a_dashboard_and_its_companions(
+    package: Callable[[dict[str, str]], ModuleType], example: rhi_config.Config, tmp_path: Path
+) -> None:
+    pair = STUDENTS_MODULE.replace("def dashboard(config):", "def one(config):") + (
+        "\n\ndef dashboard(config):\n"
+        "    companion = one(config).uid('sample-companion').title('Sample: companion')\n"
+        "    return one(config), companion\n"
+    )
+    written = build.write(example, tmp_path, package({"pair": pair}))
+    assert [path.name for path in written] == ["sample-students.json", "sample-companion.json"]
+
+    # Within one module too, two dashboards never share an identifier.
+    clash = pair.replace("uid('sample-companion')", "uid('sample-students')")
+    with pytest.raises(build.BuildError):
+        build.dashboards(example, package({"pair": clash}))
+
+
 def test_a_dashboard_is_built_from_the_configuration(
     package: Callable[[dict[str, str]], ModuleType], two_pools: rhi_config.Config
 ) -> None:

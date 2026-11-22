@@ -5,7 +5,8 @@ defines, itself, these two names.
 
 - `dashboard(config)` returns the Grafana Foundation SDK's dashboard builder
   (`grafana_foundation_sdk.builders.dashboard.Dashboard`), with a fixed identifier (`uid`) and a
-  title. `config` is the configuration (`rhi.config.Config`): a pool is one of its entries and one
+  title; or a tuple of them, the dashboard and a companion view of its numbers that needs a time
+  range of its own (Grafana gives every panel of a dashboard the dashboard's fixed dates). `config` is the configuration (`rhi.config.Config`): a pool is one of its entries and one
   row of a dashboard (system design, section 4.2), so a module builds its rows from
   `config.pools`, with the helpers of `rhi_dashboards.rules`.
 - `METRICS` declares where each metric name the dashboard queries comes from
@@ -99,22 +100,26 @@ def _number_panels(model: models.Dashboard) -> None:
             inner.id_val = number
 
 
-def _build(module: ModuleType, config: Config) -> Built:
-    builder = module.dashboard(config)
-    if not isinstance(builder, dashboard_builders.Dashboard):
-        raise BuildError(f"{module.__name__}: dashboard() must return the SDK's dashboard builder")
+def _build(module: ModuleType, config: Config) -> list[Built]:
+    made = module.dashboard(config)
+    builders = list(made) if isinstance(made, tuple) else [made]
+    if not builders or not all(isinstance(builder, dashboard_builders.Dashboard) for builder in builders):
+        raise BuildError(f"{module.__name__}: dashboard() must return the SDK's dashboard builder, or a tuple of them")
     declared = getattr(module, "METRICS", None)
     if not isinstance(declared, (tuple, list)) or not all(
         isinstance(one, (rules.FromEngineTable, rules.EmittedBy, rules.ExportedBy)) for one in declared
     ):
         raise BuildError(f"{module.__name__}: METRICS must declare where each metric name comes from")
-    model = builder.build()
-    if model.uid is None or _UID.fullmatch(model.uid) is None:
-        raise BuildError(f"{module.__name__}: the dashboard needs an identifier of lower-case letters, digits, hyphens")
-    if not model.title:
-        raise BuildError(f"{module.__name__}: the dashboard needs a title")
-    _number_panels(model)
-    return Built(module.__name__, model, tuple(declared))
+    built = []
+    for builder in builders:
+        model = builder.build()
+        if model.uid is None or _UID.fullmatch(model.uid) is None:
+            raise BuildError(f"{module.__name__}: a dashboard needs an identifier of lower-case letters, digits, hyphens")
+        if not model.title:
+            raise BuildError(f"{module.__name__}: a dashboard needs a title")
+        _number_panels(model)
+        built.append(Built(module.__name__, model, tuple(declared)))
+    return built
 
 
 def dashboards(config: Config, package: ModuleType = rhi_dashboards) -> list[Built]:
@@ -123,13 +128,14 @@ def dashboards(config: Config, package: ModuleType = rhi_dashboards) -> list[Bui
     Two dashboards with one identifier, or with one title, raise `BuildError`: Grafana would keep
     one of them only.
     """
-    built = [_build(module, config) for module in modules(package)]
+    built = [one for module in modules(package) for one in _build(module, config)]
     for what in ("uid", "title"):
         owners: dict[str, str] = {}
         for one in built:
-            other = owners.setdefault(getattr(one, what), one.module)
-            if other != one.module:
-                raise BuildError(f"{other} and {one.module} give their dashboards the same {what}")
+            value = getattr(one, what)
+            if value in owners:
+                raise BuildError(f"{owners[value]} and {one.module} give their dashboards the same {what}")
+            owners[value] = one.module
     return built
 
 
