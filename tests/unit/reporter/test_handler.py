@@ -681,6 +681,41 @@ def test_an_approval_of_another_execution_changes_nothing(stub: Stub, commit: st
     assert deployment(client, other_commit) == [WAITING]
 
 
+def test_an_approval_of_another_stage_is_a_step_that_runs(
+    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed = stub.list_action_executions
+
+    def with_preflight(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+        answer = listed(pipelineName, filter)
+        kind = {"actionTypeId": {"category": "Approval", "provider": "Manual"}}
+        record = {"stageName": "Preflight", "actionName": "Confirm", "status": "InProgress", "startTime": STARTED}
+        return {"actionExecutionDetails": [*answer["actionExecutionDetails"], record | {"input": kind}]}
+
+    monkeypatch.setattr(stub, "list_action_executions", with_preflight)
+    client = Client()
+    deliver([action_event(stub.execution, "Preflight", "Confirm", "Approval", "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING]
+
+
+@pytest.mark.parametrize("resolved", [False, True], ids=["while it waits", "once it resolved"])
+def test_unreadable_approvals_leave_the_last_status_in_place(
+    stub: Stub, commit: str, resolved: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stub.approvals[stub.execution] = [("Succeeded" if resolved else "InProgress", STARTED)]
+    client = Client()
+    deliver([stage_event(stub.execution, STAGE, "STARTED")], stub, client)
+
+    def throttled(**_: object) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": MARKER}}, "ListActionExecutions")
+
+    monkeypatch.setattr(stub, "list_action_executions", throttled)
+    with caplog.at_level(logging.WARNING):
+        deliver([approval(stub.execution, "STARTED"), *progress(stub.execution)], stub, client)
+    assert deployment(client, commit) == [RUNNING if resolved else WAITING]
+    assert handler.NO_APPROVALS in caplog.messages and MARKER not in caplog.text
+
+
 @pytest.mark.parametrize("secret", [None, {"app_id": "1", "installation_id": "2"}], ids=["absent", "no private_key"])
 def test_no_secret_no_status(stub: Stub, secret: dict[str, str] | None, caplog: pytest.LogCaptureFixture) -> None:
     stub.secret = secret

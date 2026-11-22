@@ -47,9 +47,9 @@ in that order with `rhi_reporter.github`.
   While one waits, a status that would say the deployment runs says instead that it waits for the
   approval, so that a late or out-of-order event of the same execution cannot hide the wait. An
   approval's start that arrives once its own run has ended, and none waits, posts nothing, so that
-  it cannot bring the wait back. An approval of another execution changes nothing. When the
-  records cannot be read, the status is posted as the event gives it, after logging
-  `NO_APPROVALS`.
+  it cannot bring the wait back; the start of an approval of another stage is, for this stage, a
+  step that runs. An approval of another execution changes nothing. When the records cannot be
+  read, no pending status is posted, after logging `NO_APPROVALS`: the last one stays in place.
 
 **The commit** is the source revision of the execution, read from CodePipeline: an event does not
 carry it. An execution that names none yet posts nothing.
@@ -200,7 +200,7 @@ MARK_BYTES = 65536
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
-NO_APPROVALS = "A pending status was posted as its event gives it: the pipeline's approvals could not be read."
+NO_APPROVALS = "A pending status was not posted: the pipeline's approvals could not be read."
 NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
 NO_FAILED_TESTS = "The report of a failed verification names no smoke test: the verification's marks could not be read."
 NO_LAST_STAGES = (
@@ -575,9 +575,10 @@ def _as_approvals_stand(
 ) -> CommitStatus | None:
     """The pending status `status` of `stage`, as the stage's manual approvals stand in `runs`, the
     action runs of the event's own execution. While one waits, a deployment that runs is one that
-    waits for it. None, nothing to post, for the start of `own`, the event's approval, once its own
-    run has ended and none waits. Any other status is returned as it is, and so is every status
-    when the runs cannot be read, after logging `NO_APPROVALS`."""
+    waits for it. None, nothing to post, for the start of `own`, the event's approval of `stage`,
+    once its own run has ended and none waits. The start of an approval of another stage (`own`
+    None) is a step that runs. None too, after logging `NO_APPROVALS`, when the runs cannot be
+    read: the status last posted stays. Any other status is returned as it is."""
     if not status.context.startswith(DEPLOY_CONTEXT) or status.description not in (
         Description.DEPLOYING,
         APPROVAL_DESCRIPTION,
@@ -595,13 +596,15 @@ def _as_approvals_stand(
                 latest[name] = run
     except (BotoCoreError, ClientError, KeyError, TypeError, ValueError, AttributeError):
         logger.warning(NO_APPROVALS)
-        return status
-    waits = any(run.get("status") == ACTIVE_RUN for run in latest.values())
-    if waits:
-        return replace(status, description=APPROVAL_DESCRIPTION)
-    if status.description == APPROVAL_DESCRIPTION and own in latest:
         return None
-    return status
+    if any(run.get("status") == ACTIVE_RUN for run in latest.values()):
+        return replace(status, description=APPROVAL_DESCRIPTION)
+    if status.description != APPROVAL_DESCRIPTION:
+        return status
+    if own is None:
+        return replace(status, description=Description.DEPLOYING)
+    # The event's own approval, not yet in the records, waits as the event tells.
+    return None if own in latest else status
 
 
 def _read(
