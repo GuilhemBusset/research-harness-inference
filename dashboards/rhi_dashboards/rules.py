@@ -19,7 +19,11 @@ showing a wrong number. Three belong to every panel, and are built here:
 
 An engine names its metrics its own way, so an engine query never writes a name: `engine_series`
 reads it from the per-engine table (`rhi_common.engine_metrics`), at the row of the engine the
-pool's configuration names. Every query a helper builds names its data source by the fixed
+pool's configuration names. That holds for the contract's quantities (`Quantity`) and for the
+further ones a row may leave out (`Further`): `engine_reports` says whether the pool's row names
+one, and a panel draws no series of a quantity its pool's engine does not give. A further name that
+is only part of its family carries the labels that select it (vLLM's computed input is
+`source="local_compute"`), and every selector the helpers write for it holds them. Every query a helper builds names its data source by the fixed
 identifier the Grafana image provisions (`services/grafana/provisioning/datasources/`).
 
 A dashboard module also declares where each metric name it queries comes from, in its `METRICS`:
@@ -39,7 +43,7 @@ from grafana_foundation_sdk.builders import timeseries as timeseries_builders
 from grafana_foundation_sdk.models import common
 from grafana_foundation_sdk.models import dashboard as models
 
-from rhi_common.engine_metrics import Kind, Quantity, metric_names
+from rhi_common.engine_metrics import Further, Kind, Quantity, further_names, metric_names
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -66,11 +70,15 @@ COUNTER_SAMPLE = "_total"
 HISTOGRAM_SAMPLES = ("_bucket", "_sum", "_count")
 
 
+# A quantity of the per-engine table: one of the contract's, or one of the further ones.
+type EngineQuantity = Quantity | Further
+
+
 @dataclass(frozen=True)
 class FromEngineTable:
-    """A quantity of the per-engine table: each engine's row gives its name."""
+    """A quantity of the per-engine table: each engine's row that names it gives its name."""
 
-    quantity: Quantity
+    quantity: EngineQuantity
 
 
 @dataclass(frozen=True)
@@ -144,39 +152,84 @@ def request_count(
     return increase(histogram + "_count", matchers, window=window, by=by)
 
 
-def engine_series(pool: Pool, quantity: Quantity, sample: str = "") -> str:
+def _engine_name(pool: Pool, quantity: EngineQuantity) -> tuple[str, Kind, Mapping[str, str]]:
+    """The family's name in the row of the pool's engine, its kind, and the labels that select the quantity."""
+    if isinstance(quantity, Quantity):
+        family = metric_names(pool.engine)[quantity]
+        return family, quantity.kind, getattr(family, "labels", None) or {}
+    named = further_names(pool.engine)
+    if quantity not in named:
+        message = f"the row of the engine {pool.engine!r} leaves out {quantity.value}"
+        raise KeyError(message)
+    return named[quantity], named[quantity].kind, named[quantity].labels
+
+
+def engine_reports(pool: Pool, quantity: EngineQuantity) -> bool:
+    """Whether the row of the pool's engine names the quantity: every row names each `Quantity`,
+    and may leave out any `Further` one."""
+    return isinstance(quantity, Quantity) or quantity in further_names(pool.engine)
+
+
+def engine_series(pool: Pool, quantity: EngineQuantity, sample: str = "") -> str:
     """The series of a quantity, as the pool's engine names it, for this pool.
 
     The name is the per-engine table's, at the row of `pool.engine`. A counter's series carries
     `_total`; a histogram's is one of `_bucket`, `_sum` and `_count`, which `sample` names. An
-    engine with no row raises `KeyError`.
+    engine with no row, or a further quantity its row leaves out, raises `KeyError`.
     """
-    family = metric_names(pool.engine)[quantity]
-    if quantity.kind is Kind.COUNTER:
+    family, kind, _ = _engine_name(pool, quantity)
+    if kind is Kind.COUNTER:
         sample = COUNTER_SAMPLE
-    elif quantity.kind is Kind.HISTOGRAM and sample not in HISTOGRAM_SAMPLES:
+    elif kind is Kind.HISTOGRAM and sample not in HISTOGRAM_SAMPLES:
         message = f"{quantity.value} is a histogram: name one of its samples, {', '.join(HISTOGRAM_SAMPLES)}"
         raise ValueError(message)
     return family + sample
 
 
-def engine_selector(pool: Pool, quantity: Quantity, sample: str = "") -> str:
+def engine_matchers(pool: Pool, quantity: EngineQuantity) -> dict[str, str]:
+    """The matchers of the quantity's series for this pool: its pool, and the labels that select it."""
+    return {POOL: pool.name, **_engine_name(pool, quantity)[2]}
+
+
+def engine_selector(pool: Pool, quantity: EngineQuantity, sample: str = "") -> str:
     """The selector of `engine_series`, for a gauge or for an expression written by hand."""
-    return selector(engine_series(pool, quantity, sample), {POOL: pool.name})
+    return selector(engine_series(pool, quantity, sample), engine_matchers(pool, quantity))
 
 
 def engine_rate(
-    pool: Pool, quantity: Quantity, sample: str = "", *, window: str = WINDOW, by: Sequence[str] = ()
+    pool: Pool, quantity: EngineQuantity, sample: str = "", *, window: str = WINDOW, by: Sequence[str] = ()
 ) -> str:
     """`rate` of an engine's counter, or of a histogram's `_sum` or `_count`, for this pool."""
-    return rate(engine_series(pool, quantity, sample), {POOL: pool.name}, window=window, by=by)
+    return rate(engine_series(pool, quantity, sample), engine_matchers(pool, quantity), window=window, by=by)
 
 
 def engine_increase(
-    pool: Pool, quantity: Quantity, sample: str = "", *, window: str = WINDOW, by: Sequence[str] = ()
+    pool: Pool, quantity: EngineQuantity, sample: str = "", *, window: str = WINDOW, by: Sequence[str] = ()
 ) -> str:
     """`increase` of an engine's counter, or of a histogram's `_sum` or `_count`, for this pool."""
-    return increase(engine_series(pool, quantity, sample), {POOL: pool.name}, window=window, by=by)
+    return increase(engine_series(pool, quantity, sample), engine_matchers(pool, quantity), window=window, by=by)
+
+
+def _engine_histogram(pool: Pool, quantity: EngineQuantity) -> str:
+    family, kind, _ = _engine_name(pool, quantity)
+    if kind is not Kind.HISTOGRAM:
+        message = f"{quantity.value} is not a histogram"
+        raise ValueError(message)
+    return family
+
+
+def engine_quantile(
+    pool: Pool, q: float, quantity: EngineQuantity, *, window: str = WINDOW, by: Sequence[str] = ()
+) -> str:
+    """`quantile` of a histogram of the pool's engine, for this pool."""
+    histogram = _engine_histogram(pool, quantity)
+    return quantile(q, histogram, engine_matchers(pool, quantity), window=window, by=by)
+
+
+def engine_request_count(pool: Pool, quantity: EngineQuantity, *, window: str = WINDOW, by: Sequence[str] = ()) -> str:
+    """`request_count` of a histogram of the pool's engine, for this pool: the requests behind its quantiles."""
+    histogram = _engine_histogram(pool, quantity)
+    return request_count(histogram, engine_matchers(pool, quantity), window=window, by=by)
 
 
 def in_service(pool: str) -> str:
@@ -302,3 +355,78 @@ def engine_percentile_timeseries(
     queries["requests"] = request_count(histogram, matchers, window=window)
     panel = engine_timeseries(pool, title, queries)
     return panel.override_by_query(_ref(len(quantiles)), _count_on_its_own_axis())
+
+
+@dataclass(frozen=True)
+class Series:
+    """One query of a pool's graph, with the name its series is read by.
+
+    `engine` is whether it reads the pool's engine, and so is kept to the pool in service. `axis`
+    is the unit of a series read on the right-hand axis, because it is not in the panel's unit (a
+    count of requests is "short"); None keeps it on the panel's axis.
+    """
+
+    legend: str
+    expression: str
+    engine: bool = False
+    axis: str | None = None
+
+
+def percentile_series(
+    histogram: str,
+    matchers: Mapping[str, str] | None = None,
+    *,
+    quantiles: Sequence[float] = (0.5, 0.95),
+    window: str = WINDOW,
+    by: Sequence[str] = (),
+    legend: str = "",
+) -> list[Series]:
+    """A histogram family's quantiles and the count of requests behind them, over the same window
+    and by the same labels, as series of a pool's graph. `legend` comes before each one's name."""
+    found = [
+        Series(f"{legend}{_percent(q)}", quantile(q, histogram, matchers, window=window, by=by)) for q in quantiles
+    ]
+    count = request_count(histogram, matchers, window=window, by=by)
+    return [*found, Series(f"{legend}requests", count, axis="short")]
+
+
+def engine_percentile_series(
+    pool: Pool,
+    quantity: EngineQuantity,
+    *,
+    quantiles: Sequence[float] = (0.5, 0.95),
+    window: str = WINDOW,
+    by: Sequence[str] = (),
+    legend: str = "",
+) -> list[Series]:
+    """`percentile_series` for a histogram of the pool's engine: each kept to the pool in service."""
+    histogram = _engine_histogram(pool, quantity)
+    found = percentile_series(
+        histogram, engine_matchers(pool, quantity), quantiles=quantiles, window=window, by=by, legend=legend
+    )
+    return [Series(one.legend, one.expression, engine=True, axis=one.axis) for one in found]
+
+
+def pool_timeseries(pool: Pool, title: str, series: Sequence[Series]) -> timeseries_builders.Panel:
+    """A graph of one pool that may mix the engine's series with others: the gateway's, a reference line.
+
+    Each engine series is kept only while the pool has an instance in service, and while it has
+    none the panel draws "asleep" in their place, as `engine_timeseries` does. The other series are
+    drawn as they are. A panel with no engine series has no "asleep".
+    """
+    panel = _graph().title(title).datasource(PROMETHEUS)
+    for index, one in enumerate(series):
+        expression = awake(pool.name, one.expression) if one.engine else one.expression
+        panel.with_target(query(expression, one.legend, _ref(index)))
+        if one.axis is not None:
+            panel.override_by_query(
+                _ref(index),
+                [
+                    models.DynamicConfigValue(id_val="custom.axisPlacement", value="right"),
+                    models.DynamicConfigValue(id_val="unit", value=one.axis),
+                ],
+            )
+    if any(one.engine for one in series):
+        panel.with_target(query(asleep(pool.name), ASLEEP, ASLEEP_REF))
+        panel.override_by_query(ASLEEP_REF, _reads_asleep())
+    return panel
