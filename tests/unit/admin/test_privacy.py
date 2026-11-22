@@ -316,11 +316,13 @@ def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed:
     erased: list[int] = []
 
     def erase_first(**_: Any) -> None:
-        # The erase runs to its end between the command's read of the entry and its write of the key.
-        # The erase's own transaction passes here too: it runs once.
+        # The erase runs to its end between the command's read of the entry and its write of the
+        # key, and the student is put back on the roster under another alias. The erase's own
+        # transactions pass here too: it runs once.
         if not erased:
             erased.append(-1)
             erased[0] = deployed.run("erase", str(OTTER))[0]
+            admin_roster.add(OTTER, "kestrel", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
 
     deployed.admin.keys.meta.client.meta.events.register("before-call.dynamodb.TransactWriteItems", erase_first)
     out = io.StringIO()
@@ -329,7 +331,40 @@ def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed:
     status = main.run(["key", "issue", str(OTTER)], admin, now=NOW, out=out, err=out)
 
     assert (erased, status) == ([0], 1)
-    assert deployed.rows(OTTER) == []
+    assert rules.every_key(OTTER, deployed.admin.keys) == []
+
+
+def test_an_erase_taken_over_by_another_writes_nothing_more(deployed: Deployed) -> None:
+    issue(deployed, OTTER)
+    use(deployed, OTTER, "otter", "2027-01-15")
+    later: list[str] = []
+
+    def erase_again_then_reenroll() -> None:
+        # A second erase of the student runs to its end while the first one waits, and the
+        # student is put back on the roster, with a key and a usage row of the new entry.
+        assert deployed.run("erase", str(OTTER))[0] == 0
+        admin_roster.add(OTTER, "kestrel", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
+        later.append(issue(deployed, OTTER))
+        use(deployed, OTTER, "kestrel", "2027-01-16")
+
+    deployed.during_sleep.append(erase_again_then_reenroll)
+
+    status, printed = deployed.run("erase", str(OTTER))
+
+    assert status == 1 and admin_roster.ERASE_TAKEN_OVER in printed
+    record = DynamoKeyStore(deployed.admin.keys).lookup(key_hash(later[0]))
+    assert record is not None and not record.revoked and record.alias == "kestrel"
+    assert [row["day"] for row in deployed.usage.scan()["Items"] if row["github_id"] == OTTER] == ["2027-01-16"]
+
+
+def test_an_erase_refuses_what_is_no_github_id_before_it_writes_anything(deployed: Deployed) -> None:
+    before = deployed.admin.roster.scan(ConsistentRead=True)["Items"]
+
+    # The one number whose erase would be held under heron's own entry.
+    status, printed = deployed.run("erase", str(-(2**60) - HERON))
+
+    assert status == 1 and "GitHub ID" in printed
+    assert deployed.admin.roster.scan(ConsistentRead=True)["Items"] == before
 
 
 def test_an_erase_run_again_removes_a_login_s_lock_left_alone(deployed: Deployed) -> None:

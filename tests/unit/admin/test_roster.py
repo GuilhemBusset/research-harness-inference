@@ -63,6 +63,10 @@ def test_an_entry_is_added_listed_and_removed(admin: main.Admin, capsys: pytest.
     assert all(record.revoked_at == NOW for record in otter_keys)
     # Once off the roster, the student is issued no key.
     assert cli(admin, capsys, "key", "issue", str(OTTER))[0] == 1
+    # What was written under the alias stays the student's: no other entry is given it.
+    code, refused = cli(admin, capsys, "roster", "add", "6161", "otter")
+    assert code == 1 and "held back" in refused
+    assert cli(admin, capsys, "roster", "add", str(OTTER), "stoat")[0] == 0
 
 
 def test_a_directly_issued_key_verifies_and_is_stored_as_its_sha256_only(

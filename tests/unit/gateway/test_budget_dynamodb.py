@@ -360,6 +360,35 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
     assert (written().tokens, written().leases) == (1000, {})
 
 
+def test_a_withdrawal_deletes_a_day_it_opened_that_holds_only_what_the_opening_carried(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    table = boto3.resource("dynamodb").Table(TABLE)
+    before = UsageDay(
+        7,
+        "2026-11-14",
+        "student-07",
+        tokens=5,
+        expires_at=COURSE_END,
+        leases={"running": Lease(tokens=10, estimate=10, expires=NOON + 600)},
+        affinity_cookies={"coursework": "AWSALB=cookie-of-yesterday"},
+        rebalance_applied={"coursework": 3},
+    )
+    for opener, other in (("alone", None), ("opener", "other")):
+        table.put_item(Item=before.to_item())
+        opened = reserve(ledger, student(), opener, pool="coursework")
+        # The day before goes once the opening has read it, as the admin's erase deletes it.
+        table.delete_item(Key={"github_id": 7, "day": "2026-11-14"})
+        if other:
+            reserve(ledger, student(), other, pool="coursework")
+        ledger.withdraw(opened)
+        if other is None:
+            # The stand-in, the cookie and the number it carried go with it.
+            assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
+        else:
+            # What another request wrote since keeps the day.
+            assert set(written().leases) == {"2026-11-14/running", other}
+
+
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
     ledger = DynamoDBLedger(client, TABLE, clock=Clock())
     who = student(limit=4)

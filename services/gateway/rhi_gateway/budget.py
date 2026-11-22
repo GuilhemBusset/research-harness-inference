@@ -124,7 +124,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any, Protocol
 
@@ -192,7 +192,8 @@ class Reservation:
     `pool` is the pool the request is for, if the reservation named one, and `cookie` the
     load balancer's cookie the record held for that pool when the reservation was written: `None`
     if it held none. `rebalance_applied` is the last rebalance number the record had applied for
-    that pool then: `None` if it had applied none.
+    that pool then: `None` if it had applied none. `opened` is the day as the reservation's write
+    made it, when that write opened the day: `None` when the day was there already.
     """
 
     github_id: int
@@ -202,6 +203,7 @@ class Reservation:
     pool: str | None = None
     cookie: str | None = None
     rebalance_applied: int | None = None
+    opened: UsageDay | None = field(default=None, repr=False, compare=False)
 
 
 class Ledger(Protocol):
@@ -260,8 +262,10 @@ class Ledger(Protocol):
         """Take back a reservation whose key no longer passes, charging nothing.
 
         The day's row is then deleted if nothing is left in it: no tokens, no lease, no cookie and
-        no rebalance number. A request whose student was erased while its body arrived leaves no
-        row of its own behind, and what other requests wrote stays.
+        no rebalance number; or, when the reservation opened the day, if what is left is what that
+        opening wrote, the cookies and numbers it carried from the day before included. A request
+        whose student was erased while its body arrived leaves no row of its own behind, and what
+        other requests wrote stays.
         """
         ...
 
@@ -388,14 +392,14 @@ def _reserve_within_the_day(
     output_limit: int,
     seconds: int,
     pool: str | None,
-    write: Callable[[Reservation, int], UsageDay],
+    write: Callable[[Reservation, int], tuple[UsageDay, bool]],
     read: Callable[[int, str], UsageDay | None],
     take_back: Callable[[Reservation], object],
 ) -> Reservation:
     """A reservation that `write` made, and that counts in the day it was confirmed in.
 
-    `write` adds the reservation to the record of its day and returns the record as it wrote it,
-    or raises the refusal; `read` reads a student's day without writing. The reservation returned
+    `write` adds the reservation to the record of its day and returns the record as it wrote it and
+    whether it opened the day, or raises the refusal; `read` reads a student's day without writing. The reservation returned
     holds the cookie that record has for `pool`, and the rebalance number it has applied for it.
     The clock is read again when `write` returns. If
     the day has changed and the next day was opened without this lease, `take_back` removes the
@@ -404,7 +408,9 @@ def _reserve_within_the_day(
     now = int(clock())
     lease = _new_lease(body, output_limit, now + seconds)
     reservation = Reservation(student.github_id, utc_day(now), request_id, lease, pool)
-    held = write(reservation, now)
+    held, opened = write(reservation, now)
+    if opened:
+        reservation = replace(reservation, opened=held)
     if pool is not None:
         reservation = replace(
             reservation, cookie=held.affinity_cookies.get(pool), rebalance_applied=held.rebalance_applied.get(pool)
@@ -451,6 +457,28 @@ def _empty(day: UsageDay) -> bool:
     return not (day.tokens or day.leases or day.affinity_cookies or day.rebalance_applied)
 
 
+def _opening_left(reservation: Reservation) -> UsageDay | None:
+    """What the day the reservation opened holds once the reservation is taken back: `None` if it opened none."""
+    opened = reservation.opened
+    if opened is None:
+        return None
+    leases = {request: lease for request, lease in opened.leases.items() if request != reservation.request_id}
+    return replace(opened, tokens=opened.tokens - reservation.lease.tokens, leases=leases)
+
+
+def _withdrawable(day: UsageDay, reservation: Reservation) -> bool:
+    """Whether a day a withdrawn reservation leaves is deleted: empty, or as the reservation's opening left it."""
+    left = _opening_left(reservation)
+    if left is not None and (day.tokens, day.leases, day.affinity_cookies, day.rebalance_applied) == (
+        left.tokens,
+        left.leases,
+        left.affinity_cookies,
+        left.rebalance_applied,
+    ):
+        return True
+    return _empty(day)
+
+
 def _left(day: UsageDay | None, student: Student, now: int) -> int:
     if day is None:
         return max(0, student.daily_token_budget)
@@ -484,18 +512,19 @@ class InMemoryLedger:
         longest_request_seconds: int,
         pool: str | None = None,
     ) -> Reservation:
-        def write(reservation: Reservation, now: int) -> UsageDay:
+        def write(reservation: Reservation, now: int) -> tuple[UsageDay, bool]:
             def before() -> UsageDay | None:
                 return self._days.get((reservation.github_id, _day_before(reservation.day)))
 
             with self._lock:
                 day = self._days.get((reservation.github_id, reservation.day))
+                opened = day is None
                 if day is None:
                     day = _new_day(student, reservation.day, before(), now)
                 gone = _to_remove(day, student, request_id, reservation.lease, now, before)
                 written = _reserved(day, request_id, reservation.lease, gone)
                 self._write(written)
-            return written
+            return written, opened
 
         return _reserve_within_the_day(
             self._clock,
@@ -568,7 +597,7 @@ class InMemoryLedger:
         self._remove(reservation, 0)
         with self._lock:
             day = self._days.get((reservation.github_id, reservation.day))
-            if day is not None and _empty(day):
+            if day is not None and _withdrawable(day, reservation):
                 del self._days[(day.github_id, day.day)]
                 self.writes += 1
 
@@ -697,24 +726,49 @@ class DynamoDBLedger:
 
     def withdraw(self, reservation: Reservation) -> None:
         self._remove(reservation, 0)
+        names = {**_NAMES, "#cookies": _COOKIES, "#applied": _APPLIED}
         # Deleted only while nothing is left in it: `_empty`, as one condition.
         nothing = "(attribute_not_exists({0}) OR {0} = :none)"
+        empty = ["#tokens = :zero", "size(#leases) = :zero", nothing.format("#cookies"), nothing.format("#applied")]
+        written, _ = self._conditional(
+            self._client.delete_item,
+            Key=self._key(reservation.github_id, reservation.day),
+            ConditionExpression=" AND ".join(empty),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=_values({":zero": 0, ":none": {}}),
+        )
+        left = _opening_left(reservation)
+        if written or left is None:
+            return
+        # Or while it holds what this reservation's opening wrote, and nothing else: `_withdrawable`.
+        values: dict[str, object] = {":tokens": left.tokens, ":none": {}}
+        held = ["#tokens = :tokens"]
+        for name, found in (
+            ("#leases", {request: lease.to_map() for request, lease in left.leases.items()}),
+            ("#cookies", dict(left.affinity_cookies)),
+            ("#applied", dict(left.rebalance_applied)),
+        ):
+            if found:
+                values[":" + name[1:]] = found
+                held.append(f"{name} = :{name[1:]}")
+            else:
+                held.append(f"size({name}) = :zero" if name == "#leases" else nothing.format(name))
+        if not left.leases:
+            values[":zero"] = 0
         self._conditional(
             self._client.delete_item,
             Key=self._key(reservation.github_id, reservation.day),
-            ConditionExpression=" AND ".join(
-                ["#tokens = :zero", "size(#leases) = :zero", nothing.format("#cookies"), nothing.format("#applied")]
-            ),
-            ExpressionAttributeNames={**_NAMES, "#cookies": _COOKIES, "#applied": _APPLIED},
-            ExpressionAttributeValues=_values({":zero": 0, ":none": {}}),
+            ConditionExpression=" AND ".join(held),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=_values(values),
         )
 
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
         return _left(self._read(student.github_id, utc_day(now)), student, now)
 
-    def _write_reservation(self, student: Student, reservation: Reservation, now: int) -> UsageDay:
-        """Add the reservation to the item of its day and return the day as written, or raise the refusal."""
+    def _write_reservation(self, student: Student, reservation: Reservation, now: int) -> tuple[UsageDay, bool]:
+        """Add the reservation to the item of its day; the day as written and whether this opened it, or the refusal."""
         request_id, lease = reservation.request_id, reservation.lease
 
         def before() -> UsageDay | None:
@@ -727,11 +781,11 @@ class DynamoDBLedger:
         for _ in range(_ATTEMPTS):
             written, item = self._add_lease(student, reservation, gone, carried)
             if written is not None:
-                return written
+                return written, False
             if item is None:
                 written, item = self._open_day(student, reservation, now)
                 if written is not None:
-                    return written
+                    return written, True
             # The write changed nothing. Decide from the day it found: refuse, or send it again
             # without the leases that have expired and the stand-ins of requests that have ended,
             # and, in a day not yet confirmed, with the stand-ins its opener did not write.
