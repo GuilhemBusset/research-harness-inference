@@ -16,7 +16,7 @@ GPU, so its row would hold nothing. A row has seven panels:
 | Memory used | `DCGM_FI_DEV_FB_USED_BYTES` | Bytes |
 | Temperature | `DCGM_FI_DEV_GPU_TEMP_CELSIUS` | Degrees Celsius |
 | Power | `DCGM_FI_DEV_BOARD_POWER_WATTS` | Watts |
-| Energy used | The rate of `DCGM_FI_DEV_GPU_ENERGY_JOULES_TOTAL` | Joules a second |
+| Energy used | The rate of `DCGM_FI_DEV_GPU_ENERGY_JOULES_TOTAL`, published as `..._total` | Joules a second |
 | Xid errors | `DCGM_FI_DEV_XID_ERROR` | The code of the last Xid error |
 
 Memory bandwidth comes first: a stream's speed is bounded by memory traffic, since each step of
@@ -28,7 +28,11 @@ one that is hot, idle or failing. An Xid error is a code, not a quantity: the se
 holds the last code it reported, and only that GPU's own series can say which code it was.
 
 **The energy is a rate per series, then summed per instance** (`rules.rate`): the counter restarts
-from zero when the driver is reloaded, and a rate over a sum would read that as a fall.
+from zero when the driver is reloaded, and a rate over a sum would read that as a fall. Its series
+in Prometheus is the field's name followed by `_total`: the node's collector gives every counter it
+remote-writes Prometheus' counter suffix, and it takes only a lowercase `_total` for one already
+there, so the exporter's `..._JOULES_TOTAL` reaches the workspace as `..._JOULES_TOTAL_total`. A
+gauge keeps its name.
 
 Every panel follows the rule of a pool at zero (`rules.engine_timeseries`): it reads "asleep"
 while the scaler counts no instance in service, and never shows what a stopped instance last
@@ -62,6 +66,8 @@ MEMORY_USED = "DCGM_FI_DEV_FB_USED_BYTES"
 TEMPERATURE = "DCGM_FI_DEV_GPU_TEMP_CELSIUS"
 POWER = "DCGM_FI_DEV_BOARD_POWER_WATTS"
 ENERGY = "DCGM_FI_DEV_GPU_ENERGY_JOULES_TOTAL"
+# The energy counter's series, as the collector publishes it: the field's name and the counter's suffix.
+ENERGY_SERIES = ENERGY + rules.COUNTER_SAMPLE
 XID = "DCGM_FI_DEV_XID_ERROR"
 
 # The label the collector gives every series of an instance (its ID), and the exporter's label for
@@ -104,7 +110,7 @@ def gauge(pool: Pool, metric: str) -> timeseries_builders.Panel:
 
 def energy(pool: Pool) -> timeseries_builders.Panel:
     """The energy each instance of the pool uses: the counter's rate on each GPU, summed per instance."""
-    used = rules.rate(ENERGY, {rules.POOL: pool.name}, by=(INSTANCE,))
+    used = rules.rate(ENERGY_SERIES, {rules.POOL: pool.name}, by=(INSTANCE,))
     return rules.engine_timeseries(pool, ENERGY_TITLE, {_PER_INSTANCE: used}).unit("watt").min(0)
 
 
