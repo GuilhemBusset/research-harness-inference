@@ -13,6 +13,7 @@ import contextlib
 import io
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,14 @@ from rhi_admin import main as admin_main
 from rhi_cli import main as rhi_main
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNBOOKS = ["session-on-and-off.md", "capacity-failure.md", "disabled-pool.md"]
+RUNBOOKS = [
+    "session-on-and-off.md",
+    "capacity-failure.md",
+    "disabled-pool.md",
+    "leaked-key.md",
+    "bad-deployment.md",
+    "secret-rotation.md",
+]
 SECTIONS = ["when", "check", "act", "verify"]
 
 
@@ -108,3 +116,47 @@ def test_detects_an_unknown_command() -> None:
 def test_section_headings_count_only_outside_code_blocks() -> None:
     sections = "".join(f"## {section.title()}\n\n" for section in SECTIONS)
     assert len(problems("```sh\n" + sections + "rhi status\n```\n")) == 1
+
+
+def _factory_key_replacement() -> str:
+    """The shell block of the secret rotation runbook that installs a new key of the factory's App."""
+    text = (ROOT / "docs" / "runbooks" / "secret-rotation.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```sh\n(.*?)```", text, re.DOTALL)
+    return next(b for b in blocks if "Downloads/<new-key>" in b and "LOOP_GITHUB_APP_KEY_FILE" in b)
+
+
+@pytest.mark.parametrize("fault", [None, "copy cut short", "download kept"])
+def test_the_factory_key_replacement_keeps_the_old_key_unless_the_copy_completes(
+    tmp_path: Path, fault: str | None
+) -> None:
+    download = tmp_path / "Downloads" / "replacement.private-key.pem"
+    download.parent.mkdir()
+    download.write_bytes(b"new key\n" * 512)
+    key = tmp_path / "factory.pem"
+    key.write_bytes(b"old key\n")
+    # A file that already has the name of the old file plus .new is someone's, and stays as it is.
+    bystander = Path(f"{key}.new")
+    bystander.write_bytes(b"not the factory's\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if fault == "download kept":  # an rm that cannot remove anything in the downloads
+        rm = bin_dir / "rm"
+        rm.write_text('#!/bin/sh\nfor a do case "$a" in */Downloads/*) exit 1;; esac; done\nexec /bin/rm "$@"\n')
+        rm.chmod(0o700)
+    # A file-size limit of one block cuts the copy short, as a full disk would.
+    script = ("ulimit -f 1\n" if fault == "copy cut short" else "") + _factory_key_replacement().replace(
+        "<new-key>", "replacement"
+    )
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "LOOP_GITHUB_APP_KEY_FILE": str(key)}
+    result = subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path, capture_output=True, check=False, text=True)
+    assert bystander.read_bytes() == b"not the factory's\n"
+    assert sorted(f.name for f in tmp_path.glob("factory.pem*")) == ["factory.pem", "factory.pem.new"]
+    if fault == "copy cut short":
+        assert key.read_bytes() == b"old key\n"
+        assert download.exists()
+        assert "not installed" in result.stdout
+    else:
+        assert key.read_bytes() == b"new key\n" * 512
+        assert download.exists() == (fault == "download kept")
+        assert "the new key is installed" in result.stdout
+        assert "not installed" not in result.stdout
