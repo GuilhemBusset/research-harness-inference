@@ -120,19 +120,19 @@ names = [
 # commit status per stage on each merge commit, and the engine reads them between the merge and
 # the evidence step: every context listed here must report success before the issue's evidence is
 # recorded, a failure or an error takes the broken-main path, and nothing else lands meanwhile.
-# The values below are neutral: with no context nothing is read and nothing waits. The owner sets
-# them, through a pull request of their own, once statuses appear on merge commits
-# (docs/factory/green-light.md, step 11). No other key is accepted in this table.
+# With no context nothing is read and nothing waits. The owner sets the values, through a pull
+# request of their own, once statuses appear on merge commits (docs/factory/green-light.md,
+# step 11). No other key is accepted in this table.
 [deploy]
 # The contexts to wait for, such as "deploy/<stage>" and later "verify/<stage>".
-contexts = []
+contexts = ["deploy/Rhi", "verify/Rhi"]
 # Seconds one run polls for a verdict. Past it the issue waits and the supervisor's next run
 # reads the same merge commit again; the timeout never fails an issue.
 timeout_s = 3600
 # The description the pipeline's reporter gives a pending status while the deployment waits for
 # the owner's approval. A pending status that carries it makes the issue wait with the kind
 # `owner_approval`, with no timeout, and lets other issues land meanwhile. Empty: never.
-approval_description = ""
+approval_description = "The deployment waits for the owner's approval in the pipeline."
 # The description the reporter gives the success of a "verify/<stage>" status when the
 # verification's smoke tests ran and passed. A verification also succeeds without running a test
 # (no canary key, no listener, a parked system), with another description. When a configured
@@ -140,15 +140,18 @@ approval_description = ""
 # aws:deployed-environment and names a test under `tests/smoke/` is proven by that status and is
 # not left to the owner. Empty: never. The owner sets it with the contexts, and
 # `tests/unit/test_deploy_settings.py` holds both descriptions equal to the reporter's constants.
-verified_description = ""
+verified_description = "The verification's tests ran and passed."
 # The smoke test files of which the verification leaves a test out (`scripts/pipeline/verify.py`
 # deselects the tests that must reach the internal load balancer): an item that names one of them
-# stays the owner's, whatever the verification's status says. Absent, as here: the table does not
-# say what the verification leaves out, and a verified deployment discharges nothing. The owner
+# stays the owner's, whatever the verification's status says. Absent: the table does not say what
+# the verification leaves out, and a verified deployment discharges nothing. The owner
 # sets it with `verified_description`, and `tests/unit/test_deploy_settings.py` then holds it
 # equal to the files of the tests the verification's own run deselects, and names them when it
 # fails. An empty list says that every smoke test is run.
-# unverified_tests = ["tests/smoke/deployed/<file>.py"]
+unverified_tests = [
+  "tests/smoke/deployed/test_gpu_release.py",
+  "tests/smoke/deployed/test_internal_routes.py",
+]
 
 # The sandbox every agent call and every check command runs in (ADR 0001, decision 3;
 # docs/factory/isolation.md). The root filesystem is read-only, `/tmp` and the home directory
