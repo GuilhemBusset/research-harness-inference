@@ -41,6 +41,15 @@ in that order with `rhi_reporter.github`.
   the execution's stages has stopped short (failed, stopped or cancelled), or once the execution
   itself has ended: events arrive in no guaranteed order, and a late pending status, of the stage
   or of a step before it, would hide the verdict already posted.
+- A pending status of `deploy/<stage>` follows the stage's manual approvals as CodePipeline's
+  records of the event's own execution show them now, not as the events tell them: an approval
+  waits when the latest run of an approval action of that stage, by its start, is `InProgress`.
+  While one waits, a status that would say the deployment runs says instead that it waits for the
+  approval, so that a late or out-of-order event of the same execution cannot hide the wait. An
+  approval's start that arrives once its own run has ended, and none waits, posts nothing, so that
+  it cannot bring the wait back. An approval of another execution changes nothing. When the
+  records cannot be read, the status is posted as the event gives it, after logging
+  `NO_APPROVALS`.
 
 **The commit** is the source revision of the execution, read from CodePipeline: an event does not
 carry it. An execution that names none yet posts nothing.
@@ -120,7 +129,7 @@ import logging
 import os
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -128,7 +137,17 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_reporter import github, measure, notify, superseded
 from rhi_reporter.report import build_report, statuses_of
-from rhi_reporter.status import VERIFIED_DESCRIPTION, VERIFY_ACTION, State, as_it_ran, status_for
+from rhi_reporter.status import (
+    APPROVAL_CATEGORY,
+    APPROVAL_DESCRIPTION,
+    DEPLOY_CONTEXT,
+    VERIFIED_DESCRIPTION,
+    VERIFY_ACTION,
+    Description,
+    State,
+    as_it_ran,
+    status_for,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -166,6 +185,8 @@ EVENT_PAGES = 10
 EXECUTION_PAGES = 10
 # The statuses CodePipeline gives a run of an action that ended without success.
 UNSUCCESSFUL_RUNS = frozenset({"Failed", "Abandoned"})
+# The status CodePipeline gives a run of an action that has not ended: for an approval, one that waits.
+ACTIVE_RUN = "InProgress"
 # The verification's marks (`src/rhi/pipeline/verify.py`): the prefix of their keys in the artifact
 # bucket, before the execution's ID, and the name of each.
 MARKS_PREFIX = "verification"
@@ -179,6 +200,7 @@ MARK_BYTES = 65536
 NO_CREDENTIAL = "No commit status was posted: the reporter's GitHub credential is not in its secret."
 NO_COMMIT = "No commit status was posted: the pipeline's execution names no commit yet."
 NO_FACTS = "The report of a failure leaves out its resources: the pipeline's records could not be read."
+NO_APPROVALS = "A pending status was posted as its event gives it: the pipeline's approvals could not be read."
 NO_EXECUTIONS = "No superseded commit was reported yet: the pipeline's executions could not be read."
 NO_FAILED_TESTS = "The report of a failed verification names no smoke test: the verification's marks could not be read."
 NO_LAST_STAGES = (
@@ -319,10 +341,17 @@ def handle(
     category = kind_of.get("category") if isinstance(kind_of, dict) else None
     ended: tuple[set[str], bool] | None = None
     records: list[_Records] = []
+    listed: list[list[Mapping[str, Any]]] = []
+
+    def runs() -> list[Mapping[str, Any]]:
+        """The execution's action runs, listed once for the event."""
+        if not listed:
+            listed.append(list(_action_executions(aws.codepipeline, pipeline, execution)))
+        return listed[0]
 
     def read() -> _Records:
         if not records:
-            records.append(_read(aws, pipeline=pipeline, execution=execution, stage=stage, action=action))
+            records.append(_read(aws, action_runs=runs, stage=stage, action=action))
         return records[0]
 
     try:
@@ -336,6 +365,10 @@ def handle(
                 ended = _ended(aws.codepipeline, pipeline, execution) if ended is None else ended
                 stages_ended, stopped_short = ended
                 if under in stages_ended or stopped_short:
+                    continue
+                own = action if category == APPROVAL_CATEGORY and stage == under else None
+                status = _as_approvals_stand(status, runs, under, own)
+                if status is None:
                     continue
             _post(client, status)
             if status.state is State.FAILURE and action is not None:
@@ -537,13 +570,50 @@ def _ended(codepipeline: Any, pipeline: object, execution: object) -> tuple[set[
     return ended, stopped_short
 
 
-def _read(aws: Aws, *, pipeline: object, execution: object, stage: object, action: object) -> _Records:
+def _as_approvals_stand(
+    status: CommitStatus, runs: Callable[[], Sequence[Mapping[str, Any]]], stage: str, own: object
+) -> CommitStatus | None:
+    """The pending status `status` of `stage`, as the stage's manual approvals stand in `runs`, the
+    action runs of the event's own execution. While one waits, a deployment that runs is one that
+    waits for it. None, nothing to post, for the start of `own`, the event's approval, once its own
+    run has ended and none waits. Any other status is returned as it is, and so is every status
+    when the runs cannot be read, after logging `NO_APPROVALS`."""
+    if not status.context.startswith(DEPLOY_CONTEXT) or status.description not in (
+        Description.DEPLOYING,
+        APPROVAL_DESCRIPTION,
+    ):
+        return status
+    try:
+        latest: dict[object, Mapping[str, Any]] = {}
+        for run in runs():
+            category = run.get("input", {}).get("actionTypeId", {}).get("category")
+            if run.get("stageName") != stage or category != APPROVAL_CATEGORY:
+                continue
+            name = run.get("actionName")
+            # A stage that is retried runs its approval again: the latest run is the one that counts.
+            if name not in latest or run["startTime"] > latest[name]["startTime"]:
+                latest[name] = run
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError, AttributeError):
+        logger.warning(NO_APPROVALS)
+        return status
+    waits = any(run.get("status") == ACTIVE_RUN for run in latest.values())
+    if waits:
+        return replace(status, description=APPROVAL_DESCRIPTION)
+    if status.description == APPROVAL_DESCRIPTION and own in latest:
+        return None
+    return status
+
+
+def _read(
+    aws: Aws, *, action_runs: Callable[[], Sequence[Mapping[str, Any]]], stage: object, action: object
+) -> _Records:
     """The records of the action `stage` and `action` name as the pipeline does: the execution's
-    action runs, the action's latest run that ended without success, and the events since it
-    started of the stack it deploys. What cannot be read is left empty, and `NO_FACTS` logged."""
+    action runs, as `action_runs` lists them, the action's latest run that ended without success,
+    and the events since it started of the stack it deploys. What cannot be read is left empty,
+    and `NO_FACTS` logged."""
     records = _Records(executions=[], run=None, resource_events=[], read=True)
     try:
-        records.executions = list(_action_executions(aws.codepipeline, pipeline, execution))
+        records.executions = list(action_runs())
         runs = [
             detail
             for detail in records.executions
