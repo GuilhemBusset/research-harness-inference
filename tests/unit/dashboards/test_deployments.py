@@ -4,14 +4,31 @@ from __future__ import annotations
 
 import importlib
 import re
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+from prometheus_client import CollectorRegistry
 
 from rhi import config as rhi_config
+from rhi_common.engine_metrics import MOCK
 from rhi_dashboards import build, check, deployments, rules
 from rhi_lifecycle import serving
+from rhi_lifecycle.host import Host
+from rhi_lifecycle.release import Release, Settings
+
+
+def release_labels() -> set[str]:
+    """The labels the lifecycle agent gives its release metric, read from what an agent in service
+    reports (made-up release and settings, stand-ins for AWS)."""
+    registry = CollectorRegistry()
+    served = Release(f"registry.example.com/engine@sha256:{'a' * 64}", "c" * 40, (), "b" * 64)
+    settings = Settings(*(["example"] * 8))
+    tables = SimpleNamespace(Table=lambda name: None)
+    serving.Serving(served, settings, "instance", MOCK, dynamodb=tables, secrets=None, host=Host(), registry=registry)
+    (family,) = [family for family in registry.collect() if family.name == serving.RELEASE_METRIC]
+    (sample,) = family.samples
+    return set(sample.labels)
 
 
 @pytest.fixture
@@ -45,11 +62,13 @@ def test_each_pool_has_a_release_panel_by_instance_digest_and_revision(example: 
         if target["datasource"]["uid"] == rules.PROMETHEUS_UID
     ]
     assert len(releases) == len(example.pools)
+    labels = release_labels()
+    assert labels == {"image_digest", "model_revision"}
     for pool, expression in zip(example.pools, releases, strict=True):
         # The lifecycle agent's metric, for this pool, grouped by its two labels and by instance.
         assert f'{serving.RELEASE_METRIC}{{pool="{pool.name}"}}' in expression
         (grouped,) = re.findall(r"by \(([^)]*)\)", expression)
-        assert {label.strip() for label in grouped.split(",")} == {"pool", "instance", *serving.RELEASE_LABELS}
+        assert {label.strip() for label in grouped.split(",")} == {"pool", "instance", *labels}
 
 
 def test_one_panel_reads_the_executions_from_the_pipeline_events(

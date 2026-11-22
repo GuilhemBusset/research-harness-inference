@@ -6,8 +6,11 @@ One of the six dashboards of the system design (section 7.3). It reads two sourc
   (`rhi.pipeline.events.LOG_GROUP_NAME`, `/rhi/pipeline/events`), through the CloudWatch data source. Each record holds the
   fields of `rhi.pipeline.events.FIELDS`. The panel keeps the executions' own state changes, not
   those of a stage or an action, and shows one line for each execution: the pipeline, the
-  execution ID, when it started, when it last changed, and its last state, which is its result
-  (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, `STOPPED`, or `STARTED` while it runs). Newest first.
+  execution ID, the times of its first and its last state change within the dashboard's range,
+  and its last state, which is its result (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, `STOPPED`, or
+  `STARTED` while it runs). The most recent change first. The first change seen is not called the
+  start: a run that started before the range begins shows only its later changes, and a record
+  holds no start time of its own.
 - **The release each instance serves**, from the lifecycle agent's identity report,
   `rhi_lifecycle_release_info` (section 4.1). The engine does not know its image digest, so the
   agent reports it: one series of value 1, whose labels `image_digest` and `model_revision` are the
@@ -78,14 +81,17 @@ def _field(name: str) -> str:
 
 
 def executions_query() -> str:
-    """The Logs Insights query of the executions: one line each, with its last state as its result."""
+    """The Logs Insights query of the executions: one line each, with its last state as its result.
+
+    The times are those of the first and the last state change the range holds: the range may
+    begin after the run started, so the first is not named its start."""
     pipeline, execution, state = (_field(name) for name in ("pipeline", "execution-id", "state"))
-    times = "min(@timestamp) as started, max(@timestamp) as updated"
+    times = "min(@timestamp) as first_seen, max(@timestamp) as last_seen"
     return "\n".join(
         (
             f'filter {_field("detail-type")} = "{EXECUTION}"',
             f"| stats latest({state}) as result, {times} by {pipeline}, {execution}",
-            "| sort started desc",
+            "| sort last_seen desc",
             f"| limit {EXECUTIONS_SHOWN}",
         )
     )
