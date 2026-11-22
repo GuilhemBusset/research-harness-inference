@@ -209,12 +209,21 @@ def _whole_dollars(value: object) -> int:
     return value
 
 
+# What one AWS::Budgets::Budget can hold: at most 10 notifications, each at a threshold of at most
+# 1,000,000,000 (the CloudFormation resource reference and its schema).
+MOST_BUDGET_ALERTS = 10
+HIGHEST_BUDGET_ALERT_PERCENTAGE = 1_000_000_000
+
+
 def _percentages(value: object) -> tuple[int, ...]:
-    # At least one, each a whole number above 0 (a TOML boolean is a Python int: it is not one), and
-    # no two the same: the budget has one notification at each.
-    if not isinstance(value, (list, tuple)) or not value:
+    # From one to MOST_BUDGET_ALERTS, each a whole number above 0 and at most
+    # HIGHEST_BUDGET_ALERT_PERCENTAGE (a TOML boolean is a Python int: it is not one), and no two the
+    # same: the budget has one notification at each.
+    if not isinstance(value, (list, tuple)) or not 0 < len(value) <= MOST_BUDGET_ALERTS:
         raise ValueError
-    if any(type(item) is not int or item <= 0 for item in value) or len(set(value)) != len(value):
+    if any(type(item) is not int or not 0 < item <= HIGHEST_BUDGET_ALERT_PERCENTAGE for item in value):
+        raise ValueError
+    if len(set(value)) != len(value):
         raise ValueError
     return tuple(value)
 
@@ -395,7 +404,7 @@ KEYS: dict[str, Key] = {
     "login_client_id": _STRING,
     "monthly_budget_usd": Key("a whole number of US dollars above zero", _whole_dollars, _number_from_text),
     "budget_alert_percentages": Key(
-        "a list of whole percentages above 0, none of them repeated, such as [50, 80, 100]",
+        "a list of 1 to 10 whole percentages from 1 to 1000000000, none of them repeated, such as [50, 80, 100]",
         _percentages,
         _json_from_text,
     ),

@@ -191,7 +191,12 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("monthly_budget_usd", "true"),
         *(
             ("budget_alert_percentages", value)
-            for value in ("[50, 0, 100]", f"[{MARK}, {MARK}]", "[]", f"[{MARK}.5]", f"[-{MARK}]", "[true]", f"{MARK}")
+            for value in (
+                *("[50, 0, 100]", f"[{MARK}, {MARK}]", "[]", f"[{MARK}.5]", f"[-{MARK}]", "[true]", f"{MARK}"),
+                # One budget holds at most 10 notifications, each at a threshold of at most 1,000,000,000.
+                str(list(range(10, 111, 10))),
+                f"[1000000001, {MARK}]",
+            )
         ),
         ("time_zone", MARK),
         ("time_zone", f'"Nowhere/City{MARK}"'),
