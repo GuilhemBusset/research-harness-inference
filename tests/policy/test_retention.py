@@ -6,6 +6,9 @@ metrics (system design, section 6.6; evidence E27).
   one for a function that names none, at run time, outside every template and with no retention.
 - The metrics workspace keeps at most 90 days; with no retention set, it keeps the service's
   default, which is longer.
+- Every bucket a load balancer writes its access logs to expires every object within 90 days of
+  its writing: the logs hold source addresses. A bucket this check cannot find, in the load
+  balancer's template or as another template's export, counts as one that never expires.
 - No CloudWatch alarm, metric or metric filter has a dimension that identifies a student: alias,
   student or github_id, whatever its case. A metric is checked wherever a resource holds one: an
   alarm, a dashboard, a scaling policy that tracks it, a service that publishes its events' metrics
@@ -31,6 +34,10 @@ LOG_GROUP = "AWS::Logs::LogGroup"
 FUNCTION = "AWS::Lambda::Function"
 WORKSPACE = "AWS::APS::Workspace"
 DASHBOARD = "AWS::CloudWatch::Dashboard"
+LOAD_BALANCER = "AWS::ElasticLoadBalancingV2::LoadBalancer"
+BUCKET = "AWS::S3::Bucket"
+# What narrows a lifecycle rule to some of a bucket's objects.
+RULE_FILTERS = ("Prefix", "TagFilters", "ObjectSizeGreaterThan", "ObjectSizeLessThan")
 
 
 def stage_templates(templates: Mapping[str, Any]) -> dict[str, Any]:
@@ -75,6 +82,58 @@ def workspaces_kept_too_long(template: Mapping[str, Any]) -> list[str]:
         if not isinstance(days := properties.get("WorkspaceConfiguration", {}).get("RetentionPeriodInDays"), int)
         or days > MAX_DAYS
     ]
+
+
+def log_buckets(templates: Mapping[str, Any]) -> dict[tuple[str, str], tuple[str, str] | None]:
+    """The bucket each load balancer writes its access logs to, as `(template, logical ID)`, by
+    the load balancer's: a bucket of its own template by `Ref`, or of another by the import of an
+    export of that `Ref`. None for a bucket that neither names."""
+    exports = {
+        output["Export"]["Name"]: (path, output["Value"]["Ref"])
+        for path, template in templates.items()
+        for output in template.get("Outputs", {}).values()
+        if isinstance(output.get("Value"), dict) and "Ref" in output["Value"] and "Export" in output
+    }
+    found: dict[tuple[str, str], tuple[str, str] | None] = {}
+    for path, template in templates.items():
+        for name, properties in of_type(template, LOAD_BALANCER).items():
+            attributes = {a.get("Key"): a.get("Value") for a in properties.get("LoadBalancerAttributes") or []}
+            if attributes.get("access_logs.s3.enabled") not in (True, "true"):
+                continue
+            bucket = attributes.get("access_logs.s3.bucket")
+            if isinstance(bucket, dict) and "Ref" in bucket:
+                found[path, name] = (path, bucket["Ref"])
+            elif isinstance(bucket, dict) and "Fn::ImportValue" in bucket:
+                found[path, name] = exports.get(bucket["Fn::ImportValue"])
+            else:
+                found[path, name] = None
+    return found
+
+
+def expires_within(bucket: Mapping[str, Any] | None, days: int) -> bool:
+    """Whether an enabled rule of the bucket's lifecycle, on every object, expires each within
+    `days` of its writing."""
+    rules = (bucket or {}).get("Properties", {}).get("LifecycleConfiguration", {}).get("Rules", [])
+    return any(
+        rule.get("Status") == "Enabled"
+        and not any(rule.get(key) for key in RULE_FILTERS)
+        and isinstance(expiry := rule.get("ExpirationInDays"), int)
+        and expiry <= days
+        for rule in rules
+    )
+
+
+def log_buckets_kept_too_long(templates: Mapping[str, Any]) -> list[str]:
+    """Every bucket a load balancer logs to, as `template:logical ID`, with no expiry or a longer
+    one than `MAX_DAYS`; or the load balancer, when its bucket is not found."""
+    found = set()
+    for (path, balancer), bucket in log_buckets(templates).items():
+        resource = templates[bucket[0]].get("Resources", {}).get(bucket[1]) if bucket else None
+        if bucket is None or resource is None or resource.get("Type") != BUCKET:
+            found.add(f"{path}:{balancer}: no bucket found")
+        elif not expires_within(resource, MAX_DAYS):
+            found.add(":".join(bucket))
+    return sorted(found)
 
 
 def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -160,6 +219,15 @@ def test_the_workspace_keeps_at_most_90_days(templates: dict[str, Any]) -> None:
     assert findings(stage, workspaces_kept_too_long) == {}
 
 
+def test_every_access_log_bucket_of_the_stage_expires_within_90_days(templates: dict[str, Any]) -> None:
+    stage = stage_templates(templates)
+    # Both load balancers, the public one and the internal one, log, to the one bucket.
+    buckets = log_buckets(stage)
+    assert len(buckets) == 2
+    assert len(set(buckets.values())) == 1
+    assert log_buckets_kept_too_long(stage) == []
+
+
 def test_no_cloudwatch_dimension_of_the_stage_identifies_a_student(templates: dict[str, Any]) -> None:
     assert findings(stage_templates(templates), student_dimensions) == {}
 
@@ -218,6 +286,30 @@ def test_detects_a_workspace_kept_too_long(cdk: ModuleType) -> None:
             aps.CfnWorkspace(stack, name, workspace_configuration=config)
 
     assert sorted(workspaces_kept_too_long(synthesize(cdk, build))) == ["Long", "Unset"]
+
+
+def test_detects_an_access_log_bucket_kept_too_long(cdk: ModuleType) -> None:
+    from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+    from aws_cdk import aws_s3 as s3
+
+    def build(stack: Any) -> None:
+        for name, days in (("NoExpiry", None), ("Year", 365), ("Kept", MAX_DAYS)):
+            rules = [s3.LifecycleRule(expiration=cdk.Duration.days(days))] if days else None
+            bucket = s3.Bucket(stack, name, lifecycle_rules=rules)
+            attribute = elbv2.CfnLoadBalancer.LoadBalancerAttributeProperty
+            elbv2.CfnLoadBalancer(
+                stack,
+                f"LogsTo{name}",
+                load_balancer_attributes=[
+                    attribute(key="access_logs.s3.enabled", value="true"),
+                    attribute(key="access_logs.s3.bucket", value=bucket.bucket_name),
+                ],
+            )
+        # A bucket no load balancer logs to is not held to it.
+        s3.Bucket(stack, "Other")
+
+    found = log_buckets_kept_too_long({"Built": synthesize(cdk, build)})
+    assert [name.removeprefix("Built:")[:-8] for name in found] == ["NoExpiry", "Year"]
 
 
 def test_detects_a_student_dimension(cdk: ModuleType) -> None:

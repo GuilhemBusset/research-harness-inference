@@ -1,5 +1,5 @@
 """The network stack: the VPC, the security groups, the public load balancer and its web ACL
-(system design, section 6.5).
+(system design, section 6.5), and the bucket of both load balancers' access logs (section 6.6).
 
 The stack is environment-agnostic, and the CDK gives such a stack two zones. This one has three:
 the first three that `Fn::GetAZs` lists for the deploying region, which CloudFormation resolves at
@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
 
+from rhi.network.access_logs import AccessLogs
 from rhi.network.edge import Edge
 from rhi.network.security import SecurityGroups
 from rhi.network.vpc import ZONES, Network
@@ -28,7 +29,8 @@ if TYPE_CHECKING:
 class NetworkStack(cdk.Stack):
     """Holds the VPC, its S3 gateway endpoint, the security groups and the public load balancer,
     which the other stacks of the stage take from `vpc`, `s3_endpoint`, `security_groups`,
-    `load_balancer` and `https_listener`."""
+    `load_balancer` and `https_listener`, and the bucket of the load balancers' access logs, from
+    `access_logs` (`access_logs.bucket`)."""
 
     def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
         super().__init__(scope, construct_id)
@@ -39,8 +41,16 @@ class NetworkStack(cdk.Stack):
         # The groups of the load balancers, the tasks and the instances: another stack of the stage
         # takes one from `security_groups` (`security_groups.gateway`, ...).
         self.security_groups = SecurityGroups(self, "SecurityGroups", vpc=self.vpc)
+        # Both load balancers' access logs, the internal one's included: it is in the pools stack,
+        # which deploys after this one, and so after the bucket's policy.
+        self.access_logs = AccessLogs(self, "AccessLogs")
         edge = Edge(
-            self, "Edge", vpc=self.vpc, security_group=self.security_groups.public_load_balancer, config=config
+            self,
+            "Edge",
+            vpc=self.vpc,
+            security_group=self.security_groups.public_load_balancer,
+            access_logs=self.access_logs,
+            config=config,
         )
         self.load_balancer: elbv2.ApplicationLoadBalancer = edge.load_balancer
         # The listener a service adds its rule and its target group to, or None while the
