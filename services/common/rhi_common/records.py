@@ -29,6 +29,9 @@ a missing or mistyped attribute, a mode outside the four, a switch that is neith
 The session switch (section 5.6) is one item of the pool-state table that no pool can be: a pool's
 name is lower-case letters, digits and hyphens, so none is `_session`. Only the admin writes it,
 `on` as a boolean, true or false. A missing item reads as off: `session_is_on` is that rule.
+`set_by` and `set_at` say who last changed the switch and when: setting it to what it already
+reads writes nothing (`switched` is that rule), so the time an off switch was set is
+the time the last session ended, which the scaler's count outside sessions reads.
 """
 
 from __future__ import annotations
@@ -268,7 +271,7 @@ class ScalerNote:
 
 @dataclass(frozen=True)
 class SessionSwitch:
-    """Whether a session is on, and who set the switch and when (section 5.6). Only the admin sets it."""
+    """Whether a session is on, and who last changed the switch and when (section 5.6). Only the admin sets it."""
 
     on: bool
     set_by: str
@@ -292,6 +295,14 @@ class SessionSwitch:
         if not isinstance(on, bool):
             raise RecordError("`on` is not true or false")
         return cls(on=on, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
+
+
+def switched(current: SessionSwitch | None, on: bool, set_by: str, now: int) -> SessionSwitch | None:
+    """The switch to write when `set_by` sets it `on` at the time `now`, or `None` when there is
+    nothing to write because it already reads so (a missing record reads as off)."""
+    if session_is_on(current) == on:
+        return None
+    return SessionSwitch(on=on, set_by=set_by, set_at=now)
 
 
 def session_is_on(switch: SessionSwitch | None) -> bool:

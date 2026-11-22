@@ -9,10 +9,10 @@ one instance in service while no session was on. A run that sees none in service
 switch on, ends the stretch: the next one counts from zero. Where the stretch began is kept in the
 pool's memory (`Memory.outside_sessions_since`), so it runs on from one run to the next.
 
-The stretch rests on what the runs saw, never on when the switch was last written: an admin who
-sets an off switch off again changes nothing, so an hour in service outside sessions still raises
-the alarm. (A session that came and went entirely while no run completed goes unseen; those missed
-runs raise the alarm on `RunCompleted` themselves.)
+A switch that reads off has been off since it was set (`set_at` is when it last changed, and
+setting it to what it already reads writes nothing: `rhi_common.records.switched`). So when runs
+were missed while a session came and went, the stretch counts from the end of that session, not
+from before it, and an admin who sets an off switch off again leaves the count as it was.
 
 A run that could not read the switch still sees the pool's instances: one that sees none in service
 ends the stretch all the same, and one that sees some leaves the stretch where it stood.
@@ -41,7 +41,12 @@ def stretch_since(
         return previous
     if session_is_on(switch):
         return None
-    return now if previous is None else previous
+    if previous is None:
+        return now
+    if switch is not None:
+        # No session has been on since the switch was set off.
+        return max(previous, min(switch.set_at, now))
+    return previous
 
 
 def minutes(since: int | None, now: int) -> int:

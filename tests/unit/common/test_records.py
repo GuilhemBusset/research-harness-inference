@@ -16,6 +16,7 @@ from rhi_common.records import (
     SessionSwitch,
     is_fresh,
     session_is_on,
+    switched,
 )
 
 NOW = 1_800_000_000
@@ -151,6 +152,14 @@ def test_the_session_switch_reads_back_and_reads_off_when_it_has_no_record(on: b
     assert SessionSwitch.from_item({**item, "set_at": Decimal(NOW)}) == switch
     assert session_is_on(switch) is on
     assert session_is_on(None) is False
+
+
+def test_setting_the_switch_to_what_it_reads_writes_nothing() -> None:
+    off = SessionSwitch(on=False, set_by="admin", set_at=NOW)
+    assert switched(off, False, "admin", NOW + 60) is None
+    assert switched(None, False, "admin", NOW + 60) is None
+    assert switched(off, True, "admin", NOW + 60) == SessionSwitch(on=True, set_by="admin", set_at=NOW + 60)
+    assert switched(None, True, "admin", NOW + 60) == SessionSwitch(on=True, set_by="admin", set_at=NOW + 60)
 
 
 @pytest.mark.parametrize("on", ["on", 1, None])

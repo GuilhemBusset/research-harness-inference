@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from rhi_common.records import SessionSwitch
+from rhi_common.records import SessionSwitch, switched
 from rhi_scaler.outside_sessions import minutes, stretch_since
 
 T0 = 1_800_000_000
@@ -46,10 +46,17 @@ def test_the_count_restarts_after_the_pool_went_to_zero_and_when_the_switch_is_t
     assert counts(after_on)[30:] == [30, 0, *range(11)]
 
 
-def test_setting_an_off_switch_off_again_keeps_the_count() -> None:
-    again = SessionSwitch(on=False, set_by="admin", set_at=T0 + 3600)
-    runs = [(T0 + 60 * n, 1, OFF if n < 60 else again) for n in range(62)]
-    assert counts(runs)[-1] == 61
+def test_a_session_that_came_and_went_between_two_runs_restarts_the_count() -> None:
+    # Runs missed while a class was on: the switch, read again, was set off a minute ago.
+    ended = SessionSwitch(on=False, set_by="admin", set_at=T0 + 3600)
+    assert counts([(T0, 1, OFF), (T0 + 3660, 1, ended), (T0 + 3720, 1, ended)]) == [0, 1, 2]
+
+
+@pytest.mark.parametrize("switch", [OFF, None], ids=["off", "no-record"])
+def test_setting_an_off_switch_off_again_keeps_the_count(switch: SessionSwitch | None) -> None:
+    # The admin sets the switch off an hour in: there is nothing to write, so the runs read the same.
+    assert switched(switch, False, "admin", T0 + 3600) is None
+    assert counts([(T0 + 60 * n, 1, switch) for n in range(62)])[-1] == 61
 
 
 def test_a_run_that_could_not_read_the_switch_still_ends_the_stretch_of_an_empty_pool() -> None:
