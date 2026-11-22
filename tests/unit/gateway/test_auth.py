@@ -52,7 +52,6 @@ def issued(key: str, **changes: int | None) -> StudentKey:
         issued_at=NOW - 3600,
         expires_at=COURSE_END,
         revoked_at=None,
-        daily_token_budget=2_000_000,
         concurrency_limit=4,
     )
     return replace(item, **changes)
@@ -112,7 +111,7 @@ def send(
     """What the application answers to a request with these headers, and what the request did.
 
     The request's body raises when it is read. The route's handler stands for the ones that read
-    the body and reserve budget: it records that it ran.
+    the body and take a concurrency slot: it records that it ran.
     """
     did: list[str] = []
 
@@ -160,7 +159,6 @@ def test_each_header_is_accepted(headers: Callable[[str], dict[str, str]]) -> No
     assert student == KeyRecord(
         github_id=4242,
         alias="otter",
-        daily_token_budget=2_000_000,
         concurrency_limit=4,
         expires_at=COURSE_END,
         revoked=False,
@@ -257,7 +255,7 @@ def test_the_body_is_not_read() -> None:
     # Refused at each step: no key, two keys, a malformed key, and a key the store does not hold.
     for headers in ({}, bearer(known) | api_key(unknown), bearer(malformed(known)["checksum"]), bearer(unknown)):
         status, _, _, did = send(authenticator, headers)
-        # Neither the body was read nor the handler, which is where budget is reserved, ran.
+        # Neither the body was read nor the handler, which is where a slot is taken, ran.
         assert (status, did) == (401, [])
 
 

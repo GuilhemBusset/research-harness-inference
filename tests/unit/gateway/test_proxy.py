@@ -136,7 +136,6 @@ def gateway(upstream: Upstream, store: InMemoryKeyStore | None = None) -> tuple[
         issued_at=NOW - 3600,
         expires_at=NOW + 90 * 86400,
         revoked_at=None,
-        daily_token_budget=2_000_000,
         concurrency_limit=4,
     )
     store = InMemoryKeyStore() if store is None else store
@@ -190,7 +189,7 @@ def test_an_answer_reaches_the_client_whole_and_its_usage_is_settled(
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
     # The slot is freed and nothing is charged; the usage the engine reported is logged.
-    assert (day.tokens, day.leases) == (0, {})
+    assert day.leases == {}
     assert logged_tokens(capsys) == REPORTED[entry]
     assert len(upstream.seen) == 1
     sent = upstream.seen[0]
@@ -214,7 +213,7 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it(
     assert json.loads(upstream.seen[0].content)["stream_options"] == {"include_usage": True}
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
-    assert (day.tokens, day.leases) == (0, {})
+    assert day.leases == {}
     assert logged_tokens(capsys) == REPORTED[routes.CHAT_COMPLETIONS]
 
 

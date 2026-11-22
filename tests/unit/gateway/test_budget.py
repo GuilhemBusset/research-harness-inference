@@ -1,8 +1,8 @@
 """Take a concurrency slot before a request, release it after (`rhi_gateway.budget`; section 6.2, step 3).
 
 These tests run the in-memory ledger, on a clock they control. The DynamoDB ledger decides with
-the same functions and is run against moto in `test_budget_dynamodb.py`. Every student here has a
-key whose daily budget is 0: no budget takes part in a reservation.
+the same functions and is run against moto in `test_budget_dynamodb.py`. No budget takes part in a
+reservation: a key has none.
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ def student(*, limit: int = 4) -> StudentKey:
         issued_at=NOON - 86_400,
         expires_at=COURSE_END,
         revoked_at=None,
-        daily_token_budget=0,
         concurrency_limit=limit,
     )
 
@@ -88,15 +87,15 @@ def written(ledger: InMemoryLedger, day: str = "2026-11-15") -> UsageDay:
     return record
 
 
-def test_a_reservation_takes_a_slot_and_writes_tokens_and_estimate_0() -> None:
+def test_a_reservation_takes_a_slot_and_writes_a_lease_of_its_expiry() -> None:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
 
     reservation = reserve(ledger, student(), "request-1")
 
-    lease = Lease(tokens=0, estimate=0, expires=NOON + 2280)
+    lease = Lease(expires=NOON + 2280)
     assert reservation == Reservation(github_id=7, day="2026-11-15", request_id="request-1", lease=lease)
     record = written(ledger)
-    assert (record.alias, record.tokens, record.leases) == ("student-07", 0, {"request-1": lease})
+    assert (record.alias, record.leases) == ("student-07", {"request-1": lease})
     assert record.expires_at == retention.expires_at(COURSE_END_DATE)
 
 
@@ -118,7 +117,7 @@ def test_fifty_reservations_at_once_against_a_limit_of_ten_admit_ten() -> None:
     assert sum(isinstance(answer, Reservation) for answer in answers) == 10
     assert answers.count(Cause.CONCURRENCY_LIMIT) == 40
     record = written(ledger)
-    assert (record.tokens, len(record.leases)) == (0, 10)
+    assert len(record.leases) == 10
 
 
 def test_a_fifth_concurrent_request_is_refused_until_one_has_ended() -> None:
@@ -131,13 +130,13 @@ def test_a_fifth_concurrent_request_is_refused_until_one_has_ended() -> None:
 
     # Each end frees the slot, and charges nothing.
     assert settle(ledger, held[0]) is True
-    assert written(ledger).tokens == 0
+    assert len(written(ledger).leases) == 3
     reserve(ledger, who, "request-5")
     assert refusal(ledger, who, "request-6") is Cause.CONCURRENCY_LIMIT
     settle(ledger, held[1])
     reserve(ledger, who, "request-6")
     record = written(ledger)
-    assert (record.tokens, len(record.leases)) == (0, 4)
+    assert len(record.leases) == 4
 
 
 def test_a_reservation_is_settled_once() -> None:
@@ -150,7 +149,7 @@ def test_a_reservation_is_settled_once() -> None:
     assert settle(ledger, reservation) is False
     assert ledger.writes == 2
     record = written(ledger)
-    assert (record.tokens, record.leases) == (0, {})
+    assert record.leases == {}
 
 
 def test_two_writes_per_request() -> None:
@@ -283,7 +282,7 @@ def test_a_lease_expires_after_2280_seconds() -> None:
     clock.now = NOON + 2281
     reserve(ledger, who, "request-2")
     record = written(ledger)
-    assert (record.tokens, set(record.leases)) == (0, {"request-2"})
+    assert set(record.leases) == {"request-2"}
 
     # The request of the expired lease ends at last: its lease is gone, and nothing is written.
     assert settle(ledger, first) is False
@@ -298,7 +297,7 @@ def test_a_settlement_after_the_expiry_removes_the_lease() -> None:
     clock.now = NOON + 2280
     assert settle(ledger, reservation) is True
     record = written(ledger)
-    assert (record.tokens, record.leases) == (0, {})
+    assert record.leases == {}
 
 
 def test_a_request_belongs_to_the_utc_day_it_started() -> None:

@@ -173,7 +173,6 @@ def issue_key(key: str | None = None) -> str:
         issued_at=now - 60,
         expires_at=now + 86_400,
         revoked_at=None,
-        daily_token_budget=1_000_000,
         concurrency_limit=2,
     ).to_item()
     boto3.resource("dynamodb").Table(KEYS_TABLE).put_item(Item=item)
@@ -328,8 +327,8 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
         assert pool_secrets["mock"] not in "".join(environ.values())
         # The ledger is the usage table's: the request's slot was taken and released there, and
         # nothing was charged.
-        assert [(int(day["github_id"]), int(day["tokens"]), day["leases"]) for day in items(USAGE_TABLE)] == [
-            (7, 0, {})
+        assert [(int(day["github_id"]), "tokens" in day, day["leases"]) for day in items(USAGE_TABLE)] == [
+            (7, False, {})
         ]
 
         # The body limit of the environment: a body above it is refused, and nothing is forwarded.
