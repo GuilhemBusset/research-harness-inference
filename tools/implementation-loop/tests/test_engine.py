@@ -3,6 +3,7 @@ verifier and real squash merges into a local bare remote. Only the agents and Gi
 
 import re
 import unittest
+from concurrent.futures import Future
 from unittest import mock
 
 from helpers import SHIP, TempRepo, issue_body, present
@@ -11,7 +12,7 @@ from implement_loop.config import Caps, Config, Deploy
 from implement_loop.engine import Engine
 from implement_loop.github import FakeGitHub
 from implement_loop.graph import build_plan
-from implement_loop.model import Phase
+from implement_loop.model import WRITING_PHASES, Phase
 from implement_loop.state import RepoClaims, RunStore
 from implement_loop.workspace import Workspace
 
@@ -53,7 +54,7 @@ class EngineCase(unittest.TestCase):
         self.gh.on_merge = deployed
         self.policy = {**self.policy, "deploy": Deploy(contexts=(context,))}
 
-    def run_engine(self, agents=None, caps=None, fresh=False, policy=None):
+    def engine_for(self, agents=None, caps=None, fresh=False, policy=None):
         plan = build_plan(self.gh, EPIC, self.repo.work)
         store = RunStore.for_root(self.repo.work, EPIC, fresh=fresh)
         ws = Workspace(self.repo.work, EPIC, SHIP, base_dir=self.repo.loop_dir)
@@ -62,10 +63,11 @@ class EngineCase(unittest.TestCase):
         engine = Engine(plan, store, self.gh, ws, self.agents, cfg, repo_root=self.repo.work,
                         log=lambda m: None, sleep=lambda s: None, environment=getattr(self, "environment", None),
                         policy=policy or self.policy)
-        self.engine = engine
-        summary = engine.run()
-        self.store = store
-        return summary
+        self.engine, self.store = engine, store
+        return engine
+
+    def run_engine(self, agents=None, caps=None, fresh=False, policy=None):
+        return self.engine_for(agents, caps, fresh, policy).run()
 
     def phase(self, n):
         return self.store.issue(n).phase
@@ -277,6 +279,124 @@ class RequirementTests(EngineCase):
             self.run_engine()
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertTrue(self.events("requirements_changed", 2))
+
+
+class RecordingPool:
+    """The dispatcher's executor, as a log of what it submits: no step runs, so the test moves
+    each issue on itself, one dispatch event at a time."""
+
+    def __init__(self):
+        self.submitted: list[tuple[str, int]] = []
+
+    def submit(self, fn, n):
+        self.submitted.append((fn.__name__.removeprefix("_step_"), n))
+        return Future()
+
+
+class DispatchTests(EngineCase):
+    """First plans are admitted for the writer slots they could fill, plus one standby."""
+
+    def dispatcher(self, issues, writers=2, fresh=True):
+        for n, path in issues.items():
+            self.add_work(n, path, "x")
+        self.epic(*sorted(self.scripts))
+        engine = self.engine_for(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=writers), fresh=fresh)
+        self.pool, self.running = RecordingPool(), {}
+        return engine
+
+    def dispatch(self):
+        self.engine._dispatch(self.pool, self.running)  # ty: ignore[invalid-argument-type]  # test double
+        return list(self.pool.submitted)
+
+    def put(self, n, phase, plan=True, store=None, **changes):
+        """Issue `n` reaches `phase` as a step would leave it; its step, if any, has ended."""
+        store = store or self.store
+        st = store.issue(n)
+        st.phase = phase
+        if plan:
+            st.plan = {"items": [], "notes": "saved"}
+        for k, v in changes.items():
+            setattr(st, k, v)
+        store.put(st)
+        self.running.pop(n, None)
+
+    def plans(self):
+        return [n for step, n in self.pool.submitted if step == "plan"]
+
+    def writing(self):
+        return [n for n in self.engine.plan.work if self.store.issue(n).phase in WRITING_PHASES]
+
+    def test_two_writers_admit_three_first_plans_until_a_writer_releases_its_slot(self):
+        self.dispatcher({n: f"docs/{n}.txt" for n in range(2, 8)})
+        for _ in range(3):
+            self.dispatch()
+        self.assertEqual(self.plans(), [2, 3, 4], "two slots and one standby, however often it dispatches")
+        self.put(2, Phase.PLANNED)          # a completed plan builds at once: the slot is taken, not released
+        self.dispatch()
+        self.put(3, Phase.PLANNED)
+        self.dispatch()
+        self.put(4, Phase.PLANNED)          # a completed plan awaiting its build still counts
+        self.dispatch()
+        self.dispatch()
+        self.assertEqual(self.plans(), [2, 3, 4])
+        self.assertEqual(self.writing(), [2, 3])
+        self.assertEqual(self.store.issue(4).phase, Phase.PLANNED)
+        self.put(2, Phase.DONE)             # the writer releases its slot
+        self.dispatch()
+        self.assertEqual(self.pool.submitted[-2:], [("build", 4), ("plan", 5)])
+        self.assertEqual(self.writing(), [3, 4])
+
+    def test_admission_scans_past_a_path_conflict_and_an_owner_wait(self):
+        self.dispatcher({2: "docs/a.txt", 3: "docs/a.txt", 4: "docs/d.txt", 5: "docs/a.txt", 6: "docs/f.txt",
+                         7: "docs/g.txt"})
+        self.put(2, Phase.BUILD)
+        self.running[2] = Future()          # one writer, on `docs/a.txt`
+        self.put(4, Phase.WAITING, wait={"kind": "owner_review", "detail": "the owner reviews it"})
+        self.dispatch()
+        self.assertEqual(self.plans(), [3, 6], "#3 can only be the standby; #6 fills the free slot, #5 and #7 wait")
+
+    def test_a_ready_build_goes_before_a_fresh_standby_plan(self):
+        self.dispatcher({2: "docs/a.txt", 3: "docs/b.txt", 4: "docs/c.txt", 5: "docs/d.txt"})
+        self.put(3, Phase.PLANNED)
+        self.put(4, Phase.PLANNED)
+        self.assertEqual(self.dispatch(), [("build", 3), ("build", 4), ("plan", 2)])
+
+    def test_a_prerequisite_found_while_planning_frees_its_place_and_keeps_its_plan(self):
+        self.add_work(2, "docs/a.txt", "x", items=["`docs/a.txt` contains `x`.", "It uses the widget of #4."],
+                      deferred=(("D2", 4),))
+        self.add_work(4, "docs/d.txt", "x")
+        self.gh.issues[4]["title"] = "Prerequisite widget"   # what the fake plan quotes of the issue it needs
+        self.dispatcher({3: "docs/c.txt", 5: "docs/e.txt"}, writers=1)
+        self.dispatch()
+        self.assertEqual(self.plans(), [2, 3], "one slot and one standby")
+        del self.running[2]
+        self.engine._step_plan(2)          # the plan finds that #2 needs #4, in this run
+        self.assertEqual((self.store.issue(2).phase, self.engine.plan.deps[2]), (Phase.PENDING, {4}))
+        self.dispatch()
+        self.assertEqual(self.plans(), [2, 3, 4], "#2 no longer holds a place: #4 takes it")
+        self.put(4, Phase.DONE)
+        self.put(3, Phase.DONE)
+        self.dispatch()
+        self.assertEqual(self.pool.submitted[-2:], [("build", 2), ("plan", 5)])
+        self.assertEqual([c for c in self.agents.calls if c[0] == "plan" and c[2] == 2], [("plan", "claude", 2)],
+                         "the saved plan is reused, not made again")
+
+    def test_a_resumed_run_builds_its_saved_plans_under_the_writer_cap(self):
+        issues = {n: f"docs/{n}.txt" for n in range(2, 8)}
+        self.dispatcher(issues)
+        for n in (2, 3):
+            self.put(n, Phase.PLANNED)
+        for n in (4, 5):                     # as a stopped run leaves them: planned, not yet moved on
+            self.put(n, Phase.PENDING)
+        self.engine_for(caps=Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2))   # the run resumes
+        self.assertEqual(self.dispatch(), [("build", 2), ("build", 3)])
+        self.assertEqual([self.store.issue(n).phase for n in (4, 5)], [Phase.PLANNED, Phase.PLANNED])
+        self.put(2, Phase.DONE)
+        self.dispatch()
+        self.put(3, Phase.DONE)
+        self.dispatch()
+        self.assertEqual(self.pool.submitted, [("build", 2), ("build", 3), ("build", 4), ("build", 5), ("plan", 6)])
+        self.assertEqual(self.writing(), [4, 5])
 
 
 if __name__ == "__main__":

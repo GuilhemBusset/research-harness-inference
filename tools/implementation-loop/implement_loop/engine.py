@@ -170,6 +170,7 @@ EXPLORE_QUESTIONS = (
     "External references the issues cite: what do they establish that the work depends on?",
 )
 MERGE_QUEUE = "merge-queue"
+STANDBY_PLANS = 1   # plans prepared beyond what the free writer slots can take (`Engine._admit_plans`)
 REVIVED_FEEDBACK = 8   # the most entries of a failed round's feedback a revival keeps after its note (#85)
 # Deployment verdicts still awaited, one file per issue, under the runs' root. The merge-queue claim
 # belongs to a process: the run frees it when it ends, and a claim whose process died is taken
@@ -761,6 +762,7 @@ class Engine:
         landing = bool(self._landers)
         steps = {Phase.PLAN: self._step_plan, Phase.BUILD: self._step_build, Phase.VERIFY: self._step_verify,
                  Phase.EXAMINE: self._step_examine, Phase.MERGED: self._step_accept}
+        fresh: list[int] = []   # dependency-ready issues with no saved plan: admitted after the runnable work
         # An issue that waits for its deployment verdict takes the merge queue before any issue lands.
         for n in sorted(self.plan.work, key=lambda m: phases.get(m) != DEPLOYING):
             if n in running:
@@ -770,12 +772,13 @@ class Engine:
                 continue
             if not self._claim_issue(n):
                 continue
+            if ph in (Phase.PENDING, Phase.PLAN) and not self.store.issue(n).plan:
+                # a first plan, or one a stopped run left unfinished
+                if ph == Phase.PLAN or scheduler.prerequisites_met(self.plan, phases, n):
+                    fresh.append(n)
+                continue
             if ph == Phase.PENDING:
                 if not scheduler.prerequisites_met(self.plan, phases, n):
-                    continue
-                if not self.store.issue(n).plan:
-                    self._set_phase(n, Phase.PLAN)
-                    running[n] = pool.submit(self._step_plan, n)
                     continue
                 self._set_phase(n, Phase.PLANNED)   # already planned: it may start building in this pass
                 ph = Phase.PLANNED
@@ -802,6 +805,39 @@ class Engine:
                     self._polling.setdefault(n, time.monotonic())   # another run is landing, or waits for a verdict: poll
             elif ph in steps:
                 running[n] = pool.submit(steps[ph], n)
+        if fresh:
+            self._admit_plans(pool, running, fresh)
+
+    def _admit_plans(self, pool: ThreadPoolExecutor, running: dict[int, Future], fresh: list[int]) -> None:
+        """Plan close to when a writer can take the issue: first plans are admitted, after every
+        runnable step, only for a writer slot the issue could fill and for one standby. Plans in
+        flight and completed plans awaiting a build fill those first, so the count holds across
+        passes. A plan fills a slot only when it can write alongside the writers and the plans
+        already counted for the other slots; any other plan is the standby."""
+        phases = self._phases()
+        held = [n for n in self.plan.work if phases.get(n) in WRITING_PHASES]
+        standby = 0
+
+        def fits(n: int) -> bool:
+            return scheduler.can_start_writing(self.plan, n, held, self.caps.max_parallel_writers)
+
+        for n in self.plan.work:   # an issue waiting on a prerequisite found while planning is not counted
+            if n not in fresh and phases.get(n) in (Phase.PLAN, Phase.PLANNED):
+                if fits(n):
+                    held.append(n)
+                else:
+                    standby += 1
+        for n in fresh:
+            if fits(n):
+                held.append(n)
+            elif standby < STANDBY_PLANS:
+                standby += 1
+            else:
+                if phases.get(n) == Phase.PLAN:
+                    self._set_phase(n, Phase.PENDING)   # an unfinished plan waits for its turn like a first one
+                continue
+            self._set_phase(n, Phase.PLAN)
+            running[n] = pool.submit(self._step_plan, n)
 
     # ------------------------------------------------------------------ helpers
     def _req(self, n: int, feedback: list[str] | None = None) -> IssueRequest:
