@@ -100,15 +100,17 @@ lacks = [
 # merged head discharges the obligation. A capability with no entry here stays the owner's.
 ci_jobs = { "host:container-runtime" = "container-tests" }
 
-# Safety invariants: a finding that names one blocks even when it quotes no ledger item.
+# Safety invariants: a finding that names one blocks even when it quotes no ledger item, and from
+# an issue's fourth examination on only such a finding blocks. Each names a specific harm: a broad
+# name ("data loss", "a false done") matches almost any finding, and the bound then never applies.
 [invariants]
 names = [
   "secret exposure",
-  "check or gate bypass",
-  "data loss",
+  "a ci job, gate script, git hook or required check weakened",
+  "stored data deleted or made unrecoverable",
   "cross-run corruption",
-  "wrong results presented as correct",
-  "a false done",
+  "a status or measurement published as success when it failed",
+  "an item or check reported as passed that did not pass",
   "edits to another issue's merged deliverable",
   "an aws account id, arn or secret committed",
   "an iam policy broader than the issue requires",
