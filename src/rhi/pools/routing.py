@@ -26,6 +26,11 @@ that carries the cookie goes to the same target, and every request renews the du
 target a cookie names is unhealthy, deregistered or draining, the load balancer picks another and
 issues a new cookie. The gateway is this load balancer's client and keeps the cookie per student
 and pool (`rhi_gateway.affinity`): a request without one is routed by least outstanding requests.
+
+The load balancer writes its access logs to the network stack's access-log bucket, under its own
+prefix (`rhi.network.access_logs`). Its attributes are set here, not through the CDK's helper.
+Elastic Load Balancing refuses them until the bucket's policy lets it write: that policy is in the
+network stack, which the pools stack depends on (`rhi.pools.stack`).
 """
 
 from __future__ import annotations
@@ -37,9 +42,12 @@ from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from constructs import Construct
 
+from rhi.network.access_logs import INTERNAL_PREFIX, access_log_attributes
 from rhi.network.security import ENGINE_PORT, INTERNAL_LOAD_BALANCER_PORT
 
 if TYPE_CHECKING:
+    from aws_cdk import aws_s3 as s3
+
     from rhi_common.pool_config import Pool
 
 # The inference routes of the engine contract (section 4.1), and the one method they take.
@@ -71,6 +79,7 @@ class Routing(Construct):
         *,
         vpc: ec2.IVpc,
         security_group: ec2.ISecurityGroup,
+        access_logs_bucket: s3.IBucket,
         pools: tuple[Pool, ...],
     ) -> None:
         super().__init__(scope, construct_id)
@@ -83,6 +92,8 @@ class Routing(Construct):
             security_group=security_group,
             idle_timeout=cdk.Duration.seconds(IDLE_TIMEOUT_SECONDS),
         )
+        for key, value in access_log_attributes(access_logs_bucket, INTERNAL_PREFIX).items():
+            self.load_balancer.set_attribute(key, value)
         self.listener = self.load_balancer.add_listener(
             "Http",
             port=INTERNAL_LOAD_BALANCER_PORT,

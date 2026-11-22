@@ -248,7 +248,14 @@ def test_an_object_read_from_outside_the_endpoint_is_refused_and_no_write_is(
 
 
 def test_each_gpu_pool_reads_its_own_prefix_only(configured: dict[str, dict[str, Any]], name: str) -> None:
-    (template,) = [t for t in configured.values() if of_type(t, "AWS::S3::Bucket")]
+    # The template of the model bucket, the one bucket named so.
+    (template,) = [
+        t
+        for t in configured.values()
+        if any(
+            written(b["Properties"].get("BucketName"), t, name) == name for b in of_type(t, "AWS::S3::Bucket").values()
+        )
+    ]
     arn = ARN_START + name
     instance_roles = {
         next(tag["Value"] for tag in role["Properties"]["Tags"] if tag["Key"] == "rhi-pool"): logical_id

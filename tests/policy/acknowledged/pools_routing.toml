@@ -1,2 +1,8 @@
-[nag]
-"AwsSolutions-ELB2" = "The internal load balancer keeps no access logs: only the gateway reaches it, and the gateway records every request it forwards, so a bucket of access logs would add storage and its cost that nothing in the design reads."
+# What the roles of `src/rhi/pools/routing.py` may do, each action on each resource, with its
+# reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The module creates no role: it has no action to list. The internal load balancer writes its
+# access logs to the bucket of `src/rhi/network/access_logs.py`, whose policy lets Elastic Load
+# Balancing's log-delivery service write them (`network_access_logs.toml`), so cdk-nag's finding on
+# a load balancer without access logs (AwsSolutions-ELB2) is fixed, and the file has no table.

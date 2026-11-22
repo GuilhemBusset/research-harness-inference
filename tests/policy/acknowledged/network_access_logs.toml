@@ -1,0 +1,15 @@
+# What the roles of `src/rhi/network/access_logs.py` may do, each action on each resource, with its
+# reason. The file's tables hold only what cdk-nag and the wildcard check read, so the inventory is
+# written here as comments.
+#
+# The module creates no role. Its bucket's policy allows one action to one principal: s3:PutObject,
+# to Elastic Load Balancing's log-delivery service, on the objects under each load balancer's
+# prefix below `AWSLogs/<the stack's account>/`, where the service writes access logs. It holds
+# no other statement.
+#
+# cdk-nag's other finding on a bucket is fixed in the module: public access is blocked
+# (AwsSolutions-S2).
+
+[nag]
+"AwsSolutions-S1" = "The bucket holds the load balancers' access logs themselves, and a server access log of it would be a second log of the same writes, in a second bucket that nothing in the design reads."
+"AwsSolutions-S10" = "Refusing every request without TLS takes a statement on every principal, and the log-delivery service is the only principal the bucket's policy names: the policy lets no one else in, and the account's own identities reach the bucket through IAM and the AWS SDKs, which use TLS."
