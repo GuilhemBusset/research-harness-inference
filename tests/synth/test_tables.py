@@ -9,7 +9,8 @@ the admin changes. What a deployment runs is a custom resource, so `pool_state_w
 one that writes an item of the table: by an SDK call that its properties name with the table, or
 through what serves it, a function or a state machine whose role may write an item of the table,
 by a reference to it or by an ARN pattern that its name matches, or may run one that may (a
-provider's framework, which runs a handler or a waiter). A table created from an import is written
+provider's framework, which runs a handler or a waiter), reached directly or through what stands
+for it (an alias or a version of a function, a topic a function subscribes to). A table created from an import is written
 by its deployment too.
 
 The CDK is imported inside the fixtures, after `app_module` has started jsii (see conftest.py).
@@ -67,6 +68,9 @@ ITEM_WRITE_CALLS = (
 RUN_ACTIONS = ("lambda:invokefunction", "states:startexecution", "states:startsyncexecution")
 # What may serve a custom resource or be run by one, and the property that names its role.
 RUNNERS = {"AWS::Lambda::Function": "Role", "AWS::StepFunctions::StateMachine": "RoleArn"}
+# What stands for a function, so that a custom resource or a role reaches the function through it:
+# an alias or a version of it, or a topic it subscribes to.
+STAND_INS = ("AWS::Lambda::Alias", "AWS::Lambda::Version", "AWS::SNS::Topic")
 
 
 def key_schema(partition: KeyAttribute, sort: KeyAttribute | None) -> list[dict[str, str]]:
@@ -270,9 +274,25 @@ def pool_state_writes(templates: Templates, table: Node) -> list[str]:
     arn = f"arn:aws:dynamodb:us-east-1:123456789012:table/{POOLS_STACK_NAME}-{table[1]}-EXAMPLE"
     runners = {node: r for node, r in assembly.resources() if r["Type"] in RUNNERS}
     writers = {node for node, r in runners.items() if assembly.allows(node, r, ITEM_WRITE_ACTIONS, {table}, (arn,))}
+    stand_ins = {node: r for node, r in assembly.resources() if r["Type"] in STAND_INS}
+    subscriptions = [(node, r) for node, r in assembly.resources() if r["Type"] == "AWS::SNS::Subscription"]
     grown = True
     while grown:
-        more = {node for node, r in runners.items() if node not in writers and assembly.allows(node, r, RUN_ACTIONS, writers)}
+        more = {
+            node
+            for node, r in runners.items()
+            if node not in writers and assembly.allows(node, r, RUN_ACTIONS, writers)
+        }
+        more |= {
+            node
+            for node, r in stand_ins.items()
+            if node not in writers and assembly.references(r.get("Properties", {}), node[0]) & writers
+        }
+        for node, r in subscriptions:
+            properties = r.get("Properties", {})
+            if assembly.references(properties.get("Endpoint"), node[0]) & writers:
+                topics = assembly.references(properties.get("TopicArn"), node[0])
+                more |= {topic for topic in topics if isinstance(topic, tuple) and topic not in writers}
         writers |= more
         grown = bool(more)
 
@@ -329,7 +349,12 @@ FUNCTION, MACHINE = "AWS::Lambda::Function", "AWS::StepFunctions::StateMachine"
 
 def _sdk_call(table: str, scaler: str) -> dict[str, Resource]:
     del scaler
-    create = {"Fn::Join": ["", ['{"service":"DynamoDB","action":"putItem","parameters":{"TableName":"', {"Ref": table}, '"}}']]}
+    create = {
+        "Fn::Join": [
+            "",
+            ['{"service":"DynamoDB","action":"putItem","parameters":{"TableName":"', {"Ref": table}, '"}}'],
+        ]
+    }
     return {"Injected": {"Type": "Custom::AWS", "Properties": {"ServiceToken": "any", "Create": create}}}
 
 
@@ -358,34 +383,97 @@ def _a_provider_s_waiter(table: str, scaler: str) -> dict[str, Resource]:
     }
 
 
+def _an_alias_of_the_scaler(table: str, scaler: str) -> dict[str, Resource]:
+    del table
+    version = {"Type": "AWS::Lambda::Version", "Properties": {"FunctionName": {"Ref": scaler}}}
+    alias = {"FunctionName": {"Ref": scaler}, "FunctionVersion": {"Fn::GetAtt": ["Version", "Version"]}, "Name": "live"}
+    token = {"ServiceToken": {"Ref": "Alias"}}
+    return {
+        "Version": version,
+        "Alias": {"Type": "AWS::Lambda::Alias", "Properties": alias},
+        "Injected": {"Type": "Custom::Injected", "Properties": token},
+    }
+
+
+def _a_topic_the_scaler_subscribes_to(table: str, scaler: str) -> dict[str, Resource]:
+    del table
+    subscription = {"Protocol": "lambda", "TopicArn": {"Ref": "Topic"}, "Endpoint": {"Fn::GetAtt": [scaler, "Arn"]}}
+    return {
+        "Topic": {"Type": "AWS::SNS::Topic", "Properties": {}},
+        "Subscription": {"Type": "AWS::SNS::Subscription", "Properties": subscription},
+        "Injected": {"Type": "Custom::Injected", "Properties": {"ServiceToken": {"Ref": "Topic"}}},
+    }
+
+
+def _a_provider_that_invokes_an_alias(table: str, scaler: str) -> dict[str, Resource]:
+    del scaler
+    alias = {"FunctionName": {"Ref": "Handler"}, "FunctionVersion": "$LATEST", "Name": "live"}
+    return {
+        **_runner("Handler", FUNCTION, ["dynamodb:PutItem"], [{"Fn::GetAtt": [table, "Arn"]}]),
+        "Alias": {"Type": "AWS::Lambda::Alias", "Properties": alias},
+        **_runner("Framework", FUNCTION, ["lambda:InvokeFunction"], [{"Ref": "Alias"}]),
+        "Injected": _served_by("Framework"),
+    }
+
+
 def _table_name_arns(table: str) -> tuple[Any, Any]:
     """An ARN pattern that the pool-state table's name matches, built the two ways a template does."""
     name = f"table/{POOLS_STACK_NAME}-{table}-*"
     by_sub = {"Fn::Sub": f"arn:${{AWS::Partition}}:dynamodb:${{AWS::Region}}:${{AWS::AccountId}}:{name}"}
-    parts = ["arn:", {"Ref": "AWS::Partition"}, ":dynamodb:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, f":{name}"]
+    parts = [
+        "arn:",
+        {"Ref": "AWS::Partition"},
+        ":dynamodb:",
+        {"Ref": "AWS::Region"},
+        ":",
+        {"Ref": "AWS::AccountId"},
+        f":{name}",
+    ]
     return by_sub, {"Fn::Join": ["", parts]}
 
 
 def _a_name_pattern_by_sub(table: str, scaler: str) -> dict[str, Resource]:
     del scaler
-    return {**_runner("Handler", FUNCTION, ["dynamodb:PutItem"], [_table_name_arns(table)[0]]), "Injected": _served_by("Handler")}
+    return {
+        **_runner("Handler", FUNCTION, ["dynamodb:PutItem"], [_table_name_arns(table)[0]]),
+        "Injected": _served_by("Handler"),
+    }
 
 
 def _a_name_pattern_by_join(table: str, scaler: str) -> dict[str, Resource]:
     del scaler
-    return {**_runner("Handler", FUNCTION, ["dynamodb:UpdateItem"], [_table_name_arns(table)[1]]), "Injected": _served_by("Handler")}
+    return {
+        **_runner("Handler", FUNCTION, ["dynamodb:UpdateItem"], [_table_name_arns(table)[1]]),
+        "Injected": _served_by("Handler"),
+    }
 
 
 def test_a_pattern_finds_only_the_tables_it_names() -> None:
     arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Stack-Table-EXAMPLE"
     another = {"Fn::Join": ["", [{"Fn::GetAtt": ["Other", "Arn"]}, "*"]]}
-    assert [fnmatch(arn, pattern(value)) for value in ("*", "arn:aws:dynamodb:*:*:table/*", another)] == [True, True, False]
-    assert not fnmatch(arn, pattern({"Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Other}"}))
+    assert [fnmatch(arn, pattern(value)) for value in ("*", "arn:aws:dynamodb:*:*:table/*", another)] == [
+        True,
+        True,
+        False,
+    ]
+    assert not fnmatch(
+        arn, pattern({"Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Other}"})
+    )
 
 
 @pytest.mark.parametrize(
     "injected",
-    [_sdk_call, _the_scaler, _a_provider, _a_provider_s_waiter, _a_name_pattern_by_sub, _a_name_pattern_by_join],
+    [
+        _sdk_call,
+        _the_scaler,
+        _a_provider,
+        _a_provider_s_waiter,
+        _a_name_pattern_by_sub,
+        _a_name_pattern_by_join,
+        _an_alias_of_the_scaler,
+        _a_topic_the_scaler_subscribes_to,
+        _a_provider_that_invokes_an_alias,
+    ],
 )
 def test_a_deployment_that_writes_pool_state_is_found(
     app: cdk.App, templates: Templates, pool_state: Node, injected: Callable[[str, str], dict[str, Resource]]
@@ -397,7 +485,9 @@ def test_a_deployment_that_writes_pool_state_is_found(
     assert pool_state_writes(changed, pool_state) != []
 
 
-def test_a_write_from_another_stack_or_an_import_is_found(app: cdk.App, cloud_assembly: Path, templates: Templates, pool_state: Node) -> None:
+def test_a_write_from_another_stack_or_an_import_is_found(
+    app: cdk.App, cloud_assembly: Path, templates: Templates, pool_state: Node
+) -> None:
     stage = app.node.find_child("Rhi")
     pools = stage.pools  # ty: ignore[unresolved-attribute]
     scaler = pools.resolve(pools.get_logical_id(pools.scaler.function.node.default_child))
@@ -408,7 +498,10 @@ def test_a_write_from_another_stack_or_an_import_is_found(app: cdk.App, cloud_as
     ]
     changed = copy.deepcopy(templates)
     access = template_path(app, cloud_assembly, stage.access)  # ty: ignore[unresolved-attribute]
-    changed[access]["Resources"]["Injected"] = {"Type": "Custom::Injected", "Properties": {"ServiceToken": {"Fn::ImportValue": export}}}
+    changed[access]["Resources"]["Injected"] = {
+        "Type": "Custom::Injected",
+        "Properties": {"ServiceToken": {"Fn::ImportValue": export}},
+    }
     assert pool_state_writes(changed, pool_state) != []
 
     changed = copy.deepcopy(templates)
