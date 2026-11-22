@@ -8,7 +8,9 @@ the three wire formats. The student's key is generated when the tests run.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -229,6 +231,54 @@ def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pyte
     assert (response.status_code, upstream.seen) == (500 if change == "unreadable" else 401, [])
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None and (day.tokens, day.leases) == (7, {})
+
+
+@pytest.mark.parametrize("cancelled", ["reserving", "confirming"])
+def test_a_request_cancelled_before_its_key_is_confirmed_keeps_no_reservation(
+    monkeypatch: pytest.MonkeyPatch, cancelled: str
+) -> None:
+    upstream = Upstream()
+    app, key, ledger = gateway(upstream)
+    reserve = ledger.reserve
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        stopped_at, write = asyncio.Event(), threading.Event()
+
+        def slow_reserve(*args: Any, **kwargs: Any) -> Any:
+            # The client goes while the reservation is written, which it cannot stop.
+            if cancelled == "reserving":
+                loop.call_soon_threadsafe(stopped_at.set)
+                write.wait(5)
+            return reserve(*args, **kwargs)
+
+        async def never_answers(self: Authenticator, student: Any) -> Any:
+            stopped_at.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(ledger, "reserve", slow_reserve)
+        if cancelled == "confirming":
+            monkeypatch.setattr(Authenticator, "confirm", never_answers)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example.com") as client:
+            body = CASES[routes.MESSAGES][0]
+            sending = asyncio.create_task(client.post("/v1/messages", json=body, headers={"x-api-key": key}))
+            await stopped_at.wait()
+            sending.cancel()
+            write.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sending
+        # The reservation's write, then the withdrawal, which may end after the request.
+        for _ in range(500):
+            if ledger.writes and ledger.day(STUDENT, utc_day(NOW)) is None:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+    assert upstream.seen == []
+    assert ledger.writes
+    assert ledger.day(STUDENT, utc_day(NOW)) is None
 
 
 def test_each_chunk_reaches_the_client_before_the_next_one_is_sent() -> None:

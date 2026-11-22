@@ -100,7 +100,8 @@ whatever else is in flight, and every gateway task sees the same cookie. No othe
 the map: not the write that takes a reservation back, not the removal of expired leases, and a
 settlement that finds nothing to settle stores nothing. Only a withdrawal (`Ledger.withdraw`)
 deletes a day with its map, and only a day that holds what its opening carried from the day before,
-which the next opening carries again. A day's first reservation, which reads the
+which the next opening carries again: a day a request has settled into, whatever it charged, is
+marked so (`settled`), and no withdrawal deletes it. A day's first reservation, which reads the
 day before for its stand-ins, writes the new day with the cookies that day held, so that a student
 keeps their instance across midnight. A request that started the day before settles into that
 day's item, and its cookie stays there. A student's requests in flight at once each store theirs,
@@ -262,9 +263,10 @@ class Ledger(Protocol):
         """Take back a reservation whose key no longer passes, charging nothing.
 
         The day's row is then deleted if what is left in it is only what a day's opening carries
-        from the day before (`_carried_only`): no tokens, and no lease but stand-ins, whatever its
-        cookies and rebalance numbers. All of that a later opening carries again from the day
-        before, if that day is still there. A request whose student was erased while its body
+        from the day before (`_carried_only`): no tokens, no lease but stand-ins, and no request
+        settled into it, so that its cookies and rebalance numbers are those the opening carried.
+        All of that a later opening carries again from the day before, if that day is still there.
+        A day a request settled into keeps what that settlement stored, even at no tokens. A request whose student was erased while its body
         arrived thus leaves no row behind, however many such requests take theirs back and in
         whatever order, and what other requests charged or hold stays.
         """
@@ -451,10 +453,14 @@ def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: 
     return used if ended_cleanly else max(used, lease.estimate)
 
 
-def _carried_only(day: UsageDay) -> bool:
-    """Whether the day holds only what its opening carries from the day before: no tokens, and stand-ins alone."""
+def _carried_only(day: UsageDay, settled: bool) -> bool:
+    """Whether the day holds only what its opening carries from the day before.
+
+    No tokens, stand-ins alone, and no settlement (`settled`), which would have stored its cookie
+    and rebalance number there.
+    """
     prefix = _day_before(day.day) + "/"
-    return day.tokens == 0 and all(name.startswith(prefix) for name in day.leases)
+    return not settled and day.tokens == 0 and all(name.startswith(prefix) for name in day.leases)
 
 
 def _left(day: UsageDay | None, student: Student, now: int) -> int:
@@ -473,6 +479,8 @@ class InMemoryLedger:
         self._clock = clock
         self._lock = threading.Lock()
         self._days: dict[tuple[int, str], UsageDay] = {}
+        # The days a request has settled into: the table's `settled` attribute.
+        self._settled: set[tuple[int, str]] = set()
         self.writes = 0
 
     def day(self, github_id: int, day: str) -> UsageDay | None:
@@ -529,7 +537,12 @@ class InMemoryLedger:
     ) -> int | None:
         charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
         stored = self._remove(
-            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+            reservation,
+            charge,
+            cookie=cookie,
+            rebalance_number=rebalance_number,
+            cookie_dropped=cookie_dropped,
+            settled=True,
         )
         return charge if stored else None
 
@@ -541,16 +554,20 @@ class InMemoryLedger:
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
+        settled: bool = False,
     ) -> bool:
         """Remove the lease and replace its tokens by `charge`, if the lease is still there.
 
         The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
-        if there is one, and removes the pool's cookie when there is none and it was dropped.
+        if there is one, and removes the pool's cookie when there is none and it was dropped. A
+        settlement (`settled`) marks the day as one a request settled into.
         """
         with self._lock:
             day = self._days.get((reservation.github_id, reservation.day))
             if day is None or reservation.request_id not in day.leases:
                 return False
+            if settled:
+                self._settled.add((day.github_id, day.day))
             leases = {request: held for request, held in day.leases.items() if request != reservation.request_id}
             cookies, applied, pool = day.affinity_cookies, day.rebalance_applied, reservation.pool
             if pool is not None and cookie is not None:
@@ -573,9 +590,10 @@ class InMemoryLedger:
     def withdraw(self, reservation: Reservation) -> None:
         self._remove(reservation, 0)
         with self._lock:
-            day = self._days.get((reservation.github_id, reservation.day))
-            if day is not None and _carried_only(day):
-                del self._days[(day.github_id, day.day)]
+            key = (reservation.github_id, reservation.day)
+            day = self._days.get(key)
+            if day is not None and _carried_only(day, key in self._settled):
+                del self._days[key]
                 self.writes += 1
 
     def tokens_left(self, student: Student) -> int:
@@ -598,6 +616,8 @@ _COOKIES = "affinity_cookies"
 _APPLIED = "rebalance_applied"
 # The attribute of a day whose opener has not confirmed it yet (see the module's "Midnight").
 _OPENING = "opening"
+# The attribute of a day a request has settled into, which no withdrawal deletes.
+_SETTLED = "settled"
 _CONDITION_FAILED = "ConditionalCheckFailedException"
 _serializer = TypeSerializer()
 _deserializer = TypeDeserializer()
@@ -697,7 +717,12 @@ class DynamoDBLedger:
     ) -> int | None:
         charge = _charge(reservation.lease, input_tokens, output_tokens, ended_cleanly, int(self._clock()))
         stored = self._remove(
-            reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
+            reservation,
+            charge,
+            cookie=cookie,
+            rebalance_number=rebalance_number,
+            cookie_dropped=cookie_dropped,
+            settled=True,
         )
         return charge if stored else None
 
@@ -706,14 +731,15 @@ class DynamoDBLedger:
         key = self._key(reservation.github_id, reservation.day)
         for _ in range(_ATTEMPTS):
             item = self._client.get_item(TableName=self._table, Key=key, ConsistentRead=True).get("Item")
-            if not item or not _carried_only(_day(item)):
+            if not item or not _carried_only(_day(item), _SETTLED in item):
                 return
-            # `_carried_only` as read, held by the delete: the same tokens, and the same leases.
+            # `_carried_only` as read, held by the delete: the same tokens, the same leases, and
+            # no settlement since.
             deleted, _ = self._conditional(
                 self._client.delete_item,
                 Key=key,
-                ConditionExpression="#tokens = :zero AND #leases = :leases",
-                ExpressionAttributeNames=_NAMES,
+                ConditionExpression="#tokens = :zero AND #leases = :leases AND attribute_not_exists(#settled)",
+                ExpressionAttributeNames={**_NAMES, "#settled": _SETTLED},
                 ExpressionAttributeValues={":zero": _serializer.serialize(0), ":leases": item["leases"]},
             )
             if deleted:
@@ -768,6 +794,7 @@ class DynamoDBLedger:
         cookie: str | None = None,
         rebalance_number: int | None = None,
         cookie_dropped: bool = False,
+        settled: bool = False,
     ) -> bool:
         """Remove the lease and replace its tokens by `charge`, in one write, if the lease is still there.
 
@@ -775,7 +802,8 @@ class DynamoDBLedger:
         stand-ins it missed; the write carries them into the day and confirms the day. The others
         are given only by a settlement, and the same write applies them to the reservation's pool:
         it stores `cookie` and `rebalance_number`, each if there is one, and removes the pool's
-        cookie when there is none and it was dropped.
+        cookie when there is none and it was dropped. `settled` marks the day as one a request
+        settled into.
         """
         values: dict[str, object] = {":change": charge - reservation.lease.tokens}
         names, sets = _stand_in_updates(stand_ins or {}, values)
@@ -796,6 +824,10 @@ class DynamoDBLedger:
             names |= {"#applied": _APPLIED, "#pool": reservation.pool}
             sets.append("#applied.#pool = :number")
             values[":number"] = rebalance_number
+        if settled:
+            names["#settled"] = _SETTLED
+            sets.append("#settled = :settled")
+            values[":settled"] = True
         update = "REMOVE " + ", ".join(removals) + " ADD #tokens :change"
         if sets:
             update += " SET " + ", ".join(sets)

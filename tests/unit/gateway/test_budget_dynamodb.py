@@ -24,7 +24,14 @@ from rhi_common.causes import Cause
 from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
 from rhi_common.tables import USAGE
-from rhi_gateway.budget import BYTES_PER_TOKEN, USAGE_RETENTION_SECONDS, DynamoDBLedger, Reservation
+from rhi_gateway.budget import (
+    BYTES_PER_TOKEN,
+    USAGE_RETENTION_SECONDS,
+    DynamoDBLedger,
+    InMemoryLedger,
+    Ledger,
+    Reservation,
+)
 from rhi_gateway.errors import GatewayError, cause_of
 
 DAILY_BUDGET = 100_000_000
@@ -104,7 +111,7 @@ def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
 
 
 def reserve(
-    ledger: DynamoDBLedger,
+    ledger: Ledger,
     who: StudentKey,
     request: str,
     *,
@@ -358,6 +365,21 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
     assert ledger.settle(settled, input_tokens=900, output_tokens=100, ended_cleanly=True) == 1000
     ledger.withdraw(reserve(ledger, student(), "withdrawn"))
     assert (written().tokens, written().leases) == (1000, {})
+
+
+@pytest.mark.parametrize("kind", ["memory", "dynamodb"])
+def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: Calls, kind: str) -> None:
+    ledger = InMemoryLedger(clock=Clock()) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=Clock())
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    settled = ledger.settle(
+        completed, input_tokens=0, output_tokens=0, ended_cleanly=True, cookie="kept-cookie", rebalance_number=7
+    )
+    assert settled == 0
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
 
 
 def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(

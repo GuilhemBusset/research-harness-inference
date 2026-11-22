@@ -33,10 +33,10 @@ order leaves none of them a row behind:
    GitHub ID given back to `roster add` (`rhi_admin.roster.end_erase`).
 4. A request accepted before the erase reads its key again, past its cache, right after it writes
    its reservation, the write that makes a usage row (`rhi_gateway.auth.Authenticator.confirm`).
-   When the key is revoked or gone, or the read fails, it takes its reservation back and deletes
-   the row once it holds only what the day's opening carried from the day before: no tokens, no
-   lease but stand-ins, and the cookies and rebalance numbers
-   (`rhi_gateway.budget.Ledger.withdraw`). The rows such requests made go, in whatever order they
+   When the key is revoked or gone, the read fails, or the request is cancelled before the read
+   ends, it takes its reservation back and deletes the row once it holds only what the day's
+   opening carried from the day before: no tokens, no lease but stand-ins, no settlement, and the
+   cookies and rebalance numbers (`rhi_gateway.budget.Ledger.withdraw`). The rows such requests made go, in whatever order they
    take their reservations back, and what a new entry of the same student charged or holds stays.
    A settlement writes only to a row that holds its lease, so it creates none.
 

@@ -18,13 +18,13 @@ The reservation is made once the body is read and filtered, because it needs wha
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
 long the lease lasts. It is still made before anything is sent to the engine. Right after it, the
 key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`): a key revoked or
-erased while the body arrived, or a read that fails, has the reservation taken back, and the day's
-row deleted when it holds only what its opening carried from the day before (`Ledger.withdraw`),
-so that no request undoes an erase and none takes what another request charged or holds. The
-reservation names the pool, and returns the load balancer's cookie the student's record holds for
-it: the proxy sends that cookie, and the settlement stores the one the request ended with
-(`rhi_gateway.affinity`). It
-returns the last rebalance number the record has applied for the pool as well: the request is
+erased while the body arrived, a read that fails, or a request cancelled before the read ends, has
+the reservation taken back, and the day's row deleted when it holds only what its opening carried
+from the day before (`Ledger.withdraw`), so that no request undoes an erase and none takes what
+another request charged, holds or stored. The reservation names the pool, and returns the load
+balancer's cookie the student's record holds for it: the proxy sends that cookie, and the
+settlement stores the one the request ended with (`rhi_gateway.affinity`). It returns the last
+rebalance number the record has applied for the pool as well: the request is
 judged on the pool's number as the gateway holds it then, which may drop the cookie for this
 request, and the settlement stores that number (section 5.5).
 
@@ -95,6 +95,7 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 from starlette.applications import Starlette
@@ -112,7 +113,7 @@ from rhi_common.records import Mode
 from rhi_gateway import routes, telemetry
 from rhi_gateway.affinity import Affinity
 from rhi_gateway.body import BodySource, Forwarded
-from rhi_gateway.budget import Ledger
+from rhi_gateway.budget import Ledger, Reservation
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.experience import Experience
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
@@ -506,6 +507,47 @@ def _refusal(error: GatewayError, entry: Route, retry_after: Mapping[Cause, int]
     return Response(content=answer.body, status_code=answer.status, headers=answer.headers)
 
 
+# The reservations being made or taken back for requests cancelled meanwhile: held here so that
+# none is collected before it ends.
+_RESERVING: set[asyncio.Future[Any]] = set()
+
+
+def _kept(work: Awaitable[Any]) -> asyncio.Future[Any]:
+    running = asyncio.ensure_future(work)
+    _RESERVING.add(running)
+    running.add_done_callback(_RESERVING.discard)
+    return running
+
+
+async def _reserved(
+    reserve: Callable[[], Reservation], confirm: Callable[[], Awaitable[KeyRecord]], ledger: Ledger
+) -> tuple[Reservation, KeyRecord]:
+    """Reserve, then read the key again past the cache (`Authenticator.confirm`); the reservation and the record.
+
+    A key revoked or erased since it was accepted, a read that fails, or a request cancelled during
+    the read, has the reservation taken back (`Ledger.withdraw`), the withdrawal run to its end
+    even if the request is cancelled meanwhile. The reservation's write cannot be stopped once
+    started: a request cancelled during it has its reservation taken back once the write ends. So
+    no cancellation leaves a reservation that no settlement or withdrawal ends.
+    """
+    reserving = _kept(run_in_threadpool(reserve))
+    try:
+        reservation = await asyncio.shield(reserving)
+    except asyncio.CancelledError:
+
+        def take_back(done: asyncio.Future[Reservation]) -> None:
+            if not done.cancelled() and done.exception() is None:
+                _kept(run_in_threadpool(ledger.withdraw, done.result()))
+
+        reserving.add_done_callback(take_back)
+        raise
+    try:
+        return reservation, await confirm()
+    except BaseException:
+        await _to_the_end(run_in_threadpool(ledger.withdraw, reservation))
+        raise
+
+
 def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, Route, KeyRecord], Awaitable[Response]]:
     async def handler(request: Request, entry: Route, student: KeyRecord) -> Response:
         request_id = uuid.uuid4().hex
@@ -524,7 +566,7 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 held = _Held(
                     holding, forwarded.pool, entry.wire_format or WireFormat.MESSAGES, streams=_streams(forwarded)
                 )
-            reservation = await run_in_threadpool(
+            reserve = partial(
                 forwarding.ledger.reserve,
                 student,
                 request_id,
@@ -534,18 +576,12 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 longest_request_seconds=forwarding.proxy.longest_request_seconds,
                 pool=forwarded.pool.name,
             )
+            # The body may have taken long: the key is read again once the reservation is written.
+            reservation, student = await _reserved(
+                reserve, partial(forwarding.authenticator.confirm, student), forwarding.ledger
+            )
         except GatewayError as refused:
             return _refusal(refused, entry, forwarding.retry_after)
-        # The body may have taken long: the key is read again once the reservation is written. A
-        # key revoked or erased meanwhile, or a read that fails, has the reservation taken back.
-        try:
-            student = await forwarding.authenticator.confirm(student)
-        except GatewayError as refused:
-            await run_in_threadpool(forwarding.ledger.withdraw, reservation)
-            return _refusal(refused, entry, forwarding.retry_after)
-        except Exception:
-            await run_in_threadpool(forwarding.ledger.withdraw, reservation)
-            raise
         # The load balancer's cookie the student's record holds for the pool: the proxy sends it,
         # and the settlement stores the one the request ends with (section 5.5). The request is
         # judged here on the pool's rebalance number, as the gateway holds it now: a number new to
