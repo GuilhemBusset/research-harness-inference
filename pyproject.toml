@@ -24,7 +24,7 @@ dependencies = [
     "aws-cdk-lib==2.276.0",
     "constructs==10.8.1",
     "cdk-nag==3.0.2",
-    "boto3[crt]==1.43.126",
+    "boto3[crt]==1.44.3",
     "grafana-foundation-sdk==0.0.22",
 ]
 
@@ -73,7 +73,7 @@ gateway = [
     # Without its optional native extras (uvloop, httptools), which this load does not need.
     "uvicorn==0.54.0",
     "prometheus-client==0.26.0",
-    "boto3==1.43.126",
+    "boto3==1.44.3",
 ]
 mock-engine = [
     "starlette==1.10.0",
@@ -81,22 +81,22 @@ mock-engine = [
     "prometheus-client==0.26.0",
 ]
 scaler = [
-    "boto3==1.43.126",
+    "boto3==1.44.3",
     "protobuf==7.36.2",
     # Snappy as prebuilt wheels, with no system library.
     "cramjam==2.14.0",
 ]
 reporter = [
-    "boto3==1.43.126",
+    "boto3==1.44.3",
     "PyJWT==2.15.1",
     "cryptography==50.0.2",
 ]
-issuer = ["boto3==1.43.126"]
+issuer = ["boto3==1.44.3"]
 lifecycle = [
-    "boto3==1.43.126",
+    "boto3==1.44.3",
     "prometheus-client==0.26.0",
 ]
-admin = ["boto3==1.43.126"]
+admin = ["boto3==1.44.3"]
 # client/pyproject.toml, from which students install the CLI, declares the same requirement.
 cli = ["keyring==25.7.0"]
 # Not a service: what the spikes under spikes/ import (system design, section 12). The OpenAI and
@@ -110,7 +110,7 @@ cli = ["keyring==25.7.0"]
 spikes = [
     "openai==3.57.0",
     "anthropic==2.11.0",
-    "boto3==1.43.126",
+    "boto3==1.44.3",
     "highspy==1.16.0",
     "httpx==0.28.1",
 ]
