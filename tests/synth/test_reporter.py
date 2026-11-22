@@ -10,6 +10,7 @@ is given to put events on that bus (sections 8.4 and 12).
 
 from __future__ import annotations
 
+import json
 import runpy
 from pathlib import Path
 from typing import Any
@@ -48,13 +49,16 @@ def reporter_functions(template: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def test_the_rule_matches_this_pipeline_s_state_changes_only(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     (pipeline_id,) = of_type(template, "AWS::CodePipeline::Pipeline")
-    # The one rule on the default bus that matches events: the other is on the measurement bus, and
-    # a schedule matches none.
+    # The one rule on the default bus that matches events and invokes no log group: the other is on
+    # the measurement bus, a schedule matches none, and the rule that keeps the same events targets
+    # the pipeline's events log group (`tests/synth/test_pipeline_events.py`).
     (rule,) = [
         rule
         for template in templates.values()
         for rule in of_type(template, "AWS::Events::Rule").values()
-        if "EventBusName" not in rule and "EventPattern" in rule
+        if "EventBusName" not in rule
+        and "EventPattern" in rule
+        and not any(":log-group:" in json.dumps(target["Arn"]) for target in rule["Targets"])
     ]
     pattern = rule["EventPattern"]
     assert pattern["source"] == ["aws.codepipeline"]

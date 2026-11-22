@@ -3,7 +3,7 @@ private subnets, reached on port 3000 through one rule of the public load balanc
 priority 30, which authenticates against the admin's user pool before it forwards; an environment
 that gives it the workspace's query address and the region; and a role that may query the one
 workspace, read CloudWatch metrics and read the log groups of the gateway, the scaler, the issuer
-and the pools, never a build project's. All of the load balancer's part only while the listener
+the pools and the pipeline's events, never a build project's. All of the load balancer's part only while the listener
 exists.
 
 The app of the session is synthesized from the example configuration, whose listener exists, with
@@ -42,6 +42,8 @@ QUERY_ACTIONS = {"aps:QueryMetrics", "aps:GetSeries", "aps:GetLabels", "aps:GetM
 LOG_ACTIONS = {"logs:StartQuery", "logs:GetLogGroupFields", "logs:GetLogEvents"}
 CLOUDWATCH_READS = {"cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "logs:GetQueryResults"}
 SERVICE_LOG_GROUPS = {"/rhi/gateway", "/rhi/scaler", "/rhi/issuer"}
+# The pipeline's state changes, for the deployments dashboard: a log group of the pipeline's stack.
+PIPELINE_EVENTS = "/rhi/pipeline/events"
 
 # What the pseudo parameters of an ARN are read as, and the ARN of a log group so read: its name,
 # then `:*` for the log group and its streams.
@@ -383,15 +385,17 @@ def test_the_role_names_the_workspace_and_the_stage_s_log_groups_only(templates:
     assert set(logs["Action"]) == LOG_ACTIONS
 
     # The log groups, each by its own name and none by a pattern: the gateway's, the scaler's, the
-    # issuer's and that of each of the example's pools.
+    # issuer's, that of each of the example's pools and that of the pipeline's events.
     assert [pool.name for pool in EXAMPLE.pools] == ["coursework", "mock"]
     named = log_groups_named(template)
-    assert named == SERVICE_LOG_GROUPS | {"/rhi/pools/coursework", "/rhi/pools/mock"}
-    # Each is the name of a log group the stage creates. Grafana's own is not among them.
+    assert named == SERVICE_LOG_GROUPS | {"/rhi/pools/coursework", "/rhi/pools/mock", PIPELINE_EVENTS}
+    # Each is the name of a log group the stage creates, or, for the pipeline's events, the
+    # pipeline's stack. Grafana's own is not among them.
+    pipeline = stack_path(templates, "RhiPipeline")
     created = {
         group["LogGroupName"]
         for path, _, group in everywhere(templates, "AWS::Logs::LogGroup")
-        if "/" in path and isinstance(group.get("LogGroupName"), str)
+        if ("/" in path or path == pipeline) and isinstance(group.get("LogGroupName"), str)
     }
     assert named <= created
     assert "/rhi/grafana" in created - named
@@ -411,7 +415,7 @@ def test_the_role_names_the_log_group_of_each_configured_pool(tmp_path: Path) ->
     stage = EndpointStage(app, "Rhi", config=dataclasses.replace(EXAMPLE, pools=pools, default_pool="first"))
     app.synth()
     template = json.loads((Path(stage.outdir) / stage.observability.template_file).read_text(encoding="utf-8"))
-    assert log_groups_named(template) == SERVICE_LOG_GROUPS | {"/rhi/pools/first", "/rhi/pools/second"}
+    assert log_groups_named(template) == SERVICE_LOG_GROUPS | {"/rhi/pools/first", "/rhi/pools/second", PIPELINE_EVENTS}
 
 
 def test_the_stack_depends_on_no_stack_that_depends_on_it(templates: Templates) -> None:

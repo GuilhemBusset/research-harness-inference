@@ -214,6 +214,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ),
         *((key, value) for key in TARGET_KEYS for value in (f'"{MARK}"', "0", f"-{MARK}.5", "true", "nan")),
         ("cached_share_flag_percent", f"100.{MARK}"),
+        *(("pipeline_events_retention_days", value) for value in ("0", "91", f'"{MARK}"', "90.5", "true")),
         *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
@@ -297,6 +298,13 @@ def test_the_provisional_targets_read_the_defaults_of_section_17_when_left_out(t
     }
     given = load_text(tmp_path, example_with(**{key: str(value) for key, value in moved.items()}))
     assert {key: getattr(given, key) for key in TARGET_KEYS} == moved
+
+
+def test_pipeline_events_retention_days_reads_90_when_left_out(tmp_path: Path) -> None:
+    # A configuration written before the key loads, with the period of the stage's log groups.
+    assert load_text(tmp_path, example_with(pipeline_events_retention_days=None)).pipeline_events_retention_days == 90
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["pipeline_events_retention_days"] == 90
+    assert load_text(tmp_path, example_with(pipeline_events_retention_days="30")).pipeline_events_retention_days == 30
 
 
 def test_an_optional_key_may_be_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
