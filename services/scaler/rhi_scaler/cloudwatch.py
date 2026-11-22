@@ -11,13 +11,13 @@ namespace `NAMESPACE`:
 | `LaunchesSuspended` | `Pool` | 1 while the pool's launches are suspended after three abandoned launches, else 0 (sections 5.1 and 5.4) |
 | `MinutesInServiceOutsideSessions` | `Pool` | The whole minutes the pool has been in service while no session is on (`rhi_scaler.outside_sessions`) |
 
-The pool's name is the only dimension any of them carries. A CloudWatch metric cannot be deleted
+The data points carry no timestamp: CloudWatch dates them when it receives them, after the run has
+applied its decision. The pool's name is the only dimension any of them carries. A CloudWatch metric cannot be deleted
 for 15 months, so nothing that names a student ever goes there (section 6.6; evidence E27).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 from rhi_scaler.model import Decision
@@ -33,8 +33,7 @@ POOL_DIMENSION = "Pool"
 def metric_data(decision: Decision, now: int) -> list[dict[str, Any]]:
     """The data points of a run that completed at the time `now` with this decision, whose pools'
     memory holds where their stretch outside sessions stands (`outside_sessions.carry`)."""
-    timestamp = datetime.fromtimestamp(now, UTC)
-    data: list[dict[str, Any]] = [{"MetricName": RUN_COMPLETED, "Value": 1.0, "Unit": "Count", "Timestamp": timestamp}]
+    data: list[dict[str, Any]] = [{"MetricName": RUN_COMPLETED, "Value": 1.0, "Unit": "Count"}]
     for pool in decision.pools:
         dimensions = [{"Name": POOL_DIMENSION, "Value": pool.pool}]
         outside = minutes(pool.memory.outside_sessions_since, now)
@@ -44,14 +43,12 @@ def metric_data(decision: Decision, now: int) -> list[dict[str, Any]]:
                 "Dimensions": dimensions,
                 "Value": 1.0 if pool.suspend_launches else 0.0,
                 "Unit": "None",
-                "Timestamp": timestamp,
             },
             {
                 "MetricName": MINUTES_OUTSIDE_SESSIONS,
                 "Dimensions": dimensions,
                 "Value": float(outside),
                 "Unit": "None",
-                "Timestamp": timestamp,
             },
         ]
     return data

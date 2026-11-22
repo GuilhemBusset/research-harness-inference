@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
 from typing import Any
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode
+from rhi_common.records import Mode, RecordError
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, Run, TableNames
 from rhi_scaler.metrics import DecisionCounts
@@ -84,19 +85,18 @@ def a_run(monkeypatch: pytest.MonkeyPatch, cloudwatch: Any, failing: str | None 
 
 def test_a_completed_run_publishes_that_it_completed_and_each_pool_s_two_values(monkeypatch: pytest.MonkeyPatch) -> None:
     client = boto3.client("cloudwatch", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub")
-    at = datetime.fromtimestamp(NOW, UTC)
 
     def per_pool(pool: str, suspended: float, outside: float) -> list[dict[str, Any]]:
         pool_dimension = [{"Name": "Pool", "Value": pool}]
         return [
-            {"MetricName": "LaunchesSuspended", "Dimensions": pool_dimension, "Value": suspended, "Unit": "None", "Timestamp": at},
-            {"MetricName": "MinutesInServiceOutsideSessions", "Dimensions": pool_dimension, "Value": outside, "Unit": "None", "Timestamp": at},
+            {"MetricName": "LaunchesSuspended", "Dimensions": pool_dimension, "Value": suspended, "Unit": "None"},
+            {"MetricName": "MinutesInServiceOutsideSessions", "Dimensions": pool_dimension, "Value": outside, "Unit": "None"},
         ]
 
     expected = {
         "Namespace": "rhi/scaler",
         "MetricData": [
-            {"MetricName": "RunCompleted", "Value": 1.0, "Unit": "Count", "Timestamp": at},
+            {"MetricName": "RunCompleted", "Value": 1.0, "Unit": "Count"},
             *per_pool("coursework", 0.0, 61.0),
             *per_pool("mock", 1.0, 0.0),
         ],
@@ -122,3 +122,29 @@ def test_no_published_metric_has_a_dimension_other_than_the_pool(monkeypatch: py
     for datum in call["MetricData"]:
         assert [dimension["Name"] for dimension in datum.get("Dimensions", [])] in ([], ["Pool"])
     assert {d["Dimensions"][0]["Value"] for d in call["MetricData"] if "Dimensions" in d} == {"coursework", "mock"}
+
+
+def test_a_switch_that_could_not_be_read_fails_the_run_after_its_decision_and_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[Decision] = []
+    recorder = Recorder()
+    monkeypatch.setattr(scaler.aws_io, "read", lambda *_: replace(RUN, session_error=RecordError("unreadable")))
+    monkeypatch.setattr(scaler, "decide", lambda *_: DECISION)
+    monkeypatch.setattr(scaler.aws_io, "apply", lambda clients, tables, run, decision: applied.append(decision))
+    clients = Clients(autoscaling=None, elbv2=None, dynamodb=None, cloudwatch=recorder)
+    with pytest.raises(RecordError):
+        scaler.run_cycle(SETTINGS, clients, Recorder(), NOW, DecisionCounts())  # ty: ignore[invalid-argument-type] - a test double
+    assert recorder.calls == []
+    # The decision was applied, and each pool's stretch stayed where it stood.
+    (decision,) = applied
+    assert [pool.memory.outside_sessions_since for pool in decision.pools] == [NOW - 3660, NOW - 600]
+
+
+def test_a_publication_cloudwatch_refuses_fails_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = boto3.client("cloudwatch", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub")
+    with Stubber(client) as stubber:
+        stubber.add_client_error("put_metric_data", "InvalidParameterValue")
+        with pytest.raises(ClientError):
+            a_run(monkeypatch, client)
+        stubber.assert_no_pending_responses()

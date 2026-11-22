@@ -12,8 +12,12 @@ the admin CLI. Whoever calls, a run does the same thing, and the event is never 
 
 A run that fails before its writes leaves the pool as it was; the next run reads the world again.
 A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is what the alarm
-reads. A metrics push or a publication that fails does not fail the run: the decision is already
-applied, and the log holds it.
+reads. A metrics push that fails does not fail the run: the decision is already applied, and the
+log holds it. Two failures do fail the run, after its decision is applied, which stands:
+
+- the session switch could not be read: what demand calls for is applied all the same, each pool's
+  stretch outside sessions stays as it was, and nothing is published;
+- CloudWatch refused the publication: the run did not deliver what the alarms read.
 """
 
 from __future__ import annotations
@@ -74,17 +78,22 @@ def run_cycle(
     metrics' samples (by default, `now`'s second).
     """
     run = aws_io.read(clients, settings.tables, settings.pools, now)
-    decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session)
+    readable = run.session_error is None
+    decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session, read=readable)
     aws_io.apply(clients, settings.tables, run, decision)
     log_decisions(run, decision)
     try:
         writer.push(fleet_series(run.inputs, decision, counts, milliseconds))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
+    if run.session_error is not None:
+        LOGGER.error(json.dumps({"event": "session-switch-not-read", "error": type(run.session_error).__name__}))
+        raise run.session_error
     try:
         cloudwatch.publish(clients.cloudwatch, decision, now)
-    except Exception as error:  # noqa: BLE001 - the decision is applied; a lost data point only leaves a gap
-        LOGGER.warning(json.dumps({"event": "cloudwatch-not-published", "error": type(error).__name__}))
+    except Exception as error:
+        LOGGER.error(json.dumps({"event": "cloudwatch-not-published", "error": type(error).__name__}))
+        raise
     return decision
 
 

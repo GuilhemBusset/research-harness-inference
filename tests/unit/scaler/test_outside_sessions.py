@@ -44,3 +44,9 @@ def test_the_count_restarts_after_the_pool_went_to_zero_and_when_the_switch_is_t
     after_on += [(T0 + 1860, 1, ON)]
     after_on += [(T0 + 1920 + 60 * n, 1, OFF) for n in range(11)]
     assert counts(after_on)[30:] == [30, 0, *range(11)]
+
+
+def test_a_session_that_came_and_went_between_two_runs_restarts_the_count() -> None:
+    # Missed runs while a class was on: the switch, read again, was set off a minute ago.
+    ended = SessionSwitch(on=False, set_by="admin", set_at=T0 + 3600)
+    assert counts([(T0, 1, OFF), (T0 + 3660, 1, ended), (T0 + 3720, 1, ended)]) == [0, 1, 2]

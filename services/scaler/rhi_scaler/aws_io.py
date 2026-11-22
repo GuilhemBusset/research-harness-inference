@@ -17,7 +17,9 @@ What is read, for each pool:
 
 And once for the whole run, the session switch (`rhi_common.records.SessionSwitch`), from its item
 in the pool-state table. It only reports (`rhi_scaler.outside_sessions`) and `decide` never sees it.
-A missing item reads as no record; so does one nobody can read, which a run does not fail over.
+A missing item reads as no record. A read that fails, or an item that is not a switch, is not taken
+for no record: the run keeps the error (`Run.session_error`), decides and applies from what it read
+of demand, and the handler fails it only after that.
 
 The supply, from the lifecycle states and target health:
 
@@ -69,6 +71,7 @@ from decimal import Decimal
 from typing import Any
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_common.pool_config import Pool
 from rhi_common.records import (
@@ -137,11 +140,13 @@ class GroupState:
 @dataclass(frozen=True)
 class Run:
     """What one run read: the decision's inputs, each pool's group by pool name, and the session
-    switch, `None` when it has no record."""
+    switch, `None` when it has no record. `session_error` is why the switch could not be read, and
+    then `session` is `None` too."""
 
     inputs: Inputs
     groups: Mapping[str, GroupState]
     session: SessionSwitch | None = None
+    session_error: Exception | None = None
 
 
 @dataclass(frozen=True)
@@ -409,25 +414,28 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
 
 
 def read_session(clients: Clients, tables: TableNames) -> SessionSwitch | None:
-    """The session switch; `None` when it has no record, or one that is not a switch."""
+    """The session switch; `None` when it has no record. An item that is not a switch raises
+    `RecordError`."""
     key = {name: {"S": value} for name, value in SESSION_SWITCH_KEY.items()}
     item = clients.dynamodb.get_item(TableName=tables.pool_state, Key=key, ConsistentRead=True).get("Item")
-    if item is None:
-        return None
-    try:
-        return SessionSwitch.from_item(_plain(item))
-    except RecordError:
-        return None
+    return None if item is None else SessionSwitch.from_item(_plain(item))
 
 
 def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:
     """Everything one run decides from, at the time `now`, for each pool in the order given, and the
     session switch."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
+    session, session_error = None, None
+    try:
+        session = read_session(clients, tables)
+    except (ClientError, BotoCoreError, RecordError) as error:
+        # It only reports: a wake that demand calls for must not wait on it.
+        session_error = error
     return Run(
         inputs=Inputs(now=now, pools=tuple(inputs for inputs, _ in read_pools)),
         groups={inputs.config.name: state for inputs, state in read_pools},
-        session=read_session(clients, tables),
+        session=session,
+        session_error=session_error,
     )
 
 

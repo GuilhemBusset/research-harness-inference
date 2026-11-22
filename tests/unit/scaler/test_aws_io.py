@@ -14,7 +14,7 @@ from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, SessionSwitch
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, RecordError, SessionSwitch
 from rhi_scaler.aws_io import (
     Clients,
     PoolSettings,
@@ -235,13 +235,27 @@ def test_the_mode_record_and_the_memory_record_are_read(aws: Aws) -> None:
         (SessionSwitch(on=True, set_by="admin", set_at=NOW - 5).to_item(), SessionSwitch(on=True, set_by="admin", set_at=NOW - 5)),
         (SessionSwitch(on=False, set_by="admin", set_at=NOW - 5).to_item(), SessionSwitch(on=False, set_by="admin", set_at=NOW - 5)),
         (None, None),
-        # A switch nobody can read is no record: the run goes on and reports no session on.
-        ({"pool": "_session", "record": "switch", "on": "yes"}, None),
     ],
 )
 def test_the_session_switch_is_read_once_per_run(aws: Aws, item: dict[str, Any] | None, read_as: SessionSwitch | None) -> None:
     aws.queue_read(session=item)
-    assert read_one(aws).session == read_as
+    run = read_one(aws)
+    assert (run.session, run.session_error) == (read_as, None)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"pool": "_session", "record": "switch", "on": "yes", "set_by": "admin", "set_at": NOW - 5},
+        # On, but without who set it: still not taken for no record.
+        {"pool": "_session", "record": "switch", "on": True, "set_at": NOW - 5},
+    ],
+)
+def test_a_switch_that_is_not_a_switch_is_an_error_of_the_run_not_no_record(aws: Aws, item: dict[str, Any]) -> None:
+    aws.queue_read(session=item)
+    run = read_one(aws)
+    assert run.session is None
+    assert isinstance(run.session_error, RecordError)
 
 
 def test_a_decision_becomes_calls_in_order_and_the_note_carries_no_capacity(aws: Aws) -> None:
