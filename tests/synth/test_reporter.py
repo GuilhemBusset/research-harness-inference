@@ -154,12 +154,8 @@ def test_the_function_s_lifecycle_stages_are_the_members_of_the_stages_enumerati
 
 def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
-    (topic_id, topic), *others = [
-        (logical_id, properties)
-        for template in templates.values()
-        for logical_id, properties in of_type(template, "AWS::SNS::Topic").items()
-    ]
-    assert others == [] and topic_id in template["Resources"]
+    # The pipeline stack's one topic. The stage's alerts topic is another (`rhi.guardrails.alerts`).
+    ((topic_id, topic),) = of_type(template, "AWS::SNS::Topic").items()
     assert topic["KmsMasterKeyId"] == "alias/aws/sns"
     (policy,) = [p for p in of_type(template, "AWS::SNS::TopicPolicy").values() if {"Ref": topic_id} in p["Topics"]]
     assert {

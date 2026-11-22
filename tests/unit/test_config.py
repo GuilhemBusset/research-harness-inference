@@ -207,6 +207,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("https_listener", f'"{MARK}"'),
         ("https_listener", '"true"'),
         ("https_listener", "1"),
+        *(("cost_anomaly_detection", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(
             (key, value)
             for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
@@ -250,6 +251,13 @@ def test_https_listener_reads_false_when_left_out(tmp_path: Path) -> None:
     # The example turns the listener on, so that synthesis sees it.
     assert config.load({"RHI_CONFIG": "example"}).https_listener is True
     assert load_text(tmp_path, example_with(https_listener="false")).https_listener is False
+
+
+def test_cost_anomaly_detection_reads_false_when_left_out(tmp_path: Path) -> None:
+    # An account may already hold the one monitor of the services dimension (issue E4-36).
+    assert load_text(tmp_path, example_with(cost_anomaly_detection=None)).cost_anomaly_detection is False
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["cost_anomaly_detection"] is False
+    assert load_text(tmp_path, example_with(cost_anomaly_detection="true")).cost_anomaly_detection is True
 
 
 def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
