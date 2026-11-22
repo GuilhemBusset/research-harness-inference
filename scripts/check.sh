@@ -77,7 +77,10 @@ do_lint() {
 }
 
 do_types() {
-  uv run --locked ty check
+  # Without PYTHONPATH: since 0.0.104, ty puts its entries before the roots of ty.toml, and the
+  # implement loop's verifier sets it to the engine of the main checkout, which would then stand
+  # for the `implement_loop` of the branch under check.
+  env -u PYTHONPATH uv run --locked ty check
 }
 
 do_tests() {
