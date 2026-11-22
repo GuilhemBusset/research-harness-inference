@@ -42,6 +42,10 @@ no hold. Otherwise the reservation is made, and only then is the scaler asked to
 - a call that is not a stream is held in silence, then forwarded as any other; a client that
   leaves meanwhile ends its hold, and so does the cancellation of the request, which is settled still.
 
+Either answer carries the header `x-rhi-held: true` (`rhi_gateway.hold.HELD_HEADER`), which a
+request forwarded with no hold never does: a hold that ends before its first keep-alive leaves no
+other sign a client can see.
+
 A hold that ends, at its deadline (`warming`, or `capacity_unavailable`) or for any other cause,
 settles the reservation with nothing observed, which the ledger charges the input estimate, and
 ends the request with its cause: the error event of its format on a stream, the JSON answer (503
@@ -117,7 +121,7 @@ from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger, Reservation
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.experience import Experience
-from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
+from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, HELD_HEADER, Action, End, Forward, Hold, KeepAlive, Wake
 from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
 from rhi_gateway.readiness import PoolView, Readiness
 from rhi_gateway.routes import TABLE, Route, match
@@ -644,12 +648,13 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         if held is not None and not held.ready:
             if held.streams:
                 # Answered 200 at once: the keep-alives, then the engine's stream on the same connection.
-                return forwarding.proxy.held(entry, forwarded, settle, held, token_sent=token_sent, affinity=affinity)
+                answer = forwarding.proxy.held(entry, forwarded, settle, held, token_sent=token_sent, affinity=affinity)
+                return _marked_held(answer)
             try:
                 left = await _hold_silently(held, request.receive)
             except GatewayError as ended:
                 await settle(Observed(0, 0, ended_cleanly=False))
-                return _refusal(ended, entry, forwarding.retry_after)
+                return _marked_held(_refusal(ended, entry, forwarding.retry_after))
             except asyncio.CancelledError:
                 # The request itself is cancelled while held: it has ended, and its settlement is run to its end still.
                 await _to_the_end(settle(Observed(0, 0, ended_cleanly=False)))
@@ -657,11 +662,21 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             if left:
                 await settle(Observed(0, 0, ended_cleanly=False))
                 return Response(status_code=CLIENT_LEFT_STATUS)
+            answer = await forwarding.proxy.forward(
+                entry, forwarded, settle, receive=request.receive, token_sent=token_sent, affinity=affinity
+            )
+            return _marked_held(answer)
         return await forwarding.proxy.forward(
             entry, forwarded, settle, receive=request.receive, token_sent=token_sent, affinity=affinity
         )
 
     return handler
+
+
+def _marked_held(answer: Response) -> Response:
+    """The answer to a request the gateway held, with the header that says so (`rhi_gateway.hold.HELD_HEADER`)."""
+    answer.headers[HELD_HEADER] = "true"
+    return answer
 
 
 def forwarding_handlers(forwarding: Forwarding) -> dict[Route, Handler]:
