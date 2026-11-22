@@ -643,3 +643,34 @@ def test_a_write_in_flight_keeps_the_row_of_a_box_another_run_ticks_meanwhile():
             issue_run.result()
         assert f"- [x] {SIGNS_IN} ([evidence]" in run.fake.issues[2]["body"]
         assert rows(run) and rows(run, "D3")
+
+
+def test_a_comment_write_applied_late_is_repaired_once_another_root_closed_the_issue():
+    with two_roots() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(push_main(run, files=(LATER,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+        update, writing, resume = run.fake.update_comment, Event(), Event()
+
+        def late(number, body):   # the issue's run writes D3's row; GitHub applies it last, without a reply
+            if L.report.EVIDENCE_MARKER in body and not writing.is_set():
+                writing.set()
+                resume.wait(10)
+                update(number, body)
+                raise L.github.GitHubUnavailable("the reply was lost")
+            return update(number, body)
+        run.fake.update_comment = late
+        with ThreadPoolExecutor() as pool:
+            issue_run = pool.submit(run.run, root=2)
+            try:
+                assert writing.wait(10)
+                run.fake.set_status(merge, RHI, "success", VERIFIED)
+                run.run(root=EPIC)   # publishes D2 and D3, ticks both and closes the issue
+            finally:
+                resume.set()
+            issue_run.result()
+        run.fake.update_comment = update
+        assert run.fake.issues[2]["state"] == "closed" and not rows(run)
+        run.run(root=EPIC)
+        run.run(root=2)
+        assert any(merge[:12] in row for row in rows(run)) and rows(run, "D3")
+        assert not run.issue(2, root=2).obligations

@@ -2951,14 +2951,22 @@ class Engine:
         an issue edited since it was delivered (its items are not the ones proven), or a read
         GitHub does not answer, which the next run tries again. A proof read before a write GitHub
         did not answer is recorded by the next run only if GitHub ticked its box; otherwise it is
-        read again (`_kept_proofs`)."""
+        read again (`_kept_proofs`). Such a proof is settled even once its issue is no longer this
+        run's work (another root's run closed it meanwhile): a write of the evidence comment GitHub
+        applied late, without its reply, may have erased the rows that run published, which the
+        settling writes again; nothing new is proven for such an issue."""
         contexts, said, _ = self._discharge_table()
         head: list[str] = []   # the head of `main`, fetched once, when an issue needs it
-        for n in self.plan.work:
+        for n in [*self.plan.work, *(m for m in self.store.known() if m not in self.plan.work)]:
             st = self.store.issue(n)
-            if st.phase != Phase.DELIVERED or self.plan.specs[n].body_hash != st.body_hash:
+            if st.phase != Phase.DELIVERED:
+                continue
+            if n not in self.plan.work:
+                items = {}   # only what this run saved and left unsettled
+            elif self.plan.specs[n].body_hash != st.body_hash:
                 continue   # an edited issue is not discharged: its items are no longer the ones delivered
-            items = self._owed_smoke_items(n, st)
+            else:
+                items = self._owed_smoke_items(n, st)
             if not items and not self._kept_proofs(st):   # a proof saved and not recorded is settled all the same
                 continue
             try:
