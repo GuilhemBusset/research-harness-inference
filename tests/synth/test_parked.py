@@ -10,8 +10,9 @@ keeps its stack and its logical ID, and the state recorded in the policy tests'
 
 CloudFormation refuses to delete an export that a deployed stack still imports, and the pipeline
 deploys a stack after the stacks it depends on. So an export that one synthesis imports and the
-next one no longer declares must have its importer deploy first in the next one
-(`deleted_exports_in_use`), whether its resource goes or only its last importer does.
+next one no longer declares, or declares with another value, must have its importer deploy first in
+the next one, its import gone (`deleted_exports_in_use`), whether its resource goes or only its last
+importer does.
 """
 
 from __future__ import annotations
@@ -224,8 +225,13 @@ def _imports(node: Any, stack: str) -> Iterator[str]:
 
 def exports(stage: Stage) -> dict[str, str]:
     """Every export the stage declares, by its name, with the stack that declares it."""
+    return {name: stack for name, (stack, _) in _exported_values(stage).items()}
+
+
+def _exported_values(stage: Stage) -> dict[str, tuple[str, Any]]:
+    """Every export the stage declares, by its name, with the stack that declares it and its value."""
     return {
-        output["Export"]["Name"]: stack
+        output["Export"]["Name"]: (stack, output.get("Value"))
         for stack, template in stage.templates.items()
         for output in template.get("Outputs", {}).values()
         if "Export" in output
@@ -233,12 +239,12 @@ def exports(stage: Stage) -> dict[str, str]:
 
 
 def deleted_exports_in_use(before: Stage, after: Stage) -> list[tuple[str, str]]:
-    """Every export of `before` a stack of `before` imports that `after` no longer declares, unless
-    that stack deploys before the export's stack in `after` and no longer imports it there, as
-    `(importer, export name)`: deploying `after` over `before` would delete an export in use. An
-    import whose name the template does not fully say counts for every export its name may resolve
-    to."""
-    declared_before, declared_after = exports(before), exports(after)
+    """Every export of `before` a stack of `before` imports that `after` no longer declares, or
+    declares with another value, unless that stack deploys before the export's stack in `after` and
+    no longer imports it there, as `(importer, export name)`: deploying `after` over `before` would
+    delete or change an export in use, which CloudFormation refuses. An import whose name the
+    template does not fully say counts for every export its name may resolve to."""
+    values_before, values_after = _exported_values(before), _exported_values(after)
 
     def imported(stage: Stage, importer: str, name: str) -> bool:
         template = stage.templates.get(importer, {})
@@ -248,8 +254,8 @@ def deleted_exports_in_use(before: Stage, after: Stage) -> list[tuple[str, str]]
         {
             (importer, name)
             for importer in before.templates
-            for name, exporter in declared_before.items()
-            if name not in declared_after
+            for name, (exporter, _) in values_before.items()
+            if values_after.get(name) != values_before[name]
             and imported(before, importer, name)
             and (importer not in after.after.get(exporter, set()) or imported(after, importer, name))
         }
@@ -394,12 +400,18 @@ def test_parked_keeps_the_recorded_state_and_its_protections(stages: dict[bool, 
 
 
 def two_stacks(
-    *, parked: bool, consumer_first: bool = False, still_imports: str = "", substituted: str = ""
+    *,
+    parked: bool,
+    consumer_first: bool = False,
+    still_imports: str = "",
+    substituted: str = "",
+    rewritten: str = "",
 ) -> Stage:
     """A stage of two stacks. Unparked, `Consumer` imports the name of a bucket of `Producer`, by a
     reference or, given `substituted`, by a `Fn::Sub` of that text that resolves to the export's
-    name; parked, the bucket is gone, `Consumer` deploys after `Producer` or before it, and
-    `still_imports` names an export it keeps importing."""
+    name; parked, the bucket is gone, `Consumer` deploys after `Producer` or before it,
+    `still_imports` names an export it keeps importing, and `rewritten` names an export `Producer`
+    keeps declaring, its value now `none`."""
     import aws_cdk as cdk
 
     app = cdk.App(analytics_reporting=False)
@@ -415,6 +427,8 @@ def two_stacks(
             consumer.add_dependency(producer)
         if still_imports:
             cdk.CfnOutput(consumer, "Imported", value=cdk.Fn.import_value(still_imports))
+        if rewritten:
+            cdk.CfnOutput(producer, "Exported", value="none", export_name=rewritten)
     else:
         bucket = cdk.aws_s3.Bucket(producer, "Bucket")
         if substituted:
@@ -437,6 +451,9 @@ def test_no_export_in_use_is_deleted(stages: dict[bool, Stage]) -> None:
     # Deploying first is not enough: the importer must also drop its import.
     retained = two_stacks(parked=True, consumer_first=True, still_imports=name)
     assert deleted_exports_in_use(before, retained) == [("Consumer", name)]
+    # Nor may the export stay with another value while the importer still deploys after it.
+    assert deleted_exports_in_use(before, two_stacks(parked=True, rewritten=name)) == [("Consumer", name)]
+    assert deleted_exports_in_use(before, two_stacks(parked=True, consumer_first=True, rewritten=name)) == []
     # An import whose name a substitution gives, a parameter possibly giving the empty text.
     for template in ("${Prefix}-Bucket", "Producer-Bucket${Suffix}"):
         substituted = two_stacks(parked=False, substituted=template)
