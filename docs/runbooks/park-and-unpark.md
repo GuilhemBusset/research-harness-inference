@@ -263,10 +263,17 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
 4. **A student's key still works.** For the cohort that was parked: with a key issued to your own
    roster entry before parking, the status of the pools is answered, which the gateway does only
-   for a valid key. For a new cohort, whose keys are issued after the unpark, log in first with
-   `rhi login` and use that key:
+   for a valid key:
 
    ```sh
+   rhi status
+   ```
+
+   For a new cohort, whose keys are issued after the unpark, log in first with your own roster
+   entry, which issues a key and keeps it for the CLI, then ask for the status with that key:
+
+   ```sh
+   rhi login
    rhi status
    ```
 

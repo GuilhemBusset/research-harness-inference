@@ -72,6 +72,30 @@ that `rhi_admin roster list` prints.
    the stage removes them with everything else. Read the list in your terminal and keep no copy of
    it in the repository.
 
+   **Students removed during the course** are not on this list, yet `rhi_admin roster remove`
+   deleted only their entry: their revoked keys and their usage rows stay until retention removes
+   them. They are erased too (Act, step 3), and cannot be exported. List every GitHub ID that has
+   a key or a usage row: first the names of the stage's three tables (the logical IDs hold `Keys`,
+   `Roster` and `Usage`),
+
+   ```sh
+   aws cloudformation list-stack-resources --stack-name Rhi-Access \
+       --query "StackResourceSummaries[?ResourceType=='AWS::DynamoDB::Table'].[LogicalResourceId,PhysicalResourceId]" --output text
+   ```
+
+   then the GitHub IDs in the keys and the usage tables, `<keys-table>` and `<usage-table>` being
+   their names:
+
+   ```sh
+   for table in <keys-table> <usage-table>; do
+       aws dynamodb scan --table-name "$table" --projection-expression github_id --query 'Items[].github_id.N' --output text || echo "INCOMPLETE: $table was not read" >&2
+   done | tr '\t' '\n' | sort -u
+   ```
+
+   Each ID it prints that the roster does not list is a student removed during the course (or one
+   whose earlier erase was interrupted). Note those IDs, in your terminal only, for Act, step 3. A
+   line `INCOMPLETE` means the list is not whole: run it again.
+
 3. **What you keep, and where.** The student notice (section 6.6) says what is kept after the course
    and why: nothing at all, or, say, each student's usage when it counts toward grading. Export only
    the students whose data the notice says you keep. An export is personal data: it goes to a folder
@@ -114,7 +138,8 @@ that `rhi_admin roster list` prints.
    days. It reads the logs and the workspace, so it takes a while for each student. A student who is
    no longer on the roster is refused: `Refused: that GitHub ID is not on the roster.`
 
-3. **Erase each student's data,** once their export, if any, read `exported`:
+3. **Erase each student's data,** once their export, if any, read `exported`, and the data of
+   each student removed during the course (Check, step 2), whom no export reaches:
 
    ```sh
    rhi_admin privacy erase 1234567 && echo "1234567: erased" || echo "1234567: NOT erased"
@@ -139,7 +164,8 @@ that `rhi_admin roster list` prints.
 
    **Check the erases now,** before step 4: the admin CLI finds its tables through the stage's
    stacks, so once the stage is deleted it cannot run. The roster and a refused export are not
-   enough, since an interrupted erase passes both. For each student, run the erase once more; it
+   enough, since an interrupted erase passes both. For each student, those removed during the
+   course included, run the erase once more; it
    must be refused because nothing of the student is left:
 
    ```sh

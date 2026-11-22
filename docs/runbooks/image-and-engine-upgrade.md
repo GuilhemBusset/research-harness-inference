@@ -343,7 +343,10 @@ larger pools included, while a machine image refreshes only the promoted pool.
        --query 'Reservations[].Instances[].[ImageId,State.Name]' --output text
    ```
 
-   A pool with no instance prints nothing: its next start is the check, in step 3.
+   A pool with no instance prints nothing, and step 3's panel shows the engine's release, not the
+   machine image. Run the same command again at the pool's next start, once its first instance
+   runs: that instance must show the candidate's ID. Until it has, the image is promoted but not
+   verified on an instance: say so wherever you report the upgrade.
 
 5. **No pool's launches are suspended:**
 

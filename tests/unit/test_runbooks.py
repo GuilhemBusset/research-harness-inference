@@ -84,6 +84,7 @@ def _is_repository_path(word: str) -> bool:
 CONTROL = {"|", "|&", "||", "&&", "&", ";", ";;", ";&", ";;&"}
 REDIRECTION = {"<", ">", ">>", ">|", "<>", "<<", "<<-", "<<<", ">&", "<&", "&>", "&>>"}
 OPERATORS = sorted(CONTROL | REDIRECTION, key=len, reverse=True)  # longest first: `>>` before `>`
+NUMBERED = REDIRECTION - {"&>", "&>>"}  # the redirections a descriptor's number may start: `2&>` is `2`, then `&>`
 
 
 def _quoted(line: str, index: int) -> tuple[str, int]:
@@ -120,14 +121,14 @@ def split(line: str) -> list[tuple[str, bool]]:
         elif char == "#" and word is None:
             break
         elif operator or char in " \t":
-            if word is not None and not (digits and operator in REDIRECTION):
+            if word is not None and not (digits and operator in NUMBERED):
                 found.append((word, False))
             word, digits = None, False
             if operator:
                 found.append((operator, True))
             index += len(operator) or 1
         else:
-            digits = char.isdigit() and (word is None or digits)
+            digits = char in "0123456789" and (word is None or digits)  # ASCII only, as the shell reads them
             word, index = (word or "") + char, index + 1
     if word is not None:
         found.append((word, False))
@@ -202,6 +203,9 @@ def test_detects_an_unknown_command() -> None:
     # Only unquoted, unescaped digits name a descriptor: an escaped or quoted one is an argument.
     escaped = "```sh\nrhi status \\2>/dev/null\nrhi status '2'>/dev/null\n```\n"
     assert problems(sections + escaped) == ["the rhi CLI refuses: rhi status 2"] * 2
+    # `&>` takes no descriptor, and a digit that is not ASCII names none.
+    unnumbered = "```sh\nrhi status 2&>/dev/null\nrhi status \u00b2>/dev/null\nrhi status 2>/dev/null\n```\n"
+    assert problems(sections + unnumbered) == ["the rhi CLI refuses: rhi status 2", "the rhi CLI refuses: rhi status '\u00b2'"]
     # A line the shell refuses for an unterminated quote is refused here too.
     with pytest.raises(ValueError, match="no closing quotation"):
         problems(sections + '```sh\nrhi "status\n```\n')
