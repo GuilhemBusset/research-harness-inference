@@ -65,11 +65,13 @@ Do these the day before the class, while no session is on.
    lists, since a fallback type may be the one launched. For the example's coursework pool, whose
    only type is `g7e.2xlarge` with 8 vCPUs, that is 8 × (`max_instances` + 1): 24 for the example's
    2, 32 for 3. Look up the vCPUs of your pool's types in the EC2 console's instance types page if
-   they differ. Every G-family pool the class uses counts against the same quota, so add their
-   needs. Read the quota in the region of the endpoint:
+   they differ. Each instance family has its own quota: a `g…` type counts against "Running
+   On-Demand G and VT instances", a `p…` type against "Running On-Demand P instances". Add the needs
+   of every pool the class uses whose types are of the same family, and compare each family's total
+   with that family's quota. Read both quotas in the region of the endpoint:
 
    ```sh
-   aws service-quotas list-service-quotas --service-code ec2 --query "Quotas[?QuotaName=='Running On-Demand G and VT instances'].Value" --output text
+   aws service-quotas list-service-quotas --service-code ec2 --query "Quotas[?QuotaName=='Running On-Demand G and VT instances' || QuotaName=='Running On-Demand P instances'].[QuotaName,Value]" --output text
    ```
 
    If it is short, request more, well ahead of the class, since an increase can take days. The quota
@@ -81,10 +83,10 @@ Do these the day before the class, while no session is on.
    setup/owner-setup.sh --step quotas --max-instances N
    ```
 
-   If your pools list another type, or several G-family pools are used together, the script's
-   figure is not yours: request the total you computed above instead, in the Service Quotas console,
-   under Amazon EC2, for the quota "Running On-Demand G and VT instances", with **Request increase
-   at account level**.
+   If your pools list another type, a P-family type, or several pools of one family are used
+   together, the script's figure is not yours: request the total you computed above instead, in the
+   Service Quotas console, under Amazon EC2, for the quota of that family ("Running On-Demand G and
+   VT instances" or "Running On-Demand P instances"), with **Request increase at account level**.
 
 2. **A pool's maximum, if the class needs more instances.** Edit `max_instances` of the pool in
    your configuration file, kept outside the working tree, then validate and write it to SSM:
@@ -94,12 +96,13 @@ Do these the day before the class, while no session is on.
    ```
 
    The quota of step 1 must cover the new maximum plus one. The new value takes effect only once a
-   pipeline run has deployed it. Note the time once the script has written the configuration, then
-   start a run with **Release change** on the pipeline's page in the CodePipeline console. Check
-   that run itself, not a status left by an earlier one: in the pipeline's execution history, open
-   the execution whose start time is after the time you noted. An edit of SSM changes no commit, so
-   the `deploy/<stage>` status of step 3 can still be an earlier run's success; only this execution
-   says what happened to the edit. In the stage the class uses, it runs the deployment actions
+   pipeline run has deployed it. Once the script has written the configuration, start a run with
+   **Release change** on the pipeline's page in the CodePipeline console, and note the execution
+   ID the console shows for it: the run you started is the first row of the pipeline's execution
+   history, with the trigger `StartPipelineExecution` and your identity. Check that execution
+   itself, by its ID, from here on. An edit of SSM changes no commit, so the `deploy/<stage>` status
+   of step 3 can still be an earlier run's success; only this execution says what happened to the
+   edit. In the stage the class uses, it runs the deployment actions
    first and the verification (the action Verify, the smoke tests against the deployed endpoint)
    after them. Read the deployment first:
 
@@ -115,44 +118,37 @@ Do these the day before the class, while no session is on.
      missing because the canary command has not been run yet. Read what the verification did from
      the same execution, below.
 
-   **Whether the smoke tests ran and passed.** The pipeline's reporter posts the verification's
-   verdict as the commit status `verify/<stage>` on the commit the execution deployed, which for a
-   run started with **Release change** is the latest commit of `main`. An earlier execution left a
-   status of the same name on that commit, so read only the newest one, and check that it was
-   created after the time you noted. On GitHub, with the name of the stage the class uses in place
-   of `<stage>`:
+   **Whether the smoke tests ran and passed.** Read it from the log of this execution's own Verify
+   action, not from a commit status: an SSM edit deploys no new commit, so a `verify/<stage>` status
+   on the commit can come from another execution of the same commit, posted before or after yours.
+   In the execution's detail page (the execution ID you noted), in the stage the class uses, open
+   the action Verify's details, which link to its CodeBuild log, and read the end of the log:
 
-   ```sh
-   gh api repos/OWNER/REPOSITORY/commits/main/statuses --jq '[.[] | select(.context == "verify/<stage>")][0] | "\(.created_at) \(.state) \(.description)"'
-   ```
-
-   - `success` with the description "The verification's tests ran and passed.": the smoke tests
-     ran against the endpoint with the new value, and passed.
-   - `success` with a description that begins "No test ran": the deployment is not verified, even
-     though Verify Succeeded. The description says why. For a missing canary key, create it with
-     the canary command below, then start another run with **Release change** and read its status
-     again; for a missing HTTPS listener, the listener must be turned on first (it is off by
-     default).
-   - `failure` or `error`: the verification failed, as in the case above where Verify failed.
-   - No status created after the time you noted: the reporter has not posted this execution's
-     verdict yet. Wait a few minutes and read it again; until it is there, the deployment is not
-     verified.
+   - A line of pytest's summary that reports tests `passed` and none `failed` or `error`, for each
+     run (one on the mock pool, and one more on each GPU pool whose release this execution
+     deployed): the smoke tests ran against the endpoint with the new value, and passed.
+   - The line `verify: no test was run:` followed by `listener-off` or `canary-missing`: the
+     deployment is not verified, even though Verify Succeeded. For `canary-missing`, create the
+     canary's key with the command below, then start another run with **Release change**, note
+     its ID, and read its Verify log again; for `listener-off`, the HTTPS listener must be turned
+     on first (it is off by default).
+   - A summary that reports a test `failed` or `error`, or a Verify that failed: the verification
+     failed, as in the case above where Verify failed.
 
    ```sh
    rhi_admin canary
    ```
 
-   Switch the session on only once an execution started after your last configuration change has
-   succeeded through Verify **and** its `verify/<stage>` status reads "The verification's tests ran
-   and passed.".
+   Switch the session on only once the execution you started after your last configuration change
+   has succeeded through Verify **and** its own Verify log shows the smoke tests ran and passed.
 
 3. **Every configuration change has landed, and no deployment is running.** A deployment that has
    passed the deployment hold's check runs to its end even after the session is switched on, so
    none may be under way when you switch it on. A change merged to `main` has landed when the
    latest commit of `main` carries a `deploy/<stage>` status that reads success; it has also been
    tested only when the commit's `verify/<stage>` status reads success with the description "The
-   verification's tests ran and passed.", not one that begins "No test ran" (step 2 says what each
-   means). A change made in SSM alone has landed only when the execution of step 2 succeeded, which
+   verification's tests ran and passed.", not one that begins "No test ran", which is the
+   reporter's word for the Verify log's `verify: no test was run:` of step 2. A change made in SSM alone has landed only when the execution of step 2 succeeded, which
    the `deploy/<stage>` status cannot show. On GitHub:
 
    ```sh
@@ -267,8 +263,12 @@ Do these the day before the class, while no session is on.
    pool up until it ends, and the idle interval starts only then. So first wait until no request
    of the pool is running: in Grafana, on the dashboard "Fleet and scaling", in the pool's row, the
    panel "Engine requests: running and waiting, per instance" reads zero running and zero waiting
-   for every instance. With the session off, the gateway takes no new request, so none is held
-   either. Then allow the full `idle_minutes` (20 for the example's coursework), plus a few minutes
+   for every instance. With the session off, the gateway takes no new request, but one it was
+   already holding while the pool started stays held until the pool is ready or the hold's deadline
+   passes (7 minutes for a stream, 4 for a call, section 5.3), and the scaler counts it as demand.
+   So also wait until the gateway holds none for the pool: in Grafana's Explore, on the Prometheus
+   data source, the query `sum by (pool) (rhi_gateway_requests_held)` reads zero, or no data, for
+   the pool. Then allow the full `idle_minutes` (20 for the example's coursework), plus a few minutes
    for the scaler to act, before checking that each pool has no instance in service: on the same
    dashboard, in each pool's row, the panel "Instances: desired, in service, warm" reads zero for
    desired and for in service.

@@ -131,8 +131,10 @@ During a session, a pool does not come up:
    ```
 
    It takes effect at the next pipeline run, which you start, while no session is on, with
-   **Release change** on the pipeline's page in the CodePipeline console. The GPU quota must still
-   cover one instance more than the pool's `max_instances`, of the largest type it lists.
+   **Release change** on the pipeline's page in the CodePipeline console; check that execution, by
+   its ID, as the runbook [a session switched on and off](session-on-and-off.md) says in its check
+   2. The GPU quota must still cover one instance more than the pool's `max_instances`, of the
+   largest type it lists, against the quota of that type's family.
 
 ## Verify
 
