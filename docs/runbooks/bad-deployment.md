@@ -164,14 +164,22 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      aws cloudformation describe-stacks --stack-name <stack> --query 'Stacks[0].StackStatus'
      ```
 
-     and its latest events, the newest first, read back to the moment the action started (the
-     events of the stack itself, whose logical ID is the stack's name, mark where each update
-     began and how it ended):
+     and its events since the moment the action started, the newest first (the events of the
+     stack itself, whose logical ID is the stack's name, mark where each update began and how it
+     ended). `<action-start>` is the action's start time as the execution's actions show it, in
+     UTC, written `2026-01-31T14:05:00`. The command sets no `--max-items`: the CLI reads every
+     page of the stack's events before it keeps those since `<action-start>`, so an update with
+     many resources, or later events, cannot push the start of the update being investigated out
+     of the answer:
 
      ```sh
-     aws cloudformation describe-stack-events --stack-name <stack> --max-items 40 \
-         --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus]' --output text
+     aws cloudformation describe-stack-events --stack-name <stack> \
+         --query "StackEvents[?Timestamp>='<action-start>'].[Timestamp,LogicalResourceId,ResourceStatus]" \
+         --output text
      ```
+
+     An answer with no event of the stack itself means no update of it began after
+     `<action-start>`; check the time you gave before reading it so.
 
      - `UPDATE_IN_PROGRESS` or `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`: the update is still running
        (an abandoned action, or a stop that has not ended); wait and read it again.

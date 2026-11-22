@@ -51,9 +51,15 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 ## Check
 
 1. **Whose key it is.** A key does not name its student, and the clear key is in no table: the keys
-   table holds only its SHA-256. When the student reported it, or the key was found in their own
-   repository, the student is known. Otherwise ask the person who found it where it was, and whose
-   work that was. Find the student's GitHub ID and alias on the roster:
+   table holds only its SHA-256. When the student reported it as their own, the student is known.
+   Where the key was found is only a lead: a repository, a chat or a file can hold a key someone
+   else pasted there (a teammate's, a classmate's that was copied, a fork of another student's
+   work), so its owner is not, by that alone, the key's owner. Ask the person whose repository or
+   message it is whose key it is, and where it came from; check it with that student, and with the
+   usage of Check, step 2, which shows whose alias asks when the key is used. While the owner is
+   still uncertain, revoke the keys of each student it could be (Act, step 1): a revocation costs a
+   student only a new login, and a key left working costs more. Find each student's GitHub ID and
+   alias on the roster:
 
    ```sh
    rhi_admin roster list

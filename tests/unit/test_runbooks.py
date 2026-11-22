@@ -125,23 +125,38 @@ def _factory_key_replacement() -> str:
     return next(b for b in blocks if "Downloads/<new-key>" in b and "LOOP_GITHUB_APP_KEY_FILE" in b)
 
 
-@pytest.mark.parametrize("cut_short", [False, True])
+@pytest.mark.parametrize("fault", [None, "copy cut short", "download kept"])
 def test_the_factory_key_replacement_keeps_the_old_key_unless_the_copy_completes(
-    tmp_path: Path, cut_short: bool
+    tmp_path: Path, fault: str | None
 ) -> None:
     download = tmp_path / "Downloads" / "replacement.private-key.pem"
     download.parent.mkdir()
     download.write_bytes(b"new key\n" * 512)
     key = tmp_path / "factory.pem"
     key.write_bytes(b"old key\n")
+    # A file that already has the name of the old file plus .new is someone's, and stays as it is.
+    bystander = Path(f"{key}.new")
+    bystander.write_bytes(b"not the factory's\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if fault == "download kept":  # an rm that cannot remove anything in the downloads
+        rm = bin_dir / "rm"
+        rm.write_text('#!/bin/sh\nfor a do case "$a" in */Downloads/*) exit 1;; esac; done\nexec /bin/rm "$@"\n')
+        rm.chmod(0o700)
     # A file-size limit of one block cuts the copy short, as a full disk would.
-    script = ("ulimit -f 1\n" if cut_short else "") + _factory_key_replacement().replace("<new-key>", "replacement")
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LOOP_GITHUB_APP_KEY_FILE": str(key)}
-    subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path, capture_output=True, check=False)
-    if cut_short:
+    script = ("ulimit -f 1\n" if fault == "copy cut short" else "") + _factory_key_replacement().replace(
+        "<new-key>", "replacement"
+    )
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "LOOP_GITHUB_APP_KEY_FILE": str(key)}
+    result = subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path, capture_output=True, check=False, text=True)
+    assert bystander.read_bytes() == b"not the factory's\n"
+    assert sorted(f.name for f in tmp_path.glob("factory.pem*")) == ["factory.pem", "factory.pem.new"]
+    if fault == "copy cut short":
         assert key.read_bytes() == b"old key\n"
         assert download.exists()
-        assert not Path(f"{key}.new").exists()
+        assert "not installed" in result.stdout
     else:
         assert key.read_bytes() == b"new key\n" * 512
-        assert not download.exists()
+        assert download.exists() == (fault == "download kept")
+        assert "the new key is installed" in result.stdout
+        assert "not installed" not in result.stdout

@@ -236,25 +236,35 @@ key, and nothing restarts.
    old key, and the doctor too.
 
 3. **Replace the file at the configured path,** keeping its name, with the mode `600`. The new
-   key is first copied beside the old file, under the name with `.new` added, and only a complete
-   copy is moved over the old file, which within one directory replaces it in one step. Should the
-   copy fail or be cut short (a directory that is not writable, a full disk, a file-size limit),
-   the old file is untouched and still signs, the partial copy is removed, the download is kept,
-   and the command says so. The download is removed only once the configured path holds the new
-   key:
+   key is first copied beside the old file, into a file that `mktemp` creates for this attempt
+   with the mode `600` and a name no other file has, so no file already there is touched. Only a
+   complete copy is moved over the old file, which within one directory replaces it in one step.
+   Should the copy fail or be cut short (a directory that is not writable, a full disk, a
+   file-size limit), the old file is untouched and still signs, the partial copy is removed, the
+   download is kept, and the command says so. The download is removed only once the configured
+   path holds the new key, and the command reports the two apart: which key the configured path
+   holds, then whether the download is gone:
 
    ```sh
-   install -m 600 "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE.new" \
-       && cmp -s "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE.new" \
-       && mv -f "$LOOP_GITHUB_APP_KEY_FILE.new" "$LOOP_GITHUB_APP_KEY_FILE" \
-       && rm "$HOME/Downloads/<new-key>.private-key.pem" \
-       && echo "the new key is installed" \
-       || { rm -f "$LOOP_GITHUB_APP_KEY_FILE.new"; echo "not installed: the old key is in place and the download is kept"; }
+   staged=""
+   if staged=$(mktemp "$LOOP_GITHUB_APP_KEY_FILE.new.XXXXXX") \
+       && cat "$HOME/Downloads/<new-key>.private-key.pem" > "$staged" \
+       && cmp -s "$HOME/Downloads/<new-key>.private-key.pem" "$staged" \
+       && mv -f "$staged" "$LOOP_GITHUB_APP_KEY_FILE"; then
+     echo "the new key is installed"
+     rm "$HOME/Downloads/<new-key>.private-key.pem" \
+       || echo "the download could not be removed: delete it by hand"
+   else
+     if [ -n "$staged" ]; then rm -f "$staged"; fi
+     echo "not installed: the old key is in place and the download is kept"
+   fi
    ```
 
-   Go on to step 4 only after "the new key is installed". Otherwise the engine and the doctor
-   still sign with the old key, which a passing doctor would not tell apart: fix the cause (the
-   file's owner or its directory's permissions) and run this step again.
+   Go on to step 4 only after "the new key is installed", whatever the line after it says: a
+   download that could not be removed is a copy of the new key to delete by hand, and does not
+   change which key signs. Otherwise the engine and the doctor still sign with the old key, which
+   a passing doctor would not tell apart: fix the cause (the file's owner or its directory's
+   permissions) and run this step again.
 
 4. **Check the new key** with the doctor, from the same shell: the line `github identity` mints a
    token with the file the variable names.
@@ -373,9 +383,13 @@ the next run uses the new key.
      ```
 
      When each running instance of the pool last started (`<group>` is the pool's group, the one
-     tagged `rhi-pool` with the pool's name), and whether its engine was restarted since: in the
-     pool's log group `/rhi/pools/<pool>`, the line "the engine did not answer a completion: its
-     unit was restarted" marks a restart of an engine's unit:
+     tagged `rhi-pool` with the pool's name), and whether its engine was started again since. Every
+     start of the engine's unit, `rhi-engine.service`, reads the secret, whatever started it: the
+     lifecycle agent's restart, which writes the line "the engine did not answer a completion: its
+     unit was restarted"; systemd's own restart, 5 seconds after the engine exits with a failure,
+     which writes no line of the agent's; or any other start of the unit. So read, in the pool's log group `/rhi/pools/<pool>`, the instance's stream for the lines of the
+     unit `rhi-engine.service` (the engine's own output, which starts again from its first lines,
+     the model's loading, at each start), as well as the agent's line:
 
      ```sh
      aws ec2 describe-instances \
@@ -387,8 +401,9 @@ the next run uses the new key.
 
      - a gateway task that started before the version was written still sends the old value:
        the mismatch is the gateway's, so start its deployment again (Act, step 3);
-     - an instance that last started before the version, with no restart line after it, still
-       runs an engine with the old value: its lifecycle agent did not restart it. Its log may say
+     - an instance that last started before the version, whose engine shows no start after it
+       (neither the agent's restart line nor the engine's first lines again), still runs an engine
+       with the old value: its lifecycle agent did not restart it. Its log may say
        why ("the pool's secret cannot be read: the engine is not checked this minute" means the
        agent cannot read the secret; "its unit could not be restarted" means the restart failed).
        Fix that cause; the instance's next start, or the agent's next successful check, gives the
