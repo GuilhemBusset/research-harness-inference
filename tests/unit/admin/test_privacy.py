@@ -268,13 +268,19 @@ def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(
     assert f"No new roster entry is given the alias otter for {privacy.ALIAS_HELD_DAYS} days" in printed
 
 
-def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_kept(deployed: Deployed) -> None:
+def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_kept(
+    deployed: Deployed, monkeypatch: pytest.MonkeyPatch
+) -> None:
     assert deployed.run("erase", str(OTTER))[0] == 0
     roster = deployed.admin.roster
 
-    # Its series and log records cannot tell two students apart: no one else is given them.
-    with pytest.raises(admin_roster.AdminError, match="held back"):
-        admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW)
+    # Its series and log records cannot tell two students apart: no one else is given them, even
+    # while the alias index, which DynamoDB updates after the write, shows neither entry nor hold.
+    with monkeypatch.context() as patch:
+        query = roster.query
+        patch.setattr(roster, "query", lambda **q: {"Items": []} if "IndexName" in q else query(**q))
+        with pytest.raises(admin_roster.AdminError, match="held back"):
+            admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW)
     (held,) = [item for item in roster.scan(ConsistentRead=True)["Items"] if item["alias"] == "otter"]
     # What holds it names no student, and the table's expiry removes it once the telemetry is gone.
     assert held == {"github_id": admin_roster.held_alias_id("otter"), "alias": "otter", "expires_at": held["expires_at"]}
@@ -283,6 +289,27 @@ def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_
 
     roster.delete_item(Key={"github_id": held["github_id"]})
     assert admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW).alias == "otter"
+
+
+def test_the_student_is_not_put_back_on_the_roster_while_their_erase_runs(deployed: Deployed) -> None:
+    refused: list[str] = []
+
+    def reenroll() -> None:
+        try:
+            admin_roster.add(OTTER, "kestrel", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
+        except admin_roster.AdminError as error:
+            refused.append(str(error))
+
+    deployed.during_sleep.append(reenroll)
+
+    status, printed = deployed.run("erase", str(OTTER))
+
+    assert status == 0, printed
+    assert refused == ["that GitHub ID is being erased: wait for the erase, or run it again if it stopped"]
+    assert deployed.rows(OTTER) == []
+    # Once the erase is over, the student may be added again, under another alias.
+    again = admin_roster.add(OTTER, "kestrel", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
+    assert again.alias == "kestrel"
 
 
 def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed: Deployed) -> None:

@@ -19,7 +19,11 @@ apart, so another student given it would be given the first one's too. `hold_ali
 entry, in one write, by an item that holds the alias and its expiry and nothing else: no GitHub
 ID, no budget. Its partition key is a negative number made from the alias, which no GitHub ID is,
 so no login and no command reads it as a student; `add` refuses the alias until the table's expiry
-removes the item, and `entries` lists none.
+removes the item, and `entries` lists none. While an erase runs, `begin_erase` holds the GitHub ID
+the same way, under a negative key of its own, until `end_erase`: `add` refuses that GitHub ID
+meanwhile, so that the erase deletes no key and no usage of a new entry. `add` reads both items by
+their keys, in the transaction that writes the entry, never through the alias index, which DynamoDB
+updates after the write.
 
 Every function takes the tables as the table resources of the AWS SDK and the time as whole
 seconds since the epoch. Nothing here prints or logs: the command line (`rhi_admin.main`) does.
@@ -99,6 +103,21 @@ def hold_alias(entry: RosterEntry, *, roster: Any, until: int) -> None:
         raise
 
 
+def erasing_id(github_id: int) -> int:
+    """The partition key of the item that holds a GitHub ID while it is erased: below every `held_alias_id`."""
+    return -(2**60) - github_id
+
+
+def begin_erase(github_id: int, *, roster: Any, until: int) -> None:
+    """Holds the GitHub ID back from `add` until `end_erase`, or the table's expiry at `until`."""
+    roster.put_item(Item={ROSTER.partition_key.name: erasing_id(github_id), EXPIRES_AT: until})
+
+
+def end_erase(github_id: int, *, roster: Any) -> None:
+    """Gives the GitHub ID back to `add`, once its erase has deleted everything."""
+    roster.delete_item(Key={ROSTER.partition_key.name: erasing_id(github_id)})
+
+
 def get(github_id: int, *, roster: Any) -> RosterEntry | None:
     """The entry of that student, read with a consistent read; `None` when there is none."""
     item = roster.get_item(Key={ROSTER.partition_key.name: github_id}, ConsistentRead=True).get("Item")
@@ -146,15 +165,33 @@ def add(
         added_at=now,
         expires_at=expiry(course_end) + RETENTION_DAYS * 86400,
     )
+    absent = {"ConditionExpression": "attribute_not_exists(#id)", "ExpressionAttributeNames": {"#id": ROSTER.partition_key.name}}
+
+    def nothing_at(key: int) -> dict[str, Any]:
+        return {"ConditionCheck": {"TableName": roster.name, "Key": {ROSTER.partition_key.name: key}, **absent}}
+
+    # The alias's hold and the GitHub ID's erase are read by their keys, in the write itself.
+    refusals = (
+        "that alias was erased, and is held back while its series and log records are kept",
+        "that GitHub ID is being erased: wait for the erase, or run it again if it stopped",
+        "that GitHub ID is already on the roster",
+    )
     try:
-        roster.put_item(
-            Item=entry.to_item(),
-            ConditionExpression="attribute_not_exists(#id)",
-            ExpressionAttributeNames={"#id": ROSTER.partition_key.name},
+        # The table resource's client, which takes the item's values as the table resource does.
+        roster.meta.client.transact_write_items(
+            TransactItems=[
+                nothing_at(held_alias_id(alias)),
+                nothing_at(erasing_id(github_id)),
+                {"Put": {"TableName": roster.name, "Item": entry.to_item(), **absent}},
+            ]
         )
     except ClientError as error:
-        if _failed_condition(error):
-            raise AdminError("that GitHub ID is already on the roster") from None
+        if error.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+            raise
+        reasons = [reason.get("Code") for reason in error.response.get("CancellationReasons") or []]
+        for reason, refusal in zip(reasons, refusals, strict=False):
+            if reason == "ConditionalCheckFailed":
+                raise AdminError(refusal) from None
         raise
     return entry
 

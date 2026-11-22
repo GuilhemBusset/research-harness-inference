@@ -200,25 +200,35 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it()
     assert (day.tokens, day.leases) == (39, {})
 
 
-@pytest.mark.parametrize("erased", [False, True])
-def test_a_key_revoked_or_erased_while_the_body_arrives_keeps_nothing(monkeypatch: pytest.MonkeyPatch, erased: bool) -> None:
+@pytest.mark.parametrize("change", ["revoked", "erased", "unreadable"])
+def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pytest.MonkeyPatch, change: str) -> None:
     upstream, store = Upstream(), InMemoryKeyStore()
     app, key, ledger = gateway(upstream, store)
+    # A request of the day already settled: what it wrote is no request's to take back.
+    student = store.lookup(key_hash(key))
+    assert student is not None
+    settled = ledger.reserve(student, "settled", b"{}", output_limit=10, hold_seconds=1, longest_request_seconds=1)
+    ledger.settle(settled, input_tokens=7, output_tokens=0, ended_cleanly=True)
+
+    def unreadable(_: str) -> None:
+        raise OSError
 
     async def body() -> AsyncIterator[bytes]:
-        # The key was accepted from the headers. Before the body comes it is revoked, or its
-        # student erased, which deletes it: the reservation's write may come after either.
+        # The key was accepted from the headers. Before the body comes it is revoked, its student
+        # erased, which deletes it, or the store stops answering: the reservation comes after.
         store.revoke(key_hash(key), at=NOW)
-        if erased:
-            monkeypatch.setattr(store, "lookup", lambda _: None)
+        if change != "revoked":
+            monkeypatch.setattr(store, "lookup", (lambda _: None) if change == "erased" else unreadable)
         yield json.dumps(CASES[routes.MESSAGES][0]).encode()
 
-    response = call(app, lambda client: client.post("/v1/messages", content=body(), headers={"x-api-key": key}))
+    def send(client: httpx.AsyncClient) -> Any:
+        return client.post("/v1/messages", content=body(), headers={"x-api-key": key})
 
-    assert (response.status_code, upstream.seen) == (401, [])
+    response = call(app, send)
+
+    assert (response.status_code, upstream.seen) == (500 if change == "unreadable" else 401, [])
     day = ledger.day(STUDENT, utc_day(NOW))
-    # Revoked: the reservation is taken back, nothing charged. Erased: the usage row is deleted.
-    assert (day is None) if erased else (day is not None and (day.tokens, day.leases) == (0, {}))
+    assert day is not None and (day.tokens, day.leases) == (7, {})
 
 
 def test_each_chunk_reaches_the_client_before_the_next_one_is_sent() -> None:
