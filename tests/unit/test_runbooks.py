@@ -232,8 +232,25 @@ SHOWS_A_COMMAND = re.compile(
 
 def _shows_a_repository_command(line: str) -> bool:
     """Whether a line of a block of another language (a query, a setting) shows a command of this
-    repository: its label does not hide it, and the line is then checked as any shell line is."""
-    return bool(SHOWS_A_COMMAND.search(line.strip().removeprefix("$ ")))
+    repository: its label does not hide it, and the line is then checked as any shell line is. The
+    raw text is searched, and so are the line's words as the shell reads them (so quotes, `r"hi"` or
+    `'scripts/x.sh'`, hide nothing): a CLI of this repository as any word, a path of it as the first
+    word of a command, in the line or in a substitution of it."""
+    text = line.strip().removeprefix("$ ")
+    if SHOWS_A_COMMAND.search(text):
+        return True
+    bodies = [text]
+    try:
+        while bodies:
+            words = split(bodies.pop(0), bodies)
+            if any(not word.operator and word.text in CLI_NAMES for word in words):
+                return True
+            if any(_is_repository_path(command[0].text) for command in commands(words)):
+                return True
+    except ValueError:
+        pass  # what the shell cannot read shows a command only in its raw text, searched above
+    return False
+
 
 
 def problems(text: str, root: Path = ROOT) -> list[str]:
@@ -318,6 +335,13 @@ def test_detects_an_unknown_command() -> None:
     ]
     with pytest.raises(ValueError, match="no closing quotation"):
         problems(sections + '```text\nrhi "status\n```\n')
+    # Quotes hide no command or path from the shell, so they hide none here.
+    quoted = "```text\nr\"hi\" status unexpected\nrhi_\"admin\" roster list unexpected\n'scripts/no-such-script.sh'\n```\n"
+    assert problems(sections + quoted) == [
+        "the rhi CLI refuses: rhi status unexpected",
+        "the admin CLI refuses: rhi_admin roster list unexpected",
+        "no such path in the repository: scripts/no-such-script.sh",
+    ]
 
 
 def test_refuses_arguments_the_shell_decides_and_checks_commands_inside_substitutions() -> None:
