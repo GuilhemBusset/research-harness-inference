@@ -51,6 +51,7 @@ from botocore.exceptions import ClientError
 from rhi_common import retention
 from rhi_common.students import RosterEntry
 from rhi_common.tables import BY_ALIAS, BY_STUDENT, EXPIRES_AT, KEYS, ROSTER
+from rhi_issuer.mint import held_to_validity
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key
 
@@ -304,7 +305,8 @@ def change(
 
     A key revoked in the meantime is left as it is: the write to a key is conditional on it not
     being revoked. The write to the entry also sets its expiry, the course end plus 90 days, as
-    every write of an entry does (`add`), and the write to a key holds its expiry to that date.
+    every write of an entry does (`add`). A key it writes stays in use, so the write holds the key's
+    expiry to the end of its validity, the course end (`rhi_issuer.mint.held_to_validity`).
     """
     _check_numbers(daily_token_budget, concurrency_limit)
     values = {
@@ -344,7 +346,7 @@ def change(
                     "#revoked": "revoked_at",
                     "#expires": EXPIRES_AT,
                 },
-                ExpressionAttributeValues={**numbers, ":expires": retention.no_later(record.expires_at, course_end)},
+                ExpressionAttributeValues={**numbers, ":expires": held_to_validity(record.expires_at, course_end)},
             )
         except ClientError as error:
             if _failed_condition(error):

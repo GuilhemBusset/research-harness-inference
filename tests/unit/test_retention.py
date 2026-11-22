@@ -28,7 +28,7 @@ from rhi_common.keys import generate_key, key_hash
 from rhi_common.students import RosterEntry, StudentKey
 from rhi_common.tables import KEYS, ROSTER, USAGE, Table
 from rhi_gateway.budget import DynamoDBLedger, InMemoryLedger, Ledger, Reservation
-from rhi_issuer import revoke, rules
+from rhi_issuer import mint, revoke, rules
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -295,12 +295,26 @@ def test_every_key_row_the_admin_cli_writes_again_expires_by_the_course_end_plus
     argv = [*command[:2], str(GITHUB_ID), *command[2:]]
     assert main.run(argv, admin, now=NOW + 60, out=io.StringIO()) == 0
 
-    # An erase deletes the keys once its waits are over: what they hold meanwhile is what counts.
+    # A key `roster set` writes stays in use, so it stops working at the new course end; a revoked
+    # key may stay until the rows expire. An erase deletes the keys once its waits are over: what
+    # they hold meanwhile is what counts.
+    rewritten = mint.expiry(COURSE_END) if command[0:2] == ["roster", "set"] else EXPIRY
     for keys in seen or [by_hash()]:
-        assert keys == {later: EXPIRY, earlier: kept}
+        assert keys == {later: rewritten, earlier: kept}
 
 
-@pytest.mark.parametrize("write", ["replace", "revoke", "revoke all"])
+def test_revoking_a_key_row_without_an_expiry_gives_it_the_course_end_plus_90_days(aws: SimpleNamespace) -> None:
+    key = rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW, keys=aws.keys).key
+    row = {KEYS.partition_key.name: key_hash(key)}
+    aws.keys.update_item(Key=row, UpdateExpression="REMOVE expires_at")
+
+    revoke.revoke_key(key, keys=aws.keys, now=NOW + 60, course_end=COURSE_END)
+
+    item = aws.keys.get_item(Key=row, ConsistentRead=True)["Item"]
+    assert ("revoked_at" in item, item.get("expires_at")) == (True, EXPIRY)
+
+
+@pytest.mark.parametrize("write", ["replace", "login elsewhere", "revoke", "revoke all"])
 def test_every_key_row_the_issuer_writes_again_expires_by_the_course_end_plus_90_days(
     aws: SimpleNamespace, write: str
 ) -> None:
@@ -311,6 +325,9 @@ def test_every_key_row_the_issuer_writes_again_expires_by_the_course_end_plus_90
     if write == "replace":
         # A login on the first installation, once the course end is 15 January 2027.
         rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW + 60, keys=aws.keys)
+    elif write == "login elsewhere":
+        # A login on the other installation: the first key stays in use, and names its successor.
+        rules.issue(_entry(), "installation-2", course_end=COURSE_END, now=NOW + 60, keys=aws.keys)
     elif write == "revoke":
         revoke.revoke_key(first.key, keys=aws.keys, now=NOW + 60, course_end=COURSE_END)
         revoke.revoke_key(other.key, keys=aws.keys, now=NOW + 60, course_end=COURSE_END)
@@ -321,5 +338,6 @@ def test_every_key_row_the_issuer_writes_again_expires_by_the_course_end_plus_90
         item = aws.keys.get_item(Key={KEYS.partition_key.name: key_hash(minted.key)}, ConsistentRead=True)["Item"]
         return int(item["expires_at"]), "revoked_at" in item
 
-    assert expiry(first) == (EXPIRY, True)
+    # A key left in use stops working at the course end; a revoked one may stay until the rows expire.
+    assert expiry(first) == ((mint.expiry(COURSE_END), False) if write == "login elsewhere" else (EXPIRY, True))
     assert expiry(other) == (kept, write != "replace")

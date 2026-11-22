@@ -45,6 +45,16 @@ def expiry(course_end: datetime.date) -> int:
     return min(end_of_day, retention.expires_at(course_end))
 
 
+def held_to_validity(expires_at: int, course_end: datetime.date) -> int:
+    """The expiry of an active key written again: its own, or `expiry(course_end)` when that is earlier.
+
+    A key's validity ends at the course end (section 6.4), so a key still in use that is written
+    again after the course end was moved earlier stops working by the new date; an earlier expiry
+    it already had stays.
+    """
+    return min(int(expires_at), expiry(course_end))
+
+
 def mint(entry: RosterEntry, installation: str, *, course_end: datetime.date, now: int) -> tuple[str, StudentKey]:
     """A new key for the student of that roster entry, and the item that stores it as its SHA-256.
 

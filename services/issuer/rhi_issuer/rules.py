@@ -58,7 +58,7 @@ from rhi_common import retention
 from rhi_common.records import RecordError
 from rhi_common.students import RosterEntry, StudentKey
 from rhi_common.tables import BY_STUDENT, EXPIRES_AT, KEYS
-from rhi_issuer.mint import Minted, mint
+from rhi_issuer.mint import Minted, held_to_validity, mint
 from rhi_issuer.redeem import Refusal, Refused
 
 DEFAULT_ISSUANCES_PER_DAY = 5
@@ -277,8 +277,9 @@ def _store(
 ) -> bool:
     """Writes the new key, revokes the replaced ones and names the new key as the latest key's successor, in one write.
 
-    Each older key it writes again has its expiry held to the course end plus 90 days
-    (`rhi_common.retention.no_later`): an earlier expiry stays. `False` when the write is
+    Each older key it revokes has its expiry held to the course end plus 90 days
+    (`rhi_common.retention.no_later`), and a latest key it leaves in use to the end of its validity
+    (`rhi_issuer.mint.held_to_validity`): an earlier expiry stays. `False` when the write is
     cancelled because another login wrote first.
     """
     hash_name = KEYS.partition_key.name
@@ -318,9 +319,11 @@ def _store(
         )
     if latest is not None:
         assignments = ["#successor = :new", held]
+        # A latest key this write does not revoke stays in use: its expiry is held to its validity.
+        bound = retention.no_later if latest.record.key_hash in revoked else held_to_validity
         values: dict[str, Any] = {
             ":new": record.key_hash,
-            ":expires": retention.no_later(latest.record.expires_at, course_end),
+            ":expires": bound(latest.record.expires_at, course_end),
         }
         update_names = {**names, "#successor": _SUCCESSOR, "#expires": EXPIRES_AT}
         if latest.record.key_hash in revoked:

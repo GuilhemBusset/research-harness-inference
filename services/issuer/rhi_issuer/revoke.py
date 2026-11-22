@@ -37,7 +37,7 @@ def _mark_revoked(hashed: str, now: int, keys: Any, course_end: datetime.date) -
 
     The write also holds the item's expiry to the course end plus 90 days (`rhi_common.retention`),
     so that a key written again after the course end was moved earlier expires by the new date. A
-    write sets the lower expiry only on condition that the item's is later; when it is not, a
+    write sets the lower expiry only on condition that the item has none or a later one; when not, a
     second write revokes the key and leaves its earlier expiry. Each write is one conditional
     `UpdateItem`, so no expiry is ever raised.
     """
@@ -46,7 +46,8 @@ def _mark_revoked(hashed: str, now: int, keys: Any, course_end: datetime.date) -
     names = {"#student": KEYS.index(BY_STUDENT).partition_key.name, "#revoked": "revoked_at"}
     later = {
         "UpdateExpression": "SET #revoked = :now, #expires = :expires",
-        "ConditionExpression": f"{condition} AND #expires > :expires",
+        # An item with no expiry is given one: only an earlier expiry is left as it is.
+        "ConditionExpression": f"{condition} AND (attribute_not_exists(#expires) OR #expires > :expires)",
         "ExpressionAttributeNames": {**names, "#expires": EXPIRES_AT},
         "ExpressionAttributeValues": {":now": now, ":expires": retention.expires_at(course_end)},
     }
