@@ -235,6 +235,18 @@ def test_the_export_holds_the_student_s_data_and_no_key_and_no_hash(deployed: De
     assert re.search(r"rhi_[0-9A-Za-z]{20,}|[0-9a-f]{64}", printed) is None
 
 
+def test_the_export_leaves_out_the_budget_s_attributes_of_a_row_an_earlier_release_wrote(deployed: Deployed) -> None:
+    lease = {"expires": NOW + 120}
+    row = {"github_id": OTTER, "day": "2027-01-14", "alias": "otter", "expires_at": NOW + 86_400}
+    deployed.usage.put_item(Item={**row, "tokens": 0, "leases": {"request": {**lease, "tokens": 0, "estimate": 0}}})
+    deployed.stubs["logs"].add_response("filter_log_events", {"events": []})
+
+    status, printed = deployed.run("export", str(OTTER))
+
+    assert status == 0
+    assert json.loads(printed)["usage"] == [{**row, "leases": {"request": lease}}]
+
+
 def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(deployed: Deployed) -> None:
     keys = [issue(deployed, OTTER), issue(deployed, OTTER)]
     heron = issue(deployed, HERON)

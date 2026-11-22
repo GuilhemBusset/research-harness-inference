@@ -6,7 +6,8 @@ gateway's log records under the student's alias, and the series in the Prometheu
 labelled with that alias.
 
 `export` gathers all of it as one JSON document: the entry, each key's issue, expiry and
-revocation times (no key and no SHA-256), the usage rows, the log records whose `alias` is the
+revocation times (no key and no SHA-256), the usage rows as `rhi_common.students.UsageDay` reads
+them (without the budget's attributes a row of an earlier release still holds), the log records whose `alias` is the
 student's, and the samples of every series labelled with the alias, read day by day over the
 workspace's 90 days, from the entry's addition on. An alias taken off the roster, by an erase or
 by `roster remove`, is held back from any new entry while what was written under it is kept
@@ -35,7 +36,7 @@ order leaves none of them a row behind:
    its reservation, the write that makes a usage row (`rhi_gateway.auth.Authenticator.confirm`).
    When the key is revoked or gone, the read fails, or the request is cancelled before the read
    ends, it takes its reservation back and deletes the row once it holds only what the day's
-   opening carried from the day before: no tokens, no lease but stand-ins, no settlement, and the
+   opening carried from the day before: no tokens other than an earlier release's 0, no lease but stand-ins, no settlement, and the
    cookies and rebalance numbers (`rhi_gateway.budget.Ledger.withdraw`). The rows such requests made go, in whatever order they
    take their reservations back, and what a new entry of the same student charged or holds stays.
    A settlement writes only to a row that holds its lease, so it creates none.
@@ -82,7 +83,7 @@ from rhi_admin.roster import (
     hold_alias,
 )
 from rhi_common import retention
-from rhi_common.students import RosterEntry
+from rhi_common.students import RosterEntry, UsageDay
 from rhi_common.tables import BY_STUDENT, EXPIRES_AT, KEYS, USAGE
 from rhi_issuer.rules import every_key, lock_key
 
@@ -245,7 +246,8 @@ def export(github_id: int, *, roster: Any, keys: Any, stores: Stores, now: int) 
             {"issued_at": record.issued_at, "expires_at": record.expires_at, "revoked_at": record.revoked_at}
             for record in sorted(every_key(github_id, keys), key=lambda record: record.issued_at)
         ],
-        "usage": [_plain(item) for item in _usage_rows(github_id, stores.usage)],
+        # Each row as this release reads it: what an earlier release wrote that no record holds is left out.
+        "usage": [_plain(UsageDay.from_item(item).to_item()) for item in _usage_rows(github_id, stores.usage)],
         "logs": _log_records(entry.alias, stores, _since(entry, now), now),
         "series": _series(entry.alias, stores.query, _since(entry, now), now),
     }
