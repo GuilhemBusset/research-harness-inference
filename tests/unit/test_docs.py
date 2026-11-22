@@ -154,6 +154,11 @@ def _check_base_url(harness: str, value: object) -> None:
     url = urlsplit(str(value))
     assert url.scheme in {"http", "https"}, (harness, url)  # a harness resolves no relative URL
     assert url.username is None and url.password is None, harness  # no credential in the URL
+    try:
+        port = url.port
+    except ValueError:  # out of range or not a number: the harness refuses the URL
+        port = -1
+    assert port is None or 0 < port < 2**16, (harness, url)
     host = url.hostname or ""
     assert host == "example.com" or host.endswith(".example.com"), (harness, url)
     assert url.path.rstrip("/").endswith("/v1"), (harness, url)
@@ -184,8 +189,34 @@ def check_provider_entries(text: str) -> None:
         assert "rhi token" in section.replace(block, ""), harness
 
 
+def check_opencode_launch(text: str) -> None:
+    """The OpenCode section's shell block sets each variable its entry names from rhi token, then
+    starts OpenCode standalone: the shared background server did not start from that shell, and
+    does not see its variables."""
+    section, block = provider_entries(text)["OpenCode"]
+    names = {name for provider in json.loads(block)["providers"].values() for name in provider.get("env", [])}
+    assert names
+    lines = [shlex.split(line) for line in section.split("```sh\n", 1)[1].split("```", 1)[0].splitlines()]
+    starts = [i for i, argv in enumerate(lines) if "opencode" in argv]
+    assert starts
+    for i in starts:
+        argv = lines[i]
+        assert "--standalone" in argv, argv
+        assigned = {
+            word.split("=", 1)[0] for line in lines[:i] + [argv] for word in line if word.endswith("=$(rhi token)")
+        }
+        assert names <= assigned, (names, argv)
+
+
 def test_guide_opencode_and_pi_entries_hold_no_key() -> None:
     check_provider_entries(GUIDE.read_text(encoding="utf-8"))
+
+
+def test_guide_starts_opencode_where_the_key_is_set() -> None:
+    text = GUIDE.read_text(encoding="utf-8")
+    check_opencode_launch(text)
+    with pytest.raises(AssertionError):
+        check_opencode_launch(text.replace("opencode --standalone", "opencode"))
 
 
 def _literal_key(provider: dict) -> None:
@@ -212,6 +243,10 @@ def _relative_base_url(provider: dict) -> None:
     provider["baseUrl"] = "//inference.example.com/v1"
 
 
+def _out_of_range_port(provider: dict) -> None:
+    provider["baseUrl"] = provider["baseUrl"].replace(".com/", ".com:65536/", 1)
+
+
 def _credential_in_base_url(provider: dict) -> None:
     provider["baseUrl"] = provider["baseUrl"].replace("://", "://student:" + secrets.token_urlsafe(24) + "@", 1)
 
@@ -225,6 +260,7 @@ def _credential_in_base_url(provider: dict) -> None:
         _other_command,
         _opencode_syntax,
         _relative_base_url,
+        _out_of_range_port,
         _credential_in_base_url,
     ],
 )

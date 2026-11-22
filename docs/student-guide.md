@@ -134,17 +134,21 @@ keep the `/v1`. The model's name, `coursework`, is the default pool's name, as `
 (section 4).
 
 The entry holds no key: it names the environment variable OpenCode reads the key from,
-`RHI_API_KEY`. Set it from `rhi token` in the shell that starts OpenCode, then start OpenCode in that
-same shell and choose `rhi/coursework` with `/models`:
+`RHI_API_KEY`. OpenCode reads that variable in the server process that sends the requests, and
+OpenCode's shared background server, if one is already running, did not start from your shell and
+does not see it. So set the variable from `rhi token` in the shell that starts OpenCode, then start
+OpenCode in that same shell in standalone mode, which runs a private server from this shell, and
+choose `rhi/coursework` with `/models`:
 
 ```sh
 export RHI_API_KEY="$(rhi token)"
-opencode
+opencode --standalone
 ```
 
 The key stays in that shell's memory and is never written into a file. Do not put the `export` line
-in a shell startup file. After a new login, the old key stops working: set the variable again from
-`rhi token` and restart OpenCode.
+in a shell startup file, and do not give the key to the shared background server with
+`opencode service set env`: it would keep the key beyond your shell. After a new login, the old key
+stops working: set the variable again from `rhi token` and restart OpenCode.
 
 Spike S3 (section 7) has not yet run OpenCode, so the course has no tested version of it yet.
 
