@@ -23,6 +23,11 @@ switch, so the scaler, which runs every minute, says what it read: the objective
 samples taken while this gauge is 1 (`rhi_dashboards.objectives`). A run that could not read the
 switch sends no sample of it, rather than a value it does not know.
 
+A reading takes effect no earlier than the change it reads. A run reads the switch some seconds
+after it starts, and the switch may have changed in between: its sample then carries the first
+millisecond of the second after the switch's own time (`set_at`, a whole second, so the change
+falls within it), not the run's time, and every scrape before that still reads the state before.
+
 The function keeps nothing between runs but what its process holds, so the counter counts from
 the process's start, and Prometheus reads a smaller value as a restart (as it does for any
 process). A series a process sends for the first time starts with a zero one millisecond before
@@ -42,6 +47,7 @@ from __future__ import annotations
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import cramjam
@@ -49,6 +55,7 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
+from rhi_common.records import SessionSwitch, session_is_on
 from rhi_scaler.model import Decision, Inputs
 
 DESIRED_CAPACITY = "rhi_scaler_desired_capacity"
@@ -132,10 +139,38 @@ class DecisionCounts:
         self.last_milliseconds = milliseconds
         return milliseconds
 
+    def passed(self, milliseconds: int) -> None:
+        """A sample of this run went out at `milliseconds`: no later run stamps one at or before it."""
+        if self.last_milliseconds is None or milliseconds > self.last_milliseconds:
+            self.last_milliseconds = milliseconds
 
-def session_series(session_on: bool, milliseconds: int) -> Series:
-    """The session gauge's sample: 1 while the switch reads on, 0 while it reads off or has no record."""
-    return Series(SESSION_ON, (), ((1.0 if session_on else 0.0, milliseconds),))
+
+class Unread(Enum):
+    """A session switch the run could not read: neither on nor off."""
+
+    UNREAD = "unread"
+
+
+UNREAD = Unread.UNREAD
+
+
+def session_series(switch: SessionSwitch | None, milliseconds: int) -> Series:
+    """The session gauge's sample: 1 while the switch reads on, 0 while it reads off or has no record.
+
+    It carries the run's time `milliseconds`, or, when the switch changed later than that, the
+    first millisecond of the second after its change: never a time before the change it reads.
+    """
+    if switch is not None:
+        milliseconds = max(milliseconds, (switch.set_at + 1) * 1000)
+    return Series(SESSION_ON, (), ((1.0 if session_is_on(switch) else 0.0, milliseconds),))
+
+
+def session_alone(switch: SessionSwitch | None, counts: DecisionCounts, milliseconds: int) -> list[Series]:
+    """The session gauge on its own, for a run whose fleet series are not sent, at the run's time
+    `milliseconds` (or later, as `session_series` says)."""
+    series = session_series(switch, counts.stamp(milliseconds))
+    counts.passed(series.samples[-1][1])
+    return [series]
 
 
 def fleet_series(
@@ -144,19 +179,21 @@ def fleet_series(
     counts: DecisionCounts,
     milliseconds: int | None = None,
     *,
-    session_on: bool | None = None,
+    session: SessionSwitch | None | Unread = UNREAD,
 ) -> list[Series]:
     """Counts this run's decisions, and returns every series to send for it, pool by pool.
 
-    `milliseconds` is the run's time; without it, the decision clock's second. `session_on` is
-    what the run read of the session switch, and gives the session gauge; `None`, a switch the run
-    could not read, gives no sample of it.
+    `milliseconds` is the run's time; without it, the decision clock's second. `session` is what
+    the run read of the session switch (`None` for no record), and gives the session gauge;
+    `UNREAD`, a switch the run could not read, gives no sample of it.
     """
     milliseconds = counts.stamp(inputs.now * 1000 if milliseconds is None else milliseconds)
     supplies = {pool.config.name: pool.supply for pool in inputs.pools}
     out: list[Series] = []
-    if session_on is not None:
-        out.append(session_series(session_on, milliseconds))
+    if not isinstance(session, Unread):
+        gauge = session_series(session, milliseconds)
+        counts.passed(gauge.samples[-1][1])
+        out.append(gauge)
     for pool in decision.pools:
         supply = supplies[pool.pool]
         gauges = {

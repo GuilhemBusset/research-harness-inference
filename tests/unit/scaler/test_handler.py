@@ -236,6 +236,20 @@ def test_a_run_that_cannot_read_the_pools_still_sends_the_switch_it_reads(edge: 
     assert series(body) == {(SESSION_ON, ()): [0.0]}
 
 
+def test_a_run_whose_pool_write_fails_still_sends_the_switch_it_read(edge: Edge) -> None:
+    # The wake goes, then DynamoDB refuses the pool's note; the switch has no record: off.
+    edge.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)])
+    edge.autoscaling.add_response(
+        "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
+    )
+    edge.dynamodb.add_client_error("put_item", "ProvisionedThroughputExceededException")
+    with pytest.raises(ClientError, match="ProvisionedThroughputExceededException"):
+        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    # The session gauge alone, at 0, and the run fails on its write.
+    ((_, _, body),) = edge.pushes
+    assert series(body) == {(SESSION_ON, ()): [0.0]}
+
+
 def test_a_second_run_is_harmless(edge: Edge) -> None:
     edge.queue_first_run()
     counts = DecisionCounts()

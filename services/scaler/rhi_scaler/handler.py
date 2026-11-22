@@ -15,9 +15,9 @@ A run that fails before its writes leaves the pool as it was; the next run reads
 A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is what the alarm
 reads. A metrics push that fails does not fail the run: the decision is already applied, and the
 log holds it; a switch that could not be read sends no session sample. A run whose reading of the
-pools fails sends the session gauge alone, if it can read the switch, and then fails: the gauge's
-last reading stays the one in force until the next, and an off left unsent would let the session
-seem on. Two failures do fail the
+pools fails sends the session gauge alone, if it can read the switch, and then fails; so does a
+run whose writes fail, from the switch it read: the gauge's last reading stays the one in force
+until the next, and an off left unsent would let the session seem on. Two failures do fail the
 run, after its decision is applied, which stands:
 
 - the session switch could not be read: what demand calls for is applied all the same, a pool seen
@@ -37,10 +37,10 @@ from typing import Any
 
 import boto3
 
-from rhi_common.records import session_is_on
+from rhi_common.records import SessionSwitch
 from rhi_scaler import aws_io, cloudwatch, outside_sessions
 from rhi_scaler.decide import decide
-from rhi_scaler.metrics import DecisionCounts, RemoteWriter, fleet_series, session_series
+from rhi_scaler.metrics import UNREAD, DecisionCounts, RemoteWriter, fleet_series, session_alone
 from rhi_scaler.model import Decision
 from rhi_scaler.settings import Settings, read_settings
 
@@ -71,13 +71,12 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
 
 
 def send_session_alone(
-    clients: aws_io.Clients, settings: Settings, writer: RemoteWriter, counts: DecisionCounts, milliseconds: int
+    writer: RemoteWriter, counts: DecisionCounts, switch: SessionSwitch | None, milliseconds: int
 ) -> None:
-    """The session gauge on its own, for a run that could not read the pools: nothing if the switch
-    cannot be read either, or the push fails."""
+    """The session gauge on its own, for a run that fails before its fleet series go: nothing if the
+    push fails, whose error the run's own does not replace."""
     try:
-        session_on = session_is_on(aws_io.read_session(clients, settings.tables))
-        writer.push([session_series(session_on, counts.stamp(milliseconds))])
+        writer.push(session_alone(switch, counts, milliseconds))
     except Exception as error:  # noqa: BLE001 - the run fails on its own error, which is the one to report
         LOGGER.warning(json.dumps({"event": "session-gauge-not-sent", "error": type(error).__name__}))
 
@@ -96,18 +95,29 @@ def run_cycle(
     `now` is the decision clock, in whole seconds; `milliseconds`, the run's time for the
     metrics' samples (by default, `now`'s second).
     """
+    milliseconds = now * 1000 if milliseconds is None else milliseconds
     try:
         run = aws_io.read(clients, settings.tables, settings.pools, now)
     except Exception:
-        send_session_alone(clients, settings, writer, counts, now * 1000 if milliseconds is None else milliseconds)
+        try:
+            switch = aws_io.read_session(clients, settings.tables)
+        except Exception as error:  # noqa: BLE001 - the run fails on its own error, which is the one to report
+            LOGGER.warning(json.dumps({"event": "session-gauge-not-sent", "error": type(error).__name__}))
+        else:
+            send_session_alone(writer, counts, switch, milliseconds)
         raise
     readable = run.session_error is None
     decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session, read=readable)
-    aws_io.apply(clients, settings.tables, run, decision)
-    log_decisions(run, decision)
-    session_on = session_is_on(run.session) if readable else None
     try:
-        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session_on=session_on))
+        aws_io.apply(clients, settings.tables, run, decision)
+    except Exception:
+        # The switch was read all the same: its reading goes, and the run fails on its writes.
+        if readable:
+            send_session_alone(writer, counts, run.session, milliseconds)
+        raise
+    log_decisions(run, decision)
+    try:
+        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session=run.session if readable else UNREAD))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     if run.session_error is not None:
