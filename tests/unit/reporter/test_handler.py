@@ -469,14 +469,17 @@ def test_a_verification_that_ran_nothing_is_not_verified(stub: Stub, commit: str
         assert (posted_on, state, context) == (commit, "success", VERIFY)
         return description
 
-    canary, listener, parked = (described(reason) for reason in ("canary-missing", "listener-off", "parked"))
+    reasons = ("canary-missing", "listener-off", "parked", "dormant")
+    canary, listener, parked, unknown = (described(reason) for reason in reasons)
     # One description of the vocabulary for each known reason, and one for a reason not known yet.
-    assert (canary, listener, parked) == (
+    assert (canary, listener, parked, unknown) == (
         Description.NOT_RUN_CANARY_MISSING,
         Description.NOT_RUN_LISTENER_OFF,
+        Description.NOT_RUN_PARKED,
         Description.NOT_RUN_OTHER,
     )
-    assert len({canary, listener, parked}) == 3 and VERIFIED_DESCRIPTION not in (canary, listener, parked)
+    assert len({canary, listener, parked, unknown}) == 4
+    assert VERIFIED_DESCRIPTION not in (canary, listener, parked, unknown)
     # A mark that holds nothing still says that no test ran.
     assert described("") == Description.NOT_RUN_OTHER
     # Only a verification that left no such mark ran its tests.

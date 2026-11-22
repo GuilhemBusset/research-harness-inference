@@ -34,7 +34,8 @@ that description: the execution-level state it answers has no stage, and names n
 
 **A verification that ran no test is not a verification that passed.** The verification step ends
 in success without running a test while there is nothing to test, and leaves its reason
-(`scripts/pipeline/verify.py`). No event carries that reason, so `status_for` cannot tell: whoever
+(`scripts/pipeline/verify.py`), or, while the system is parked, the reason `parked` without running
+the script (`src/rhi/pipeline/verify.py`). No event carries that reason, so `status_for` cannot tell: whoever
 holds it passes the status through `as_it_ran`, which gives a verification's success the
 description of `not_run_description` in place of `VERIFIED_DESCRIPTION`: one member per known
 reason, `NOT_RUN_REASONS`, and one for any other. The reason is only compared, never written.
@@ -86,6 +87,7 @@ class Description(StrEnum):
     VERIFICATION_FAILED = "The verification failed."
     NOT_RUN_CANARY_MISSING = "No test ran: the canary's key is missing. The deployment is not verified."
     NOT_RUN_LISTENER_OFF = "No test ran: the endpoint has no HTTPS listener. The deployment is not verified."
+    NOT_RUN_PARKED = "No test ran: the system is parked and has no endpoint. The deployment is not verified."
     NOT_RUN_OTHER = "No test ran, for a reason the reporter does not know. The deployment is not verified."
     STOPPING = "The pipeline's execution is being stopped."
     STOPPED = "The pipeline's execution was stopped before this step finished."
@@ -100,11 +102,13 @@ VERIFIED_DESCRIPTION = Description.VERIFIED
 # A manual approval that waits for a person: no other event gives it.
 APPROVAL_DESCRIPTION = Description.APPROVAL_WAITING
 
-# The reasons the verification step leaves when it runs no test (`scripts/pipeline/verify.py`),
-# each with the description of a verification that ended in success so.
+# The reasons the verification step leaves when it runs no test, each with the description of a
+# verification that ended in success so: the script's two (`scripts/pipeline/verify.py`), and the
+# step's own while the system is parked, when it runs no script (`src/rhi/pipeline/verify.py`).
 NOT_RUN_REASONS = {
     "canary-missing": Description.NOT_RUN_CANARY_MISSING,
     "listener-off": Description.NOT_RUN_LISTENER_OFF,
+    "parked": Description.NOT_RUN_PARKED,
 }
 
 

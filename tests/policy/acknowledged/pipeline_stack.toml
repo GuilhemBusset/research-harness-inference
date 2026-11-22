@@ -34,6 +34,11 @@
 #   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
 #   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
 #
+# While the configuration is parked, the step runs no test and its project keeps its logical ID:
+# its role holds only s3:PutObject on verification/* of the artifact bucket, for the mark
+# verification/<execution ID>/not-run that holds the line parked, beside CDK Pipelines' read of its
+# input and CodeBuild's grant above. Every finding of that role is one already listed below.
+#
 # What the role of the step that copies the weights (`src/rhi/pipeline/weights.py`) may do, held
 # the same way: that module creates no resource, so the step's project and role are this file's
 # too. `tests/synth/test_weights_job.py` holds the role to it, and `tests/policy/test_pipeline.py`

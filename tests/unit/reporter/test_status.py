@@ -147,20 +147,22 @@ def test_nothing_from_aws_is_copied() -> None:
 
 def test_a_verification_that_ran_no_test_is_described_by_its_reason_and_never_as_verified() -> None:
     canary, listener = not_run_description("canary-missing"), not_run_description("listener-off")
-    other = not_run_description("parked")
-    # Three members of the vocabulary, which no event gives and the loop does not read as verified.
-    assert len({canary, listener, other}) == 3 and {canary, listener, other} <= set(Description)
-    assert VERIFIED_DESCRIPTION not in (canary, listener, other)
-    assert [given_by(description) for description in (canary, listener, other)] == [[], [], []]
+    parked, other = not_run_description("parked"), not_run_description("dormant")
+    # Four members of the vocabulary, which no event gives and the loop does not read as verified.
+    described = (canary, listener, parked, other)
+    assert len(set(described)) == 4 and set(described) <= set(Description)
+    assert VERIFIED_DESCRIPTION not in described
+    assert [given_by(description) for description in described] == [[], [], [], []]
     # A reason is compared and never written: whatever else it is, it gets the one other member.
     arn = ":".join(("arn", "aws", "s3", "", "", "pipeline-artifacts"))
-    for reason in ("", "Canary-Missing", "canary-missing\n", f"listener-off {arn}", arn, 7, None):
+    for reason in ("", "Canary-Missing", "Parked", "parked\n", f"listener-off {arn}", arn, 7, None):
         assert not_run_description(reason) is other
 
     verified = status_for(event("verify", "SUCCEEDED"))
     told = as_it_ran(verified, "listener-off")
     assert told == CommitStatus(SHA, State.SUCCESS, "verify/Prod", listener)
     assert as_it_ran(verified, arn) == CommitStatus(SHA, State.SUCCESS, "verify/Prod", other)
+    assert as_it_ran(verified, "parked") == CommitStatus(SHA, State.SUCCESS, "verify/Prod", parked)
     # With no reason the tests ran, and only a verification's success is told otherwise.
     assert as_it_ran(verified, None) == verified
     for kind, state in SWEEP:
