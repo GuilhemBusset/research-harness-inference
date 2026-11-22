@@ -228,6 +228,9 @@ DISCHARGE_WRITES = 3   # the writes of an evidence comment a discharge makes whi
 # The key of a discharge's proof saved before it is written to GitHub, until it is recorded: "writing"
 # while its run writes it, "failed" once that run gave up on a write GitHub did not answer.
 PUBLISHING = "publishing"
+# The key of the invocation that saved such a proof: what its run lock held when it saved it. Another
+# root's run takes a proof that is "writing" for one being written only while that same lock is held.
+WRITER = "writer"
 # A pull request's address, as GitHub gives it: the repository's page, then `pull/<number>`. A
 # check run's own page is `runs/<id>` under the same repository page.
 PULL_ADDRESS = re.compile(r"(https://[^\s?#]+)/pull/\d+$")
@@ -2968,32 +2971,44 @@ class Engine:
                          head: list[str]) -> None:
         """`_discharge_delivered` for issue `n`, whose `items` it found. A read or a write GitHub
         does not answer is raised. The proofs are saved before anything is written (`PUBLISHING`),
-        and marked failed when a write is not answered. A box GitHub ticked without its reply is
-        recorded by the next run from the proof saved for it, whatever the statuses then say: its
-        row was written before its tick. A proof whose box is not ticked was never published: the
-        next run drops it and reads the statuses of the contexts then configured again. The issue
-        is read before and after the statuses: an issue edited meanwhile, whose items may no longer
-        be the ones proven, is left as it is."""
+        and marked failed when a write is not answered. A box GitHub ticked without its reply, with
+        the link to the evidence comment the engine ticks it with, is recorded by the next run from
+        the proof saved for it, whatever the statuses then say: its row was written before its tick.
+        A proof whose box is not ticked so was never published (an owner's tick carries no such
+        link): the next run drops it, writes the evidence comment again without it, in case its row
+        was written, and reads the statuses of the contexts then configured again. The issue is read
+        before and after the statuses: an issue edited meanwhile, whose items may no longer be the
+        ones proven, is left as it is."""
         st = self.store.issue(n)
         body = self._as_delivered(n, st) if st.pr else None
         if body is None:
             return
-        ticked = {i.id for i in issue_parser.ledger(body) if i.checked}
-        proven = {i: e for i, e in self._kept_proofs(st, items).items() if i in ticked}
+        kept = self._kept_proofs(st, items)
+        linked = self._linked(body, self._evidence_link(st.pr or 0), kept) if kept else set()
+        proven = {i: e for i, e in kept.items() if i in linked}
         stale = self._unrecorded(st) - set(proven)
-        if stale:   # never published: proven again, by the statuses of now, or not at all
-            st.evidence = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE
-                                                         and e.get(PUBLISHING) and e.get("criterion") in stale)]
-            self.store.put(st)
+        # Never published: proven again, by the statuses of now, or not at all.
+        keep = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE
+                                               and e.get(PUBLISHING) and e.get("criterion") in stale)]
         todo = {i: tests for i, tests in items.items() if i not in proven}
         if todo:
             proven |= self._read_proofs(st, todo, contexts, said, head)
+        if stale and not proven:   # a row it may have written is withdrawn before it is forgotten
+            st.evidence = keep
+            mine = {e.get("criterion") for e in keep if e.get("kind") == COMMIT_STATUS_EVIDENCE}
+            self._publish_status_rows(n, st, keep, {}, mine, tick=False)
+            self.store.put(st)
+            return
+        if stale:   # the comment written below holds none of them
+            st.evidence = keep
+            self.store.put(st)
         if not proven or self._as_delivered(n, st) is None:
             return
         # The verifier's records of an item's agent part stay: only a status record of the item is replaced.
         mine = {e.get("criterion") for e in st.evidence if e.get("kind") == COMMIT_STATUS_EVIDENCE}
         base = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get("criterion") in proven)]
-        base += [{**e, PUBLISHING: "writing"} for e in proven.values()]
+        writer = self.store.lock().holder()   # this invocation, as its run lock names it
+        base += [{**e, PUBLISHING: "writing", WRITER: writer} for e in proven.values()]
         # Saved before the comment and the body are written, with the obligations still owed: a run of
         # another root that writes them meanwhile then finds the records (`_status_elsewhere`) once it
         # has written, and writes their rows and their ticks again.
@@ -3006,7 +3021,8 @@ class Engine:
                 return
             done = {*proven, *adopted}
             st = self.store.issue(n)
-            st.evidence = [{k: v for k, v in e.items() if k != PUBLISHING} for e in [*base, *adopted.values()]]
+            st.evidence = [{k: v for k, v in e.items() if k not in (PUBLISHING, WRITER)}
+                           for e in [*base, *adopted.values()]]
             st.obligations = [o for o in st.obligations if not (o["kind"] == "capability" and o["item"] in done)]
             st.human_tasks = [self._obligation_text(o) for o in st.obligations]
             self.store.put(st)
@@ -3055,27 +3071,30 @@ class Engine:
         return proven
 
     def _publish_status_rows(self, n: int, st: IssueState, base: list[dict], proven: dict[str, dict],
-                             mine: set) -> tuple[dict[str, dict], str]:
+                             mine: set, tick: bool = True) -> tuple[dict[str, dict], str]:
         """Write the evidence comment of issue `n`'s pull request with the records `base` and the
         status records another root's run holds for it (`_status_elsewhere`), which are kept, never
         erased, then tick the boxes of `proven` and of those records: the records adopted, and the
-        link of the comment, or no link when the issue was edited (nothing is then ticked). The
-        other roots' records are read again once the body is written; one saved meanwhile, whose
-        row or tick these writes may have erased, is adopted and both are written again. As each
-        run saves its records before it writes, the last write of the comment and of the body holds
-        every record saved before it, whichever run finishes last (`DISCHARGE_WRITES` bounds the
-        rounds; past them, the next run tries again). A record another run saved and did not
-        publish, its run having given up or ended, is adopted only if its box is ticked on GitHub:
-        what that run never published is not proven by this one."""
-        def elsewhere(body: str) -> dict[str, dict]:
-            ticked, out = {i.id for i in issue_parser.ledger(body) if i.checked}, {}
+        link of the comment, or no link when the issue was edited (nothing is then ticked). With
+        `tick` false, only the comment is written, and nothing is ticked. The other roots' records
+        are read again once the body is written; one saved meanwhile, whose row or tick these
+        writes may have erased, is adopted and both are written again. As each run saves its
+        records before it writes, the last write of the comment and of the body holds every record
+        saved before it, whichever run finishes last (`DISCHARGE_WRITES` bounds the rounds; past
+        them, the next run tries again). A record another run saved and did not publish, its run
+        having given up or ended, is adopted only if its box is ticked on GitHub with the link to
+        the evidence comment (`_linked`): what that run never published is not proven by this one,
+        nor by an owner's tick."""
+        def elsewhere(body: str, link: str) -> dict[str, dict]:
+            out: dict[str, dict] = {}
             for e, published in self._status_elsewhere(n, st.pr or 0):
-                if e["criterion"] not in proven and e["criterion"] not in mine and (published or e["criterion"] in ticked):
-                    out.setdefault(e["criterion"], e)
+                c = e["criterion"]
+                if c not in proven and c not in mine and (published or self._linked(body, link, {c})):
+                    out.setdefault(c, e)
             return out
         evidence_head = st.verified_sha or next((e["head_sha"] for e in st.evidence if e.get("kind") == "command"), "")
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
-        adopted = elsewhere(self.gh.get_issue(n).get("body") or "")
+        adopted = elsewhere(self.gh.get_issue(n).get("body") or "", "")
         for _ in range(DISCHARGE_WRITES):
             comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, report.render_evidence(
                 n, [*base, *adopted.values()], evidence_head, verdicts))
@@ -3083,10 +3102,10 @@ class Engine:
             body = self.gh.get_issue(n).get("body") or ""
             if not link or issue_parser.body_hash(body) != st.body_hash:
                 return adopted, ""
-            ticked = issue_parser.tick(body, dict.fromkeys({*proven, *adopted}, link))
+            ticked = issue_parser.tick(body, dict.fromkeys({*proven, *adopted}, link)) if tick else body
             if ticked != body:
                 self.gh.edit_issue(n, body=ticked)
-            missing = {c: e for c, e in elsewhere(ticked).items() if c not in adopted}
+            missing = {c: e for c, e in elsewhere(ticked, link).items() if c not in adopted}
             if not missing:
                 return adopted, link
             adopted |= missing
@@ -3129,16 +3148,30 @@ class Engine:
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 continue
             if isinstance(raw, dict) and raw.get("pr") == pr:
-                alive: list[bool] = []   # whether that run holds its lock, asked once
+                alive: list[dict] = []   # who holds that run's lock, if an engine that is alive does: asked once
                 for e in raw.get("evidence") or []:
                     if not (isinstance(e, dict) and e.get("passed") and e.get("kind") == COMMIT_STATUS_EVIDENCE
                             and isinstance(e.get("criterion"), str)):
                         continue
                     state = e.get(PUBLISHING)
                     if state == "writing" and not alive:
-                        alive.append(RunLock(d / "lock").held())
-                    out.append((e, not state or (state == "writing" and alive[0])))
+                        lock = RunLock(d / "lock")
+                        alive.append(lock.holder() if lock.held() else {})
+                    # being written only by the invocation that saved it: a run of the same root
+                    # started since, which holds the lock now, did not write it
+                    out.append((e, not state or (state == "writing" and bool(alive[0]) and e.get(WRITER) == alive[0])))
         return out
+
+    @staticmethod
+    def _linked(body: str, link: str, items) -> set[str]:
+        """The `items` whose box `body` ticks with `link`, the evidence comment, as the engine
+        ticks it: a box an owner ticked by hand carries no such link, and proves no record."""
+        return {i for i in items if link and issue_parser.tick(body, {i: link}) == body}
+
+    def _evidence_link(self, pr: int) -> str:
+        """The address of pull request `pr`'s evidence comment; a list GitHub does not answer is raised."""
+        return next((c.get("html_url") or "" for c in self.gh.list_comments(pr)
+                     if report.EVIDENCE_MARKER in (c.get("body") or "")), "")
 
     def _upsert_comment_answered(self, n: int, marker: str, body: str) -> dict:
         """`_upsert_comment`, where a read or a write GitHub does not answer is raised: a list of

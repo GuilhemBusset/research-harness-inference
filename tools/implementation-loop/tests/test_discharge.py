@@ -7,6 +7,7 @@ The engine runs are real and the fakes are those of `test_deploying.py`: the fak
 pipeline, and the test posts the verification's status where and when it chooses."""
 
 import dataclasses
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Event
@@ -210,6 +211,55 @@ def test_a_proof_never_published_is_read_again_and_must_still_hold(then, dischar
             run.deploy = dataclasses.replace(run.deploy, discharge_contexts=("verify/Other",))
         run.run()
         assert snapshot(run) == before and not run.events("obligations_discharged", 2)
+
+
+@pytest.mark.parametrize("unwritten", ["the-row-and-the-tick", "the-tick"])
+def test_a_proof_the_engine_did_not_tick_is_never_published_as_passing(unwritten, discharge):
+    with delivered() as run:
+        pr = present(run.issue(2).pr)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        discharge.failing.add("list_comments" if unwritten == "the-row-and-the-tick" else "edit_issue")
+        run.run()
+        discharge.failing.clear()
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        issue = run.fake.issues[2]
+        issue["body"] = issue["body"].replace(f"- [ ] {SIGNS_IN}", f"- [x] {SIGNS_IN}")   # the owner ticks it by hand
+        run.run()
+        assert not [line for line in run.comment(pr, L.report.EVIDENCE_MARKER).splitlines() if line.startswith("| D2 ")]
+        assert not [e for e in run.issue(2).evidence if e["criterion"] == "D2"]
+        assert not run.events("obligations_discharged", 2)
+
+
+def test_a_proof_an_ended_invocation_saved_is_not_taken_for_one_a_new_invocation_writes():
+    later = "tests/smoke/deployed/test_later.py"
+    owner = ((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, later), DEPLOYED))
+    run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
+    run.deploy = dataclasses.replace(run.deploy, discharge_contexts=(RHI,))
+    try:
+        run.add_work(2, owner=owner, files=(SMOKE,))
+        run.run(root=EPIC)
+        run.run(root=2)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        pid = os.fork()
+        if pid == 0:   # the epic's run saves D2's proof and its process ends before writing any of it
+            update = run.fake.update_comment
+            run.fake.update_comment = lambda n, body: os._exit(42) if L.report.EVIDENCE_MARKER in body else update(n, body)
+            try:
+                run.run(root=EPIC)
+            finally:
+                os._exit(1)
+        assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 42
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+        run.fake.set_status(push_main(run, files=(later,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+        with run.stores[EPIC].lock():   # the epic runs again, in a new invocation
+            run.run(root=2)   # proves D3
+        body = run.fake.issues[2]["body"]
+        assert f"- [x] {owner[1][0]}" in body and f"- [ ] {SIGNS_IN}" in body
+        assert run.fake.issues[2]["state"] == "open"
+    finally:
+        run.repo.cleanup()
 
 
 def test_another_root_s_proof_never_published_ticks_nothing(discharge):
