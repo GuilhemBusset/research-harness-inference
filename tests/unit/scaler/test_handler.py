@@ -10,13 +10,14 @@ from typing import Any
 
 import boto3
 import pytest
-from boto3.dynamodb.types import TypeSerializer
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.credentials import Credentials
 from botocore.stub import ANY, Stubber
+from moto import mock_aws
 
 from rhi_common.records import GatewayHeartbeat
 from rhi_scaler import handler as scaler
-from rhi_scaler.aws_io import Clients, memory_to_item, memory_update
+from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
 from rhi_scaler.metrics import DECISIONS, GAUGES, DecisionCounts, RemoteWriter, decode
 from rhi_scaler.model import Memory, Reason
 from rhi_scaler.settings import read_settings
@@ -60,6 +61,23 @@ def serialize(item: dict[str, Any]) -> dict[str, Any]:
     return {name: TypeSerializer().serialize(value) for name, value in item.items()}
 
 
+def stored_memory(update: dict[str, Any]) -> Memory:
+    """The memory that an UpdateItem call leaves for a pool that had no memory record: the call
+    made by moto's DynamoDB, so the expectation owes nothing to how the scaler built it."""
+    keys = [("pool", "HASH"), ("record", "RANGE")]
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub")
+        client.create_table(
+            TableName=update["TableName"],
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": name, "AttributeType": "S"} for name, _ in keys],
+            KeySchema=[{"AttributeName": name, "KeyType": kind} for name, kind in keys],
+        )
+        client.update_item(**update)
+        item = client.get_item(TableName=update["TableName"], Key=update["Key"])["Item"]
+    return memory_from_item({name: TypeDeserializer().deserialize(value) for name, value in item.items()})
+
+
 class Edge:
     """Stubbed clients, every call queued in order, and the pushes the writer sent."""
 
@@ -73,6 +91,11 @@ class Edge:
         self.autoscaling = Stubber(self.clients.autoscaling)
         self.elbv2 = Stubber(self.clients.elbv2)
         self.dynamodb = Stubber(self.clients.dynamodb)
+        # Each UpdateItem call made, as the scaler made it.
+        self.updates: list[dict[str, Any]] = []
+        self.clients.dynamodb.meta.events.register(
+            "provide-client-params.dynamodb.UpdateItem", lambda params, **_: self.updates.append(dict(params))
+        )
         self.pushes: list[tuple[str, dict[str, str], bytes]] = []
         self.writer = RemoteWriter(
             WORKSPACE, "us-east-1", Credentials("stub", "stub"), send=lambda url, headers, body: self.pushes.append((url, dict(headers), body))
@@ -106,11 +129,11 @@ class Edge:
             }
             self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
 
-    def expect_writes(self, note: dict[str, Any], memory: Memory | None) -> None:
-        """The note put whole, then the memory of a pool that had none updated to `memory`."""
+    def expect_writes(self, note: dict[str, Any]) -> None:
+        """The note put whole, then the memory updated: what it stores is in `updates`."""
         self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
-        update = None if memory is None else memory_update("pool-state-table", "mock", Memory(), memory)
-        self.dynamodb.add_response("update_item", {}, update)
+        update = ("Key", "UpdateExpression", "ExpressionAttributeNames", "ExpressionAttributeValues")
+        self.dynamodb.add_response("update_item", {}, {"TableName": "pool-state-table", **dict.fromkeys(update, ANY)})
 
     def queue_first_run(self) -> None:
         """A pool at zero, a request held: one instance asked for, and the memory stored."""
@@ -118,8 +141,7 @@ class Edge:
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
-        stored = Memory(last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1)
-        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, stored)
+        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW})
 
 
 @pytest.fixture
@@ -145,6 +167,10 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     edge.queue_first_run()
     decision = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
     assert [(pool.desired, pool.reason) for pool in decision.pools] == [(1, Reason.WAKE)]
+    # The memory stored: the request received, the run that saw it held, the gateway's heartbeat.
+    (update,) = edge.updates
+    assert update["Key"] == {"pool": {"S": "mock"}, "record": {"S": "memory"}}
+    assert stored_memory(update) == Memory(last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1)
 
     ((url, headers, body),) = edge.pushes
     assert url == WORKSPACE
@@ -176,7 +202,7 @@ def test_a_second_run_is_harmless(edge: Edge) -> None:
         heartbeats=[held_request(later)],
     )
     # No Auto Scaling call is queued: one would fail the test. Only the note and the memory.
-    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": later}, None)
+    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": later})
     second = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, later, counts)
     assert [pool.desired for pool in second.pools] == [pool.desired for pool in first.pools] == [1]
 

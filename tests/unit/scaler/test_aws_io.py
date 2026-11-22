@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -319,7 +320,27 @@ def test_the_memory_update_leaves_the_admins_clear_and_what_is_not_the_scalers(m
         assert stored == Memory(last_request_at=NOW, suspended_at=NOW - 30)
         assert client.get_item(TableName=TABLES.pool_state, Key=key)["Item"]["cleared_by"] == {"S": "user/admin"}
 
-        # A run that raises the mark sets it.
-        client.update_item(**memory_update(TABLES.pool_state, "coursework", stored, Memory(launch_suspended=True, suspended_at=NOW)))
+        # A run that raises the mark sets it, and every attribute of the memory is stored.
+        full = Memory(
+            last_request_at=NOW - 1,
+            last_in_flight_at=NOW - 2,
+            above_target_since=NOW - 3,
+            waiting_since=(("instance-a", NOW - 4),),
+            last_scale_out_at=NOW - 5,
+            low_load_since=NOW - 6,
+            last_gateway_at=NOW - 7,
+            launch_suspended=True,
+            suspended_at=NOW,
+            abandons_counted_from=NOW - 8,
+            queuing_since=(("instance-b", NOW - 9),),
+            rebalance_number=3,
+            last_rebalance_at=NOW - 10,
+        )
+        assert all(value not in (None, (), 0, False) for value in dataclasses.astuple(full))
+        client.update_item(**memory_update(TABLES.pool_state, "coursework", stored, full))
+        assert memory_from_item(plain(client.get_item(TableName=TABLES.pool_state, Key=key)["Item"])) == full
+
+        # And what it holds no more is removed.
+        client.update_item(**memory_update(TABLES.pool_state, "coursework", full, Memory(launch_suspended=True, suspended_at=NOW)))
         stored = memory_from_item(plain(client.get_item(TableName=TABLES.pool_state, Key=key)["Item"]))
         assert stored == Memory(launch_suspended=True, suspended_at=NOW)

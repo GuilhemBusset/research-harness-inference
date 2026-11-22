@@ -8,8 +8,9 @@ is in its configured mode, and what the admin set there, a disabled pool or a cl
 the admin changes. What a deployment runs is a custom resource, so `pool_state_writes` looks for
 one that writes an item of the table: by an SDK call that its properties name with the table, or
 through what serves it, a function or a state machine whose role may write an item of the table,
-or may run one that may (a provider's framework, which runs a handler or a waiter). A table created
-from an import is written by its deployment too.
+by a reference to it or by an ARN pattern that its name matches, or may run one that may (a
+provider's framework, which runs a handler or a waiter). A table created from an import is written
+by its deployment too.
 
 The CDK is imported inside the fixtures, after `app_module` has started jsii (see conftest.py).
 """
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from rhi_admin.main import POOLS_STACK_NAME
 from rhi_common.tables import HEARTBEATS, KEYS, POOL_STATE, ROSTER, TABLES, USAGE, AttributeType, KeyAttribute, Table
 
 if TYPE_CHECKING:
@@ -208,8 +210,11 @@ class Assembly:
                 found += [(node[0], statement) for statement in as_list(policy["PolicyDocument"]["Statement"])]
         return found
 
-    def allows(self, runner: Node, resource: Resource, actions: tuple[str, ...], on: set[Node]) -> bool:
-        """Whether the runner's role may make one of the actions on one of the resources `on`."""
+    def allows(
+        self, runner: Node, resource: Resource, actions: tuple[str, ...], on: set[Node], arns: tuple[str, ...] = ()
+    ) -> bool:
+        """Whether the runner's role may make one of the actions on one of the resources `on`, or on
+        one of the `arns` by a pattern."""
         roles = self.references(resource["Properties"].get(RUNNERS[resource["Type"]]), runner[0])
         for role in (role for role in roles if isinstance(role, tuple)):
             for path, statement in self.statements(role):
@@ -219,14 +224,52 @@ class Assembly:
                 reached = self.references(statement.get("Resource", []), path)
                 if "*" in reached or reached & on:
                     return True
+                patterns = [pattern(part) for part in as_list(statement.get("Resource", []))]
+                if any(fnmatch(arn, text) for arn in arns for text in patterns):
+                    return True
         return False
+
+
+# A value only a deployment knows, such as another resource's name, in an ARN pattern: nothing matches it.
+UNKNOWN = "\0"
+
+
+def pattern(value: Any) -> str:
+    """The text a value of a template makes, as a pattern: a pseudo parameter such as the account or
+    the region matches anything, a value only a deployment knows matches nothing."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict) or len(value) != 1:
+        return UNKNOWN
+    if isinstance(value.get("Ref"), str):
+        return "*" if value["Ref"].startswith("AWS::") else UNKNOWN
+    if "Fn::Join" in value:
+        separator, parts = (as_list(value["Fn::Join"]) + [None])[:2]
+        if not isinstance(separator, str) or not isinstance(parts, list):
+            return UNKNOWN
+        return separator.join(pattern(part) for part in parts)
+    if "Fn::Sub" in value:
+        text, variables = (as_list(value["Fn::Sub"]) + [{}])[:2]
+        if not isinstance(text, str) or not isinstance(variables, dict):
+            return UNKNOWN
+
+        def substitute(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name in variables:
+                return pattern(variables[name])
+            return "*" if name.startswith("AWS::") else UNKNOWN
+
+        return re.sub(r"\$\{([^}!]+)\}", substitute, text)
+    return UNKNOWN
 
 
 def pool_state_writes(templates: Templates, table: Node) -> list[str]:
     """What, in the templates, writes an item of the table when it is deployed."""
     assembly = Assembly(templates)
+    # The table's ARN, as CloudFormation names it: the stack's name, its logical ID and a suffix.
+    arn = f"arn:aws:dynamodb:us-east-1:123456789012:table/{POOLS_STACK_NAME}-{table[1]}-EXAMPLE"
     runners = {node: r for node, r in assembly.resources() if r["Type"] in RUNNERS}
-    writers = {node for node, r in runners.items() if assembly.allows(node, r, ITEM_WRITE_ACTIONS, {table})}
+    writers = {node for node, r in runners.items() if assembly.allows(node, r, ITEM_WRITE_ACTIONS, {table}, (arn,))}
     grown = True
     while grown:
         more = {node for node, r in runners.items() if node not in writers and assembly.allows(node, r, RUN_ACTIONS, writers)}
@@ -315,7 +358,35 @@ def _a_provider_s_waiter(table: str, scaler: str) -> dict[str, Resource]:
     }
 
 
-@pytest.mark.parametrize("injected", [_sdk_call, _the_scaler, _a_provider, _a_provider_s_waiter])
+def _table_name_arns(table: str) -> tuple[Any, Any]:
+    """An ARN pattern that the pool-state table's name matches, built the two ways a template does."""
+    name = f"table/{POOLS_STACK_NAME}-{table}-*"
+    by_sub = {"Fn::Sub": f"arn:${{AWS::Partition}}:dynamodb:${{AWS::Region}}:${{AWS::AccountId}}:{name}"}
+    parts = ["arn:", {"Ref": "AWS::Partition"}, ":dynamodb:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, f":{name}"]
+    return by_sub, {"Fn::Join": ["", parts]}
+
+
+def _a_name_pattern_by_sub(table: str, scaler: str) -> dict[str, Resource]:
+    del scaler
+    return {**_runner("Handler", FUNCTION, ["dynamodb:PutItem"], [_table_name_arns(table)[0]]), "Injected": _served_by("Handler")}
+
+
+def _a_name_pattern_by_join(table: str, scaler: str) -> dict[str, Resource]:
+    del scaler
+    return {**_runner("Handler", FUNCTION, ["dynamodb:UpdateItem"], [_table_name_arns(table)[1]]), "Injected": _served_by("Handler")}
+
+
+def test_a_pattern_finds_only_the_tables_it_names() -> None:
+    arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Stack-Table-EXAMPLE"
+    another = {"Fn::Join": ["", [{"Fn::GetAtt": ["Other", "Arn"]}, "*"]]}
+    assert [fnmatch(arn, pattern(value)) for value in ("*", "arn:aws:dynamodb:*:*:table/*", another)] == [True, True, False]
+    assert not fnmatch(arn, pattern({"Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Other}"}))
+
+
+@pytest.mark.parametrize(
+    "injected",
+    [_sdk_call, _the_scaler, _a_provider, _a_provider_s_waiter, _a_name_pattern_by_sub, _a_name_pattern_by_join],
+)
 def test_a_deployment_that_writes_pool_state_is_found(
     app: cdk.App, templates: Templates, pool_state: Node, injected: Callable[[str, str], dict[str, Resource]]
 ) -> None:

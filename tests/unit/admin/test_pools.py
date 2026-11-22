@@ -95,15 +95,15 @@ class Deployed:
     cloudformation: Stubber
     functions: Stubber
 
-    def run(self, *argv: str, now: int = NOW, settings: bool = True) -> tuple[int, str, str]:
+    def run(self, *argv: str, now: int = NOW, settings: str | None = SETTINGS) -> tuple[int, str, str]:
         for logical_id, physical_id, kind in (
             (main.POOL_STATE_LOGICAL_ID, TABLE, "AWS::DynamoDB::Table"),
             (main.SCALER_FUNCTION_LOGICAL_ID, SCALER, "AWS::Lambda::Function"),
         ):
             expected = {"StackName": main.POOLS_STACK_NAME, "LogicalResourceId": logical_id}
             self.cloudformation.add_response("describe_stack_resource", _detail(logical_id, physical_id, kind), expected)
-        if settings:
-            answer = {"FunctionName": SCALER, "Environment": {"Variables": {SETTINGS_VARIABLE: SETTINGS}}}
+        if settings is not None:
+            answer = {"FunctionName": SCALER, "Environment": {"Variables": {SETTINGS_VARIABLE: settings}}}
             self.functions.add_response("get_function_configuration", answer, {"FunctionName": SCALER})
         out, err = io.StringIO(), io.StringIO()
         status = main.run(["pool", *argv], self.admin, now=now, out=out, err=err)
@@ -157,6 +157,15 @@ def test_disabling_and_re_enabling_write_the_mode_with_who_and_when(deployed: De
     }
 
 
+def test_a_pool_priced_above_the_default_limit_can_be_disabled(deployed: Deployed) -> None:
+    # The deployment checked its prices against the configuration's limit, which may be above the default.
+    settings = json.loads(SETTINGS)
+    settings["pools"]["mock"]["entry"]["prices"] = {"g6e.xlarge": 6.0}
+    status, _, err = deployed.run("disable", "mock", settings=json.dumps(settings))
+    assert (status, err) == (0, "")
+    assert deployed.item("mock", "mode") == {"pool": "mock", "record": "mode", "mode": "disabled", "set_by": WHO, "set_at": NOW}
+
+
 def test_status_shows_the_deployed_configured_mode_until_the_admin_sets_one(deployed: Deployed) -> None:
     # The configuration in SSM may say otherwise before the next deployment: the running pools are what counts.
     ssm = boto3.client("ssm")
@@ -202,13 +211,13 @@ def test_asking_for_a_run_invokes_the_function_found_by_its_logical_id(deployed:
     body = json.dumps(decisions).encode()
     expected = {"FunctionName": SCALER, "InvocationType": "RequestResponse", "Payload": b"{}"}
     deployed.functions.add_response("invoke", {"StatusCode": 200, "Payload": StreamingBody(io.BytesIO(body), len(body))}, expected)
-    status, out, _ = deployed.run("run", settings=False)
+    status, out, _ = deployed.run("run", settings=None)
     assert status == 0
     assert out.splitlines() == ["coursework\t0\tunchanged", "mock\t1\twake"]
 
     # A run under way: the function's one reserved invocation is taken.
     deployed.functions.add_client_error("invoke", "TooManyRequestsException", http_status_code=429)
-    status, _, err = deployed.run("run", settings=False)
+    status, _, err = deployed.run("run", settings=None)
     assert status == 1 and "already running" in err
 
 
