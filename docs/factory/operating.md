@@ -264,8 +264,9 @@ reading anything:
   raised and that is still open, sends the build back. Read the `examined` events' `findings` and
   `bounded`, the findings in the issue's state in `state.json`, and the follow-up issues the bound
   filed: findings carried over from early examinations, or new ones that name an invariant, show
-  which rule kept the issue going. A round there with no blocking finding at all was most often
-  sent back by a missing verdict (below).
+  which rule kept the issue going. A round there whose `examined` event has no blocking finding
+  was sent back by a missing verdict: its `missing` list is not empty, and the
+  `examination_incomplete` retries before it name the same items (below).
 - **Before the fourth examination**: each round's findings are in the `examined` event and in
   `state.json`. Findings that close and are replaced by new ones every round point at the examiner
   or at an issue that invites edge cases; a finding the builder did not fix shows instead under
