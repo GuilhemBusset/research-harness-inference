@@ -9,7 +9,15 @@ Two things are left out on purpose. No rule group inspects a request's body: the
 cross-site-scripting rule blocks real coding prompts (evidence E18). And no rule samples requests:
 a sample shows the request's headers, `Authorization` and `x-api-key` with the student's key in
 cleartext among them, and a logging redaction does not reach samples (evidence E26). The metrics
-stay on. The ACL has no logging configuration; one added later must redact both key headers.
+stay on.
+
+The ACL logs every request to a log group of its stack, whose name starts with `aws-waf-logs-`, as
+WAF requires; its retention is the stage's (`rhi.retention`). A log record holds the request's
+headers, so neither key header may reach it in cleartext (section 6.2, step 2). The logging
+configuration redacts both, but WAF applies that redaction only to the rules that match on the
+header, and no rule here does. So the ACL's data protection also substitutes both headers'
+values, wherever WAF writes them, whichever rule matches, with no exception for a rule's match
+details or a rate rule's keys.
 
 The load balancer exists whether or not its HTTPS listener is on, so the ACL always does too.
 """
@@ -18,6 +26,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import aws_cdk as cdk
+from aws_cdk import aws_logs as logs
 from aws_cdk import aws_wafv2 as wafv2
 from constructs import Construct
 
@@ -31,6 +41,10 @@ WINDOW_SECONDS = 300
 REPUTATION_LIST = "AWSManagedRulesAmazonIpReputationList"
 ISSUER_PREFIX = "/auth/"
 GRAFANA_PREFIX = "/grafana/"
+# The headers a student's key arrives in (section 6.2, step 2), as WAF matches a header's name.
+KEY_HEADERS = ("authorization", "x-api-key")
+# WAF logs only to a log group whose name starts with `aws-waf-logs-`.
+LOG_GROUP_NAME = "aws-waf-logs-rhi"
 
 
 def _visibility(metric_name: str) -> wafv2.CfnWebACL.VisibilityConfigProperty:
@@ -67,8 +81,24 @@ def _rate_rule(name: str, priority: int, limit: int, path_prefix: str | None) ->
     )
 
 
+def _data_protection() -> wafv2.CfnWebACL.DataProtectionConfigProperty:
+    # The key headers' values are replaced by `REDACTED` everywhere WAF writes a request, a rule's
+    # match details and a rate rule's keys included.
+    return wafv2.CfnWebACL.DataProtectionConfigProperty(
+        data_protections=[
+            wafv2.CfnWebACL.DataProtectProperty(
+                action="SUBSTITUTION",
+                field=wafv2.CfnWebACL.FieldToProtectProperty(field_type="SINGLE_HEADER", field_keys=list(KEY_HEADERS)),
+                exclude_rule_match_details=False,
+                exclude_rate_based_details=False,
+            )
+        ]
+    )
+
+
 class WebAcl(Construct):
-    """The web ACL, as `web_acl`, attached to `load_balancer`."""
+    """The web ACL, as `web_acl`, attached to `load_balancer`, and its logging configuration, as
+    `logging`, to `log_group`."""
 
     def __init__(
         self,
@@ -96,6 +126,7 @@ class WebAcl(Construct):
             scope="REGIONAL",
             default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
             visibility_config=_visibility("rhi-web-acl"),
+            data_protection_config=_data_protection(),
             rules=[
                 reputation,
                 _rate_rule("issuer-rate", 1, rate_limits.issuer, ISSUER_PREFIX),
@@ -105,4 +136,31 @@ class WebAcl(Construct):
         )
         wafv2.CfnWebACLAssociation(
             self, "Association", resource_arn=load_balancer.load_balancer_arn, web_acl_arn=self.web_acl.attr_arn
+        )
+        self.log_group = logs.LogGroup(
+            self,
+            "Logs",
+            log_group_name=LOG_GROUP_NAME,
+            retention=logs.RetentionDays.THREE_MONTHS,  # section 6.6 (`rhi.retention`)
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+        stack = cdk.Stack.of(self)
+        self.logging = wafv2.CfnLoggingConfiguration(
+            self,
+            "Logging",
+            resource_arn=self.web_acl.attr_arn,
+            # WAF takes the log group's ARN without the `:*` that CloudFormation's attribute ends in.
+            log_destination_configs=[
+                stack.format_arn(
+                    service="logs",
+                    resource="log-group",
+                    resource_name=self.log_group.log_group_name,
+                    arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME,
+                )
+            ],
+            redacted_fields=[
+                # The schema types the header loosely, so it is written as CloudFormation reads it.
+                wafv2.CfnLoggingConfiguration.FieldToMatchProperty(single_header={"Name": header})
+                for header in KEY_HEADERS
+            ],
         )

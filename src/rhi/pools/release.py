@@ -151,7 +151,7 @@ REFRESH_QUERY_INTERVAL = cdk.Duration.seconds(30)
 # The start may wait for a refresh still running to be cancelled (`refresh_handler.CANCEL_SECONDS`).
 START_TIMEOUT = cdk.Duration.minutes(14)
 QUERY_TIMEOUT = cdk.Duration.minutes(1)
-LOG_RETENTION = logs.RetentionDays.ONE_MONTH
+LOG_RETENTION = logs.RetentionDays.THREE_MONTHS  # Section 6.6 (`rhi.retention`).
 
 PULL_ACTIONS = ("ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage")
 REFRESH_ACTIONS = ("autoscaling:StartInstanceRefresh", "autoscaling:CancelInstanceRefresh")
