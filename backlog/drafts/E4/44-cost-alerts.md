@@ -1,7 +1,7 @@
 +++
 id = "E4-44"
-title = "AWS Budgets e-mail alerts at thresholds set at deployment, and nothing that stops"
-labels = ["size:M", "kind:infra"]
+title = "AWS Budgets alerts at thresholds read from the configuration"
+labels = ["size:S", "kind:infra"]
 epic = 6
 blocked_by = [219]
 +++
@@ -9,42 +9,38 @@ blocked_by = [219]
 ## Context
 
 The cost net is alerts only (section 11.3; ADR 0003, decision 2): a monthly cost budget that
-e-mails the admin at thresholds of a monthly amount, and nothing that stops a pool or a session on
-its own. The owner decides what to switch off. The fleet-size cap of `tests/policy/` is not a
-budget and is untouched here.
+e-mails the admin, through the alerts topic, at thresholds of a monthly amount, and nothing that
+stops a pool or a session on its own. The design makes both the amount and the thresholds
+configuration, read when the stage is deployed (section 11.3), 50%, 80% and 100% by default
+(section 17).
 
-**The amount and the thresholds are configuration, read at deployment.** The monthly amount is the
-existing key monthly_budget_usd of `src/rhi/config.py`, whose value is the owner's (section 15,
-decision 6) and stays in SSM, never in the repository: the example holds a placeholder. The
-thresholds are a new key, budget_alert_percentages, whole percentages above 0, 50, 80 and 100 by
-default (section 17), optional so that a configuration in SSM written before this issue loads
-unchanged. The CDK app reads both when it synthesizes the budget; no service reads them.
+**What is already there.** The guardrails stack holds the budget (`src/rhi/guardrails/budget.py`):
+a monthly cost budget for the configuration's monthly_budget_usd, one notification on actual cost
+at each threshold, each to the alerts topic, the topic policy's statement that lets AWS Budgets
+publish, and no latch, function or second topic. `tests/synth/test_alerts.py` checks it. Its
+thresholds are fixed in the module (`THRESHOLDS`), not read from the configuration.
 
-**Where the alerts go.** Every alert of the stage goes to the alerts topic of the guardrails stack,
-whose subscriber is the admin's e-mail address and whose key lets AWS Budgets publish (issue #219).
-Each threshold is one notification of the budget on actual cost, to that topic. AWS Budgets'
-data is updated about once a day (evidence E27), which is enough for an alert.
-
-**What it does not have.** No latch, no second topic, no function: a notification at 100% is an
-e-mail like the others. The budget lives in the guardrails stack, which reads resources of other
-stacks and is read by none (issue #219).
+**What this issue changes.** The thresholds become the configuration's key
+budget_alert_percentages: whole percentages above 0, without repeats, 50, 80 and 100 by default.
+The key is optional, so that a configuration in SSM written before this issue loads unchanged and
+gives the defaults. The CDK app reads it when it synthesizes the budget; no service reads it. The
+fleet-size cap of `tests/policy/` is not a budget and is untouched here.
 
 ## Deliverables
 
-- [ ] `src/rhi/guardrails/budget.py` creates a monthly cost budget for the configuration's monthly_budget_usd, with one notification on actual cost at each percentage of budget_alert_percentages, each to the alerts topic, and nothing else: no other topic, no function, no action on any resource.
-- [ ] `src/rhi/guardrails/stack.py` adds the budget's construct to the guardrails stack without creating a resource of its own.
-- [ ] `src/rhi/config.py` gains budget_alert_percentages, a list of whole percentages above 0 and without repeats, 50, 80 and 100 by default; `config.example.toml` gives it; `tests/unit/test_config.py` holds the default and refuses a percentage of 0 and a repeated one.
-- [ ] Every cdk-nag finding `src/rhi/guardrails/budget.py` brings is fixed or acknowledged with its reason in `tests/policy/acknowledged/guardrails_budget.toml`, and `tests/synth/test_budget.py` checks the budget.
+- [ ] `src/rhi/config.py` gains budget_alert_percentages, a list of whole percentages above 0 without repeats, 50, 80 and 100 when the key is left out, and `config.example.toml` gives it.
+- [ ] `src/rhi/guardrails/budget.py` makes one notification on actual cost, to the alerts topic, at each percentage of the configuration's budget_alert_percentages, and holds no fixed list of thresholds.
+- [ ] `tests/synth/test_alerts.py` checks the notifications against the configuration, and `tests/unit/test_config.py` holds the default and refuses a percentage of 0 and a repeated one.
 
 ## Acceptance criteria
 
-- [ ] `uv run --locked pytest tests/synth/test_budget.py tests/unit/test_config.py` passes: the guardrails stack holds one budget whose amount is the example configuration's, with one notification on actual cost at each of 50%, 80% and 100%, each to the alerts topic; the stage holds no function and no topic that the budget's notifications reach other than the alerts topic; and a configuration that leaves budget_alert_percentages out loads 50, 80 and 100.
-- [ ] The owner writes the monthly amount and, if not the defaults, the thresholds to the configuration in SSM with the configuration step of `setup/owner-setup.sh`, part of decision 6 of the design (needs human:owner-decision).
-- [ ] In the account, the admin's address has confirmed the alerts topic's subscription, and the budget lists its thresholds in the Billing console (needs aws:console).
+- [ ] `uv run --locked pytest tests/synth/test_alerts.py tests/unit/test_config.py` passes: under the example configuration the budget notifies the alerts topic at 50%, 80% and 100% of the example's amount; a configuration with budget_alert_percentages of 25 and 90 gives exactly those two notifications; a configuration that leaves the key out loads 50, 80 and 100; and a list holding 0 or a repeated percentage is refused.
+- [ ] `uv run --locked pytest tests/synth/test_nag.py tests/synth/test_parked.py` passes.
+- [ ] In the account, after the deployment, the budget lists its thresholds in the Billing console (needs aws:console).
 
 ## References
 
-- `docs/design/system-design.md`, sections 11.3, 15 and 17
-- `docs/design/evidence.md`, E27
+- `docs/design/system-design.md`, sections 11.3 and 17
 - `docs/adr/0003-sessions-only-and-usage-logged.md`, decision 2
+- `src/rhi/guardrails/budget.py`
 - `src/rhi/config.py`

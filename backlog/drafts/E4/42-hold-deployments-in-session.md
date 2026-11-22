@@ -3,7 +3,6 @@ id = "E4-42"
 title = "Hold the pipeline's deployment while a session is on"
 labels = ["size:M", "kind:infra"]
 epic = 6
-blocked_by = ["E4-40"]
 +++
 
 ## Context
@@ -12,10 +11,12 @@ There is one environment, and a deployment that touches a pool refreshes its ins
 4.3), which in a class would cost the students their warm instances and their cached transcripts;
 a gateway deployment drains for up to 30 minutes (section 8.5). So the pipeline's deployment waits
 while a session is on (sections 5.6 and 8.2): a step before the stage's deployment reads the
-session switch (issue E4-40) and passes once it reads off.
+session switch and passes once it reads off.
 
 **What the step reads.** The switch is an item of the deployed stage's pool-state table, partition
-key `_session`, sort key `switch`. The step finds the table's name by the table's logical ID in the
+key `_session`, sort key `switch`: its record is `SessionSwitch`, read on or off by `session_is_on`
+(`services/common/rhi_common/records.py`), and its key is `SESSION_SWITCH_KEY`
+(`services/common/rhi_common/tables.py`). The step finds the table's name by the table's logical ID in the
 pools stack, as the admin CLI finds its tables (`admin/rhi_admin/main.py`), and the spike jobs
 already take that stack's name and the table's logical ID from the stage as text
 (`src/rhi/pipeline/spikes.py`, `pool_state_table_arn`): the pipeline's stack, another assembly,
