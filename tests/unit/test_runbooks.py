@@ -94,6 +94,8 @@ def _quoted(line: str, index: int) -> tuple[str, int]:
         if quote == '"' and line[end] == "\\" and line[end + 1 : end + 2] in ("$", "`", '"', "\\"):
             end += 1
         text, end = text + line[end], end + 1
+    if end >= len(line):
+        raise ValueError(f"no closing quotation in: {line}")  # as shlex.split, where the shell refuses the line
     return text, end + 1
 
 
@@ -105,26 +107,27 @@ def split(line: str) -> list[tuple[str, bool]]:
     hides what follows), and the digits of a descriptor (`2>`) belong to their redirection."""
     found: list[tuple[str, bool]] = []
     word: str | None = None  # None between words; "" for a word of empty quotes so far
+    digits = False  # whether the word so far is only unquoted, unescaped digits, which a redirection takes
     index = 0
     while index < len(line):
         char = line[index]
         operator = next((op for op in OPERATORS if line.startswith(op, index)), "")
         if char == "\\":
-            word, index = (word or "") + line[index + 1 : index + 2], index + 2
+            word, index, digits = (word or "") + line[index + 1 : index + 2], index + 2, False
         elif char in "'\"":
             text, index = _quoted(line, index)
-            word = (word or "") + text
+            word, digits = (word or "") + text, False
         elif char == "#" and word is None:
             break
         elif operator or char in " \t":
-            descriptor = operator in REDIRECTION and word is not None and re.fullmatch(r"\d+", line[index - len(word) : index])
-            if word is not None and not descriptor:
+            if word is not None and not (digits and operator in REDIRECTION):
                 found.append((word, False))
-            word = None
+            word, digits = None, False
             if operator:
                 found.append((operator, True))
             index += len(operator) or 1
         else:
+            digits = char.isdigit() and (word is None or digits)
             word, index = (word or "") + char, index + 1
     if word is not None:
         found.append((word, False))
@@ -196,6 +199,12 @@ def test_detects_an_unknown_command() -> None:
         "the rhi CLI refuses: rhi frobnicate",
         "the rhi CLI refuses: rhi status unexpected",
     ]
+    # Only unquoted, unescaped digits name a descriptor: an escaped or quoted one is an argument.
+    escaped = "```sh\nrhi status \\2>/dev/null\nrhi status '2'>/dev/null\n```\n"
+    assert problems(sections + escaped) == ["the rhi CLI refuses: rhi status 2"] * 2
+    # A line the shell refuses for an unterminated quote is refused here too.
+    with pytest.raises(ValueError, match="no closing quotation"):
+        problems(sections + '```sh\nrhi "status\n```\n')
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:
