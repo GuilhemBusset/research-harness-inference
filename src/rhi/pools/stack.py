@@ -21,10 +21,10 @@ runs. The tables, the model bucket, each pool's instance role with its log group
 secret and the scaler's log group, whose name is fixed (`rhi.pools.scaler.log_group`), stay, and
 `ReleaseParameters` reads `NO_POOL`. The stack still deploys after the network stack and the
 observability stack, whose exports it imports: the model bucket's policy names the S3 endpoint, and
-the instance roles the workspace. So the exports of those two stacks that it imports unparked and
-that name what stays (`_keep_exports`) are kept, through the exporting stack's `export_value`: an
-export that a deployed stack imports cannot be deleted, and this stack's update, which drops the
-import, comes after theirs.
+the instance roles the workspace. So every export of those two stacks that it imports unparked, the
+workspace's that only the scaler names with the pools table empty included (`_keep_exports`), is
+kept, through the exporting stack's `export_value`: an export that a deployed stack imports cannot
+be deleted, and this stack's update, which drops the import, comes after theirs.
 """
 
 from __future__ import annotations
@@ -241,4 +241,8 @@ class PoolsStack(cdk.Stack):
             network.access_logs.bucket.bucket_name,
         ):
             network.export_value(value)
-        observability.export_value(observability.prometheus.workspace.attr_prometheus_endpoint)
+        # The workspace's endpoint and ARN, which the instance roles and the scaler name: with the pools
+        # table empty, the scaler alone imports them unparked.
+        workspace = observability.prometheus.workspace
+        for value in (workspace.attr_prometheus_endpoint, workspace.attr_arn):
+            observability.export_value(value)

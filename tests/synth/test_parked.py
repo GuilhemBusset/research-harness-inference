@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -174,15 +176,51 @@ def read_stage(assembly: cdk.cx_api.CloudAssembly) -> Stage:
     return Stage({stack.stack_name: stack.template for stack in stacks}, {name: closure(name) for name in direct})
 
 
-def _imports(node: Any) -> Iterator[str]:
+# What an import's name holds where the template does not say: a parameter, an attribute, a
+# pseudo parameter other than the stack's name. It may be any text.
+_ANY = ".+"
+
+
+def _name_pattern(node: Any, stack: str) -> str:
+    """The names an import's argument can resolve to in `stack`, as a regular expression: a literal,
+    or a `Fn::Sub` or `Fn::Join` of what this resolves, and any other part matching any text."""
+    if isinstance(node, str):
+        return re.escape(node)
+    if not isinstance(node, dict) or len(node) != 1:
+        return _ANY
+    [(function, argument)] = node.items()
+    if function == "Fn::Join" and isinstance(argument, list) and len(argument) == 2:
+        delimiter, parts = argument
+        if isinstance(delimiter, str) and isinstance(parts, list):
+            return re.escape(delimiter).join(_name_pattern(part, stack) for part in parts)
+    if function == "Fn::Sub":
+        template, variables = (argument, {}) if isinstance(argument, str) else (argument + [{}])[:2]
+        if isinstance(template, str) and isinstance(variables, dict):
+            variables = {"AWS::StackName": stack} | variables
+            pattern, position = "", 0
+            for match in re.finditer(r"\$\{(!?)([^}]*)\}", template):
+                pattern += re.escape(template[position : match.start()])
+                if match[1]:
+                    pattern += re.escape("${" + match[2] + "}")
+                elif match[2] in variables:
+                    pattern += _name_pattern(variables[match[2]], stack)
+                else:
+                    pattern += _ANY
+                position = match.end()
+            return pattern + re.escape(template[position:])
+    return _ANY
+
+
+def _imports(node: Any, stack: str) -> Iterator[str]:
+    """The name of every export `stack`'s template node imports, each as `_name_pattern` gives it."""
     if isinstance(node, dict):
-        if isinstance(node.get("Fn::ImportValue"), str):
-            yield node["Fn::ImportValue"]
+        if "Fn::ImportValue" in node:
+            yield _name_pattern(node["Fn::ImportValue"], stack)
         for value in node.values():
-            yield from _imports(value)
+            yield from _imports(value, stack)
     elif isinstance(node, list):
         for value in node:
-            yield from _imports(value)
+            yield from _imports(value, stack)
 
 
 def exports(stage: Stage) -> dict[str, str]:
@@ -196,16 +234,21 @@ def exports(stage: Stage) -> dict[str, str]:
 
 
 def deleted_exports_in_use(before: Stage, after: Stage) -> list[tuple[str, str]]:
-    """Every export a stack of `before` imports that `after` no longer declares, while that stack
-    does not deploy before the export's stack in `after`, as `(importer, export name)`: deploying
-    `after` over `before` would delete an export in use."""
+    """Every export of `before` a stack of `before` imports that `after` no longer declares, while
+    that stack does not deploy before the export's stack in `after`, as `(importer, export name)`:
+    deploying `after` over `before` would delete an export in use. An import whose name the template
+    does not fully say counts for every export its name may resolve to."""
     declared_before, declared_after = exports(before), exports(after)
     return sorted(
-        (importer, name)
-        for importer, template in before.templates.items()
-        for name in set(_imports(template))
-        if name not in declared_after
-        and importer not in after.after.get(declared_before.get(name, ""), set())
+        {
+            (importer, name)
+            for importer, template in before.templates.items()
+            for pattern in set(_imports(template, importer))
+            for name, exporter in declared_before.items()
+            if re.fullmatch(pattern, name)
+            and name not in declared_after
+            and importer not in after.after.get(exporter, set())
+        }
     )
 
 
@@ -225,17 +268,24 @@ def fixed_log_groups(stage: Stage) -> dict[str, tuple[str, str]]:
     }
 
 
-@pytest.fixture(scope="module")
-def stages(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[bool, Stage]:
-    """The stage unparked and parked, by `parked`."""
+def synthesize(
+    app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory, configuration: config.Config
+) -> dict[bool, Stage]:
+    """The stage of `configuration` unparked and parked, by `parked`."""
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    example = dataclasses.replace(config.load({"RHI_CONFIG": "example"}), cost_anomaly_detection=True)
     built = {}
     for parked in (False, True):
         outdir = tmp_path_factory.mktemp("cdk.out")
-        app = app_module.build(dataclasses.replace(example, parked=parked), outdir=str(outdir), context=context)
+        app = app_module.build(dataclasses.replace(configuration, parked=parked), outdir=str(outdir), context=context)
         built[parked] = read_stage(app.synth())
     return built
+
+
+@pytest.fixture(scope="module")
+def stages(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[bool, Stage]:
+    """The example's stage unparked and parked, by `parked`."""
+    example = dataclasses.replace(config.load({"RHI_CONFIG": "example"}), cost_anomaly_detection=True)
+    return synthesize(app_module, tmp_path_factory, example)
 
 
 def test_parked_holds_only_what_may_stay(stages: dict[bool, Stage]) -> None:
@@ -297,9 +347,10 @@ def test_parked_keeps_the_recorded_state_and_its_protections(stages: dict[bool, 
             assert lost == [], f"{stack} {logical_id}"
 
 
-def two_stacks(*, parked: bool, consumer_first: bool = False) -> Stage:
-    """A stage of two stacks. Unparked, `Consumer` imports the name of a bucket of `Producer`;
-    parked, the bucket is gone, and `Consumer` deploys after `Producer`, or before it."""
+def two_stacks(*, parked: bool, consumer_first: bool = False, substituted: bool = False) -> Stage:
+    """A stage of two stacks. Unparked, `Consumer` imports the name of a bucket of `Producer`, by
+    the export's name or, `substituted`, by a `Fn::Sub` that resolves to it; parked, the bucket is
+    gone, and `Consumer` deploys after `Producer`, or before it."""
     import aws_cdk as cdk
 
     app = cdk.App(analytics_reporting=False)
@@ -315,7 +366,13 @@ def two_stacks(*, parked: bool, consumer_first: bool = False) -> Stage:
             consumer.add_dependency(producer)
     else:
         bucket = cdk.aws_s3.Bucket(producer, "Bucket")
-        cdk.CfnOutput(consumer, "Imported", value=bucket.bucket_name)
+        if substituted:
+            cdk.CfnOutput(producer, "Exported", value=bucket.bucket_name, export_name="Producer-Bucket")
+            consumer.add_dependency(producer)
+            imported = cdk.Fn.import_value(cdk.Fn.sub("${Prefix}-Bucket", {"Prefix": "Producer"}))
+            cdk.CfnOutput(consumer, "Imported", value=imported)
+        else:
+            cdk.CfnOutput(consumer, "Imported", value=bucket.bucket_name)
     return read_stage(app.synth())
 
 
@@ -324,6 +381,21 @@ def test_no_export_in_use_is_deleted(stages: dict[bool, Stage]) -> None:
     [name] = exports(before)
     assert deleted_exports_in_use(before, two_stacks(parked=True)) == [("Consumer", name)]
     assert deleted_exports_in_use(before, two_stacks(parked=True, consumer_first=True)) == []
+    # An import whose name a substitution gives.
+    substituted = two_stacks(parked=False, substituted=True)
+    assert deleted_exports_in_use(substituted, two_stacks(parked=True)) == [("Consumer", "Producer-Bucket")]
+    assert deleted_exports_in_use(substituted, two_stacks(parked=True, consumer_first=True)) == []
     # The stage itself, parking and unparking.
     assert deleted_exports_in_use(stages[False], stages[True]) == []
     assert deleted_exports_in_use(stages[True], stages[False]) == []
+
+
+def test_parking_with_no_pool_deletes_no_export_in_use(
+    app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    raw = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
+    raw["pools"] = {}
+    raw.pop("default_pool", None)
+    built = synthesize(app_module, tmp_path_factory, config.parse(raw, "no pools"))
+    assert deleted_exports_in_use(built[False], built[True]) == []
+    assert deleted_exports_in_use(built[True], built[False]) == []
