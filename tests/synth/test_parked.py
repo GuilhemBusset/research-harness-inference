@@ -62,7 +62,7 @@ MAY_STAY = {
     # Log groups: those of a fixed name must stay.
     "AWS::Logs::LogGroup",
     # The VPC, which costs nothing without its NAT gateway, and the custom resource that strips its
-    # default security group of every rule, with its function.
+    # default security group of every rule. Its function stays as `KEPT_FUNCTIONS` allows.
     "AWS::EC2::VPC",
     "AWS::EC2::Subnet",
     "AWS::EC2::RouteTable",
@@ -74,7 +74,6 @@ MAY_STAY = {
     "AWS::EC2::SecurityGroup",
     "AWS::EC2::SecurityGroupIngress",
     "Custom::VpcRestrictDefaultSG",
-    "AWS::Lambda::Function",
     # Roles and policies, which cost nothing: the pools' instance roles, the workspace's policies.
     "AWS::IAM::Role",
     "AWS::IAM::Policy",
@@ -177,8 +176,8 @@ def read_stage(assembly: cdk.cx_api.CloudAssembly) -> Stage:
 
 
 # What an import's name holds where the template does not say: a parameter, an attribute, a
-# pseudo parameter other than the stack's name. It may be any text.
-_ANY = ".+"
+# pseudo parameter other than the stack's name. It may be any text, the empty text included.
+_ANY = ".*"
 
 
 def _name_pattern(node: Any, stack: str) -> str:
@@ -234,20 +233,25 @@ def exports(stage: Stage) -> dict[str, str]:
 
 
 def deleted_exports_in_use(before: Stage, after: Stage) -> list[tuple[str, str]]:
-    """Every export of `before` a stack of `before` imports that `after` no longer declares, while
-    that stack does not deploy before the export's stack in `after`, as `(importer, export name)`:
-    deploying `after` over `before` would delete an export in use. An import whose name the template
-    does not fully say counts for every export its name may resolve to."""
+    """Every export of `before` a stack of `before` imports that `after` no longer declares, unless
+    that stack deploys before the export's stack in `after` and no longer imports it there, as
+    `(importer, export name)`: deploying `after` over `before` would delete an export in use. An
+    import whose name the template does not fully say counts for every export its name may resolve
+    to."""
     declared_before, declared_after = exports(before), exports(after)
+
+    def imported(stage: Stage, importer: str, name: str) -> bool:
+        template = stage.templates.get(importer, {})
+        return any(re.fullmatch(pattern, name) for pattern in set(_imports(template, importer)))
+
     return sorted(
         {
             (importer, name)
-            for importer, template in before.templates.items()
-            for pattern in set(_imports(template, importer))
+            for importer in before.templates
             for name, exporter in declared_before.items()
-            if re.fullmatch(pattern, name)
-            and name not in declared_after
-            and importer not in after.after.get(exporter, set())
+            if name not in declared_after
+            and imported(before, importer, name)
+            and (importer not in after.after.get(exporter, set()) or imported(after, importer, name))
         }
     )
 
@@ -256,6 +260,20 @@ def resources(stage: Stage) -> Iterator[tuple[str, str, dict[str, Any]]]:
     for stack, template in stage.templates.items():
         for logical_id, resource in template.get("Resources", {}).items():
             yield stack, logical_id, resource
+
+
+def kept_functions(stage: Stage) -> set[tuple[str, str]]:
+    """The only functions a parked stage may hold, by stack and logical ID: the handlers of the
+    custom resources `MAY_STAY` lists, each the function its custom resource's service token names.
+    A function that serves, such as the issuer or the scaler, is no one's handler."""
+    return {
+        (stack, resource["Properties"]["ServiceToken"]["Fn::GetAtt"][0])
+        for stack, _, resource in resources(stage)
+        if resource["Type"].startswith("Custom::")
+        and resource["Type"] in MAY_STAY
+        and isinstance(resource.get("Properties", {}).get("ServiceToken"), dict)
+        and "Fn::GetAtt" in resource["Properties"]["ServiceToken"]
+    }
 
 
 def fixed_log_groups(stage: Stage) -> dict[str, tuple[str, str]]:
@@ -288,13 +306,23 @@ def stages(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> 
     return synthesize(app_module, tmp_path_factory, example)
 
 
+def unexpected(stage: Stage) -> list[tuple[str, str]]:
+    """Every resource of `stage` a parked stage may not hold, as `(stack, logical ID)`: a type
+    outside `MAY_STAY`, or a function `kept_functions` does not allow."""
+    handlers = kept_functions(stage)
+    return sorted(
+        (stack, logical_id)
+        for stack, logical_id, resource in resources(stage)
+        if resource["Type"] not in MAY_STAY
+        and not (resource["Type"] == "AWS::Lambda::Function" and (stack, logical_id) in handlers)
+    )
+
+
 def test_parked_holds_only_what_may_stay(stages: dict[bool, Stage]) -> None:
     from rhi.pools import scaler  # The CDK is loaded by the fixture (`conftest.app_module`).
 
     parked = stages[True]
-    assert sorted({(stack, resource["Type"]) for stack, _, resource in resources(parked)} - {
-        (stack, kind) for stack in parked.templates for kind in MAY_STAY
-    }) == []
+    assert unexpected(parked) == []
     held = {resource["Type"] for _, _, resource in resources(parked)}
     assert [kind for kind in REMOVED if kind in held] == []
     # No scaler function: none is given the scaler's settings.
@@ -303,6 +331,24 @@ def test_parked_holds_only_what_may_stay(stages: dict[bool, Stage]) -> None:
         for _, logical_id, resource in resources(parked)
         if scaler.SETTINGS_VARIABLE in resource.get("Properties", {}).get("Environment", {}).get("Variables", {})
     ] == []
+
+
+def test_a_function_left_serving_may_not_stay(stages: dict[bool, Stage]) -> None:
+    """Only a kept custom resource's handler is allowed: a parked stage that kept the issuer's
+    function, or the scaler's, fails."""
+    parked = stages[True]
+    serving = [
+        (stack, logical_id, resource)
+        for stack, logical_id, resource in resources(stages[False])
+        if resource["Type"] == "AWS::Lambda::Function" and logical_id.startswith(("Issuer", "Scaler"))
+    ]
+    assert {stack for stack, _, _ in serving} == {"Rhi-Access", "Rhi-Pools"}
+    for stack, logical_id, resource in serving:
+        template = parked.templates[stack]
+        leftover = template | {"Resources": template.get("Resources", {}) | {logical_id: resource}}
+        assert unexpected(dataclasses.replace(parked, templates=parked.templates | {stack: leftover})) == [
+            (stack, logical_id)
+        ]
 
 
 def test_leaving_parked_out_builds_the_stage_as_before(stages: dict[bool, Stage]) -> None:
@@ -347,10 +393,13 @@ def test_parked_keeps_the_recorded_state_and_its_protections(stages: dict[bool, 
             assert lost == [], f"{stack} {logical_id}"
 
 
-def two_stacks(*, parked: bool, consumer_first: bool = False, substituted: bool = False) -> Stage:
-    """A stage of two stacks. Unparked, `Consumer` imports the name of a bucket of `Producer`, by
-    the export's name or, `substituted`, by a `Fn::Sub` that resolves to it; parked, the bucket is
-    gone, and `Consumer` deploys after `Producer`, or before it."""
+def two_stacks(
+    *, parked: bool, consumer_first: bool = False, still_imports: str = "", substituted: str = ""
+) -> Stage:
+    """A stage of two stacks. Unparked, `Consumer` imports the name of a bucket of `Producer`, by a
+    reference or, given `substituted`, by a `Fn::Sub` of that text that resolves to the export's
+    name; parked, the bucket is gone, `Consumer` deploys after `Producer` or before it, and
+    `still_imports` names an export it keeps importing."""
     import aws_cdk as cdk
 
     app = cdk.App(analytics_reporting=False)
@@ -364,12 +413,16 @@ def two_stacks(*, parked: bool, consumer_first: bool = False, substituted: bool 
             producer.add_dependency(consumer)
         else:
             consumer.add_dependency(producer)
+        if still_imports:
+            cdk.CfnOutput(consumer, "Imported", value=cdk.Fn.import_value(still_imports))
     else:
         bucket = cdk.aws_s3.Bucket(producer, "Bucket")
         if substituted:
             cdk.CfnOutput(producer, "Exported", value=bucket.bucket_name, export_name="Producer-Bucket")
             consumer.add_dependency(producer)
-            imported = cdk.Fn.import_value(cdk.Fn.sub("${Prefix}-Bucket", {"Prefix": "Producer"}))
+            # A parameter of the importer's own, which may resolve to the empty text.
+            cdk.CfnParameter(consumer, "Suffix", type="String", default="")
+            imported = cdk.Fn.import_value(cdk.Fn.sub(substituted, {"Prefix": "Producer"}))
             cdk.CfnOutput(consumer, "Imported", value=imported)
         else:
             cdk.CfnOutput(consumer, "Imported", value=bucket.bucket_name)
@@ -381,10 +434,14 @@ def test_no_export_in_use_is_deleted(stages: dict[bool, Stage]) -> None:
     [name] = exports(before)
     assert deleted_exports_in_use(before, two_stacks(parked=True)) == [("Consumer", name)]
     assert deleted_exports_in_use(before, two_stacks(parked=True, consumer_first=True)) == []
-    # An import whose name a substitution gives.
-    substituted = two_stacks(parked=False, substituted=True)
-    assert deleted_exports_in_use(substituted, two_stacks(parked=True)) == [("Consumer", "Producer-Bucket")]
-    assert deleted_exports_in_use(substituted, two_stacks(parked=True, consumer_first=True)) == []
+    # Deploying first is not enough: the importer must also drop its import.
+    retained = two_stacks(parked=True, consumer_first=True, still_imports=name)
+    assert deleted_exports_in_use(before, retained) == [("Consumer", name)]
+    # An import whose name a substitution gives, a parameter possibly giving the empty text.
+    for template in ("${Prefix}-Bucket", "Producer-Bucket${Suffix}"):
+        substituted = two_stacks(parked=False, substituted=template)
+        assert deleted_exports_in_use(substituted, two_stacks(parked=True)) == [("Consumer", "Producer-Bucket")]
+        assert deleted_exports_in_use(substituted, two_stacks(parked=True, consumer_first=True)) == []
     # The stage itself, parking and unparking.
     assert deleted_exports_in_use(stages[False], stages[True]) == []
     assert deleted_exports_in_use(stages[True], stages[False]) == []
