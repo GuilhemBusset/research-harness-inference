@@ -22,20 +22,19 @@ reconciled.
 **The hours are Auto Scaling's count of the pool's running instances**, from the group metrics
 `rhi.pools.group` turns on, in the namespace `AWS/AutoScaling`: `GroupTotalInstances` (in service,
 pending and terminating) plus `WarmPoolPendingCapacity` (an instance prepared for the warm pool
-runs before it stops). A group without a warm pool publishes no warm-pool series, which then adds
-nothing. Each series has one data point a minute, the count during that minute, so the `Sum`
-statistic over a period is the instance-minutes inside it, and divided by 60 the instance-hours.
-A period cut short by the window's edge, the hour that is still running included, holds only its
-own minutes: nothing counts a partial hour as a whole one. The hours are summed over the window.
+runs before it stops), as the fleet's alarms read them (`rhi.guardrails.alarms_fleet`). A group
+without a warm pool has no warm-pool point, which adds nothing. Each series has one data point a
+minute, the count during that minute, so the `Sum` statistic over a period is the instance-minutes
+inside it. A period cut short by the window's edge, the hour that is still running included, holds
+only its own minutes: nothing counts a partial hour as a whole one. Grafana's server-side
+expressions sum each count over the window, add the two, and divide by 60: the instance-hours.
 
-**A pool's group is found by its logical ID.** CloudFormation names the group, from the stack's
-name, the group's logical ID and a random suffix, so its name is known only in the account. The
-logical ID is the CDK's, from the construct path `rhi.pools.stack` gives the group
-(`group_logical_id`), and a CloudWatch search on it, within the dimension `AutoScalingGroupName`,
-finds that pool's group, and a replaced group of the same pool too, whose hours the pool also ran.
-A search finds only the metrics that reported in the past two weeks: the group in place publishes
-every minute, at zero instances too, but a group deleted more than two weeks ago (with its pools
-stack) is no longer found, and its hours are then in the bill alone.
+**A pool's group is read by its name**, which the pools stack fixes (`rhi_common.pool_config.group_name`):
+each count is one metric, read by its namespace, name and the one dimension `AutoScalingGroupName`
+with that value exactly, which CloudWatch answers with every data point it keeps in the window. A
+group deleted and created again, whose hours the pool also ran, published under the same name, so
+its hours are counted too. No query searches for the group: a search finds only the metrics that
+reported in the past two weeks.
 
 **The price is the hourly price the configuration gives the pool's first instance type**, the one
 the group launches first (section 5.4): a fallback type launched in its place is counted at that
@@ -75,8 +74,6 @@ colour: its thresholds hold the base step alone, where Grafana's default would t
 
 from __future__ import annotations
 
-import hashlib
-import re
 from typing import TYPE_CHECKING, Literal
 
 from grafana_foundation_sdk.builders import cloudwatch as cloudwatch_builders
@@ -87,6 +84,7 @@ from grafana_foundation_sdk.builders import stat as stat_builders
 from grafana_foundation_sdk.models import cloudwatch, common
 from grafana_foundation_sdk.models import dashboard as models
 
+from rhi_common.pool_config import group_name
 from rhi_dashboards import rules
 
 if TYPE_CHECKING:
@@ -102,10 +100,10 @@ OUTPUT_TOKENS = "rhi_gateway_student_output_tokens"
 METRICS: tuple[rules.Declared, ...] = (rules.EmittedBy(OUTPUT_TOKENS, GATEWAY_METRICS),)
 
 # Auto Scaling's group metrics: the namespace, the group's dimension, and the two counts whose sum
-# is the instances running.
+# is the instances running, each with the letter of its query.
 AUTO_SCALING = "AWS/AutoScaling"
 GROUP_DIMENSION = "AutoScalingGroupName"
-INSTANCE_COUNTS = ("GroupTotalInstances", "WarmPoolPendingCapacity")
+INSTANCE_COUNTS = {"GroupTotalInstances": "T", "WarmPoolPendingCapacity": "W"}
 # The period the counts are summed over, in seconds: a whole number of minutes, and of the five
 # minutes CloudWatch keeps one-minute data at after 15 days.
 PERIOD = 3600
@@ -120,11 +118,6 @@ CURRENCY: cloudwatch.Dimensions = {"Currency": "USD"}
 BILLING_PERIOD = 3600
 # The data source's own region: the endpoint's.
 OWN_REGION = "default"
-
-# The construct path `rhi.pools.stack` gives a pool's group, and the CDK's rule for a logical ID.
-GROUP_PATH = ("Pool-{pool}", "Group")
-_NOT_ALPHANUMERIC = re.compile(r"[^A-Za-z0-9]")
-_HASH_LENGTH = 8
 
 # The calendar windows, as Grafana's relative times, from their start to now; and the time zone
 # they are taken in: AWS bills by the month in UTC.
@@ -143,86 +136,40 @@ HALF = 12
 BILLING_ROW = "The bill, month to date"
 
 
-def group_logical_id(pool: Pool) -> str:
-    """The logical ID of the pool's Auto Scaling group in the pools stack, by the CDK's rule: the
-    path's parts without what is not a letter or a digit, then the first 8 hexadecimal digits of
-    the MD5 of the path, in capitals."""
-    path = [part.format(pool=pool.name) for part in GROUP_PATH]
-    human = "".join(_NOT_ALPHANUMERIC.sub("", part) for part in path)
-    digest = hashlib.md5("/".join(path).encode(), usedforsecurity=False).hexdigest()
-    return human + digest[:_HASH_LENGTH].upper()
-
-
 def price(pool: Pool) -> float:
     """Dollars an hour: the configured price of the pool's first instance type."""
     return pool.prices[pool.instance_types[0]]
 
 
-def instance_minutes(pool: Pool) -> str:
-    """CloudWatch's metric math for the minutes the pool's instances ran in each period: the sum, in
-    every group found for the pool, of the two counts' one-minute data points."""
-    names = " OR ".join(f'MetricName="{name}"' for name in INSTANCE_COUNTS)
-    search = f"{{{AUTO_SCALING},{GROUP_DIMENSION}}} ({names}) {GROUP_DIMENSION}={group_logical_id(pool)}"
-    return f"SUM(SEARCH('{search}', 'Sum', {PERIOD}))"
-
-
-def gpu_hours(pool: Pool) -> str:
-    """The hours the pool's instances ran in each period."""
-    return f"{instance_minutes(pool)} / {MINUTES_AN_HOUR}"
-
-
-def dollars(pool: Pool) -> str:
-    """Those hours at the pool's price, in dollars."""
-    return f"{gpu_hours(pool)} * {price(pool)!r}"
-
-
-def output_tokens(pool: Pool) -> str:
-    """The output tokens the gateway settled for the pool over the panel's window, read at its end:
-    the increase of each series there at the window's start, and the latest value of each series
-    created inside it, which counts its first settlement, summed by pool."""
-    series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
-    at_start = f"{series} offset {WINDOW}"
-    there = f"sum by ({rules.POOL}) (increase({series}[{WINDOW}]) and {at_start})"
-    created = f"sum by ({rules.POOL}) (last_over_time({series}[{WINDOW}]) unless {at_start})"
-    return f"(({there}) + ({created})) or ({there}) or ({created})"
-
-
-def cloudwatch_math(expression: str, ref_id: str, *, hide: bool = False) -> cloudwatch_builders.MetricsQuery:
-    """A query of the CloudWatch data source, in its own region: metric math, in code."""
-    return (
-        cloudwatch_builders.MetricsQuery()
-        .query_mode(cloudwatch.QueryMode.METRICS)
-        .metric_query_type(cloudwatch.MetricQueryType.SEARCH)
-        .metric_editor_mode(cloudwatch.MetricEditorMode.CODE)
-        .expression(expression)
-        .id(ref_id.lower())
-        .ref_id(ref_id)
-        .region(OWN_REGION)
-        .period(str(PERIOD))
-        .hide(hide)
-        .datasource(rules.CLOUDWATCH)
-    )
-
-
-def charges(ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """The account's charge since the month began, in the one region AWS publishes it in."""
+def metric(namespace: str, name: str, dimensions: cloudwatch.Dimensions, ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """One metric of the CloudWatch data source, read by its namespace, name and dimensions exactly,
+    hidden: an expression computes from it."""
     return (
         cloudwatch_builders.MetricsQuery()
         .query_mode(cloudwatch.QueryMode.METRICS)
         .metric_query_type(cloudwatch.MetricQueryType.SEARCH)
         .metric_editor_mode(cloudwatch.MetricEditorMode.BUILDER)
-        .namespace(BILLING)
-        .metric_name(CHARGES)
-        .dimensions(CURRENCY)
+        .namespace(namespace)
+        .metric_name(name)
+        .dimensions(dimensions)
         .match_exact(True)
-        .statistic("Maximum")
         .id(ref_id.lower())
         .ref_id(ref_id)
-        .region(BILLING_REGION)
-        .period(str(BILLING_PERIOD))
         .hide(True)
         .datasource(rules.CLOUDWATCH)
     )
+
+
+def count(pool: Pool, name: str, ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """One count of the pool's group, in the endpoint's region: its instance-minutes in each period."""
+    dimensions: cloudwatch.Dimensions = {GROUP_DIMENSION: group_name(pool.name)}
+    return metric(AUTO_SCALING, name, dimensions, ref_id).statistic("Sum").region(OWN_REGION).period(str(PERIOD))
+
+
+def charges(ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """The account's charge since the month began, in the one region AWS publishes it in."""
+    query = metric(BILLING, CHARGES, CURRENCY, ref_id)
+    return query.statistic("Maximum").region(BILLING_REGION).period(str(BILLING_PERIOD))
 
 
 # The reductions a server-side expression is asked for.
@@ -243,13 +190,50 @@ def reduce(ref_id: str, of: str, reducer: Reducer, *, hide: bool = True) -> expr
     )
 
 
+def math(ref_id: str, expression: str, *, hide: bool = False) -> expr_builders.TypeMath:
+    """A server-side expression over the panel's numbers, shown unless `hide`."""
+    return expr_builders.TypeMath().expression(expression).ref_id(ref_id).hide(hide).datasource(rules.EXPRESSIONS)
+
+
+type Target = cloudwatch_builders.MetricsQuery | expr_builders.TypeReduce
+
+
+def hours(pool: Pool, suffix: str = "") -> tuple[list[Target], str]:
+    """The queries of the pool's two counts, each summed over the window, and the server-side
+    expression of the hours they add up to. `suffix` tells one pool's queries from another's."""
+    targets: list[Target] = []
+    sums = []
+    for name, letter in INSTANCE_COUNTS.items():
+        targets += [count(pool, name, letter + suffix), reduce(f"S{letter}{suffix}", letter + suffix, "sum")]
+        sums.append(f"$S{letter}{suffix}")
+    return targets, f"({' + '.join(sums)}) / {MINUTES_AN_HOUR}"
+
+
+def dollars(pool: Pool, suffix: str = "") -> tuple[list[Target], str]:
+    """The same queries, and the expression of those hours at the pool's price, in dollars."""
+    targets, expression = hours(pool, suffix)
+    return targets, f"{expression} * {price(pool)!r}"
+
+
+def output_tokens(pool: Pool) -> str:
+    """The output tokens the gateway settled for the pool over the panel's window, read at its end:
+    the increase of each series there at the window's start, and the latest value of each series
+    created inside it, which counts its first settlement, summed by pool."""
+    series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
+    at_start = f"{series} offset {WINDOW}"
+    there = f"sum by ({rules.POOL}) (increase({series}[{WINDOW}]) and {at_start})"
+    created = f"sum by ({rules.POOL}) (last_over_time({series}[{WINDOW}]) unless {at_start})"
+    return f"(({there}) + ({created})) or ({there}) or ({created})"
+
+
 def _one_colour() -> dashboard_builders.ThresholdsConfig:
     """One step, the base: no value is ever shown against a threshold."""
     steps = [models.Threshold(value=None, color=COLOR)]
     return dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps)
 
 
-def _stat(title: str, description: str, unit: str, calculation: str) -> stat_builders.Panel:
+def _stat(title: str, description: str, unit: str) -> stat_builders.Panel:
+    """A panel of the numbers its server-side expressions give, each its own."""
     return (
         stat_builders.Panel()
         .title(title)
@@ -259,8 +243,14 @@ def _stat(title: str, description: str, unit: str, calculation: str) -> stat_bui
         .thresholds(_one_colour())
         .color_mode(common.BigValueColorMode.NONE)
         .graph_mode(common.BigValueGraphMode.NONE)
-        .reduce_options(common_builders.ReduceDataOptions().calcs([calculation]))
+        .reduce_options(common_builders.ReduceDataOptions().calcs(["lastNotNull"]))
     )
+
+
+def _with[P: stat_builders.Panel](panel: P, targets: list[Target]) -> P:
+    for target in targets:
+        panel.with_target(target)
+    return panel
 
 
 _CALENDAR = {
@@ -277,8 +267,9 @@ def hours_stat(pool: Pool, window: str) -> stat_builders.Panel:
         f"The hours of the pool's running instances, warm-pool preparation included, {since} to now: "
         f"Auto Scaling's {' plus '.join(INSTANCE_COUNTS)}. {_FIXED_RANGE}"
     )
-    panel = _stat(f"GPU-hours {name}, estimate", description, COUNT, "sum").datasource(rules.CLOUDWATCH)
-    return panel.time_from(window).with_target(cloudwatch_math(gpu_hours(pool), "A"))
+    targets, expression = hours(pool)
+    panel = _stat(f"GPU-hours {name}, estimate", description, COUNT).datasource(rules.CLOUDWATCH)
+    return _with(panel.time_from(window), targets).with_target(math("H", expression))
 
 
 def dollars_stat(pool: Pool, window: str) -> stat_builders.Panel:
@@ -288,8 +279,9 @@ def dollars_stat(pool: Pool, window: str) -> stat_builders.Panel:
         f"The GPU-hours {since} to now, at ${price(pool)!r} an hour, the configured price of "
         f"{pool.instance_types[0]}. {_FIXED_RANGE}"
     )
-    panel = _stat(f"Cost {name}, estimate", description, USD, "sum").datasource(rules.CLOUDWATCH)
-    return panel.time_from(window).with_target(cloudwatch_math(dollars(pool), "A"))
+    targets, expression = dollars(pool)
+    panel = _stat(f"Cost {name}, estimate", description, USD).datasource(rules.CLOUDWATCH)
+    return _with(panel.time_from(window), targets).with_target(math("E", expression))
 
 
 def per_million_stat(pool: Pool, window: str | None) -> stat_builders.Panel:
@@ -304,47 +296,40 @@ def per_million_stat(pool: Pool, window: str | None) -> stat_builders.Panel:
         f"The estimated cost of the pool's instances, at ${price(pool)!r} an hour, over the output tokens "
         f"the gateway settled for the pool, in millions, {over}"
     )
-    panel = (
-        _stat(title, description, USD, "lastNotNull")
-        .datasource(rules.MIXED)
-        .with_target(cloudwatch_math(dollars(pool), "A", hide=True))
-        .with_target(rules.query(output_tokens(pool), "tokens", "B", instant=True).hide(True))
-        .with_target(reduce("C", "A", "sum"))
-        .with_target(reduce("D", "B", "last"))
-        .with_target(
-            expr_builders.TypeMath()
-            .expression("$C / ($D / 1000000)")
-            .ref_id("E")
-            .datasource(rules.EXPRESSIONS)
-        )
-    )
+    targets, expression = dollars(pool)
+    panel = _with(_stat(title, description, USD).datasource(rules.MIXED), targets)
+    panel.with_target(rules.query(output_tokens(pool), "tokens", "B", instant=True).hide(True))
+    panel.with_target(reduce("D", "B", "last"))
+    panel.with_target(math("E", f"{expression} / ($D / 1000000)"))
     return panel if window is None else panel.time_from(window)
 
 
 def bill_stat(config: Config) -> stat_builders.Panel:
     """The account's month-to-date charge, beside the month's estimate over every pool."""
-    estimate = " + ".join(f"({dollars(pool)})" for pool in config.pools)
     description = (
         "The account's charge since the month began, from CloudWatch's billing metric in US East "
         "(N. Virginia), beside the estimated cost of every pool's instances over the same month, "
         f"in UTC. The bill also holds the always-on platform, storage and traffic. {_FIXED_RANGE}"
     )
-    shown = {"C": "AWS charge, month to date", "D": "Instances, month to date, estimate"}
     panel = (
-        _stat("The bill beside the estimate, month to date", description, USD, "lastNotNull")
+        _stat("The bill beside the estimate, month to date", description, USD)
         .datasource(rules.CLOUDWATCH)
         .time_from(THIS_MONTH)
         .with_target(charges("A"))
+        # The latest reading: AWS may lower its estimate of the month.
+        .with_target(reduce("C", "A", "last", hide=False))
+        .override_by_query("C", [models.DynamicConfigValue(id_val="displayName", value="AWS charge, month to date")])
     )
+    estimates = []
+    for index, pool in enumerate(config.pools):
+        targets, expression = dollars(pool, str(index))
+        _with(panel, targets)
+        estimates.append(f"({expression})")
     # With no pool, there is no instance to estimate.
-    if estimate:
-        panel.with_target(cloudwatch_math(estimate, "B", hide=True))
-    # The latest reading: AWS may lower its estimate of the month.
-    panel.with_target(reduce("C", "A", "last", hide=False))
-    if estimate:
-        panel.with_target(reduce("D", "B", "sum", hide=False))
-    for ref_id, name in shown.items():
-        panel.override_by_query(ref_id, [models.DynamicConfigValue(id_val="displayName", value=name)])
+    if estimates:
+        panel.with_target(math("D", " + ".join(estimates)))
+        shown = [models.DynamicConfigValue(id_val="displayName", value="Instances, month to date, estimate")]
+        panel.override_by_query("D", shown)
     return panel
 
 

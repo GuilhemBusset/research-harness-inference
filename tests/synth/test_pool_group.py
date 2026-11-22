@@ -97,15 +97,13 @@ def test_the_mock_pool_group(pools: dict[str, Any], group: tuple[str, dict[str, 
     assert of_type(pools, "AWS::AutoScaling::ScalingPolicy") == {}
 
 
-def test_the_cost_dashboard_finds_each_pools_group_by_its_logical_id(pools: dict[str, Any]) -> None:
-    """CloudFormation names a group after its logical ID, which the cost dashboard searches for."""
-    from rhi_dashboards import cost
-
+def test_each_pools_group_has_the_fixed_name_the_cost_dashboard_reads(pools: dict[str, Any]) -> None:
+    """A group deleted and created again keeps its name, so its metrics keep theirs."""
     groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
-    assert len(groups) == len(EXAMPLE.pools) == 2
+    names = {properties["AutoScalingGroupName"]: properties["Tags"] for properties in groups.values()}
+    assert len(names) == len(groups) == len(EXAMPLE.pools) == 2
     for pool in EXAMPLE.pools:
-        properties = groups[cost.group_logical_id(pool)]
-        assert [tag["Value"] for tag in properties["Tags"] if tag["Key"] == "rhi-pool"] == [pool.name]
+        assert [tag["Value"] for tag in names[f"rhi-pool-{pool.name}"] if tag["Key"] == "rhi-pool"] == [pool.name]
 
 
 def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(

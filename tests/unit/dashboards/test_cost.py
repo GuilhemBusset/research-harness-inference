@@ -15,8 +15,7 @@ from rhi_gateway import metrics
 from rhi_gateway.telemetry import RequestRecord
 
 REPO = Path(__file__).resolve().parents[3]
-# One SEARCH of Auto Scaling's group metrics: what it searches, then its statistic and period.
-SEARCH = re.compile(r"SEARCH\('(?P<terms>[^']*)', '(?P<statistic>\w+)', (?P<period>\d+)\)")
+COUNTS = {"GroupTotalInstances", "WarmPoolPendingCapacity"}
 
 
 @pytest.fixture
@@ -44,9 +43,14 @@ def of_type(panel: dict[str, Any], source: str) -> list[dict[str, Any]]:
     return [target for target in panel["targets"] if target["datasource"]["type"] == source]
 
 
-def searches(panel: dict[str, Any]) -> list[re.Match[str]]:
-    """Every SEARCH in the panel's CloudWatch metric math."""
-    return [found for one in of_type(panel, "cloudwatch") for found in SEARCH.finditer(one.get("expression", ""))]
+def counts(panel: dict[str, Any]) -> list[dict[str, Any]]:
+    """The panel's queries of Auto Scaling's group metrics."""
+    return [one for one in of_type(panel, "cloudwatch") if one.get("namespace") == "AWS/AutoScaling"]
+
+
+def shown(panel: dict[str, Any]) -> dict[str, str]:
+    """The expression of each query the panel shows, by its reference."""
+    return {one["refId"]: one.get("expression", "") for one in panel["targets"] if not one.get("hide")}
 
 
 def example_price(pool: str) -> float:
@@ -61,43 +65,43 @@ def test_each_pool_has_its_row_and_the_bill_its_own(example: rhi_config.Config) 
 
 
 def test_every_panel_from_the_instance_count_says_estimate(example: rhi_config.Config) -> None:
-    from_the_count = [panel for panel in every_panel(example) if searches(panel)]
+    from_the_count = [panel for panel in every_panel(example) if counts(panel)]
     # Every panel of a pool's row, and the bill's, which holds the month's estimate.
     assert len(from_the_count) == 6 * len(example.pools) + 1
     assert all("estimate" in panel["title"].lower() for panel in from_the_count)
 
 
-def test_the_gpu_hours_read_both_counts_of_each_pools_group(example: rhi_config.Config) -> None:
+def test_the_gpu_hours_read_both_counts_of_each_pools_group_by_its_name(example: rhi_config.Config) -> None:
     for pool in example.pools:
-        others = [cost.group_logical_id(other) for other in example.pools if other != pool]
         for panel in rows(example)[pool.name]:
-            for search in searches(panel):
-                terms = search["terms"]
-                assert terms.startswith("{AWS/AutoScaling,AutoScalingGroupName} ")
-                assert '(MetricName="GroupTotalInstances" OR MetricName="WarmPoolPendingCapacity")' in terms
-                assert terms.endswith(f" AutoScalingGroupName={cost.group_logical_id(pool)}")
-                assert not any(other in terms for other in others)
-                # Each one-minute point is the count in its minute: summed, then in hours.
-                assert search["statistic"] == "Sum"
-                assert f"{search[0]}) / 60" in panel["targets"][0]["expression"]
+            read = counts(panel)
+            assert {one["metricName"] for one in read} == COUNTS and len(read) == 2
+            for one in read:
+                # One metric, read exactly by the group's fixed name: CloudWatch answers with every
+                # point it keeps in the window, a group deleted and created again included. No
+                # search, which finds only what reported in the past two weeks.
+                assert (one["dimensions"], one["matchExact"]) == ({"AutoScalingGroupName": f"rhi-pool-{pool.name}"}, True)
+                assert "expression" not in one and "sqlExpression" not in one
+                # Each one-minute point is the count in its minute: summed over the window.
+                assert (one["statistic"], one["hide"]) == ("Sum", True)
+            by_ref = {one["refId"]: one for one in panel["targets"]}
+            assert {by_ref[ref]["expression"]: by_ref[ref]["reducer"] for ref in ("ST", "SW")} == {"$T": "sum", "$W": "sum"}
+            assert {by_ref[ref]["metricName"] for ref in ("T", "W")} == COUNTS
         hours = [panel for panel in rows(example)[pool.name] if panel["title"].startswith("GPU-hours")]
-        # The day and the month so far, each summed over its hours.
+        # The day and the month so far, in hours.
         assert [panel["timeFrom"] for panel in hours] == ["now/d", "now/M"]
-        assert all(panel["options"]["reduceOptions"]["calcs"] == ["sum"] for panel in hours)
+        assert all(shown(panel) == {"H": "($ST + $SW) / 60"} for panel in hours)
 
 
 def test_the_price_is_the_example_configurations(example: rhi_config.Config) -> None:
     assert {pool.name: example_price(pool.name) for pool in example.pools} == {"coursework": 3.36, "mock": 0.02}
     for pool in example.pools:
         for panel in rows(example)[pool.name]:
-            if panel["title"].startswith("GPU-hours"):
-                continue
-            (dollars,) = of_type(panel, "cloudwatch")
-            (shown,) = re.findall(r"\* ([0-9.]+)$", dollars["expression"])
-            assert float(shown) == example_price(pool.name)
+            if panel["title"].startswith("Cost"):
+                (expression,) = shown(panel).values()
+                assert f"($ST + $SW) / 60 * {example_price(pool.name)!r}" in expression
     (bill,) = rows(example)[cost.BILLING_ROW]
-    (estimate,) = [one for one in of_type(bill, "cloudwatch") if "expression" in one]
-    assert sorted(float(one) for one in re.findall(r"\* ([0-9.]+)\)", estimate["expression"])) == [0.02, 3.36]
+    assert shown(bill)["D"] == "(($ST0 + $SW0) / 60 * 3.36) + (($ST1 + $SW1) / 60 * 0.02)"
 
 
 def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_millions(
@@ -110,11 +114,8 @@ def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_m
         for panel in per_million:
             assert panel["datasource"] == {"type": "datasource", "uid": "-- Mixed --"}
             by_ref = {target["refId"]: target for target in panel["targets"]}
-            assert [ref for ref, target in by_ref.items() if not target.get("hide")] == ["E"]
-            assert by_ref["E"]["expression"] == "$C / ($D / 1000000)"
-            assert (by_ref["C"]["expression"], by_ref["C"]["reducer"]) == ("$A", "sum")
-            assert by_ref["D"]["expression"] == "$B"
-            assert by_ref["A"]["expression"] == cost.dollars(pool)
+            assert shown(panel) == {"E": f"($ST + $SW) / 60 * {example_price(pool.name)!r} / ($D / 1000000)"}
+            assert (by_ref["D"]["expression"], by_ref["D"]["reducer"]) == ("$B", "last")
             assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (cost.output_tokens(pool), True)
 
 
@@ -159,14 +160,13 @@ def test_exactly_one_panel_reads_the_billing_metric_in_us_east_1_beside_the_mont
     assert charge["region"] == "us-east-1"
     assert panel["timeFrom"] == "now/M"
     # Beside it, shown, the estimate of every pool's group over the same month.
-    by_ref = {target["refId"]: target for target in panel["targets"]}
-    shown = {ref: target["expression"] for ref, target in by_ref.items() if not target.get("hide")}
-    assert shown == {"C": f"${charge['refId']}", "D": "$B"}
+    assert set(shown(panel)) == {"C", "D"} and shown(panel)["C"] == f"${charge['refId']}"
     # The latest reading of the charge, not its highest: AWS may lower its estimate of the month.
-    assert charge["hide"] is True
+    by_ref = {target["refId"]: target for target in panel["targets"]}
+    assert (charge["statistic"], charge["hide"]) == ("Maximum", True)
     assert (by_ref["C"]["reducer"], by_ref["C"]["settings"]["mode"]) == ("last", "dropNN")
-    assert {search["terms"].rpartition("=")[2] for search in searches(panel)} == {
-        cost.group_logical_id(pool) for pool in example.pools
+    assert {one["dimensions"]["AutoScalingGroupName"] for one in counts(panel)} == {
+        f"rhi-pool-{pool.name}" for pool in example.pools
     }
     # Every other CloudWatch query reads the endpoint's own region.
     others = [
