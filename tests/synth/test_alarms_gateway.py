@@ -98,6 +98,8 @@ def test_the_alarm_compares_the_failed_share_of_the_load_balancers_requests_with
     # The two 5xx counts over the requests that reached a target: one 504 in 19 such requests breaches.
     assert share(alarm, own=None, elb5xx=1.0, requests=19.0) == 100 / 19
     assert share(alarm, own=50.0, elb5xx=None, requests=1000.0) == 5
+    # Both sources in the same period add up: 3 + 3 failures in 100 requests is 6%, and breaches.
+    assert share(alarm, own=3.0, elb5xx=3.0, requests=100.0) == 6
     # A gateway at zero tasks: no request reaches a target, and the load balancer answers all of them.
     assert share(alarm, own=None, elb5xx=40.0, requests=None) == 100
     assert share(alarm, own=None, elb5xx=40.0, requests=0.0) == 100
