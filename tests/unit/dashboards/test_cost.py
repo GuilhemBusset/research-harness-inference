@@ -12,6 +12,7 @@ import pytest
 from rhi import config as rhi_config
 from rhi_dashboards import build, check, cost, rules
 from rhi_gateway import metrics
+from rhi_gateway.telemetry import RequestRecord
 
 REPO = Path(__file__).resolve().parents[3]
 # One SEARCH of Auto Scaling's group metrics: what it searches, then its statistic and period.
@@ -114,8 +115,23 @@ def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_m
             assert (by_ref["C"]["expression"], by_ref["C"]["reducer"]) == ("$A", "sum")
             assert by_ref["D"]["expression"] == "$B"
             assert by_ref["A"]["expression"] == cost.dollars(pool)
-            tokens = rules.increase(f"{metrics.OUTPUT_TOKENS}_total", {"pool": pool.name}, window="$__range")
-            assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (tokens, True)
+            assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (cost.output_tokens(pool), True)
+
+
+def test_the_tokens_count_the_first_settlement_of_a_series_created_in_the_window(example: rhi_config.Config) -> None:
+    pool = example.pools[0].name
+    # The gateway creates an alias's series on its first settlement, already holding its tokens.
+    gateway = metrics.Metrics()
+    series, labels = f"{metrics.OUTPUT_TOKENS}_total", {"pool": pool, "alias": "student-example"}
+    assert gateway.registry.get_sample_value(series, labels) is None
+    gateway.count(RequestRecord(time="", wire_format=None, pool=pool, alias="student-example", output_tokens=100))
+    assert gateway.registry.get_sample_value(series, labels) == 100
+    # So a series with no sample at the window's start counts its latest value, its increase only
+    # a series that was there; both summed by pool.
+    selected = rules.selector(series, {"pool": pool})
+    there = f"sum by (pool) (increase({selected}[$__range]) and {selected} offset $__range)"
+    created = f"sum by (pool) (last_over_time({selected}[$__range]) unless {selected} offset $__range)"
+    assert cost.output_tokens(example.pools[0]) == f"(({there}) + ({created})) or ({there}) or ({created})"
 
 
 def test_no_panel_shows_a_ceiling(example: rhi_config.Config) -> None:
@@ -146,6 +162,9 @@ def test_exactly_one_panel_reads_the_billing_metric_in_us_east_1_beside_the_mont
     by_ref = {target["refId"]: target for target in panel["targets"]}
     shown = {ref: target["expression"] for ref, target in by_ref.items() if not target.get("hide")}
     assert shown == {"C": f"${charge['refId']}", "D": "$B"}
+    # The latest reading of the charge, not its highest: AWS may lower its estimate of the month.
+    assert charge["hide"] is True
+    assert (by_ref["C"]["reducer"], by_ref["C"]["settings"]["mode"]) == ("last", "dropNN")
     assert {search["terms"].rpartition("=")[2] for search in searches(panel)} == {
         cost.group_logical_id(pool) for pool in example.pools
     }

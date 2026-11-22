@@ -33,18 +33,23 @@ name, the group's logical ID and a random suffix, so its name is known only in t
 logical ID is the CDK's, from the construct path `rhi.pools.stack` gives the group
 (`group_logical_id`), and a CloudWatch search on it, within the dimension `AutoScalingGroupName`,
 finds that pool's group, and a replaced group of the same pool too, whose hours the pool also ran.
+A search finds only the metrics that reported in the past two weeks: the group in place publishes
+every minute, at zero instances too, but a group deleted more than two weeks ago (with its pools
+stack) is no longer found, and its hours are then in the bill alone.
 
 **The price is the hourly price the configuration gives the pool's first instance type**, the one
 the group launches first (section 5.4): a fallback type launched in its place is counted at that
 price too. The dollars are the hours times it.
 
 **The tokens are the output tokens the gateway settled for the pool**
-(`rhi_gateway_student_output_tokens_total`, `rhi_gateway.metrics`), the increase of each series
-over the window, then summed (section 7.2, first rule): an instance's price is over what it
-produced, its output (section 4.7). A series a task starts in the window has no sample before its
-first, so the first settlement it counts is not in the increase: the tokens are a little under
-what was settled, and the cost per million a little over. Grafana's server-side expressions divide
-the dollars, from CloudWatch, by the tokens, from Prometheus, in millions.
+(`rhi_gateway_student_output_tokens_total`, `rhi_gateway.metrics`): an instance's price is over what
+it produced, its output (section 4.7). Each series is counted on its own, then summed by pool
+(section 7.2, first rule). A series that was there at the window's start counts its increase over
+the window. A series the gateway creates inside the window, on its first settlement for an alias
+(a new alias, a new task), has no sample before that settlement, so its increase would leave the
+settlement out, and a first settlement followed by none would count nothing: such a series counts
+its latest value instead, every token it settled since it was created. Grafana's server-side
+expressions divide the dollars, from CloudWatch, by the tokens, from Prometheus, in millions.
 
 **The calendar windows are the panel's own**: "today" is from the start of the day to now, "this
 month" from the start of the month to now, in UTC, as AWS bills. Grafana gives a panel its own
@@ -61,7 +66,8 @@ East (N. Virginia) only, whatever region the endpoint is in, so that query names
 `us-east-1`; the instances' queries read the data source's own region, the endpoint's. AWS
 publishes it only once billing alerts are on, the owner's fifth one-time step (section 8.6). It
 holds what the instances' estimate leaves out: the always-on platform, about $170 a month at idle
-(section 11.2), storage, traffic.
+(section 11.2), storage, traffic. AWS updates it several times a day, and may lower it: the panel
+shows its latest reading, not its highest.
 
 **No panel shows a ceiling**: there are no GPU-hour ceilings (section 11.3). Every panel has one
 colour: its thresholds hold the base step alone, where Grafana's default would turn red at 80.
@@ -110,7 +116,8 @@ BILLING_REGION = "us-east-1"
 BILLING = "AWS/Billing"
 CHARGES = "EstimatedCharges"
 CURRENCY: cloudwatch.Dimensions = {"Currency": "USD"}
-BILLING_PERIOD = 21600
+# An hour: one reading or none in most periods, so that a period's maximum is its reading.
+BILLING_PERIOD = 3600
 # The data source's own region: the endpoint's.
 OWN_REGION = "default"
 
@@ -124,6 +131,8 @@ _HASH_LENGTH = 8
 TODAY = "now/d"
 THIS_MONTH = "now/M"
 TIME_ZONE = "utc"
+# The panel's window, as Grafana gives it to a Prometheus query.
+WINDOW = "$__range"
 
 # Every number is one colour, with no threshold: nothing is a ceiling.
 COLOR = "blue"
@@ -168,8 +177,14 @@ def dollars(pool: Pool) -> str:
 
 
 def output_tokens(pool: Pool) -> str:
-    """The output tokens the gateway settled for the pool over the panel's window."""
-    return rules.increase(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name}, window="$__range")
+    """The output tokens the gateway settled for the pool over the panel's window, read at its end:
+    the increase of each series there at the window's start, and the latest value of each series
+    created inside it, which counts its first settlement, summed by pool."""
+    series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
+    at_start = f"{series} offset {WINDOW}"
+    there = f"sum by ({rules.POOL}) (increase({series}[{WINDOW}]) and {at_start})"
+    created = f"sum by ({rules.POOL}) (last_over_time({series}[{WINDOW}]) unless {at_start})"
+    return f"(({there}) + ({created})) or ({there}) or ({created})"
 
 
 def cloudwatch_math(expression: str, ref_id: str, *, hide: bool = False) -> cloudwatch_builders.MetricsQuery:
@@ -211,15 +226,17 @@ def charges(ref_id: str) -> cloudwatch_builders.MetricsQuery:
 
 
 # The reductions a server-side expression is asked for.
-type Reducer = Literal["sum", "max", "last"]
+type Reducer = Literal["sum", "last"]
 
 
 def reduce(ref_id: str, of: str, reducer: Reducer, *, hide: bool = True) -> expr_builders.TypeReduce:
-    """A server-side expression: the query `of` reduced to one number, shown unless `hide`."""
+    """A server-side expression: the query `of` reduced to one number, what is not a number left
+    out, shown unless `hide`."""
     return (
         expr_builders.TypeReduce()
         .expression(f"${of}")
         .reducer(reducer)
+        .settings(expr_builders.ExprTypeReduceSettings().mode("dropNN"))
         .ref_id(ref_id)
         .hide(hide)
         .datasource(rules.EXPRESSIONS)
@@ -322,7 +339,8 @@ def bill_stat(config: Config) -> stat_builders.Panel:
     # With no pool, there is no instance to estimate.
     if estimate:
         panel.with_target(cloudwatch_math(estimate, "B", hide=True))
-    panel.with_target(reduce("C", "A", "max", hide=False))
+    # The latest reading: AWS may lower its estimate of the month.
+    panel.with_target(reduce("C", "A", "last", hide=False))
     if estimate:
         panel.with_target(reduce("D", "B", "sum", hide=False))
     for ref_id, name in shown.items():
