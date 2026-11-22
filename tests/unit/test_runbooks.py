@@ -85,12 +85,32 @@ CONTROL = {"|", "||", "&&", ";"}
 REDIRECTION = {">", ">>", "<", "2>"}
 
 
+def uncommented(line: str) -> str:
+    """The line without its comment. As in the shell, an unquoted `#` starts one only where a word
+    starts (after a blank or an operator character), so `report#draft` is one word."""
+    quote, escaped = "", False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1] in " \t|&;<>()"):
+            return line[:index]
+    return line
+
+
 def split(line: str) -> list[tuple[str, bool]]:
-    """The words of a shell line, as `shlex.split` gives them, each with whether it is an operator:
-    a control operator or a redirection the shell reads as one, unquoted. A quoted `'|'` is a word."""
+    """The words of a shell line, less its comment, as `shlex.split` gives them, each with whether it
+    is an operator: a control operator or a redirection the shell reads as one, unquoted. A quoted
+    `'|'` is a word."""
+    line = uncommented(line)
     stream = io.StringIO(line)
     lexer = shlex.shlex(stream, posix=True)
-    lexer.whitespace_split, lexer.commenters = True, "#"
+    lexer.whitespace_split, lexer.commenters = True, ""
     found, start = [], 0
     for word in lexer:
         end = stream.tell()
@@ -155,6 +175,9 @@ def test_detects_an_unknown_command() -> None:
     assert problems(sections + redirected) == ["the rhi CLI refuses: rhi frobnicate"]
     # A quoted operator is an argument, which the CLI is given.
     assert problems(sections + "```sh\nrhi status '|'\n```\n") == ["the rhi CLI refuses: rhi status '|'"]
+    # A `#` inside a word starts no comment, so what follows it is still given to the CLI.
+    hashed = "```sh\nrhi status > report#draft unexpected\nrhi status # a comment\n```\n"
+    assert problems(sections + hashed) == ["the rhi CLI refuses: rhi status unexpected"]
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:

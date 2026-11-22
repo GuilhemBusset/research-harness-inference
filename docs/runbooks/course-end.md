@@ -117,33 +117,44 @@ that `rhi_admin roster list` prints.
 3. **Erase each student's data,** once their export, if any, read `exported`:
 
    ```sh
-   rhi_admin privacy erase 1234567
+   rhi_admin privacy erase 1234567 && echo "1234567: erased" || echo "1234567: NOT erased"
    ```
 
    The erase deletes the roster entry, revokes and deletes every key, and deletes every usage row
    with its affinity cookies. It waits about two minutes on each student, for the logins and the
-   gateway's cache it outwaits, so it is run for one student after the other. It prints what it
-   deleted, then what only retention removes: the workspace's series under the alias, the
-   gateway's log records under it, and the load balancers' and web ACL's logs, which no student can
-   be tied to. With the entry gone, the alias names nobody, and no new entry is given it until that
-   data has expired. When it prints that rows of the student were written during the erase, run it
-   again for that student.
+   gateway's cache it outwaits, so it is run for one student after the other. On success it exits
+   with status 0, prints `Erased 1234567:` and what it deleted, then what only retention removes:
+   the workspace's series under the alias, the gateway's log records under it, and the load
+   balancers' and web ACL's logs, which no student can be tied to; and the line ends with
+   `1234567: erased`. With the entry gone, the alias names nobody, and no new entry is given it
+   until that data has expired.
+
+   **An erase that did not end with `erased` is not complete,** whatever else looks done. The
+   erase removes the roster entry first and deletes the keys and the usage rows only after its
+   wait, so one that was interrupted (Ctrl-C, a closed terminal, expired credentials) or that
+   printed `Refused:` (such as `rows of the student were written during the erase: run it
+   again`) can leave keys and usage rows behind a roster entry that is already gone. Run the same
+   line again for that student, even though `rhi_admin roster list` no longer shows them: an erase
+   takes an interrupted one over and deletes what is left. Repeat until it ends with `erased`.
 
    **Check the erases now,** before step 4: the admin CLI finds its tables through the stage's
-   stacks, so once the stage is deleted it cannot run. The roster holds the canary's entry and the
-   spikes' students only, or nothing at all:
+   stacks, so once the stage is deleted it cannot run. The roster and a refused export are not
+   enough, since an interrupted erase passes both. For each student, run the erase once more; it
+   must be refused because nothing of the student is left:
+
+   ```sh
+   rhi_admin privacy erase 1234567
+   ```
+
+   It prints `Refused: that GitHub ID has no roster entry, no key and no usage row.` and deletes
+   nothing. Any other end means something of the student was left: this run erases it, and you
+   run the check again until it is refused that way. Every student must pass this check before you
+   park or delete the stage. The roster then holds the canary's entry and the spikes' students
+   only, or nothing at all:
 
    ```sh
    rhi_admin roster list
    ```
-
-   and an export of each erased student is refused, since the entry is gone:
-
-   ```sh
-   rhi_admin privacy export 1234567
-   ```
-
-   It prints `Refused: that GitHub ID is not on the roster.`
 
 4. **Park or delete the stage.**
 
@@ -160,19 +171,38 @@ that `rhi_admin roster list` prints.
    pipeline stack `RhiPipeline`, and the stage's stacks `Rhi-Network`, `Rhi-Access`,
    `Rhi-Observability`, `Rhi-Pools`, `Rhi-Gateway` and `Rhi-Guardrails`.
 
-   a. **Write down what the stacks retain.** The tables, the buckets, the admin's sign-in and the
-      workspace are retained when their stack is deleted, so that no deployment can delete them by
-      mistake (section 8.5). List them before the stacks go, since their stacks are what names them;
-      read the list in your terminal and never paste it anywhere:
+   a. **Write down what the stacks retain.** Some resources are retained when their stack is
+      deleted, so that no deployment can delete them by mistake (section 8.5): the tables, the
+      buckets, the admin's sign-in and the workspace, and, besides them, a log group and a key. List
+      every one before the stacks go, since their stacks are what names them. The list is read from
+      each deployed template's deletion policies, so it holds whatever the deployed stacks retain;
+      read it in your terminal and never paste it anywhere:
 
       ```sh
-      for stack in Rhi-Access Rhi-Pools Rhi-Observability Rhi-Network; do aws cloudformation describe-stack-resources --stack-name "$stack" --query "StackResources[?ResourceType=='AWS::DynamoDB::Table' || ResourceType=='AWS::S3::Bucket' || ResourceType=='AWS::Cognito::UserPool' || ResourceType=='AWS::APS::Workspace'].[ResourceType,PhysicalResourceId]" --output text; done
+      for stack in RhiPipeline Rhi-Network Rhi-Access Rhi-Observability Rhi-Pools Rhi-Gateway Rhi-Guardrails; do
+        for id in $(aws cloudformation get-template --stack-name "$stack" --query TemplateBody --output json | jq -r '.Resources | to_entries[] | select(.value.DeletionPolicy == "Retain" or .value.DeletionPolicy == "RetainExceptOnCreate") | .key'); do
+          aws cloudformation describe-stack-resource --stack-name "$stack" --logical-resource-id "$id" --query 'StackResourceDetail.[StackName,ResourceType,PhysicalResourceId]' --output text
+        done
+      done
       ```
 
-      Each line is a type and an identifier: a table's name, a bucket's name, the user pool's ID,
-      and, for the workspace, its ARN, whose last part, after `workspace/`, is the workspace's ID
-      (the admin CLI reads it the same way). Steps d and the Verify section use these identifiers,
-      and only these.
+      Each line is a stack, a type and an identifier. With the example configuration they are:
+
+      | Stack | Type | What it is | Holds a student's data |
+      | --- | --- | --- | --- |
+      | `Rhi-Access` | `AWS::DynamoDB::Table`, three | The keys, roster and usage tables | Yes |
+      | `Rhi-Pools` | `AWS::DynamoDB::Table`, two | The pools' state and heartbeats | No |
+      | `Rhi-Access` | `AWS::Cognito::UserPool`, `AWS::Cognito::UserPoolUser` | The admin's sign-in to Grafana, and the admin in it | No |
+      | `Rhi-Observability` | `AWS::APS::Workspace` | The Prometheus workspace; its identifier is an ARN, whose last part, after `workspace/`, is the workspace's ID (the admin CLI reads it the same way) | Yes |
+      | `Rhi-Network` | `AWS::S3::Bucket` | The load balancers' access logs | Yes |
+      | `Rhi-Pools` | `AWS::S3::Bucket` | The model bucket | No |
+      | `Rhi-Pools` | `AWS::Logs::LogGroup` | The retained log group `/aws/lambda/...` of the function a custom resource of the stack runs, 90 days' retention | No |
+      | `Rhi-Guardrails` | `AWS::KMS::Key` | The alerts key, which encrypts the alerts topic | No |
+      | `RhiPipeline` | `AWS::S3::Bucket` | The pipeline's artifact bucket | No |
+      | `RhiPipeline` | `AWS::Logs::LogGroup` | The log group of the pipeline's permissions check | No |
+
+      A line that is not in this table is retained too: it is deleted or kept like the line of its
+      type in step d. Steps d and the Verify section use these identifiers, and only these.
 
    b. **Delete the pipeline stack first.** Otherwise the next merge to `main` deploys the stage
       again:
@@ -190,19 +220,37 @@ that `rhi_admin roster list` prints.
 
       The loop stops at the first stack that does not delete; read its events in the
       CloudFormation console, fix the cause, and run the loop again. The log groups of the stage,
-      the gateway's included, go with their stacks, and their records with them.
+      the gateway's included, go with their stacks, and their records with them, all but the
+      retained log groups of step a, which step d deletes.
 
-   d. **Delete what the stacks retained,** each name from step a in place of the placeholder. The
-      five tables, each first without its deletion protection:
+   d. **Delete what the stacks retained,** each identifier from step a in place of the
+      placeholder. Each one you decide to keep instead (the model bucket for a later deployment,
+      say), write down with the reason: the Verify section expects it to be there, and only those.
+      A resource that holds a student's data (step a's last column) is not kept.
+
+      The five tables. For each, remove its deletion protection, and wait until the table is
+      active again with the protection off: the update is asynchronous, and DynamoDB refuses to
+      delete a table that is still updating. The wait returns once the table is active, and the
+      description must then read `ACTIVE` and `False`:
 
       ```sh
       aws dynamodb update-table --table-name <table> --no-deletion-protection-enabled
-      aws dynamodb delete-table --table-name <table>
+      aws dynamodb wait table-exists --table-name <table>
+      aws dynamodb describe-table --table-name <table> --query 'Table.[TableStatus,DeletionProtectionEnabled]' --output text
       ```
 
-      A table with point-in-time recovery leaves a system backup when it is deleted, which
-      DynamoDB keeps for 35 days. For each table of step a, and no other, list its system backups
-      by the table's name, then delete each backup that lists:
+      Only then delete it, and wait until the deletion has completed, which is also asynchronous:
+
+      ```sh
+      aws dynamodb delete-table --table-name <table>
+      aws dynamodb wait table-not-exists --table-name <table>
+      ```
+
+      A table with point-in-time recovery leaves a system backup when its deletion completes, which
+      DynamoDB keeps for 35 days. Once the wait above has returned, for each table of step a, and
+      no other, list its system backups by the table's name, then delete each backup that lists.
+      Should a deleted table list none yet, list it again a few minutes later: the Verify section
+      lists them once more.
 
       ```sh
       aws dynamodb list-backups --table-name <table> --backup-type SYSTEM --query 'BackupSummaries[].BackupArn' --output text
@@ -210,6 +258,22 @@ that `rhi_admin roster list` prints.
       ```
 
       A backup of a table that step a did not list is not the stage's: leave it.
+
+      The retained log groups, each by its name from step a (the `/aws/lambda/...` group of
+      `Rhi-Pools` and the permissions check's group of `RhiPipeline`). Neither holds a student's
+      data; deleting them removes their records at once, rather than after their retention:
+
+      ```sh
+      aws logs delete-log-group --log-group-name <log-group>
+      ```
+
+      The alerts key of `Rhi-Guardrails`, by its key ID from step a. Nothing uses it once its stack
+      is deleted. KMS deletes a key only after a waiting period, at least 7 days, during which it
+      can still be cancelled:
+
+      ```sh
+      aws kms schedule-key-deletion --key-id <key> --pending-window-in-days 7
+      ```
 
       The workspace, by its workspace ID from step a (the end of its ARN, not the whole ARN):
 
@@ -229,7 +293,8 @@ that `rhi_admin roster list` prints.
       aws cognito-idp delete-user-pool --user-pool-id <user-pool>
       ```
 
-      The two buckets, the access logs' and the model bucket, each emptied first:
+      The three buckets, the access logs', the model bucket and the pipeline's artifact bucket,
+      each emptied first:
 
       ```sh
       aws s3 rm s3://<bucket> --recursive
@@ -238,9 +303,8 @@ that `rhi_admin roster list` prints.
 
    e. **What is left is the owner's,** outside the stage, and holds no student's data: the
       configuration in SSM and the image parameters `/rhi/images/<pool>`; the secrets the admin
-      CLI wrote, `rhi/canary-key` and `rhi/spike-keys`, and the GitHub Apps' secrets; the
-      pipeline's artifact bucket; the CDK's bootstrap. Remove them, or keep them for a later
-      deployment, as you choose.
+      CLI wrote, `rhi/canary-key` and `rhi/spike-keys`, and the GitHub Apps' secrets; the CDK's
+      bootstrap. Remove them, or keep them for a later deployment, as you choose.
 
 5. **What retention removes afterwards,** on a parked stage, or of what an erase left:
 
@@ -281,14 +345,18 @@ that `rhi_admin roster list` prints.
    aws cloudformation describe-stacks --query "Stacks[?starts_with(StackName, 'Rhi')].StackName"
    ```
 
-   Each identifier of Act, step 4a, is gone. Each of these commands, run with the identifier, fails
-   because what it names does not exist, and each `list-backups` lists nothing:
+   Each identifier of Act, step 4a, is gone, but for those you wrote down as kept in Act, step 4d,
+   which are still there. For each other one, its command below, run with the identifier, fails
+   because what it names does not exist, each `list-backups` lists nothing, each
+   `describe-log-groups` prints nothing, and the key reads `PendingDeletion`:
 
    ```sh
    aws dynamodb describe-table --table-name <table> --query Table.TableName
    aws dynamodb list-backups --table-name <table> --backup-type SYSTEM --query 'BackupSummaries[].BackupArn' --output text
    aws cognito-idp describe-user-pool --user-pool-id <user-pool> --query UserPool.Id
    aws s3api head-bucket --bucket <bucket>
+   aws logs describe-log-groups --log-group-name-prefix <log-group> --query "logGroups[?logGroupName=='<log-group>'].logGroupName" --output text
+   aws kms describe-key --key-id <key> --query KeyMetadata.KeyState --output text
    ```
 
    The workspace, by its workspace ID, either no longer exists or reads `DELETING`:
@@ -298,16 +366,19 @@ that `rhi_admin roster list` prints.
    ```
 
 4. **Retention is set on every log group that holds a student's records,** on a parked stage, the
-   day you park it. Each fixed log group, and the web ACL's, whose name starts with
-   `aws-waf-logs-`, reads `90`:
+   day you park it. The endpoint's log groups that hold a student's records have fixed names:
+   `/rhi/gateway`, `/rhi/issuer`, `/rhi/scaler`, `/rhi/pools/<pool>` for each pool of your
+   configuration, and the web ACL's, `aws-waf-logs-rhi`. Each reads `90`:
 
    ```sh
    aws logs describe-log-groups --log-group-name-prefix /rhi/ --query 'logGroups[].[logGroupName,retentionInDays]' --output text
-   aws logs describe-log-groups --log-group-name-prefix aws-waf-logs- --query 'logGroups[].[logGroupName,retentionInDays]' --output text
+   aws logs describe-log-groups --log-group-name-prefix aws-waf-logs-rhi --query "logGroups[?logGroupName=='aws-waf-logs-rhi'].[logGroupName,retentionInDays]" --output text
    ```
 
-   A group that reads `None` keeps its records for ever: set its retention, and file the fault as
-   an issue:
+   The listing by `/rhi/` can show other groups of the endpoint as well; only the names above are
+   read here. One of those names that reads `None` keeps its records for ever: set its retention,
+   with that exact name and no other (never a group the listing shows under another name, which
+   can belong to another application of the account), and file the fault as an issue:
 
    ```sh
    aws logs put-retention-policy --log-group-name <group> --retention-in-days 90

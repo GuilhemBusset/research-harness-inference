@@ -129,16 +129,20 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
    - `promote_image: promoted`, after `promote_image: pipeline started`: the canary served, the
      parameter holds the candidate, and the job started an execution of the pipeline;
-   - `promote_image: not promoted:` and a cause (`family-not-listed`, `image-unavailable`,
+   - `promote_image: not promoted:` and any other cause (`family-not-listed`, `image-unavailable`,
      `canary-failed`, `canary-timed-out`, ...): nothing was written, the pool keeps its image, and
-     no execution started. Fix the cause, or choose another candidate, and start again. With
-     `pipeline-not-started` the parameter **was** written: start an execution with **Release
-     change** on the pipeline's page in the CodePipeline console.
+     no execution started. Fix the cause, or choose another candidate, and start again.
+   - `promote_image: not promoted: pipeline-not-started`: the parameter **was** written, but the
+     job started no execution. Start one yourself with **Release change** on the pipeline's page
+     in the CodePipeline console, and note the execution ID the console shows for it once started
+     as `<execution>`. Skip the search by the build's times in step 3: that execution was started
+     after the build, by you, and step 3's last paragraph still applies to it.
 
    The canary start is one GPU start, at one instance's price for its minutes; the job terminates
    the canary whatever came of it.
 
-3. **Find the execution the job started,** and note its ID as `<execution>`. The job prints no
+3. **Find the execution the job started,** when it ended with `promote_image: promoted`, and note
+   its ID as `<execution>`. The job prints no
    ID. Its execution started while the job's build ran, between the build's start and end times,
    with the trigger `StartPipelineExecution` and, as the trigger's detail, the job's own role
    rather than your identity. The build's times, `<build>` being the build's ID, which
@@ -163,10 +167,12 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    Verify reads this execution only.
 
    The pipeline is not set to restart an execution when its self-update (the stage
-   `UpdatePipeline`, its action `SelfMutate`) changes it. Read the execution's actions (Verify,
-   step 1): when it ended without any action of the stage `Rhi`, and no newer execution is in
-   progress, start one with **Release change** on the pipeline's page in the CodePipeline console,
-   and that execution, the newest with your identity as its trigger's detail, is `<execution>`.
+   `UpdatePipeline`, its action `SelfMutate`) changes it. Read the actions of `<execution>`,
+   whichever way it was started (Verify, step 1): when it ended without any action of the stage
+   `Rhi`, and no newer execution is in progress, start one with **Release change** on the
+   pipeline's page in the CodePipeline console; from then on `<execution>` is that new execution,
+   whose ID the console shows once it is started (the newest in the listing above, with your
+   identity as its trigger's detail).
 
 ### The engine
 
@@ -295,25 +301,37 @@ larger pools included, while a machine image refreshes only the promoted pool.
      read: its refresh line above says its instances were replaced, and step 3 checks what it
      serves.
 
-   Any other end means the release is not verified:
+   Any other end means the release is not verified by the pipeline:
 
    - `gpu-verification: the smoke tests run on no GPU pool`: no refresh of a GPU pool began during
-     this execution (the pool had no instance, or nothing of its release changed);
-   - `verify: no test was run:` followed by `listener-off` or `canary-missing`: no test ran at all;
+     this execution, because the affected pools had no instance in service or warm (the `upgrade`
+     and `xl` pools keep none, and an idle coursework pool with no warm instance has none), or
+     nothing of their release changed. Nothing tested what any affected pool serves: step 3
+     applies to every one of them, coursework included;
+   - `verify: no test was run:` followed by `listener-off` or `canary-missing`: no test ran at all,
+     and step 3 applies to every affected pool;
    - a summary with a test `failed` or `error`, or a refresh that ended otherwise than
      `Successful`: the verification failed, and the runbook [a bad deployment](bad-deployment.md)
      applies.
 
-3. **Another pool that was refreshed,** an engine change's larger pools (`upgrade`, `xl`), or a
-   promoted pool other than coursework: the verification tests the coursework pool whichever GPU
-   pool's refresh it found, never that pool.
-   At that pool's next start, in Grafana, on the dashboard "Deployments and releases", the panel
-   "Release each instance serves: image digest and model revision" shows its instances' image
-   digest and model revision; they equal what its release parameter holds:
+3. **Every affected pool whose release the smoke tests did not read.** The affected pools are the
+   promoted pool for a machine image, and every pool served by vLLM for the engine. Of them, the
+   smoke tests read only the coursework pool, and only when step 2 found its summary. Each other
+   affected pool is checked here: a pool that was refreshed but is not coursework, a pool that had
+   no instance to refresh (its next instance is the first to start on the new release), and the
+   coursework pool itself when step 2 ended otherwise. Write down which pools these are.
+   At each such pool's next start, in Grafana, on the dashboard "Deployments and releases", the
+   panel "Release each instance serves: image digest and model revision" shows its instances' image
+   digest and model revision; they equal what its release parameter holds (`upgrade` below, or the
+   pool's name in its place):
 
    ```sh
    aws ssm get-parameter --name /rhi/pools/upgrade/release --query Parameter.Value --output text
    ```
+
+   A pool whose first instance on the new release serves anything else is a bad deployment (runbook
+   [a bad deployment](bad-deployment.md)). Until each such pool has started once, its release is
+   deployed but not verified: say so wherever you report the upgrade.
 
 4. **For a machine image, the instances run it.** Every instance of the promoted pool
    (`coursework` below, or the pool's name in its place), the stopped warm ones included, shows the
@@ -324,6 +342,8 @@ larger pools included, while a machine image refreshes only the promoted pool.
        Name=instance-state-name,Values=running,stopped \
        --query 'Reservations[].Instances[].[ImageId,State.Name]' --output text
    ```
+
+   A pool with no instance prints nothing: its next start is the check, in step 3.
 
 5. **No pool's launches are suspended:**
 
