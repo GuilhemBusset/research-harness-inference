@@ -209,7 +209,8 @@ def _apply_rules(records: list[StudentKey], installation: str, now: int, issuanc
         raise Refused(Refusal.TOO_MANY_ISSUANCES)
 
 
-def _lock_key(github_id: int) -> dict[str, str]:
+def lock_key(github_id: int) -> dict[str, str]:
+    """The key of the student's lock item in the keys table, which the admin's erase deletes too."""
     return {KEYS.partition_key.name: f"{_LOCK_PREFIX}{github_id}"}
 
 
@@ -218,7 +219,7 @@ def _take_lock(github_id: int, now: int, keys: Any) -> str | None:
     holder = secrets.token_hex(16)
     try:
         keys.put_item(
-            Item={**_lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder},
+            Item={**lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder},
             ConditionExpression="attribute_not_exists(#hash) OR #locked < :stale",
             ExpressionAttributeNames={"#hash": KEYS.partition_key.name, "#locked": _LOCKED_AT},
             ExpressionAttributeValues={":stale": now - LOCK_SECONDS},
@@ -234,7 +235,7 @@ def _release_lock(github_id: int, holder: str, keys: Any) -> None:
     """Deletes the student's lock, if this login still holds it."""
     try:
         keys.delete_item(
-            Key=_lock_key(github_id),
+            Key=lock_key(github_id),
             ConditionExpression="#holder = :holder",
             ExpressionAttributeNames={"#holder": _HOLDER},
             ExpressionAttributeValues={":holder": holder},
@@ -329,7 +330,7 @@ def _store(
             {
                 "Delete": {
                     "TableName": keys.name,
-                    "Key": _lock_key(record.github_id),
+                    "Key": lock_key(record.github_id),
                     "ConditionExpression": "#holder = :holder",
                     "ExpressionAttributeNames": {"#holder": _HOLDER},
                     "ExpressionAttributeValues": {":holder": holder},

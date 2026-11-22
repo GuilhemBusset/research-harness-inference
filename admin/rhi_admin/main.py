@@ -19,6 +19,8 @@ repository, and it reaches the tables directly.
     pool enable <pool>                                          the pool's configured mode again
     pool clear-suspension <pool>                                the mark launch_suspended cleared
     pool run                                                    one run of the scaler, now
+    privacy export <github-id>                                  everything kept of a student, as one JSON document
+    privacy erase <github-id>                                   a student's entry, keys and usage rows deleted
 
 The account and the region are the caller's, from the AWS SDK's own configuration. Each table is
 found in the deployed access stack by its logical ID, which `tests/policy/stateful_logical_ids.json`
@@ -30,14 +32,22 @@ table by its logical ID, and the scaler's function by the logical ID of the scal
 (`tests/synth/test_scaler.py` holds it to the synthesized one), so this file names no function
 either. Each change they make carries who made it, the caller's identity from STS without its
 account, and when (`rhi_admin.pools`).
+
+The commands `privacy` (`rhi_admin.privacy`) reach, once one of them runs, the usage table by its
+logical ID, the gateway's log group by its logical ID in the gateway stack, and the Prometheus
+workspace by its logical ID in the observability stack, whose query address Managed Prometheus
+gives. `tests/policy/stateful_logical_ids.json` pins the table's and the workspace's logical IDs,
+and `tests/synth/test_gateway_service.py` holds the log group's to the synthesized one.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import sys
 import time
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TextIO
@@ -46,6 +56,7 @@ import boto3
 
 from rhi_admin import keys as admin_keys
 from rhi_admin import pools as admin_pools
+from rhi_admin import privacy as admin_privacy
 from rhi_admin import roster as admin_roster
 from rhi_admin.canary import CANARY_SECRET, run_canary
 from rhi_admin.roster import AdminError
@@ -56,6 +67,12 @@ from rhi_common.spike_keys import SPIKE_KEYS_SECRET
 STACK_NAME = "Rhi-Access"
 KEYS_LOGICAL_ID = "TablesKeys6B5A3ABF"
 ROSTER_LOGICAL_ID = "TablesRosterDAE02BAB"
+USAGE_LOGICAL_ID = "TablesUsageA60E9525"
+# The gateway's log group, in the gateway stack, and the metrics workspace, in the observability stack.
+GATEWAY_STACK_NAME = "Rhi-Gateway"
+GATEWAY_LOG_GROUP_LOGICAL_ID = "ServiceLogs205D48C6"
+OBSERVABILITY_STACK_NAME = "Rhi-Observability"
+WORKSPACE_LOGICAL_ID = "PrometheusWorkspaceF3098DB6"
 # The deployed stack that holds the pools, the logical ID of the pool-state table in it, and that
 # of the scaler's function.
 POOLS_STACK_NAME = "Rhi-Pools"
@@ -68,13 +85,14 @@ COURSE_END_PARAMETER = "/rhi/config/course_end"
 @dataclass(frozen=True)
 class Admin:
     """What the commands act on: the two tables, a Secrets Manager client, the course end, and
-    what the commands `pool` act on, made when one of them runs."""
+    what the commands `pool` and `privacy` act on, each made when one of them runs."""
 
     roster: Any
     keys: Any
     secrets: Any
     course_end: Callable[[], datetime.date]
     pools: Callable[[], admin_pools.Pools]
+    privacy: Callable[[], admin_privacy.Stores]
 
 
 def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -> str:
@@ -83,8 +101,10 @@ def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -
     return answer["StackResourceDetail"]["PhysicalResourceId"]
 
 
-def connect(session: Any = None) -> Admin:
-    """The deployed tables and secrets, reached with the caller's own credentials and region."""
+def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request.urlopen) -> Admin:
+    """The deployed tables and secrets, reached with the caller's own credentials and region.
+
+    `urlopen` sends the workspace's signed queries."""
     if session is None:
         session = boto3.session.Session()
     cloudformation = session.client("cloudformation")
@@ -104,12 +124,24 @@ def connect(session: Any = None) -> Admin:
             caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
         )
 
+    def privacy() -> admin_privacy.Stores:
+        # A workspace's physical ID is its ARN, which ends with its ID.
+        workspace = physical_id(cloudformation, WORKSPACE_LOGICAL_ID, OBSERVABILITY_STACK_NAME).rsplit("/", 1)[-1]
+        endpoint = session.client("amp").describe_workspace(workspaceId=workspace)["workspace"]["prometheusEndpoint"]
+        return admin_privacy.Stores(
+            usage=dynamodb.Table(physical_id(cloudformation, USAGE_LOGICAL_ID)),
+            logs=session.client("logs"),
+            log_group=physical_id(cloudformation, GATEWAY_LOG_GROUP_LOGICAL_ID, GATEWAY_STACK_NAME),
+            query=admin_privacy.workspace_query(session, endpoint, urlopen=urlopen),
+        )
+
     return Admin(
         roster=dynamodb.Table(physical_id(cloudformation, ROSTER_LOGICAL_ID)),
         keys=dynamodb.Table(physical_id(cloudformation, KEYS_LOGICAL_ID)),
         secrets=session.client("secretsmanager"),
         course_end=course_end,
         pools=pools,
+        privacy=privacy,
     )
 
 
@@ -146,6 +178,12 @@ def _parser() -> argparse.ArgumentParser:
     pool.add_parser("enable", help="set a pool back to its configured mode").add_argument("pool")
     pool.add_parser("clear-suspension", help="clear the mark launch_suspended of a pool").add_argument("pool")
     pool.add_parser("run", help="ask the scaler to run now")
+
+    privacy = commands.add_parser("privacy", help="one student's data").add_subparsers(dest="command", required=True)
+    privacy.add_parser("export", help="export what is kept of a student, as JSON").add_argument("github_id", type=int)
+    privacy.add_parser(
+        "erase", help="delete a student's entry, keys and usage rows, and say what only retention removes"
+    ).add_argument("github_id", type=int)
     return parser
 
 
@@ -171,6 +209,22 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
     command = (arguments.group, getattr(arguments, "command", None))
     if arguments.group == "pool":
         _pool_command(arguments.command, arguments, admin.pools(), now, out)
+    elif command == ("privacy", "export"):
+        document = admin_privacy.export(
+            arguments.github_id, roster=admin.roster, keys=admin.keys, stores=admin.privacy(), now=now
+        )
+        print(json.dumps(document, indent=2, sort_keys=True), file=out)
+    elif command == ("privacy", "erase"):
+        erased = admin_privacy.erase(
+            arguments.github_id,
+            roster=admin.roster,
+            keys=admin.keys,
+            stores=admin.privacy(),
+            now=now,
+            say=lambda line: print(line, file=out, flush=True),
+        )
+        for line in admin_privacy.report(erased, arguments.github_id):
+            print(line, file=out)
     elif command == ("roster", "add"):
         entry = admin_roster.add(
             arguments.github_id,
