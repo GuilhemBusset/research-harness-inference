@@ -281,8 +281,9 @@ type Reported = list[tuple[dict[str, str], list[tuple[int, float]]]]
 LOOKBACK = 300
 
 
-def latest(samples: list[tuple[int, float]], at: int) -> float | None:
-    """What Prometheus reads of a series at a time: its latest sample within the lookback."""
+def last_over(samples: list[tuple[int, float]], at: int) -> float | None:
+    """`last_over_time` over five minutes ending at a time: the last sample in the window, read
+    from the samples themselves, so a series that went stale since still has it."""
     found = [value for time, value in samples if at - LOOKBACK < time <= at]
     return found[-1] if found else None
 
@@ -300,16 +301,20 @@ def students_at(example: rhi_config.Config, reported: Reported, at: int, in_serv
     assert shape is not None
     assert shape["zero"] == f"sum by ({shape['outer']}) ({rules.in_service('coursework')})"
     outer, inner = (tuple(label.strip() for label in shape[part].split(",")) for part in ("outer", "inner"))
-    # A series counted a request when its value differs from the one at the window's start, or it
-    # was not there then.
-    active = re.fullmatch(r"\((?P<s>\w+\{[^}]*\}) != (?P=s) offset 5m\) or \((?P=s) unless (?P=s) offset 5m\)", shape["active"])
+    # A series counted a request when its last sample in the window differs from its last one in
+    # the window before, or it reported none then.
+    now = r"last_over_time\((?P=s)\[5m\]\)"
+    before = r"last_over_time\((?P=s)\[5m\] offset 5m\)"
+    active = re.fullmatch(
+        rf"\(last_over_time\((?P<s>\w+\{{[^}}]*\}})\[5m\]\) != {before}\) or \({now} unless {before}\)", shape["active"]
+    )
     assert active is not None
     (pattern,) = re.findall(r'alias=~"([^"]*)"', active["s"])
     assert active["s"].startswith(f"{gateway_metrics.REQUESTS}_total{{")
 
     students: set[tuple[str, ...]] = set()
     for labels, samples in reported:
-        now, before = latest(samples, at), latest(samples, at - LOOKBACK)
+        now, before = last_over(samples, at), last_over(samples, at - LOOKBACK)
         if now is not None and now != before and re.fullmatch(pattern, labels.get("alias", "")):
             students.add(tuple(labels.get(label, "") for label in inner))
     counted: dict[tuple[str, ...], float] = {}
@@ -333,6 +338,16 @@ def test_a_student_counts_once(example: rhi_config.Config) -> None:
     # A series that appeared in the window holds its first request; a second alias is a second student.
     heron = ({"pool": "coursework", "alias": "heron", "instance": "task-b"}, [(200, 1.0), (215, 1.0)])
     assert students_at(example, [*one_student, heron], 301, in_service=1) == {("coursework",): 2}
+
+
+def test_recent_students_survive_a_stale_gateway_series(example: rhi_config.Config) -> None:
+    # A request scraped at 15 s, after which the task stopped reporting: still in the window at 300 s.
+    gone = ({"pool": "coursework", "alias": "otter", "instance": "task-a"}, [(0, 1.0), (15, 2.0)])
+    assert students_at(example, [gone], 300, in_service=1) == {("coursework",): 1}
+    # A task that missed the scrapes around the window's start and came back unchanged counted nothing.
+    gap = [*((time, 2.0) for time in range(-300, -15, 15)), *((time, 2.0) for time in range(15, 301, 15))]
+    unchanged = ({"pool": "coursework", "alias": "otter", "instance": "task-a"}, gap)
+    assert students_at(example, [unchanged], 300, in_service=1) == {("coursework",): 0}
 
 
 def test_an_idle_pool_has_no_student_per_instance(example: rhi_config.Config) -> None:

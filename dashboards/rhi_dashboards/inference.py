@@ -41,8 +41,9 @@ share, 85% by default.
 
 **Students are counted once.** The gateway's per-student counter of requests has one series for
 each alias and each gateway task (the collector labels a task's series with its ID): the query
-first takes, for each series, whether it counted a request in the last five minutes (its value now
-differs from its value at the window's start, or it was not there then), then counts the pool's
+first takes, for each series, whether it counted a request in the last five minutes (the last
+sample it reported in the window differs from the last it reported in the five minutes before, or
+it reported none then), then counts the pool's
 aliases among those, so two tasks that served one student count one. It reads zero while the
 scaler reports the pool and no student is at work. Over the instances in service it is an average:
 the gateway cannot know which instance serves a student (section 5.5). No series drawn carries an
@@ -377,12 +378,15 @@ def streams(pool: Pool) -> list[rules.Series]:
 
 def active(pool: Pool) -> str:
     """Each series of the pool's per-student counter that counted a request in the last five
-    minutes: its value now differs from its value at the window's start (the latest sample at or
-    before it, so a request scraped just inside the window counts), or it was not there then (a
-    series appears holding its first request, and appears again after a restart)."""
+    minutes: the last sample it reported in the window differs from the last it reported in the
+    window before (so a request scraped just inside the window counts), or it reported none then (a
+    series appears holding its first request). Both are read from the samples themselves, not from
+    instant values: a series that went stale after its request still counts it, and one that missed
+    a scrape at the window's start and came back unchanged counts nothing."""
     series = rules.selector(STUDENT_REQUESTS + rules.COUNTER_SAMPLE, _gateway(pool), matching={ALIAS: ".+"})
-    before = f"{series} offset {STUDENT_WINDOW}"
-    return f"({series} != {before}) or ({series} unless {before})"
+    now = f"last_over_time({series}[{STUDENT_WINDOW}])"
+    before = f"last_over_time({series}[{STUDENT_WINDOW}] offset {STUDENT_WINDOW})"
+    return f"({now} != {before}) or ({now} unless {before})"
 
 
 def students(pool: Pool) -> str:
