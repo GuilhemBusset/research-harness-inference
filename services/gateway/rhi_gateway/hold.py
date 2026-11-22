@@ -33,6 +33,9 @@ caller reports the engine's first event, with `first_event`. A non-streaming req
 
 Keep-alives and wakes are due on a grid from the start of the hold. A step that comes late sends
 one of each, not one for every time it missed, and the next is due on the grid again.
+
+The answer to a request the gateway held carries the header `HELD_HEADER`, so that a client can
+tell a held request from a warm one even when the hold ended before its first keep-alive was due.
 """
 
 from __future__ import annotations
@@ -51,6 +54,8 @@ DEFAULT_KEEPALIVE_SECONDS = 10
 WAKE_SECONDS = 15
 # A launch that found no capacity counts for this long (section 5.3).
 NO_CAPACITY_SECONDS = 600
+# The header, with the value `true`, on the answer to a request the gateway held.
+HELD_HEADER = "x-rhi-held"
 
 _PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 _COMMENT = b": keep-alive\n\n"

@@ -126,6 +126,7 @@ JOBS: tuple[SpikeJob, ...] = (
     SpikeJob("s5_capacity", "s5_capacity.py"),
     SpikeJob("s3_harness_task", "s3_harness_task.py"),
     SpikeJob("s3_second_session", "s3_second_session.py"),
+    SpikeJob("dry_run_class", "dry_run_class.py"),
 )
 
 

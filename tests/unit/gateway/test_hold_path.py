@@ -33,7 +33,7 @@ from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.errors import WireFormat, render_json, render_stream_event
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
-from rhi_gateway.hold import keep_alive
+from rhi_gateway.hold import HELD_HEADER, keep_alive
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import Readiness
 
@@ -474,6 +474,28 @@ def test_a_held_call_that_is_not_a_stream_is_forwarded_once_ready() -> None:
         assert (call.status, call.body) == (200, answer)
         assert call.pieces[0][0] == 30
         assert gateway.ledger.settled == [(21, 7, True)]
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_the_answer_says_whether_the_request_was_held(stream: bool) -> None:
+    async def scenario() -> None:
+        # Held 5 seconds, forwarded before its first keep-alive was due: the header is its one sign.
+        gateway = Gateway(STREAMS[routes.MESSAGES], healthy_at=5)
+        call = Call(gateway, routes.MESSAGES, stream=stream)
+        await held(gateway)
+        await gateway.advance_to(6)
+        await call.ended()
+        assert call.status == 200
+        assert call.headers[HELD_HEADER] == "true"
+        assert keep_alive(WireFormat.MESSAGES).data not in call.body
+
+        warm = Gateway(STREAMS[routes.MESSAGES], healthy_at=0)
+        call = Call(warm, routes.MESSAGES, stream=stream)
+        await call.ended()
+        assert call.status == 200
+        assert HELD_HEADER not in call.headers
 
     run(scenario)
 

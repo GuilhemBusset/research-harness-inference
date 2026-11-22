@@ -323,3 +323,33 @@ def test_a_stream_is_timed_and_counted_as_the_gateway_does(name: str) -> None:
     assert record.first_answer_seconds == 0.25 * (answered + 1)
     assert record.output_tokens_per_second == (recorded.usage.output_tokens - 1) / (0.25 * (tokens[-1] - tokens[0]))
     assert (record.input_tokens, record.output_tokens) == (recorded.usage.input_tokens, recorded.usage.output_tokens)
+
+
+def test_a_failed_connection_ends_the_replay_unless_failures_are_kept() -> None:
+    keys = [generate_key(), generate_key()]
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.headers["authorization"] == f"Bearer {keys[0]}":
+            raise httpx.ConnectError("refused")
+        return httpx.Response(402, json={"type": "error", "error": {"type": "budget_reached", "message": "spent"}})
+
+    sessions = (session(1, loadgen.Turn(1.0, 10)), session(2, loadgen.Turn(1.0, 10)))
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(
+            loadgen.replay(loadgen.Load(sessions), keys, "http://gateway.example.com", at_once=2,
+                           transport=httpx.MockTransport(answer))
+        )  # fmt: skip
+    assert raised.group_contains(httpx.ConnectError)
+
+    seen: list[loadgen.Record] = []
+    records = asyncio.run(
+        loadgen.replay(loadgen.Load(sessions), keys, "http://gateway.example.com", at_once=2,
+                       transport=httpx.MockTransport(answer), keep_failures=True, on_record=seen.append)
+    )  # fmt: skip
+    # Each session ends at its first request: one failed, the other refused with the gateway's cause.
+    assert seen == records
+    assert [(one.student, one.status, one.failure, one.cause) for one in records] == [
+        (0, None, loadgen.Failure.CONNECT_ERROR, None),
+        (1, 402, None, "budget_reached"),
+    ]
+    assert all(one.sent_at is not None for one in records)
