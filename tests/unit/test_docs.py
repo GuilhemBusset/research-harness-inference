@@ -53,8 +53,8 @@ def guide_rhi_commands(text: str) -> list[list[str]]:
             continue
         spans = [line.strip().removeprefix("$ ")] if fenced else re.findall(r"`([^`]+)`", line)
         commands.extend(shlex.split(span) for span in spans if re.match(r"rhi(\s|$)", span))
-        for argv in re.findall(r"\[\s*[\"']rhi[\"'][^\]]*\]", line):
-            commands.append(ast.literal_eval(argv))
+    # An argument list may span several lines.
+    commands.extend(ast.literal_eval(argv) for argv in re.findall(r"\[\s*[\"']rhi[\"'][^\]]*\]", text))
     return commands
 
 
@@ -76,7 +76,8 @@ def test_guide_addresses_are_on_example_com_but_the_install_command() -> None:
     lines = GUIDE.read_text(encoding="utf-8").splitlines()
     installs = []
     for line in lines:
-        for url in re.findall(r"https?://[^\s\"'`)<>\]]+", line, re.IGNORECASE):
+        # Any scheme, or none: a destination starting with // inherits the page's scheme.
+        for url in re.findall(r"(?:[a-z][a-z0-9+.-]*:)?//[^\s\"'`)<>\]]+", line, re.IGNORECASE):
             host = urlsplit(url).hostname or ""
             if host == "github.com":
                 installs.append((line, url))
