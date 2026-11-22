@@ -25,6 +25,8 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
   from their heartbeat rows. The reporter reads them there. When the execution deployed a GPU
   pool's release, the step first waits for that pool's instance refresh to end, then runs the
   smoke tests on the coursework pool as well.
+  While the configuration is parked, the stage has no endpoint: the step runs no test and leaves
+  `parked` as its reason in `not-run`.
 
 The asset step builds every image asset of the stage for its pool's processor architecture
 (sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
@@ -46,7 +48,7 @@ Beside the pipeline too, the spike jobs of `rhi.pipeline.spikes`, one CodeBuild 
 entry of its list, which the owner starts on a commit of `main` and nothing else starts (sections
 8.4 and 12); the weekly GPU canary of `rhi.pipeline.canary`, a job that runs the coursework pool's
 smoke tests against what is deployed and that its schedule alone starts, on Sundays at 04:00 UTC
-(sections 8.2, step 6, and 14); and the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
+(sections 8.2, step 6, and 14), neither of which exists while the configuration is parked; and the job of `rhi.pipeline.image_promotion`, which promotes a GPU pool's
 machine image after a canary start on it passes, writes the pool's image parameter and then starts
 an execution of the pipeline (section 4.3). The owner starts it by hand, and nothing else starts it.
 
@@ -173,7 +175,15 @@ class PipelineStack(cdk.Stack):
         # step leaves its marks in the pipeline's artifact bucket, where the reporter reads them. It
         # takes from the stage, as text, what names the stage's heartbeats table to its role: this
         # stack, another assembly, holds no reference to a resource of the stage.
-        verify = verify_step(self, source, stage=stage, artifacts=underlying.artifact_bucket, pipeline=underlying)
+        # Parked, the stage has no endpoint: the step runs no test and leaves the reason `parked`.
+        verify = verify_step(
+            self,
+            source,
+            stage=stage,
+            artifacts=underlying.artifact_bucket,
+            pipeline=underlying,
+            parked=config.parked,
+        )
         # Before any deployment action of the stage, and after the approval: the weights of a
         # release that will be deployed, in the model bucket before an instance asks for them.
         copy_weights = copy_weights_step(self, source)
@@ -230,11 +240,17 @@ class PipelineStack(cdk.Stack):
             stage=stage,
         )
         # Started by its weekly schedule alone; it reads the repository through the connection too.
+        # Parked, it has no endpoint to test: no schedule, and no job.
         self.canary = (
             None
             if first_deploy
             else GpuCanary(
-                self, "Canary", connection_arn=connection.attr_connection_arn, repository=repository, stage=stage
+                self,
+                "Canary",
+                connection_arn=connection.attr_connection_arn,
+                repository=repository,
+                stage=stage,
+                parked=config.parked,
             )
         )
         self._as_cfn_lint_reads_it(underlying)

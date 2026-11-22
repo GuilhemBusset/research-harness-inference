@@ -80,7 +80,8 @@ an execution are the objects under `verification/<execution ID>/`, and the event
 - `failed-smoke-tests`: the IDs of the smoke tests that failed, one per line;
 - `last-stages`: the last lifecycle stage each instance of the tested pools reached, one per line,
   left when the tests failed;
-- `not-run`: one line, the reason no test ran.
+- `not-run`: one line, the reason no test ran: `canary-missing` or `listener-off`, which the
+  verification script leaves, or `parked`, which the step leaves while the system is parked.
 
 A mark is first looked for by listing its key, then read: the function's role may list that
 prefix, so a mark that is not there is told from one that cannot be read. At most `MARK_BYTES` of

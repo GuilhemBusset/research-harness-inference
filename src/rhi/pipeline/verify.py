@@ -47,6 +47,17 @@ the object `verification/<execution ID>/not-run` of the artifact bucket, where t
 that the verification was not run. A copy that fails fails the step: a verification that was not
 run is never taken for one that passed.
 
+**While the system is parked** (the configuration's `parked`, sections 8.5 and 11.2), the stage
+has no endpoint, and the step is built without the smoke tests: the pipeline is synthesized from
+the stage's configuration, so the step learns the flag from its definition, never from a read of
+SSM when it runs. It is still the action `ACTION`, after every deployment action of the stage, on
+the source. Its build phase runs neither the decision nor the script, nor installs anything; its
+post-build phase writes the one line `parked`, `PARKED`, to the reason file and copies it, as above,
+to `verification/<execution ID>/not-run`, so the reporter posts the description of a verification
+that passed because the system is parked, never that of one whose tests ran. Nothing goes to the
+step's output artifact, and a copy that fails fails the step. Its role may then only write under
+`verification/` of the artifact bucket, beside what CDK Pipelines gives every project.
+
 **When a test fails.** A CodeBuild action that fails may leave no output artifact, so the step
 does not rely on one. The script leaves the ID of each smoke test that fails, one per line and
 nothing else, in the file of the second variable, and the post-build phase, which CodeBuild runs
@@ -116,6 +127,8 @@ CANARY_SECRET = "rhi/canary-key"
 # in the folder of the execution's ID.
 PREFIX = "verification"
 NOT_RUN = "not-run"
+# The reason the step itself leaves, while the system is parked, in place of the script's.
+PARKED = "parked"
 FAILED_TESTS = "failed-smoke-tests"
 LAST_STAGES = "last-stages"
 # The files the script leaves its reason, the IDs of the failed tests and the instances' last
@@ -163,6 +176,11 @@ POST_BUILD_COMMANDS = [
 ]
 
 
+# While parked: no test, and the reason, written then copied where the reporter reads it.
+PARKED_COMMANDS = ["echo 'The system is parked: it has no endpoint, so no test runs.'"]
+PARKED_POST_BUILD_COMMANDS = [f'echo {PARKED} > "${REASON_FILE_VARIABLE}"', _copy(REASON_FILE_VARIABLE, NOT_RUN)]
+
+
 def heartbeats_table_arn(scope: cdk.Stack, stage: EndpointStage) -> str:
     """The ARN pattern of the heartbeats table of `stage`, in the partition, region and account of
     `scope`, the pipeline's stack: the table by the name CloudFormation gives it, the pools stack's
@@ -183,9 +201,13 @@ def verify_step(
     stage: cdk.Stage,
     artifacts: s3.IBucket,
     pipeline: codepipeline.Pipeline,
+    parked: bool = False,
 ) -> pipelines.CodeBuildStep:
     """The verification step of `pipeline`, in `scope`, on `source`, for `stage`, the stage it
-    runs after, in a pipeline whose artifact bucket is `artifacts`."""
+    runs after, in a pipeline whose artifact bucket is `artifacts`; while `parked`, the step that
+    runs no test and says so."""
+    if parked:
+        return _parked_step(source, artifacts)
     environment = {
         EXECUTION_VARIABLE: EXECUTION_ID,
         BUCKET_VARIABLE: artifacts.bucket_name,
@@ -245,4 +267,25 @@ def verify_step(
         env_from_cfn_outputs=outputs,
         role_policy_statements=statements,
         timeout=TIMEOUT,
+    )
+
+
+def _parked_step(source: pipelines.IFileSetProducer, artifacts: s3.IBucket) -> pipelines.CodeBuildStep:
+    """The verification step while the system is parked: no test, and the reason `PARKED` written
+    to the execution's not-run mark in the post-build phase."""
+    return pipelines.CodeBuildStep(
+        ACTION,
+        input=source,
+        commands=PARKED_COMMANDS,
+        partial_build_spec=codebuild.BuildSpec.from_object(
+            {"version": "0.2", "phases": {"post_build": {"commands": PARKED_POST_BUILD_COMMANDS}}}
+        ),
+        env={
+            EXECUTION_VARIABLE: EXECUTION_ID,
+            BUCKET_VARIABLE: artifacts.bucket_name,
+            REASON_FILE_VARIABLE: REASON_FILE,
+        },
+        role_policy_statements=[
+            iam.PolicyStatement(actions=["s3:PutObject"], resources=[artifacts.arn_for_objects(f"{PREFIX}/*")])
+        ],
     )

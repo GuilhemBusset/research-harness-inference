@@ -4,18 +4,26 @@ endpoint, a schedule on Sundays at 04:00 UTC whose only target is that job, and 
 the canary's secret, queries the workspace, reads the pools' release parameters and sends the
 measurement event, and nothing else.
 
-The tests read the app's own pipeline, built from the example configuration.
+The tests read the app's own pipeline, built from the example configuration. One also builds the
+app parked: no schedule, and no job for one to start, only the job's log group.
 """
 
 from __future__ import annotations
 
 import json
+import tomllib
 from fnmatch import fnmatchcase
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from rhi import config
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+REPO = Path(__file__).resolve().parents[2]
 
 PIPELINE_TEMPLATE = "RhiPipeline.template.json"
 CANARY = "rhi-gpu-canary"
@@ -171,3 +179,26 @@ def test_the_job_s_role_reads_no_table(pipeline: dict[str, Any], project: tuple[
         if fnmatchcase("dynamodb:query", action.lower()) or action.lower().startswith("dynamodb:")
     ]
     assert not granted
+
+
+def test_parked_the_canary_has_no_schedule_and_no_job(
+    app_module: ModuleType, pipeline: dict[str, Any], tmp_path: Path
+) -> None:
+    # The app as `app.py` builds it, cdk-nag included, from the example configuration parked.
+    data = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
+    data["parked"] = True
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app_module.build(config.parse(data, "test"), outdir=str(tmp_path), context=context).synth()
+    parked = json.loads((tmp_path / PIPELINE_TEMPLATE).read_text(encoding="utf-8"))
+
+    # No rule or schedule of the canary's name, and no job for one to start.
+    for kind in ("AWS::Events::Rule", "AWS::Scheduler::Schedule"):
+        assert not [p for p in of_type(parked, kind).values() if p.get("Name") == CANARY]
+    assert not [p for p in of_type(parked, "AWS::CodeBuild::Project").values() if p.get("Name") == CANARY]
+    # The job's log group stays, under its logical ID, with the logs of the runs before.
+    groups = {
+        k: p
+        for k, p in of_type(pipeline, "AWS::Logs::LogGroup").items()
+        if p.get("LogGroupName") == f"/aws/codebuild/{CANARY}"
+    }
+    assert groups and all(of_type(parked, "AWS::Logs::LogGroup").get(k) == p for k, p in groups.items())
