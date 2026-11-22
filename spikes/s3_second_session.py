@@ -21,8 +21,8 @@ after the first resuming it by the id Claude Code gave (`--resume`):
 | --- | --- | --- |
 | `open` | Opens the session: no skill in the folder, no MCP server | Claude Code answered and gave the session's id |
 | `skill` | The job puts the skill of `s3_second_session/skill/` in the folder's `.claude/skills/`, then asks for what only the skill says how to do | The skill's output: `field-note.txt` holds the skill's word and the run's reference |
-| `echo` | Resumes with an MCP configuration that adds the server of `s3_second_session/echo_server.py`, whose tool echo Claude Code then announces mid-conversation, and asks the model to call echo with a random text | echo was called, returned the text, and the answer quotes it |
-| `pdf` | Asks the model to read a PDF the job generated (`s3_second_session/make_pdf.py`) and give its code word | An answer after the PDF |
+| `echo` | Resumes with an MCP configuration that adds the server of `s3_second_session/echo_server.py`, whose tool echo Claude Code then announces mid-conversation, and asks the model to call echo with a random text | echo was called and returned the text, and the answer quotes all it returned |
+| `pdf` | Asks the model to read a PDF the job generated (`s3_second_session/make_pdf.py`) and give its code word | An answer after the PDF: one of a turn that called a tool on the PDF's file or sent it as a document block |
 | `agents` | Part 1 of the task: two agents in parallel, then a figure | The figure's file, `figure.svg` |
 | `search` | Part 2 of the task: a web search | The search's answer: the reply gives an address that Claude Code's web search returned |
 
@@ -31,8 +31,10 @@ The skill and the tool both arrive in the middle of the session, as a pack's do.
 besides its result, what shows how the result came about: whether the skill was called, whether a
 request declared echo, whether Claude Code sent the PDF as a document block and whether the answer
 names the PDF's word, how many agents it started and how many in one message, and whether the web
-search was called, failed, and returned addresses. A reply that says the search could not be made
-is no search answer: only an address the search itself returned counts.
+search was called, failed, and returned addresses. An agent asked for counts as started only once a
+subagent's message names its call or its call returned no error. A reply that says the search could
+not be made is no search answer: only an address the search itself returned counts, its path as
+written.
 
 **What is recorded**, one JSON object a line on standard output, which the spike jobs' log group
 keeps (`s3_harness_task.Lines`). Every line has `at`, its UTC time, and `kind`:
@@ -41,9 +43,9 @@ keeps (`s3_harness_task.Lines`). Every line has `at`, its UTC time, and `kind`:
 | --- | --- |
 | `job` | The pool and its engine |
 | `versions` | The version of each harness and SDK |
-| `step` | For each step: when it started and ended, Claude Code's exit status, whether its result is there, what shows how, its requests and refused requests, and the build the pool served as its lifecycle agents report it |
+| `step` | For each step: when it started and ended, Claude Code's exit status (and the type of the error, when it could not be launched), whether its result is there, what shows how, its requests and refused requests, and the build the pool served as its lifecycle agents report it |
 | `refused_request` | Each request the gateway or the engine refused during a step: the step, its time, route and status, and its cause |
-| `step_failed` | A step that raised, or a reading of the workspace that failed: its name and the type of the error |
+| `step_failed` | A step that raised, a turn Claude Code could not be launched for (its `step` line still follows), or a reading of the workspace that failed: its name and the type of the error |
 | `job_failed` | An error that stopped the job: the type of the error |
 
 A refused request, and the build, are read as in the first part (`s3_harness_task`): a status other
@@ -77,6 +79,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 import boto3
 
@@ -185,14 +188,16 @@ def task_prompt(part: int, marker: str) -> str:
 
 @dataclass
 class Turn:
-    """One turn of the session: its step, when it started and ended, what Claude Code left, and the
-    exchanges the forwarder saw during it."""
+    """One turn of the session: its step, when it started and ended, what Claude Code left, the
+    exchanges the forwarder saw during it, and the type of the error that stopped Claude Code from
+    being launched, if one did."""
 
     step: Step
     started_at: float
     ended_at: float
     ran: s3.Ran
     exchanges: list[s2.Exchange]
+    launch_error: str | None = None
 
     def events(self) -> list[dict[str, Any]]:
         """Claude Code's events: the lines of its output that are JSON objects."""
@@ -255,6 +260,11 @@ class Turn:
         results = self.tool_results()
         return [results[call["id"]] for call in self.calls(name) if call.get("id") in results]
 
+    def children(self) -> set[str]:
+        """The ids of the tool calls a subagent's messages name as their parent: the agents that ran."""
+        found = {event.get("parent_tool_use_id") for event in self.events()}
+        return {one for one in found if isinstance(one, str)}
+
 
 def _blocks(content: object) -> list[dict[str, Any]]:
     return [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
@@ -267,8 +277,13 @@ def _text(content: object) -> str:
 
 
 def addresses(text: str | None) -> set[str]:
-    """The web addresses `text` holds, without trailing punctuation or slash, in lower case."""
-    return {found.rstrip(".,;:!?'\"/").lower() for found in _ADDRESS.findall(text or "")}
+    """The web addresses `text` holds, without trailing punctuation or slash; their scheme and host in
+    lower case, which name the same thing in any case, and the rest as written, which may not."""
+    found = set()
+    for one in _ADDRESS.findall(text or ""):
+        parts = urlsplit(one.rstrip(".,;:!?'\"/"))
+        found.add(urlunsplit(parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower())))
+    return found
 
 
 def refused_requests(turn: Turn) -> list[dict[str, Any]]:
@@ -323,9 +338,11 @@ def skill_of(turn: Turn, output: Path, marker: str) -> dict[str, Any]:
 
 
 def echo_of(turn: Turn, text: str, servers: Mapping[str, str]) -> dict[str, Any]:
-    results = turn.results_of(ECHO_TOOL)
-    returned = any(not error and text in held for error, held in results)
-    quoted = text in (turn.answer() or "")
+    """Echo's result is there when a call of echo returned the text it was asked for, and the answer
+    quotes all that call returned."""
+    returns = [held.strip() for error, held in turn.results_of(ECHO_TOOL) if not error and text in held]
+    returned = bool(returns)
+    quoted = any(held in (turn.answer() or "") for held in returns)
     state = servers.get(ECHO_SERVER_NAME)
     return {
         "result_present": returned and quoted,
@@ -338,23 +355,38 @@ def echo_of(turn: Turn, text: str, servers: Mapping[str, str]) -> dict[str, Any]
 
 
 def pdf_of(turn: Turn, word: str) -> dict[str, Any]:
+    """An answer after the PDF is an answer of a turn that shows the PDF was read, or tried: a tool
+    call that names its file, or a request that carries a document block. A reply to the prompt
+    alone is recorded as `answered`, and is none."""
     answer = turn.answer()
+    document = any(carries_document(one) for one in turn.exchanges)
+    read = any(PDF_FILE in json.dumps(block.get("input")) for _, block in turn.tool_uses())
     return {
-        "result_present": answer is not None,
-        "document_block_sent": any(carries_document(one) for one in turn.exchanges),
+        "result_present": answer is not None and (document or read),
+        "answered": answer is not None,
+        "pdf_tool_call": read,
+        "document_block_sent": document,
         "names_word": answer is not None and word in answer,
     }
 
 
 def agents_of(turn: Turn, figure: Path) -> dict[str, Any]:
+    """An agent the model asked for is started when a subagent's message names its call as parent or
+    its call returned a result that is no error; one the harness refused is only asked for."""
+    results, children = turn.tool_results(), turn.children()
     per_message: dict[object, int] = {}
-    started = 0
+    asked = started = 0
     for message, block in turn.tool_uses():
-        if block.get("name") in AGENT_TOOLS:
+        if block.get("name") not in AGENT_TOOLS:
+            continue
+        asked += 1
+        call = block.get("id")
+        if call in children or (isinstance(call, str) and call in results and not results[call][0]):
             started += 1
             per_message[message] = per_message.get(message, 0) + 1
     return {
         "result_present": figure.is_file() and figure.stat().st_size > 0,
+        "agents_asked": asked,
         "agents_started": started,
         "agents_in_one_message": max(per_message.values(), default=0),
     }
@@ -508,9 +540,13 @@ class Job:
         before = len(self.forwarder.recorded())
         command = self.command(prompt, echo=echo)
         started = self.wall()
-        ran = self.launch(command)
+        error = None
+        try:
+            ran = self.launch(command)
+        except Exception as raised:  # noqa: BLE001 - the turn is still recorded, with what it left
+            ran, error = s3.Ran(None), type(raised).__name__
         ended = self.wall()
-        turn = Turn(step, started, ended, ran, self.forwarder.recorded()[before:])
+        turn = Turn(step, started, ended, ran, self.forwarder.recorded()[before:], error)
         self.session = turn.session_id() or self.session
         return turn
 
@@ -519,6 +555,9 @@ class Job:
         refused = refused_requests(turn)
         for fields in refused:
             self.lines.write(Line.REFUSED_REQUEST, **fields)
+        if turn.launch_error is not None:
+            self.failures += 1
+            self.lines.write(Line.STEP_FAILED, step=turn.step.value, error=turn.launch_error)
         try:
             build = self.build_in(turn.started_at, turn.ended_at)
         except Exception as error:  # noqa: BLE001 - the step's observations are kept, the failure recorded
@@ -535,6 +574,7 @@ class Job:
             seconds=round(turn.ended_at - turn.started_at, 1),
             exit_status=turn.ran.exit_code,
             stopped=turn.ran.stopped,
+            launch_error=turn.launch_error,
             **observed,
             tools_used=tools_used(turn),
             requests=len(turn.exchanges),

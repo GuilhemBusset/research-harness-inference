@@ -149,7 +149,8 @@ def does_each_step(prompt: str, folder: Path) -> list[dict[str, Any]]:
         return [answer(word[1].decode())]
     if "part 1" in prompt:
         (folder / job.FIGURE_FILE).write_text("<svg/>", encoding="utf-8")
-        return [calls("m1", ("Task", {}), ("Task", {})), answer("Two lines.")]
+        done = [returned(f"m1-{n}", "Done.") for n in range(2)]
+        return [calls("m1", ("Task", {}), ("Task", {})), *done, answer("Two lines.")]
     if "part 2" in prompt:
         found = f'Web search results for query: "HiGHS"\nLinks: [{{"title": "HiGHS", "url": "{FOUND}"}}]'
         return [calls("m1", ("WebSearch", {"query": "HiGHS"})), returned("m1-0", found), answer(f"{FOUND}/. A solver.")]
@@ -163,8 +164,12 @@ def does_nothing(prompt: str, folder: Path) -> list[dict[str, Any]]:
     return [answer("Web search is not available here: see https://example.com/help." if "part 2" in prompt else "No.")]
 
 
-def stub(behaviour: Callable[[str, Path], list[dict[str, Any]]], seen: list[tuple[list[str], bool]]) -> job.s3.Launch:
+def stub(
+    behaviour: Callable[[str, Path], list[dict[str, Any]]], seen: list[tuple[list[str], bool]], fails: str | None = None
+) -> job.s3.Launch:
     def launched(command: job.s3.Command) -> job.s3.Ran:
+        if fails is not None and fails in command.argv[2]:
+            raise OSError("not launched")
         prompt, argv = command.argv[2], command.argv
         seen.append((argv, (command.folder / ".claude" / "skills" / job.SKILL_NAME).is_dir()))
         tools = [{"name": "Read"}, *([{"name": job.ECHO_TOOL}] if "--mcp-config" in argv else [])]
@@ -181,18 +186,22 @@ def stub(behaviour: Callable[[str, Path], list[dict[str, Any]]], seen: list[tupl
 
 
 def ran_job(
-    tmp_path: Path, gateway: str, behaviour: Callable[[str, Path], list[dict[str, Any]]]
+    tmp_path: Path,
+    gateway: str,
+    behaviour: Callable[[str, Path], list[dict[str, Any]]],
+    fails: str | None = None,
+    failed: int = 0,
 ) -> tuple[list[dict[str, Any]], list[str], list[tuple[list[str], bool]]]:
     """The job, run once: its lines as read and as written, and each turn's command with whether the
-    skill was in the folder."""
+    skill was in the folder. The turn whose prompt holds `fails` cannot be launched."""
     clock, written, seen, key = Clock(), [], [], generate_key()
     session = job.Job(
         pool="coursework", engine="vllm", endpoint=gateway, key=key, gateway=Ready(), workspace=Workspace(),
         lines=job.s3.Lines([key], wall=clock, out=written.append), work=tmp_path,
-        install=lambda folder: ({"claude_code": folder / "claude"}, VERSIONS), launch=stub(behaviour, seen),
+        install=lambda folder: ({"claude_code": folder / "claude"}, VERSIONS), launch=stub(behaviour, seen, fails),
         wall=clock, sleep=clock.sleep, rng=Random(3),
     )  # fmt: skip
-    assert session.run() == 0
+    assert session.run() == failed
     assert not any(key in line for line in written)
     return [json.loads(line) for line in written], written, seen
 
@@ -210,7 +219,8 @@ def steps_of(lines: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     assert list(steps) == list(job.Step)
     for line in steps.values():
         assert when(line["started_at"]) < when(line["ended_at"])
-        assert (line["build"], line["version"], line["requests"]) == (BUILD, VERSIONS["claude_code"], 1)
+        assert (line["build"], line["version"]) == (BUILD, VERSIONS["claude_code"])
+        assert line["requests"] == (0 if line["launch_error"] else 1)
     return steps
 
 
@@ -225,7 +235,7 @@ def test_each_step_writes_its_times_its_result_its_refusals_and_its_build(tmp_pa
         "echo_called": True,
     }
     assert (steps["pdf"]["document_block_sent"], steps["pdf"]["names_word"]) == (True, True)
-    assert (steps["agents"]["agents_started"], steps["agents"]["agents_in_one_message"]) == (2, 2)
+    assert [steps["agents"][name] for name in ("agents_asked", "agents_started", "agents_in_one_message")] == [2, 2, 2]
     assert (steps["search"]["search_called"], steps["search"]["addresses_returned"]) == (True, 1)
     # The document block the gateway refused, during the PDF's step and no other.
     (refused,) = [line for line in lines if line["kind"] == "refused_request"]
@@ -262,6 +272,59 @@ def test_a_step_whose_result_is_missing_records_it_as_not_there(tmp_path: Path, 
     assert (steps["search"]["answered"], steps["search"]["search_called"]) == (True, False)
 
 
+def test_a_turn_that_cannot_be_launched_keeps_its_step_line_and_the_session_goes_on(
+    tmp_path: Path, gateway: str
+) -> None:
+    lines, _, seen = ran_job(tmp_path, gateway, does_each_step, fails=job.PDF_FILE, failed=1)
+    steps = steps_of(lines)
+    assert [line["step"] for line in lines if line["kind"] == "step_failed"] == ["pdf"]
+    assert (steps["pdf"]["result_present"], steps["pdf"]["launch_error"], steps["pdf"]["exit_status"]) == (
+        False,
+        "OSError",
+        None,
+    )
+    assert steps["agents"]["result_present"] and steps["search"]["result_present"]
+    assert len(seen) == 5
+
+
+def turn_of(step: job.Step, *events: dict[str, Any], exchanges: list[Any] | None = None) -> job.Turn:
+    printed = [(0.0, json.dumps(one)) for one in events]
+    return job.Turn(step, 0.0, 1.0, job.s3.Ran(0, printed), exchanges or [])
+
+
+def test_echo_is_quoted_only_when_the_answer_holds_all_it_returned() -> None:
+    def quoted(returns: str, says: str) -> bool:
+        asked = calls("m1", (job.ECHO_TOOL, {"text": "echo-a1b2"}))
+        return job.echo_of(turn_of(job.Step.ECHO, asked, returned("m1-0", returns), answer(says)), "echo-a1b2", {})[
+            "result_present"
+        ]
+
+    assert quoted("echo-a1b2", 'It returned "echo-a1b2".')
+    assert quoted("reply echo-a1b2", "reply echo-a1b2")
+    assert not quoted("reply echo-a1b2", "echo-a1b2")
+
+
+def test_an_answer_after_the_pdf_needs_the_pdf_read_or_sent() -> None:
+    def present(*events: dict[str, Any]) -> bool:
+        return job.pdf_of(turn_of(job.Step.PDF, *events), "rhi0a1b2c")["result_present"]
+
+    assert not present(answer("The folder is ready."))
+    assert present(calls("m1", ("Read", {"file_path": job.PDF_FILE})), answer("It cannot be read here."))
+
+
+def test_an_agent_the_harness_refused_is_asked_for_but_not_started(tmp_path: Path) -> None:
+    refused = turn_of(
+        job.Step.AGENTS,
+        calls("m1", ("Agent", {"subagent_type": "missing-kind"})),
+        returned("m1-0", "No such agent type.", error=True),
+    )
+    child = {"type": "assistant", "parent_tool_use_id": "m1-0", "message": {"id": "c1", "content": []}}
+    running = turn_of(job.Step.AGENTS, calls("m1", ("Agent", {})), child)
+    figure = tmp_path / job.FIGURE_FILE
+    assert [job.agents_of(refused, figure)[name] for name in ("agents_asked", "agents_started")] == [1, 0]
+    assert job.agents_of(running, figure)["agents_started"] == 1
+
+
 def test_only_an_address_the_web_search_returned_is_a_search_answer() -> None:
     def search(*events: dict[str, Any]) -> dict[str, Any]:
         printed = [(0.0, json.dumps(one)) for one in events]
@@ -272,6 +335,9 @@ def test_only_an_address_the_web_search_returned_is_a_search_answer() -> None:
     assert search(asked, returned("m1-0", links), answer(f"See {FOUND}."))["result_present"]
     assert not search(asked, returned("m1-0", "unavailable", error=True), answer(f"See {FOUND}."))["result_present"]
     assert not search(asked, returned("m1-0", links), answer("https://example.com/other"))["result_present"]
+    # A host in any case is the same host; a path in another case may be another page.
+    assert search(asked, returned("m1-0", links), answer(FOUND.replace("example.com", "Example.COM")))["result_present"]
+    assert not search(asked, returned("m1-0", links), answer(FOUND.replace("highs", "HiGHS")))["result_present"]
 
 
 def test_the_echo_server_answers_a_call_with_the_text_it_was_given() -> None:
@@ -290,7 +356,11 @@ def test_the_echo_server_answers_a_call_with_the_text_it_was_given() -> None:
     )
     started, called = (json.loads(line) for line in ran.stdout.splitlines())
     assert (started["id"], started["result"]["protocolVersion"]) == (1, "2025-06-18")
-    assert called == {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "a b"}], "isError": False}}
+    assert called == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"content": [{"type": "text", "text": "a b"}], "isError": False},
+    }
 
 
 def test_the_pdf_program_writes_a_pdf_that_gives_its_word(tmp_path: Path) -> None:
@@ -301,4 +371,6 @@ def test_the_pdf_program_writes_a_pdf_that_gives_its_word(tmp_path: Path) -> Non
     assert b"(The code word is rhi0a1b2c.)" in data
     # Each object's offset in the table is where the object is.
     offsets = re.findall(rb"(\d{10}) 00000 n", data)
-    assert [data[int(at) :].split(b" ", 1)[0] for at in offsets] == [str(n).encode() for n in range(1, len(offsets) + 1)]
+    assert [data[int(at) :].split(b" ", 1)[0] for at in offsets] == [
+        str(n).encode() for n in range(1, len(offsets) + 1)
+    ]
