@@ -20,7 +20,7 @@ wake and takes no concurrency slot: cheap calls never wake a GPU, and a status c
 
 | State | When |
 | --- | --- |
-| `unavailable` | the hold's rule (`rhi_gateway.hold`) would end a request for the pool at once, with its cause: `pool_disabled`, `pool_ceiling_reached` or `pool_scheduled_only` |
+| `unavailable` | the hold's rule (`rhi_gateway.hold`) would end a request for the pool at once, with its cause: `pool_disabled` or `pool_scheduled_only` |
 | `ready` | otherwise, when the pool has a healthy target |
 | `unavailable` | otherwise, with `capacity_unavailable`, when a launch found no capacity in the past 10 minutes |
 | `warming` | otherwise, when the scaler asked for capacity |
@@ -68,7 +68,7 @@ from rhi_gateway.waker import Waker
 # The mode a pool is in before the admin writes one, by its `wake` (section 11.3).
 _CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 # The causes the hold's rule gives at once, before any deadline.
-_IMMEDIATE = frozenset({Cause.POOL_DISABLED, Cause.POOL_CEILING_REACHED, Cause.POOL_SCHEDULED_ONLY})
+_IMMEDIATE = frozenset({Cause.POOL_DISABLED, Cause.POOL_SCHEDULED_ONLY})
 
 
 class State(StrEnum):

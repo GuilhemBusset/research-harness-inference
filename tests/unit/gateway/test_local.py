@@ -188,7 +188,6 @@ def test_the_four_states() -> None:
         (pool, PoolView(note=note(asked=0)), State.COLD, None),
         (pool, PoolView(), State.COLD, None),
         (pool, PoolView(ready=True, mode=mode(Mode.DISABLED)), State.UNAVAILABLE, Cause.POOL_DISABLED),
-        (pool, PoolView(mode=mode(Mode.BUDGET_LATCHED)), State.UNAVAILABLE, Cause.POOL_CEILING_REACHED),
         (scheduled, PoolView(), State.UNAVAILABLE, Cause.POOL_SCHEDULED_ONLY),
         (pool, PoolView(mode=mode(Mode.SCHEDULED_ONLY), note=note()), State.UNAVAILABLE, Cause.POOL_SCHEDULED_ONLY),
         (scheduled, PoolView(note=note(asked=1)), State.WARMING, None),

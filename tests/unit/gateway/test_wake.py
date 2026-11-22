@@ -201,7 +201,6 @@ def test_a_claude_name_wakes_the_default_pool_and_an_unknown_name_is_refused() -
     [
         ("mock", mode("mock", Mode.DISABLED), "pool_disabled"),
         ("evening", None, "pool_scheduled_only"),
-        ("mock", mode("mock", Mode.BUDGET_LATCHED), "pool_ceiling_reached"),
     ],
 )
 def test_stopped_pools_are_not_woken(name: str, record: PoolState | None, cause: str) -> None:

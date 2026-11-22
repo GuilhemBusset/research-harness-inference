@@ -142,6 +142,24 @@ def test_a_missing_https_listener_parameter_reads_false() -> None:
     assert config.read_ssm(stand_in) == dataclasses.replace(EXAMPLE, https_listener=False)
 
 
+def test_the_retired_session_windows_parameter_loads_only_as_an_empty_list() -> None:
+    # The deployed prefix may still hold the parameter, which the writer never deletes (ADR 0003,
+    # decision 2): `[]` loads as if it were not there, a window is refused, and no writing puts it.
+    stand_in = StandIn(example_parameters())
+    assert "/rhi/config/session_windows" not in stand_in.parameters
+    stand_in.parameters["/rhi/config/session_windows"] = ("String", "[]")
+    assert config.read_ssm(stand_in) == EXAMPLE
+    stand_in.parameters["/rhi/config/session_windows"] = ("String", f'["Monday 09:00 {MARK}"]')
+    with pytest.raises(config.ConfigError) as raised:
+        config.read_ssm(stand_in)
+    assert "'session_windows'" in str(raised.value)
+    assert MARK not in as_logged(raised.value)
+
+    written = StandIn()
+    config.write_ssm(EXAMPLE, written)
+    assert not any("session_windows" in name for name in written.parameters)
+
+
 def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -> None:
     other = dataclasses.replace(
         EXAMPLE,
@@ -167,7 +185,7 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
     [
         # A missing parameter.
         ("'domain'", {"/rhi/config/domain": None}),
-        ("'session_windows'", {"/rhi/config/session_windows": None}),
+        ("'course_end'", {"/rhi/config/course_end": None}),
         # A parameter under the prefix that names no key.
         ("'/rhi/config/surprise'", {"/rhi/config/surprise": f"value{MARK}"}),
         ("'/rhi/config/domain/more'", {"/rhi/config/domain/more": f"value{MARK}"}),
@@ -221,7 +239,6 @@ def test_a_missing_an_unknown_or_a_wrongly_typed_parameter_raises(
         ("course_end", datetime.datetime(int(MARK), 1, 1, tzinfo=datetime.UTC)),
         ("time_zone", f"Nowhere/City{MARK}"),
         ("pools", (f"entry{MARK}",)),
-        ("session_windows", None),
         ("https_listener", 1),
     ],
 )

@@ -92,7 +92,7 @@ def test_in_flight_above_target_for_sixty_seconds() -> None:
     nothing = run(T + 60, none, 17, memory=run(T, none, 17).memory)
     assert (nothing.desired, nothing.memory.above_target_since) == (0, None)
     # A pool somebody stopped does not grow; a scheduled-only pool in use does.
-    for mode, desired in ((Mode.DISABLED, 2), (Mode.BUDGET_LATCHED, 2), (Mode.SCHEDULED_ONLY, 3)):
+    for mode, desired in ((Mode.DISABLED, 2), (Mode.SCHEDULED_ONLY, 3)):
         assert run(T + 60, two, 17, memory=first.memory, mode=mode).desired == desired
 
 

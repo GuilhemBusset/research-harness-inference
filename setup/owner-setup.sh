@@ -496,9 +496,8 @@ step_configuration() {
 The configuration is one file that you keep outside the working tree: a copy of
 config.example.toml with your values in place of the placeholders (the domain and its hosted
 zone, the admin e-mail address, the monthly budget of decision 6, the time zone, the course end
-date of decision 1, ...). For now `session_windows` stays an empty list: the loader refuses a
-window until windows have a shape. `pools` stays an empty table, `pools = {}`, until you add the
-mock pool, the `[pools.mock]` table of the example; each later pool brings its GPU-hour ceiling.
+date of decision 1, ...). `pools` stays an empty table, `pools = {}`, until you add the mock
+pool, the `[pools.mock]` table of the example.
 
 The configuration loader checks the file before anything is written, and the configuration
 writer then writes one parameter per key under /rhi/config/, in the region of your credentials.

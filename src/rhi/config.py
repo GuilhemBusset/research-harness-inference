@@ -110,10 +110,10 @@ class Config:
     # actual cost to the alerts topic (`rhi.guardrails.budget`; sections 11.3 and 17). Only
     # synthesis reads them.
     budget_alert_percentages: tuple[int, ...]
-    # The schedule: an IANA time zone name, the course end date and the session windows.
+    # The schedule: an IANA time zone name and the course end date. Sessions have no schedule:
+    # the instructor switches them on and off (section 5.6).
     time_zone: str
     course_end: datetime.date
-    session_windows: tuple[()]
     # One entry per pool, parsed by `rhi_common.pool_config`, in the table's order.
     pools: tuple[Pool, ...]
     # The instance types a pool may list: a hard cap (section 11.3).
@@ -279,8 +279,7 @@ def _boolean(value: object) -> bool:
 
 
 def _no_entries(value: object) -> tuple[()]:
-    # Entries get their shape, and their parser, in the issue that introduces them. Until then
-    # an entry is refused, so that no source holds one a later, stricter parser could refuse.
+    # Only an empty list: the retired key `session_windows` held one and nothing else.
     if not isinstance(value, list) or value:
         raise ValueError
     return ()
@@ -389,7 +388,7 @@ def _json_from_text(text: str) -> object:
 
 
 _STRING = Key("a string that is not empty", _string)
-_EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
+_EMPTY_LIST = Key("an empty list: the key is retired", _no_entries, _list_from_text)
 _WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
 _NUMBER_ABOVE_ZERO = Key("a number above zero", _number_above_zero, _price_from_text)
 
@@ -410,7 +409,6 @@ KEYS: dict[str, Key] = {
     ),
     "time_zone": Key("an IANA time zone name that this host's time zone database knows", _time_zone),
     "course_end": Key("a date, written YYYY-MM-DD without quotes", _date, _date_from_text),
-    "session_windows": _EMPTY_LIST,
     "pools": Key("a table of pools, one entry per pool, each as section 4.2 gives it", _pools, _json_from_text),
     "https_listener": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
@@ -445,6 +443,14 @@ KEYS: dict[str, Key] = {
     "gateway_error_alarm_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
     "gateway_error_alarm_minutes": _WHOLE_NUMBER,
     "parked": Key("true or false, without quotes", _boolean, _boolean_from_text),
+}
+
+# Keys a source may still hold though the configuration has none: each is checked with its old
+# parser and then dropped, so that a source holding it loads as if it did not, and any other value
+# is refused as before. `session_windows` (ADR 0003, decision 2) stays until the owner has deleted
+# its parameter in SSM; a later change then removes the entry.
+RETIRED_KEYS: dict[str, Key] = {
+    "session_windows": _EMPTY_LIST,
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -523,10 +529,19 @@ def required_keys() -> frozenset[str]:
 
 def parse(data: Mapping[str, object], source: str) -> Config:
     """The typed configuration of what one source holds. `source` is its name, for the errors."""
-    unknown = sorted(set(data) - set(KEYS))
+    unknown = sorted(set(data) - set(KEYS) - set(RETIRED_KEYS))
     if unknown:
         names = ", ".join(repr(name) for name in unknown)
         raise ConfigError(f"the configuration source {source!r} holds an unknown key: {names}")
+    for name, key in RETIRED_KEYS.items():
+        if name not in data:
+            continue
+        try:
+            key.parse(data[name])
+        except ValueError:
+            raise ConfigError(
+                f"the key {name!r} in the configuration source {source!r} must be {key.expected}"
+            ) from None
     values: dict[str, Any] = {}
     # Where each key's value came from, and the value as it came, for the keys read against the pools.
     origins: dict[str, str] = {}
@@ -658,13 +673,14 @@ def read_ssm(client: Any = None) -> Config:
     entries: dict[str, object] = {}
     stray: list[str] = []
     not_strings: list[str] = []
+    known = KEYS | RETIRED_KEYS
     for parameter in sorted(stored, key=lambda parameter: parameter["Name"]):
         name: str = parameter["Name"]
         key = name.removeprefix(SSM_PREFIX)
         entry = name.removeprefix(SSM_POOLS_PREFIX)
         is_entry = name.startswith(SSM_POOLS_PREFIX) and entry != "" and "/" not in entry
         # The pools table is a key with no parameter of its own.
-        is_key = name.startswith(SSM_PREFIX) and key in KEYS and key != "pools"
+        is_key = name.startswith(SSM_PREFIX) and key in known and key != "pools"
         if not is_entry and not is_key:
             stray.append(name)
         elif parameter.get("Type") != "String":
@@ -672,7 +688,7 @@ def read_ssm(client: Any = None) -> Config:
         elif is_entry:
             entries[entry] = _json_from_text(parameter["Value"])
         else:
-            data[key] = KEYS[key].from_text(parameter["Value"])
+            data[key] = known[key].from_text(parameter["Value"])
     for names, problem in ((stray, "that names no key"), (not_strings, "that is not of type String")):
         if names:
             listed = ", ".join(repr(name) for name in names)

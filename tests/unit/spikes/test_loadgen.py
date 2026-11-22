@@ -332,7 +332,7 @@ def test_a_failed_connection_ends_the_replay_unless_failures_are_kept() -> None:
         if request.headers["authorization"] == f"Bearer {keys[0]}":
             raise httpx.ConnectError("refused")
         return httpx.Response(
-            402, json={"type": "error", "error": {"type": "pool_ceiling_reached", "message": "ceiling"}}
+            503, json={"type": "error", "error": {"type": "pool_disabled", "message": "disabled"}}
         )
 
     sessions = (session(1, loadgen.Turn(1.0, 10)), session(2, loadgen.Turn(1.0, 10)))
@@ -352,6 +352,6 @@ def test_a_failed_connection_ends_the_replay_unless_failures_are_kept() -> None:
     assert seen == records
     assert [(one.student, one.status, one.failure, one.cause) for one in records] == [
         (0, None, loadgen.Failure.CONNECT_ERROR, None),
-        (1, 402, None, "pool_ceiling_reached"),
+        (1, 503, None, "pool_disabled"),
     ]
     assert all(one.sent_at is not None for one in records)

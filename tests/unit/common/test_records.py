@@ -34,7 +34,7 @@ INSTANCE = InstanceHeartbeat(
     stage="serving",
     written_at=NOW,
 )
-STATE = PoolState(pool="coursework", mode=Mode.BUDGET_LATCHED, set_by="admin", set_at=NOW - 500)
+STATE = PoolState(pool="coursework", mode=Mode.SCHEDULED_ONLY, set_by="admin", set_at=NOW - 500)
 NOTE = ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=NOW - 90, written_at=NOW)
 
 RECORDS = [
@@ -80,8 +80,8 @@ def test_item_keys() -> None:
     assert instance["expires_at"] == NOW + 3600
 
 
-def test_the_modes_are_the_four_of_the_design() -> None:
-    assert {mode.value for mode in Mode} == {"enabled", "scheduled-only", "disabled", "budget-latched"}
+def test_the_modes_are_the_three_of_the_design() -> None:
+    assert {mode.value for mode in Mode} == {"enabled", "scheduled-only", "disabled"}
 
 
 def test_a_note_without_a_rebalance_number_reads_as_0() -> None:

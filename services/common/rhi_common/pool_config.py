@@ -15,16 +15,20 @@ with `_`, which no pool's name may hold. A rule that admitted it would let a poo
 switch share one partition.
 
 Seven fields have a default of section 17, which gives them to every pool: the two holds, the idle
-time, the drain and the three settings of student affinity, below. `target_concurrency` and `gpu_hours_per_day` are a pool's own values, so
-every pool gives the first and every vllm pool the second. A mock pool serves canned responses
-from no model repository: it may leave out `model`, `revision` and `gpu_hours_per_day`.
+time, the drain and the three settings of student affinity, below. `target_concurrency` is a
+pool's own value, so every pool gives it. A mock pool serves canned responses from no model
+repository: it may leave out `model` and `revision`.
+
+`gpu_hours_per_day` is a retired field (ADR 0003, decision 2): a pool has none, but an entry may
+still hold it, as a whole number not below 0, which is read into nothing, so that an entry written
+before its removal still loads. Any other value is refused. A later change removes the tolerance
+once the deployed entries no longer hold it.
 
 Each pool prices every instance type it lists, in dollars an hour (sections 5.4 and 7.2): the
 first listed type is the one it runs, the others are its fallbacks, the next sizes of the same GPU,
-which cost more. The scaler accrues what actually ran at these prices. A fallback is a price the
-pool can run at, so every listed type is held to the on-demand price limit: a pool priced above it
-may only wake on schedule (sections 11.3 and 17). The limit is the caller's, 5 dollars an hour
-when none is given.
+which cost more. A fallback is a price the pool can run at, so every listed type is held to the
+on-demand price limit: a pool priced above it may only wake on schedule (sections 11.3 and 17).
+The limit is the caller's, 5 dollars an hour when none is given.
 
 A pool may give `expected`, the values the inference dashboard draws beside the measured series
 (sections 4.7 and 7.3): each of speed per stream, time to first token and cache capacity is
@@ -237,8 +241,6 @@ class Pool:
     hold_seconds_non_streaming: int
     idle_minutes: int
     drain_seconds: int
-    # The scaler refuses to wake beyond this. A vllm pool has one.
-    gpu_hours_per_day: int | None
     # None until a start has been measured (spike S1): the launch hook's deadline becomes twice
     # this (sections 4.3 and 17).
     measured_start_seconds: int | None
@@ -284,6 +286,8 @@ class Pool:
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
+# The fields an entry may still hold though a pool has none: each is checked, then dropped.
+RETIRED_FIELDS = frozenset({"gpu_hours_per_day"})
 
 
 def _text(pool: str, entry: Mapping[str, object], field: str) -> str:
@@ -508,9 +512,11 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
     if not isinstance(entry, Mapping):
         raise PoolConfigError(name, None, "the entry must be a table")
-    unknown = sorted(str(field) for field in entry if field not in FIELDS)
+    unknown = sorted(str(field) for field in entry if field not in FIELDS | RETIRED_FIELDS)
     if unknown:
         raise PoolConfigError(name, unknown[0], "is not a field of a pool")
+    if "gpu_hours_per_day" in entry:
+        _whole(name, entry, "gpu_hours_per_day", least=0)  # checked, and read into nothing
 
     engine = _choice(name, entry, "engine", ENGINES)
     served_by_vllm = engine == "vllm"
@@ -550,11 +556,6 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         ),
         idle_minutes=_whole(name, entry, "idle_minutes", least=0, default=DEFAULT_IDLE_MINUTES),
         drain_seconds=_whole(name, entry, "drain_seconds", least=0, default=DEFAULT_DRAIN_SECONDS),
-        gpu_hours_per_day=(
-            _whole(name, entry, "gpu_hours_per_day", least=0)
-            if served_by_vllm or "gpu_hours_per_day" in entry
-            else None
-        ),
         measured_start_seconds=(
             _whole(name, entry, "measured_start_seconds", least=1) if "measured_start_seconds" in entry else None
         ),

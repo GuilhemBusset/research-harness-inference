@@ -7,8 +7,6 @@ and carries a `Decision` out.
 
 A time is a whole number of seconds since the epoch, as in `rhi_common.records`, and `None` when
 it is unknown. An instance is named by its ID.
-
-The rules that come later (the ceilings and the spend, the schedule) extend these shapes.
 """
 
 from __future__ import annotations
@@ -135,7 +133,7 @@ class Reason(StrEnum):
     WAKE = "wake"
     # No request received and none in flight for `idle_minutes`: the pool goes to zero.
     IDLE = "idle"
-    # The pool is stopped (`disabled` or `budget-latched`) and releases its idle instances.
+    # The pool is stopped (`disabled`) and releases its idle instances.
     STOPPED = "stopped"
     # The instances in service have been full for 60 seconds: the pool grows by one instance.
     SCALE_OUT = "scale-out"
