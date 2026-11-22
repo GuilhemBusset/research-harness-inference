@@ -16,6 +16,8 @@ from botocore.stub import Stubber
 from moto import mock_aws
 
 from rhi_admin import main
+from rhi_admin import session as admin_session
+from rhi_common.records import SessionSwitch
 from rhi_common.tables import SESSION_SWITCH_KEY
 
 NOW = 1_800_000_000
@@ -100,3 +102,33 @@ def test_the_switch_reads_off_until_switched_on_then_reads_back_who_and_when(run
     assert rows(run("status")[1]) == [["off", WHO, str(NOW + 3600)]]
     items = boto3.resource("dynamodb").Table(TABLE).scan()["Items"]
     assert [{key: item[key] for key in SESSION_SWITCH_KEY} for item in items] == [SESSION_SWITCH_KEY]
+
+
+def test_an_off_command_that_races_another_keeps_the_first_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two admins switch the session off at once: the one that writes first is who ended it, and when."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    with mock_aws():
+        keys = [("pool", "HASH"), ("record", "RANGE")]
+        table = boto3.resource("dynamodb").create_table(
+            TableName=TABLE,
+            BillingMode="PAY_PER_REQUEST",
+            AttributeDefinitions=[{"AttributeName": name, "AttributeType": "S"} for name, _ in keys],
+            KeySchema=[{"AttributeName": name, "KeyType": kind} for name, kind in keys],
+        )
+        first = admin_session.Switch(table=table, caller=lambda: "user/first")
+        admin_session.turn(True, switch=first, now=NOW)
+        read = table.get_item
+
+        def read_then_first_switches_off(**kwargs: Any) -> Any:
+            item = read(**kwargs)  # the second command has read the switch on
+            monkeypatch.setattr(table, "get_item", read)
+            assert admin_session.turn(False, switch=first, now=NOW + 20)[1]
+            return item
+
+        monkeypatch.setattr(table, "get_item", read_then_first_switches_off)
+        second = admin_session.Switch(table=table, caller=lambda: "user/second")
+        state, written = admin_session.turn(False, switch=second, now=NOW + 21)
+
+        assert not written
+        assert state == SessionSwitch(on=False, set_by="user/first", set_at=NOW + 20)
+        assert admin_session.status(first) == state

@@ -40,8 +40,10 @@ pool, by its name in the configuration, which is also the model name `rhi status
 
 ## Check
 
-1. **Every pool's mode, who set it and when:** a pool in its configured mode reads `configured`
-   under `set_by`; a disabled one reads `disabled`, with the identity that disabled it and the time.
+1. **Every pool's mode, who set it and when:** a pool whose mode no admin has set reads its
+   configured mode, with `configured` under `set_by`; a disabled one reads `disabled`, with the
+   identity that disabled it and the time; a re-enabled one reads its configured mode, with the
+   identity that re-enabled it and the time.
 
    ```sh
    rhi_admin pool status
@@ -64,26 +66,47 @@ requests already running finish.
 rhi_admin pool disable coursework
 ```
 
-To re-enable it. The pool goes back to its configured mode: `enabled` for a pool that wakes on
-demand, `scheduled-only` for one that does not. While a session is on, wake it again:
+To re-enable it. The pool goes back to its configured mode, which `rhi_admin pool status` then
+shows: `enabled` for a pool configured `wake = "on-demand"`, `scheduled-only` for one configured
+`wake = "scheduled-only"`.
 
 ```sh
 rhi_admin pool enable coursework
+```
+
+Then, only for a pool that reads `enabled`, and while a session is on, wake it so that it is ready
+for the students rather than started by the first request:
+
+```sh
 rhi wait coursework
 ```
 
+A pool that reads `scheduled-only` is not woken this way: students cannot wake it (section 5.3),
+so `rhi wait` stops at once with the cause `pool_scheduled_only` and asks for no capacity. It starts
+only when the admin asks for its capacity, which is not part of this runbook.
+
 ## Verify
 
-1. The mode reads `disabled` after the first command, and the configured mode after the second,
-   each with your identity and the time:
+1. The mode reads `disabled` after disabling, with your identity under `set_by` and the time under
+   `set_at`. After re-enabling it reads the configured mode, `enabled` or `scheduled-only`, again
+   with your identity and the time: this is the check of either kind of re-enable.
 
    ```sh
    rhi_admin pool status
    ```
 
 2. `rhi status` lists a disabled pool as `unavailable` with the cause `pool_disabled`. After
-   re-enabling it, and while a session is on, it reads `cold`, then `warming` and `ready` once
-   `rhi wait coursework` has woken it.
+   re-enabling:
+
+   - a pool back in mode `enabled` reads `cold` while it has no instance; once `rhi wait` has woken
+     it, during a session, it reads `warming`, then `ready`, and `rhi wait` exits 0;
+   - a pool back in mode `scheduled-only` that has no instance reads `unavailable` with the cause
+     `pool_scheduled_only`, not `pool_disabled`: the re-enable worked, and the pool waits for the
+     admin to start it.
+
+   ```sh
+   rhi status
+   ```
 
 3. After disabling, in Grafana, the panel Instances of the fleet and scaling dashboard shows the
    pool's desired capacity at zero once its last request has finished.

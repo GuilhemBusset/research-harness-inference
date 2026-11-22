@@ -35,8 +35,16 @@ During a session, a pool does not come up:
   13 minutes a cold launch is estimated to take (section 5.2);
 - `rhi status` lists the pool as `unavailable` with the cause `capacity_unavailable`: its last
   launch found no capacity in the past 10 minutes (section 5.3);
-- students report that their harness waited, then received `capacity_unavailable`, a 503 with
-  `Retry-After: 60` (section 6.2).
+- students report that their harness waited, then failed with `capacity_unavailable` (section
+  6.2). How it shows depends on the kind of call. A streaming call, which harnesses use for chat,
+  is answered HTTP 200 at once and kept alive while the gateway holds it; at the deadline (the
+  pool's `hold_seconds`, 7 minutes by default) the stream ends with the error event of its wire
+  format, which carries `capacity_unavailable`, so the harness shows an error after a stream that
+  began well, not an HTTP status. A non-streaming call is held silently, and at its deadline
+  (`hold_seconds_non_streaming`, 4 minutes by default) it is answered HTTP 503 with
+  `Retry-After: 60` and `capacity_unavailable` in the error body. Either way, a held call whose
+  pool has not found capacity in the past 10 minutes ends with `warming` instead: the pool is still
+  starting.
 
 ## Check
 

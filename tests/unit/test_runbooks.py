@@ -25,16 +25,25 @@ RUNBOOKS = ["session-on-and-off.md", "capacity-failure.md", "disabled-pool.md"]
 SECTIONS = ["when", "check", "act", "verify"]
 
 
-def block_lines(text: str) -> list[list[str]]:
-    """The words of every line of every fenced code block: a `\\` continues a line, and blank and
-    comment lines are left out."""
+FENCE = re.compile(r"^(`{3,}|~{3,})")
+
+
+def read(text: str) -> tuple[list[str], list[list[str]]]:
+    """The level-2 headings outside the code blocks, and the words of every line of every fenced code
+    block (backticks or tildes): a `\\` continues a line, and blank and comment lines are left out."""
+    headings: list[str] = []
     lines: list[list[str]] = []
-    fenced, pending = False, ""
+    fence, pending = "", ""
     for line in text.splitlines():
-        if line.strip().startswith("```"):
-            fenced, pending = not fenced, ""
+        opening = FENCE.match(line.strip())
+        if not fence:
+            if opening:
+                fence, pending = opening[1], ""
+            elif match := re.match(r"^##\s+(.+)$", line):
+                headings.append(match[1].strip().lower())
             continue
-        if not fenced:
+        if opening and opening[1][0] == fence[0] and len(opening[1]) >= len(fence) and line.strip() == opening[1]:
+            fence = ""
             continue
         pending += line.strip().removeprefix("$ ")
         if pending.endswith("\\"):
@@ -44,7 +53,7 @@ def block_lines(text: str) -> list[list[str]]:
         if words:
             lines.append(words)
         pending = ""
-    return lines
+    return headings, lines
 
 
 def _refuses(parser: argparse.ArgumentParser, argv: list[str]) -> bool:
@@ -63,11 +72,11 @@ def _is_repository_path(word: str) -> bool:
 def problems(text: str, root: Path = ROOT) -> list[str]:
     """What is wrong with a runbook: a missing section, a command that does not parse, a path that is not there."""
     found = []
-    headings = [h.strip().lower() for h in re.findall(r"^##\s+(.+)$", text, re.MULTILINE)]
+    headings, lines = read(text)
     if [h for h in headings if h in SECTIONS] != SECTIONS:
         found.append(f"the sections are {headings}, not {SECTIONS} in that order")
     admin = admin_main.parser()
-    for words in block_lines(text):
+    for words in lines:
         first, rest = words[0], words[1:]
         if first == "rhi" and _refuses(rhi_main.parser(), rest):
             found.append(f"the rhi CLI refuses: {shlex.join(words)}")
@@ -81,7 +90,7 @@ def problems(text: str, root: Path = ROOT) -> list[str]:
 @pytest.mark.parametrize("name", RUNBOOKS)
 def test_runbook_has_its_sections_and_only_commands_the_repository_has(name: str) -> None:
     text = (ROOT / "docs" / "runbooks" / name).read_text(encoding="utf-8")
-    assert block_lines(text), "the runbook shows no command"
+    assert read(text)[1], "the runbook shows no command"
     assert problems(text) == []
 
 
@@ -92,3 +101,10 @@ def test_detects_an_unknown_command() -> None:
     assert problems(sections + "```sh\nrhi status\nscripts/check.sh fast\n```\n") == []
     assert problems(unknown_rhi) == ["the rhi CLI refuses: rhi frobnicate coursework"]
     assert problems(missing_script) == ["no such path in the repository: scripts/no-such-script.sh"]
+    # A tilde fence is a code block too, and a backtick line inside it does not close it.
+    assert problems(sections + "~~~sh\n```\nrhi frobnicate\n~~~\n") == ["the rhi CLI refuses: rhi frobnicate"]
+
+
+def test_section_headings_count_only_outside_code_blocks() -> None:
+    sections = "".join(f"## {section.title()}\n\n" for section in SECTIONS)
+    assert len(problems("```sh\n" + sections + "rhi status\n```\n")) == 1
