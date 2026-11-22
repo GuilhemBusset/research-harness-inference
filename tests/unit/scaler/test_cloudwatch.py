@@ -136,9 +136,9 @@ def test_a_switch_that_could_not_be_read_fails_the_run_after_its_decision_and_pu
     with pytest.raises(RecordError):
         scaler.run_cycle(SETTINGS, clients, Recorder(), NOW, DecisionCounts())  # ty: ignore[invalid-argument-type] - a test double
     assert recorder.calls == []
-    # The decision was applied, and each pool's stretch stayed where it stood.
+    # The decision was applied: coursework, in service, kept its stretch; mock, with none in service, ended its own.
     (decision,) = applied
-    assert [pool.memory.outside_sessions_since for pool in decision.pools] == [NOW - 3660, NOW - 600]
+    assert [pool.memory.outside_sessions_since for pool in decision.pools] == [NOW - 3660, None]
 
 
 def test_a_publication_cloudwatch_refuses_fails_the_run(monkeypatch: pytest.MonkeyPatch) -> None:

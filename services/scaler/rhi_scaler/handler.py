@@ -15,8 +15,9 @@ A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is 
 reads. A metrics push that fails does not fail the run: the decision is already applied, and the
 log holds it. Two failures do fail the run, after its decision is applied, which stands:
 
-- the session switch could not be read: what demand calls for is applied all the same, each pool's
-  stretch outside sessions stays as it was, and nothing is published;
+- the session switch could not be read: what demand calls for is applied all the same, a pool seen
+  with no instance in service ends its stretch outside sessions while every other stretch stays as
+  it was, and nothing is published;
 - CloudWatch refused the publication: the run did not deliver what the alarms read.
 """
 
