@@ -28,7 +28,8 @@ There is no per-student token budget (ADR 0003, decisions 2 and 3). An item writ
 release can still hold a key's or a roster entry's `daily_token_budget`, a day's `tokens` or a
 lease's `tokens` and `estimate`, until it expires. No record has them and nothing here writes them:
 `from_item` and `from_map` read only the attributes above and ignore any other, so such an item
-reads as one without them.
+reads as one without them. `without_budget` gives an item as it is stored less those attributes
+alone, for a reader that keeps what else the item holds (the privacy export).
 
 `expires_at` is the attribute the table deletes an item by, and whoever writes the item sets it.
 On a key it is the course end, and the key is refused after it whatever the table has deleted.
@@ -53,6 +54,28 @@ _DAY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 def utc_day(at: int) -> str:
     """The sort key of the usage table for a time: its UTC date, as YYYY-MM-DD."""
     return datetime.fromtimestamp(at, UTC).date().isoformat()
+
+
+_RETIRED = frozenset({"daily_token_budget", "tokens"})
+_RETIRED_FROM_A_LEASE = frozenset({"tokens", "estimate"})
+
+
+def without_budget(item: Mapping[str, object]) -> dict[str, object]:
+    """A stored item less the budget's attributes an earlier release wrote, every other attribute kept as it is.
+
+    It drops a key's or an entry's `daily_token_budget`, a day's `tokens`, and each lease's
+    `tokens` and `estimate`; what the item holds besides, known here or not, stays.
+    """
+    kept = {name: value for name, value in item.items() if name not in _RETIRED}
+    leases = kept.get("leases")
+    if isinstance(leases, Mapping):
+        kept["leases"] = {
+            request: {name: value for name, value in lease.items() if name not in _RETIRED_FROM_A_LEASE}
+            if isinstance(lease, Mapping)
+            else lease
+            for request, lease in leases.items()
+        }
+    return kept
 
 
 def _optional_text(item: Mapping[str, object], name: str) -> str | None:

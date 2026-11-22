@@ -235,10 +235,15 @@ def test_the_export_holds_the_student_s_data_and_no_key_and_no_hash(deployed: De
     assert re.search(r"rhi_[0-9A-Za-z]{20,}|[0-9a-f]{64}", printed) is None
 
 
-def test_the_export_leaves_out_the_budget_s_attributes_of_a_row_an_earlier_release_wrote(deployed: Deployed) -> None:
+@pytest.mark.parametrize("earlier_release", [True, False], ids=["with-the-budget", "without-it"])
+def test_the_export_keeps_every_attribute_of_a_row_but_the_budget_s(deployed: Deployed, earlier_release: bool) -> None:
     lease = {"expires": NOW + 120}
-    row = {"github_id": OTTER, "day": "2027-01-14", "alias": "otter", "expires_at": NOW + 86_400}
-    deployed.usage.put_item(Item={**row, "tokens": 0, "leases": {"request": {**lease, "tokens": 0, "estimate": 0}}})
+    maps = {"affinity_cookies": {"mock": "AWSALB=cookie-of-otter"}, "rebalance_applied": {"mock": 7}}
+    row: dict[str, object] = {"github_id": OTTER, "day": "2027-01-14", "alias": "otter", "expires_at": NOW + 86_400}
+    row |= {**maps, "carried_maps": maps, "opening": True}
+    budget = {"tokens": 0, "estimate": 0} if earlier_release else {}
+    stored = {**row, "leases": {"request": {**lease, **budget}}} | ({"tokens": 0} if earlier_release else {})
+    deployed.usage.put_item(Item=stored)
     deployed.stubs["logs"].add_response("filter_log_events", {"events": []})
 
     status, printed = deployed.run("export", str(OTTER))
