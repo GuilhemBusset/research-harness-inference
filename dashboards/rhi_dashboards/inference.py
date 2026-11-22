@@ -110,6 +110,9 @@ METRICS: tuple[rules.Declared, ...] = (
     ),
 )
 
+# The colour of the cached-share panel's "asleep": neither the flag's red nor its green.
+ASLEEP_COLOR = "grey"
+
 # A row is 24 columns wide: two panels to a line.
 HALF = 12
 
@@ -124,8 +127,10 @@ def _engine(legend: str, expression: str, axis: str | None = None) -> rules.Seri
 
 
 def _line(legend: str, value: float) -> rules.Series:
-    """A reference line: the same value at every moment."""
-    return rules.Series(legend, f"vector({value:g})")
+    """A reference line: the same value at every moment, written in full, never rounded."""
+    number = float(value)
+    written = str(int(number)) if number.is_integer() else repr(number)
+    return rules.Series(legend, f"vector({written})")
 
 
 def _expected(bounds: tuple[float, float] | None) -> list[rules.Series]:
@@ -230,13 +235,28 @@ def cached_share(pool: Pool) -> list[rules.Series]:
 
 
 def _flag(panel: timeseries_builders.Panel, threshold: float) -> timeseries_builders.Panel:
-    """Red below the threshold, green from it: the line, and the area under it, are drawn."""
+    """Red below the threshold, green from it: the line, and the area under it, are drawn.
+
+    The "asleep" series is zero, below any threshold: it is drawn in grey, with no threshold of its
+    own, so a pool with no instance does not read as a cache that fails.
+    """
     steps = [models.Threshold(value=None, color="red"), models.Threshold(value=threshold, color="green")]
     return (
         panel.thresholds(dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps))
         .color_scheme(dashboard_builders.FieldColor().mode(models.FieldColorModeId.THRESHOLDS))
         .thresholds_style(
             common_builders.GraphThresholdsStyleConfig().mode(common.GraphThresholdsStyleMode.LINE_AND_AREA)
+        )
+        .override_by_query(
+            rules.ASLEEP_REF,
+            [
+                models.DynamicConfigValue(id_val="color", value={"mode": "fixed", "fixedColor": ASLEEP_COLOR}),
+                models.DynamicConfigValue(
+                    id_val="thresholds",
+                    value={"mode": "absolute", "steps": [{"value": None, "color": ASLEEP_COLOR}]},
+                ),
+                models.DynamicConfigValue(id_val="custom.thresholdsStyle", value={"mode": "off"}),
+            ],
         )
     )
 

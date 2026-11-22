@@ -141,6 +141,17 @@ def test_the_cached_share_is_flagged_below_the_configured_threshold(example: rhi
             assert steps[1]["value"] == pytest.approx(threshold)
             assert defaults["color"]["mode"] == "thresholds"
             assert defaults["custom"]["thresholdsStyle"]["mode"] != "off"
+            # The asleep series is zero: it keeps a colour that is neither the flag's red nor its green.
+            asleep = [
+                {prop["id"]: prop["value"] for prop in override["properties"]}
+                for override in panels[inference.CACHED_SHARE]["fieldConfig"]["overrides"]
+                if override["matcher"] == {"id": "byFrameRefID", "options": rules.ASLEEP_REF}
+            ]
+            colours = {one["color"]["fixedColor"] for one in asleep if "color" in one}
+            colours |= {step["color"] for one in asleep if "thresholds" in one for step in one["thresholds"]["steps"]}
+            assert colours
+            assert not colours & {"red", "green"}
+            assert all(one["color"]["mode"] == "fixed" for one in asleep if "color" in one)
 
 
 def lines(panel: dict[str, Any], prefix: str) -> list[str]:
@@ -151,26 +162,27 @@ def test_the_prediction_is_on_the_panel(example: rhi_config.Config) -> None:
     coursework = pool(example, "coursework")
     assert coursework.expected is not None
     expected = dataclasses.replace(
-        coursework.expected, stream_tokens_per_second=(11.5, 27), time_to_first_token_seconds=(0.7, 2.25)
+        coursework.expected, stream_tokens_per_second=(11.12501, 27), time_to_first_token_seconds=(0.7, 2.250001)
     )
     changed = tuple(dataclasses.replace(one, expected=expected) if one is coursework else one for one in example.pools)
     config = dataclasses.replace(
-        example, pools=changed, target_ttft_p95_seconds=4, target_stream_p10_tokens_per_second=9
+        example, pools=changed, target_ttft_p95_seconds=4.125001, target_stream_p10_tokens_per_second=9
     )
     found = rows(config)
 
+    # The values are drawn as configured, never rounded.
     speed, first = found["coursework"][inference.SPEED], found["coursework"][inference.FIRST_TOKEN]
-    assert lines(speed, inference.EXPECTED) == ["vector(11.5)", "vector(27)"]
-    assert lines(first, inference.EXPECTED) == ["vector(0.7)", "vector(2.25)"]
+    assert lines(speed, inference.EXPECTED) == ["vector(11.12501)", "vector(27)"]
+    assert lines(first, inference.EXPECTED) == ["vector(0.7)", "vector(2.250001)"]
     assert lines(speed, "floor") == ["vector(15)", "vector(9)"]
-    assert lines(first, "floor") == ["vector(4)"]
+    assert lines(first, "floor") == ["vector(4.125001)"]
 
     # The mock pool gives no expected values: its panels carry the floors and no expected line.
     assert pool(config, "mock").expected is None
     for panel in found["mock"].values():
         assert lines(panel, inference.EXPECTED) == []
     assert lines(found["mock"][inference.SPEED], "floor") == ["vector(15)", "vector(9)"]
-    assert lines(found["mock"][inference.FIRST_TOKEN], "floor") == ["vector(4)"]
+    assert lines(found["mock"][inference.FIRST_TOKEN], "floor") == ["vector(4.125001)"]
     # A pool with expected values that leave one out shows only the floors on that panel.
     partial = ExpectedValues(stream_tokens_per_second=None, time_to_first_token_seconds=(1, 2), cache_tokens=None)
     one = dataclasses.replace(coursework, expected=partial)
