@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
+from prometheus_client import CollectorRegistry
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
@@ -27,11 +28,14 @@ from starlette.types import Message
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
 from rhi_common.students import StudentKey
+from rhi_gateway import app as gateway_app
 from rhi_gateway import proxy, routes
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import BodyFilter
+from rhi_gateway.body import BodyFilter, Forwarded
 from rhi_gateway.budget import InMemoryLedger
+from rhi_gateway.errors import WireFormat
+from rhi_gateway.experience import FIRST_TOKEN, Experience
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.hold import HELD_HEADER
@@ -169,6 +173,23 @@ def gateway(
     return build_app(forwarding_handlers(forwarding), local=local), key
 
 
+def _scope(method: str, path: str, headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("192.0.2.1", 50000),
+        "server": ("gateway.example.com", 443),
+    }
+
+
 def call(
     app: Starlette, method: str, path: str, *, key: str | None = None, body: Any = None, marker: bool = False
 ) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
@@ -192,21 +213,7 @@ def call(
     async def send(message: Message) -> None:
         sent.append(message)
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "method": method,
-        "scheme": "https",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "root_path": "",
-        "headers": headers,
-        "client": ("192.0.2.1", 50000),
-        "server": ("gateway.example.com", 443),
-    }
-    asyncio.run(app(scope, receive, send))
+    asyncio.run(app(_scope(method, path, headers), receive, send))
     start = next(message for message in sent if message["type"] == "http.response.start")
     content = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
     return start["status"], list(start.get("headers", [])), content
@@ -378,6 +385,67 @@ def test_a_warm_stream_was_not_held(capsys: pytest.CaptureFixture[str]) -> None:
     [record] = records(capsys)
     assert record["held_ms"] == 0
     assert record["time_to_first_token_ms"] == 2500
+
+
+def test_the_log_and_the_histogram_read_the_same_wait(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    waits = Waits()
+    app, key = streaming(waits)
+    registry = CollectorRegistry()
+    app.state.experience = Experience(registry, clock=lambda: waits.now)
+    classify = gateway_app.first_turn
+
+    def slow_classify(wire_format: WireFormat, forwarded: Forwarded) -> bool:
+        # Telling a first turn from a later one takes a second: it is before the request is accepted.
+        waits.now += 1.0
+        return classify(wire_format, forwarded)
+
+    monkeypatch.setattr(gateway_app, "first_turn", slow_classify)
+    waits.sends = [(1.0 + at, part) for at, part in STREAM]
+    assert call(app, "POST", "/v1/messages", key=key, body={**BODIES[routes.MESSAGES], "stream": True})[0] == 200
+    [record] = records(capsys)
+    labels = {"pool": "coursework", "wire_format": "messages", "start": "warm", "turn": "first"}
+    seconds = registry.get_sample_value(f"{FIRST_TOKEN}_sum", labels)
+    assert seconds is not None
+    assert record["time_to_first_token_ms"] == round(seconds * 1000) == 2500
+
+
+def test_a_held_stream_whose_client_leaves_before_its_hold_ran_logs_the_time_held(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    waits = Waits(ready=False, sends=STREAM)
+    app, key = streaming(waits)
+    body = json.dumps({**BODIES[routes.MESSAGES], "stream": True}).encode()
+    request: list[Message] = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def scenario() -> None:
+        started, left = asyncio.Event(), asyncio.Event()
+
+        async def receive() -> Message:
+            if request:
+                return request.pop()
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                # The held answer's headers are never written: the client leaves 3 seconds into the hold.
+                assert (HELD_HEADER.encode(), b"true") in message["headers"]
+                started.set()
+                await asyncio.get_running_loop().create_future()
+
+        headers = [(b"content-type", b"application/json"), (b"x-api-key", key.encode())]
+        served = asyncio.ensure_future(app(_scope("POST", "/v1/messages", headers), receive, send))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        waits.hold_clock += 3.0
+        left.set()
+        await asyncio.wait_for(served, timeout=5)
+
+    asyncio.run(scenario())
+    [record] = records(capsys)
+    assert record["held_ms"] == 3000
+    assert (record["input_tokens"], record["time_to_first_token_ms"]) == (0, None)
 
 
 def test_a_stream_cut_before_any_usage_logs_no_tokens_and_no_first_token(capsys: pytest.CaptureFixture[str]) -> None:

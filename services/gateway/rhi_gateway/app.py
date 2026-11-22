@@ -410,6 +410,7 @@ class _Held:
                 raise GatewayError(action.cause)
         self.ready = any(isinstance(action, Forward) for action in self._first)
         self.demand: Demand | None = None  # Set once the request is received: it is forwarded when the hold ends.
+        self._ended = False
 
     def _step(self) -> tuple[Action, ...]:
         view = self._holding.view(self._pool)
@@ -448,6 +449,15 @@ class _Held:
                     await self._until_next()
                 actions = self._step()
         finally:
+            self.ended()
+
+    def ended(self) -> None:
+        """The hold is over: the time held, from its start, is noted on the request's record, once.
+
+        `waiting` notes it when it ends; the settlement, for a request that ended before its hold ran.
+        """
+        if not self._ended:
+            self._ended = True
             telemetry.note_held(self._holding.clock() - self._started_at)
 
     async def next_keep_alive(self) -> bytes:
@@ -600,16 +610,18 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
 
         # From here the request is accepted, and settles exactly once: what students experience counts
         # its waits from this moment, warm or held, and is told its tokens at its settlement.
-        accepted_at = forwarding.clock()
         experience = _experience(request)
         wire_format = entry.wire_format or WireFormat.MESSAGES
+        # The turn is classified before the acceptance is read: the log and the histogram read it at the same moment.
+        first = experience is not None and first_turn(wire_format, forwarded)
+        accepted_at = forwarding.clock()
         turn = None
         if experience is not None:
             turn = experience.request(
                 forwarded.pool.name,
                 wire_format,
                 held=held is not None and not held.ready,
-                first_turn=first_turn(wire_format, forwarded),
+                first_turn=first,
             )
 
         def token_sent(answer: bool) -> None:
@@ -620,6 +632,9 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
 
         async def settle(observed: Observed) -> None:
             telemetry.note_tokens(observed.input_tokens, observed.output_tokens, observed.cached_input_tokens)
+            if held is not None and not held.ready:
+                # A request that ended before its hold ran, or while it ran, was held until now.
+                held.ended()
             if demand is not None:
                 demand.end()
             if turn is not None:
