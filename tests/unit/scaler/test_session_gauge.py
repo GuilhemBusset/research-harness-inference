@@ -3,18 +3,23 @@
 
 from __future__ import annotations
 
+import dataclasses
+import time
 from typing import Any
 
 import boto3
 import pytest
 from boto3.dynamodb.types import TypeSerializer
+from botocore.credentials import Credentials
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
 from rhi_common.records import Mode, RecordError, SessionSwitch
+from rhi_scaler import handler
 from rhi_scaler.aws_io import Clients, TableNames, read_session
-from rhi_scaler.metrics import SESSION_ON, UNREAD, DecisionCounts, Unread, decode, encode, fleet_series
+from rhi_scaler.metrics import SESSION_ON, UNREAD, DecisionCounts, RemoteWriter, Unread, decode, encode, fleet_series
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
+from rhi_scaler.settings import Settings
 
 NOW = 1_800_000_000
 TABLES = TableNames(heartbeats="heartbeats-table", pool_state="pool-state-table")
@@ -97,3 +102,30 @@ def test_a_change_read_during_the_run_takes_effect_no_earlier_than_the_change(on
     # A change before the run started is read at the run's time.
     earlier = SessionSwitch(on=on, set_by="instructor", set_at=NOW - 60)
     assert sent(earlier)[SESSION_ON][1] == [(value, NOW * 1000)]
+
+
+def test_an_off_read_during_a_run_keeps_the_scrapes_before_its_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The run starts at NOW + 60. The admin's command took its time at NOW + 48, but its off write
+    # commits only at NOW + 64, and the run's read of the switch returns at NOW + 66: a scrape at
+    # NOW + 62 still saw the session on, and must stay inside it.
+    clock = [float(NOW + 60)]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    off = SessionSwitch(on=False, set_by="instructor", set_at=NOW + 48).to_item()
+
+    class DynamoDB:
+        def get_item(self, **_: Any) -> dict[str, Any]:
+            clock[0] = NOW + 66
+            return {"Item": {name: TypeSerializer().serialize(value) for name, value in off.items()}}
+
+    class CloudWatch:
+        def put_metric_data(self, **_: Any) -> None:
+            pass
+
+    pushes: list[bytes] = []
+    writer = RemoteWriter("https://aps.example.com/api/v1/remote_write", "us-east-1", Credentials("stub", "stub"))
+    writer = dataclasses.replace(writer, send=lambda url, headers, body: pushes.append(body))
+    clients = Clients(autoscaling=None, elbv2=None, dynamodb=DynamoDB(), cloudwatch=CloudWatch())
+    settings = Settings((), TABLES, writer.url, "us-east-1")
+    handler.run_cycle(settings, clients, writer, NOW + 60, DecisionCounts(), (NOW + 60) * 1000)
+    (gauge,) = [s for s in decode(pushes[-1]).timeseries if s.labels[0].value == SESSION_ON]
+    assert [(s.value, s.timestamp) for s in gauge.samples] == [(0.0, (NOW + 66) * 1000)]

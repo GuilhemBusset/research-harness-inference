@@ -71,12 +71,12 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
 
 
 def send_session_alone(
-    writer: RemoteWriter, counts: DecisionCounts, switch: SessionSwitch | None, milliseconds: int
+    writer: RemoteWriter, counts: DecisionCounts, switch: SessionSwitch | None, milliseconds: int, read_at: int | None
 ) -> None:
     """The session gauge on its own, for a run that fails before its fleet series go: nothing if the
     push fails, whose error the run's own does not replace."""
     try:
-        writer.push(session_alone(switch, counts, milliseconds))
+        writer.push(session_alone(switch, counts, milliseconds, read_at=read_at))
     except Exception as error:  # noqa: BLE001 - the run fails on its own error, which is the one to report
         LOGGER.warning(json.dumps({"event": "session-gauge-not-sent", "error": type(error).__name__}))
 
@@ -100,11 +100,11 @@ def run_cycle(
         run = aws_io.read(clients, settings.tables, settings.pools, now)
     except Exception:
         try:
-            switch = aws_io.read_session(clients, settings.tables)
+            switch, read_at = aws_io.read_session_at(clients, settings.tables)
         except Exception as error:  # noqa: BLE001 - the run fails on its own error, which is the one to report
             LOGGER.warning(json.dumps({"event": "session-gauge-not-sent", "error": type(error).__name__}))
         else:
-            send_session_alone(writer, counts, switch, milliseconds)
+            send_session_alone(writer, counts, switch, milliseconds, read_at)
         raise
     readable = run.session_error is None
     decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session, read=readable)
@@ -113,11 +113,12 @@ def run_cycle(
     except Exception:
         # The switch was read all the same: its reading goes, and the run fails on its writes.
         if readable:
-            send_session_alone(writer, counts, run.session, milliseconds)
+            send_session_alone(writer, counts, run.session, milliseconds, run.session_read_at)
         raise
     log_decisions(run, decision)
     try:
-        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session=run.session if readable else UNREAD))
+        session = run.session if readable else UNREAD
+        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session=session, read_at=run.session_read_at))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     if run.session_error is not None:

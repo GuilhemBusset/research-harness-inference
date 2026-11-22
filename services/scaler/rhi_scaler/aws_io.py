@@ -65,6 +65,7 @@ record is updated (`memory_update`), so that what the admin CLI writes in it sur
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -142,12 +143,13 @@ class GroupState:
 class Run:
     """What one run read: the decision's inputs, each pool's group by pool name, and the session
     switch, `None` when it has no record. `session_error` is why the switch could not be read, and
-    then `session` is `None` too."""
+    then `session` is `None` too. `session_read_at` is when its read returned, in milliseconds."""
 
     inputs: Inputs
     groups: Mapping[str, GroupState]
     session: SessionSwitch | None = None
     session_error: Exception | None = None
+    session_read_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -422,13 +424,20 @@ def read_session(clients: Clients, tables: TableNames) -> SessionSwitch | None:
     return None if item is None else SessionSwitch.from_item(_plain(item))
 
 
+def read_session_at(clients: Clients, tables: TableNames) -> tuple[SessionSwitch | None, int]:
+    """The session switch, as `read_session` reads it, and when the read returned, in milliseconds:
+    whatever change it reads was written by then (`rhi_scaler.metrics.session_series`)."""
+    switch = read_session(clients, tables)
+    return switch, int(time.time() * 1000)
+
+
 def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:
     """Everything one run decides from, at the time `now`, for each pool in the order given, and the
     session switch."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
-    session, session_error = None, None
+    session, session_error, session_read_at = None, None, None
     try:
-        session = read_session(clients, tables)
+        session, session_read_at = read_session_at(clients, tables)
     except (ClientError, BotoCoreError, RecordError) as error:
         # It only reports: a wake that demand calls for must not wait on it.
         session_error = error
@@ -437,6 +446,7 @@ def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], no
         groups={inputs.config.name: state for inputs, state in read_pools},
         session=session,
         session_error=session_error,
+        session_read_at=session_read_at,
     )
 
 
