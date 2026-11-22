@@ -7,7 +7,8 @@ without the helpers is held to the same rules as one made with them. It reports:
 | --- | --- |
 | `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
-| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine series read over the session's minutes (`rules.over_sessions`) needs no "asleep", having no "now", when `rules.awake` keeps it at the same step: the expression the session gates holds the awake one with no range, subquery, `offset` or `@` outside it, which could carry a value from another step |
+| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine series read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again |
+| `session` | In a panel of one value, a query, shown, that reads the session gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
 | `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise or leaves its quantity out. An engine metric is any name of the per-engine table, its further quantities included |
 | `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
 | `undeclared` | A metric name no declaration covers: neither a declared family nor that family's name followed by a sample's suffix |
@@ -196,85 +197,32 @@ def _read(expression: str) -> _Expression:
     return _Expression(tuple(texts), tuple(selectors), tuple(calls))
 
 
-@dataclass(frozen=True)
-class _Session:
-    """A span of tokens that is what `rules.over_sessions` writes: the span of the whole call and
-    the span of the expression it gates."""
-
-    start: int
-    end: int
-    inner_start: int
-    inner_end: int
+# A name that stands for a selector in what a helper writes.
+_PLACEHOLDER = "x"
 
 
-def _session_gate() -> list[str]:
-    """The tokens `rules.in_session` puts after the expression it gates."""
-    return _tokens(rules.in_session("x"))[0][3:]
+def _increment_spans(tokens: Sequence[str], series: Sequence[str]) -> Iterator[tuple[int, int]]:
+    """Every span of the tokens that is `rules.session_increment` of the series' tokens."""
+    for previous in rules.PREVIOUS:
+        pattern: list[str] = []
+        for token in _tokens(rules.session_increment(_PLACEHOLDER, previous))[0]:
+            pattern.extend(series if token == _PLACEHOLDER else (token,))
+        for index in range(len(tokens) - len(pattern) + 1):
+            if list(tokens[index : index + len(pattern)]) == pattern:
+                yield index, index + len(pattern)
 
 
-def _sessions(tokens: Sequence[str]) -> list[_Session]:
-    """Every span of the tokens that `rules.over_sessions` writes."""
-    gate = _session_gate()
-    found = []
-    for index, text in enumerate(tokens):
-        if not text.endswith("_over_time") or tokens[index + 1 : index + 3] != ("(", "("):
-            continue
-        try:
-            call_end = _closing(tokens, index + 1)
-            group_end = _closing(tokens, index + 2)
-            if tokens[group_end + 1 : group_end + 2] != ("[",) or tokens[index + 3] != "(":
-                continue
-            range_end = _closing(tokens, group_end + 1)
-            inner_end = _closing(tokens, index + 3)
-        except _Unreadable:
-            continue
-        if range_end + 1 != call_end or list(tokens[inner_end + 1 : group_end]) != gate:
-            continue
-        found.append(_Session(index, call_end + 1, index + 4, inner_end))
-    return found
-
-
-def _opening(tokens: Sequence[str], closing: int) -> int:
-    """The index of the bracket that the one at `closing` closes."""
-    opening = {value: key for key, value in _CLOSING.items()}[tokens[closing]]
-    depth = 0
-    for index in range(closing, -1, -1):
-        if tokens[index] == tokens[closing]:
-            depth += 1
-        elif tokens[index] == opening:
-            depth -= 1
-            if depth == 0:
-                return index
-    raise _Unreadable("a bracket is never opened")
-
-
-# What can make an expression read another step than the one it is evaluated at.
-_ELSEWHERE_IN_TIME = frozenset({"[", "offset", "@"})
-
-
-def _awake_in_session(expression: _Expression, selector: _Selector, pool: str) -> bool:
-    """Whether the selector is in an expression that `rules.awake` keeps for the pool, itself what a
-    span of `rules.over_sessions` gates, with nothing around it that reads another step: kept to
-    the pool in service at the step its value is counted at."""
-    gate = _tokens(rules.awake(pool, "x"))[0][3:]
+def _counted_per_sample(expression: _Expression, selector: _Selector) -> bool:
+    """Whether the selector is read as what each of its samples added, taken in a session
+    (`rules.session_increment`): a series no instance updates any more adds nothing, so nothing an
+    instance last reported is counted again."""
     tokens = expression.tokens
-    sessions = _sessions(tokens)
-    for index in range(1, len(tokens) - len(gate) + 1):
-        if list(tokens[index : index + len(gate)]) != gate or tokens[index - 1] != ")":
-            continue
-        try:
-            opening = _opening(tokens, index - 1)
-        except _Unreadable:
-            continue
-        if not opening < selector.start < selector.end < index:
-            continue
-        end = index + len(gate)
-        for session in sessions:
-            if session.inner_start <= opening and end <= session.inner_end:
-                around = [*tokens[session.inner_start : opening], *tokens[end : session.inner_end]]
-                if not _ELSEWHERE_IN_TIME.intersection(text.lower() for text in around):
-                    return True
-    return False
+    own = list(tokens[selector.start : selector.end])
+    if selector.window is not None:
+        own = own[: own.index("[")]
+    return any(
+        start <= selector.start and selector.end <= end for start, end in _increment_spans(tokens, own)
+    )
 
 
 def _engine_names() -> dict[str, list[tuple[str, rules.EngineQuantity]]]:
@@ -426,7 +374,7 @@ def _panel_problems(
     where = f"panel {panel.get('title')!r}"
     engine_names = _engine_names()
     targets = panel.get("targets") or ()
-    read: list[_Expression] = []
+    read: list[tuple[Mapping[str, Any], _Expression]] = []
     counts: set[tuple[str, frozenset[tuple[str, str, str]], str | None]] = set()
     asleep_for: set[str] = set()
     for target in targets:
@@ -439,7 +387,7 @@ def _panel_problems(
         except _Unreadable as problem:
             yield Violation("unreadable", where, f"query {target.get('refId')!r}: {problem}")
             continue
-        read.append(expression)
+        read.append((target, expression))
         counted = _counted(expression) if _is_shown(target) else None
         if counted is not None:
             counts.add((counted.name, counted.matchers, counted.window))
@@ -465,7 +413,7 @@ def _panel_problems(
                 yield Violation("engine-row", where, f"{selector.name} is not queried for one configured pool")
             elif all(engine != pool.engine for engine, _ in rows):
                 yield Violation("engine-row", where, f"{selector.name} is not in the row of the pool's engine")
-            elif not _awake_in_session(expression, selector, pool.name):
+            elif not _counted_per_sample(expression, selector):
                 asleep_for.add(pool.name)
                 if not _keeps_awake(expression, pool.name):
                     yield Violation("asleep", where, f"a query of {selector.name} is not kept to the pool in service")
@@ -473,10 +421,15 @@ def _panel_problems(
     for pool in sorted(asleep_for):
         if not _reads_asleep(panel, pool):
             yield Violation("asleep", where, f"no query of the in-service count of {pool!r} reads asleep at zero")
-    if asleep_for and panel.get("type") in ONE_VALUE_PANELS and not all(target.get("instant") for target in targets):
+    one_value = panel.get("type") in ONE_VALUE_PANELS
+    if asleep_for and one_value and not all(target.get("instant") for target in targets):
         yield Violation("asleep", where, "a panel of one value asks for the range, and would keep an old value")
+    for target, expression in read:
+        reads_session = any(one.name == rules.SESSION_ON for one in expression.selectors)
+        if one_value and reads_session and _is_shown(target) and not target.get("instant"):
+            yield Violation("session", where, f"query {target.get('refId')!r} is read over the session and asks for the range")
 
-    for expression in read:
+    for _, expression in read:
         for call in expression.calls:
             if call.function != "histogram_quantile":
                 continue

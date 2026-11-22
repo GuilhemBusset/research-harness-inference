@@ -153,10 +153,13 @@ def test_the_objectives_row_shows_each_objective_against_its_target(example: rhi
         assert [step["color"] for step in steps] == ["red", "green"]
         green = steps[1]["value"]
         assert measure.met(green) and not measure.met(math.nextafter(green, -math.inf))
-        # Every query keeps only the steps the session gauge reads 1 throughout, over the dashboard's range.
+        # Every query counts only the samples taken in the dashboard's range while the session gauge
+        # read 1, at every step of that range.
         for expression in queries(panel):
-            assert rules.in_session("x").removeprefix("(x)") in expression
+            read = check._read(expression)
             assert f"[{rules.SESSION_RANGE}:{rules.SESSION_STEP}]" in expression
+            counted = [one for one in read.selectors if one.name != rules.SESSION_ON]
+            assert counted and all(check._counted_per_sample(read, one) for one in counted)
     shown = {panel["title"]: panel["fieldConfig"]["defaults"]["thresholds"]["steps"][1]["value"] for panel in row}
     assert shown["Gateway answers: not the gateway's fault"] == 0.995
     assert shown["Cold start from the warm pool: under 5 minutes"] == 0.9

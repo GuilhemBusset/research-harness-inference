@@ -7,7 +7,7 @@ target and red where it does not, with the count of observations behind a percen
 percentile is shown as the share of observations it is judged on (`rhi_dashboards.objectives`), and
 a value that must be above its threshold turns green only above it: at the threshold it is red.
 Each is one value for the whole range, so its queries are instant ones, read at the range's end over
-the range (`$__range`); a range with no session reads no data.
+exactly the range (`$__from` to its end); a range with no session reads no data.
 
 Then one row for each pool of the configuration, of five panels:
 
