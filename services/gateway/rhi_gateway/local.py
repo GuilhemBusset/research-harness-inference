@@ -26,6 +26,12 @@ wake and takes no concurrency slot: cheap calls never wake a GPU, and a status c
 | `warming` | otherwise, when the scaler asked for capacity |
 | `cold` | otherwise |
 
+While no session is on (section 5.6), a student's status lists every pool `unavailable` with the
+cause `no_session`, whatever the table says, and a student's wake is answered `no_session` (503,
+`rhi_gateway.errors.render_json`) before its body is read, asking for nothing and recording
+nothing. The models and the hello answer as ever. The owner's own entries are served as if a session
+were on (`rhi_gateway.app.in_session`).
+
 The first row is the hold itself, stepped once at the time of the call: the status cannot say a
 pool can start when a request for it would be refused. A step is pure, and the wake it may return
 is a value that is dropped here.
@@ -55,7 +61,7 @@ from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode, ScalerNote
 from rhi_gateway import routes, telemetry
-from rhi_gateway.app import Handler, RequestBody
+from rhi_gateway.app import Handler, RequestBody, in_session
 from rhi_gateway.auth import Authenticator, authenticated
 from rhi_gateway.body import MODEL_FIELD, parse, pool_named, read_body
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
@@ -137,7 +143,8 @@ class LocalRoutes:
     (`rhi_gateway.readiness.Readiness.views`); a pool it does not hold yet reads as not ready with
     no records. `clock` gives the seconds since the epoch, the clock of the scaler's note.
 
-    `waker` is the wake's: without it the wake is not served here.
+    `waker` is the wake's: without it the wake is not served here. `session` gives whether a
+    session is on (`rhi_gateway.readiness.Readiness.session_is_on`); left out, one always is.
     """
 
     authenticator: Authenticator
@@ -146,6 +153,7 @@ class LocalRoutes:
     default_pool: Pool | None = None
     clock: Callable[[], float] = time.time
     waker: Waker | None = None
+    session: Callable[[], bool] = lambda: True
 
     def __post_init__(self) -> None:
         if self.default_pool is not None and self.default_pool not in self.pools:
@@ -169,14 +177,23 @@ class LocalRoutes:
             }
         )
 
+    def statuses_for(self, student: KeyRecord) -> list[PoolStatus]:
+        """The status as the student is given it: every pool unavailable with `no_session` while the student is not served."""
+        if not in_session(self.session, student):
+            return [PoolStatus(pool.name, State.UNAVAILABLE, Cause.NO_SESSION) for pool in self.pools]
+        return self.statuses()
+
     async def status(self, request: Request, entry: Route, student: KeyRecord) -> Response:
-        return _json({"pools": [record.to_json() for record in self.statuses()]})
+        return _json({"pools": [record.to_json() for record in self.statuses_for(student)]})
 
     async def wake(self, request: Request, entry: Route, student: KeyRecord) -> Response:
         waker = self.waker
         if waker is None:
             raise RuntimeError("the wake is served only with a waker")
         try:
+            if not in_session(self.session, student):
+                # Before the body is read: the scaler is asked for nothing (section 5.6).
+                raise GatewayError(Cause.NO_SESSION)
             body = parse(await read_body(RequestBody(request.receive)))
             pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
             telemetry.note_pool(pool.name)

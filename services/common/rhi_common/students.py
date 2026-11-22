@@ -33,6 +33,13 @@ alone, for a reader that keeps what else the item holds (the privacy export).
 
 `expires_at` is the attribute the table deletes an item by, and whoever writes the item sets it.
 On a key it is the course end, and the key is refused after it whatever the table has deleted.
+
+**The owner's own entries** are on the roster under GitHub IDs no GitHub account has, which GitHub
+numbers upward from 1 and is far below 10^18: the canary of the pipeline's verification
+(`CANARY_GITHUB_ID`, `rhi_admin.canary`) and the spikes' students, from `SPIKE_GITHUB_ID_BASE` on
+(`rhi_admin.spikes`). The gateway serves them whether or not a session is on (section 5.6), so that
+the verification, the weekly canary and the spikes run between sessions: `is_owner_entry` says
+whether a GitHub ID is one of them.
 """
 
 from __future__ import annotations
@@ -47,8 +54,18 @@ from rhi_common.records import RecordError, _optional_time, _text, _whole
 
 type Item = dict[str, str | int | dict[str, str] | dict[str, int] | dict[str, dict[str, int]]]
 
+# GitHub numbers its accounts from 1: no student can have this ID.
+CANARY_GITHUB_ID = 0
+# The spikes' student n has the nth ID after this one; no student can have an ID from here on.
+SPIKE_GITHUB_ID_BASE = 10**18
+
 _KEY_HASH = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+
+
+def is_owner_entry(github_id: int) -> bool:
+    """Whether a GitHub ID is one of the owner's own entries: the canary, or one of the spikes' students."""
+    return github_id == CANARY_GITHUB_ID or github_id >= SPIKE_GITHUB_ID_BASE
 
 
 def utc_day(at: int) -> str:

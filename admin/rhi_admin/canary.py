@@ -17,10 +17,9 @@ from botocore.exceptions import ClientError
 
 from rhi_admin import keys as admin_keys
 from rhi_admin.roster import add, get
+from rhi_common.students import CANARY_GITHUB_ID
 
 CANARY_ALIAS = "canary"
-# GitHub numbers its accounts from 1: no student can have this ID.
-CANARY_GITHUB_ID = 0
 CANARY_SECRET = "rhi/canary-key"
 _DESCRIPTION = "The key of the canary roster entry, which the pipeline's verification uses."
 

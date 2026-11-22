@@ -28,6 +28,7 @@ from moto import mock_aws
 from rhi import config
 from rhi_common import tables
 from rhi_common.keys import generate_key, key_hash
+from rhi_common.records import SessionSwitch
 from rhi_common.students import StudentKey
 from rhi_gateway import main as entry
 from rhi_gateway import profile, routes
@@ -129,6 +130,9 @@ def aws(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
                 AttributeDefinitions=[{"AttributeName": key.name, "AttributeType": key.type.value} for key, _ in keys],
                 BillingMode="PAY_PER_REQUEST",
             )
+        # A session is on: the student of these tests is served (section 5.6).
+        switch = SessionSwitch(on=True, set_by="owner", set_at=int(time.time())).to_item()
+        boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).put_item(Item=switch)
         yield
 
 

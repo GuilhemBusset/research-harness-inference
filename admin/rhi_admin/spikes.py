@@ -20,11 +20,7 @@ from typing import Any
 from rhi_admin import keys as admin_keys
 from rhi_admin.roster import AdminError, add, get
 from rhi_common.spike_keys import SpikeKeys, write
-
-# GitHub numbers its accounts upward from 1 and is far below this: no student can have an ID from
-# here on. Student n has the nth after it. An earlier version put a student with no budget on the
-# roster under this one; its entry stays until it is removed with `roster remove`.
-SPIKE_GITHUB_ID_BASE = 10**18
+from rhi_common.students import SPIKE_GITHUB_ID_BASE
 
 
 def spike_alias(number: int) -> str:
@@ -33,7 +29,11 @@ def spike_alias(number: int) -> str:
 
 
 def spike_github_id(number: int) -> int:
-    """The GitHub ID of the nth student, counted from 1."""
+    """The GitHub ID of the nth student, counted from 1: the nth after `SPIKE_GITHUB_ID_BASE` (`rhi_common.students`).
+
+    An earlier version put a student with no budget on the roster under that base itself; its entry
+    stays until it is removed with `roster remove`.
+    """
     return SPIKE_GITHUB_ID_BASE + number
 
 

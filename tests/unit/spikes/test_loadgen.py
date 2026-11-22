@@ -24,6 +24,7 @@ import pytest
 import harness
 import loadgen
 from rhi_common.keys import generate_key
+from rhi_common.students import SPIKE_GITHUB_ID_BASE
 from rhi_gateway import proxy
 from rhi_gateway.sse import SseReader
 from rhi_mock_engine.app import ANSWER, REASONING
@@ -55,7 +56,11 @@ smoke = _local_stack()
 def stack() -> Generator[tuple[str, list[str]]]:
     """The local stack's address, and the keys of the students enrolled in it for these tests."""
     with smoke.local_stack(smoke.MOCK_POOL) as (address, _):
-        yield address, [smoke.enrol(github_id=1 + number, alias=f"canary-{number}") for number in range(STUDENTS)]
+        # Spike students, served whether or not a session is on (section 5.6), as the spikes' own are.
+        yield address, [
+            smoke.enrol(github_id=SPIKE_GITHUB_ID_BASE + 1 + number, alias=f"canary-{number}")
+            for number in range(STUDENTS)
+        ]
 
 
 class Clock:
