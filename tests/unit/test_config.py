@@ -189,6 +189,15 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("monthly_budget_usd", f"{MARK}.5"),
         ("monthly_budget_usd", f"-{MARK}"),
         ("monthly_budget_usd", "true"),
+        *(
+            ("budget_alert_percentages", value)
+            for value in (
+                *("[50, 0, 100]", f"[{MARK}, {MARK}]", "[]", f"[{MARK}.5]", f"[-{MARK}]", "[true]", f"{MARK}"),
+                # One budget holds at most 10 notifications, each at most 1,000,000% of the amount.
+                str(list(range(10, 111, 10))),
+                f"[1000001, {MARK}]",
+            )
+        ),
         ("time_zone", MARK),
         ("time_zone", f'"Nowhere/City{MARK}"'),
         ("time_zone", f'"../zone{MARK}"'),
@@ -255,6 +264,17 @@ def test_https_listener_reads_false_when_left_out(tmp_path: Path) -> None:
     # The example turns the listener on, so that synthesis sees it.
     assert config.load({"RHI_CONFIG": "example"}).https_listener is True
     assert load_text(tmp_path, example_with(https_listener="false")).https_listener is False
+
+
+def test_budget_alert_percentages_read_50_80_and_100_when_left_out(tmp_path: Path) -> None:
+    # Section 17, so that a configuration written before the key loads unchanged (issue E4-44).
+    assert load_text(tmp_path, example_with(budget_alert_percentages=None)).budget_alert_percentages == (50, 80, 100)
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["budget_alert_percentages"] == [50, 80, 100]
+    given = load_text(tmp_path, example_with(budget_alert_percentages="[25, 90]"))
+    assert given.budget_alert_percentages == (25, 90)
+    # AWS Budgets takes a percentage threshold up to 1,000,000% of the amount, and no higher.
+    highest = load_text(tmp_path, example_with(budget_alert_percentages="[1000000]"))
+    assert highest.budget_alert_percentages == (1_000_000,)
 
 
 def test_cost_anomaly_detection_reads_false_when_left_out(tmp_path: Path) -> None:
