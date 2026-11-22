@@ -15,6 +15,12 @@ What is read, for each pool:
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
 | Mode (the configured mode when no record exists) and the scaler's memory | the pool-state table, by pool |
 
+And once for the whole run, the session switch (`rhi_common.records.SessionSwitch`), from its item
+in the pool-state table. It only reports (`rhi_scaler.outside_sessions`) and `decide` never sees it.
+A missing item reads as no record. A read that fails, or an item that is not a switch, is not taken
+for no record: the run keeps the error (`Run.session_error`), decides and applies from what it read
+of demand, and the handler fails it only after that.
+
 The supply, from the lifecycle states and target health:
 
 | State | Supply |
@@ -65,6 +71,7 @@ from decimal import Decimal
 from typing import Any
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_common.pool_config import Pool
 from rhi_common.records import (
@@ -77,9 +84,10 @@ from rhi_common.records import (
     PoolState,
     RecordError,
     ScalerNote,
+    SessionSwitch,
     is_fresh,
 )
-from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD
+from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD, SESSION_SWITCH_KEY
 from rhi_scaler.model import Decision, Inputs, Memory, PoolInputs, Supply
 
 # The process a launch loop suspends, and the only one this module ever names.
@@ -131,19 +139,25 @@ class GroupState:
 
 @dataclass(frozen=True)
 class Run:
-    """What one run read: the decision's inputs, and each pool's group by pool name."""
+    """What one run read: the decision's inputs, each pool's group by pool name, and the session
+    switch, `None` when it has no record. `session_error` is why the switch could not be read, and
+    then `session` is `None` too."""
 
     inputs: Inputs
     groups: Mapping[str, GroupState]
+    session: SessionSwitch | None = None
+    session_error: Exception | None = None
 
 
 @dataclass(frozen=True)
 class Clients:
-    """The AWS SDK clients a run uses: `autoscaling`, `elbv2` and `dynamodb` (low-level clients)."""
+    """The AWS SDK clients a run uses: `autoscaling`, `elbv2`, `dynamodb` and `cloudwatch`
+    (low-level clients)."""
 
     autoscaling: Any
     elbv2: Any
     dynamodb: Any
+    cloudwatch: Any
 
 
 # Reading.
@@ -301,6 +315,7 @@ _MEMORY_TIMES = (
     "suspended_at",
     "abandons_counted_from",
     "last_rebalance_at",
+    "outside_sessions_since",
 )
 # The attributes of the memory record that the scaler alone writes: all of them but the keys and
 # `launch_suspended`, which the admin clears.
@@ -335,6 +350,7 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
         # A record stored before the scaler kept a number holds none.
         rebalance_number=_time(item, "rebalance_number") or 0,
         last_rebalance_at=_time(item, "last_rebalance_at"),
+        outside_sessions_since=_time(item, "outside_sessions_since"),
     )
 
 
@@ -397,12 +413,29 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
     return inputs, state
 
 
+def read_session(clients: Clients, tables: TableNames) -> SessionSwitch | None:
+    """The session switch; `None` when it has no record. An item that is not a switch raises
+    `RecordError`."""
+    key = {name: {"S": value} for name, value in SESSION_SWITCH_KEY.items()}
+    item = clients.dynamodb.get_item(TableName=tables.pool_state, Key=key, ConsistentRead=True).get("Item")
+    return None if item is None else SessionSwitch.from_item(_plain(item))
+
+
 def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:
-    """Everything one run decides from, at the time `now`, for each pool in the order given."""
+    """Everything one run decides from, at the time `now`, for each pool in the order given, and the
+    session switch."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
+    session, session_error = None, None
+    try:
+        session = read_session(clients, tables)
+    except (ClientError, BotoCoreError, RecordError) as error:
+        # It only reports: a wake that demand calls for must not wait on it.
+        session_error = error
     return Run(
         inputs=Inputs(now=now, pools=tuple(inputs for inputs, _ in read_pools)),
         groups={inputs.config.name: state for inputs, state in read_pools},
+        session=session,
+        session_error=session_error,
     )
 
 

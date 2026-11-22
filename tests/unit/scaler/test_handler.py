@@ -12,6 +12,7 @@ import boto3
 import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.credentials import Credentials
+from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
@@ -87,10 +88,12 @@ class Edge:
             autoscaling=boto3.client("autoscaling", **options),
             elbv2=boto3.client("elbv2", **options),
             dynamodb=boto3.client("dynamodb", **options),
+            cloudwatch=boto3.client("cloudwatch", **options),
         )
         self.autoscaling = Stubber(self.clients.autoscaling)
         self.elbv2 = Stubber(self.clients.elbv2)
         self.dynamodb = Stubber(self.clients.dynamodb)
+        self.cloudwatch = Stubber(self.clients.cloudwatch)
         # Each UpdateItem call made, as the scaler made it.
         self.updates: list[dict[str, Any]] = []
         self.clients.dynamodb.meta.events.register(
@@ -101,7 +104,15 @@ class Edge:
             WORKSPACE, "us-east-1", Credentials("stub", "stub"), send=lambda url, headers, body: self.pushes.append((url, dict(headers), body))
         )
 
-    def queue_read(self, *, desired: int, instances: Sequence[dict[str, Any]], records: Sequence[dict[str, Any]], heartbeats: Sequence[dict[str, Any]]) -> None:
+    def queue_read(
+        self,
+        *,
+        desired: int,
+        instances: Sequence[dict[str, Any]],
+        records: Sequence[dict[str, Any]],
+        heartbeats: Sequence[dict[str, Any]],
+        switch_error: str | None = None,
+    ) -> None:
         group = {
             "AutoScalingGroupName": GROUP,
             "MinSize": 0,
@@ -128,30 +139,41 @@ class Edge:
                 "ConsistentRead": True,
             }
             self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
+        # No session switch, or a read of it that fails with the error named.
+        switch = {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True}
+        if switch_error is None:
+            self.dynamodb.add_response("get_item", {}, switch)
+        else:
+            self.dynamodb.add_client_error("get_item", switch_error, expected_params=switch)
 
-    def expect_writes(self, note: dict[str, Any]) -> None:
-        """The note put whole, then the memory updated: what it stores is in `updates`."""
+    def expect_writes(self, note: dict[str, Any], *, published: bool = True) -> None:
+        """The note put whole, then the memory updated: what it stores is in `updates`. Then, if
+        `published`, the run's data points published to CloudWatch (`rhi_scaler.cloudwatch`)."""
         self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
         update = ("Key", "UpdateExpression", "ExpressionAttributeNames", "ExpressionAttributeValues")
         self.dynamodb.add_response("update_item", {}, {"TableName": "pool-state-table", **dict.fromkeys(update, ANY)})
+        if published:
+            self.cloudwatch.add_response("put_metric_data", {}, {"Namespace": "rhi/scaler", "MetricData": ANY})
 
-    def queue_first_run(self) -> None:
-        """A pool at zero, a request held: one instance asked for, and the memory stored."""
-        self.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)])
+    def queue_first_run(self, switch_error: str | None = None) -> None:
+        """A pool at zero, a request held: one instance asked for, and the memory stored. Nothing is
+        published when the switch's read fails with `switch_error`."""
+        self.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)], switch_error=switch_error)
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
-        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW})
+        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, published=switch_error is None)
 
 
 @pytest.fixture
 def edge() -> Iterator[Edge]:
     edge = Edge()
-    with edge.autoscaling, edge.elbv2, edge.dynamodb:
+    with edge.autoscaling, edge.elbv2, edge.dynamodb, edge.cloudwatch:
         yield edge
         edge.autoscaling.assert_no_pending_responses()
         edge.elbv2.assert_no_pending_responses()
         edge.dynamodb.assert_no_pending_responses()
+        edge.cloudwatch.assert_no_pending_responses()
 
 
 def series(body: bytes) -> dict[tuple[str, tuple[tuple[str, str], ...]], list[float]]:
@@ -186,6 +208,14 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
     # The pool and the reason are the only labels: nothing names a student.
     assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason"}
+
+
+def test_a_switch_that_cannot_be_read_still_lets_demand_wake_the_pool_then_fails_the_run(edge: Edge) -> None:
+    # The wake, the note and the memory are queued, and no publication: the fixture checks all.
+    edge.queue_first_run(switch_error="ProvisionedThroughputExceededException")
+    with pytest.raises(ClientError):
+        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    assert len(edge.updates) == 1
 
 
 def test_a_second_run_is_harmless(edge: Edge) -> None:

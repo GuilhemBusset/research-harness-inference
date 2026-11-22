@@ -78,6 +78,10 @@ class Memory:
     `waiting_since`, it goes on while the pool grows. `rebalance_number` is the pool's rebalance
     number, 0 until a run first raises it. `last_rebalance_at` is the time of the run that last
     raised it, and `None` when none has.
+
+    `outside_sessions_since` only reports (`rhi_scaler.outside_sessions`, sections 11.3 and 17): it
+    is the time of the first of the runs in a row that saw an instance of the pool in service while
+    no session was on, and `None` when the last run did not. `decide` neither reads nor sets it.
     """
 
     last_request_at: int | None = None
@@ -93,6 +97,7 @@ class Memory:
     queuing_since: tuple[tuple[str, int], ...] = ()
     rebalance_number: int = 0
     last_rebalance_at: int | None = None
+    outside_sessions_since: int | None = None
 
 
 @dataclass(frozen=True)
