@@ -161,6 +161,9 @@ class Config:
     # that dimension that Cost Explorer may already have made: an account holds only one, and a
     # second fails the deployment. Only synthesis reads it.
     cost_anomaly_detection: bool
+    # The whole hours a pool may be in service while no session is on before its alarm fires
+    # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
+    outside_sessions_alarm_hours: int
 
 
 def _as_stored(text: str) -> object:
@@ -400,6 +403,7 @@ KEYS: dict[str, Key] = {
         _number_from_text,
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
+    "outside_sessions_alarm_hours": _WHOLE_NUMBER,
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -445,6 +449,8 @@ DEFAULTS: dict[str, object] = {
     # The design gives no such key (issue E4-36): off keeps a deployed stage deployable in an
     # account that already holds Cost Explorer's monitor of the services dimension.
     "cost_anomaly_detection": False,
+    # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
+    "outside_sessions_alarm_hours": 1,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two

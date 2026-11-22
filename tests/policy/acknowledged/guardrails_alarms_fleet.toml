@@ -1,0 +1,7 @@
+# What the roles of `src/rhi/guardrails/alarms_fleet.py` may do, each action on each resource, with
+# its reason, and the cdk-nag findings its resources bring.
+#
+# The module creates CloudWatch alarms only. An alarm holds no role: CloudWatch publishes to the
+# alerts topic as the service `cloudwatch.amazonaws.com`, which the topic's own policy allows
+# (`src/rhi/guardrails/alerts.py`). So the module lists no action, and its alarms bring no cdk-nag
+# finding to acknowledge.

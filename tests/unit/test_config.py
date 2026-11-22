@@ -208,6 +208,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("https_listener", '"true"'),
         ("https_listener", "1"),
         *(("cost_anomaly_detection", value) for value in (f'"{MARK}"', '"true"', "1")),
+        *(("outside_sessions_alarm_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(
             (key, value)
             for key in ("issuer_reserved_concurrency", "key_issuances_per_day", *GATEWAY_KEYS)
@@ -258,6 +259,13 @@ def test_cost_anomaly_detection_reads_false_when_left_out(tmp_path: Path) -> Non
     assert load_text(tmp_path, example_with(cost_anomaly_detection=None)).cost_anomaly_detection is False
     assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["cost_anomaly_detection"] is False
     assert load_text(tmp_path, example_with(cost_anomaly_detection="true")).cost_anomaly_detection is True
+
+
+def test_outside_sessions_alarm_hours_reads_1_when_left_out(tmp_path: Path) -> None:
+    # Section 17: an hour, so that a configuration written before the key loads unchanged.
+    assert load_text(tmp_path, example_with(outside_sessions_alarm_hours=None)).outside_sessions_alarm_hours == 1
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["outside_sessions_alarm_hours"] == 1
+    assert load_text(tmp_path, example_with(outside_sessions_alarm_hours="3")).outside_sessions_alarm_hours == 3
 
 
 def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
