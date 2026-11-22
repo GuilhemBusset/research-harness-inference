@@ -185,6 +185,18 @@ def test_two_instances_are_two_seen_in_service_together(monkeypatch: pytest.Monk
     assert len(pool.seen) == 3
 
 
+class _Clock:
+    """The time of the job, which moves only as it sleeps, with each sleep it took."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
 class _Departing:
     """A pool of instance-a and instance-b from which instance-b leaves once `departed` is set."""
 
@@ -203,8 +215,11 @@ class _Departing:
         return 0
 
 
-def _run(monkeypatch: pytest.MonkeyPatch, pool: _Departing, *, depart_during_phase: bool = False) -> s8.Run:
-    """A whole run on `pool`, both students' second requests finding their first's cache."""
+def _run(
+    monkeypatch: pytest.MonkeyPatch, pool: _Departing, clock: _Clock, *, depart_during_phase: bool = False
+) -> s8.Run:
+    """A whole run on `pool`, both students' second requests finding their first's cache, on the
+    time of `clock`."""
     keys = [generate_key(), generate_key()]
 
     def on_rest() -> None:
@@ -221,6 +236,8 @@ def _run(monkeypatch: pytest.MonkeyPatch, pool: _Departing, *, depart_during_pha
     monkeypatch.setattr(s8.Run, "two_instances", two_instances)
     monkeypatch.setattr(s8, "_wait", wait)
     monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
+    monkeypatch.setattr(s8.time, "time", lambda: clock.now)
+    monkeypatch.setattr(s8.time, "sleep", clock.sleep)
     return s8.Run(pool, "https://gateway.example.com", keys, 2, 8)  # ty: ignore[invalid-argument-type] - a test double
 
 
@@ -228,29 +245,45 @@ def test_a_run_passes_once_a_student_has_moved_from_the_instance_that_left(monke
     # Student 1 is on instance-b, which leaves, and then reaches instance-a.
     after = [{"instance-a": 2}, {"instance-a": 2}]
     pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-b": 2}, {"instance-a": 2}, *after])
-    assert s8.SPIKE.verdict(_run(monkeypatch, pool).measure()) is Verdict.PASS
+    clock = _Clock(1000)
+    assert s8.SPIKE.verdict(_run(monkeypatch, pool, clock).measure()) is Verdict.PASS
+    # The first phase sent once the gateway held the number read at 1000; the unchanged number needed no other wait.
+    assert clock.slept == [s8.GATEWAY_SECONDS]
+    assert clock.now == 1000 + s8.GATEWAY_SECONDS
     # Both students on one instance before the departure, the one that stayed (neither moved) or the
     # one that left (both moved): not one student moving while the other stays, so not measured.
     for on in ("instance-a", "instance-b"):
         pool = _Departing([{on: 2}, {on: 2}, {on: 2}, *after])
         with pytest.raises(s8.NotExercised):
-            _run(monkeypatch, pool).measure()
+            _run(monkeypatch, pool, _Clock(1000)).measure()
 
 
 def test_an_instance_leaving_during_the_phase_before_the_departure_is_not_measured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Instance-b leaves before student 1's next requests, which then reach instance-a.
-    pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-a": 2}, {"instance-a": 2}])
+    pool, clock = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-a": 2}, {"instance-a": 2}]), _Clock(1000)
     with pytest.raises(s8.Departed):
-        _run(monkeypatch, pool, depart_during_phase=True).measure()
+        _run(monkeypatch, pool, clock, depart_during_phase=True).measure()
+    assert clock.slept == [s8.GATEWAY_SECONDS]
     # Student 1 moves to instance-a as instance-b leaves at the end of the phase, which the workspace
     # shows only when the job looks again: a departure, not a failure.
     pool = _Departing([{"instance-a": 1, "instance-b": 1}, {"instance-b": 1, "instance-a": 1}, {"instance-a": 2}])
-    run = _run(monkeypatch, pool)
-    monkeypatch.setattr(s8.time, "sleep", lambda seconds: setattr(pool, "departed", True))
+    clock, in_service = _Clock(1000), []
+    run = _run(monkeypatch, pool, clock)
+
+    def departing(seconds: float) -> None:
+        in_service.append(not pool.departed)
+        clock.sleep(seconds)
+        pool.departed = True
+
+    monkeypatch.setattr(s8.time, "sleep", departing)
     with pytest.raises(s8.Departed):
         run.measure()
+    # Instance-b was in service when the gateway's propagation wait began, and left during it.
+    assert in_service == [True]
+    assert clock.slept == [s8.GATEWAY_SECONDS]
+    assert pool.departed
 
 
 class _Table:
@@ -319,16 +352,6 @@ def test_each_run_talks_in_conversations_of_its_own(monkeypatch: pytest.MonkeyPa
         s8.asyncio.run(run.phase(first_at_once=True))
     assert len(bodies) == 4
     assert bodies[0] != bodies[2]
-
-
-class _Clock:
-    """The time of the job, which moves only as it sleeps."""
-
-    def __init__(self, now: float) -> None:
-        self.now = now
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
 
 
 class _Scaling:
