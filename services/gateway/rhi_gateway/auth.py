@@ -12,6 +12,14 @@ The store's answer, found or not, is kept for 60 seconds. That cache is the boun
 a key that was replaced or revoked stops working within 60 seconds. Expiry is checked on every
 request, from the cached record.
 
+A forwarded request reads its body after it is accepted, and a body may take long to arrive. So
+right after it reserves budget, the write that makes the student's usage row, the request has its
+key read once more, past the cache (`Authenticator.confirm`). A key revoked while the request was
+on its way, or gone from the store as the admin's erase leaves it (`rhi_admin.privacy`), has its
+reservation taken back, and the usage row deleted when nothing else is left in it: the read comes
+after the write, so a request accepted before the erase, however late its write, leaves no row of
+its own behind.
+
 Every refusal is the cause `invalid_key` and nothing else: the error never says whether the key
 was missing, malformed, unknown, revoked or expired.
 
@@ -100,6 +108,15 @@ class Authenticator:
     async def authenticate(self, headers: Headers) -> KeyRecord:
         """The record of the student whose key the headers carry; `invalid_key` for any other request."""
         record = await self._lookup(key_hash(presented_key(headers)))
+        if record is None or record.revoked or record.expires_at <= self._wall_clock():
+            raise _refused()
+        return record
+
+    async def confirm(self, student: KeyRecord) -> KeyRecord:
+        """The key of that accepted record, read again past the cache; `invalid_key` if it no longer passes."""
+        now = self._monotonic()
+        record = await run_in_threadpool(self._store.lookup, student.key_hash)
+        self._remember(student.key_hash, now, record)
         if record is None or record.revoked or record.expires_at <= self._wall_clock():
             raise _refused()
         return record

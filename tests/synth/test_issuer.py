@@ -78,6 +78,13 @@ def test_the_function_runs_on_arm64_with_its_reserved_concurrency_and_log_group(
     assert of_type(template, "AWS::Logs::LogGroup")[log_id]["LogGroupName"] == "/rhi/issuer"
 
 
+def test_the_admin_s_erase_outwaits_a_login_in_flight(templates: dict[str, dict[str, Any]]) -> None:
+    from rhi_admin import privacy
+
+    _, function = issuer_function(access_template(templates))
+    assert privacy.ISSUER_SECONDS > function["Timeout"]
+
+
 def test_the_environment_comes_from_the_configuration_and_the_tables(templates: dict[str, dict[str, Any]]) -> None:
     template = access_template(templates)
     _, function = issuer_function(template)

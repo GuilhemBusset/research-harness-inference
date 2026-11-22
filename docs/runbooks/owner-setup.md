@@ -515,7 +515,9 @@ admin=(env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no
 
 `roster set <github-id> --budget N --limit N` changes a student's numbers on the entry and on each
 of their active keys; the gateway applies them within a minute. `roster remove <github-id>`
-removes a student and revokes their keys. `key issue <github-id>` issues a key without a login,
+removes a student and revokes their keys; their alias is held back from any other entry for 91
+days, while what was written under it is kept, so a student put back on the roster takes another
+alias. `key issue <github-id>` issues a key without a login,
 when GitHub's 50 confirmations an hour run out, and prints it once; `key revoke <github-id>`
 revokes every key of a student.
 

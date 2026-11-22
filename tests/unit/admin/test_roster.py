@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rhi_admin import main
+from rhi_admin import roster as admin_roster
 from rhi_admin.canary import CANARY_ALIAS, CANARY_GITHUB_ID, CANARY_SECRET
 from rhi_common.keys import is_valid_key, key_hash
 from rhi_common.students import RosterEntry, StudentKey
@@ -42,7 +43,8 @@ def test_an_entry_is_added_listed_and_removed(admin: main.Admin, capsys: pytest.
     assert cli(admin, capsys, "roster", "add", str(OTTER), "otter")[0] == 0
     assert cli(admin, capsys, "roster", "add", str(HERON), "heron", "--budget", "0", "--limit", "2")[0] == 0
     # Without numbers, the defaults; a budget of 0 is kept.
-    entries = {item["github_id"]: RosterEntry.from_item(item) for item in items(admin.roster)}
+    # The roster's other items, under negative keys, are its aliases' own.
+    entries = {item["github_id"]: RosterEntry.from_item(item) for item in items(admin.roster) if item["github_id"] >= 0}
     assert (entries[OTTER].daily_token_budget, entries[OTTER].concurrency_limit) == (100_000_000, 4)
     assert (entries[HERON].daily_token_budget, entries[HERON].concurrency_limit) == (0, 2)
     code, listed = cli(admin, capsys, "roster", "list")
@@ -63,6 +65,32 @@ def test_an_entry_is_added_listed_and_removed(admin: main.Admin, capsys: pytest.
     assert all(record.revoked_at == NOW for record in otter_keys)
     # Once off the roster, the student is issued no key.
     assert cli(admin, capsys, "key", "issue", str(OTTER))[0] == 1
+    # What was written under the alias stays the student's: no other entry is given it.
+    code, refused = cli(admin, capsys, "roster", "add", "6161", "otter")
+    assert code == 1 and "held back" in refused
+    assert cli(admin, capsys, "roster", "add", str(OTTER), "stoat")[0] == 0
+
+
+
+def test_two_entries_added_at_once_are_never_given_one_alias(
+    admin: main.Admin, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = admin.roster.meta.client
+    transact = client.transact_write_items
+    others: list[tuple[int, str]] = []
+
+    def another_addition_first(**request: Any) -> Any:
+        # The first addition has looked the alias up and found it free; another is made before it writes.
+        monkeypatch.setattr(client, "transact_write_items", transact)
+        others.append(cli(admin, capsys, "roster", "add", str(HERON), "stoat"))
+        return transact(**request)
+
+    monkeypatch.setattr(client, "transact_write_items", another_addition_first)
+    code, refused = cli(admin, capsys, "roster", "add", str(OTTER), "stoat")
+
+    assert [status for status, _ in others] == [0]
+    assert code == 1 and "another roster entry has that alias" in refused
+    assert [(entry.github_id, entry.alias) for entry in admin_roster.entries(roster=admin.roster)] == [(HERON, "stoat")]
 
 
 def test_a_directly_issued_key_verifies_and_is_stored_as_its_sha256_only(
@@ -142,4 +170,5 @@ def test_the_tables_are_found_by_their_pinned_logical_ids() -> None:
     source = "".join(path.read_text() for path in (REPO / "admin/rhi_admin").glob("*.py"))
     assert re.search(r"\b\d{12}\b", source) is None
     assert re.search(r"\b(?:us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d\b", source) is None
-    assert "TableName" not in source
+    # A table's name comes from its resource (`table.name`), never from a literal.
+    assert re.search(r"""TableName["']?\s*[:=]\s*f?["']""", source) is None
