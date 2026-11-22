@@ -5,7 +5,9 @@ objectives of section 7.3 (`rhi_dashboards.objectives`), each against its target
 a session was on in the dashboard's time range: one stat per measure, green where it meets its
 target and red where it does not, with the count of observations behind a percentile beside it. A
 percentile is shown as the share of observations it is judged on (`rhi_dashboards.objectives`), and
-a value that must be above its threshold turns green only above it: at the threshold it is red.
+a value that must be above its threshold turns green only above it: at the threshold it is red. A
+share an older gateway task's buckets only bound reads "inconclusive", in orange, where its bounds
+straddle the threshold.
 Each is one value for the whole range, so its queries are instant ones, read at the range's end over
 exactly the range (`$__from` to its end); a range with no session reads no data.
 
@@ -108,6 +110,9 @@ OBJECTIVES_ROW = "Objectives, while a session is on"
 # The references of a measure's query and of the count behind it.
 MEASURE_REF = "A"
 COUNT_REF = "B"
+# What a measure whose buckets do not settle its objective reads, and its colour.
+INCONCLUSIVE = "inconclusive"
+INCONCLUSIVE_COLOR = "orange"
 
 
 def _graph(title: str) -> timeseries_builders.Panel:
@@ -167,6 +172,13 @@ def _target(measure: objectives.Measure) -> dashboard_builders.ThresholdsConfig:
     return dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps)
 
 
+def _reads_inconclusive() -> list[models.DynamicConfigValue]:
+    """`objectives.INCONCLUSIVE` displayed as the text "inconclusive", neither red nor green."""
+    result = models.ValueMappingResult(text=INCONCLUSIVE, color=INCONCLUSIVE_COLOR, index=0)
+    mapping = models.ValueMap(options={f"{objectives.INCONCLUSIVE:g}": result})
+    return [models.DynamicConfigValue(id_val="mappings", value=[mapping])]
+
+
 def objective_stat(objective: objectives.Objective, measure: objectives.Measure) -> stat_builders.Panel:
     """One measure of an objective over the time a session was on in the range, coloured by its target."""
     panel = (
@@ -180,6 +192,9 @@ def objective_stat(objective: objectives.Objective, measure: objectives.Measure)
         .color_mode(common.BigValueColorMode.VALUE)
         .with_target(rules.query(measure.expression, measure.legend, MEASURE_REF, instant=True))
     )
+    if measure.ceiling is not None:
+        # Buckets that bound the share on both sides of its threshold settle nothing.
+        panel.override_by_query(MEASURE_REF, _reads_inconclusive())
     if measure.count is not None:
         panel.with_target(rules.query(measure.count, "observed", COUNT_REF, instant=True))
         # A count has neither the measure's unit nor its target.

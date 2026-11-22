@@ -16,7 +16,7 @@ from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
-from rhi_common.records import GatewayHeartbeat
+from rhi_common.records import GatewayHeartbeat, SessionSwitch
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
 from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
@@ -221,6 +221,19 @@ def test_a_switch_that_cannot_be_read_still_lets_demand_wake_the_pool_then_fails
     # The push still goes, with no session sample: the run does not know what the switch reads.
     ((_, _, body),) = edge.pushes
     assert SESSION_ON not in {name for name, _ in series(body)}
+
+
+def test_a_run_that_cannot_read_the_pools_still_sends_the_switch_it_reads(edge: Edge) -> None:
+    # Auto Scaling refuses the first read; the switch, read on its own, reads off.
+    edge.autoscaling.add_client_error("describe_auto_scaling_groups", "Throttling")
+    switch = {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True}
+    off = SessionSwitch(on=False, set_by="instructor", set_at=NOW - 60).to_item()
+    edge.dynamodb.add_response("get_item", {"Item": serialize(off)}, switch)
+    with pytest.raises(ClientError):
+        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    # The session gauge alone, at 0: a session that has ended does not seem to go on.
+    ((_, _, body),) = edge.pushes
+    assert series(body) == {(SESSION_ON, ()): [0.0]}
 
 
 def test_a_second_run_is_harmless(edge: Edge) -> None:

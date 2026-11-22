@@ -33,14 +33,18 @@ agent's. A bucket is selected by its `le` label as the workspace holds it: the c
 0.165.0) write a boundary in the fewest digits that give it back, with no exponent and no ".0"
 (`5`, `12.5`), not as the client library serves it (`5.0`).
 
-**A revised floor keeps what older buckets prove.** A gateway task started before the owner revised
-a floor has no bucket at the new one. So, for each task's series, the share is read from the bucket
-nearest the floor on the side that proves the objective, among the floor and the gateway's own
-boundaries (`rhi_common.boundaries`): for a wait, the largest boundary at or under the floor, whose
-observations are all under it (`max` of the cumulative buckets); for a speed, the smallest at or
-over it, whose bucket holds every observation under the floor and so bounds them from above (`min`,
-`+Inf` among them). A task that counts the floor reads it exactly; an older one is counted for what
-its buckets prove, never more.
+**A revised floor gives a verdict only where the buckets settle it.** A gateway task started
+before the owner revised a floor to a value that is not one of the gateway's own boundaries
+(`rhi_common.boundaries`) has no bucket at it. Where the floor is one of them, every task counts it
+and the share is read exactly. Otherwise the share is bounded both ways, for each task's series, by
+its buckets nearest the floor among the floor and the gateway's boundaries: the largest at or under
+it, whose observations are all under the floor (`max` of the cumulative buckets; none, where a
+series has none), and the smallest at or over it, whose bucket holds every observation under the
+floor (`min`, `+Inf` among them). The measure shows the bound that settles the objective: the share
+proven to meet it where that meets the threshold, the most the share can be where even that misses
+it, and `INCONCLUSIVE` where the bounds straddle the threshold, which the panel reads
+"inconclusive". A task that counts the floor makes both bounds the same; an older one never decides
+a verdict its buckets do not prove.
 
 **Gateway answers.** Where there are requests and no fault was counted, zero faults are read, so a
 session without a fault reads 100%.
@@ -114,19 +118,27 @@ class Comparison(StrEnum):
         return value >= threshold if self is Comparison.AT_LEAST else value > threshold
 
 
+# What a measure shows where the buckets do not settle its objective (`Measure.expression`).
+INCONCLUSIVE = -1.0
+# The operators of a share that meets its threshold, and of one that misses it.
+_OPERATORS = {Comparison.AT_LEAST: (">=", "<"), Comparison.ABOVE: (">", "<=")}
+
+
 @dataclass(frozen=True)
 class Measure:
     """One query of an objective, and what its value is judged against.
 
     `target` is the objective's target, as section 7.3 states it (99.5%, 5 seconds, 15 tokens per
     second, 85%, 300 seconds), and `percentile`, from 0 to 1, the percentile it bounds, if any. The
-    value of `expression` meets the objective when it is `comparison` `threshold`: the target itself,
-    or, for a percentile, the share of the observations it needs. `unit` is Grafana's unit of the
-    value, and `count` the query of the observations behind a share, over the same steps.
+    value meets the objective when it is `comparison` `threshold`: the target itself, or, for a
+    percentile, the share of the observations it needs. `share` is the query of that value, or of
+    the least it can be when `ceiling`, the most it can be, is given too: a share an older gateway
+    task's buckets only bound. `unit` is Grafana's unit of the value, and `count` the query of the
+    observations behind a share, over the same steps.
     """
 
     legend: str
-    expression: str
+    share: str
     target: float
     comparison: Comparison
     threshold: float
@@ -134,8 +146,24 @@ class Measure:
     goal: str
     percentile: float | None = None
     count: str | None = None
+    ceiling: str | None = None
 
-    def met(self, value: float) -> bool:
+    @property
+    def expression(self) -> str:
+        """The query the panel shows: the share, where it is read exactly; otherwise the bound that
+        settles the objective, the least where it meets the threshold, the most where it misses
+        it, and `INCONCLUSIVE` where neither does and there were observations."""
+        if self.ceiling is None:
+            return self.share
+        meets, misses = _OPERATORS[self.comparison]
+        threshold = repr(self.threshold)
+        unsettled = f"(0 * (({self.count}) > 0)) - {-INCONCLUSIVE:g}"
+        return f"(({self.share}) {meets} {threshold}) or (({self.ceiling}) {misses} {threshold}) or ({unsettled})"
+
+    def met(self, value: float) -> bool | None:
+        """Whether the value the measure showed meets its objective; `None` where it is inconclusive."""
+        if self.ceiling is not None and value == INCONCLUSIVE:
+            return None
         return self.comparison.met(value, self.threshold)
 
 
@@ -186,6 +214,18 @@ def under_floor_at_most(histogram: str, matchers: dict[str, str], floor: float, 
     return _nearest_bucket(histogram, matchers, [*bounds, INFINITY], "min")
 
 
+def _under_bounds(
+    histogram: str, matchers: dict[str, str], floor: float, buckets: tuple[float, ...], count: str
+) -> tuple[str, str]:
+    """The least and the most the session's observations under the floor can be: the same query,
+    where the floor is one of the gateway's own boundaries, which every task counts."""
+    if float(floor) in map(float, buckets):
+        under = under_floor(histogram, matchers, floor, buckets)
+        return under, under
+    least = f"({under_floor(histogram, matchers, floor, buckets)}) or on () (0 * ({count}))"
+    return least, under_floor_at_most(histogram, matchers, floor, buckets)
+
+
 def gateway_answers() -> Objective:
     """The share of the session's requests that were not a 5xx of the gateway's own fault."""
     requests = rules.over_sessions(rules.step_increase(REQUESTS))
@@ -204,12 +244,13 @@ def first_token(config: Config) -> Objective:
     measures = []
     for turn in (FIRST_TURN, LATER_TURN):
         matchers = {START: WARM, TURN: turn}
-        under, count = under_floor(FIRST_TOKEN, matchers, target, WAIT_BUCKETS), _count(FIRST_TOKEN, matchers)
+        count = _count(FIRST_TOKEN, matchers)
+        least, most = _under_bounds(FIRST_TOKEN, matchers, target, WAIT_BUCKETS, count)
         goal = f"p95 under {target:g} s: at least {q:.0%} of warm {turn} turns with a first token under {target:g} s"
         measures.append(
             Measure(
                 f"{turn} turns under {target:g} s",
-                f"({under}) / ({count})",
+                f"({least}) / ({count})",
                 target,
                 Comparison.AT_LEAST,
                 q,
@@ -217,6 +258,7 @@ def first_token(config: Config) -> Objective:
                 goal,
                 q,
                 count,
+                None if least == most else f"({most}) / ({count})",
             )
         )
     return Objective("Time to first token, warm pool", tuple(measures))
@@ -231,13 +273,14 @@ def stream_speed(config: Config) -> Objective:
             (0.1, "slowest tenth", config.target_stream_p10_tokens_per_second),
         ):
             matchers = {rules.POOL: pool.name, START: WARM}
-            under, count = under_floor_at_most(SPEED, matchers, floor, SPEED_BUCKETS), _count(SPEED, matchers)
+            count = _count(SPEED, matchers)
+            least, most = _under_bounds(SPEED, matchers, floor, SPEED_BUCKETS, count)
             needed = round(1 - q, 12)
             goal = f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of warm streams at {floor:g} or more"
             measures.append(
                 Measure(
                     f"{pool.name} {name}, at {floor:g} tokens/s or more",
-                    f"(({count}) - ({under})) / ({count})",
+                    f"(({count}) - ({most})) / ({count})",
                     floor,
                     Comparison.ABOVE,
                     needed,
@@ -245,6 +288,7 @@ def stream_speed(config: Config) -> Objective:
                     goal,
                     q,
                     count,
+                    None if least == most else f"(({count}) - ({least})) / ({count})",
                 )
             )
     return Objective("Output speed per stream, warm pool", tuple(measures))

@@ -7,7 +7,7 @@ without the helpers is held to the same rules as one made with them. It reports:
 | --- | --- |
 | `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
-| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine series read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again |
+| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine counter, or a histogram's buckets or count, read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again. An engine gauge always does: it falls as well as rises, and what its samples "added" is no count |
 | `session` | In a panel of one value, a query, shown, that reads the session gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
 | `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise or leaves its quantity out. An engine metric is any name of the per-engine table, its further quantities included |
 | `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
@@ -225,24 +225,43 @@ def _counted_per_sample(expression: _Expression, selector: _Selector) -> bool:
     )
 
 
+def _engine_rows() -> Iterator[tuple[str, rules.EngineQuantity, Kind, str]]:
+    """Every family of the per-engine table, the further quantities' included: its engine, the
+    quantity it names, its kind and its name."""
+    for engine in ENGINES:
+        for quantity, family in metric_names(engine).items():
+            yield engine, quantity, quantity.kind, family
+        for quantity, family in further_names(engine).items():
+            yield engine, quantity, family.kind, family
+
+
 def _engine_names() -> dict[str, list[tuple[str, rules.EngineQuantity]]]:
     """Every series name of the per-engine table, the further quantities' included: the engines and
     the quantity it names."""
     names: dict[str, list[tuple[str, rules.EngineQuantity]]] = {}
-    for engine in ENGINES:
-        row: list[tuple[rules.EngineQuantity, Kind, str]] = [
-            *((quantity, quantity.kind, family) for quantity, family in metric_names(engine).items()),
-            *((quantity, family.kind, family) for quantity, family in further_names(engine).items()),
-        ]
-        for quantity, kind, family in row:
-            samples = {
-                Kind.GAUGE: ("",),
-                Kind.COUNTER: ("", rules.COUNTER_SAMPLE),
-                Kind.HISTOGRAM: ("", *rules.HISTOGRAM_SAMPLES),
-            }[kind]
-            for sample in samples:
-                names.setdefault(family + sample, []).append((engine, quantity))
+    for engine, quantity, kind, family in _engine_rows():
+        samples = {
+            Kind.GAUGE: ("",),
+            Kind.COUNTER: ("", rules.COUNTER_SAMPLE),
+            Kind.HISTOGRAM: ("", *rules.HISTOGRAM_SAMPLES),
+        }[kind]
+        for sample in samples:
+            names.setdefault(family + sample, []).append((engine, quantity))
     return names
+
+
+def _rising_names() -> frozenset[tuple[str, str]]:
+    """Every engine and series name of the per-engine table that only rises while its process
+    runs, so that a fall is a restart: a counter's, and a histogram's buckets and count. A gauge
+    falls as well as rises, and what each of its samples "added" means nothing."""
+    rising = {
+        Kind.GAUGE: (),
+        Kind.COUNTER: ("", rules.COUNTER_SAMPLE),
+        Kind.HISTOGRAM: ("_bucket", "_count"),
+    }
+    return frozenset(
+        (engine, family + sample) for engine, _, kind, family in _engine_rows() for sample in rising[kind]
+    )
 
 
 def _panels(panels: Iterable[Mapping[str, Any]]) -> Iterator[Mapping[str, Any]]:
@@ -373,6 +392,7 @@ def _panel_problems(
 ) -> Iterator[Violation]:
     where = f"panel {panel.get('title')!r}"
     engine_names = _engine_names()
+    rising = _rising_names()
     targets = panel.get("targets") or ()
     read: list[tuple[Mapping[str, Any], _Expression]] = []
     counts: set[tuple[str, frozenset[tuple[str, str, str]], str | None]] = set()
@@ -413,7 +433,7 @@ def _panel_problems(
                 yield Violation("engine-row", where, f"{selector.name} is not queried for one configured pool")
             elif all(engine != pool.engine for engine, _ in rows):
                 yield Violation("engine-row", where, f"{selector.name} is not in the row of the pool's engine")
-            elif not _counted_per_sample(expression, selector):
+            elif (pool.engine, selector.name) not in rising or not _counted_per_sample(expression, selector):
                 asleep_for.add(pool.name)
                 if not _keeps_awake(expression, pool.name):
                     yield Violation("asleep", where, f"a query of {selector.name} is not kept to the pool in service")

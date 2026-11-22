@@ -133,6 +133,11 @@ class DecisionCounts:
         return milliseconds
 
 
+def session_series(session_on: bool, milliseconds: int) -> Series:
+    """The session gauge's sample: 1 while the switch reads on, 0 while it reads off or has no record."""
+    return Series(SESSION_ON, (), ((1.0 if session_on else 0.0, milliseconds),))
+
+
 def fleet_series(
     inputs: Inputs,
     decision: Decision,
@@ -151,7 +156,7 @@ def fleet_series(
     supplies = {pool.config.name: pool.supply for pool in inputs.pools}
     out: list[Series] = []
     if session_on is not None:
-        out.append(Series(SESSION_ON, (), ((1.0 if session_on else 0.0, milliseconds),)))
+        out.append(session_series(session_on, milliseconds))
     for pool in decision.pools:
         supply = supplies[pool.pool]
         gauges = {

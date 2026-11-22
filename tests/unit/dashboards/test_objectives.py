@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -194,6 +194,21 @@ def under(expression: str, bucket: str, buckets: Mapping[str, float], reduce: Ca
     return reduce(selected)
 
 
+def read(expression: str, bucket: str, series: Sequence[Mapping[str, float]]) -> float:
+    """The share a bound's query reads of each series' cumulative buckets: the `max` or `min` of
+    those it selects, none where it selects none, summed over all their observations; the share at
+    the floor or more, for a speed."""
+    reduce = max if "max without (le) (" in expression else min
+    below = sum(under(expression, bucket, one, lambda selected: reduce(selected) if selected else 0) for one in series)
+    total = sum(one["+Inf"] for one in series)
+    return (total - below) / total if bucket.startswith(experience.SPEED) else below / total
+
+
+def shown(measure: objectives.Measure, least: float, most: float) -> float:
+    """What the measure's query shows for the bounds of its share (`Measure.expression`)."""
+    return least if measure.met(least) else most if not measure.met(most) else objectives.INCONCLUSIVE
+
+
 def test_a_revised_floor_is_read_exactly_at_a_boundary_the_gateway_counts(tmp_path: Path) -> None:
     # Floors the configuration takes, between the gateway's own boundaries.
     text = Path("config.example.toml").read_text(encoding="utf-8")
@@ -203,43 +218,64 @@ def test_a_revised_floor_is_read_exactly_at_a_boundary_the_gateway_counts(tmp_pa
     config = rhi_config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(tmp_path / "revised.toml")})
     first, _ = objectives.first_token(config).measures
     median, _ = objectives.stream_speed(config).measures
-    assert nearest(first.expression, f"{experience.FIRST_TOKEN}_bucket") == "6"
-    assert nearest(median.expression, f"{experience.SPEED}_bucket") == "16"
+    wait = f"{experience.FIRST_TOKEN}_bucket"
+    for measure, bucket, floor in ((first, wait, "6"), (median, f"{experience.SPEED}_bucket", "16")):
+        assert {nearest(measure.share, bucket), nearest(measure.ceiling or "", bucket)} == {floor}
     # The gateway counts its waits with the floor among its boundaries (`rhi_gateway.settings`): 95
-    # of 100 first tokens under 6 seconds meet the objective, 90 do not.
+    # of 100 first tokens under 6 seconds meet the objective, 90 do not, and both bounds agree.
     wait_buckets = with_floors(WAIT_BUCKETS, config.target_ttft_p95_seconds)
     labels = {"pool": "coursework", "wire_format": "messages", "start": "warm", "turn": "first"}
     for waits, met in (([4.0] * 90 + [5.5] * 5 + [7.0] * 5, True), ([4.0] * 90 + [7.0] * 10, False)):
         registry = CollectorRegistry()
         histogram = experience.Experience(registry, wait_buckets=wait_buckets).first_token
-        for wait in waits:
-            histogram.labels(*labels.values()).observe(wait)
+        for wait_seconds in waits:
+            histogram.labels(*labels.values()).observe(wait_seconds)
         served = {
-            objectives.boundary(float(sample.labels["le"])): sample.value
+            objectives.boundary(float(le)) if le != objectives.INFINITY else le: sample.value
             for family in registry.collect()
             for sample in family.samples
-            if sample.name == f"{experience.FIRST_TOKEN}_bucket"
+            if sample.name == wait and (le := sample.labels["le"])
         }
-        assert first.met(under(first.expression, f"{experience.FIRST_TOKEN}_bucket", served, max) / len(waits)) is met
+        least, most = read(first.share, wait, [served]), read(first.ceiling or "", wait, [served])
+        assert least == most
+        assert first.met(shown(first, least, most)) is met
 
 
-def test_a_revised_floor_keeps_what_older_buckets_prove(example: rhi_config.Config) -> None:
+def test_older_buckets_settle_a_revised_floor_only_where_they_prove_it(example: rhi_config.Config) -> None:
     config = dataclasses.replace(example, target_ttft_p95_seconds=6, target_stream_median_tokens_per_second=12)
-    first, _ = objectives.first_token(config).queries
-    median, _ = objectives.stream_speed(config).queries
+    first, _ = objectives.first_token(config).measures
+    median, _ = objectives.stream_speed(config).measures
     wait, speed = f"{experience.FIRST_TOKEN}_bucket", f"{experience.SPEED}_bucket"
-    # A task from before the revision has no bucket at 6: its 100 waits under 5 are under 6, and
-    # one newer wait under 6 makes 101 of 101.
+    # The least share where it meets the threshold, the most where it misses, else inconclusive.
+    for measure, meets, misses in ((first, ">=", "<"), (median, ">", "<=")):
+        threshold = repr(measure.threshold)
+        assert measure.expression == (
+            f"(({measure.share}) {meets} {threshold}) or (({measure.ceiling}) {misses} {threshold})"
+            f" or ((0 * (({measure.count}) > 0)) - 1)"
+        )
+        assert measure.met(objectives.INCONCLUSIVE) is None
+    # 100 first turns at 5.5 seconds, from a task with no bucket at 6: between none and all of them
+    # under 6, so neither met nor missed.
+    straddling = {"4": 0, "5": 0, "7.5": 100, "10": 100, "+Inf": 100}
+    assert (read(first.share, wait, [straddling]), read(first.ceiling or "", wait, [straddling])) == (0, 1)
+    assert shown(first, 0, 1) == objectives.INCONCLUSIVE
+    # Waits under 5 prove it met, and one newer wait under 6 makes 101 of 101; waits of 7.5 or more
+    # prove it missed.
     older, newer = {"5": 100, "7.5": 100, "+Inf": 100}, {"5": 0, "6": 1, "7.5": 1, "+Inf": 1}
-    assert "max without (le) (" in first and "min without" not in first
-    assert under(first, wait, older, max) + under(first, wait, newer, max) == 101
-    # A speed: an older task's streams under 12.5 are at most those under 12, never fewer, so
-    # what is proven at 12 or more is only what is: 10 - 5 and 10 - 4.
-    older, newer = {"10": 2, "12.5": 5, "+Inf": 10}, {"10": 1, "12": 4, "12.5": 4, "+Inf": 10}
-    assert "min without (le) (" in median and "max without" not in median
-    assert under(median, speed, older, min) == 5 and under(median, speed, newer, min) == 4
-    # A task with no finite boundary at or over the floor is bounded by all its streams.
-    assert under(median, speed, {"10": 2, "+Inf": 10}, min) == 10
+    assert read(first.share, wait, [older, newer]) == 1
+    late = {"5": 0, "7.5": 0, "+Inf": 100}
+    assert read(first.ceiling or "", wait, [late]) == 0 and shown(first, 0, 0) == 0
+    # A speed: an older task's 5 streams under 12.5 may all be under 12, its 2 under 10 surely are,
+    # so between half and 80% are at 12 or more: neither above half proven, nor ruled out.
+    older = {"10": 2, "12.5": 5, "+Inf": 10}
+    least, most = read(median.share, speed, [older]), read(median.ceiling or "", speed, [older])
+    assert (least, most) == (0.5, 0.8)
+    assert shown(median, least, most) == objectives.INCONCLUSIVE
+    # A newer task counts the floor, and its bounds agree; one with no finite boundary over the floor
+    # is bounded by all its streams.
+    newer = {"10": 1, "12": 4, "12.5": 4, "+Inf": 10}
+    assert read(median.share, speed, [newer]) == read(median.ceiling or "", speed, [newer]) == 0.6
+    assert read(median.share, speed, [{"10": 2, "+Inf": 10}]) == 0
 
 
 def test_a_percentile_is_judged_exactly_at_its_floor(example: rhi_config.Config) -> None:

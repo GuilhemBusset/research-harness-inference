@@ -268,14 +268,19 @@ def test_the_check_reads_a_query_kept_to_the_session() -> None:
         panel = sdk_stat.Panel().title("Objective").datasource(rules.PROMETHEUS)
         for index, expression in enumerate(queries):
             panel.with_target(rules.query(expression, "", "ABC"[index], instant=instant))
-        declared = [rules.FromEngineTable(Quantity.INPUT_TOKENS)]
+        declared = [rules.FromEngineTable(Quantity.INPUT_TOKENS), rules.FromEngineTable(Quantity.RUNNING_REQUESTS)]
         return {one.rule for one in check.violations({"panels": [as_json(panel)]}, declared, (MOCK,))}
 
-    # An engine series read as what each of its samples added in the session has no "now" to read
+    # An engine counter read as what each of its samples added in the session has no "now" to read
     # asleep at, and counts nothing an instance last reported: a series no instance updates adds
     # nothing. Read so, it needs no "asleep".
     tokens = rules.engine_step_increase(MOCK, Quantity.INPUT_TOKENS)
     assert broken(rules.over_sessions(tokens)) == set()
+    # A gauge read the same way still does: it falls as requests finish, which is no restart.
+    running = rules.step_increase(
+        rules.engine_series(MOCK, Quantity.RUNNING_REQUESTS), rules.engine_matchers(MOCK, Quantity.RUNNING_REQUESTS)
+    )
+    assert broken(rules.over_sessions(running)) == {"asleep"}
     # Read as its value over the session's steps, not its increment, it does.
     series = rules.engine_selector(MOCK, Quantity.INPUT_TOKENS)
     value = f"sum_over_time((sum by (pool) ({series} and on () ({rules.SESSION_ON} == 1)))[{rules.SESSION_RANGE}:{rules.SESSION_STEP}])"

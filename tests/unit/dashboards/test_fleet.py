@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 from typing import Any
 
 import pytest
+from grafana_foundation_sdk.cog.encoder import JSONEncoder
 
 from rhi import config as rhi_config
 from rhi_common.engine_metrics import Quantity
@@ -174,3 +176,28 @@ def test_a_panel_states_the_target_it_applies(example: rhi_config.Config) -> Non
     # The share it turns green above is the configured one.
     assert "above 85.4%" in (panel.description or "")
     assert objectives.threshold_step(objective.measures[0]) == math.nextafter(85.4 / 100, math.inf)
+
+
+def test_a_share_older_buckets_only_bound_reads_inconclusive(example: rhi_config.Config) -> None:
+    def mapped(config: rhi_config.Config) -> dict[str, dict[str, Any]]:
+        """What the first-token panel shows instead of each value of its measure's query."""
+        objective = objectives.first_token(config)
+        panel = json.loads(json.dumps(fleet.objective_stat(objective, objective.measures[0]).build(), cls=JSONEncoder))
+        return {
+            value: result
+            for override in panel["fieldConfig"].get("overrides", ())
+            if override["matcher"] == {"id": "byFrameRefID", "options": fleet.MEASURE_REF}
+            for one in override["properties"]
+            if one["id"] == "mappings"
+            for mapping in one["value"]
+            for value, result in mapping["options"].items()
+        }
+
+    # A floor that is not one of the gateway's own boundaries: neither red nor green where older
+    # buckets straddle it (`objectives.INCONCLUSIVE`).
+    revised = dataclasses.replace(example, target_ttft_p95_seconds=6)
+    result = mapped(revised)[f"{objectives.INCONCLUSIVE:g}"]
+    assert (result["text"], result["color"]) == ("inconclusive", "orange")
+    assert check.violations(built(revised).document(), built(revised).metrics, revised.pools) == []
+    # The example's floor is one of them: its share is read exactly, and always gives a verdict.
+    assert mapped(example) == {}
