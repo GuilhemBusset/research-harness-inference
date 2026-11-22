@@ -47,7 +47,7 @@ rhi login --endpoint https://inference.example.com
 ```
 
 The pools are named by their model name, the name `rhi status` prints; `coursework` below stands
-for each pool the class uses.
+for each on-demand pool the class uses (configured `wake = "on-demand"`, mode `enabled`).
 
 ## When
 
@@ -84,13 +84,22 @@ Do these the day before the class, while no session is on.
    ```
 
    The quota of step 1 must cover the new maximum plus one. The new value takes effect only once a
-   pipeline run has deployed it: start one with **Release change** on the pipeline's page in the
-   CodePipeline console, and let it finish (step 3).
+   pipeline run has deployed it. Note the time once the script has written the configuration, then
+   start a run with **Release change** on the pipeline's page in the CodePipeline console. Check
+   that run itself, not a status left by an earlier one: in the pipeline's execution history, the
+   execution whose start time is after the time you noted must have succeeded, with its status
+   Succeeded and every stage up to and including the stage the class uses Succeeded. An edit of
+   SSM changes no commit, so the `deploy/<stage>` status of step 3 can still be an earlier run's
+   success; only this execution says the edit is deployed. If it failed or stopped, the new value
+   is not deployed: fix the cause and start another run, and switch the session on only once one
+   has succeeded.
 
 3. **Every configuration change has landed, and no deployment is running.** A deployment that has
    passed the deployment hold's check runs to its end even after the session is switched on, so
-   none may be under way when you switch it on. On GitHub, the latest commit of `main` must carry
-   a `deploy/<stage>` status that reads success:
+   none may be under way when you switch it on. A change merged to `main` has landed when the
+   latest commit of `main` carries a `deploy/<stage>` status that reads success; a change made in
+   SSM alone has landed only when the execution of step 2 succeeded, which this status cannot show.
+   On GitHub:
 
    ```sh
    gh api repos/OWNER/REPOSITORY/commits/main/status --jq '.statuses[] | "\(.context) \(.state)"'
@@ -116,14 +125,22 @@ Do these the day before the class, while no session is on.
    rhi_admin session on
    ```
 
-2. **Wake each pool** the class uses, shortly before the class starts. `rhi wait` asks for the
-   pool, repeats the request every minute, and prints each change of state until the pool is ready.
-   From the warm pool a start takes an estimated 2 to 6 minutes; a cold launch, when the warm
-   instance cannot start, about 3 to 13 (section 5.2).
+2. **Wake each on-demand pool** the class uses, shortly before the class starts. `rhi wait` asks
+   for the pool, repeats the request every minute, and prints each change of state until the pool
+   is ready. From the warm pool a start takes an estimated 2 to 6 minutes; a cold launch, when the
+   warm instance cannot start, about 3 to 13 (section 5.2).
 
    ```sh
    rhi wait coursework
    ```
+
+   **A scheduled-only pool is not woken this way.** `rhi_admin pool status` shows which pools are in
+   mode `scheduled-only` (configured `wake = "scheduled-only"`, such as an upgrade pool). Students
+   cannot wake such a pool, and neither can `rhi wait`: while nothing has asked for its capacity, a
+   wake asks for nothing, and `rhi wait` stops at once with the cause `pool_scheduled_only` (section
+   5.3). The admin starts it separately, by asking for its capacity; this repository has no command
+   for that yet, so it is not part of this runbook. Once it has been started, confirm it with
+   `rhi status` (Verify, step 2), which lists it as `warming`, then `ready`.
 
    **Time it by the pool's idle rule.** The moment a wake finds the pool ready counts as a request,
    and a pool falls to zero `idle_minutes` after its last request (section 5.6); once `rhi wait`
@@ -135,11 +152,12 @@ Do these the day before the class, while no session is on.
 
    It exits with the cause when the pool is unavailable: `capacity_unavailable` is the runbook
    [capacity failure](capacity-failure.md), `pool_disabled` the runbook
-   [a disabled pool](disabled-pool.md), and `no_session` means the switch does not read on.
+   [a disabled pool](disabled-pool.md), `pool_scheduled_only` a scheduled-only pool that nothing
+   has started (above), and `no_session` means the switch does not read on.
 
-3. **Just before the class starts, read each pool's state** (Verify, step 2). A pool that reads
-   `cold` again fell to zero by its idle rule: run `rhi wait` for it again, as in step 2, and the
-   pool is ready a few minutes later.
+3. **Just before the class starts, read each pool's state** (Verify, step 2). An on-demand pool
+   that reads `cold` again fell to zero by its idle rule: run `rhi wait` for it again, as in step 2,
+   and the pool is ready a few minutes later.
 
    ```sh
    rhi status
@@ -164,8 +182,9 @@ Do these the day before the class, while no session is on.
    ```
 
 2. `rhi status` shows each pool as `cold`, `warming`, `ready` or `unavailable`, with the cause when
-   it is unavailable. When the class starts, every pool the class uses reads `ready`; one that reads
-   `cold` is woken again (Act, step 3):
+   it is unavailable. When the class starts, every pool the class uses reads `ready`; an on-demand
+   pool that reads `cold` is woken again (Act, step 3). A scheduled-only pool reads `unavailable`
+   with the cause `pool_scheduled_only` until the admin has started it, then `warming` and `ready`:
 
    ```sh
    rhi status

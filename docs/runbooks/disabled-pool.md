@@ -49,11 +49,15 @@ pool, by its name in the configuration, which is also the model name `rhi status
    rhi_admin pool status
    ```
 
-2. **What the students see:**
+2. **What the students see,** while a session is on:
 
    ```sh
    rhi status
    ```
+
+   With the session off, once the gateway enforces the switch (issue E4-41), every pool reads
+   `unavailable` with the cause `no_session`, whatever its mode: the students' view then says
+   nothing about a disabled pool, and step 1 is the check.
 
 3. **Before re-enabling,** the reason the pool was disabled is gone: ask whoever `set_by` names.
 
@@ -89,14 +93,17 @@ only when the admin asks for its capacity, which is not part of this runbook.
 
 1. The mode reads `disabled` after disabling, with your identity under `set_by` and the time under
    `set_at`. After re-enabling it reads the configured mode, `enabled` or `scheduled-only`, again
-   with your identity and the time: this is the check of either kind of re-enable.
+   with your identity and the time: this is the check of either kind of re-enable, and of the
+   disable, whether a session is on or off.
 
    ```sh
    rhi_admin pool status
    ```
 
-2. `rhi status` lists a disabled pool as `unavailable` with the cause `pool_disabled`. After
-   re-enabling:
+2. While a session is on, `rhi status` lists a disabled pool as `unavailable` with the cause
+   `pool_disabled`. While the session is off, it lists every pool with the cause `no_session`
+   instead, once the gateway enforces the switch, even when the disable succeeded: step 1 is then
+   the check, and this one waits for the next session. After re-enabling, again with a session on:
 
    - a pool back in mode `enabled` reads `cold` while it has no instance; once `rhi wait` has woken
      it, during a session, it reads `warming`, then `ready`, and `rhi wait` exits 0;

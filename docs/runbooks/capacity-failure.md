@@ -42,9 +42,10 @@ During a session, a pool does not come up:
   format, which carries `capacity_unavailable`, so the harness shows an error after a stream that
   began well, not an HTTP status. A non-streaming call is held silently, and at its deadline
   (`hold_seconds_non_streaming`, 4 minutes by default) it is answered HTTP 503 with
-  `Retry-After: 60` and `capacity_unavailable` in the error body. Either way, a held call whose
-  pool has not found capacity in the past 10 minutes ends with `warming` instead: the pool is still
-  starting.
+  `Retry-After: 60` and `capacity_unavailable` in the error body. Either way, the cause at the
+  deadline depends on the pool's last launches: `capacity_unavailable` when a launch of the pool
+  found no capacity in the past 10 minutes, and `warming` when none did, which means the pool is
+  still starting and is not this runbook (section 5.3).
 
 ## Check
 
@@ -84,9 +85,12 @@ During a session, a pool does not come up:
 
 2. **Keep asking for the pool.** A wake on a pool unavailable for capacity still reaches the
    scaler, which launches again (section 5.3). Run `rhi wait` again every ten minutes or so: each
-   run sends a wake. While the pool's last launch found no capacity in the past 10 minutes, it stops
-   at once with the cause `capacity_unavailable`; once a launch has found an instance, it reads
-   `warming` and waits until the pool is ready.
+   run sends a wake. A launch that found no capacity stays visible for 10 minutes: until then the
+   pool reads `unavailable` with `capacity_unavailable`, and `rhi wait` stops at once with that
+   cause, even when a later launch has found an instance that is still starting. Only once those 10
+   minutes have passed does a pool that is starting read `warming`, and `rhi wait` then waits until
+   it is ready. So neither `capacity_unavailable` nor `warming` says whether a launch has
+   succeeded; `ready` is the one sign that the pool is up (Verify).
 
    ```sh
    rhi wait coursework
