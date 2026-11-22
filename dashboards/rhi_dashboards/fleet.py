@@ -3,7 +3,9 @@
 The first of the six dashboards of the system design (section 7.3). Its first row shows the five
 objectives of section 7.3 (`rhi_dashboards.objectives`), each against its target, over the minutes
 a session was on in the dashboard's time range: one stat per measure, green where it meets its
-target and red where it does not, with the count of observations behind a percentile beside it.
+target and red where it does not, with the count of observations behind a percentile beside it. A
+percentile is shown as the share of observations it is judged on (`rhi_dashboards.objectives`), and
+a value that must be above its threshold turns green only above it: at the threshold it is red.
 Each is one value for the whole range, so its queries are instant ones, read at the range's end over
 the range (`$__range`); a range with no session reads no data.
 
@@ -157,12 +159,11 @@ def stage_seconds(pool: Pool, transition: str) -> timeseries_builders.Panel:
 
 
 def _target(measure: objectives.Measure) -> dashboard_builders.ThresholdsConfig:
-    """Green where the value meets the target, red where it does not."""
-    if measure.comparison is objectives.Comparison.UNDER:
-        below, above = "green", "red"
-    else:
-        below, above = "red", "green"
-    steps = [models.Threshold(value=None, color=below), models.Threshold(value=measure.target, color=above)]
+    """Red, then green from the least value that meets the measure's threshold."""
+    steps = [
+        models.Threshold(value=None, color="red"),
+        models.Threshold(value=objectives.threshold_step(measure), color="green"),
+    ]
     return dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps)
 
 
@@ -171,7 +172,7 @@ def objective_stat(objective: objectives.Objective, measure: objectives.Measure)
     panel = (
         stat_builders.Panel()
         .title(f"{objective.name}: {measure.legend}")
-        .description(f"Target: {measure.comparison.value} {measure.target:g}, over the minutes a session was on")
+        .description(f"Target: {measure.goal}, over the minutes a session was on")
         .datasource(rules.PROMETHEUS)
         .reduce_options(common_builders.ReduceDataOptions().calcs(["lastNotNull"]))
         .unit(measure.unit)
@@ -180,7 +181,7 @@ def objective_stat(objective: objectives.Objective, measure: objectives.Measure)
         .with_target(rules.query(measure.expression, measure.legend, MEASURE_REF, instant=True))
     )
     if measure.count is not None:
-        panel.with_target(rules.query(measure.count, "requests", COUNT_REF, instant=True))
+        panel.with_target(rules.query(measure.count, "observed", COUNT_REF, instant=True))
         # A count has neither the measure's unit nor its target.
         panel.override_by_query(
             COUNT_REF,

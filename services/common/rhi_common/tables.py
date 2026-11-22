@@ -10,7 +10,7 @@ a table is plain data that the stack turns into a construct and that a reader tu
 | keys | `key_hash` (string) | none | `by_student`: `github_id` (number), sorted by `issued_at` (number) | One API key |
 | roster | `github_id` (number) | none | `by_alias`: `alias` (string) | One student |
 | usage | `github_id` (number) | `day` (string) | none | One student's day |
-| pool-state | `pool` (string) | `record` (string) | none | A pool's `mode`, `note` and `memory`; under the pool `_session`, the session switch |
+| pool-state | `pool` (string) | `record` (string) | none | A pool's `mode`, `note` and `memory`; the session switch |
 | heartbeats | `pool` (string) | `source` (string) | none | One gateway task's or one instance's heartbeat |
 
 A table's `name` is the name the code knows it by, not the name of the deployed table, which the
@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from rhi_common.records import MODE_RECORD, NOTE_RECORD, SESSION_POOL, SWITCH_RECORD
+from rhi_common.records import MODE_RECORD, NOTE_RECORD, SESSION_PARTITION, SWITCH_RECORD
 
 # The expiry attribute of every table.
 EXPIRES_AT = "expires_at"
@@ -35,8 +35,9 @@ EXPIRES_AT = "expires_at"
 # the scaler's memory of earlier runs.
 MEMORY_RECORD = "memory"
 POOL_STATE_RECORDS = (MODE_RECORD, NOTE_RECORD, MEMORY_RECORD)
-# The keys of the session switch's item, beside the pools' records: a partition no pool can take.
-SESSION_SWITCH = (SESSION_POOL, SWITCH_RECORD)
+# The item of the session switch (`rhi_common.records.SessionSwitch`), beside the pools' records:
+# its partition key, which no pool's name can be, and its sort key.
+SESSION_SWITCH_KEY = {"pool": SESSION_PARTITION, "record": SWITCH_RECORD}
 # The one attribute of the record `memory` that another component than the scaler writes.
 LAUNCH_SUSPENDED = "launch_suspended"
 

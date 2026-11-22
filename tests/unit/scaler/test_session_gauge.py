@@ -1,4 +1,5 @@
-"""The session gauge the scaler sends on every run (`rhi_scaler.metrics`, `rhi_scaler.aws_io.read_session`)."""
+"""The session gauge the scaler sends on every run (`rhi_scaler.metrics`), from the switch it reads
+(`rhi_scaler.aws_io.read_session`)."""
 
 from __future__ import annotations
 
@@ -10,9 +11,8 @@ from boto3.dynamodb.types import TypeSerializer
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode, SessionSwitch
-from rhi_scaler.aws_io import Clients, TableNames
-from rhi_scaler.handler import read_switch
+from rhi_common.records import Mode, RecordError, SessionSwitch, session_is_on
+from rhi_scaler.aws_io import Clients, TableNames, read_session
 from rhi_scaler.metrics import SESSION_ON, DecisionCounts, decode, encode, fleet_series
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -35,17 +35,17 @@ POOL = parse_pools(
 )[0]
 
 
-def switch(item: dict[str, Any] | None) -> bool | None:
-    """What a run reads of the switch when the pool-state table holds `item` under its key."""
+def switch(item: dict[str, Any] | None) -> bool:
+    """Whether a run reads the switch on when the pool-state table holds `item` under its key."""
     client = boto3.client("dynamodb", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub")
-    clients = Clients(autoscaling=None, elbv2=None, dynamodb=client)
+    clients = Clients(autoscaling=None, elbv2=None, dynamodb=client, cloudwatch=None)
     key = {"pool": {"S": "_session"}, "record": {"S": "switch"}}
     found = {} if item is None else {"Item": {name: TypeSerializer().serialize(v) for name, v in item.items()}}
     with Stubber(client) as stub:
         stub.add_response("get_item", found, {"TableName": TABLES.pool_state, "Key": key, "ConsistentRead": True})
-        read = read_switch(clients, TABLES)
+        read = read_session(clients, TABLES)
         stub.assert_no_pending_responses()
-    return read
+    return session_is_on(read)
 
 
 def sent(session_on: bool | None) -> dict[str, tuple[dict[str, str], list[float]]]:
@@ -79,5 +79,6 @@ def test_the_gauge_reads_the_switch(item: dict[str, Any] | None, gauge: float) -
 def test_a_switch_that_cannot_be_read_sends_no_sample() -> None:
     # An item whose `on` is not a boolean is not the switch's record: neither on nor off.
     unreadable = {**SessionSwitch(on=True, set_by="instructor", set_at=NOW).to_item(), "on": "yes"}
-    assert switch(unreadable) is None
+    with pytest.raises(RecordError):
+        switch(unreadable)
     assert SESSION_ON not in sent(None)

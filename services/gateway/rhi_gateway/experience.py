@@ -40,6 +40,12 @@ answer. Each carries two more labels:
 The objective of section 7.3 is a time to first token under 5 seconds at the 95th percentile on a
 warm pool (section 17). 5 seconds is a boundary of both histograms, so that it is read exactly.
 
+**A bucket counts the values strictly under its boundary.** Every wait and every speed is observed
+one step of the float above itself (`_strictly`): a wait of exactly 5 seconds lands above the
+bucket of 5, a stream of exactly 15 tokens per second above the bucket of 15. So, at a floor, the
+bucket reads exactly both what an objective asks: the share under 5 seconds, and the share at 15 or
+more (`rhi_dashboards.objectives`). The step is 10^-15 of the value, far below anything measured.
+
 **The speed of a request** is its output tokens after the first, over the seconds from its first
 token sent to its last: 401 tokens whose first is sent at 2 seconds and whose last at 22 ran at 20
 tokens per second. It only means something on a stream, where tokens are sent as they come, so it
@@ -70,6 +76,7 @@ is the pool's.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
@@ -111,6 +118,11 @@ _SPEED_LABELS = (*_LABELS, "start")
 _WAIT_LABELS = (*_SPEED_LABELS, "turn")
 
 
+def _strictly(value: float) -> float:
+    """The value as observed: the next float above it, so that a bucket's boundary is not in it."""
+    return math.nextafter(value, math.inf)
+
+
 class Turn:
     """One request, from its reservation to its settlement: its token times, then its tokens."""
 
@@ -132,10 +144,10 @@ class Turn:
         now = series.clock()
         if self._first_token_at is None:
             self._first_token_at = now
-            series.first_token.labels(*self._wait_labels).observe(now - self._accepted_at)
+            series.first_token.labels(*self._wait_labels).observe(_strictly(now - self._accepted_at))
         if answer and not self._answered:
             self._answered = True
-            series.first_answer.labels(*self._wait_labels).observe(now - self._accepted_at)
+            series.first_answer.labels(*self._wait_labels).observe(_strictly(now - self._accepted_at))
         self._last_token_at = now
 
     def settled(self, input_tokens: int, output_tokens: int) -> None:
@@ -146,7 +158,7 @@ class Turn:
         first, last = self._first_token_at, self._last_token_at
         if first is None or last is None or last <= first or output_tokens < 2:
             return
-        series.speed.labels(*self._speed_labels).observe((output_tokens - 1) / (last - first))
+        series.speed.labels(*self._speed_labels).observe(_strictly((output_tokens - 1) / (last - first)))
 
 
 class _Demand:

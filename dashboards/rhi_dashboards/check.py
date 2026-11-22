@@ -7,9 +7,9 @@ without the helpers is held to the same rules as one made with them. It reports:
 | --- | --- |
 | `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
-| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine series read over the session's minutes (`rules.over_sessions`) is kept by `rules.awake` inside the gate, at each minute, and needs no "asleep": it has no "now" |
+| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine series read over the session's minutes (`rules.over_sessions`) needs no "asleep", having no "now", when `rules.awake` keeps it at the same step: the expression the session gates holds the awake one with no range, subquery, `offset` or `@` outside it, which could carry a value from another step |
 | `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise or leaves its quantity out. An engine metric is any name of the per-engine table, its further quantities included |
-| `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else. Buckets read over the session's minutes need the count read over the same minutes, by the same `rules.over_sessions` |
+| `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
 | `undeclared` | A metric name no declaration covers: neither a declared family nor that family's name followed by a sample's suffix |
 | `declaration` | A declared file that is not in the repository or does not contain the name; an exporter with no exact version |
 | `unreadable` | An expression this module cannot read |
@@ -198,19 +198,13 @@ def _read(expression: str) -> _Expression:
 
 @dataclass(frozen=True)
 class _Session:
-    """A span of tokens that is what `rules.over_sessions` writes: the function, the span of the
-    whole call, the span of the expression it gates, and the subquery's range."""
+    """A span of tokens that is what `rules.over_sessions` writes: the span of the whole call and
+    the span of the expression it gates."""
 
-    function: str
     start: int
     end: int
     inner_start: int
     inner_end: int
-    range: str
-
-    @property
-    def key(self) -> str:
-        return f"{self.function}[{self.range}]"
 
 
 def _session_gate() -> list[str]:
@@ -236,18 +230,8 @@ def _sessions(tokens: Sequence[str]) -> list[_Session]:
             continue
         if range_end + 1 != call_end or list(tokens[inner_end + 1 : group_end]) != gate:
             continue
-        span_range = "".join(tokens[group_end + 2 : range_end])
-        found.append(_Session(text, index, call_end + 1, index + 4, inner_end, span_range))
+        found.append(_Session(index, call_end + 1, index + 4, inner_end))
     return found
-
-
-def _session_of(sessions: Sequence[_Session], start: int, end: int) -> _Session | None:
-    """The innermost session span that holds the tokens from `start` to `end`."""
-    holding = sorted(
-        (one for one in sessions if one.inner_start <= start and end <= one.inner_end),
-        key=lambda one: one.end - one.start,
-    )
-    return holding[0] if holding else None
 
 
 def _opening(tokens: Sequence[str], closing: int) -> int:
@@ -264,9 +248,14 @@ def _opening(tokens: Sequence[str], closing: int) -> int:
     raise _Unreadable("a bracket is never opened")
 
 
+# What can make an expression read another step than the one it is evaluated at.
+_ELSEWHERE_IN_TIME = frozenset({"[", "offset", "@"})
+
+
 def _awake_in_session(expression: _Expression, selector: _Selector, pool: str) -> bool:
-    """Whether the selector is in an expression that `rules.awake` keeps for the pool, itself in a
-    span that `rules.over_sessions` writes: kept to the pool in service at every minute."""
+    """Whether the selector is in an expression that `rules.awake` keeps for the pool, itself what a
+    span of `rules.over_sessions` gates, with nothing around it that reads another step: kept to
+    the pool in service at the step its value is counted at."""
     gate = _tokens(rules.awake(pool, "x"))[0][3:]
     tokens = expression.tokens
     sessions = _sessions(tokens)
@@ -277,8 +266,14 @@ def _awake_in_session(expression: _Expression, selector: _Selector, pool: str) -
             opening = _opening(tokens, index - 1)
         except _Unreadable:
             continue
-        if opening < selector.start and selector.end < index and _session_of(sessions, opening, index + len(gate)):
-            return True
+        if not opening < selector.start < selector.end < index:
+            continue
+        end = index + len(gate)
+        for session in sessions:
+            if session.inner_start <= opening and end <= session.inner_end:
+                around = [*tokens[session.inner_start : opening], *tokens[end : session.inner_end]]
+                if not _ELSEWHERE_IN_TIME.intersection(text.lower() for text in around):
+                    return True
     return False
 
 
@@ -370,18 +365,9 @@ def _counted(expression: _Expression) -> _Selector | None:
     """The series whose increase, summed, is all the expression returns; None when it returns anything else.
 
     What `rules.awake` adds for the series' own pool is not counted against it. A mean, a ratio or
-    a comparison that holds the same increase is not a count. A count summed over the session's
-    minutes (`rules.over_sessions`, with `sum_over_time`) is a count too, of the series over its
-    window within those minutes.
+    a comparison that holds the same increase is not a count.
     """
     tokens = expression.tokens
-    whole = [one for one in _sessions(tokens) if (one.start, one.end) == (0, len(tokens))]
-    if whole and whole[0].function == "sum_over_time":
-        session = whole[0]
-        inner = _counted(_read(" ".join(tokens[session.inner_start : session.inner_end])))
-        if inner is None:
-            return None
-        return _Selector(inner.name, inner.matchers, f"{inner.window}@{session.key}", inner.start, inner.end)
     start, end = 0, len(tokens)
     if len(expression.selectors) == 2:
         pools = [
@@ -491,7 +477,6 @@ def _panel_problems(
         yield Violation("asleep", where, "a panel of one value asks for the range, and would keep an old value")
 
     for expression in read:
-        sessions = _sessions(expression.tokens)
         for call in expression.calls:
             if call.function != "histogram_quantile":
                 continue
@@ -504,9 +489,7 @@ def _panel_problems(
                 yield Violation("percentile", where, "a percentile of no histogram's buckets")
             for bucket in buckets:
                 count = bucket.name.removesuffix("_bucket") + "_count"
-                session = _session_of(sessions, bucket.start, bucket.end)
-                window = bucket.window if session is None else f"{bucket.window}@{session.key}"
-                if (count, bucket.matchers, window) not in counts:
+                if (count, bucket.matchers, bucket.window) not in counts:
                     yield Violation("percentile", where, f"no query shows the increase of {count} over the same window")
 
 

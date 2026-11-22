@@ -7,7 +7,8 @@ holds a table reads and writes it.
 
 | Table | Partition key | Sort key | Items |
 | --- | --- | --- | --- |
-| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote`. Under the pool `_session`, `switch`: `SessionSwitch` |
+| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote` |
+| pool-state | `_session` | `switch` | The session switch, the admin's: `SessionSwitch` |
 | heartbeats | `pool` | `source` | `gateway#<task ID>`: `GatewayHeartbeat`. `instance#<instance ID>`: `InstanceHeartbeat` |
 
 An item is in the form boto3's table resource takes and returns: attribute names to plain values,
@@ -22,14 +23,15 @@ A heartbeat is rewritten every 5 seconds and ignored once it is older than 20 se
 hour after it was written, which only clears the rows of tasks and instances that are gone. The
 pool-state items carry no expiry: they survive deployments (section 11.3).
 
-**The session switch** (section 5.6) is one item of the pool-state table, beside the pools' records
-under a key no pool can have: partition key `_session`, sort key `switch`. A pool's name is
-lower-case letters, digits and hyphens, so `_session` is never one. The item says whether a session
-is on (`on`, a boolean), who set it and when; the admin sets it, no deployment writes it, and a
-missing item reads as off (`session_is_on`).
-
 `from_item` refuses, with a `RecordError`, an item that is not the record asked for: another key,
-a missing or mistyped attribute, a mode outside the four, a switch whose `on` is not a boolean.
+a missing or mistyped attribute, a mode outside the four, a switch that is neither on nor off.
+
+The session switch (section 5.6) is one item of the pool-state table that no pool can be: a pool's
+name is lower-case letters, digits and hyphens, so none is `_session`. Only the admin writes it,
+`on` as a boolean, true or false. A missing item reads as off: `session_is_on` is that rule.
+`set_by` and `set_at` say who last changed the switch and when: setting it to what it already
+reads writes nothing (`switched` is that rule), so the time an off switch was set is
+the time the last session ended, which the scaler's count outside sessions reads.
 """
 
 from __future__ import annotations
@@ -43,8 +45,8 @@ from typing import Self
 # The sort keys of the pool-state table that this module owns.
 MODE_RECORD = "mode"
 NOTE_RECORD = "note"
-# The keys of the session switch's item in the pool-state table: a partition no pool can take.
-SESSION_POOL = "_session"
+# The keys of the session switch's item in the pool-state table.
+SESSION_PARTITION = "_session"
 SWITCH_RECORD = "switch"
 # What comes before the task's or the instance's ID in the sort key of the heartbeats table.
 GATEWAY_SOURCE = "gateway#"
@@ -269,29 +271,43 @@ class ScalerNote:
 
 @dataclass(frozen=True)
 class SessionSwitch:
-    """Whether a session is on, and who set the switch and when. Only the admin changes it."""
+    """Whether a session is on, and who last changed the switch and when (section 5.6). Only the admin sets it."""
 
     on: bool
     set_by: str
     set_at: int
 
     def to_item(self) -> Item:
-        return {"pool": SESSION_POOL, "record": SWITCH_RECORD, "on": self.on, "set_by": self.set_by, "set_at": self.set_at}
+        return {
+            "pool": SESSION_PARTITION,
+            "record": SWITCH_RECORD,
+            "on": self.on,
+            "set_by": self.set_by,
+            "set_at": self.set_at,
+        }
 
     @classmethod
     def from_item(cls, item: Mapping[str, object]) -> Self:
+        if item.get("pool") != SESSION_PARTITION:
+            raise RecordError(f"the item is not under the partition key `{SESSION_PARTITION}`")
         _record(item, SWITCH_RECORD)
-        if item.get("pool") != SESSION_POOL:
-            raise RecordError(f"the item is not under the pool `{SESSION_POOL}`")
         on = item.get("on")
         if not isinstance(on, bool):
-            raise RecordError("`on` is not a boolean")
+            raise RecordError("`on` is not true or false")
         return cls(on=on, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
 
 
-def session_is_on(item: Mapping[str, object] | None) -> bool:
-    """Whether the switch's item, as read, says a session is on: a missing item reads as off."""
-    return item is not None and SessionSwitch.from_item(item).on
+def switched(current: SessionSwitch | None, on: bool, set_by: str, now: int) -> SessionSwitch | None:
+    """The switch to write when `set_by` sets it `on` at the time `now`, or `None` when there is
+    nothing to write because it already reads so (a missing record reads as off)."""
+    if session_is_on(current) == on:
+        return None
+    return SessionSwitch(on=on, set_by=set_by, set_at=now)
+
+
+def session_is_on(switch: SessionSwitch | None) -> bool:
+    """Whether a session is on: not while the switch reads off, nor while it has no record."""
+    return switch is not None and switch.on
 
 
 def is_fresh(heartbeat: GatewayHeartbeat | InstanceHeartbeat, now: int) -> bool:

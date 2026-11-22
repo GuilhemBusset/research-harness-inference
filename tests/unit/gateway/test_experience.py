@@ -31,7 +31,17 @@ from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.errors import WireFormat
-from rhi_gateway.experience import HELD, IN_FLIGHT, INPUT_TOKENS, OUTPUT_TOKENS, SERIES, SPEED, Experience
+from rhi_gateway.experience import (
+    FIRST_TOKEN,
+    HELD,
+    IN_FLIGHT,
+    INPUT_TOKENS,
+    OUTPUT_TOKENS,
+    SERIES,
+    SPEED,
+    Experience,
+    Turn,
+)
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.heartbeat import Heartbeat
@@ -244,8 +254,9 @@ def test_speed_per_request(wire_format: WireFormat, held: bool) -> None:
     labels = {"pool": POOL, "wire_format": wire_format.value}
     # A request that waited for its pool is apart from those of a warm pool.
     speed = {**labels, "start": "held" if held else "warm"}
-    # 401 tokens, the first sent at 2 seconds and the last at 22: the 400 after the first, over 20 seconds.
-    assert value(made, SPEED + "_sum", **speed) == 20
+    # 401 tokens, the first sent at 2 seconds and the last at 22: the 400 after the first, over 20
+    # seconds, observed one step of the float above (`rhi_gateway.experience`).
+    assert value(made, SPEED + "_sum", **speed) == pytest.approx(20, rel=1e-12)
     assert value(made, SPEED + "_count", **speed) == 1
     assert value(made, SPEED + "_count", **labels, start="warm" if held else "held") is None
     assert value(made, OUTPUT_TOKENS + "_sum", **labels) == STREAMED
@@ -348,3 +359,20 @@ def test_served_with_the_gateway_metrics_with_the_floors_as_boundaries() -> None
     boundaries = {float(sample.labels["le"]) for sample in served(made) if sample.name == SPEED + "_bucket"}
     # The floors of the objectives, 10 and 15 tokens per second, are read exactly.
     assert boundaries >= {10.0, 15.0}
+
+
+def test_a_value_at_a_floor_is_not_in_the_floors_bucket() -> None:
+    # A first token at exactly 5 seconds is not under 5; a stream at exactly 15 tokens per second is
+    # at 15 or more. The bucket of each floor holds neither, the next one up holds each.
+    registry, now = CollectorRegistry(), [0.0]
+    one = Turn(Experience(registry, clock=lambda: now[0]), POOL, WireFormat.MESSAGES, held=False, first_turn=True)
+    now[0] = 5.0
+    one.token_sent(answer=True)
+    now[0] = 25.0
+    one.token_sent(answer=True)
+    one.settled(input_tokens=10, output_tokens=301)
+    wait = {"pool": POOL, "wire_format": "messages", "start": "warm", "turn": "first"}
+    speed = {"pool": POOL, "wire_format": "messages", "start": "warm"}
+    for name, labels, floor, above in ((FIRST_TOKEN, wait, "5.0", "7.5"), (SPEED, speed, "15.0", "17.5")):
+        assert registry.get_sample_value(f"{name}_bucket", {**labels, "le": floor}) == 0
+        assert registry.get_sample_value(f"{name}_bucket", {**labels, "le": above}) == 1

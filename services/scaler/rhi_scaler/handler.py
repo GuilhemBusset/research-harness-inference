@@ -4,14 +4,23 @@ The gateway calls it when a request needs a cold pool, a one-minute schedule cal
 the admin CLI. Whoever calls, a run does the same thing, and the event is never read:
 
 1. read the settings (`rhi_scaler.settings`) and the inputs (`rhi_scaler.aws_io.read`);
-2. decide (`rhi_scaler.decide`), from the inputs alone;
+2. decide (`rhi_scaler.decide`), from the inputs alone, and note in each pool's memory how long it
+   has been in service outside a session (`rhi_scaler.outside_sessions`), which only reports;
 3. apply: the Auto Scaling calls that change something, then each pool's note and memory record;
-4. log one record per pool with its decision and its reason, read the session switch, and send
-   the fleet's metrics with the session gauge (`rhi_scaler.metrics`).
+4. log one record per pool with its decision and its reason, send the fleet's metrics with the
+   session gauge, from the switch the run read (`rhi_scaler.metrics`), and publish to CloudWatch
+   what the alarms read (`rhi_scaler.cloudwatch`).
 
 A run that fails before its writes leaves the pool as it was; the next run reads the world again.
-A metrics push that fails does not fail the run: the decision is already applied, and the log
-holds it. Nor does a switch that cannot be read: the push then carries no session sample.
+A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is what the alarm
+reads. A metrics push that fails does not fail the run: the decision is already applied, and the
+log holds it; a switch that could not be read sends no session sample. Two failures do fail the
+run, after its decision is applied, which stands:
+
+- the session switch could not be read: what demand calls for is applied all the same, a pool seen
+  with no instance in service ends its stretch outside sessions while every other stretch stays as
+  it was, and nothing is published;
+- CloudWatch refused the publication: the run did not deliver what the alarms read.
 """
 
 from __future__ import annotations
@@ -25,7 +34,8 @@ from typing import Any
 
 import boto3
 
-from rhi_scaler import aws_io
+from rhi_common.records import session_is_on
+from rhi_scaler import aws_io, cloudwatch, outside_sessions
 from rhi_scaler.decide import decide
 from rhi_scaler.metrics import DecisionCounts, RemoteWriter, fleet_series
 from rhi_scaler.model import Decision
@@ -57,15 +67,6 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
         LOGGER.info(json.dumps(record, sort_keys=True))
 
 
-def read_switch(clients: aws_io.Clients, tables: aws_io.TableNames) -> bool | None:
-    """What the session switch reads, or `None`, logged, when it cannot be read."""
-    try:
-        return aws_io.read_session(clients, tables)
-    except Exception as error:  # noqa: BLE001 - the decision does not depend on the switch; only its sample is lost
-        LOGGER.warning(json.dumps({"event": "session-switch-not-read", "error": type(error).__name__}))
-        return None
-
-
 def run_cycle(
     settings: Settings,
     clients: aws_io.Clients,
@@ -74,20 +75,30 @@ def run_cycle(
     counts: DecisionCounts,
     milliseconds: int | None = None,
 ) -> Decision:
-    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics.
+    """One cycle at the time `now`: read, decide, apply and store the memory, log, send the metrics,
+    publish to CloudWatch.
 
     `now` is the decision clock, in whole seconds; `milliseconds`, the run's time for the
     metrics' samples (by default, `now`'s second).
     """
     run = aws_io.read(clients, settings.tables, settings.pools, now)
-    decision = decide(run.inputs)
+    readable = run.session_error is None
+    decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session, read=readable)
     aws_io.apply(clients, settings.tables, run, decision)
     log_decisions(run, decision)
-    session_on = read_switch(clients, settings.tables)
+    session_on = session_is_on(run.session) if readable else None
     try:
         writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session_on=session_on))
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
+    if run.session_error is not None:
+        LOGGER.error(json.dumps({"event": "session-switch-not-read", "error": type(run.session_error).__name__}))
+        raise run.session_error
+    try:
+        cloudwatch.publish(clients.cloudwatch, decision, now)
+    except Exception as error:
+        LOGGER.error(json.dumps({"event": "cloudwatch-not-published", "error": type(error).__name__}))
+        raise
     return decision
 
 
@@ -98,6 +109,7 @@ def connect(settings: Settings) -> tuple[aws_io.Clients, RemoteWriter]:
         autoscaling=session.client("autoscaling"),
         elbv2=session.client("elbv2"),
         dynamodb=session.client("dynamodb"),
+        cloudwatch=session.client("cloudwatch"),
     )
     return clients, RemoteWriter(settings.workspace_url, settings.region, session.get_credentials())
 

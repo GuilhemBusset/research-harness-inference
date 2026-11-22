@@ -14,7 +14,7 @@ from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, RecordError, SessionSwitch
 from rhi_scaler.aws_io import (
     Clients,
     PoolSettings,
@@ -60,6 +60,7 @@ class Aws:
             autoscaling=boto3.client("autoscaling", **options),
             elbv2=boto3.client("elbv2", **options),
             dynamodb=boto3.client("dynamodb", **options),
+            cloudwatch=boto3.client("cloudwatch", **options),
         )
         self.autoscaling = Stubber(self.clients.autoscaling)
         self.elbv2 = Stubber(self.clients.elbv2)
@@ -76,6 +77,7 @@ class Aws:
         records: Sequence[dict[str, Any]] = (),
         activities: Sequence[dict[str, Any]] = (),
         heartbeats: Sequence[dict[str, Any]] = (),
+        session: dict[str, Any] | None = None,
     ) -> None:
         group = {
             "AutoScalingGroupName": GROUP,
@@ -101,6 +103,8 @@ class Aws:
         self.elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": descriptions}, {"TargetGroupArn": TARGETS})
         self.dynamodb.add_response("query", {"Items": [serialize(item) for item in records]}, query(TABLES.pool_state))
         self.dynamodb.add_response("query", {"Items": [serialize(item) for item in heartbeats]}, query(TABLES.heartbeats))
+        switch = {"TableName": TABLES.pool_state, "Key": {"pool": {"S": "_session"}, "record": {"S": "switch"}}, "ConsistentRead": True}
+        self.dynamodb.add_response("get_item", {} if session is None else {"Item": serialize(session)}, switch)
 
     def expect(self, operation: str, **parameters: object) -> None:
         self.autoscaling.add_response(operation, {}, {"AutoScalingGroupName": GROUP, **parameters})
@@ -225,6 +229,35 @@ def test_the_mode_record_and_the_memory_record_are_read(aws: Aws) -> None:
     assert memory_from_item(None) == Memory()
 
 
+@pytest.mark.parametrize(
+    ("item", "read_as"),
+    [
+        (SessionSwitch(on=True, set_by="admin", set_at=NOW - 5).to_item(), SessionSwitch(on=True, set_by="admin", set_at=NOW - 5)),
+        (SessionSwitch(on=False, set_by="admin", set_at=NOW - 5).to_item(), SessionSwitch(on=False, set_by="admin", set_at=NOW - 5)),
+        (None, None),
+    ],
+)
+def test_the_session_switch_is_read_once_per_run(aws: Aws, item: dict[str, Any] | None, read_as: SessionSwitch | None) -> None:
+    aws.queue_read(session=item)
+    run = read_one(aws)
+    assert (run.session, run.session_error) == (read_as, None)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"pool": "_session", "record": "switch", "on": "yes", "set_by": "admin", "set_at": NOW - 5},
+        # On, but without who set it: still not taken for no record.
+        {"pool": "_session", "record": "switch", "on": True, "set_at": NOW - 5},
+    ],
+)
+def test_a_switch_that_is_not_a_switch_is_an_error_of_the_run_not_no_record(aws: Aws, item: dict[str, Any]) -> None:
+    aws.queue_read(session=item)
+    run = read_one(aws)
+    assert run.session is None
+    assert isinstance(run.session_error, RecordError)
+
+
 def test_a_decision_becomes_calls_in_order_and_the_note_carries_no_capacity(aws: Aws) -> None:
     aws.queue_read(
         desired=3,
@@ -335,6 +368,7 @@ def test_the_memory_update_leaves_the_admins_clear_and_what_is_not_the_scalers(m
             queuing_since=(("instance-b", NOW - 9),),
             rebalance_number=3,
             last_rebalance_at=NOW - 10,
+            outside_sessions_since=NOW - 11,
         )
         assert all(value not in (None, (), 0, False) for value in dataclasses.astuple(full))
         client.update_item(**memory_update(TABLES.pool_state, "coursework", stored, full))

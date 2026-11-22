@@ -264,23 +264,21 @@ def test_the_check_holds_a_further_name_to_the_row_of_its_pools_engine() -> None
 
 
 def test_the_check_reads_a_query_kept_to_the_session() -> None:
-    def broken(*queries: str, declared: list[rules.Declared]) -> set[str]:
+    def broken(*queries: str) -> set[str]:
         panel = sdk_stat.Panel().title("Objective").datasource(rules.PROMETHEUS)
         for index, expression in enumerate(queries):
             panel.with_target(rules.query(expression, "", "ABC"[index], instant=True))
+        declared = [rules.FromEngineTable(Quantity.INPUT_TOKENS)]
         return {one.rule for one in check.violations({"panels": [as_json(panel)]}, declared, (MOCK,))}
 
-    # A percentile of the session's buckets needs the count of the same series over the same minutes.
-    family = "rhi_gateway_time_to_first_token_seconds"
-    seconds: list[rules.Declared] = [rules.EmittedBy(family, "services/gateway/rhi_gateway/experience.py")]
-    quantile = f"histogram_quantile(0.95, {rules.over_sessions(rules.minute_increase(f'{family}_bucket', by=('le',)))})"
-    assert broken(quantile, rules.over_sessions(rules.minute_increase(f"{family}_count")), declared=seconds) == set()
-    assert broken(quantile, rules.minute_increase(f"{family}_count"), declared=seconds) == {"percentile"}
-
-    # An engine series read over the session is kept to the pool in service at each minute, and has
-    # no "now" to read asleep at; read so without that, or kept only at the range's end, it is not.
-    engine: list[rules.Declared] = [rules.FromEngineTable(Quantity.INPUT_TOKENS)]
-    tokens = rules.engine_increase(MOCK, Quantity.INPUT_TOKENS, window=rules.SESSION_STEP)
-    assert broken(rules.over_sessions(rules.awake(MOCK.name, tokens)), declared=engine) == set()
-    assert broken(rules.over_sessions(tokens), declared=engine) == {"asleep"}
-    assert broken(rules.awake(MOCK.name, rules.over_sessions(tokens)), declared=engine) == {"asleep"}
+    # An engine series read over the session is kept to the pool in service at the step it counts
+    # at, and has no "now" to read asleep at; read so without that, or kept only at the range's
+    # end, it is not.
+    tokens = rules.engine_minute_increase(MOCK, Quantity.INPUT_TOKENS)
+    assert broken(rules.over_sessions(rules.awake(MOCK.name, tokens))) == set()
+    assert broken(rules.over_sessions(tokens)) == {"asleep"}
+    assert broken(rules.awake(MOCK.name, rules.over_sessions(tokens))) == {"asleep"}
+    # Nor when what is around the awake value can carry it into a later step, the pool asleep then.
+    awake = rules.awake(MOCK.name, tokens)
+    for elsewhere in (f"last_over_time(({awake})[10m:1m])", f"max_over_time(({awake})[10m:1m]) * 1"):
+        assert broken(rules.over_sessions(elsewhere)) == {"asleep"}

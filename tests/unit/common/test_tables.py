@@ -58,7 +58,7 @@ ITEMS: list[tuple[Table, Record]] = [
     ),
     (POOL_STATE, PoolState(pool="mock", mode=Mode.ENABLED, set_by="admin", set_at=NOW)),
     (POOL_STATE, ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=NOW)),
-    (POOL_STATE, SessionSwitch(on=True, set_by="instructor", set_at=NOW)),
+    (POOL_STATE, SessionSwitch(on=True, set_by="admin", set_at=NOW)),
     (
         HEARTBEATS,
         GatewayHeartbeat(task="0f3a9c", pool="mock", in_flight=1, held=0, last_request_at=None, written_at=NOW),
@@ -149,8 +149,9 @@ def test_the_pool_state_items_are_records_of_the_table() -> None:
     for table, record in ITEMS:
         if table is POOL_STATE:
             item = record.to_item()
-            # A pool's record, or the session switch under the partition no pool can take.
-            assert item["record"] in tables.POOL_STATE_RECORDS or (item["pool"], item["record"]) == tables.SESSION_SWITCH
+            # A pool's own records, or the session switch under the key no pool can take.
+            is_switch = {name: item[name] for name in tables.SESSION_SWITCH_KEY} == tables.SESSION_SWITCH_KEY
+            assert is_switch or item["record"] in tables.POOL_STATE_RECORDS
 
 
 def test_the_key_item_carries_the_keys_of_by_student() -> None:
