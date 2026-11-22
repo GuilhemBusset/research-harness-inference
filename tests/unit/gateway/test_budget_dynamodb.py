@@ -382,6 +382,34 @@ def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: C
     assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
 
 
+@pytest.mark.parametrize("kind", ["memory", "dynamodb"])
+def test_a_withdrawal_keeps_a_settlement_that_stored_again_what_the_day_carried(client: Calls, kind: str) -> None:
+    midnight = NOON + 43_200
+    clock = Clock(midnight - 10)
+    ledger = InMemoryLedger(clock=clock) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=clock)
+    first = reserve(ledger, student(), "first", pool="coursework")
+    ledger.settle(first, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="held", rebalance_number=7)
+    prior_day_turn = reserve(ledger, student(), "prior-day", pool="coursework")
+
+    clock.now = midnight + 1
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    assert (completed.cookie, completed.rebalance_applied) == ("held", 7)
+    # The day before changes after today's opening carried from it.
+    ledger.settle(
+        prior_day_turn, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="other", rebalance_number=8
+    )
+    # Today's request stores, at no tokens, the very cookie and number its day carried.
+    settled = ledger.settle(
+        completed, input_tokens=0, output_tokens=0, ended_cleanly=True, cookie="held", rebalance_number=7
+    )
+    assert settled == 0
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("held", 7)
+
+
 def test_a_withdrawal_keeps_a_settlement_from_a_draining_gateway(client: Calls) -> None:
     ledger = DynamoDBLedger(client, TABLE, clock=Clock())
     opening = reserve(ledger, student(), "opening", pool="coursework")

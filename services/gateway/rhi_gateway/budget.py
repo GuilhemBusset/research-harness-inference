@@ -271,8 +271,8 @@ class Ledger(Protocol):
         from the day before (`_carried_only`): no tokens, no lease but stand-ins, and cookies and
         rebalance numbers equal to those the opening carried and recorded. All of that a later
         opening carries again from the day before, if that day is still there. A day a request
-        stored a cookie or a number in keeps it, even at no tokens and whichever gateway task wrote
-        it, and so does a day written without the record. A reservation refused after its write (its day
+        stored a cookie or a number in keeps it, even at no tokens, even one equal to what the opening
+        carried, and whichever gateway task wrote it, and so does a day written without the record. A reservation refused after its write (its day
         ended meanwhile) is taken back in the same way. A request whose student was erased while
         its body arrived thus leaves no row behind, however many such requests take theirs back and in
         whatever order, and what other requests charged or hold stays.
@@ -468,8 +468,9 @@ def _carried_only(day: UsageDay, carried: _Carried | None) -> bool:
     """Whether the day holds only what its opening carries from the day before.
 
     No tokens, stand-ins alone, and the cookies and rebalance numbers the opening recorded
-    (`carried`). Any write that stored a cookie or a number, or dropped one, changed the maps, and
-    a day written without the record (`None`) is never deleted.
+    (`carried`). A settlement that stores a cookie or a number, or drops one, also removes the
+    record, even when what it stores equals what the opening carried, and a day without the record
+    (`None`) is never deleted.
     """
     prefix = _day_before(day.day) + "/"
     return (
@@ -574,12 +575,16 @@ class InMemoryLedger:
         """Remove the lease and replace its tokens by `charge`, if the lease is still there.
 
         The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
-        if there is one, and removes the pool's cookie when there is none and it was dropped.
+        if there is one, and removes the pool's cookie when there is none and it was dropped. When
+        it stores or drops one, it also forgets what the day's opening carried (`_carried_only`).
         """
         with self._lock:
-            day = self._days.get((reservation.github_id, reservation.day))
+            key = (reservation.github_id, reservation.day)
+            day = self._days.get(key)
             if day is None or reservation.request_id not in day.leases:
                 return False
+            if reservation.pool is not None and (cookie is not None or rebalance_number is not None or cookie_dropped):
+                self._carried.pop(key, None)
             leases = {request: held for request, held in day.leases.items() if request != reservation.request_id}
             cookies, applied, pool = day.affinity_cookies, day.rebalance_applied, reservation.pool
             if pool is not None and cookie is not None:
@@ -824,7 +829,9 @@ class DynamoDBLedger:
         stand-ins it missed; the write carries them into the day and confirms the day. The others
         are given only by a settlement, and the same write applies them to the reservation's pool:
         it stores `cookie` and `rebalance_number`, each if there is one, and removes the pool's
-        cookie when there is none and it was dropped.
+        cookie when there is none and it was dropped. When it stores or drops one, it also removes
+        the record of what the day's opening carried, so that a withdrawal keeps the day
+        (`_carried_only`) even when what it stored equals what the opening carried.
         """
         values: dict[str, object] = {":change": charge - reservation.lease.tokens}
         names, sets = _stand_in_updates(stand_ins or {}, values)
@@ -845,6 +852,9 @@ class DynamoDBLedger:
             names |= {"#applied": _APPLIED, "#pool": reservation.pool}
             sets.append("#applied.#pool = :number")
             values[":number"] = rebalance_number
+        if reservation.pool is not None and (cookie is not None or rebalance_number is not None or cookie_dropped):
+            names["#carriedmaps"] = _CARRIED
+            removals.append("#carriedmaps")
         update = "REMOVE " + ", ".join(removals) + " ADD #tokens :change"
         if sets:
             update += " SET " + ", ".join(sets)
