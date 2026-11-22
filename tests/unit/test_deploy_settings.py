@@ -14,6 +14,11 @@ The verification does not run every smoke test: its script deselects some
 test is left out, and the engine leaves an item that names one of them to the owner. This test
 holds that list equal to the files of the tests the verification's own run deselects, so a test
 that is newly left out cannot go on discharging the items it decides.
+
+The engine also reads, in `discharge_contexts`, verification contexts it never waits for: only to
+discharge such an item after the fact, from a later verification of the merge commit or of a `main`
+that holds it. Each must be the context of a stage's verification as the reporter posts it, or the
+engine would read, run after run, a status nothing posts.
 """
 
 from __future__ import annotations
@@ -93,6 +98,17 @@ def posted_by_the_reporter(context: object) -> bool:
     return context in (own.context, verification.context)
 
 
+def verification_posted_by_the_reporter(context: object) -> bool:
+    """Whether `context` is `verify/<stage>` for a stage the reporter accepts: the context of the
+    stage's verification, and not of its own status."""
+    if not isinstance(context, str) or not posted_by_the_reporter(context):
+        return False
+    verification = status.status_for(
+        {"stage": context.partition("/")[2], "action": status.VERIFY_ACTION, "state": "SUCCEEDED", "commit": A_COMMIT}
+    )
+    return context == verification.context
+
+
 def problems(table: Mapping[str, object], left_out: Sequence[str] | None = None) -> list[str]:
     """What is wrong with a table `[deploy]`: nothing for the committed one, and for the owner's.
     `left_out` is the test files of which the verification leaves a test out: the real ones, unless
@@ -102,6 +118,10 @@ def problems(table: Mapping[str, object], left_out: Sequence[str] | None = None)
     for context in contexts if isinstance(contexts, list) else [contexts]:
         if not posted_by_the_reporter(context):
             found.append(f"the context {context!r} is neither deploy/<stage> nor verify/<stage>")
+    discharge = table.get("discharge_contexts", [])
+    for context in discharge if isinstance(discharge, list) else [discharge]:
+        if not verification_posted_by_the_reporter(context):
+            found.append(f"the discharge context {context!r} is not a verify/<stage> context the reporter posts")
     for key, constant in DESCRIPTIONS.items():
         value = table.get(key, "")
         if value != "" and not (isinstance(value, str) and value == str(constant)):
@@ -118,6 +138,7 @@ def owners_table(**changes: object) -> dict[str, object]:
     """The table the owner is expected to write, with one value changed."""
     table = {
         "contexts": ["deploy/beta", "verify/beta"],
+        "discharge_contexts": ["verify/beta"],
         "timeout_s": 1800,
         "approval_description": str(status.APPROVAL_DESCRIPTION),
         "verified_description": str(status.VERIFIED_DESCRIPTION),
@@ -142,6 +163,12 @@ def test_the_table_the_owner_is_expected_to_write_passes() -> None:
 def test_a_context_of_another_form_fails(context: str) -> None:
     [problem] = problems(owners_table(contexts=["deploy/beta", context]))
     assert repr(context) in problem
+
+
+@pytest.mark.parametrize("context", ["deploy/beta", "verify/", "Verify/beta", "verify/a stage", "verify/beta/x", "beta", 1])
+def test_a_discharge_context_that_is_no_verification_the_reporter_posts_fails(context: object) -> None:
+    [problem] = problems(owners_table(discharge_contexts=["verify/beta", context]))
+    assert problem.startswith("the discharge context") and repr(context) in problem
 
 
 @pytest.mark.parametrize("key", list(DESCRIPTIONS))
