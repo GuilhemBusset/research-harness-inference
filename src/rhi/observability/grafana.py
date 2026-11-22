@@ -53,10 +53,12 @@ with its reason, and nothing else:
 
 - `prometheus.QUERY_ACTIONS` on the one workspace, by its ARN: the dashboards' queries;
 - `LOG_ACTIONS` on the log groups of the gateway, the scaler and the issuer, `/rhi/gateway`,
-  `/rhi/scaler` and `/rhi/issuer`, and on that of each pool of the configuration,
-  `/rhi/pools/<pool>`: the dashboards' log queries. Each is named by its fixed name, as text, and
-  never by a reference to the stack that creates it: the pools stack and the gateway stack depend
-  on this one, which must not depend on them. Each ARN ends `:*`, which is how CloudWatch Logs
+  `/rhi/scaler` and `/rhi/issuer`, on that of each pool of the configuration,
+  `/rhi/pools/<pool>`, and on that of the pipeline's state changes, `/rhi/pipeline/events`
+  (`rhi.pipeline.events`), which the deployments dashboard reads: the dashboards' log queries. Each
+  is named by its fixed name, as text, and never by a reference to the stack that creates it: the
+  pools stack and the gateway stack depend on this one, which must not depend on them, and the
+  pipeline stack is in another assembly. Each ARN ends `:*`, which is how CloudWatch Logs
   names a log group and its streams in a policy. No other log group is named, and none by a
   pattern: not a build project's, whose logs hold the real configuration, not Grafana's own, and
   not that of a pool the configuration does not hold;
@@ -104,6 +106,7 @@ from rhi.access.sign_in import CALLBACK_PATH
 from rhi.gateway import service as gateway
 from rhi.network.security import GRAFANA_PORT
 from rhi.observability import prometheus
+from rhi.pipeline import events as pipeline_events
 from rhi.pools import scaler
 from rhi.pools.role import log_group_name
 from rhi_dashboards import build as dashboards
@@ -147,9 +150,11 @@ DEREGISTRATION_SECONDS = 30
 # What the load balancer asks of the user pool: who signed in, and nothing else.
 SCOPE = "openid"
 
-# The log groups of the services, by their fixed names. Those of the pools' instances are added
-# for the pools of the configuration, each by its own name (`readable_log_groups`).
+# The log groups of the services, and that of the pipeline's state changes, by their fixed names.
+# Those of the pools' instances are added for the pools of the configuration, each by its own name
+# (`readable_log_groups`).
 SERVICE_LOG_GROUPS = (gateway.LOG_GROUP_NAME, scaler.LOG_GROUP_NAME, issuer.LOG_GROUP_NAME)
+PIPELINE_LOG_GROUPS = (pipeline_events.LOG_GROUP_NAME,)
 # What a log query of the CloudWatch data source takes on a log group: starting the query, the
 # fields the query editor lists, and the events around a line.
 LOG_ACTIONS = ("logs:StartQuery", "logs:GetLogGroupFields", "logs:GetLogEvents")
@@ -159,10 +164,10 @@ EVERY_RESOURCE_ACTIONS = ("cloudwatch:GetMetricData", "cloudwatch:ListMetrics", 
 
 
 def readable_log_groups(config: Config) -> tuple[str, ...]:
-    """The names of the log groups Grafana may query: the services', and that of each pool of the
-    configuration, `/rhi/pools/<pool>`. No pattern: a pool the configuration does not hold has no
-    log group here."""
-    return (*SERVICE_LOG_GROUPS, *(log_group_name(pool.name) for pool in config.pools))
+    """The names of the log groups Grafana may query: the services', that of each pool of the
+    configuration, `/rhi/pools/<pool>`, and the pipeline's events'. No pattern: a pool the
+    configuration does not hold has no log group here."""
+    return (*SERVICE_LOG_GROUPS, *(log_group_name(pool.name) for pool in config.pools), *PIPELINE_LOG_GROUPS)
 
 
 def image_context(config: Config, *, folder: Path = IMAGE_FOLDER) -> str:

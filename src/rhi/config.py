@@ -152,6 +152,9 @@ class Config:
     target_stream_median_tokens_per_second: float
     target_stream_p10_tokens_per_second: float
     cached_share_flag_percent: float
+    # The days the pipeline's log group keeps its state changes (`rhi.pipeline.events`), a period
+    # CloudWatch Logs takes. Only synthesis of the pipeline stack reads it.
+    pipeline_events_retention_days: int
 
 
 def _as_stored(text: str) -> object:
@@ -186,6 +189,19 @@ def _whole_dollars(value: object) -> int:
 def _whole_number(value: object) -> int:
     # A TOML boolean is a Python int: it is not a count.
     if type(value) is not int or value <= 0:
+        raise ValueError
+    return value
+
+
+# The retention periods, in days, that CloudWatch Logs takes for a log group.
+LOG_RETENTION_DAYS = frozenset(
+    {1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653}
+)
+
+
+def _log_retention_days(value: object) -> int:
+    # A TOML boolean is a Python int: it is not a number of days.
+    if type(value) is not int or value not in LOG_RETENTION_DAYS:
         raise ValueError
     return value
 
@@ -372,6 +388,11 @@ KEYS: dict[str, Key] = {
     "target_stream_median_tokens_per_second": _NUMBER_ABOVE_ZERO,
     "target_stream_p10_tokens_per_second": _NUMBER_ABOVE_ZERO,
     "cached_share_flag_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
+    "pipeline_events_retention_days": Key(
+        "a whole number of days that CloudWatch Logs takes as a retention period, such as 30, 90 or 365",
+        _log_retention_days,
+        _number_from_text,
+    ),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -411,6 +432,9 @@ DEFAULTS: dict[str, object] = {
     "target_stream_median_tokens_per_second": 15,
     "target_stream_p10_tokens_per_second": 10,
     "cached_share_flag_percent": 85,
+    # The design gives no period for the pipeline's events, which hold no personal data (issue
+    # E4-30): 90 days, the period of every log group of the stage (section 6.6).
+    "pipeline_events_retention_days": 90,
 }
 
 # Keys a source may leave out without a default: the field is then None. `parse` fills the two

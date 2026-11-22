@@ -6,9 +6,11 @@
 # - aps:QueryMetrics, aps:GetSeries, aps:GetLabels and aps:GetMetricMetadata on the metrics
 #   workspace only, by its ARN: the dashboards' queries.
 # - logs:StartQuery, logs:GetLogGroupFields and logs:GetLogEvents on the log groups /rhi/gateway,
-#   /rhi/scaler and /rhi/issuer, and on the log group of each pool of the configuration,
-#   /rhi/pools/<pool>, each by its fixed name; each ARN ends `:*`, the log group and its streams:
-#   the dashboards' log queries. No other log group is named, none by a pattern, and no build
+#   /rhi/scaler and /rhi/issuer, on the log group of each pool of the configuration,
+#   /rhi/pools/<pool>, and on the log group of the pipeline's state changes, /rhi/pipeline/events,
+#   which the pipeline's stack creates (`src/rhi/pipeline/events.py`), each by its fixed name; each
+#   ARN ends `:*`, the log group and its streams: the dashboards' log queries, the deployments
+#   dashboard's among them. No other log group is named, none by a pattern, and no build
 #   project's.
 # - cloudwatch:GetMetricData, cloudwatch:ListMetrics and logs:GetQueryResults on every resource:
 #   the metrics of the load balancers, of Auto Scaling and of the pipeline, the account's
@@ -37,6 +39,7 @@
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/gateway:*]" = "Grafana queries the gateway's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/scaler:*]" = "Grafana queries the scaler's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/issuer:*]" = "Grafana queries the issuer's log group, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pipeline/events:*]" = "Grafana queries the log group of the pipeline's state changes for the deployments dashboard, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/rhi/pools/<pool>:*]" = "Grafana queries the log group of each configured pool's instances, by its fixed name, and the ARN ends with the wildcard by which CloudWatch Logs names a log group together with its streams."
 "AwsSolutions-ECS2" = "The task definition gives Grafana the workspace's query address, the region and the domain as environment variables, which is how the image's settings and data sources read them, and none holds a secret: both data sources sign their requests with the task's role."
 "AwsSolutions-ECS4" = "Grafana shows the metrics of the Managed Prometheus workspace and of CloudWatch, and its own logs go to its log group, so Container Insights would be a paid store of metrics that no dashboard of the design reads."
