@@ -38,8 +38,9 @@ class Clock:
 class CloudFormation:
     """Names the table by its logical ID in the stack, or fails with `failure`."""
 
-    def __init__(self, failure: ClientError | None = None) -> None:
+    def __init__(self, failure: ClientError | None = None, detail: dict[str, Any] | None = None) -> None:
         self.failure = failure
+        self.detail = {"PhysicalResourceId": TABLE} if detail is None else detail
         self.reads = 0
 
     def describe_stack_resource(self, *, StackName: str, LogicalResourceId: str) -> dict[str, Any]:
@@ -47,7 +48,7 @@ class CloudFormation:
         if self.failure is not None:
             raise self.failure
         assert (StackName, LogicalResourceId) == (STACK, LOGICAL_ID)
-        return {"StackResourceDetail": {"PhysicalResourceId": TABLE}}
+        return {"StackResourceDetail": self.detail}
 
 
 class DynamoDB:
@@ -90,6 +91,13 @@ def test_passes_at_once_when_no_session_is_on(answer: bool | None) -> None:
 )
 def test_passes_at_once_when_the_stack_or_its_table_does_not_exist(message: str) -> None:
     cloudformation, dynamodb, clock = CloudFormation(error("ValidationError", message)), DynamoDB(), Clock()
+    assert run(cloudformation, dynamodb, clock) == 0
+    assert (cloudformation.reads, dynamodb.reads, clock.now) == (1, 0, 0)
+
+
+def test_passes_at_once_when_the_table_was_never_created() -> None:
+    cloudformation = CloudFormation(detail={"LogicalResourceId": LOGICAL_ID, "ResourceStatus": "CREATE_FAILED"})
+    dynamodb, clock = DynamoDB(), Clock()
     assert run(cloudformation, dynamodb, clock) == 0
     assert (cloudformation.reads, dynamodb.reads, clock.now) == (1, 0, 0)
 

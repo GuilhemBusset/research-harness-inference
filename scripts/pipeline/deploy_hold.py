@@ -14,7 +14,8 @@ The stack's name and the logical ID come from `RHI_HOLD_POOLS_STACK` and
 **When it passes at once.** When the switch reads off, when its item is missing (which reads off),
 and when the pools stack, or its table, does not exist yet, as before the stage's first deployment:
 CloudFormation then answers `ValidationError` saying that the stack or the resource does not
-exist, and DynamoDB `ResourceNotFoundException`. Any other error, a `ValidationError` for another
+exist, or names the resource with no physical ID (its creation failed before the table existed),
+and DynamoDB answers `ResourceNotFoundException`. Any other error, a `ValidationError` for another
 cause among them, and a switch whose item does not read, fail the job: the hold is never released
 without the switch read off.
 
@@ -74,7 +75,11 @@ def table_name(cloudformation: Any, stack: str, logical_id: str) -> str:
         if _missing_stack_or_resource(error):
             raise NotDeployed from None
         raise
-    return answer["StackResourceDetail"]["PhysicalResourceId"]
+    # A resource whose creation failed before the table existed has no physical ID: no table yet.
+    name = answer["StackResourceDetail"].get("PhysicalResourceId")
+    if not name:
+        raise NotDeployed
+    return name
 
 
 def read_switch(table: Any) -> SessionSwitch | None:
