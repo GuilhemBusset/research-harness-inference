@@ -48,14 +48,17 @@ sessions, run at once. Both draw their sizes from a seed, so a run can be repeat
   seconds from the first token to the last. It is `None` where the rule gives nothing: an answer
   that is not a stream, fewer than two output tokens, or every token in one moment;
 - the input (whole, cached or not), cached input and output tokens the answer reported, read from
-  its usage where each wire format puts them (`None` for a count the answer did not report);
+  its usage where each wire format puts them (`None` for a count the answer did not report). A
+  stream's usage objects are taken in turn, each field keeping the last whole number reported for
+  it: a later object that leaves a field out, or gives it `null`, does not erase it, as the gateway
+  counts (`rhi_gateway.usage`);
 - the student, the session, whether the request was its session's first turn, and the status of
   the answer;
 - the time on the replay's clock the request was sent, and the seconds from then to its last token;
 - whether the gateway held the request, which its answer says with its header
-  (`rhi_gateway.hold.HELD_HEADER`), and whether it sent a keep-alive before the engine's first
-  event, which only a held stream gets: a `ping` event on Messages, an SSE comment on the OpenAI
-  formats. A hold that ends before its first keep-alive is due leaves none;
+  (`rhi_gateway.hold.HELD_HEADER`), and only that: a keep-alive in the stream is no sign of it, since
+  a hold that ends before its first keep-alive is due leaves none, and an engine may open its own
+  stream with a comment or a `ping`;
 - the gateway's cause, when the answer is one of its errors, a refusal or an error event, and the
   cause is one of its own (`rhi_common.causes.Cause`); nothing else of an error is kept.
 
@@ -103,7 +106,7 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=1200.0, write=60.0, pool=None)
 
 MESSAGES_PATH = "/v1/messages"
 STREAM_TYPE = "text/event-stream"
-# The gateway's keep-alive on a held Messages stream; on the OpenAI formats, an SSE comment.
+# A keep-alive on a Messages stream, the gateway's or the engine's; on the OpenAI formats, an SSE comment.
 PING_EVENT = "ping"
 _CAUSES = frozenset(cause.value for cause in Cause)
 # The headers of a capture that are not replayed: the recording's host and length, and a key.
@@ -358,6 +361,19 @@ def _usage(data: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _merge(usage: dict[str, Any], update: Mapping[str, Any]) -> None:
+    """Takes a stream's next usage object into `usage`: a field it carries as a whole number replaces
+    the one before, an object of details is taken in the same way, and a field that is `null` or
+    anything else leaves the count already reported."""
+    for name, value in update.items():
+        if isinstance(value, dict):
+            details = usage.get(name)
+            usage[name] = details = details if isinstance(details, dict) else {}
+            _merge(details, value)
+        elif _whole(value) is not None:
+            usage[name] = value
+
+
 def _whole(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -418,10 +434,8 @@ class Record:
     """The time on the replay's clock the request was sent."""
     last_token_seconds: float | None = None
     """From the request sent to its last token; `None` when the answer streamed none."""
-    kept_alive: bool = False
-    """Whether the gateway sent a keep-alive before the engine's first event: the stream was held."""
     held: bool = False
-    """Whether the gateway held the request: its answer's header said so, or a keep-alive came."""
+    """Whether the gateway held the request: its answer's header said so."""
     cause: str | None = None
     """The gateway's cause, when the answer was one of its errors and the cause one of its own."""
     failure: Failure | None = None
@@ -482,7 +496,7 @@ async def _send(
     reader, usage, text, whole = SseReader(), {}, [], bytearray()
     first = answered = last = None
     status: int | None = None
-    streamed = engine = kept_alive = marked = False
+    streamed = marked = False
     cause: str | None = None
     failure: Failure | None = None
     sent = clock()
@@ -498,12 +512,10 @@ async def _send(
                 now = clock()
                 for event in reader.feed(chunk):
                     if event.comment or event.name == PING_EVENT:
-                        kept_alive = kept_alive or not engine
                         continue
-                    engine = True
                     data = _object(event.data)
                     cause = cause or cause_of(data)
-                    usage |= _usage(data)
+                    _merge(usage, _usage(data))
                     carried = output_of(wire, event) if wire else None
                     if carried is None:
                         continue
@@ -534,8 +546,7 @@ async def _send(
         "output_tokens": output_tokens,
         "sent_at": sent,
         "last_token_seconds": None if last is None else last - sent,
-        "kept_alive": kept_alive,
-        "held": marked or kept_alive,
+        "held": marked,
         "cause": cause,
         "failure": failure,
     }

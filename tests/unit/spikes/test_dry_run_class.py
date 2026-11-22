@@ -88,9 +88,11 @@ def _event(name: str, data: dict[str, Any]) -> bytes:
 
 
 def _stream(*, ping: bool) -> bytes:
-    usage = {"input_tokens": 10, "cache_read_input_tokens": 30, "output_tokens": 3}
+    # The last usage object repeats the cached input as null: the count reported first stands.
+    first = {"input_tokens": 10, "cache_read_input_tokens": 30, "output_tokens": 1}
+    usage = {"cache_read_input_tokens": None, "output_tokens": 3}
     events = [
-        _event("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+        _event("message_start", {"type": "message_start", "message": {"usage": first}}),
         *(
             _event(
                 "content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}
@@ -105,7 +107,8 @@ def _stream(*, ping: bool) -> bytes:
 
 class Pool(httpx.AsyncBaseTransport):
     """The gateway's answers by student: the first held, with a keep-alive first on its first request
-    only, the second warm with its third request cut, the third refused for its budget."""
+    only, the second warm, its engine opening each stream with a comment, with its third request cut,
+    the third refused for its budget."""
 
     def __init__(self, keys: list[str], clock: Clock) -> None:
         self.keys, self.clock, self.sent = keys, clock, 0
@@ -120,6 +123,8 @@ class Pool(httpx.AsyncBaseTransport):
         if student == 1 and self.by_student[1] == 3:
             raise httpx.ReadError("cut")
         stream, clock = _stream(ping=student == 0 and self.by_student[0] == 1), self.clock
+        if student == 1:
+            stream = b": engine\n\n" + stream
         headers = {"content-type": "text/event-stream", **({HELD_HEADER: "true"} if student == 0 else {})}
 
         async def paced() -> Any:
@@ -252,11 +257,9 @@ def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
     assert {line["first_turn"] for line in answered} == {True, False}
     assert {line["conversation"] for line in answered if line["session"] == 0} >= {0, 1, 2}
     # The gateway said it held the first student's requests, whether a keep-alive came or not; the
-    # warm student's answers did not say so.
-    held = [line for line in answered if line["session"] == 0]
-    assert all(line["held"] for line in held)
-    assert {line["kept_alive"] for line in held} == {True, False}
-    assert not any(line["held"] or line["kept_alive"] for line in answered if line["session"] == 1)
+    # warm student's answers did not say so, though their engine opened each stream with a comment.
+    assert all(line["held"] for line in answered if line["session"] == 0)
+    assert not any(line["held"] for line in answered if line["session"] == 1)
 
     refused = [line for line in requests if line["session"] == 2]
     assert refused
@@ -322,6 +325,34 @@ def test_the_readings_name_instances_and_tell_a_launch_in_the_hour_from_one_befo
     assert (started["instance"], started["transition"]) == ("instance-2", "cold-launch")
     assert started["stages"] == {stage: seconds + 3 for stage, seconds in STAGES.items()}
     assert hour["started_at"] < started["began_at"] <= hour["ends_at"]
+
+
+@pytest.mark.parametrize("boot", [40.0, 108.0], ids=["seen-after-the-hour", "booting-past-the-final-reads"])
+def test_a_launch_that_began_just_before_the_hour_ended_is_written(boot: float) -> None:
+    lines: list[str] = []
+    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    # The kernel starts 3 seconds before the end of the hour; each stage is first sampled on the
+    # 15-second grid after it ends.
+    stages = {"boot": boot, "image": 10.0, "release-check": 1.0, "container-start": 3.0, "weights": 6.0, "hook": 1.0}
+    ends = list(itertools.accumulate(stages.values(), initial=START + rehearsal.duration - 3))[1:]
+
+    class Launching(Workspace):
+        def _stages(self, start: float, end: float) -> list[common.Series]:
+            series = []
+            for (stage, seconds), ended in zip(stages.items(), ends, strict=True):
+                first = START + 15 * -(-(ended - START) // 15)
+                at = [t for t in range(int(first), int(end) + 1, 15) if t >= start]
+                labels = {"instance": self.after, "transition": "promotion", "stage": stage}
+                series.append(_series(labels, *((t, seconds) for t in at)))
+            return [one for one in series if one.samples]
+
+    rehearsal.workspace = Launching(*instances)
+    _run(rehearsal)
+    (started,) = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
+    hour = next(line for line in _kinds(lines) if line["kind"] == "hour_started")
+    assert started["stages"] == stages
+    # The latest it can have begun, which its later samples bring down into the hour.
+    assert dry.utc(START + rehearsal.duration - 3) <= started["began_at"] <= hour["ends_at"]
 
 
 def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:

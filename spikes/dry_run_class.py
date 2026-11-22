@@ -32,8 +32,8 @@ error event, ends its conversation as a refusal does: the next one opens with a 
 
 **Whether a request was held** is the gateway's own decision, which its answer carries in the
 header `rhi_gateway.hold.HELD_HEADER` (`loadgen.Record.held`), whether or not the hold lasted long
-enough for a keep-alive; whether one came before the engine's first event is written beside it
-(`kept_alive`).
+enough for a keep-alive. A keep-alive in the stream decides nothing: an engine may open its own
+stream with a comment or a `ping`, which a warm request then gets too.
 
 **The hour's bounds.** The hour starts once the pool is ready and ends `duration` seconds later,
 both written in `hour_started`. The readings of the start and the end are of the workspace as it
@@ -70,9 +70,12 @@ before, which a new launch does: it empties the metric and sets each stage as it
 are taken whatever their transition label, because the agent takes a launch into service for a
 promotion until it finds no image on the disk, and then moves its stages to `cold-launch`: the
 launch is written once, under its last label (`launches_of`). It began, at the latest, when it was
-first seen less the seconds of the stages it had ended by then, and it is written when that is in
-the hour. A launch that began in the hour keeps the stages it ends after it: the job waits for each
-to end its `hook`, the last stage, for at most `LAUNCH_WAIT_SECONDS` after the hour.
+seen less the seconds of the stages it had ended by then; each later sample of it, with more stages
+ended, can only make that earlier (`Launch.began`), and it is written when that is in the hour.
+A launch shows no stage before its boot has ended, so one that began near the hour's end is seen
+only after it: the job goes on reading for `DISCOVERY_SECONDS` after the hour, and a launch that
+began in the hour keeps the stages it ends after it: the job waits for each to end its `hook`, the
+last stage, for at most `LAUNCH_WAIT_SECONDS` after the hour.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-dry_run_class`):
 
@@ -144,6 +147,10 @@ SETTLE_SECONDS = 4 * SCRAPE_SECONDS
 # Seconds the job waits, after the hour, for a launch that began in it to end its last stage: a cold
 # launch at worst (spike S1).
 LAUNCH_WAIT_SECONDS = READY_WAIT_SECONDS
+# Seconds the job goes on reading the stages after the hour for a launch it has not seen yet: one that
+# began before the hour's end shows its first stage once its boot has ended, which this leaves ample
+# time for.
+DISCOVERY_SECONDS = 15 * 60.0
 # Seconds. Prometheus' lookback: how far back a reading at a time finds a series' last sample.
 LOOKBACK_SECONDS = 300.0
 # Seconds a series' last sample may be old and still be read as written now: four scrapes. The
@@ -192,7 +199,9 @@ type Snapshot = dict[str, float]
 class Launch:
     """One launch of an instance, as the stage metric showed it: its last transition label, the step
     it was first seen at, the latest it can have begun, and the seconds of each stage it had ended by
-    its last sample."""
+    its last sample. The stages follow each other from the kernel's start, so at each sample the
+    launch began no later than the sample's time less the seconds of the stages ended by then: the
+    latest it can have begun is the earliest of these."""
 
     instance: str
     transition: str
@@ -212,8 +221,8 @@ def launches_of(series: Iterable[common.Series], start: float) -> list[Launch]:
     Per instance, the stages of each step form a snapshot, whatever their transition label. The last
     one at or before `start` is the launch from before the hour; each later snapshot that gives a
     stage other seconds than the launch it follows begins a new one, and one that agrees with it adds
-    the stages it ended since and gives it its label. A launch began, at the latest, when it was
-    first seen less the seconds of the stages it had ended by then. A label outside the agent's fixed
+    the stages it ended since and gives it its label. A launch began, at the latest, at the earliest
+    of its samples' times less the seconds of the stages it had ended by each. A label outside the agent's fixed
     stages and transitions is not read."""
     steps: dict[str, dict[float, tuple[set[str], Snapshot]]] = {}
     for one in series:
@@ -234,6 +243,7 @@ def launches_of(series: Iterable[common.Series], start: float) -> list[Launch]:
             if current is not None and _same_launch(current.stages, snapshot):
                 current.stages.update(snapshot)
                 current.transition = transition
+                current.began = min(current.began, at - sum(current.stages.values()))
                 continue
             current = Launch(instance, transition, at, at - sum(snapshot.values()), dict(snapshot))
             if at > start:
@@ -374,10 +384,15 @@ class Rehearsal:
 
     async def started_instances(self, start: float, deadline: float, *, wait: float = 0.0) -> None:
         """A line for each launch that began between `start` and `deadline`, from the stage metric
-        (`launches_of`), once each has ended its last stage or `wait` seconds have passed."""
+        (`launches_of`). It reads until `DISCOVERY_SECONDS` after `deadline`, so that a launch still in
+        its boot then is seen, and until each launch has ended its last stage; never longer than
+        `wait` seconds from now."""
         waited_from = self.clock.now()
         launches = await self._launches(start, deadline)
-        while any(_LAST_STAGE not in launch.stages for launch in launches):
+        while (
+            self.clock.now() < deadline + DISCOVERY_SECONDS
+            or any(_LAST_STAGE not in launch.stages for launch in launches)
+        ):
             if self.clock.now() - waited_from >= wait:
                 break
             await self.clock.sleep(SCRAPE_SECONDS)
@@ -422,7 +437,6 @@ class Rehearsal:
             cached_input_tokens=record.cached_input_tokens,
             output_tokens=record.output_tokens,
             held=record.held,
-            kept_alive=record.kept_alive,
             status=record.status,
             cause=record.cause,
             failure=None if record.failure is None else record.failure.value,
