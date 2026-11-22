@@ -569,6 +569,51 @@ def test_leases_the_release_before_wrote_are_settled_and_swept_and_the_day_s_tok
     assert (record.tokens, record.leases) == (2300, {})
 
 
+def test_the_stand_ins_a_day_s_opening_and_its_confirmation_write_hold_tokens_and_estimate_0(client: Calls) -> None:
+    # Just after midnight, the day before holds a lease of the release before, with its tokens and estimate.
+    midnight = NOON - 43_200
+    table = boto3.resource("dynamodb").Table(TABLE)
+    before = UsageDay(
+        7,
+        "2026-11-14",
+        "student-07",
+        tokens=2500,
+        expires_at=COURSE_END,
+        leases={"running": Lease(tokens=1500, estimate=1000, expires=midnight + 600)},
+    )
+    table.put_item(Item=before.to_item())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock(midnight + 1))
+
+    def stored_stand_in(request: str) -> dict[str, Any]:
+        item = client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)["Item"]
+        return item["leases"]["M"][f"2026-11-14/{request}"]["M"]
+
+    # The opening writes the day whole, with a stand-in for the running lease; the release before
+    # reads both attributes of each lease, so they are checked as stored.
+    reserve(ledger, student(), "opener")
+    assert stored_stand_in("running") == {
+        "tokens": {"N": "0"},
+        "estimate": {"N": "0"},
+        "expires": {"N": str(midnight + 600)},
+    }
+
+    # A lease of the day before written after that opening read it: the next reservation's write
+    # confirms the day and adds its stand-in.
+    table.update_item(
+        Key={"github_id": 7, "day": "2026-11-14"},
+        UpdateExpression="SET leases.#late = :lease",
+        ExpressionAttributeNames={"#late": "late"},
+        ExpressionAttributeValues={":lease": Lease(tokens=900, estimate=400, expires=midnight + 700).to_map()},
+    )
+    reserve(ledger, student(), "follower")
+    assert stored_stand_in("late") == {
+        "tokens": {"N": "0"},
+        "estimate": {"N": "0"},
+        "expires": {"N": str(midnight + 700)},
+    }
+    assert set(written().leases) == {"2026-11-14/running", "2026-11-14/late", "opener", "follower"}
+
+
 class Paused:
     """A client whose first call of one operation waits for the test, before it reaches the table.
 
