@@ -254,10 +254,10 @@ def test_the_job_runs_the_coursework_pool_s_smoke_tests_and_sends_their_result()
     ((env, arguments),) = given
     assert env["RHI_SMOKE_POOL"] == "coursework"
     assert env["RHI_SMOKE_KEY"] == key
-    # The workspace's own query address, under which the tests ask for api/v1/query, from the
-    # release parameter's settings; and no table, which the canary's role may not read.
+    # The workspace's own query address, under which the tests ask for api/v1/query, and the
+    # heartbeats table's name, from the release parameter's settings.
     assert env["RHI_SMOKE_WORKSPACE_URL"] == WORKSPACE
-    assert "RHI_VERIFY_HEARTBEATS_TABLE" not in env
+    assert env["RHI_VERIFY_HEARTBEATS_TABLE"] == HEARTBEATS
     assert json.loads(env["RHI_SMOKE_RELEASE_PARAMETERS"]) == {"coursework": PARAMETER}
     assert arguments[-1] == "tests/smoke"
     (entry,) = sent
@@ -309,7 +309,7 @@ def collected(env: Mapping[str, str], arguments: Sequence[str]) -> set[str]:
     return {line for line in answer.stdout.splitlines() if line.startswith("tests/smoke/") and "::" in line}
 
 
-def test_the_run_makes_the_verification_s_tests_on_the_coursework_pool_but_the_heartbeat_one() -> None:
+def test_the_run_makes_every_test_of_the_verification_on_the_coursework_pool() -> None:
     given: list[tuple[dict[str, str], list[str]]] = []
 
     def run(env: Mapping[str, str], arguments: Sequence[str]) -> int:
@@ -328,12 +328,11 @@ def test_the_run_makes_the_verification_s_tests_on_the_coursework_pool_but_the_h
     ((env, arguments),) = given
     endpoint = {"RHI_SMOKE_ENDPOINT": env["RHI_SMOKE_ENDPOINT"], "RHI_SMOKE_POOL": env["RHI_SMOKE_POOL"]}
     after_a_refresh = collected(endpoint | {"RHI_SMOKE_POOL": "coursework"}, ["tests/smoke"])
-    heartbeat = {test for test in after_a_refresh if "release_heartbeats" in test}
-    assert heartbeat
+    assert any("release_heartbeats" in test for test in after_a_refresh)
     assert any("gpu_release" in test for test in after_a_refresh)
-    # Every test of the verification's run after a refresh, the release served among them, but the
-    # one that reads the heartbeats table, which the canary's role may not read.
-    assert collected(endpoint, arguments) == after_a_refresh - heartbeat
+    # Every test of the verification's run after a refresh, the release served and the heartbeat
+    # rows among them, and no other.
+    assert collected(endpoint, arguments) == after_a_refresh
 
 
 def test_the_watch_reads_the_coursework_pool_s_state_until_it_is_ready() -> None:
