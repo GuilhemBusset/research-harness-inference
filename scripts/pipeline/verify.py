@@ -14,12 +14,14 @@ each line goes on with `REDACTED` in place of the key and of any piece of it `PI
 long or longer: pytest shortens a long value by cutting its middle out, which can leave part of a
 key.
 
-**The tests it leaves out.** The step runs outside the private network, and only the gateway may
-reach the internal load balancer (section 6.5), so the tests that call the forbidden routes
-through it cannot run from here. They are deselected by their IDs, `DESELECTED`. How the
-verification reaches that load balancer is the owner's decision: once it is made, those IDs leave
-this one tuple. The tests of `GPU_PASS_ONLY` are deselected too in the run on the mock pool, the
-one that names no pool: they belong to the run on the coursework pool. No other test is.
+**The tests it leaves out.** The forbidden routes are checked at the gateway's hop: the smoke
+tests call them through the gateway and expect 404 (`tests/smoke/test_smoke.py`). The internal
+load balancer's own rules, the four inference routes forwarded and a fixed 404 for everything
+else, the health route included, are asserted on the synthesized template
+(`tests/synth/test_internal_routing.py`): only the gateway may reach that load balancer (section
+6.5), and this step runs outside the private network. So the only tests left out are those of
+`GPU_PASS_ONLY`, in the run on the mock pool, the one that names no pool: they belong to the run
+on the coursework pool. A run that names a pool leaves none out.
 
 **The coursework pool.** Before this script, the step runs the decision of `gpu_verification.py`,
 which waits for the instance refresh a GPU pool's release started and leaves, in the file
@@ -134,17 +136,9 @@ NO_POOL = "none"
 LISTENER_OFF = "listener-off"
 CANARY_MISSING = "canary-missing"
 
-# The tests that call the forbidden routes through the internal load balancer, by their IDs
-# (`tests/smoke/ids.py`): the only tests the verification leaves out.
-DESELECTED: tuple[str, ...] = (
-    "internal-invocations",
-    "internal-pause",
-    "internal-tokenize",
-    "internal-metrics",
-    "internal-health",
-)
-# The tests that only the run on a pool the decision named makes, by their IDs: a run that names no
-# pool, the mock pool's, leaves them out.
+# The tests that only the run on a pool the decision named makes, by their IDs
+# (`tests/smoke/ids.py`): a run that names no pool, the mock pool's, leaves them out, and they are
+# the only tests the verification leaves out.
 GPU_PASS_ONLY: tuple[str, ...] = ("gpu-release-served",)
 # The marker a smoke test carries its ID in.
 ID_MARKER = "smoke_id"
@@ -160,10 +154,10 @@ _left: set[str] = set()
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """As a plugin of the run of the smoke tests: deselects the tests whose ID is one of `DESELECTED`,
-    and, in a run that names no pool, of `GPU_PASS_ONLY`, and keeps the IDs of the others for
-    `pytest_runtest_logreport`."""
-    deselected = set(DESELECTED) | (set() if os.environ.get(POOL_VARIABLE) else set(GPU_PASS_ONLY))
+    """As a plugin of the run of the smoke tests: in a run that names no pool, deselects the tests
+    whose ID is one of `GPU_PASS_ONLY`, and none in a run that names one; keeps the IDs of the
+    others for `pytest_runtest_logreport`."""
+    deselected = set() if os.environ.get(POOL_VARIABLE) else set(GPU_PASS_ONLY)
     left_out = [item for item in items if any(set(marker.args) & deselected for marker in item.iter_markers(ID_MARKER))]
     if left_out:
         config.hook.pytest_deselected(items=left_out)

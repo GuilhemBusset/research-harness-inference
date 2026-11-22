@@ -8,7 +8,6 @@ query the workspace and read the pools' release parameters, and gives:
 
 | Variable | Holds |
 | --- | --- |
-| `RHI_SMOKE_INTERNAL_ENDPOINT` | The address of the internal load balancer's listener, a URL or a host name reached over HTTP |
 | `RHI_SMOKE_WORKSPACE_URL` | The Prometheus workspace's query address: the workspace's own endpoint, under which `api/v1/query` answers |
 | `RHI_SMOKE_RELEASE_PARAMETERS` | Each pool's release parameter, as JSON from the pool's name to the parameter's name |
 
@@ -50,7 +49,6 @@ from rhi_lifecycle import launch, release
 
 ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
 
-INTERNAL_ENDPOINT_VARIABLE = "RHI_SMOKE_INTERNAL_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
 RELEASE_PARAMETERS_VARIABLE = "RHI_SMOKE_RELEASE_PARAMETERS"
 
@@ -128,13 +126,6 @@ class Workspace:
 def run_started(request: pytest.FixtureRequest) -> float:
     """The Unix time this run began, before any of its tests sent the pool a stream."""
     return request.session.stash[RUN_STARTED]
-
-
-@pytest.fixture(scope="module")
-def internal_endpoint() -> str:
-    """The address of the internal load balancer's listener."""
-    address = given(INTERNAL_ENDPOINT_VARIABLE)
-    return (address if "://" in address else f"http://{address}").rstrip("/")
 
 
 @pytest.fixture(scope="module")

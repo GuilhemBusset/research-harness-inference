@@ -27,11 +27,6 @@ SMOKE_TEST_IDS: tuple[str, ...] = (
     "stream-chat-completions",
     "stream-responses",
     # tests/smoke/deployed/: what only a deployed stack answers.
-    "internal-invocations",
-    "internal-pause",
-    "internal-tokenize",
-    "internal-metrics",
-    "internal-health",
     "metrics-gateway",
     "metrics-pool",
     "release-served",

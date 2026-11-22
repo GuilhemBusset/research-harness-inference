@@ -155,7 +155,9 @@ def test_a_description_that_is_another_member_of_the_vocabulary_fails(key: str) 
     assert problems(owners_table(**{key: str(DESCRIPTIONS[key]).rstrip(".")}))
 
 
-RUN, LEFT_OUT = "tests/smoke/test_smoke.py", "tests/smoke/deployed/test_internal_routes.py"
+# A file the verification runs, and the file that holds the GPU-only smoke test, which its own run
+# on the mock pool leaves out.
+RUN, LEFT_OUT = "tests/smoke/test_smoke.py", "tests/smoke/deployed/test_gpu_release.py"
 
 
 @pytest.mark.parametrize(
@@ -177,5 +179,5 @@ def test_a_table_that_does_not_name_the_tests_the_verification_leaves_out_fails(
 
 def test_the_files_left_out_are_read_from_the_verification_s_own_run() -> None:
     files = left_out_by_the_verification()
-    assert bool(files) == bool(verify.DESELECTED), "while the script deselects a test, a file is left out"
+    assert sorted(files) == [LEFT_OUT], "the run on the mock pool leaves out the GPU-only test's file"
     assert all(file.startswith("tests/smoke/") and (verify.REPO / file).is_file() for file in files)
