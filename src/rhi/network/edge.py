@@ -13,6 +13,11 @@ that no service's rule takes gets a fixed 404.
 The certificate is validated by DNS in the configured hosted zone, which is imported by its ID and
 never looked up. Until the domain resolves through that zone the validation cannot complete, so
 the certificate, the listener and the alias record exist only when `https_listener` is true.
+
+The load balancer writes its access logs to the stage's access-log bucket, under its own prefix
+(`rhi.network.access_logs`). Its attributes are set here, not through the CDK's helper, and the
+load balancer depends on the bucket's policy: Elastic Load Balancing refuses the attributes until
+the policy lets it write.
 """
 
 from __future__ import annotations
@@ -27,10 +32,12 @@ from aws_cdk import aws_route53 as route53
 from aws_cdk import aws_route53_targets as targets
 from constructs import Construct
 
+from rhi.network.access_logs import PUBLIC_PREFIX, access_log_attributes
 from rhi.network.security import HTTPS_PORT
 
 if TYPE_CHECKING:
     from rhi.config import Config
+    from rhi.network.access_logs import AccessLogs
 
 IDLE_TIMEOUT_SECONDS = 1200
 NOT_FOUND = 404
@@ -47,6 +54,7 @@ class Edge(Construct):
         *,
         vpc: ec2.IVpc,
         security_group: ec2.ISecurityGroup,
+        access_logs: AccessLogs,
         config: Config,
     ) -> None:
         super().__init__(scope, construct_id)
@@ -59,6 +67,9 @@ class Edge(Construct):
             security_group=security_group,
             idle_timeout=cdk.Duration.seconds(IDLE_TIMEOUT_SECONDS),
         )
+        for key, value in access_log_attributes(access_logs.bucket, PUBLIC_PREFIX).items():
+            self.load_balancer.set_attribute(key, value)
+        self.load_balancer.node.add_dependency(access_logs.policy)
         self.https_listener: elbv2.ApplicationListener | None = None
         if not config.https_listener:
             return
