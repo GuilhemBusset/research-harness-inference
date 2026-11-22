@@ -19,7 +19,9 @@ How the counts are made:
   defines them: `input_tokens` (not cached), `cache_creation_input_tokens` (written to the cache)
   and `cache_read_input_tokens` (read from it). Together they are the whole input, and the daily
   budget counts all of it, cached or not (sections 11.3 and 17). The `cache_creation` object some
-  responses carry is a breakdown of `cache_creation_input_tokens` and is not added again.
+  responses carry is a breakdown of `cache_creation_input_tokens` and is not added again. The
+  cached part (`cached_input_tokens`) is `cache_read_input_tokens`, 0 when the usage reports none:
+  it is part of the input, not added to it.
 - One value is kept per field. A usage object replaces the fields it carries and leaves the
   others, so the value of each field is the last one the stream reported, and a field no usage
   object carried counts as zero. A field that is `null`, or anything but a whole number that is
@@ -42,6 +44,8 @@ from rhi_gateway.sse import SseReader
 
 INPUT_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 """The input fields of a usage object; their sum is the whole input."""
+CACHED_FIELD = "cache_read_input_tokens"
+"""The input field of the tokens read from the cache: the cached part of the input."""
 OUTPUT_FIELD = "output_tokens"
 
 
@@ -54,6 +58,8 @@ class Usage:
     output_tokens: int
     ended_cleanly: bool
     """Whether the response is complete: a stream's `message_stop` was read, or a whole answer."""
+    cached_input_tokens: int = 0
+    """The part of the input read from the cache, already counted in `input_tokens`."""
 
 
 class MessagesStreamUsage:
@@ -104,6 +110,7 @@ def _usage(counts: dict[str, int], *, ended_cleanly: bool) -> Usage:
         input_tokens=sum(counts[field] for field in INPUT_FIELDS),
         output_tokens=counts[OUTPUT_FIELD],
         ended_cleanly=ended_cleanly,
+        cached_input_tokens=counts[CACHED_FIELD],
     )
 
 

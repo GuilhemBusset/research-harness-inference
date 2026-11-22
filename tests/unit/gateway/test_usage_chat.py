@@ -31,7 +31,7 @@ ANSWER = (
     b'{"id":"chatcmpl-1","object":"chat.completion","model":"m","choices":[{"index":0,'
     b'"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],' + USAGE + b"}"
 )
-TOTALS = Usage(input_tokens=425, output_tokens=15, ended_cleanly=True)
+TOTALS = Usage(input_tokens=425, output_tokens=15, ended_cleanly=True, cached_input_tokens=300)
 NOTHING = Usage(input_tokens=0, output_tokens=0, ended_cleanly=False)
 
 
@@ -55,11 +55,14 @@ def test_the_recorded_stream_gives_its_totals_whatever_the_byte_boundaries() -> 
         assert different == []
 
 
-def test_cached_input_is_counted_once() -> None:
+def test_cached_input_is_counted_once_and_read_apart() -> None:
     usage = b'{"prompt_tokens":82000,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":80000}}'
-    counted_once = Usage(input_tokens=82_000, output_tokens=40, ended_cleanly=True)
+    counted_once = Usage(input_tokens=82_000, output_tokens=40, ended_cleanly=True, cached_input_tokens=80_000)
     assert run(chunk(usage), DONE, asked=False)[1] == counted_once
     assert read_answer(b'{"object":"chat.completion","choices":[],"usage":' + usage + b"}") == counted_once
+    # A usage that details no cached part reports 0 of it.
+    for none in (b'{"prompt_tokens":82000,"completion_tokens":40}', usage.replace(b"80000", b"null")):
+        assert read_answer(b'{"usage":' + none + b"}").cached_input_tokens == 0
 
 
 def test_the_usage_chunk_is_hidden() -> None:
@@ -82,7 +85,7 @@ def test_a_stream_that_is_cut_reports_the_tokens_so_far_and_no_clean_end() -> No
         for asked in (True, False):
             received, observed = run(STREAM[:cut], asked=asked)
             # The usage counts once the stream has ended its chunk, and the end is clean only after `[DONE]`.
-            assert observed == (Usage(425, 15, False) if cut >= end else NOTHING)
+            assert observed == (Usage(425, 15, False, cached_input_tokens=300) if cut >= end else NOTHING)
             # A usage chunk that is whole but for the end of its event (two line feeds) is already hidden.
             hidden = not asked and cut >= end - 2
             assert received == (STREAM[:start] + STREAM[end:cut] if hidden else STREAM[:cut])
@@ -96,7 +99,7 @@ def test_a_non_streaming_answer_gives_its_usage_object() -> None:
 
 
 def test_only_a_usage_object_without_choices_is_hidden_and_only_a_usage_makes_the_end_clean() -> None:
-    usage = b'{"prompt_tokens":425,"completion_tokens":15}'
+    usage = b'{"prompt_tokens":425,"completion_tokens":15,"prompt_tokens_details":{"cached_tokens":300}}'
     # A stream that ends without a usage has nothing to settle to: an error and then `[DONE]`.
     error = b'data: {"error":{"message":"overloaded","type":"server_error"}}\n\n'
     assert run(BEFORE, error, DONE, asked=False) == (BEFORE + error + DONE, NOTHING)

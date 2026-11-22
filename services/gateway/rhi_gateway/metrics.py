@@ -9,8 +9,10 @@ configuration scrapes. Any other route answers 404.
 | Series | Kind | Labels | Value |
 | --- | --- | --- | --- |
 | `rhi_gateway_student_requests_total` | counter | `alias`, `pool` | The requests the gateway answered |
-| `rhi_gateway_student_input_tokens_total` | counter | `alias`, `pool` | The input tokens their settlements observed |
+| `rhi_gateway_student_input_tokens_total` | counter | `alias`, `pool` | The input tokens their settlements observed, cached or not |
+| `rhi_gateway_student_cached_input_tokens_total` | counter | `alias`, `pool` | The part of that input the engine reported read from the cache |
 | `rhi_gateway_student_output_tokens_total` | counter | `alias`, `pool` | The output tokens their settlements observed |
+| `rhi_gateway_student_counted_tokens_total` | counter | `alias`, `pool` | The tokens the token counts answered |
 | `rhi_gateway_student_errors_total` | counter | `alias`, `pool`, `cause` | The requests the gateway gave a cause |
 | `rhi_gateway_student_budget_left_tokens` | gauge | `alias` | The tokens the student has left of the day |
 | `rhi_gateway_own_faults_total` | counter | none | The answers of 500 or above that named no cause: the gateway's own faults |
@@ -18,7 +20,10 @@ configuration scrapes. Any other route answers 404.
 **One request, one count.** `Metrics.count` is given the log record of each request when it ends
 (`rhi_gateway.telemetry`), so the counters and the log agree: every request the gateway answers
 is counted once, a local route, a refusal and a path outside the table included. The tokens are
-those the request's settlement observed. A request counts as an error when its record names a
+those the request's settlement observed. A token count (`POST /v1/messages/count_tokens`) is a
+count asked, not a generation (section 11.3): the count it answered is counted in
+`rhi_gateway_student_counted_tokens_total` alone, and in neither the input nor the output tokens.
+The cached input tokens are part of the input tokens, counted apart as well. A request counts as an error when its record names a
 cause: one of `rhi_common.causes`, or `none` for the gateway's own fault, which is what the error
 rate reads (section 7.3). An answer that states a cause is counted under it whatever its status,
 so the error event that ends a stream answered 200 counts too.
@@ -87,7 +92,9 @@ ROUTE = "/metrics"
 # The families' names; a counter's samples end in `_total`.
 REQUESTS = "rhi_gateway_student_requests"
 INPUT_TOKENS = "rhi_gateway_student_input_tokens"
+CACHED_INPUT_TOKENS = "rhi_gateway_student_cached_input_tokens"
 OUTPUT_TOKENS = "rhi_gateway_student_output_tokens"
+COUNTED_TOKENS = "rhi_gateway_student_counted_tokens"
 ERRORS = "rhi_gateway_student_errors"
 BUDGET_LEFT = "rhi_gateway_student_budget_left_tokens"
 OWN_FAULTS = "rhi_gateway_own_faults"
@@ -181,8 +188,14 @@ class Metrics:
         self._input_tokens = Counter(
             INPUT_TOKENS, "Input tokens settled, cached or not.", ["alias", "pool"], registry=self.registry
         )
+        self._cached_input_tokens = Counter(
+            CACHED_INPUT_TOKENS, "Input tokens settled read from the cache.", ["alias", "pool"], registry=self.registry
+        )
         self._output_tokens = Counter(
             OUTPUT_TOKENS, "Output tokens settled.", ["alias", "pool"], registry=self.registry
+        )
+        self._counted_tokens = Counter(
+            COUNTED_TOKENS, "Tokens the token counts answered.", ["alias", "pool"], registry=self.registry
         )
         self._errors = Counter(
             ERRORS,
@@ -198,13 +211,18 @@ class Metrics:
         """Count one request that has ended, from its log record. Reads nothing and never waits."""
         alias, pool = record.alias or "", record.pool or ""
         children: list[tuple[Counter, tuple[str, ...]]] = [(self._requests, (alias, pool))]
-        if record.input_tokens:
-            children.append((self._input_tokens, (alias, pool)))
-        if record.output_tokens:
-            children.append((self._output_tokens, (alias, pool)))
+        if record.token_count:
+            # A count asked, not a generation: its input is none of the student's input tokens.
+            amounts = {self._counted_tokens: record.input_tokens}
+        else:
+            amounts = {
+                self._input_tokens: record.input_tokens,
+                self._cached_input_tokens: record.cached_input_tokens,
+                self._output_tokens: record.output_tokens,
+            }
+        children += [(counter, (alias, pool)) for counter, amount in amounts.items() if amount]
         if record.cause is not None:
             children.append((self._errors, (alias, pool, record.cause)))
-        amounts = {self._input_tokens: record.input_tokens, self._output_tokens: record.output_tokens}
         for counter, labels in children:
             counter.labels(*labels).inc(amounts.get(counter, 1))
         if record.student is not None:
