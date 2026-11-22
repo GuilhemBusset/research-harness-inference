@@ -97,6 +97,16 @@ def test_every_listed_block_of_a_tool_anthropic_runs_is_replaced_even_with_an_ob
     assert content == [{"type": "text", "text": messages.SERVER_TOOL_SENTENCE}, TEXT]
 
 
+@pytest.mark.parametrize("kind", [[], {}, 1, None], ids=["array", "object", "number", "null"])
+@pytest.mark.parametrize("in_a_tool_result", [False, True], ids=["in_a_message", "in_a_tool_result"])
+@BOTH_ROUTES
+def test_a_block_whose_type_is_not_a_string_is_left_to_the_allow_list(
+    route: routes.Route, in_a_tool_result: bool, kind: object
+) -> None:
+    body = body_with([TEXT, {"type": kind, "text": "Keep."}], in_a_tool_result=in_a_tool_result)
+    assert forwarded(route, body) == forwarded(route, body, replacement=False)
+
+
 @pytest.mark.parametrize("in_a_tool_result", [False, True], ids=["in_a_message", "in_a_tool_result"])
 @BOTH_ROUTES
 def test_an_image_url_is_still_refused(route: routes.Route, in_a_tool_result: bool) -> None:

@@ -115,10 +115,12 @@ SERVER_TOOL_BLOCKS: Final = frozenset(
 
 
 def _sentence_for(block: object) -> str | None:
-    """The sentence that replaces a block, or None for a block that is kept."""
+    """The sentence that replaces a block, or None for a block that is kept (and left to the allow-list)."""
     if not isinstance(block, dict):
         return None
     kind = block.get("type")
+    if not isinstance(kind, str):
+        return None
     if kind == "search_result":
         return SEARCH_RESULT_SENTENCE
     if kind in SERVER_TOOL_BLOCKS:
