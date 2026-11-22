@@ -9,6 +9,7 @@ import pytest
 
 from rhi.config import pool_entry
 from rhi_common.pool_config import HistogramBuckets, PoolConfigError, parse_pools
+from rhi_common.records import SESSION_PARTITION
 
 # A commit hash made when the test runs: 40 hexadecimal characters that name no real commit.
 REVISION = hashlib.sha1(b"a pinned commit", usedforsecurity=False).hexdigest()
@@ -225,6 +226,11 @@ def refused(name: str, entry: Mapping[str, object], **limit: float) -> PoolConfi
     assert refusal.value.pool == name
     assert repr(name) in str(refusal.value)
     return refusal.value
+
+
+def test_no_pool_can_take_the_session_switch_s_key() -> None:
+    # The switch sits in the pool-state table under this partition key, beside the pools' items.
+    assert refused(SESSION_PARTITION, COURSEWORK).field == "name"
 
 
 def test_prices() -> None:
