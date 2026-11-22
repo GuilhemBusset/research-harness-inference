@@ -161,6 +161,12 @@ _PARSER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 _PROFILE_ENTRY = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
 
 
+def group_name(pool: str) -> str:
+    """The name of the pool's Auto Scaling group. The pools stack gives the group this name, and the cost
+    dashboard reads the group's metrics by it, the hours of a group deleted and created again included."""
+    return f"rhi-pool-{pool}"
+
+
 class PoolConfigError(ValueError):
     """A pool's entry was refused. The message names the pool and the field, never a value.
 
