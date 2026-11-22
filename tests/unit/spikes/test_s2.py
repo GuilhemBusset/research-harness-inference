@@ -49,28 +49,25 @@ def holds(gave_up: set[tuple[s2.Client, s2.Kind]]) -> list[s2.HoldOutcome]:
     ]
 
 
-REFUSALS = [s2.RefusalOutcome(client, "1.0.0", retried=False, shown=True) for client in Client]
-
-
 def test_only_codex_with_its_default_timer_aborting_passes() -> None:
-    numbers = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
+    numbers = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}))
     assert set(numbers) == {name.value for name in s2.Number}
     assert numbers[s2.seconds_before_giving_up(Client.CODEX_DEFAULT, Kind.STREAM)] == 300.0
     assert s2.SPIKE.verdict(numbers) is Verdict.PASS
-    assert s2.SPIKE.verdict(s2.numbers_of(holds(set()), REFUSALS)) is Verdict.PASS
+    assert s2.SPIKE.verdict(s2.numbers_of(holds(set()))) is Verdict.PASS
     names = [name.value for name in s2.Number]
     measurement_event("S2", "s2-client-hold", Verdict.PASS, numbers, names=names, commit="a" * 40, bus="bus")
 
 
 @pytest.mark.parametrize("pair", [pair for pair in s2.PAIRS if pair[0] is not Client.CODEX_DEFAULT])
 def test_a_client_aborting_with_the_profile_fails(pair: tuple[s2.Client, s2.Kind]) -> None:
-    assert s2.SPIKE.verdict(s2.numbers_of(holds({pair}), REFUSALS)) is Verdict.FAIL
-    assert s2.SPIKE.verdict(s2.numbers_of(holds({pair, (Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)) is Verdict.FAIL
+    assert s2.SPIKE.verdict(s2.numbers_of(holds({pair}))) is Verdict.FAIL
+    assert s2.SPIKE.verdict(s2.numbers_of(holds({pair, (Client.CODEX_DEFAULT, Kind.STREAM)}))) is Verdict.FAIL
 
 
 def assert_a_record_of_s2(text: str) -> None:
-    """A record of S2: pending until a run is in, a line per row and one per client for the 402,
-    and each row of a run labelled with the client, its version and the kind of call."""
+    """A record of S2: pending until a run is in, a line per row, and each row of a run labelled
+    with the client, its version and the kind of call."""
     data = tomllib.loads(text.split("+++")[1])
     runs, rows = data.get("runs", []), data.get("rows", [])
     if not runs:
@@ -81,8 +78,7 @@ def assert_a_record_of_s2(text: str) -> None:
     for row in rows:
         client = next(client for client in Client if row["name"].startswith(f"{client}_"))
         assert row["labels"]["client"] == client and row["labels"]["version"], row
-        if not row["name"].startswith(f"{client}_402_"):
-            assert row["labels"]["call"] == row["name"].removeprefix(f"{client}_").split("_")[0], row
+        assert row["labels"]["call"] == row["name"].removeprefix(f"{client}_").split("_")[0], row
     lines = text.splitlines()
     for name in s2.Number:
         assert any(f"`{name}`" in line for line in lines), name
@@ -90,15 +86,9 @@ def assert_a_record_of_s2(text: str) -> None:
         (line,) = [line for line in lines if f"`{s2.completed(client, kind)}`" in line]
         assert f"| {kind} |" in line
         assert VERSIONS[s2.VERSION_OF[client]] in line
-    refusal_lines = [line for line in lines if "_402_retried`" in line]
-    assert sorted(line.split("`")[1] for line in refusal_lines) == sorted(Client)
-    for line in refusal_lines:
-        client = Client(line.split("`")[1])
-        assert f"`{s2.shown_402(client)}`" in line
-        assert VERSIONS[s2.VERSION_OF[client]] in line
 
 
-def test_the_record_is_pending_with_a_line_per_row_and_one_per_client_for_the_402() -> None:
+def test_the_record_is_pending_with_a_line_per_row() -> None:
     text = RECORD.read_text(encoding="utf-8")
     assert_a_record_of_s2(text)
     if "[[runs]]" not in text:
@@ -112,7 +102,7 @@ def test_the_record_still_reads_once_a_run_is_written_into_it() -> None:
     record = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(record)
     data, prose = record.read(RECORD.read_text(encoding="utf-8"))
-    numbers = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
+    numbers = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}))
     units = {name: "s" if name.endswith("_seconds_before_giving_up") else "count" for name in numbers}
     run = Run("S2", "s2-client-hold", s2.SPIKE.verdict(numbers), numbers)
     record.with_run(data, run, date(2026, 11, 20), "a" * 40, units)
@@ -182,7 +172,6 @@ def test_a_client_s_outcome_is_its_request_s() -> None:
     unmarked = exchange(Client.OPENAI_SDK, Kind.STREAM, "rhi-s2-bbbbbbbb")
     found = [model_list, other_kind, unmarked, wanted, exchange(Client.OPENAI_SDK, Kind.STREAM, MARKER)]
     assert s2.intended(found, Client.OPENAI_SDK, Kind.STREAM, MARKER) is wanted
-    assert s2.repeats(found, wanted) == 1
 
 
 def test_a_hold_counts_only_just_under_its_deadline() -> None:
@@ -252,14 +241,14 @@ def serving(answer: Callable[[str], tuple[int, list[bytes], float]]) -> Iterator
 
 
 def refusing(path: str) -> tuple[int, list[bytes], float]:
+    # A status the SDKs do not retry, so that each request is sent once.
+    cause = Cause.REQUEST_REFUSED
     if path.startswith("/v1/messages"):
-        error = {"type": "error", "error": {"type": "budget_reached", "message": Cause.BUDGET_REACHED.sentence}}
+        error = {"type": "error", "error": {"type": cause.value, "message": cause.sentence}}
     else:
-        error = {
-            "error": {"message": Cause.BUDGET_REACHED.sentence, "type": "budget_reached", "code": "budget_reached"}
-        }
+        error = {"error": {"message": cause.sentence, "type": cause.value, "code": cause.value}}
     return (
-        (402, [json.dumps(error).encode()], 0.0)
+        (cause.status, [json.dumps(error).encode()], 0.0)
         if path.startswith("/v1/") and path != "/v1/models"
         else (200, [b"{}"], 0.0)
     )
@@ -278,30 +267,23 @@ def send(url: str, body: dict[str, Any] | None = None) -> None:
         pass
 
 
-@pytest.mark.parametrize("retries", [0, 1])
-def test_the_forwarder_confirms_the_402_and_counts_its_repeats(refusing_gateway: Gateway, retries: int) -> None:
+def test_the_forwarder_names_the_mock_pool_and_records_a_refusal(refusing_gateway: Gateway) -> None:
     marker = "rhi-s2-0123abcd"
     body = {"model": "gpt-5", "stream": True, "messages": [{"role": "user", "content": f"Reply. {marker}"}]}
     with s2.Forwarder(refusing_gateway.url, "mock") as forwarder:
         send(f"{forwarder.url}/v1/models")
         send(f"{forwarder.url}/v1/chat/completions", {**body, "messages": [], "stream": False})
-        for _ in range(1 + retries):
-            send(f"{forwarder.url}/v1/chat/completions", body)
+        send(f"{forwarder.url}/v1/chat/completions", body)
     # Every request reached the gateway naming the mock pool.
     assert {sent["model"] for sent in refusing_gateway.bodies} == {"mock"}
-    attempt = s2.Attempt(1, f"Error: {Cause.BUDGET_REACHED.sentence}", 1.0, forwarder.recorded())
-    outcome = s2.refusal_outcome(Client.OPENAI_SDK, "3.57.0", attempt, marker)
-    assert (outcome.retried, outcome.shown) == (retries > 0, True)
-    assert not s2.refusal_outcome(
-        Client.OPENAI_SDK, "3.57.0", s2.Attempt(1, "Error 402", 1.0, attempt.exchanges), marker
-    ).shown
-    # A client whose request never met the 402 cannot answer the question.
-    with pytest.raises(s2.NotExercised):
-        s2.refusal_outcome(Client.OPENAI_SDK, "3.57.0", attempt, "rhi-s2-ffffffff")
+    request = s2.intended(forwarder.recorded(), Client.OPENAI_SDK, Kind.STREAM, marker)
+    assert request is not None
+    assert (request.status, request.cause) == (Cause.REQUEST_REFUSED.status, Cause.REQUEST_REFUSED)
+    assert s2.refused(request) and not s2.ended_by_client(request)
 
 
 @pytest.mark.parametrize("client", [Client.OPENAI_SDK, Client.ANTHROPIC_SDK])
-def test_an_sdk_script_meets_the_402_through_its_forwarder(
+def test_an_sdk_script_reaches_the_gateway_through_its_forwarder(
     refusing_gateway: Gateway, client: s2.Client, tmp_path: Path
 ) -> None:
     marker = "rhi-s2-0123abcd"
@@ -311,8 +293,10 @@ def test_an_sdk_script_meets_the_402_through_its_forwarder(
     )  # fmt: skip
     while not running.done():
         time.sleep(0.1)
-    outcome = s2.refusal_outcome(client, "1.0.0", running.result(), marker)
-    assert (outcome.retried, outcome.shown) == (False, True)
+    attempt = running.result()
+    request = s2.intended(attempt.exchanges, client, Kind.STREAM, marker)
+    assert request is not None and request.cause == Cause.REQUEST_REFUSED
+    assert attempt.exit_code != 0 and Cause.REQUEST_REFUSED.sentence in attempt.output
 
 
 def test_the_forwarder_records_when_a_client_gives_up() -> None:
@@ -498,11 +482,11 @@ def test_two_builds_of_one_commit_post_apart(
     pool = SimpleNamespace(name="mock", engine="mock", start_delay_seconds=380, hold_seconds=420,
                            hold_seconds_non_streaming=240)  # fmt: skip
     monkeypatch.setattr(s2.config, "read_ssm", lambda: SimpleNamespace(pools=[pool]))
-    monkeypatch.setattr(s2.common, "canary_keys", lambda: SpikeKeys(tuple(generate_key() for _ in Client), generate_key()))
+    monkeypatch.setattr(s2.common, "canary_keys", lambda: SpikeKeys(tuple(generate_key() for _ in Client)))
     monkeypatch.setattr(s2.common.boto3, "client", lambda name: Events())
     monkeypatch.setattr(s2.harnesses, "install", lambda folder: {})
     monkeypatch.setattr(s2.harnesses, "versions", lambda binaries: VERSIONS)
-    measured = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}), REFUSALS)
+    measured = s2.numbers_of(holds({(Client.CODEX_DEFAULT, Kind.STREAM)}))
     environ = {"RHI_SPIKE_ENDPOINT": "https://example.com", BUS_VARIABLE: "bus", s2.common.COMMIT_VARIABLE: "a" * 40}
     environ |= given
 
@@ -580,21 +564,16 @@ class FakePool:
 
 
 class FakeClient(s2.Started):
-    def __init__(self, pool: FakePool, client: s2.Client, kind: s2.Kind, key: str, prompt: str, spent: str) -> None:
+    def __init__(self, pool: FakePool, client: s2.Client, kind: s2.Kind, key: str, prompt: str) -> None:
         self.pool, self.client, self.kind = pool, client, kind
         self.marker = prompt.split()[-1]
         self.sent_at = pool.clock[0]
-        self.refused = key == spent
-        if not self.refused:
-            pool.begin()
+        pool.begin()
 
     def done(self) -> bool:
-        return self.refused or self.pool.state() == s2.READY
+        return self.pool.state() == s2.READY
 
     def result(self) -> s2.Attempt:
-        if self.refused:
-            request = exchange(self.client, self.kind, self.marker, status=402, cause="budget_reached")
-            return s2.Attempt(1, Cause.BUDGET_REACHED.sentence, 0.0, [request])
         self.pool.ready_at = None  # the pool goes cold again before the next attempt
         gives_up = self.client is Client.CODEX_DEFAULT
         request = exchange(
@@ -608,12 +587,12 @@ def test_a_run_repeats_a_hold_that_missed_and_aims_the_calls_at_the_measured_sta
     clock = [0.0]
     # A first cold start too short to count, then one just under 7 minutes; the calls' cold start after a wake.
     pool = FakePool(clock, [300.0, 400.0, 400.0])
-    keys = SpikeKeys(tuple(generate_key() for _ in Client), generate_key())
+    keys = SpikeKeys(tuple(generate_key() for _ in Client))
     started: list[tuple[s2.Client, s2.Kind, float]] = []
 
     def start(client: s2.Client, kind: s2.Kind, key: str, prompt: str) -> s2.Started:
         started.append((client, kind, clock[0]))
-        return FakeClient(pool, client, kind, key, prompt, keys.spent)
+        return FakeClient(pool, client, kind, key, prompt)
 
     def sleep(seconds: float) -> None:
         clock[0] += seconds
@@ -623,10 +602,8 @@ def test_a_run_repeats_a_hold_that_missed_and_aims_the_calls_at_the_measured_sta
     assert s2.SPIKE.verdict(numbers) is Verdict.PASS
     assert numbers[s2.completed(Client.CODEX_DEFAULT, Kind.STREAM)] == 0
     assert numbers[s2.seconds_before_giving_up(Client.CODEX_DEFAULT, Kind.STREAM)] == 300.0
-    assert numbers[s2.shown_402(Client.CLAUDE_CODE)] == 1
-    # First the 402, one request for each client; then the holds.
-    assert [client for client, _, _ in started[: len(Client)]] == list(Client)
-    streams = [at for _, kind, at in started[len(Client) :] if kind is Kind.STREAM]
+    # The holds alone: no client is started but for a hold.
+    streams = [at for _, kind, at in started if kind is Kind.STREAM]
     assert len(streams) == 10  # every stream client twice: the first cold start was too short
     # The calls start 180 seconds after the wake: 400 measured, less 220.
     calls = [at for _, kind, at in started if kind is Kind.CALL]
@@ -636,7 +613,7 @@ def test_a_run_repeats_a_hold_that_missed_and_aims_the_calls_at_the_measured_sta
 class Refused(FakeClient):
     """A client whose request the gateway refused at once, 400 `request_refused`."""
 
-    def __init__(self, pool: FakePool, client: s2.Client, kind: s2.Kind, key: str, prompt: str, spent: str) -> None:
+    def __init__(self, pool: FakePool, client: s2.Client, kind: s2.Kind, key: str, prompt: str) -> None:
         self.pool, self.client, self.kind = pool, client, kind
         self.marker, self.sent_at = prompt.split()[-1], pool.clock[0]
 
@@ -655,11 +632,11 @@ def test_a_request_the_gateway_refused_is_not_a_hold() -> None:
     clock = [0.0]
     # Every cold start lasts just under 7 minutes, started by the other clients' requests.
     pool = FakePool(clock, [400.0] * s2.ATTEMPTS)
-    keys = SpikeKeys(tuple(generate_key() for _ in Client), generate_key())
+    keys = SpikeKeys(tuple(generate_key() for _ in Client))
 
     def start(client: s2.Client, kind: s2.Kind, key: str, prompt: str) -> s2.Started:
         made = Refused if client is Client.CLAUDE_CODE else FakeClient
-        return made(pool, client, kind, key, prompt, keys.spent)
+        return made(pool, client, kind, key, prompt)
 
     def sleep(seconds: float) -> None:
         clock[0] += seconds

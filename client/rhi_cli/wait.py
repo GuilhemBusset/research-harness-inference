@@ -17,7 +17,7 @@ client that misbehaves while the gateway holds its request:
 2. Between two wakes it reads `GET /status` every 10 seconds, and prints the pool's state each
    time it changes.
 3. It exits 0 when the state is `ready`. It stops, prints the cause and exits 1 when a record
-   reads `unavailable`, when the gateway refuses a call with an error (`budget_reached`, say), and
+   reads `unavailable`, when the gateway refuses a call with an error (`invalid_key`, say), and
    after the minutes of `--timeout`: an answer that arrives after them is too late, even one that
    reads `ready`.
 

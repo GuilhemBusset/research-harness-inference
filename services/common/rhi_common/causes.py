@@ -1,13 +1,11 @@
-"""The twelve causes of an error the gateway produces (system design, section 6.2, step 8).
+"""The eleven causes of an error the gateway produces (system design, section 6.2, step 8).
 
 Students paste errors into public issues, so no error carries text from AWS, from the engine or
 from an exception (section 5.3). An error names one cause of this list instead, and says one
-sentence, written here and nowhere else. Each cause has the HTTP status of the design's table. The
-SDKs retry 408, 409, 429 and 5xx and nothing else, so the two budget causes are 402 and reach the
-student at once.
+sentence, written here and nowhere else. Each cause has the HTTP status of the design's table.
 
 Three causes ask the client to come back, with a `Retry-After` header: `retry_after` is the number
-of seconds, and it is `None` for the nine others. The three numbers are the defaults of the
+of seconds, and it is `None` for the eight others. The three numbers are the defaults of the
 design's section 17; whoever renders an error may give others for these three.
 
 A sentence holds no number and no name of the deployment: limits, budgets and delays are
@@ -44,7 +42,6 @@ class Cause(StrEnum):
         5,
         "You are at your limit of concurrent requests: retry when one of them has ended.",
     )
-    BUDGET_REACHED = ("budget_reached", 402, None, "Your token budget for today is spent.")
     POOL_CEILING_REACHED = (
         "pool_ceiling_reached",
         402,
