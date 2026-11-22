@@ -132,6 +132,7 @@ given.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import enum
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping
@@ -196,15 +197,20 @@ def upstream_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.
 
 @dataclass(frozen=True)
 class Observed:
-    """What an answer reported: the tokens, the input whole, and whether the answer ended cleanly."""
+    """What an answer reported: the tokens, the input whole, and whether the answer ended cleanly.
+
+    `cached_input_tokens` is the part of the input the answer reported read from the cache: already
+    in `input_tokens`, and 0 when the answer reported none.
+    """
 
     input_tokens: int
     output_tokens: int
     ended_cleanly: bool
+    cached_input_tokens: int = 0
 
     def unclean(self) -> Observed:
         """The same tokens, from an answer that did not end cleanly."""
-        return Observed(self.input_tokens, self.output_tokens, ended_cleanly=False)
+        return dataclasses.replace(self, ended_cleanly=False)
 
 
 class _Meter(Protocol):
@@ -225,7 +231,7 @@ class _MessagesMeter:
 
     def observed(self) -> Observed:
         seen = self._parser.observed
-        return Observed(seen.input_tokens, seen.output_tokens, seen.ended_cleanly)
+        return Observed(seen.input_tokens, seen.output_tokens, seen.ended_cleanly, seen.cached_input_tokens)
 
 
 class _ResponsesMeter:
@@ -240,7 +246,7 @@ class _ResponsesMeter:
         seen = self._parser.observed
         if seen is None:
             return Observed(0, 0, ended_cleanly=False)
-        return Observed(seen.input_tokens, seen.output_tokens, self._parser.ended_cleanly)
+        return Observed(seen.input_tokens, seen.output_tokens, self._parser.ended_cleanly, seen.cached_input_tokens)
 
 
 class _ChatMeter:
@@ -252,7 +258,7 @@ class _ChatMeter:
 
     def observed(self) -> Observed:
         seen = self._parser.observed
-        return Observed(seen.input_tokens, seen.output_tokens, seen.ended_cleanly)
+        return Observed(seen.input_tokens, seen.output_tokens, seen.ended_cleanly, seen.cached_input_tokens)
 
 
 def _count(value: object) -> int | None:
@@ -289,11 +295,17 @@ def read_whole_answer(route: Route, body: bytes) -> Observed:
         seen = read_token_count(body)
     elif route.wire_format is WireFormat.RESPONSES:
         usage = responses.read_answer(body)
-        seen = Observed(0, 0, False) if usage is None else Observed(usage.input_tokens, usage.output_tokens, True)
+        seen = (
+            Observed(0, 0, False)
+            if usage is None
+            else Observed(usage.input_tokens, usage.output_tokens, True, usage.cached_input_tokens)
+        )
     else:
         read = messages.read_answer if route.wire_format is WireFormat.MESSAGES else chat.read_answer
         reported = read(body)
-        seen = Observed(reported.input_tokens, reported.output_tokens, reported.ended_cleanly)
+        seen = Observed(
+            reported.input_tokens, reported.output_tokens, reported.ended_cleanly, reported.cached_input_tokens
+        )
     return seen.unclean() if _reports_failure(_json_object(body)) else seen
 
 
@@ -699,8 +711,7 @@ class _Stream:
     @property
     def observed(self) -> Observed:
         """The tokens observed so far; clean only for a stream that reached its format's clean end."""
-        seen = self._meter.observed()
-        return Observed(seen.input_tokens, seen.output_tokens, ended_cleanly=self._clean)
+        return dataclasses.replace(self._meter.observed(), ended_cleanly=self._clean)
 
     async def end(self) -> None:
         """Close the engine's answer and settle the request with what was observed; once, however often called."""
