@@ -122,7 +122,7 @@ def as_list(value: Any) -> list[Any]:
 
 def template_path(app: cdk.App, cloud_assembly: Path, stack: Any) -> str:
     stage = app.node.find_child("Rhi")
-    return (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    return (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
 
 
 @pytest.fixture(scope="module")
@@ -133,7 +133,7 @@ def tables(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, An
     for table in TABLES:
         stack = getattr(stage, STACK_OF[table])
         construct = stack.tables.by_name[table.name]
-        path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+        path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
         logical_id = stack.resolve(stack.get_logical_id(construct.node.default_child))
         found[table] = templates[path]["Resources"][logical_id]
     return found
@@ -143,7 +143,7 @@ def test_each_stack_holds_its_tables(app: cdk.App, cloud_assembly: Path, templat
     stage = app.node.find_child("Rhi")
     for name in set(STACK_OF.values()):
         stack = getattr(stage, name)
-        path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+        path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
         held = [r for r in templates[path]["Resources"].values() if r["Type"] == "AWS::DynamoDB::Table"]
         assert len(held) == len([table for table, of in STACK_OF.items() if of == name]), name
         assert sorted(stack.tables.by_name) == sorted(table.name for table, of in STACK_OF.items() if of == name)
@@ -346,7 +346,7 @@ def pool_state_writes(templates: Templates, table: Node) -> list[str]:
 @pytest.fixture(scope="module")
 def pool_state(app: cdk.App, cloud_assembly: Path) -> Node:
     """The pool-state table in the assembly."""
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute]
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute]
     construct = stack.tables.by_name[POOL_STATE.name]
     return template_path(app, cloud_assembly, stack), stack.resolve(stack.get_logical_id(construct.node.default_child))
 
@@ -542,7 +542,7 @@ def test_a_pattern_finds_only_the_tables_it_names() -> None:
 def test_a_deployment_that_writes_pool_state_is_found(
     app: cdk.App, templates: Templates, pool_state: Node, injected: Callable[[str, str], dict[str, Resource]]
 ) -> None:
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute]
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute]
     scaler = stack.resolve(stack.get_logical_id(stack.scaler.function.node.default_child))
     changed = copy.deepcopy(templates)
     changed[pool_state[0]]["Resources"].update(injected(pool_state[1], scaler))
@@ -553,7 +553,7 @@ def test_a_write_from_another_stack_or_an_import_is_found(
     app: cdk.App, cloud_assembly: Path, templates: Templates, pool_state: Node
 ) -> None:
     stage = app.node.find_child("Rhi")
-    pools = stage.pools  # ty: ignore[unresolved-attribute]
+    pools = stage.pools  # ty: ignore[missing-attribute]
     scaler = pools.resolve(pools.get_logical_id(pools.scaler.function.node.default_child))
     (export,) = [
         output["Export"]["Name"]
@@ -561,7 +561,7 @@ def test_a_write_from_another_stack_or_an_import_is_found(
         if output["Value"] == {"Fn::GetAtt": [scaler, "Arn"]}
     ]
     changed = copy.deepcopy(templates)
-    access = template_path(app, cloud_assembly, stage.access)  # ty: ignore[unresolved-attribute]
+    access = template_path(app, cloud_assembly, stage.access)  # ty: ignore[missing-attribute]
     changed[access]["Resources"]["Injected"] = {
         "Type": "Custom::Injected",
         "Properties": {"ServiceToken": {"Fn::ImportValue": export}},

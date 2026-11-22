@@ -82,10 +82,10 @@ HEADERS = {
 def _remote_write_types() -> tuple[Any, Any]:
     """`WriteRequest` and `TimeSeries` of Prometheus's remote write (`prompb`), from a descriptor."""
     # descriptor_pb2 builds its classes at import, from a serialized descriptor: ty cannot see them.
-    file = descriptor_pb2.FileDescriptorProto(  # ty: ignore[unresolved-attribute]
+    file = descriptor_pb2.FileDescriptorProto(  # ty: ignore[missing-attribute]
         name="rhi_remote_write.proto", package="prometheus", syntax="proto3"
     )
-    kinds = descriptor_pb2.FieldDescriptorProto  # ty: ignore[unresolved-attribute]
+    kinds = descriptor_pb2.FieldDescriptorProto  # ty: ignore[missing-attribute]
 
     def message(name: str, *fields: tuple[str, int, int, int, str]) -> None:
         declared = file.message_type.add(name=name)

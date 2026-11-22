@@ -814,7 +814,7 @@ ty is beta and changes diagnostics between releases `[E20]`. It is pinned exactl
 3. **A separate identity for agents.** The coding agents push through a GitHub App without the workflows and administration permissions, so GitHub refuses an agent's change to a workflow or a ruleset. Agents run in a sandbox that holds no AWS credentials and no real configuration (ADR 0001).
 4. **A ruleset on `main` with no bypass:** pull request required, required checks that only GitHub Actions can satisfy, no force-push.
 5. **No person in the merge path.** A change to the pipeline stack, the bootstrap policy, `.github/`, the gates or `tests/policy/` merges like any other, under controls 1 to 4 and the examiner's approval of a protected path (ADR 0001), so the factory runs without waiting for anyone. What keeps a deployment from reaching a class is the hold of section 8.2, not a review.
-6. **The approval on widened permissions** that CDK Pipelines offers is kept as a tripwire for honest mistakes. It does not cover the pipeline's own stack, which updates earlier in the same run `[E20]`.
+6. **No approval in the pipeline.** A change that widens a permission deploys like any other, with no approval in the pipeline and no person in the deployment's path. Before the merge, the examiner, which reviews every change to IAM and to the network, and the invariants of `tests/policy/` hold such a change; after it, the bounded bootstrap's permissions boundary caps every role the change can create. The approval on widened permissions that CDK Pipelines offers would add a wait without a control those lack, and it would not cover the pipeline's own stack, which updates earlier in the same run `[E20]`.
 
 **What the factory learns from a deployment.** Agents hold no AWS credentials, so the commit status is their only view.
 
@@ -847,7 +847,7 @@ There is one environment. What stands in for staging:
 8. Apply the repository ruleset; enable secret scanning and push protection; set a noreply commit address.
 9. Enter the roster through the admin CLI.
 
-And recurring: approve the pipeline's pause when a change widens permissions (frequent in phases 1 to 3), and switch each session on before its class and off after it.
+And recurring: switch each session on before its class and off after it.
 
 A script walks through the one-time steps and writes nothing account-specific to the working tree.
 

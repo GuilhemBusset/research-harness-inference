@@ -22,8 +22,8 @@ Resources = dict[str, dict[str, Any]]
 def observability(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> tuple[Any, Resources]:
     """The observability stack of the stage, and the resources of its template."""
     stage = app.node.find_child("Rhi")
-    stack = stage.observability  # ty: ignore[unresolved-attribute]
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.observability  # ty: ignore[missing-attribute]
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     return stack, templates[path]["Resources"]
 
 

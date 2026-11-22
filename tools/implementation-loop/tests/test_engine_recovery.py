@@ -183,7 +183,7 @@ class RoundRegressions(RecoveryCase):
             if any("required CI check" in f for f in feedback):
                 self.gh._check_seen.clear()
             return original(vendor, req, plan, worktree, feedback)
-        agents.build = fix_round  # ty: ignore[invalid-assignment]  # test double
+        agents.build = fix_round
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertFalse(self.events("ci_rerun"), "a failed check is never run again")
@@ -264,7 +264,7 @@ class RequirementRegressions(RecoveryCase):
                                              + "- [ ] A second criterion.\n")
                 edited.append(True)
             return result
-        agents.build = build_then_edit  # ty: ignore[invalid-assignment]  # test double
+        agents.build = build_then_edit
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertTrue(self.events("requirements_changed", 2))
@@ -415,7 +415,7 @@ class TestEditRegressions(RecoveryCase):
                 with (worktree / "checks" / "issue_2.sh").open("a") as test:
                     test.write("# amended after the first examination\n")
             return result
-        agents.build = amend_the_test  # ty: ignore[invalid-assignment]  # test double
+        agents.build = amend_the_test
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertIn("# amended after the first examination", present(self.repo.main_file("checks/issue_2.sh")))
@@ -441,7 +441,7 @@ class TestEditRegressions(RecoveryCase):
                 (store_dir / "STOP").write_text("stop\n")
                 raise type("AgentStopped", (RuntimeError,), {})("stopped mid-build")
             return original(vendor, req, plan, worktree, feedback)
-        agents.build = interrupted  # ty: ignore[invalid-assignment]  # test double
+        agents.build = interrupted
         self.run_engine(agents=agents)
         self.assertTrue(self.events("step_interrupted", 2))
 
@@ -476,7 +476,7 @@ class RecordedRunRegressions(RecoveryCase):
                 "set -euo pipefail\n",
                 'set -euo pipefail\n[ "${HOST_LIBS_OK:-}" = 1 ] || { echo "chrome: error while loading shared libraries: libnspr4.so"; exit 127; }\n'))
             return result
-        agents.build = test_needing_the_host  # ty: ignore[invalid-assignment]  # test double
+        agents.build = test_needing_the_host
         self.run_engine(agents=agents)
         st = self.store.issue(2)
         assert st.wait is not None
@@ -527,7 +527,7 @@ class RecordedRunRegressions(RecoveryCase):
 
         def unavailable(vendor, req, plan, worktree, feedback):
             raise AgentFailure(f"{vendor} build failed after 3 attempts: 529 overloaded", kind="outage", vendor=vendor)
-        agents.build = unavailable  # ty: ignore[invalid-assignment]  # test double
+        agents.build = unavailable
         self.run_engine(agents=agents)
         st = self.store.issue(2)
         assert st.wait is not None
@@ -648,7 +648,7 @@ class CrossVendorRegressions(RecoveryCase):
 
         def refuse(n, sha, method="squash"):
             raise GitHubError("Pull Request is not mergeable")
-        self.gh.merge_pr = refuse  # ty: ignore[invalid-assignment]  # test double
+        self.gh.merge_pr = refuse
         self.run_engine()
         st = self.store.issue(2)
         assert st.wait is not None
@@ -689,13 +689,13 @@ class CrossVendorRegressions(RecoveryCase):
         def create_then_lose_the_response(title, body, labels):
             real_create(title, body, labels)
             raise GitHubError("connection reset")
-        self.gh.create_issue = create_then_lose_the_response  # ty: ignore[invalid-assignment]  # test double
+        self.gh.create_issue = create_then_lose_the_response
 
         def crash(engine, n):
             raise KeyError("x")
         with mock.patch.object(Engine, "_step_examine", crash):
             self.run_engine()
-        self.gh.create_issue = real_create  # ty: ignore[invalid-assignment]  # test double
+        self.gh.create_issue = real_create
         self.run_engine(agents=FakeAgents(self.scripts))
         faults = [n for n, i in self.gh.issues.items() if "implement-loop:fault:" in (i.get("body") or "")]
         self.assertEqual(len(faults), 1)
@@ -712,7 +712,7 @@ class ResumeTests(RecoveryCase):
             result = original(*args, **kwargs)
             (self.store_dir() / "STOP").write_text("stop\n")
             return result
-        agents.build = build_then_stop  # ty: ignore[invalid-assignment]  # test double
+        agents.build = build_then_stop
         summary = self.run_engine(agents=agents)
         self.assertTrue(summary["stopped"])
         self.assertEqual(self.phase(2), Phase.VERIFY)
@@ -733,7 +733,7 @@ class ResumeTests(RecoveryCase):
         def triage_then_stop(*args, **kwargs):
             (self.store_dir() / "STOP").write_text("stop\n")
             return original(*args, **kwargs)
-        agents.triage = triage_then_stop  # ty: ignore[invalid-assignment]  # test double
+        agents.triage = triage_then_stop
         self.run_engine(agents=agents)
         self.assertEqual(self.phase(2), Phase.PLANNED)
         (self.store_dir() / "STOP").unlink()
@@ -754,12 +754,12 @@ class ResumeTests(RecoveryCase):
         def merge_then_die(n, sha, method="squash"):
             real_merge(n, sha, method)
             raise RuntimeError("process died right after the merge")
-        self.gh.merge_pr = merge_then_die  # ty: ignore[invalid-assignment]  # test double
+        self.gh.merge_pr = merge_then_die
         self.run_engine()
         st = self.store.issue(2)
         st.phase, st.wait = Phase.LAND, None   # as if the process died before handling the crash
         self.store.put(st)
-        self.gh.merge_pr = real_merge  # ty: ignore[invalid-assignment]  # test double
+        self.gh.merge_pr = real_merge
         self.run_engine(agents=FakeAgents(self.scripts))
         self.assertEqual(self.phase(2), Phase.DONE)
         self.assertEqual(len(self.events("merge_found_on_resume")), 1)

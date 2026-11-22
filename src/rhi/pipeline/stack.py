@@ -9,13 +9,13 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
   the source tree, checks that no private value of it is in the tree, synthesizes from that file
   and runs the tests.
 - the self-update, which CDK Pipelines adds.
-- the stage, `EndpointStage`, whose deployment waits for the approval CDK Pipelines asks for
-  when a change widens permissions. That approval is a tripwire for honest mistakes. It does not
-  cover this stack, which updates earlier in the same run (section 8.4, control 6).
-- the copy of the weights of `rhi.pipeline.weights`, after that approval and before the stage's
-  deployment: each GPU pool's model, at its pinned revision, copied into the model bucket, so that
-  a release finds its weights when its instances start. A copy that fails fails the execution
-  before anything is deployed.
+- the stage, `EndpointStage`, deployed with no approval and no person in the path, a change that
+  widens a permission among them: the examiner and `tests/policy/` hold such a change before the
+  merge, and the bounded bootstrap's boundary after it (section 8.4, control 6).
+- the copy of the weights of `rhi.pipeline.weights`, the first of the stage's steps, before the
+  stage's deployment: each GPU pool's model, at its pinned revision, copied into the model bucket,
+  so that a release finds its weights when its instances start. A copy that fails fails the
+  execution before anything is deployed.
 - the verification of `rhi.pipeline.verify`, after the stage's deployment: the smoke tests against
   the deployed endpoint, with the canary's key. A failed test fails the execution. In its
   post-build phase the step writes its marks to this pipeline's artifact bucket, under
@@ -170,7 +170,6 @@ class PipelineStack(cdk.Stack):
             execution_mode=codepipeline.ExecutionMode.QUEUED,
         )
         self.pipeline = pipelines.CodePipeline(self, "Pipeline", code_pipeline=underlying, synth=synth)
-        check = pipelines.ConfirmPermissionsBroadening("Check", stage=stage)
         # After every deployment action of the stage: the smoke tests, against what was deployed. The
         # step leaves its marks in the pipeline's artifact bucket, where the reporter reads them. It
         # takes from the stage, as text, what names the stage's heartbeats table to its role: this
@@ -184,11 +183,10 @@ class PipelineStack(cdk.Stack):
             pipeline=underlying,
             parked=config.parked,
         )
-        # Before any deployment action of the stage, and after the approval: the weights of a
+        # The first of the stage's steps, before any deployment action of it: the weights of a
         # release that will be deployed, in the model bucket before an instance asks for them.
         copy_weights = copy_weights_step(self, source)
-        copy_weights.add_step_dependency(check)
-        self.pipeline.add_stage(stage, pre=[check, copy_weights], post=[verify])
+        self.pipeline.add_stage(stage, pre=[copy_weights], post=[verify])
         self.pipeline.build_pipeline()
         self._builds_images_for_both_platforms()
 
@@ -281,9 +279,8 @@ class PipelineStack(cdk.Stack):
     def _as_cfn_lint_reads_it(self, underlying: codepipeline.Pipeline) -> None:
         """Rewrites what CDK Pipelines writes and cfn-lint warns about, with the same meaning.
 
-        - The pipeline and the function that approves a check with no widened permissions each
-          name their role, and depend on it as well (W3005): each keeps its dependency on its
-          role's policy alone.
+        - The pipeline and each function of the stack name their role, and depend on it as well
+          (W3005): each keeps its dependency on its role's policy alone.
         - A deployment action names the bootstrap's execution role with a join of text and pseudo
           parameters (E3703): it is written as the substitution of the same text.
         """

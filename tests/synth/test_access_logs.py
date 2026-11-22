@@ -42,12 +42,12 @@ def attributes(balancer: dict[str, Any]) -> dict[str, Any]:
 @pytest.fixture(scope="module")
 def stage(app: cdk.App) -> Stage:
     rhi = app.node.find_child("Rhi")
-    outdir = Path(rhi.outdir)  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    outdir = Path(rhi.outdir)  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
 
     def read(stack: Any) -> dict[str, Any]:
         return json.loads((outdir / stack.template_file).read_text(encoding="utf-8"))
 
-    network, pools = rhi.network, rhi.pools  # ty: ignore[unresolved-attribute]
+    network, pools = rhi.network, rhi.pools  # ty: ignore[missing-attribute]
     manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))
     return Stage(read(network), read(pools), manifest, network.artifact_id, pools.artifact_id)
 

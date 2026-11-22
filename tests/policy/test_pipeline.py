@@ -19,11 +19,12 @@ Rules hold those two, and every action:
 
 - an asset-publishing action is in the asset stage, and every action of that stage is a CodeBuild
   action. One that does more than publish assets is a step like any other, held by the list;
-- a CloudFormation action comes after the approval on widened permissions of its stage: a manual
-  approval that follows a CodeBuild action whose project runs `cdk diff --security-only` as a
-  command of its build specification, the conditional CDK Pipelines writes
-  (`ConfirmPermissionsBroadening`), and not text that only mentions it. A deployment made any
-  other way is a step, held by the list, and so is a CloudFormation action that deletes a stack;
+- no stage of a pipeline holds a manual approval, an action of the category `Approval`, whatever
+  it follows or precedes: a deployment has no person in its path, a change that widens a
+  permission among them, which the examiner and these rules hold before the merge and the bounded
+  bootstrap's boundary after it (section 8.4, control 6). CDK Pipelines' approval on widened
+  permissions (`ConfirmPermissionsBroadening`) and its `ManualApprovalStep` each make one. A
+  CloudFormation action that deletes a stack is a step, held by the list;
 - the pipeline starts on a push to `main` and on nothing else: its source is the connection's, on
   that branch; a trigger filters pushes to that branch, and never pull requests or tags; and no
   EventBridge rule or schedule of any template targets a pipeline: not one of the pipeline's
@@ -167,8 +168,6 @@ REVIEWED: Reviewed = [
     (
         "Rhi",
         [
-            ("Check.Check", "Build/AWS/CodeBuild"),
-            ("Check.Confirm", "Approval/AWS/Manual"),
             # Before the stage's deployment actions, which the list leaves out.
             ("CopyWeights", "Build/AWS/CodeBuild"),
             # After them.
@@ -180,7 +179,6 @@ REVIEWED: Reviewed = [
 # The types of action the rules name, as `Category/Owner/Provider`.
 CODEBUILD = "Build/AWS/CodeBuild"
 CLOUDFORMATION = "Deploy/AWS/CloudFormation"
-APPROVAL = "Approval/AWS/Manual"
 CONNECTION = "Source/AWS/CodeStarSourceConnection"
 
 # The name CDK Pipelines gives the stage that publishes assets.
@@ -209,12 +207,6 @@ INSTALLS_THE_IMAGE_BUILDER = [
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
 # one that failed.
 DEPLOYS = ("CHANGE_SET_REPLACE", "CHANGE_SET_EXECUTE", "CREATE_UPDATE")
-# What the check of the approval on widened permissions runs, as CDK Pipelines writes it: the
-# security diff, as a command of its own or as the condition that opens one.
-SECURITY_DIFF = "cdk diff -a . --security-only --fail $STAGE_PATH/"
-RUNS_THE_SECURITY_DIFF = re.compile(r"(if )?" + re.escape(SECURITY_DIFF) + r"\\\*(; then .*)?", re.DOTALL)
-# What stands for a value only known when the stack is deployed, in a command read from a template.
-DEPLOY_TIME = "<deploy-time value>"
 
 BRANCH = "main"
 # The boundary, as `Fn::Sub` would write its ARN: the fixed name, in the account that deploys.
@@ -300,7 +292,7 @@ FIELD = "\x00"
 SECRET_READS = ("secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue")
 SECRET_ARN = f"arn:{FIELD}:secretsmanager:{FIELD}:{FIELD}:secret:{REPORTER_SECRET}-??????"
 MEASUREMENT_BUS = "rhi-measurements"
-# The AWS managed policy CDK gives the functions it adds itself, CDK Pipelines' approval among them:
+# The AWS managed policy CDK gives the functions it adds itself:
 # it allows creating a log group and writing logs, and nothing else.
 WRITES_LOGS_ONLY = re.compile(
     r"arn:(aws[a-z-]*|\$\{AWS::Partition\}):iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -330,7 +322,7 @@ MISSING = "the reviewed list has it and the pipeline does not"
 ANOTHER_ORDER = "the pipeline's stages and actions are not in the order of the reviewed list"
 ASSETS_ELSEWHERE = "an asset-publishing action outside the asset stage"
 NOT_CODEBUILD = "an action of the asset stage that is not a CodeBuild action"
-NOT_AFTER_THE_APPROVAL = "a CloudFormation action that does not come after the approval on widened permissions"
+MANUAL_APPROVAL = "a manual approval action"
 ANOTHER_TRIGGER = "a trigger other than a push to `main`"
 WEBHOOK = "a CodeBuild project with a webhook"
 NO_BOUNDARY = "a role without the permissions boundary of the bounded bootstrap"
@@ -421,19 +413,6 @@ def stages_of(pipeline: Mapping[str, Any]) -> list[tuple[str, list[dict[str, Any
     ]
 
 
-def text_of(value: Any, deploy_time: str | None = None) -> str:
-    """The text of a value of a template, without what is only known when the stack is deployed,
-    or with `deploy_time` in its place."""
-    if isinstance(value, dict) and list(value) == ["Fn::Join"]:
-        parts = value["Fn::Join"][1]
-        return value["Fn::Join"][0].join(
-            part if isinstance(part, str) else deploy_time
-            for part in parts
-            if isinstance(part, str) or deploy_time is not None
-        )
-    return value if isinstance(value, str) else ""
-
-
 def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any:
     """The build specification of the project a CodeBuild action runs, when the project is one of
     the same template, named by a `Ref`."""
@@ -512,26 +491,6 @@ def differences(templates: Templates, reviewed: Reviewed) -> list[tuple[str, str
     if not different and found != expected:
         different.append((ANOTHER_ORDER, ", ".join(found)))
     return different
-
-
-def checks_permissions(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
-    """Whether an action is a CodeBuild action whose project runs the security diff: one command
-    of its build specification is that diff, or opens with it as its condition."""
-    commands = commands_of(text_of(build_spec_of(action, template), DEPLOY_TIME)) or []
-    return any(RUNS_THE_SECURITY_DIFF.fullmatch(command) for command in commands)
-
-
-def approval_on_widened_permissions(actions: list[dict[str, Any]], template: Mapping[str, Any]) -> int | None:
-    """The run order of a stage's approval on widened permissions: a manual approval that follows
-    a CodeBuild action of the stage whose project runs the security diff. None when the stage has
-    none."""
-    checked = [action.get("RunOrder", 1) for action in actions if checks_permissions(action, template)]
-    approved = [
-        action.get("RunOrder", 1)
-        for action in actions
-        if type_of(action) == APPROVAL and any(check < action.get("RunOrder", 1) for check in checked)
-    ]
-    return min(approved, default=None)
 
 
 def is_a_push_to_main(trigger: Mapping[str, Any]) -> bool:
@@ -1321,15 +1280,14 @@ def breaches(templates: Templates) -> list[tuple[str, str, str]]:
     found = []
     for path, pipeline_id, pipeline, template in resources(templates, "AWS::CodePipeline::Pipeline"):
         for stage, actions in stages_of(pipeline):
-            approved = approval_on_widened_permissions(actions, template)
             for action in actions:
                 name = f"{stage}/{action['Name']}"
                 if stage != ASSET_STAGE and publishes_assets(action, template):
                     found.append((path, name, ASSETS_ELSEWHERE))
                 if stage == ASSET_STAGE and type_of(action) != CODEBUILD:
                     found.append((path, name, NOT_CODEBUILD))
-                if type_of(action) == CLOUDFORMATION and (approved is None or action.get("RunOrder", 1) <= approved):
-                    found.append((path, name, NOT_AFTER_THE_APPROVAL))
+                if action["ActionTypeId"]["Category"] == "Approval":
+                    found.append((path, name, MANUAL_APPROVAL))
                 on_main = type_of(action) == CONNECTION and action.get("Configuration", {}).get("BranchName") == BRANCH
                 if action["ActionTypeId"]["Category"] == "Source" and not on_main:
                     found.append((path, name, ANOTHER_TRIGGER))
@@ -1422,7 +1380,7 @@ BUILT: Reviewed = [
     ("Source", [("owner_repo", CONNECTION)]),
     ("Build", [("Synth", CODEBUILD)]),
     ("UpdatePipeline", [("SelfMutate", CODEBUILD)]),
-    ("Rhi", [("Check.Check", CODEBUILD), ("Check.Confirm", APPROVAL)]),
+    ("Rhi", []),
 ]
 # A command as an asset-publishing project runs it.
 PUBLISH = 'cdk-assets --path "assembly-Pipeline-Rhi/Other.assets.json" --verbose publish "0123abcd:current_account"'
@@ -1435,7 +1393,7 @@ def built(
     connection: bool = True,
     branch: str = BRANCH,
     boundary: str = BOUNDARY,
-    approval: str = "first",
+    approval: str | None = None,
     step: tuple[str, list[str]] | None = None,
     stack_with_an_asset: str | None = None,
     verification: bool = False,
@@ -1443,15 +1401,14 @@ def built(
 ) -> dict[str, dict[str, Any]]:
     """The templates of an app, built in the test, whose pipeline CDK Pipelines makes as the
     design describes it (section 8.2): a source on a connection, a synth step, the self-update,
-    and one stage with one stack behind the approval on widened permissions. Every role carries
-    the boundary.
+    and one stage with one stack, deployed with no approval. Every role carries the boundary.
 
     A test changes one thing:
 
     - the source: a CodeCommit repository in place of the connection, or another branch;
     - the boundary's name;
-    - the approval: on widened permissions and `first`, the same and `last`, after the deployment,
-      or `unchecked`, a manual approval that no check precedes;
+    - an approval before the stage's deployment: `broadening`, CDK Pipelines' approval on widened
+      permissions, or `manual`, its manual approval step;
     - one more step before the stage's deployment, by its name and its commands;
     - one more stack in the stage, with a file asset and a role under the boundary of the name
       given or, when the name is empty, under none;
@@ -1511,16 +1468,16 @@ def built(
         if stack_with_an_asset:
             bounded(other, stack_with_an_asset)
 
-    if approval == "unchecked":
-        gate = [pipelines.ManualApprovalStep("Approve")]
-    else:
-        gate = [pipelines.ConfirmPermissionsBroadening("Check", stage=stage)]
+    gate = {
+        None: [],
+        "broadening": [pipelines.ConfirmPermissionsBroadening("Check", stage=stage)],
+        "manual": [pipelines.ManualApprovalStep("Approve")],
+    }[approval]
     more = [pipelines.ShellStep(step[0], commands=step[1])] if step is not None else []
-    last = approval == "last"
     verify = (
         [pipelines.CodeBuildStep(VERIFY_ACTION, commands=["true"], env_from_cfn_outputs=told)] if verification else []
     )
-    pipeline.add_stage(stage, pre=more if last else gate + more, post=(gate if last else []) + verify)
+    pipeline.add_stage(stage, pre=gate + more, post=verify)
     pipeline.build_pipeline()
     if change is not None:
         change(cdk, stack, pipeline.pipeline)
@@ -1549,16 +1506,18 @@ def test_detects_a_missing_and_a_moved_action(cdk: ModuleType, tmp_path: Path) -
     templates = built(cdk, tmp_path / "reviewed")
     longer: Reviewed = [*BUILT, ("Verify", [("Smoke", CODEBUILD)])]
     assert differences(templates, longer) == [(MISSING, "stage Verify"), (MISSING, f"Verify/Smoke: {CODEBUILD}")]
-    check, confirm = BUILT[3][1]
-    assert [what for what, _ in differences(templates, [*BUILT[:3], ("Rhi", [confirm, check])])] == [ANOTHER_ORDER]
+    assert [what for what, _ in differences(templates, [BUILT[1], BUILT[0], *BUILT[2:]])] == [ANOTHER_ORDER]
 
-    # The order is the one the actions run in: this step starts with the check, before the approval.
-    one_more = built(cdk, tmp_path / "one more", step=("Extra", ["true"]))
-    extra = ("Extra", CODEBUILD)
-    assert differences(one_more, [*BUILT[:3], ("Rhi", [check, extra, confirm])]) == []
-    assert [what for what, _ in differences(one_more, [*BUILT[:3], ("Rhi", [check, confirm, extra])])] == [
-        ANOTHER_ORDER
-    ]
+    # The order is the one the actions run in, not the one the template declares them in: this
+    # step comes before the deployment, the verification after it, whichever the template writes
+    # first.
+    both = built(cdk, tmp_path / "both", step=("Extra", ["true"]), verification=True)
+    (pipeline,) = [properties for _, _, properties, _ in resources(both, "AWS::CodePipeline::Pipeline")]
+    (rhi,) = [stage for stage in pipeline["Stages"] if stage["Name"] == "Rhi"]
+    rhi["Actions"].reverse()
+    extra, verify = ("Extra", CODEBUILD), (VERIFY_ACTION, CODEBUILD)
+    assert differences(both, [*BUILT[:3], ("Rhi", [extra, verify])]) == []
+    assert [what for what, _ in differences(both, [*BUILT[:3], ("Rhi", [verify, extra])])] == [ANOTHER_ORDER]
 
 
 def test_a_new_stack_or_asset_needs_no_list_change(cdk: ModuleType, tmp_path: Path) -> None:
@@ -1707,17 +1666,6 @@ def in_another_stack(starts: Change) -> Change:
     return change
 
 
-def a_check_that_only_prints_the_diff(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
-    """Replaces the commands of the check on widened permissions by one that prints its diff."""
-    (check,) = [
-        node
-        for node in stack.node.find_all()
-        if isinstance(node, cdk.aws_codebuild.CfnProject) and "SecurityCheck" in node.node.path
-    ]
-    printed = {"version": "0.2", "phases": {"build": {"commands": [f"echo '{SECURITY_DIFF}\\*'"]}}}
-    check.add_property_override("Source.BuildSpec", json.dumps(printed))
-
-
 def a_project_with_a_webhook(cdk: ModuleType, stack: Any, _pipeline: Any) -> None:
     codebuild = cdk.aws_codebuild
     opened = codebuild.FilterGroup.in_event_of(codebuild.EventAction.PULL_REQUEST_CREATED)
@@ -1741,8 +1689,19 @@ def a_synth_role_that_reads(action: str, service: str, resource: str, name: str)
     return change
 
 
-def an_approval_in_the_asset_stage(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
-    pipeline.stage(ASSET_STAGE).add_action(cdk.aws_codepipeline_actions.ManualApprovalAction(action_name="Extra"))
+def an_approval_in(stage: str) -> Change:
+    """Adds a manual approval action, CodePipeline's own, to a stage of the pipeline."""
+
+    def change(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
+        pipeline.stage(stage).add_action(cdk.aws_codepipeline_actions.ManualApprovalAction(action_name="Extra"))
+
+    return change
+
+
+def a_deletion_in_the_asset_stage(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
+    delete = cdk.aws_codepipeline_actions.CloudFormationDeleteStackAction
+    action = delete(action_name="Delete", stack_name="Rhi-Other", admin_permissions=False)
+    pipeline.stage(ASSET_STAGE).add_action(action)
 
 
 ON_MAIN = {"branches_includes": [BRANCH]}
@@ -1770,10 +1729,11 @@ def test_keeps_a_synth_role_that_reads_the_configuration(cdk: ModuleType, tmp_pa
             {"step": ("Publish", [PUBLISH])}, ASSETS_ELSEWHERE, id="an asset-publishing action outside the asset stage"
         ),
         pytest.param(
-            {"approval": "last"}, NOT_AFTER_THE_APPROVAL, id="a deployment before the approval on widened permissions"
+            {"approval": "broadening"}, MANUAL_APPROVAL, id="a pipeline with the approval on widened permissions"
         ),
         # The clauses of the rules that the four above leave out.
-        pytest.param({"approval": "unchecked"}, NOT_AFTER_THE_APPROVAL, id="a deployment after another approval"),
+        pytest.param({"approval": "manual"}, MANUAL_APPROVAL, id="a pipeline with a manual approval step"),
+        pytest.param({"change": an_approval_in("Build")}, MANUAL_APPROVAL, id="a manual approval in another stage"),
         pytest.param({"connection": False}, ANOTHER_TRIGGER, id="a source that is not the connection's"),
         pytest.param({"branch": "develop"}, ANOTHER_TRIGGER, id="a source on another branch"),
         pytest.param(
@@ -1799,12 +1759,7 @@ def test_keeps_a_synth_role_that_reads_the_configuration(cdk: ModuleType, tmp_pa
             id="a schedule of another stack that starts the pipeline",
         ),
         pytest.param(
-            {"change": a_check_that_only_prints_the_diff},
-            NOT_AFTER_THE_APPROVAL,
-            id="a deployment after a check that only prints the diff",
-        ),
-        pytest.param(
-            {"stack_with_an_asset": BOUNDARY, "change": an_approval_in_the_asset_stage},
+            {"stack_with_an_asset": BOUNDARY, "change": a_deletion_in_the_asset_stage},
             NOT_CODEBUILD,
             id="an action of the asset stage that is not a CodeBuild action",
         ),
