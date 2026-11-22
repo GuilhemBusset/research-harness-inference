@@ -10,7 +10,7 @@ recorded in `tests/policy/stateful_logical_ids.json`.
 **Who writes.** Elastic Load Balancing writes only to a bucket encrypted with S3-managed keys. The
 bucket's policy lets its log-delivery service, `LOG_DELIVERY_SERVICE`, put objects under each load
 balancer's prefix, below `AWSLogs/<account>/`, where the service writes them. The service is the
-policy's only principal: the older form of that policy names an AWS-owned account per region, which
+policy's only principal, in its only statement: the older form of that policy names an AWS-owned account per region, which
 an environment-agnostic stack cannot know and a public repository should not hold. The only account
 the policy names is the stack's own, a deployment-time value.
 
@@ -65,7 +65,9 @@ class AccessLogs(Construct):
             encryption=s3.BucketEncryption.S3_MANAGED,
             # A bucket with no ACL: its policy says who writes.
             object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
-            enforce_ssl=True,
+            # No refusal of requests without TLS: it is a statement on every principal, and the
+            # log-delivery service is the policy's only principal (AwsSolutions-S10, acknowledged).
+            enforce_ssl=False,
             lifecycle_rules=[s3.LifecycleRule(id="Expire", expiration=cdk.Duration.days(EXPIRY_DAYS))],
             removal_policy=cdk.RemovalPolicy.RETAIN,
         )

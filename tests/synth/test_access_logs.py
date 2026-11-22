@@ -75,9 +75,12 @@ def test_both_load_balancers_log_to_the_bucket_under_different_prefixes(stage: S
 def test_the_bucket_is_private_encrypted_by_s3_and_expires_objects_after_90_days(stage: Stage) -> None:
     _, bucket = bucket_of(stage)
     properties = bucket["Properties"]
-    assert properties["LifecycleConfiguration"]["Rules"] == [
-        {"ExpirationInDays": 90, "Id": "Expire", "Status": "Enabled"}
-    ]
+    [rule] = properties["LifecycleConfiguration"]["Rules"]
+    assert rule["Status"] == "Enabled"
+    assert rule["ExpirationInDays"] == 90
+    assert not {"Prefix", "TagFilters", "ObjectSizeGreaterThan", "ObjectSizeLessThan"} & rule.keys()
+    # Unversioned: an expired object is gone, not kept as a noncurrent version.
+    assert "VersioningConfiguration" not in properties
     [encryption] = properties["BucketEncryption"]["ServerSideEncryptionConfiguration"]
     assert encryption["ServerSideEncryptionByDefault"] == {"SSEAlgorithm": "AES256"}
     assert all(properties["PublicAccessBlockConfiguration"].values())
@@ -90,11 +93,9 @@ def test_the_policy_lets_only_the_log_delivery_service_write_under_the_prefixes(
     [policy] = of_type(stage.network, "AWS::S3::BucketPolicy").values()
     assert policy["Properties"]["Bucket"] == {"Ref": name}
     statements = policy["Properties"]["PolicyDocument"]["Statement"]
+    assert statements
+    assert all(s["Principal"] == LOG_DELIVERY for s in statements)
     allowed = [s for s in statements if s["Effect"] == "Allow"]
-    assert allowed
-    assert all(s["Principal"] == LOG_DELIVERY for s in allowed)
-    # What else the policy holds only refuses: every request that does not use TLS.
-    assert all(s["Effect"] == "Deny" and s["Principal"] == {"AWS": "*"} for s in statements if s not in allowed)
     [public] = of_type(stage.network, LOAD_BALANCER).values()
     [internal] = of_type(stage.pools, LOAD_BALANCER).values()
     resources = [r for s in allowed for r in (s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]])]

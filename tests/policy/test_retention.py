@@ -7,7 +7,8 @@ metrics (system design, section 6.6; evidence E27).
 - The metrics workspace keeps at most 90 days; with no retention set, it keeps the service's
   default, which is longer.
 - Every bucket a load balancer writes its access logs to expires every object within 90 days of
-  its writing: the logs hold source addresses. A bucket this check cannot find, in the load
+  its writing, a noncurrent version of it too when the bucket is versioned: the logs hold source
+  addresses. A bucket this check cannot find, in the load
   balancer's template or as another template's export, counts as one that never expires.
 - No CloudWatch alarm, metric or metric filter has a dimension that identifies a student: alias,
   student or github_id, whatever its case. A metric is checked wherever a resource holds one: an
@@ -111,16 +112,33 @@ def log_buckets(templates: Mapping[str, Any]) -> dict[tuple[str, str], tuple[str
 
 
 def expires_within(bucket: Mapping[str, Any] | None, days: int) -> bool:
-    """Whether an enabled rule of the bucket's lifecycle, on every object, expires each within
-    `days` of its writing."""
-    rules = (bucket or {}).get("Properties", {}).get("LifecycleConfiguration", {}).get("Rules", [])
-    return any(
-        rule.get("Status") == "Enabled"
-        and not any(rule.get(key) for key in RULE_FILTERS)
-        and isinstance(expiry := rule.get("ExpirationInDays"), int)
-        and expiry <= days
-        for rule in rules
-    )
+    """Whether the enabled rules of the bucket's lifecycle, on every object, remove each within
+    `days` of its writing. In a versioned bucket, an expired object stays as a noncurrent version
+    until a noncurrent-version expiry removes it: it is kept the sum of both periods."""
+    properties = (bucket or {}).get("Properties", {})
+    rules = [
+        rule
+        for rule in properties.get("LifecycleConfiguration", {}).get("Rules", [])
+        if rule.get("Status") == "Enabled" and not any(rule.get(key) for key in RULE_FILTERS)
+    ]
+    expiries = [e for rule in rules if isinstance(e := rule.get("ExpirationInDays"), int)]
+    if not expiries:
+        return False
+    kept = min(expiries)
+    if properties.get("VersioningConfiguration", {}).get("Status") in ("Enabled", "Suspended"):
+        noncurrent = [
+            n
+            for rule in rules
+            for n in (
+                rule.get("NoncurrentVersionExpiration", {}).get("NoncurrentDays"),
+                rule.get("NoncurrentVersionExpirationInDays"),
+            )
+            if isinstance(n, int)
+        ]
+        if not noncurrent:
+            return False
+        kept += min(noncurrent)
+    return kept <= days
 
 
 def log_buckets_kept_too_long(templates: Mapping[str, Any]) -> list[str]:
@@ -293,9 +311,21 @@ def test_detects_an_access_log_bucket_kept_too_long(cdk: ModuleType) -> None:
     from aws_cdk import aws_s3 as s3
 
     def build(stack: Any) -> None:
-        for name, days in (("NoExpiry", None), ("Year", 365), ("Kept", MAX_DAYS)):
-            rules = [s3.LifecycleRule(expiration=cdk.Duration.days(days))] if days else None
-            bucket = s3.Bucket(stack, name, lifecycle_rules=rules)
+        cases = (
+            ("NoExpiry", None, False, None),
+            ("Year", 365, False, None),
+            ("Kept", MAX_DAYS, False, None),
+            # Versioned: an expired object stays as a noncurrent version.
+            ("Versioned", MAX_DAYS, True, None),
+            ("VersionedLonger", MAX_DAYS, True, 1),
+            ("VersionedKept", MAX_DAYS - 1, True, 1),
+        )
+        for name, days, versioned, noncurrent in cases:
+            rules = None
+            if days:
+                kept = cdk.Duration.days(noncurrent) if noncurrent else None
+                rules = [s3.LifecycleRule(expiration=cdk.Duration.days(days), noncurrent_version_expiration=kept)]
+            bucket = s3.Bucket(stack, name, lifecycle_rules=rules, versioned=versioned)
             attribute = elbv2.CfnLoadBalancer.LoadBalancerAttributeProperty
             elbv2.CfnLoadBalancer(
                 stack,
@@ -309,7 +339,7 @@ def test_detects_an_access_log_bucket_kept_too_long(cdk: ModuleType) -> None:
         s3.Bucket(stack, "Other")
 
     found = log_buckets_kept_too_long({"Built": synthesize(cdk, build)})
-    assert [name.removeprefix("Built:")[:-8] for name in found] == ["NoExpiry", "Year"]
+    assert [name.removeprefix("Built:")[:-8] for name in found] == ["NoExpiry", "Versioned", "VersionedLonger", "Year"]
 
 
 def test_detects_a_student_dimension(cdk: ModuleType) -> None:
