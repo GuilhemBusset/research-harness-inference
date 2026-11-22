@@ -39,5 +39,21 @@ updates:
       - dependency-name: pytest
       - dependency-name: pytest-xdist
 
-# When the backlog adds them, add: `npm` for the CDK CLI pinned in package.json, and `docker`
-# for the image digests under services/.
+  # The base images the Dockerfiles under services/ pin by digest: the gateway, Grafana, the mock
+  # engine and vLLM. A bump of vLLM's FROM line also needs its VERSION file, which Dependabot does
+  # not change: tests/unit/engine/test_vllm_image.py fails until it is. Dependabot expands the pattern
+  # with Ruby's Dir.glob: `**/*` is every folder under services/, at any depth, and a folder with
+  # no Dockerfile is skipped. Security updates do not wait for the cooldown.
+  - package-ecosystem: docker
+    directories:
+      - '/services/**/*'
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    labels: []
+
+# When the backlog adds it, add `npm` for the CDK CLI pinned in package.json.
