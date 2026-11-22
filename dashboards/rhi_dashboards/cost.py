@@ -43,12 +43,14 @@ price too. The dollars are the hours times it.
 **The tokens are the output tokens the gateway settled for the pool**
 (`rhi_gateway_student_output_tokens_total`, `rhi_gateway.metrics`): an instance's price is over what
 it produced, its output (section 4.7). Each series is counted on its own, then summed by pool
-(section 7.2, first rule). A series that was there at the window's start counts its increase over
-the window. A series the gateway creates inside the window, on its first settlement for an alias
-(a new alias, a new task), has no sample before that settlement, so its increase would leave the
-settlement out, and a first settlement followed by none would count nothing: such a series counts
-its latest value instead, every token it settled since it was created. Grafana's server-side
-expressions divide the dollars, from CloudWatch, by the tokens, from Prometheus, in millions.
+(section 7.2, first rule), at every minute of the window and from its last minute to its end:
+what the series rose by since the minute before, or all of its value where it was not there then
+or fell. The gateway creates a series on its first settlement for an alias (a new alias, a new
+task), already holding those tokens, and removes it when the alias's key is revoked, to create it
+again from zero if the alias is given a key: each time the series appears, or restarts lower, its
+value is tokens settled since, and is counted. A restart inside a minute leaves out what the
+series settled in that minute before it. Grafana's server-side expressions divide the dollars,
+from CloudWatch, by the tokens, from Prometheus, in millions.
 
 **The calendar windows are the panel's own**: "today" is from the start of the day to now, "this
 month" from the start of the month to now, in UTC, as AWS bills. Grafana gives a panel its own
@@ -124,8 +126,10 @@ OWN_REGION = "default"
 TODAY = "now/d"
 THIS_MONTH = "now/M"
 TIME_ZONE = "utc"
-# The panel's window, as Grafana gives it to a Prometheus query.
-WINDOW = "$__range"
+# The panel's window, as Grafana gives it to a Prometheus query, and the step the tokens are counted
+# at: a minute, a few scrapes, so that a month is some 45,000 steps.
+WINDOW = rules.SESSION_RANGE
+TOKEN_STEP = "1m"
 
 # Every number is one colour, with no threshold: nothing is a ceiling.
 COLOR = "blue"
@@ -215,15 +219,19 @@ def dollars(pool: Pool, suffix: str = "") -> tuple[list[Target], str]:
     return targets, f"{expression} * {price(pool)!r}"
 
 
+def settled(series: str, previous: str) -> str:
+    """The tokens each series settled since `previous`, summed by pool: what it rose by, or all of
+    its value where it was not there then or fell (it was created again, from zero)."""
+    return f"sum by ({rules.POOL}) ((({series} - {previous}) >= 0) or {series})"
+
+
 def output_tokens(pool: Pool) -> str:
     """The output tokens the gateway settled for the pool over the panel's window, read at its end:
-    the increase of each series there at the window's start, and the latest value of each series
-    created inside it, which counts its first settlement, summed by pool."""
+    `settled` at every step of the window, and from its last step to its end."""
     series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
-    at_start = f"{series} offset {WINDOW}"
-    there = f"sum by ({rules.POOL}) (increase({series}[{WINDOW}]) and {at_start})"
-    created = f"sum by ({rules.POOL}) (last_over_time({series}[{WINDOW}]) unless {at_start})"
-    return f"(({there}) + ({created})) or ({there}) or ({created})"
+    steps = f"sum_over_time(({settled(series, f'{series} offset {TOKEN_STEP}')})[{WINDOW}:{TOKEN_STEP}])"
+    last = settled(series, f"last_over_time({series}[{TOKEN_STEP}:{TOKEN_STEP}])")
+    return f"(({steps}) + ({last})) or ({steps}) or ({last})"
 
 
 def _one_colour() -> dashboard_builders.ThresholdsConfig:

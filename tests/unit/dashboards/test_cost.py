@@ -119,20 +119,25 @@ def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_m
             assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (cost.output_tokens(pool), True)
 
 
-def test_the_tokens_count_the_first_settlement_of_a_series_created_in_the_window(example: rhi_config.Config) -> None:
+def test_the_tokens_count_every_settlement_of_a_series_created_or_created_again_in_the_window(
+    example: rhi_config.Config,
+) -> None:
     pool = example.pools[0].name
-    # The gateway creates an alias's series on its first settlement, already holding its tokens.
+    # The gateway creates an alias's series on its first settlement, already holding its tokens, and
+    # after the series is removed (a revoked key), creates it again from zero.
     gateway = metrics.Metrics()
     series, labels = f"{metrics.OUTPUT_TOKENS}_total", {"pool": pool, "alias": "student-example"}
     assert gateway.registry.get_sample_value(series, labels) is None
     gateway.count(RequestRecord(time="", wire_format=None, pool=pool, alias="student-example", output_tokens=100))
     assert gateway.registry.get_sample_value(series, labels) == 100
-    # So a series with no sample at the window's start counts its latest value, its increase only
-    # a series that was there; both summed by pool.
+    # So at each step, a series counts what it rose by, or all of its value where it was not there
+    # the step before or fell: 100, then 10 created again, is 110. Summed by pool, over every minute
+    # of the window, then from its last minute to its end.
     selected = rules.selector(series, {"pool": pool})
-    there = f"sum by (pool) (increase({selected}[$__range]) and {selected} offset $__range)"
-    created = f"sum by (pool) (last_over_time({selected}[$__range]) unless {selected} offset $__range)"
-    assert cost.output_tokens(example.pools[0]) == f"(({there}) + ({created})) or ({there}) or ({created})"
+    step = f"sum by (pool) ((({selected} - {selected} offset 1m) >= 0) or {selected})"
+    last = f"sum by (pool) ((({selected} - last_over_time({selected}[1m:1m])) >= 0) or {selected})"
+    steps = f"sum_over_time(({step})[${{__range_ms}}ms:1m])"
+    assert cost.output_tokens(example.pools[0]) == f"(({steps}) + ({last})) or ({steps}) or ({last})"
 
 
 def test_no_panel_shows_a_ceiling(example: rhi_config.Config) -> None:
