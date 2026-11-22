@@ -6,9 +6,10 @@ metrics (system design, section 6.6; evidence E27).
   one for a function that names none, at run time, outside every template and with no retention.
 - The metrics workspace keeps at most 90 days; with no retention set, it keeps the service's
   default, which is longer.
-- No CloudWatch alarm, metric (a dashboard's included) or metric filter has a dimension that
-  identifies a student: alias, student or github_id, whatever its case. CloudWatch metrics cannot be deleted for 15 months; the
-  per-student series live in Prometheus only.
+- No CloudWatch alarm, metric or metric filter has a dimension that identifies a student: alias,
+  student or github_id, whatever its case. A metric is checked wherever a resource holds one: an
+  alarm, a dashboard, a scaling policy that tracks it. CloudWatch metrics cannot be deleted for 15
+  months; the per-student series live in Prometheus only.
 
 These hold for the stage's templates, those of its nested assembly. The pipeline's own stack is not
 in the stage: its logs hold no student data.
@@ -28,7 +29,6 @@ STUDENT_DIMENSIONS = {"alias", "student", "github_id"}
 LOG_GROUP = "AWS::Logs::LogGroup"
 FUNCTION = "AWS::Lambda::Function"
 WORKSPACE = "AWS::APS::Workspace"
-METRIC_FILTER = "AWS::Logs::MetricFilter"
 DASHBOARD = "AWS::CloudWatch::Dashboard"
 
 
@@ -77,9 +77,9 @@ def workspaces_kept_too_long(template: Mapping[str, Any]) -> list[str]:
 
 
 def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """Every dimension that identifies a student, with the resource that has it, in a CloudWatch
-    resource (an alarm, its metrics, an anomaly detector, a dashboard's metrics) or in a metric
-    filter's metrics."""
+    """Every dimension that identifies a student, with the resource that has it: in a CloudWatch
+    metric of any resource (an alarm's, an anomaly detector's, a scaling policy's), in a metric
+    filter's metrics, or in a dashboard's metrics."""
     found: list[tuple[str, str]] = []
 
     def walk(node: object, resource: str) -> None:
@@ -111,10 +111,9 @@ def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
             walk_dashboard(item, resource)
 
     for name, resource in template.get("Resources", {}).items():
-        kind = resource.get("Type", "")
-        if kind.startswith("AWS::CloudWatch::") or kind == METRIC_FILTER:
-            walk(resource.get("Properties", {}), name)
-        if kind == DASHBOARD:
+        # Any resource can hold a CloudWatch metric: a scaling policy tracks one.
+        walk(resource.get("Properties", {}), name)
+        if resource.get("Type") == DASHBOARD:
             walk_dashboard(dashboard_body(resource.get("Properties", {}).get("DashboardBody")), name)
     return found
 
@@ -215,6 +214,7 @@ def test_detects_a_workspace_kept_too_long(cdk: ModuleType) -> None:
 
 
 def test_detects_a_student_dimension(cdk: ModuleType) -> None:
+    from aws_cdk import aws_applicationautoscaling as scaling
     from aws_cdk import aws_cloudwatch as cloudwatch
     from aws_cdk import aws_logs as logs
 
@@ -238,10 +238,22 @@ def test_detects_a_student_dimension(cdk: ModuleType) -> None:
         for dimensions in ({"pool": "coursework"}, {"pool": "coursework", "student": "a-student"}):
             metric = cloudwatch.Metric(namespace="rhi", metric_name="requests", dimensions_map=dimensions)
             dashboard.add_widgets(cloudwatch.GraphWidget(left=[metric]))
+        target = scaling.ScalableTarget(
+            stack,
+            "Target",
+            service_namespace=scaling.ServiceNamespace.ECS,
+            scalable_dimension="ecs:service:DesiredCount",
+            resource_id="service/cluster/workers",
+            min_capacity=1,
+            max_capacity=2,
+        )
+        metric = cloudwatch.Metric(namespace="rhi", metric_name="requests", dimensions_map={"STUDENT": "a-student"})
+        target.scale_to_track_metric("PerStudentTracking", custom_metric=metric, target_value=10)
 
     found = student_dimensions(synthesize(cdk, build))
     assert sorted((resource[:-8], name) for resource, name in found) == [
         ("Dashboard", "student"),
         ("PerGithubId", "GitHub_ID"),
         ("PerStudent", "Alias"),
+        ("TargetPerStudentTracking", "STUDENT"),
     ]

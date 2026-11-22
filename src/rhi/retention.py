@@ -63,9 +63,12 @@ def _property(properties: dict[str, Any], name: str) -> Any:
 
 
 def _stack_log_group(function: cdk.CfnResource) -> Any:
-    """The log group the function's logging configuration names, as its template writes it, if
-    that is a log group of the function's own stack: by a reference to it, or by the name its
-    template gives it. None for no log group, or one of another stack or of no template."""
+    """A reference to the log group the function's logging configuration names, if that is a log
+    group of the function's own stack: by a reference to it, or by the name its construct gives it.
+    None for no log group, or one of another stack or of no template.
+
+    The reference, not the name: it stays the group's name in the template even if an override
+    renames the group after its construct named it."""
     stack = cdk.Stack.of(function)
     logging = _property(stack.resolve(function._cfn_properties) or {}, "LoggingConfig")
     resolved = _property(logging, "LogGroup") if isinstance(logging, dict) else None
@@ -78,7 +81,7 @@ def _stack_log_group(function: cdk.CfnResource) -> Any:
             continue
         name = _property(stack.resolve(group._cfn_properties) or {}, "LogGroupName")
         if resolved == stack.resolve(group.ref) or (isinstance(name, str) and resolved == name):
-            return resolved
+            return group.ref
     return None
 
 

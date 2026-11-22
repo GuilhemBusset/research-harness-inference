@@ -80,3 +80,28 @@ def test_every_log_group_keeps_90_days_whatever_a_construct_overrode(app_module:
     groups = of_type(stage_stack(build), "AWS::Logs::LogGroup")
     assert len(groups) == 3
     assert {name: p.get("RetentionInDays") for name, p in groups.items()} == dict.fromkeys(groups, 90)
+
+
+def test_a_function_names_its_log_group_by_the_name_the_template_gives_it(app_module: ModuleType) -> None:
+    del app_module  # started jsii
+    from aws_cdk import aws_lambda as lambda_
+    from aws_cdk import aws_logs as logs
+
+    def build(stack: Any) -> None:
+        # The function names the group by the name its construct gave; an override renames it.
+        group = logs.CfnLogGroup(stack, "Logs", log_group_name="/rhi/jobs")
+        group.add_property_override("LogGroupName", "/rhi/workers")
+        lambda_.CfnFunction(
+            stack,
+            "Worker",
+            role=stack.format_arn(service="iam", resource="role", resource_name="worker"),
+            runtime="python3.13",
+            handler="index.handler",
+            code=lambda_.CfnFunction.CodeProperty(zip_file="def handler(event, context): pass"),
+            logging_config=lambda_.CfnFunction.LoggingConfigProperty(log_group="/rhi/jobs"),
+        )
+
+    template = stage_stack(build)
+    (function,) = of_type(template, "AWS::Lambda::Function").values()
+    (group,) = of_type(template, "AWS::Logs::LogGroup")
+    assert function["LoggingConfig"]["LogGroup"] == {"Ref": group}
