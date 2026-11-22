@@ -77,6 +77,8 @@ STAGE = "serving"
 NO_MODEL = launch.NO_MODEL
 
 RELEASE_METRIC = "rhi_lifecycle_release_info"
+# Its labels: the release the instance serves, as the heartbeat names it.
+RELEASE_LABELS = ("image_digest", "model_revision")
 RESTARTS_METRIC = "rhi_lifecycle_engine_restarts"
 
 _LOG = logging.getLogger(__name__)
@@ -144,7 +146,7 @@ class Serving:
         Gauge(
             RELEASE_METRIC,
             "The release the instance serves: the engine image digest and the model revision.",
-            ("image_digest", "model_revision"),
+            RELEASE_LABELS,
             registry=registry,
         ).labels(image_digest=self._image_digest, model_revision=self._model_revision).set(1)
         self._restarts = Counter(
