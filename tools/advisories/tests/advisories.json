@@ -93,5 +93,23 @@
         "vulnerable_functions": []
       }
     ]
+  },
+  {
+    "ghsa_id": "GHSA-94f4-hr76-p5j6",
+    "cve_id": "CVE-2026-48746",
+    "url": "https://api.github.com/advisories/GHSA-94f4-hr76-p5j6",
+    "html_url": "https://github.com/advisories/GHSA-94f4-hr76-p5j6",
+    "summary": "vLLM: OpenAI auth bypass",
+    "type": "reviewed",
+    "severity": "critical",
+    "withdrawn_at": null,
+    "vulnerabilities": [
+      {
+        "package": {"ecosystem": "pip", "name": "vllm"},
+        "vulnerable_version_range": ">= 0.3.0, < 0.22.0",
+        "first_patched_version": "0.22.0",
+        "vulnerable_functions": []
+      }
+    ]
   }
 ]

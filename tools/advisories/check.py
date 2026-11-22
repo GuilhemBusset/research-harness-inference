@@ -143,7 +143,9 @@ class GitHub:
                 link = _LINK_NEXT.search(response.headers.get("Link") or "")
                 return json.load(response), (link[1] if link else None)
         except urllib.error.HTTPError as error:
-            raise CheckError(f"GitHub answered {error.code} to {request.method} {urllib.parse.urlsplit(url).path}") from None
+            raise CheckError(
+                f"GitHub answered {error.code} to {request.method} {urllib.parse.urlsplit(url).path}"
+            ) from None
         except urllib.error.URLError:
             raise CheckError(f"GitHub could not be reached at {urllib.parse.urlsplit(url).path}") from None
 
@@ -160,7 +162,9 @@ class GitHub:
 
     def open_issue_texts(self, repository: str) -> list[str]:
         issues = self.pages(f"/repos/{repository}/issues", state="open")
-        return [f"{issue.get('title') or ''}\n{issue.get('body') or ''}" for issue in issues if "pull_request" not in issue]
+        return [
+            f"{issue.get('title') or ''}\n{issue.get('body') or ''}" for issue in issues if "pull_request" not in issue
+        ]
 
     def open_issue(self, repository: str, title: str, body: str) -> None:
         self._request(f"{self.api}/repos/{repository}/issues", {"title": title, "body": body})

@@ -121,6 +121,18 @@ def test_serious_advisories_on_recorded_ones(version: str, expected: list[tuple[
     assert [(found.identifier, found.fixed) for found in check.serious(RECORDED, version)] == expected
 
 
+PUBLISHED = "GHSA-94f4-hr76-p5j6"  # a published vLLM advisory, recorded from the database
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("0.21.1", [(PUBLISHED, "0.22.0")]), ("0.22.0", []), ("0.2.9", []), ("0.3.0", [(PUBLISHED, "0.22.0")])],
+)
+def test_serious_on_a_published_advisory(version: str, expected: list[tuple[str, str | None]]) -> None:
+    published = [advisory for advisory in RECORDED if advisory["ghsa_id"] == PUBLISHED]
+    assert [(found.identifier, found.fixed) for found in check.serious(published, version)] == expected
+
+
 def test_an_affected_version_fails_and_opens_one_plain_issue_once(
     github: StubGitHub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

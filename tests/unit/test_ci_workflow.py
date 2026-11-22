@@ -223,9 +223,12 @@ ADVISORIES = "advisories.yml"
 # What the advisory workflow's token may do, and the order of the levels a permission takes.
 ADVISORY_GRANTS = {"contents": "read", "issues": "write"}
 LEVELS = {"none": 0, "read": 1, "write": 2}
-# The ways a workflow is given AWS credentials: the action, its role input and the variables.
+# The ways a workflow is given AWS credentials: AWS's actions, their credential inputs, and any
+# `AWS_` variable (the SDKs read credentials from several, and new ones appear). The advisory
+# workflow has no use for any of them, so naming one, even with no value, is enough.
 AWS_CREDENTIAL = re.compile(
-    r"configure-aws-credentials|role-to-assume|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN"
+    r"aws-actions/|role-to-assume|aws-(access-key-id|secret-access-key|session-token)|\bAWS_\w+",
+    re.IGNORECASE,
 )
 # Neither key given: the job runs with the repository's default token, which may write anything.
 DEFAULT = "the default token permissions"
@@ -264,6 +267,15 @@ def beyond_advisory_grants(permissions: Any) -> list[str]:
     ]
 
 
+def keys(value: Any) -> set[Any]:
+    """Every mapping key under a YAML value, at any depth."""
+    if isinstance(value, dict):
+        return set(value).union(*(keys(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(keys(item) for item in value))
+    return set()
+
+
 def writes_issues(permissions: Any) -> bool:
     if isinstance(permissions, dict):
         return permissions.get("issues") == "write"
@@ -282,9 +294,9 @@ def permission_problems(workflows: dict[str, dict[str, Any]]) -> list[str]:
         if name != ADVISORIES:
             continue
         texts = strings(workflow)
-        if any(SECRETS_CONTEXT.search(text) for text in texts) or any(
-            "secrets" in job for job in (workflow.get("jobs") or {}).values()
-        ):
+        # A `secrets` key anywhere: one a job is given (`secrets: inherit`) or one the workflow
+        # declares (`on.workflow_call.secrets`), even optional and unused.
+        if any(SECRETS_CONTEXT.search(text) for text in texts) or "secrets" in keys(workflow):
             found.append(f"{name} names a secret")
         if any(AWS_CREDENTIAL.search(text) for text in texts):
             found.append(f"{name} names an AWS credential")
@@ -303,7 +315,15 @@ def test_only_the_advisory_workflow_writes_issues() -> None:
 
     jobs = workflows[ADVISORIES]["jobs"]
     advisory_job = next(iter(jobs))
-    step = {"uses": "aws-actions/configure-aws-credentials@v6", "with": {"aws-region": "us-east-1"}}
+
+    def with_step(step: dict[str, Any]) -> Any:
+        """A change that adds a last step to the advisory job, whatever its own steps are."""
+        return lambda w: w["jobs"][advisory_job]["steps"].append({"run": "true", **step})
+
+    def triggered(w: dict[str, Any]) -> dict[str, Any]:
+        return w.get("on", w.get(True))  # PyYAML reads the key `on` as the boolean true
+
+    aws_action = {"uses": "aws-actions/configure-aws-credentials@v6", "with": {"aws-region": "us-east-1"}}
     cases: list[tuple[str, Any, str]] = [
         (ADVISORIES, lambda w: w["permissions"].update({"pull-requests": "write"}), "asks for pull-requests: write"),
         (ADVISORIES, lambda w: w["permissions"].update({"contents": "write"}), "asks for contents: write"),
@@ -314,17 +334,16 @@ def test_only_the_advisory_workflow_writes_issues() -> None:
             f"the job {advisory_job} asks for id-token: write",
         ),
         (ADVISORIES, lambda w: w.pop("permissions"), f"the job {advisory_job} asks for {DEFAULT}"),
+        (ADVISORIES, with_step({"env": {"EXTRA": "${{ secrets.DEPLOY_TOKEN }}"}}), "names a secret"),
         (
             ADVISORIES,
-            lambda w: w["jobs"][advisory_job]["steps"][-1]["env"].update(EXTRA="${{ secrets.DEPLOY_TOKEN }}"),
+            lambda w: triggered(w).update(workflow_call={"secrets": {"EXAMPLE_INPUT": {"required": False}}}),
             "names a secret",
         ),
-        (ADVISORIES, lambda w: w["jobs"][advisory_job]["steps"].insert(0, step), "names an AWS credential"),
-        (
-            ADVISORIES,
-            lambda w: w["jobs"][advisory_job]["steps"][-1]["env"].update(AWS_ACCESS_KEY_ID="${{ vars.KEY }}"),
-            "names an AWS credential",
-        ),
+        (ADVISORIES, lambda w: w["jobs"][advisory_job].update(secrets="inherit"), "names a secret"),
+        (ADVISORIES, with_step(aws_action), "names an AWS credential"),
+        (ADVISORIES, with_step({"env": {"AWS_ACCESS_KEY_ID": "${{ vars.KEY }}"}}), "names an AWS credential"),
+        (ADVISORIES, lambda w: w.setdefault("env", {}).update(AWS_BEARER_TOKEN_BEDROCK=""), "names an AWS credential"),
         ("ci.yml", lambda w: w["permissions"].update({"issues": "write"}), "ci.yml: the workflow can write issues"),
         (
             "ci.yml",
