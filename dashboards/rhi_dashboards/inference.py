@@ -13,10 +13,10 @@ each pool of the configuration, of the panels of section 7.2's performance table
 | Transcript size and output per turn | The median and the 95th percentile of each request's input and output tokens | The same, from the tokens settled |
 | Cached share of input | Cached input tokens over input tokens | None |
 | Cache use against capacity | Each instance's cache use and preemptions; the capacity in tokens the lifecycle agent exports, beside the pool's expected capacity | None |
-| Sessions the cache forgot | The median and the 95th percentile of how long a block sat idle before it was evicted | None |
+| Sessions the cache forgot | The median and the 95th percentile of how long a block sat idle before it was evicted, and the blocks evicted | None |
 | Concurrent streams and the queue | Each instance's running and waiting requests | The requests in flight and held, summed over the gateway's tasks |
 | Students per instance, an average | None | The students with a request in the last five minutes, over the scaler's instances in service |
-| Cost per million output tokens, estimate (two panels) | None | The cost dashboard's estimated dollars over the gateway's output tokens, over the dashboard's range and for the month |
+| Cost per million output tokens, estimate | None | The cost dashboard's estimated dollars over the gateway's output tokens, over the dashboard's range; linked to the month's, on the cost dashboard |
 | Tokens per GPU-hour and per joule | Output throughput over the scaler's instances in service, and over the rate of the DCGM exporter's energy counter | None |
 
 **What a pool's engine does not give is not drawn.** An engine's names come from the per-engine
@@ -41,19 +41,22 @@ share, 85% by default.
 
 **Students are counted once.** The gateway's per-student counter of requests has one series for
 each alias and each gateway task (the collector labels a task's series with its ID): the query
-first takes, for each series, whether it counted a request in the last five minutes (it rose, or
-it appeared), then counts the pool's aliases among those, so two tasks that served one student
-count one. Over the instances in service it is an average: the gateway cannot know which instance
-serves a student (section 5.5). No series drawn carries an alias.
+first takes, for each series, whether it counted a request in the last five minutes (its value now
+differs from its value at the window's start, or it was not there then), then counts the pool's
+aliases among those, so two tasks that served one student count one. It reads zero while the
+scaler reports the pool and no student is at work. Over the instances in service it is an average:
+the gateway cannot know which instance serves a student (section 5.5). No series drawn carries an
+alias.
 
 **The cost is the cost dashboard's** (`rhi_dashboards.cost`): Auto Scaling's count of the pool's
 running instances, warm-pool preparation included, summed over the window and times the pool's
 configured hourly price, over the output tokens the gateway settled for the pool in that same
-window, in millions. Each is an estimate, and its title says so. One panel reads the dashboard's
-range; the other the month so far, in UTC, as AWS bills, by its own relative time (`now/M`): a
-Grafana panel has one range, and CloudWatch answers only inside it. So the dashboard is in UTC.
-Grafana keeps a panel's relative time only while the dashboard's range is relative: on fixed dates
-the month's panel reads those dates, and the cost dashboard holds the month.
+window, in millions. It is an estimate, and its title says so. The panel reads the dashboard's
+range, a past session's fixed dates included, as the cost dashboard's companion does. The month's
+estimate, from the start of the month to now, in UTC, as AWS bills, is the cost dashboard's own,
+and the panel links to it: CloudWatch answers only inside a panel's range, and on fixed dates
+Grafana gives every panel the dashboard's range, whatever relative time the panel asks for, so no
+panel of a dashboard with a time picker can hold the month. The dashboard is in UTC, as that one.
 
 Every panel follows the rules of `rhi_dashboards.rules`: a rate is taken per series and then
 summed, a percentile comes with the count of requests behind it over the same window and labels,
@@ -65,6 +68,7 @@ or not the pool has an instance.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 from grafana_foundation_sdk.builders import common as common_builders
@@ -120,9 +124,8 @@ CACHE = "Cache use against capacity, per instance"
 FORGOT = "Sessions the cache forgot: seconds a block sat idle before it was evicted"
 STREAMS = "Concurrent streams and the queue: requests"
 STUDENTS = "Students per instance, an average: students with a request in the last five minutes"
+COST = "Cost per million output tokens, estimate: the dashboard's range"
 PER_GPU = "Tokens per GPU-hour and per joule"
-COST_RANGE = "Cost per million output tokens, dashboard's range, estimate"
-COST_MONTH = "Cost per million output tokens, this month, estimate"
 TITLES = (
     SPEED,
     THROUGHPUT,
@@ -135,10 +138,12 @@ TITLES = (
     FORGOT,
     STREAMS,
     STUDENTS,
+    COST,
     PER_GPU,
-    COST_RANGE,
-    COST_MONTH,
 )
+# The cost panel's link to the month's estimate, which the cost dashboard holds.
+COST_MONTH_LINK = "Cost per million output tokens, this month, estimate: the Cost dashboard"
+COST_MONTH_URL = f"/d/{cost.UID}"
 
 # The legends of the reference lines. Only the expected ones start with EXPECTED.
 EXPECTED = "expected"
@@ -148,14 +153,15 @@ FLOOR_MEDIAN = "floor: median stream"
 FLOOR_SLOWEST_TENTH = "floor: slowest tenth"
 FLOOR_FIRST_TOKEN = "floor: 95th percentile"
 REPORTED_CAPACITY = f"reported capacity {{{{{INSTANCE}}}}}"
+# The count behind the idle times' percentiles: one observation for each block evicted.
+EVICTED_BLOCKS = "evicted blocks"
 
 # The units of the series read on the right-hand axis. Grafana gives each unit its own scale.
 TOKENS = "short"
 PREEMPTIONS_A_SECOND = "reqps"
 TOKENS_A_JOULE = "suffix: tokens/J"
 SECONDS_AN_HOUR = 3600
-# The month's cost panel: the month so far, in the dashboard's time zone, as AWS bills.
-THIS_MONTH = "now/M"
+# The cost dashboard's time zone, UTC, as AWS bills.
 TIME_ZONE = cost.TIME_ZONE
 
 METRICS: tuple[rules.Declared, ...] = (
@@ -350,7 +356,10 @@ def forgotten(pool: Pool) -> list[rules.Series]:
     """How long a block of the cache sat idle before it was evicted: none where the engine's row leaves it out."""
     if not _reports(pool, Further.BLOCK_IDLE_BEFORE_EVICTION):
         return []
-    return rules.engine_percentile_series(pool, Further.BLOCK_IDLE_BEFORE_EVICTION, legend="idle before eviction ")
+    found = rules.engine_percentile_series(pool, Further.BLOCK_IDLE_BEFORE_EVICTION, legend="idle before eviction ")
+    # The histogram observes blocks, not requests: its count is read as the blocks evicted.
+    *percentiles, observed = found
+    return [*percentiles, dataclasses.replace(observed, legend=EVICTED_BLOCKS)]
 
 
 def streams(pool: Pool) -> list[rules.Series]:
@@ -366,14 +375,23 @@ def streams(pool: Pool) -> list[rules.Series]:
     return measured
 
 
+def active(pool: Pool) -> str:
+    """Each series of the pool's per-student counter that counted a request in the last five
+    minutes: its value now differs from its value at the window's start (the latest sample at or
+    before it, so a request scraped just inside the window counts), or it was not there then (a
+    series appears holding its first request, and appears again after a restart)."""
+    series = rules.selector(STUDENT_REQUESTS + rules.COUNTER_SAMPLE, _gateway(pool), matching={ALIAS: ".+"})
+    before = f"{series} offset {STUDENT_WINDOW}"
+    return f"({series} != {before}) or ({series} unless {before})"
+
+
 def students(pool: Pool) -> str:
     """The pool's aliases with a request in the last five minutes, each counted once, however many
-    gateway tasks counted its requests: each series whose count rose in the window, or appeared in
-    it (a series appears holding its first request), then one per alias, then the aliases."""
-    series = rules.selector(STUDENT_REQUESTS + rules.COUNTER_SAMPLE, _gateway(pool), matching={ALIAS: ".+"})
-    window = STUDENT_WINDOW
-    active = f"(increase({series}[{window}]) > 0) or ({series} unless {series} offset {window})"
-    return f"count by ({rules.POOL}) (count by ({rules.POOL}, {ALIAS}) ({active}))"
+    gateway tasks counted its requests: one per alias of the active series, then the aliases; zero
+    while the scaler reports the pool and no alias is active."""
+    counted = f"count by ({rules.POOL}) (count by ({rules.POOL}, {ALIAS}) ({active(pool)}))"
+    none = f"0 * sum by ({rules.POOL}) ({rules.in_service(pool.name)})"
+    return f"({counted}) or ({none})"
 
 
 def students_per_instance(pool: Pool) -> list[rules.Series]:
@@ -394,12 +412,16 @@ def per_gpu(pool: Pool) -> list[rules.Series]:
     ]
 
 
-def cost_panels(pool: Pool) -> list[stat_builders.Panel]:
-    """The cost dashboard's estimated cost per million output tokens: over the dashboard's range,
-    and over the month so far, by the panel's own relative time while the range is relative."""
-    over_range = cost.per_million_stat(pool, of_session=True).title(COST_RANGE)
-    month = cost.per_million_stat(pool, of_session=False).title(COST_MONTH).time_from(THIS_MONTH)
-    return [over_range, month]
+def cost_panel(pool: Pool) -> stat_builders.Panel:
+    """The cost dashboard's estimated cost per million output tokens over the dashboard's range,
+    fixed dates included, linked to the month's estimate on the cost dashboard."""
+    description = (
+        f"The estimated cost of the pool's instances, at ${cost.price(pool)!r} an hour, over the output "
+        "tokens the gateway settled for the pool, in millions, over the dashboard's time range. The "
+        "month's, from the start of the month, UTC, to now, is on the Cost dashboard (the panel's link)."
+    )
+    link = dashboard_builders.DashboardLink(COST_MONTH_LINK).type(models.DashboardLinkType.LINK).url(COST_MONTH_URL)
+    return cost.per_million_stat(pool, of_session=True).title(COST).description(description).links([link])
 
 
 def _flag(panel: timeseries_builders.Panel, threshold: float) -> timeseries_builders.Panel:
@@ -437,7 +459,7 @@ def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel | stat_
     speed_series, speed_lines = speed(pool, config)
     first_series, first_lines = first_token(pool, config)
     cache_series, cache_lines = cache(pool)
-    rows: list[tuple[str, list[rules.Series], list[rules.Series], str]] = [
+    rows: list[tuple[str, list[rules.Series], list[rules.Series], str] | stat_builders.Panel] = [
         (SPEED, speed_series, speed_lines, "short"),
         (THROUGHPUT, throughput(pool), [], "short"),
         (FIRST_TOKEN, first_series, first_lines, "s"),
@@ -449,17 +471,22 @@ def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel | stat_
         (FORGOT, forgotten(pool), [], "s"),
         (STREAMS, streams(pool), [], "short"),
         (STUDENTS, students_per_instance(pool), [], "short"),
+        cost_panel(pool),
         (PER_GPU, per_gpu(pool), [], "short"),
     ]
     found: list[timeseries_builders.Panel | stat_builders.Panel] = []
-    for title, measured, references, unit in rows:
+    for row in rows:
+        if not isinstance(row, tuple):
+            found.append(row)
+            continue
+        title, measured, references, unit = row
         if not measured:
             continue
         panel = rules.pool_timeseries(pool, title, [*measured, *references]).unit(unit).min(0)
         if title == CACHED_SHARE:
             panel = _flag(panel.max(1), config.cached_share_flag_percent / 100)
         found.append(panel)
-    return [*found, *cost_panels(pool)]
+    return found
 
 
 def dashboard(config: Config) -> dashboard_builders.Dashboard:

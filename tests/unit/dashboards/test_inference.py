@@ -92,6 +92,9 @@ def test_the_coursework_row_holds_every_panel_with_both_sources(example: rhi_con
     row = rows(example)["coursework"]
 
     assert list(row) == list(inference.TITLES)
+    # The six panels of cache, load and cost follow the seven of speed and latency, one for each.
+    new = (inference.CACHE, inference.FORGOT, inference.STREAMS, inference.STUDENTS, inference.COST, inference.PER_GPU)
+    assert list(row)[7:] == list(new)
     expressions = {title: " ".join(series(panel).values()) for title, panel in row.items()}
     computed = rules.engine_selector(coursework, Further.COMPUTED_INPUT_TOKENS)
     assert 'source="local_compute"' in computed
@@ -136,6 +139,7 @@ def test_the_mock_row_draws_nothing_its_engine_leaves_out(example: rhi_config.Co
 
     left_out = (inference.PREFILL, inference.FORGOT, inference.PER_GPU)
     assert list(row) == [title for title in inference.TITLES if title not in left_out]
+    assert len(row) == len(rows(example)["coursework"]) - len(left_out)
     # The cache panel: its use and the reported capacity, no preemptions.
     assert {legend.split(" {{")[0] for legend in series(row[inference.CACHE])} == {
         "cache use",
@@ -231,10 +235,12 @@ def test_the_new_panels_read_their_sources(example: rhi_config.Config) -> None:
     axes = units(cache)
     assert axes[inference.EXPECTED_LOW] == axes[inference.EXPECTED_HIGH] == axes[inference.REPORTED_CAPACITY]
 
-    # The sessions the cache forgot: the engine's idle time before eviction, with its count.
-    forgot = expressions[inference.FORGOT]
-    assert rules.engine_quantile(coursework, 0.95, Further.BLOCK_IDLE_BEFORE_EVICTION) in forgot
-    assert rules.engine_request_count(coursework, Further.BLOCK_IDLE_BEFORE_EVICTION) in forgot
+    # The sessions the cache forgot: the engine's idle time before eviction, with the blocks it observed.
+    forgot = series(row[inference.FORGOT])
+    assert rules.engine_quantile(coursework, 0.95, Further.BLOCK_IDLE_BEFORE_EVICTION) in " ".join(forgot.values())
+    count = rules.engine_request_count(coursework, Further.BLOCK_IDLE_BEFORE_EVICTION)
+    assert count in forgot[inference.EVICTED_BLOCKS]
+    assert not [legend for legend in forgot if "request" in legend]
 
     # Streams: each instance's running and waiting requests, and the gateway's in flight and held.
     for quantity in (Quantity.RUNNING_REQUESTS, Quantity.WAITING_REQUESTS):
@@ -253,18 +259,14 @@ def test_the_new_panels_read_their_sources(example: rhi_config.Config) -> None:
     assert rules.in_service("coursework") in per_gpu
     assert rules.rate(gpu.ENERGY_SERIES, {"pool": "coursework"}) in per_gpu
 
-    # Cost: the cost dashboard's own computation, over the dashboard's range and the month so far.
-    for title in (inference.COST_RANGE, inference.COST_MONTH):
-        assert "estimate" in title.lower()
-        assert "estimate" in row[title]["title"].lower()
-    session = rows(example, cost.SESSION_UID)["coursework"]
-    month = rows(example, cost.UID)["coursework"]
-    (over_range,) = session.values()
-    (over_month,) = [panel for title, panel in month.items() if "per million" in title]
-    assert row[inference.COST_RANGE]["targets"] == over_range["targets"]
-    assert row[inference.COST_MONTH]["targets"] == over_month["targets"]
-    assert row[inference.COST_MONTH]["timeFrom"] == "now/M"
-    assert "timeFrom" not in row[inference.COST_RANGE]
+    # Cost: one panel, the cost dashboard's own computation over the dashboard's range, whatever its
+    # dates, linked to the month's estimate on the cost dashboard.
+    panel = row[inference.COST]
+    assert "estimate" in panel["title"].lower()
+    (over_range,) = rows(example, cost.SESSION_UID)["coursework"].values()
+    assert panel["targets"] == over_range["targets"]
+    assert "timeFrom" not in panel
+    assert [link["url"] for link in panel["links"]] == [f"/d/{cost.UID}"]
     assert built(example).document()["timezone"] == cost.TIME_ZONE
 
 
@@ -274,34 +276,67 @@ def test_the_gpu_panel_is_only_for_a_pool_with_a_gpu(example: rhi_config.Config)
         assert (inference.PER_GPU in found[one.name]) is (one.engine != "mock"), one.name
 
 
-def test_a_student_counts_once(example: rhi_config.Config) -> None:
+# A series of the per-student counter: its labels, and its samples as (seconds, value).
+type Reported = list[tuple[dict[str, str], list[tuple[int, float]]]]
+LOOKBACK = 300
+
+
+def latest(samples: list[tuple[int, float]], at: int) -> float | None:
+    """What Prometheus reads of a series at a time: its latest sample within the lookback."""
+    found = [value for time, value in samples if at - LOOKBACK < time <= at]
+    return found[-1] if found else None
+
+
+def students_at(example: rhi_config.Config, reported: Reported, at: int, in_service: int) -> dict[tuple[str, ...], float]:
+    """The students-per-instance query of the coursework pool, evaluated on the series reported."""
     coursework = pool(example, "coursework")
-    query = inference.students(coursework)
-    assert query in series(rows(example)["coursework"][inference.STUDENTS])["students per instance"]
-    shape = re.fullmatch(r"count by \((?P<outer>[^)]*)\) \(count by \((?P<inner>[^)]*)\) \((?P<active>.*)\)\)", query)
+    query = series(rows(example)["coursework"][inference.STUDENTS])["students per instance"]
+    assert inference.students(coursework) in query
+    assert rules.in_service("coursework") in query
+    shape = re.fullmatch(
+        r"\(count by \((?P<outer>[^)]*)\) \(count by \((?P<inner>[^)]*)\) \((?P<active>.*)\)\)\) or \(0 \* (?P<zero>.*)\)",
+        inference.students(coursework),
+    )
     assert shape is not None
+    assert shape["zero"] == f"sum by ({shape['outer']}) ({rules.in_service('coursework')})"
     outer, inner = (tuple(label.strip() for label in shape[part].split(",")) for part in ("outer", "inner"))
-    # Every selector of the counter keeps the aliases that are not empty.
-    selectors = re.findall(rf"{gateway_metrics.REQUESTS}_total\{{([^}}]*)\}}", shape["active"])
-    assert selectors
-    (pattern,) = {match[1] for one in selectors if (match := re.search(r'alias=~"([^"]*)"', one))}
-    assert all("alias=~" in one for one in selectors)
+    # A series counted a request when its value differs from the one at the window's start, or it
+    # was not there then.
+    active = re.fullmatch(r"\((?P<s>\w+\{[^}]*\}) != (?P=s) offset 5m\) or \((?P=s) unless (?P=s) offset 5m\)", shape["active"])
+    assert active is not None
+    (pattern,) = re.findall(r'alias=~"([^"]*)"', active["s"])
+    assert active["s"].startswith(f"{gateway_metrics.REQUESTS}_total{{")
 
-    def count(reported: list[dict[str, str]]) -> dict[tuple[str, ...], int]:
-        """The query's two counts over the series that counted a request in the window."""
-        kept = [labels for labels in reported if re.fullmatch(pattern, labels.get("alias", ""))]
-        students = {tuple(labels.get(label, "") for label in inner) for labels in kept}
-        counted: dict[tuple[str, ...], int] = {}
-        for student in students:
-            key = tuple(dict(zip(inner, student, strict=True))[label] for label in outer)
-            counted[key] = counted.get(key, 0) + 1
-        return counted
+    students: set[tuple[str, ...]] = set()
+    for labels, samples in reported:
+        now, before = latest(samples, at), latest(samples, at - LOOKBACK)
+        if now is not None and now != before and re.fullmatch(pattern, labels.get("alias", "")):
+            students.add(tuple(labels.get(label, "") for label in inner))
+    counted: dict[tuple[str, ...], float] = {}
+    for student in students:
+        key = tuple(dict(zip(inner, student, strict=True))[label] for label in outer)
+        counted[key] = counted.get(key, 0) + 1
+    if not counted:
+        counted = {("coursework",): 0}
+    return {key: value / in_service for key, value in counted.items()} if in_service else {}
 
+
+def test_a_student_counts_once(example: rhi_config.Config) -> None:
     # One alias whose requests two gateway tasks reported, beside a request of no student.
-    one_student = [
-        {"pool": "coursework", "alias": "otter", "instance": "task-a"},
-        {"pool": "coursework", "alias": "otter", "instance": "task-b"},
-        {"pool": "coursework", "alias": "", "instance": "task-a"},
+    rose = [(0, 1.0), *((time, 2.0) for time in range(15, 301, 15))]
+    one_student: Reported = [
+        ({"pool": "coursework", "alias": "otter", "instance": "task-a"}, rose),
+        ({"pool": "coursework", "alias": "otter", "instance": "task-b"}, rose),
+        ({"pool": "coursework", "alias": "", "instance": "task-a"}, rose),
     ]
-    assert count(one_student) == {("coursework",): 1}
-    assert count([*one_student, {"pool": "coursework", "alias": "heron", "instance": "task-b"}]) == {("coursework",): 2}
+    assert students_at(example, one_student, 301, in_service=1) == {("coursework",): 1}
+    # A series that appeared in the window holds its first request; a second alias is a second student.
+    heron = ({"pool": "coursework", "alias": "heron", "instance": "task-b"}, [(200, 1.0), (215, 1.0)])
+    assert students_at(example, [*one_student, heron], 301, in_service=1) == {("coursework",): 2}
+
+
+def test_an_idle_pool_has_no_student_per_instance(example: rhi_config.Config) -> None:
+    flat = [(time, 2.0) for time in range(0, 301, 15)]
+    idle: Reported = [({"pool": "coursework", "alias": "otter", "instance": instance}, flat) for instance in "ab"]
+    assert students_at(example, idle, 301, in_service=1) == {("coursework",): 0}
+    assert students_at(example, idle, 301, in_service=0) == {}
