@@ -25,8 +25,8 @@ def of_pool(template: dict[str, Any], kind: str, pool: str) -> dict[str, dict[st
 @pytest.fixture(scope="module")
 def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> dict[str, Any]:
     stage = app.node.find_child("Rhi")
-    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     return templates[path]
 
 

@@ -393,7 +393,7 @@ def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_ste
             return [one for one in series if one.samples]
 
     rehearsal.workspace = OutOfPhase(*instances)
-    rehearsal.clock.at = START + 300  # ty: ignore[unresolved-attribute] - the test's clock
+    rehearsal.clock.at = START + 300  # ty: ignore[missing-attribute] - the test's clock
     deadline = START + rehearsal.duration
     asyncio.run(rehearsal.started_instances(START, deadline))
     started = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
@@ -430,7 +430,7 @@ def test_a_first_scrape_long_after_its_stages_ended_leaves_the_earliest_unknown(
             ]
 
     rehearsal.workspace = Late(*instances)
-    rehearsal.clock.at = START + 300  # ty: ignore[unresolved-attribute] - the test's clock
+    rehearsal.clock.at = START + 300  # ty: ignore[missing-attribute] - the test's clock
     asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
     # Its latest is after the hour's start and nothing bounds it from below: it may have begun in the
     # hour, so it is written with its stages, and not as certain.
@@ -460,7 +460,7 @@ def test_a_launch_without_its_boot_is_not_bounded_from_below_by_its_own_scrapes(
             ]
 
     rehearsal.workspace = Unbooted(*instances)
-    rehearsal.clock.at = START + 120  # ty: ignore[unresolved-attribute] - the test's clock
+    rehearsal.clock.at = START + 120  # ty: ignore[missing-attribute] - the test's clock
     asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
     (started,) = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
     assert (started["in_hour"], started["began_after_at"], started["stages"]) == ("uncertain", None, stages)

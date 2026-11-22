@@ -264,7 +264,7 @@ def test_the_canary_key_does_not_follow_a_redirect(monkeypatch: pytest.MonkeyPat
         else:
             response = addinfourl(io.BytesIO(body), headers, request.full_url, 200)
         # urllib reads the reason of a real HTTP answer from `msg`, which the stub of addinfourl leaves out.
-        response.msg = ""  # ty: ignore[unresolved-attribute]
+        response.msg = ""  # ty: ignore[missing-attribute]
         return response
 
     monkeypatch.setattr(urllib.request, "_opener", None)

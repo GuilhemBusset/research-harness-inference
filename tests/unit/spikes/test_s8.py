@@ -482,7 +482,7 @@ def test_the_load_is_held_until_the_scaler_reads_two_instances_in_service(
     clock, stopped = _Clock(1000), []
 
     async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
-        await load.sessions[0].stop.wait()  # ty: ignore[unresolved-attribute] - the load's held streams
+        await load.sessions[0].stop.wait()  # ty: ignore[missing-attribute] - the load's held streams
         stopped.append(clock.now)
         return []
 
@@ -683,7 +683,7 @@ def test_scale_out_ends_only_with_exactly_two_in_service(monkeypatch: pytest.Mon
             return 0
 
     async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
-        await load.sessions[0].stop.wait()  # ty: ignore[unresolved-attribute] - the load's held streams
+        await load.sessions[0].stop.wait()  # ty: ignore[missing-attribute] - the load's held streams
         stopped_at.append(poll)
         return []
 

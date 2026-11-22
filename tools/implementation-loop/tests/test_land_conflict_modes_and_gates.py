@@ -211,7 +211,7 @@ class LandConflictModesAndGatesTests(unittest.TestCase):
             observed.append(wt)
             return result
 
-        agents.examine = outside_lane  # ty: ignore[invalid-assignment]  # test double
+        agents.examine = outside_lane
         self.run_engine(agents)
         self.assert_done()
         self.assertTrue(observed)

@@ -113,7 +113,7 @@ def test_a_counter_counts_each_sample_once_across_exactly_the_range() -> None:
 
 
 def seconds(duration: str) -> int:
-    number, unit = re.fullmatch(r"([0-9]+)([sm])", duration).groups()  # ty: ignore[unresolved-attribute] - a test's own duration
+    number, unit = re.fullmatch(r"([0-9]+)([sm])", duration).groups()  # ty: ignore[missing-union-attribute] - a test's own duration
     return int(number) * {"s": 1, "m": 60}[unit]
 
 
