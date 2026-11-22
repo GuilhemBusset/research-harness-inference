@@ -161,7 +161,7 @@ def test_a_recorded_answer_of_the_workspace_reads_back_as_its_series() -> None:
 
 
 def test_the_canary_keys_come_from_the_spikes_secret() -> None:
-    held = SpikeKeys(students=(generate_key(), generate_key()), spent=generate_key())
+    held = SpikeKeys(students=(generate_key(), generate_key()))
     asked: list[str] = []
 
     class Secrets:
@@ -171,14 +171,33 @@ def test_the_canary_keys_come_from_the_spikes_secret() -> None:
             asked.append(SecretId)
             return {"SecretString": self.value}
 
+    # The secret is written with the students alone.
+    assert set(json.loads(held.to_json())) == {"students"}
     assert common.canary_keys(Secrets()) == held
     assert asked == [SPIKE_KEYS_SECRET]
     # A reading does not show its keys.
-    assert not any(key in repr(held) for key in (*held.students, held.spent))
+    assert not any(key in repr(held) for key in held.students)
 
-    # A secret of another content is refused, and the error repeats nothing of it.
+    # A secret of the earlier shape, with a spent student's key, reads to the same students; that
+    # key is ignored, and kept nowhere.
+    spent = generate_key()
+    Secrets.value = json.dumps({"students": list(held.students), "spent": spent})
+    earlier = common.canary_keys(Secrets())
+    assert earlier == held
+    assert spent not in repr(vars(earlier))
+
+    # A secret of another content is refused, and the error repeats nothing of it: not JSON, no
+    # students in either shape, a key that is not valid, another set of fields.
     stray = generate_key()
-    for value in (stray, json.dumps({"students": [], "spent": stray}), json.dumps({"students": [stray]})):
+    for value in (
+        stray,
+        json.dumps({"students": []}),
+        json.dumps({"students": [], "spent": stray}),
+        json.dumps({"students": [stray[:-1]]}),
+        json.dumps({"students": [stray, "not a key"]}),
+        json.dumps({"students": [stray], "other": stray}),
+        json.dumps({"keys": [stray]}),
+    ):
         Secrets.value = value
         with pytest.raises(ValueError, match="keys") as refused:
             common.canary_keys(Secrets())

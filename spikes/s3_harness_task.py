@@ -1269,7 +1269,7 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
     keys = common.canary_keys()
     session = boto3.Session()
     workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
-    lines = Lines((*keys.students, keys.spent), out=out)
+    lines = Lines(keys.students, out=out)
     with tempfile.TemporaryDirectory(prefix="rhi-s3-") as work:
         failures = Job(
             pool=name,

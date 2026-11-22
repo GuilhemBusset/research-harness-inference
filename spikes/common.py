@@ -15,7 +15,7 @@ that falls between two samples is interpolated between them, as Prometheus's own
 for the service `aps`, and returns each series as its labels and its samples.
 
 **The canary students.** `canary_keys` reads their keys from the spikes' secret
-(`rhi_common.spike_keys`): the students with the default budget, and the one whose budget is spent.
+(`rhi_common.spike_keys`), one key for each student.
 
 **Posting.** A job cannot post a commit status. `run_spike` hands one run's numbers to the reporter
 as the measurement event of `rhi_reporter.measure`, on the bus the variable `RHI_MEASUREMENT_BUS`
