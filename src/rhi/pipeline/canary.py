@@ -40,12 +40,18 @@ resource of the stage:
 - read the canary's secret, `rhi/canary-key`, and no other;
 - query the stage's Prometheus workspace, by the tag that names its stage;
 - read the release parameter of each pool the stage deploys, by its name;
+- query the stage's heartbeats table, `dynamodb:Query` and no other action of DynamoDB, named by the
+  verification's ARN pattern (`rhi.pipeline.verify.heartbeats_table_arn`), under the condition
+  `ForAllValues:StringEquals` that `dynamodb:LeadingKeys` is the coursework pool's name alone: the
+  rows the coursework pool's instances write, which the smoke test `release-heartbeat` reads, and
+  no other pool's (the form of the pools' instance role, `rhi.pools.role`). The table's name is in
+  the coursework pool's release parameter, so nothing lists or describes it;
 - put the measurement event on the measurement bus;
 - use the pipeline's connection to read the repository and write to its own log group: what any
   CodeBuild project needs to run at all.
 
-No action of CodePipeline, DynamoDB, Auto Scaling, EC2 or IAM: the verification's query of the
-heartbeats table is not the canary's, so its run leaves out the one smoke test that reads that table
+No action of CodePipeline, Auto Scaling, EC2 or IAM, and no other action of DynamoDB, so the run
+makes every smoke test the verification makes on the coursework pool after a refresh
 (`scripts/pipeline/canary_result.py`). The project is given the role as one that takes no new
 statement (`without_policy_updates`), as the spike jobs are, so CodeBuild's construct adds nothing
 to it. It runs CodeBuild's standard image and is not privileged. It keeps
@@ -71,7 +77,7 @@ from rhi.observability.stack import STAGE_TAG
 from rhi.pipeline import reporter
 from rhi.pipeline.spikes import CONNECTION_ACTIONS
 from rhi.pipeline.synth import UV_VERSION, import_path
-from rhi.pipeline.verify import CANARY_SECRET
+from rhi.pipeline.verify import CANARY_SECRET, heartbeats_table_arn
 from rhi.stage import EndpointStage
 
 # The project's and the rule's fixed name, by which the owner finds the job and its schedule.
@@ -82,6 +88,8 @@ SCHEDULE = events.Schedule.cron(minute="0", hour="4", week_day="SUN")
 # The branch the job runs from: the one the pipeline deploys.
 BRANCH = "main"
 LOG_GROUP_NAME = f"/aws/codebuild/{NAME}"
+# The one pool the canary tests, whose heartbeat rows alone its role may query.
+POOL = "coursework"
 LOG_RETENTION = logs.RetentionDays.ONE_YEAR
 # A cold wake of the coursework pool, the hold, the smoke tests and the workspace's lag.
 TIMEOUT = cdk.Duration.hours(2)
@@ -219,4 +227,13 @@ class GpuCanary(Construct):
         ]
         if parameters:
             statements.append(iam.PolicyStatement(actions=["ssm:GetParameter"], resources=parameters))
+        # The coursework pool's heartbeat rows: a query of the stage's heartbeats table, by the
+        # verification's pattern, whose partition key may only be that pool's name.
+        statements.append(
+            iam.PolicyStatement(
+                actions=["dynamodb:Query"],
+                resources=[heartbeats_table_arn(stack, stage)],
+                conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [POOL]}},
+            )
+        )
         return statements
