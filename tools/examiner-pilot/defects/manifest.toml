@@ -32,11 +32,11 @@ invariants = ["a resource exposed to the internet without the issue asking"]
 
 [classes.retention-removed]
 title = "A retention or a deletion protection removed"
-invariants = ["data loss"]
+invariants = ["stored data deleted or made unrecoverable"]
 
 [classes.gate-weakened]
 title = "A gate or a test weakened"
-invariants = ["check or gate bypass", "a pipeline, ruleset or gate change that bypasses review"]
+invariants = ["a ci job, gate script, git hook or required check weakened", "a pipeline, ruleset or gate change that bypasses review"]
 
 # ------------------------------------------------------------------ an IAM policy broader than the change needs
 

@@ -339,7 +339,8 @@ are recorded here as proposed and are part of what the owner approves.
    or revert follows from them. And a command that several criteria name runs once per
    verification. The builder may change any file, its tests and commands included; the examiner
    reviews every change to a test in the diff, and one that weakens what an item or an invariant
-   needs proven is a finding under "check or gate bypass". What stays: the hygiene scan and the
+   needs proven is a finding (under the invariant about a weakened check when the test proves a
+   gate or an invariant, otherwise quoting the item). What stays: the hygiene scan and the
    issue's commands on the exact head, the protected paths of decision 10 with the
    `protected_change` request, the examiner's certificate, `required` on the merged head (CI runs
    every test on each pull request and on each push to `main`), and the deployment verdict of
