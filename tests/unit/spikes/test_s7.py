@@ -315,7 +315,7 @@ def test_a_gap_in_the_workspace_loses_no_observation_it_can_still_read(gap: str)
             return []
         return read(query, **window)
 
-    scaler.read_series = gapped  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    scaler.read_series = gapped
     run, _, out = a_run(scaler)
     asyncio.run(run.cycle())
 
@@ -402,7 +402,7 @@ def test_a_warm_reading_the_workspace_shows_late_is_waited_for_past_the_settle_t
             end = min(end, second + 299)
         return read(query, start=start, end=end, step=step)
 
-    scaler.read_series = lagging  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    scaler.read_series = lagging
     run, _, out = a_run(scaler)
     asyncio.run(run.cycle())
     assert [line["path"] for line in of(parsed(out), "scale_in")] == ["terminated", "warm_pool"]
@@ -444,7 +444,7 @@ def test_warm_readings_the_workspace_shows_late_are_waited_for_before_a_path_is_
             end = min(end, second + 100)
         return read(query, start=start, end=end, step=step)
 
-    scaler.read_series = lagging  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    scaler.read_series = lagging
     run, _, out = a_run(scaler)
     asyncio.run(run.cycle())
     assert [line["path"] for line in of(parsed(out), "scale_in")] == ["terminated", "warm_pool"]
@@ -512,7 +512,7 @@ def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be() -> No
                 scaler.instances[returns] = kept
         return read(query, **window)
 
-    scaler.read_series = delayed  # ty: ignore[invalid-assignment] - a stub's method replaced by the test
+    scaler.read_series = delayed
     run, _, out = a_run(scaler)
     asyncio.run(run.cycle())
 

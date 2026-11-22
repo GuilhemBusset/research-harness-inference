@@ -40,8 +40,8 @@ def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
 @pytest.fixture(scope="module")
 def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> dict[str, Any]:
     stage = app.node.find_child("Rhi")
-    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     return templates[path]
 
 
@@ -99,7 +99,7 @@ def test_the_role_is_the_mock_pools_and_the_launch_templates(
 
 
 def test_writes_only_its_pools_heartbeat_rows(app: cdk.App, statements: list[dict[str, Any]]) -> None:
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
     heartbeats = stack.resolve(stack.get_logical_id(stack.tables.heartbeats.node.default_child))
     (statement,) = with_service(statements, "dynamodb")
     assert statement["Effect"] == "Allow"

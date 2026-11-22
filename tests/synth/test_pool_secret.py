@@ -89,8 +89,8 @@ def value_holders(templates: Mapping[str, Mapping[str, Any]]) -> list[str]:
 @pytest.fixture(scope="module")
 def pools(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> dict[str, Any]:
     stage = app.node.find_child("Rhi")
-    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     return templates[path]
 
 
@@ -105,7 +105,7 @@ def test_one_generated_secret_for_the_mock_pool_exposed_by_the_stack(app: cdk.Ap
     assert generated["ExcludePunctuation"] is True
     assert generated["PasswordLength"] >= 32
     # Another construct reaches the secret through the stack, by the pool's name.
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
     assert stack.resolve(stack.secrets["mock"].secret.secret_arn) == {"Ref": name}
 
 

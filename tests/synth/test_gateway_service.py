@@ -439,7 +439,7 @@ def test_both_containers_log_to_rhi_gateway_which_keeps_90_days(gateway: Gateway
 def test_the_admin_finds_the_log_group_by_its_logical_id(app: cdk.App) -> None:
     from rhi_admin import main
 
-    stack = app.node.find_child("Rhi").gateway  # ty: ignore[unresolved-attribute]
+    stack = app.node.find_child("Rhi").gateway  # ty: ignore[missing-attribute]
     assert stack.stack_name == main.GATEWAY_STACK_NAME
     logical_id = stack.resolve(stack.get_logical_id(stack.service.log_group.node.default_child))
     assert logical_id == main.GATEWAY_LOG_GROUP_LOGICAL_ID

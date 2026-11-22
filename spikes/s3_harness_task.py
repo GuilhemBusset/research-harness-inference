@@ -812,7 +812,7 @@ def write_filler(folder: Path, word: str, rng: random.Random) -> None:
     """The files the compaction step reads: text of common words, the last file ending with `word`."""
     folder.mkdir(parents=True, exist_ok=True)
     for number in range(1, FILLER_FILES + 1):
-        lines = [" ".join(rng.choices(_FILLER, k=FILLER_WORDS_A_LINE)) for _ in range(FILLER_LINES)]
+        lines: list[str] = [" ".join(rng.choices(_FILLER, k=FILLER_WORDS_A_LINE)) for _ in range(FILLER_LINES)]
         if number == FILLER_FILES:
             lines.append(f"The last word is {word}")
         (folder / filler_name(number)).write_text("\n".join(lines) + "\n", encoding="utf-8")

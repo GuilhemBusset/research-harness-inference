@@ -220,8 +220,8 @@ class Release:
 def mock(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]) -> Release:
     """The mock pool's release in the app."""
     stage = app.node.find_child("Rhi")
-    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    outdir = Path(stage.outdir)  # ty: ignore[unresolved-attribute]
+    stack = stage.pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    outdir = Path(stage.outdir)  # ty: ignore[missing-attribute]
     assets = json.loads((outdir / f"{stack.artifact_id}.assets.json").read_text(encoding="utf-8"))
     return Release(
         templates[(outdir / stack.template_file).relative_to(cloud_assembly).as_posix()], outdir, assets, "mock"
@@ -316,7 +316,7 @@ def test_the_agent_reads_the_parameter(app: cdk.App, mock: Release) -> None:
     assert config.SSM_PREFIX == "/rhi/config/"
 
     current = agent_release.parse_current(sample(mock.parameter["Value"]))
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
     group = mock.group
     heartbeats = stack.resolve(stack.get_logical_id(stack.tables.heartbeats.node.default_child))
     assert current.settings == agent_release.Settings(

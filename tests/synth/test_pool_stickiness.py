@@ -51,8 +51,8 @@ def test_every_pool_of_the_example_keeps_a_student_for_an_hour(
     app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]]
 ) -> None:
     stage = app.node.find_child("Rhi")
-    stack = stage.pools  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.pools  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     assert [(pool.name, pool.stickiness_seconds) for pool in EXAMPLE.pools] == [("coursework", 3600), ("mock", 3600)]
     assert affinity(templates[path]) == [sticky_for(pool.stickiness_seconds) for pool in EXAMPLE.pools]
     assert affinity(templates[path]) == [sticky_for(3600), sticky_for(3600)]

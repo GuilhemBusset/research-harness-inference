@@ -85,7 +85,7 @@ class SupervisorTests(unittest.TestCase):
         engine = Engine.__new__(Engine)
         engine.store, engine.faults, engine.repo_root = RunStore.for_root(self.root, ROOT), FaultOutbox(self.root), self.root
         engine.plan, engine.log = SimpleNamespace(root=ROOT), lambda m: None  # ty: ignore[invalid-assignment]  # test double
-        engine._set_phase = engine._wait = lambda *a, **k: None  # ty: ignore[invalid-assignment]  # test double
+        engine._set_phase = engine._wait = lambda *a, **k: None
         return engine
 
     def filed(self, stall: bool) -> None:

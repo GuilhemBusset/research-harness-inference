@@ -146,7 +146,7 @@ def test_one_function_at_a_time_packaged_without_docker_logging_to_rhi_scaler(
         handler=HANDLER,
         code=packaging.function_code("scaler", lambda_.Architecture.ARM_64),
     )
-    expected = stack.resolve(probe.node.default_child.code)["s3Key"]  # ty: ignore[unresolved-attribute]
+    expected = stack.resolve(probe.node.default_child.code)["s3Key"]  # ty: ignore[missing-attribute]
     assert function["Code"]["S3Key"] == expected
 
 
@@ -236,10 +236,10 @@ def test_the_stage_reaches_the_function_and_nothing_else_may_invoke_it(app: cdk.
     from aws_cdk import aws_lambda as lambda_
 
     stage = app.node.find_child("Rhi")
-    function = stage.pools.scaler.function  # ty: ignore[unresolved-attribute]
+    function = stage.pools.scaler.function  # ty: ignore[missing-attribute]
     assert isinstance(function, lambda_.Function)
     function_id, _ = scaler_function(pools)
-    assert stage.pools.resolve(function.function_arn) == {"Fn::GetAtt": [function_id, "Arn"]}  # ty: ignore[unresolved-attribute]
+    assert stage.pools.resolve(function.function_arn) == {"Fn::GetAtt": [function_id, "Arn"]}  # ty: ignore[missing-attribute]
 
     invokers = [
         permission
@@ -264,7 +264,7 @@ def test_the_stage_reaches_the_function_and_nothing_else_may_invoke_it(app: cdk.
 def test_the_admin_finds_the_function_and_the_pool_state_table_by_their_logical_ids(app: cdk.App) -> None:
     from rhi_admin import main
 
-    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute]
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[missing-attribute]
     assert stack.stack_name == main.POOLS_STACK_NAME
     function = stack.resolve(stack.get_logical_id(stack.scaler.function.node.default_child))
     table = stack.resolve(stack.get_logical_id(stack.tables.by_name["pool-state"].node.default_child))
