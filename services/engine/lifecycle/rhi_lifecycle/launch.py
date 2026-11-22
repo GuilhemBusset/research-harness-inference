@@ -404,7 +404,11 @@ class Launch:
         finally:
             # The hook stage of a launch that passed. An abandoned launch is in no stage by now.
             start.timings.end()
-        return Outcome.CONTINUED if result == CONTINUE else Outcome.ABANDONED
+        if result != CONTINUE:
+            return Outcome.ABANDONED
+        # Auto Scaling took the completion: the launch is one completed.
+        start.timings.completed()
+        return Outcome.CONTINUED
 
     def _start(self, current: release.Current, instance: str, transition: Transition) -> _Start:
         digest, revision = identity(current.release)

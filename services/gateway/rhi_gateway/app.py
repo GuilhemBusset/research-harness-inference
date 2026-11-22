@@ -107,6 +107,7 @@ from starlette.responses import Response
 from starlette.routing import BaseRoute, Match, NoMatchFound
 from starlette.types import Receive, Scope, Send
 
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
@@ -197,6 +198,8 @@ def build_app(
     heartbeat: Heartbeat | None = None,
     metrics: Metrics | None = None,
     readiness: Readiness | None = None,
+    wait_buckets: tuple[float, ...] = WAIT_BUCKETS,
+    speed_buckets: tuple[float, ...] = SPEED_BUCKETS,
 ) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
@@ -207,7 +210,8 @@ def build_app(
     `metrics`, when given, counts every request the application answers, the local routes, the
     refusals and the paths outside the table included (`rhi_gateway.metrics`). Its registry then
     also holds what students experience (`rhi_gateway.experience`), which the forwarded routes
-    report, with the heartbeat's own counts of the requests in flight and held when it is given too.
+    report, with the heartbeat's own counts of the requests in flight and held when it is given too,
+    in `wait_buckets` and `speed_buckets` (the settings' own, with the configured floors).
 
     `local`, when given, answers the models, status, wake and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
@@ -231,7 +235,14 @@ def build_app(
     )
     # Where the forwarded routes find it (`_experience`): the handlers are made before the application.
     app.state.experience = (
-        None if metrics is None else Experience(metrics.registry, None if heartbeat is None else heartbeat.rows)
+        None
+        if metrics is None
+        else Experience(
+            metrics.registry,
+            None if heartbeat is None else heartbeat.rows,
+            wait_buckets=wait_buckets,
+            speed_buckets=speed_buckets,
+        )
     )
     router = app.router
     router.redirect_slashes = False

@@ -16,10 +16,18 @@ The deployment fills these variables in, and nothing else configures the gateway
 | `RHI_LONGEST_REQUEST_SECONDS` | The longest a request may run | 1800 |
 | `RHI_KEEPALIVE_SECONDS` | The interval between the keep-alives of a held request | 10 |
 | `RHI_RETRY_AFTER_WARMING`, `RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE`, `RHI_RETRY_AFTER_CONCURRENCY_LIMIT` | The seconds of `Retry-After` for the three causes that carry one | 30, 60, 5 |
+| `RHI_TARGET_TTFT_P95_SECONDS`, `RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND`, `RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND` | The floors of the objectives of section 7.3 (seconds to a first token, tokens a second of a stream), which the gateway's histograms take among their boundaries | 5, 15, 10 |
 
 The defaults are section 17's, and the configuration's (`src/rhi/config.py`) for the keys the
-deployment writes into the six numeric variables. A numeric variable is a whole number above
-zero, in digits.
+deployment writes into the six numeric variables and the three floors. A numeric variable is a
+whole number above zero, in digits; a floor is a number above zero, in digits with at most one
+decimal point.
+
+**A floor is a boundary.** The objectives read the share of observations under a floor from the
+bucket of that boundary (`rhi_dashboards.objectives`), and a histogram reads a share exactly only
+at a boundary. So the waits are counted in `WAIT_BUCKETS` with the floor of the time to first token
+among them, and the speed in `SPEED_BUCKETS` with the two floors of a stream
+(`rhi_common.boundaries`): a floor the owner revises is read exactly, wherever it falls.
 
 A table's name is one DynamoDB can hold (3 to 255 letters, digits, `_`, `-` and `.`), and the
 function's name one Lambda can (1 to 64 letters, digits, `_` and `-`). A target group's ARN is an
@@ -59,6 +67,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from urllib.parse import urlsplit
 
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS, with_floors
 from rhi_common.causes import Cause
 from rhi_common.pool_config import FIELDS, Pool, PoolConfigError, parse_pools
 
@@ -79,6 +88,9 @@ KEEPALIVE_SECONDS = "RHI_KEEPALIVE_SECONDS"
 RETRY_AFTER_WARMING = "RHI_RETRY_AFTER_WARMING"
 RETRY_AFTER_CAPACITY_UNAVAILABLE = "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE"
 RETRY_AFTER_CONCURRENCY_LIMIT = "RHI_RETRY_AFTER_CONCURRENCY_LIMIT"
+TARGET_TTFT_P95_SECONDS = "RHI_TARGET_TTFT_P95_SECONDS"
+TARGET_STREAM_MEDIAN = "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND"
+TARGET_STREAM_P10 = "RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND"
 
 # The variables the gateway does not start without.
 REQUIRED = (
@@ -106,11 +118,18 @@ NUMERIC_DEFAULTS: Mapping[str, int] = MappingProxyType(
     }
 )
 
+# The floors of the objectives and what each is when unset (the configuration's defaults, section 17).
+FLOOR_DEFAULTS: Mapping[str, float] = MappingProxyType(
+    {TARGET_TTFT_P95_SECONDS: 5.0, TARGET_STREAM_MEDIAN: 15.0, TARGET_STREAM_P10: 10.0}
+)
+
 # Every variable the reader reads.
-VARIABLES = (*REQUIRED, DEFAULT_POOL, *NUMERIC_DEFAULTS)
+VARIABLES = (*REQUIRED, DEFAULT_POOL, *NUMERIC_DEFAULTS, *FLOOR_DEFAULTS)
 
 # ASCII digits only, and few enough that the number is one a table or a header can hold.
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
+# A floor: digits, with at most one decimal point and digits on both of its sides.
+_DECIMAL = re.compile(r"[0-9]{1,32}(?:\.[0-9]{1,32})?", re.ASCII)
 # The fields a refusal of the pools table may name: a pool's own, never anything a value held.
 _POOL_FIELDS = FIELDS | {"name"}
 # The names DynamoDB and Lambda accept, as their APIs document them.
@@ -159,6 +178,21 @@ class Settings:
     retry_after_warming: int = NUMERIC_DEFAULTS[RETRY_AFTER_WARMING]
     retry_after_capacity_unavailable: int = NUMERIC_DEFAULTS[RETRY_AFTER_CAPACITY_UNAVAILABLE]
     retry_after_concurrency_limit: int = NUMERIC_DEFAULTS[RETRY_AFTER_CONCURRENCY_LIMIT]
+    target_ttft_p95_seconds: float = FLOOR_DEFAULTS[TARGET_TTFT_P95_SECONDS]
+    target_stream_median_tokens_per_second: float = FLOOR_DEFAULTS[TARGET_STREAM_MEDIAN]
+    target_stream_p10_tokens_per_second: float = FLOOR_DEFAULTS[TARGET_STREAM_P10]
+
+    @property
+    def wait_buckets(self) -> tuple[float, ...]:
+        """The boundaries of the two waits: the gateway's, with the floor of the time to first token."""
+        return with_floors(WAIT_BUCKETS, self.target_ttft_p95_seconds)
+
+    @property
+    def speed_buckets(self) -> tuple[float, ...]:
+        """The boundaries of a stream's speed: the gateway's, with the two floors of a stream."""
+        return with_floors(
+            SPEED_BUCKETS, self.target_stream_median_tokens_per_second, self.target_stream_p10_tokens_per_second
+        )
 
     @property
     def retry_after(self) -> dict[Cause, int]:
@@ -281,6 +315,15 @@ def _number(environ: Mapping[str, str], variable: str) -> int:
     return int(text)
 
 
+def _floor(environ: Mapping[str, str], variable: str) -> float:
+    text = environ.get(variable)
+    if text is None:
+        return FLOOR_DEFAULTS[variable]
+    if _DECIMAL.fullmatch(text) is None or float(text) <= 0:
+        raise SettingsError(variable, "must be a number above zero, in digits with at most one decimal point")
+    return float(text)
+
+
 def read_settings(environ: Mapping[str, str]) -> Settings:
     """The settings an environment gives, or `SettingsError` for the first variable that is refused.
 
@@ -306,4 +349,7 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         retry_after_warming=_number(environ, RETRY_AFTER_WARMING),
         retry_after_capacity_unavailable=_number(environ, RETRY_AFTER_CAPACITY_UNAVAILABLE),
         retry_after_concurrency_limit=_number(environ, RETRY_AFTER_CONCURRENCY_LIMIT),
+        target_ttft_p95_seconds=_floor(environ, TARGET_TTFT_P95_SECONDS),
+        target_stream_median_tokens_per_second=_floor(environ, TARGET_STREAM_MEDIAN),
+        target_stream_p10_tokens_per_second=_floor(environ, TARGET_STREAM_P10),
     )

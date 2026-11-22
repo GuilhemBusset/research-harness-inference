@@ -28,6 +28,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import Message
 
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
 from rhi_common.students import StudentKey
@@ -41,6 +42,7 @@ from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import PoolView, Readiness
+from rhi_gateway.telemetry import RequestRecord, Telemetry, note_cause
 from rhi_gateway.waker import Waker
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -349,6 +351,42 @@ def test_errors_by_cause() -> None:
     assert value(faulty, ERRORS, alias="", pool="", cause="none") == 1
     assert len(samples(faulty, ERRORS)) == 1
     assert value(faulty, REQUESTS, alias="", pool="") == 1
+
+
+def test_only_a_5xx_answer_that_names_no_cause_is_an_own_fault() -> None:
+    counted = metrics.Metrics()
+    own_faults = metrics.OWN_FAULTS + "_total"
+    # Served at zero before any fault, so that the first one is counted by an increase.
+    assert value(counted, own_faults) == 0
+    for status, cause in ((500, "none"), (200, "none"), (503, "warming"), (502, "engine_error"), (200, None)):
+        counted.count(RequestRecord(time="2026-01-01T00:00:00Z", wire_format="messages", pool="coursework", status=status, cause=cause))
+    # A stream answered 200 that failed later is an error of cause none, not a 5xx answer.
+    assert value(counted, own_faults) == 1
+    assert value(counted, ERRORS, alias="", pool="coursework", cause="none") == 2
+
+
+def test_a_named_5xx_sent_whole_stays_named_when_the_handler_then_fails() -> None:
+    sent: list[Message] = []
+    body = b'{"cause":"warming"}'
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        note_cause(Cause.WARMING)
+        await send({"type": "http.response.start", "status": 503, "headers": []})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+        raise RuntimeError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    counted = metrics.Metrics()
+    gateway = Telemetry(app, write=lambda line: None, ended=counted.count)
+    asyncio.run(gateway({"type": "http", "method": "GET", "raw_path": b"/status"}, receive, send))
+    assert [sent[0]["status"], sent[1]["body"]] == [503, body]
+    assert value(counted, metrics.OWN_FAULTS + "_total") == 0
+    assert value(counted, ERRORS, alias="", pool="", cause="warming") == 1
 
 
 def test_every_request_answered_is_counted_once() -> None:

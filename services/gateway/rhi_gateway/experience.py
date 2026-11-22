@@ -9,7 +9,7 @@ registry, so the one endpoint serves both:
 | --- | --- | --- | --- |
 | `rhi_gateway_time_to_first_token_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The seconds from a streamed request accepted to its first token sent |
 | `rhi_gateway_time_to_first_answer_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The same, to its first token that is not reasoning |
-| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format` | The output speed of each streamed request |
+| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format`, `start` | The output speed of each streamed request |
 | `rhi_gateway_request_input_tokens` | histogram | `pool`, `wire_format` | The input tokens of each request settled: the transcript's size |
 | `rhi_gateway_request_output_tokens` | histogram | `pool`, `wire_format` | The output tokens of each request settled: the output of a turn |
 | `rhi_gateway_requests_in_flight` | gauge | `pool` | The requests this task has forwarded and not yet ended |
@@ -40,6 +40,12 @@ answer. Each carries two more labels:
 The objective of section 7.3 is a time to first token under 5 seconds at the 95th percentile on a
 warm pool (section 17). 5 seconds is a boundary of both histograms, so that it is read exactly.
 
+**A bucket counts the values strictly under its boundary.** Every wait and every speed is observed
+one step of the float above itself (`_strictly`): a wait of exactly 5 seconds lands above the
+bucket of 5, a stream of exactly 15 tokens per second above the bucket of 15. So, at a floor, the
+bucket reads exactly both what an objective asks: the share under 5 seconds, and the share at 15 or
+more (`rhi_dashboards.objectives`). The step is 10^-15 of the value, far below anything measured.
+
 **The speed of a request** is its output tokens after the first, over the seconds from its first
 token sent to its last: 401 tokens whose first is sent at 2 seconds and whose last at 22 ran at 20
 tokens per second. It only means something on a stream, where tokens are sent as they come, so it
@@ -50,8 +56,12 @@ the last call are the two times, read on this module's clock. The output tokens 
 settlement observed.
 
 The objectives of section 7.3 are read from this histogram against floors held in configuration:
-the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17). A
-floor that falls between two buckets cannot be read exactly, so each floor is a bucket boundary.
+the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
+a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
+waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
+read exactly, so each floor of section 17 is a bucket boundary (`rhi_common.boundaries`), and the
+gateway adds the floors its configuration holds (`rhi_gateway.settings`), so that a revised one is
+read exactly too.
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
@@ -68,12 +78,15 @@ is the pool's.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from prometheus_client import CollectorRegistry, Histogram
 from prometheus_client.core import GaugeMetricFamily
+
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 
 if TYPE_CHECKING:
     from prometheus_client import Metric
@@ -91,21 +104,22 @@ FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 FIRST_ANSWER = "rhi_gateway_time_to_first_answer_seconds"
 SERIES = (SPEED, INPUT_TOKENS, OUTPUT_TOKENS, IN_FLIGHT, HELD, FIRST_TOKEN, FIRST_ANSWER)
 
-# Tokens per second. 10 and 15 are the floors of the objectives (sections 7.3 and 17): both are
-# boundaries, and the buckets are finest around them and across the estimate of section 4.7.
-SPEED_BUCKETS = (1, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 30, 35, 40, 45, 50, 60, 80, 100, 150, 200)
 # Tokens of one request. Zero is a request that settled with none observed. The last input boundary
 # is the full context of the coursework model (section 4.2).
 INPUT_BUCKETS = (0, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 262_144)
 OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000)
 
-# Seconds from a request accepted, for both waits. 5 is the floor of the objective (sections 7.3 and
-# 17): it is a boundary, and the buckets are finest below it. The last ones cover a hold (420 seconds
-# by default) and a turn that reasons up to the longest request (1,800).
-WAIT_BUCKETS = (0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 1800)
+# The seconds of both waits, and the tokens per second of a stream, are counted in the buckets of
+# `rhi_common.boundaries`, with the configured floors of the objectives among them (`Settings`).
 
 _LABELS = ("pool", "wire_format")
-_WAIT_LABELS = (*_LABELS, "start", "turn")
+_SPEED_LABELS = (*_LABELS, "start")
+_WAIT_LABELS = (*_SPEED_LABELS, "turn")
+
+
+def _strictly(value: float) -> float:
+    """The value as observed: the next float above it, so that a bucket's boundary is not in it."""
+    return math.nextafter(value, math.inf)
 
 
 class Turn:
@@ -116,7 +130,8 @@ class Turn:
     ) -> None:
         self._experience = experience
         self._labels = (pool, wire_format.value)
-        self._wait_labels = (*self._labels, "held" if held else "warm", "first" if first_turn else "later")
+        self._speed_labels = (*self._labels, "held" if held else "warm")
+        self._wait_labels = (*self._speed_labels, "first" if first_turn else "later")
         self._accepted_at = experience.clock()
         self._first_token_at: float | None = None
         self._last_token_at: float | None = None
@@ -128,10 +143,10 @@ class Turn:
         now = series.clock()
         if self._first_token_at is None:
             self._first_token_at = now
-            series.first_token.labels(*self._wait_labels).observe(now - self._accepted_at)
+            series.first_token.labels(*self._wait_labels).observe(_strictly(now - self._accepted_at))
         if answer and not self._answered:
             self._answered = True
-            series.first_answer.labels(*self._wait_labels).observe(now - self._accepted_at)
+            series.first_answer.labels(*self._wait_labels).observe(_strictly(now - self._accepted_at))
         self._last_token_at = now
 
     def settled(self, input_tokens: int, output_tokens: int) -> None:
@@ -142,7 +157,7 @@ class Turn:
         first, last = self._first_token_at, self._last_token_at
         if first is None or last is None or last <= first or output_tokens < 2:
             return
-        series.speed.labels(*self._labels).observe((output_tokens - 1) / (last - first))
+        series.speed.labels(*self._speed_labels).observe(_strictly((output_tokens - 1) / (last - first)))
 
 
 class _Demand:
@@ -176,6 +191,8 @@ class Experience:
     `demand` gives the heartbeat's rows as they would be written now (`Heartbeat.rows`): without it
     there are no series of requests in flight and held. `clock` gives the seconds a request's
     acceptance and its token times are read in, on a clock that never goes back; a test gives its own.
+    `wait_buckets` and `speed_buckets` are the boundaries of the two waits and of the speed: the
+    gateway's settings give them with the configured floors among them.
     """
 
     def __init__(
@@ -184,27 +201,29 @@ class Experience:
         demand: Callable[[], Iterable[GatewayHeartbeat]] | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wait_buckets: tuple[float, ...] = WAIT_BUCKETS,
+        speed_buckets: tuple[float, ...] = SPEED_BUCKETS,
     ) -> None:
         self.clock = clock
         self.first_token = Histogram(
             FIRST_TOKEN,
             "Seconds from a streamed request accepted to its first token sent, reasoning included.",
             _WAIT_LABELS,
-            buckets=WAIT_BUCKETS,
+            buckets=wait_buckets,
             registry=registry,
         )
         self.first_answer = Histogram(
             FIRST_ANSWER,
             "Seconds from a streamed request accepted to its first answer text or tool call sent.",
             _WAIT_LABELS,
-            buckets=WAIT_BUCKETS,
+            buckets=wait_buckets,
             registry=registry,
         )
         self.speed = Histogram(
             SPEED,
             "Output tokens after the first, over the seconds from the first token sent to the last, per stream.",
-            _LABELS,
-            buckets=SPEED_BUCKETS,
+            _SPEED_LABELS,
+            buckets=speed_buckets,
             registry=registry,
         )
         self.input_tokens = Histogram(

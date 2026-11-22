@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from botocore.exceptions import ClientError
+from prometheus_client import Histogram
 from prometheus_client.parser import text_string_to_metric_families
 
 from rhi_common.engine_metrics import MOCK
@@ -281,3 +282,50 @@ def test_the_boot_is_what_the_kernel_says_it_has_been_up(tmp_path: Path) -> None
     assert replace(world.launch(), uptime=lambda: None).run() is Outcome.CONTINUED
     assert ("promotion", "boot") not in exposed()
     assert sum(exposed().values()) == world.now - BOOT
+
+
+def completed(transition: str = "promotion", under: float | None = None) -> float:
+    """The launches the agent's endpoint counts as completed, or those of them under `under` seconds."""
+    sample, labels = f"{stages.LAUNCH_METRIC}_count", {"transition": transition}
+    if under is not None:
+        sample, labels = f"{stages.LAUNCH_METRIC}_bucket", {**labels, "le": f"{under:.1f}"}
+    return metrics.REGISTRY.get_sample_value(sample, labels) or 0.0
+
+
+def test_each_launch_completed_is_counted_once_and_no_other(tmp_path: Path) -> None:
+    before, before_under = completed(), completed(under=300)
+    # Two promotions that took the same seconds are two launches completed.
+    for name in ("first", "second"):
+        (tmp_path / name).mkdir()
+        assert World(tmp_path / name, IN_SERVICE, on_disk=True).launch().run() is Outcome.CONTINUED
+    assert completed() == before + 2
+    # Each took the sum of its stages, under 5 minutes.
+    assert completed(under=300) == before_under + 2
+
+    # A completion that Auto Scaling refused, and an abandoned launch, complete nothing.
+    (tmp_path / "refused").mkdir()
+    refused = World(tmp_path / "refused", IN_SERVICE, on_disk=True)
+
+    def refuse(**request: str) -> dict[str, Any]:
+        refused.now += COMPLETE
+        raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "CompleteLifecycleAction")
+
+    refused.complete_lifecycle_action = refuse  # ty: ignore[invalid-assignment] - a stand-in that refuses
+    assert refused.launch().run() is Outcome.NOT_COMPLETED
+    (tmp_path / "abandoned").mkdir()
+    abandoned = World(tmp_path / "abandoned", IN_SERVICE, on_disk=True, measured=200)
+    never_healthy(abandoned)
+    assert abandoned.launch().run() is Outcome.ABANDONED
+    assert completed() == before + 2
+
+
+def test_a_launch_of_exactly_five_minutes_is_not_under_them() -> None:
+    launches = Histogram("launch_seconds", "", ("transition",), buckets=stages.LAUNCH_BUCKETS, registry=None)
+    timings = stages.Timings(stages.Transition.PROMOTION, lambda: 0.0, launches=launches)
+    timings.seconds = {stages.Stage.BOOT: 100.0, stages.Stage.HOOK: 200.0}
+    timings.completed()
+    buckets = {(s.labels["le"], s.value) for s in next(iter(launches.collect())).samples if s.name.endswith("_bucket")}
+    assert buckets >= {
+        ("300.0", 0.0),
+        ("420.0", 1.0),
+    }

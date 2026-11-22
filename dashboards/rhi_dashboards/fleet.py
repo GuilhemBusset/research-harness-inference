@@ -1,7 +1,17 @@
 """The fleet and scaling dashboard: what the scaler decided and why, and what each start cost.
 
-The first of the six dashboards of the system design (section 7.3). One row for each pool of the
-configuration, of five panels:
+The first of the six dashboards of the system design (section 7.3). Its first row shows the five
+objectives of section 7.3 (`rhi_dashboards.objectives`), each against its target, over the time
+a session was on in the dashboard's time range: one stat per measure, green where it meets its
+target and red where it does not, with the count of observations behind a percentile beside it. A
+percentile is shown as the share of observations it is judged on (`rhi_dashboards.objectives`), and
+a value that must be above its threshold turns green only above it: at the threshold it is red. A
+share an older gateway task's buckets only bound reads "inconclusive", in orange, where its bounds
+straddle the threshold.
+Each is one value for the whole range, so its queries are instant ones, read at the range's end over
+exactly the range (`$__from` to its end); a range with no session reads no data.
+
+Then one row for each pool of the configuration, of five panels:
 
 | Panel | Shows | From |
 | --- | --- | --- |
@@ -33,11 +43,13 @@ from typing import TYPE_CHECKING
 
 from grafana_foundation_sdk.builders import common as common_builders
 from grafana_foundation_sdk.builders import dashboard as dashboard_builders
+from grafana_foundation_sdk.builders import stat as stat_builders
 from grafana_foundation_sdk.builders import timeseries as timeseries_builders
 from grafana_foundation_sdk.models import common
+from grafana_foundation_sdk.models import dashboard as models
 
 from rhi_common.engine_metrics import Quantity
-from rhi_dashboards import rules
+from rhi_dashboards import objectives, rules
 
 if TYPE_CHECKING:
     from rhi.config import Config
@@ -76,16 +88,31 @@ STARTS = {
     "cold-launch": "Cold launch: seconds per stage, per launch",
 }
 
-METRICS: tuple[rules.Declared, ...] = (
-    *(rules.EmittedBy(name, SCALER) for name in COUNTS.values()),
-    rules.EmittedBy(DECISIONS, SCALER),
-    *(rules.FromEngineTable(quantity) for quantity in ENGINE_LOAD.values()),
-    rules.EmittedBy(STAGE_SECONDS, LIFECYCLE),
+# The objectives' row declares its own, and a name both declare is listed once.
+METRICS: tuple[rules.Declared, ...] = tuple(
+    dict.fromkeys(
+        (
+            *(rules.EmittedBy(name, SCALER) for name in COUNTS.values()),
+            rules.EmittedBy(DECISIONS, SCALER),
+            *(rules.FromEngineTable(quantity) for quantity in ENGINE_LOAD.values()),
+            rules.EmittedBy(STAGE_SECONDS, LIFECYCLE),
+            *objectives.METRICS,
+        )
+    )
 )
 
 # A row is 24 columns wide: three panels on its first line, two on its second.
 THIRD = 8
 HALF = 12
+# The objectives' row: four stats to a line.
+QUARTER = 6
+OBJECTIVES_ROW = "Objectives, while a session is on"
+# The references of a measure's query and of the count behind it.
+MEASURE_REF = "A"
+COUNT_REF = "B"
+# What a measure whose buckets do not settle its objective reads, and its colour.
+INCONCLUSIVE = "inconclusive"
+INCONCLUSIVE_COLOR = "orange"
 
 
 def _graph(title: str) -> timeseries_builders.Panel:
@@ -136,9 +163,58 @@ def stage_seconds(pool: Pool, transition: str) -> timeseries_builders.Panel:
     return _queries(_graph(STARTS[transition]), {f"{{{{{INSTANCE}}}}} {{{{{STAGE}}}}}": per_launch}).unit("s").min(0)
 
 
+def _target(measure: objectives.Measure) -> dashboard_builders.ThresholdsConfig:
+    """Red, then green from the least value that meets the measure's threshold."""
+    steps = [
+        models.Threshold(value=None, color="red"),
+        models.Threshold(value=objectives.threshold_step(measure), color="green"),
+    ]
+    return dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps)
+
+
+def _reads_inconclusive() -> list[models.DynamicConfigValue]:
+    """`objectives.INCONCLUSIVE` displayed as the text "inconclusive", neither red nor green."""
+    result = models.ValueMappingResult(text=INCONCLUSIVE, color=INCONCLUSIVE_COLOR, index=0)
+    mapping = models.ValueMap(options={f"{objectives.INCONCLUSIVE:g}": result})
+    return [models.DynamicConfigValue(id_val="mappings", value=[mapping])]
+
+
+def objective_stat(objective: objectives.Objective, measure: objectives.Measure) -> stat_builders.Panel:
+    """One measure of an objective over the time a session was on in the range, coloured by its target."""
+    panel = (
+        stat_builders.Panel()
+        .title(f"{objective.name}: {measure.legend}")
+        .description(f"Target: {measure.goal}, over the time a session was on")
+        .datasource(rules.PROMETHEUS)
+        .reduce_options(common_builders.ReduceDataOptions().calcs(["lastNotNull"]))
+        .unit(measure.unit)
+        .thresholds(_target(measure))
+        .color_mode(common.BigValueColorMode.VALUE)
+        .with_target(rules.query(measure.expression, measure.legend, MEASURE_REF, instant=True))
+    )
+    if measure.ceiling is not None:
+        # Buckets that bound the share on both sides of its threshold settle nothing.
+        panel.override_by_query(MEASURE_REF, _reads_inconclusive())
+    if measure.count is not None:
+        panel.with_target(rules.query(measure.count, "observed", COUNT_REF, instant=True))
+        # A count has neither the measure's unit nor its target.
+        panel.override_by_query(
+            COUNT_REF,
+            [
+                models.DynamicConfigValue(id_val="unit", value="short"),
+                models.DynamicConfigValue(id_val="color", value={"mode": "fixed", "fixedColor": "text"}),
+            ],
+        )
+    return panel
+
+
 def dashboard(config: Config) -> dashboard_builders.Dashboard:
-    """The dashboard, with one row for each pool of the configuration, in its order."""
+    """The dashboard: the objectives' row, then one row for each pool of the configuration, in its order."""
     built = dashboard_builders.Dashboard(TITLE).uid(UID)
+    built.with_row(dashboard_builders.Row(OBJECTIVES_ROW))
+    for objective in objectives.objectives(config):
+        for measure in objective.measures:
+            built.with_panel(objective_stat(objective, measure).span(QUARTER))
     for pool in config.pools:
         built.with_row(dashboard_builders.Row(pool.name))
         for panel in (counts(pool), decisions(pool), engine_load(pool)):

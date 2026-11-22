@@ -239,6 +239,8 @@ def build(
         heartbeat=heartbeat,
         metrics=gateway_metrics,
         readiness=readiness,
+        wait_buckets=settings.wait_buckets,
+        speed_buckets=settings.speed_buckets,
     )
     return Gateway(app=app, metrics=gateway_metrics, readiness=readiness, forwarding=forwarding)
 

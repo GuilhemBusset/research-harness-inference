@@ -253,7 +253,8 @@ def served(made: Gateway, name: str) -> list[Sample]:
 def waits(made: Gateway, name: str) -> dict[tuple[str, str, str], list[float]]:
     """What one histogram holds: the requests and the sum of their seconds, for each series it serves.
 
-    A series is named by its wire format, `warm` or `held`, and `first` or `later`.
+    A series is named by its wire format, `warm` or `held`, and `first` or `later`. The sum is
+    rounded: each wait is observed one step of the float above itself.
     """
     found: dict[tuple[str, str, str], list[float]] = {}
     for sample in served(made, name):
@@ -263,7 +264,7 @@ def waits(made: Gateway, name: str) -> dict[tuple[str, str, str], list[float]]:
         if sample.name == name + "_count":
             series[0] = sample.value
         elif sample.name == name + "_sum":
-            series[1] = sample.value
+            series[1] = round(sample.value, 9)
     return found
 
 

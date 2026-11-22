@@ -16,10 +16,10 @@ from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
-from rhi_common.records import GatewayHeartbeat
+from rhi_common.records import GatewayHeartbeat, SessionSwitch
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
-from rhi_scaler.metrics import DECISIONS, GAUGES, DecisionCounts, RemoteWriter, decode
+from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
 from rhi_scaler.model import Memory, Reason
 from rhi_scaler.settings import read_settings
 
@@ -206,6 +206,8 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
         "rhi_scaler_warm_instances": 1.0,
     }
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
+    # The session switch has no record: the session gauge reads 0.
+    assert sent[(SESSION_ON, ())] == [0.0]
     # The pool and the reason are the only labels: nothing names a student.
     assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason"}
 
@@ -216,6 +218,36 @@ def test_a_switch_that_cannot_be_read_still_lets_demand_wake_the_pool_then_fails
     with pytest.raises(ClientError):
         scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
     assert len(edge.updates) == 1
+    # The push still goes, with no session sample: the run does not know what the switch reads.
+    ((_, _, body),) = edge.pushes
+    assert SESSION_ON not in {name for name, _ in series(body)}
+
+
+def test_a_run_that_cannot_read_the_pools_still_sends_the_switch_it_reads(edge: Edge) -> None:
+    # Auto Scaling refuses the first read; the switch, read on its own, reads off.
+    edge.autoscaling.add_client_error("describe_auto_scaling_groups", "Throttling")
+    switch = {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True}
+    off = SessionSwitch(on=False, set_by="instructor", set_at=NOW - 60).to_item()
+    edge.dynamodb.add_response("get_item", {"Item": serialize(off)}, switch)
+    with pytest.raises(ClientError):
+        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    # The session gauge alone, at 0: a session that has ended does not seem to go on.
+    ((_, _, body),) = edge.pushes
+    assert series(body) == {(SESSION_ON, ()): [0.0]}
+
+
+def test_a_run_whose_pool_write_fails_still_sends_the_switch_it_read(edge: Edge) -> None:
+    # The wake goes, then DynamoDB refuses the pool's note; the switch has no record: off.
+    edge.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)])
+    edge.autoscaling.add_response(
+        "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
+    )
+    edge.dynamodb.add_client_error("put_item", "ProvisionedThroughputExceededException")
+    with pytest.raises(ClientError, match="ProvisionedThroughputExceededException"):
+        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    # The session gauge alone, at 0, and the run fails on its write.
+    ((_, _, body),) = edge.pushes
+    assert series(body) == {(SESSION_ON, ()): [0.0]}
 
 
 def test_a_second_run_is_harmless(edge: Edge) -> None:
