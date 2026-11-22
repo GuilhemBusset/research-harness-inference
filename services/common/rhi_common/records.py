@@ -62,6 +62,11 @@ class Mode(StrEnum):
     BUDGET_LATCHED = "budget-latched"
 
 
+# The mode of a pool that has no mode record, by the `wake` of its configuration (section 11.3):
+# what the scaler reads, and what the admin CLI re-enables a pool to.
+CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
+
+
 def _text(item: Mapping[str, object], name: str) -> str:
     value = item.get(name)
     if not isinstance(value, str) or not value:

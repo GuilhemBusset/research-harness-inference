@@ -11,7 +11,16 @@ from botocore.stub import ANY, Stubber
 
 from rhi_common.pool_config import Pool, parse_pools
 from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
-from rhi_scaler.aws_io import Clients, PoolSettings, TableNames, apply, memory_from_item, memory_to_item, read
+from rhi_scaler.aws_io import (
+    Clients,
+    PoolSettings,
+    TableNames,
+    apply,
+    memory_from_item,
+    memory_to_item,
+    memory_update,
+    read,
+)
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -175,9 +184,11 @@ def test_the_number_reaches_the_note() -> None:
             # The two items the table must receive, exactly. No Auto Scaling call is queued: one would fail.
             note = {"pool": "coursework", "record": "note", "capacity_asked": 2, "written_at": now}
             note.update({} if number is None else {"rebalance_number": number})
+            before = read_run.inputs.pools[0].memory
             stored = [note, memory_to_item("coursework", decision.pools[0].memory)]
-            for item in stored:
-                dynamodb.add_response("put_item", {}, {"TableName": tables.pool_state, "Item": serialize(item)})
+            dynamodb.add_response("put_item", {}, {"TableName": tables.pool_state, "Item": serialize(note)})
+            update = memory_update(tables.pool_state, "coursework", before, decision.pools[0].memory)
+            dynamodb.add_response("update_item", {}, update)
             apply(clients, tables, read_run, decision)
             assert memory_from_item(stored[1]) == decision.pools[0].memory
             reasons.append(decision.pools[0].reason)

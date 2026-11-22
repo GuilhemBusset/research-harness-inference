@@ -51,7 +51,9 @@ history too, whatever came after it.
 
 Then it writes the pool's note (`rhi_common.records.ScalerNote`) and its memory record, on every
 run, whether or not a call was made. The note carries the decision's rebalance number, raised or
-not, which is how the number reaches the gateway (section 5.5).
+not, which is how the number reaches the gateway (section 5.5). The note is put whole; the memory
+record is updated (`memory_update`), so that what the admin CLI writes in it survives: the mark
+`launch_suspended` once cleared, and who cleared it and when.
 """
 
 from __future__ import annotations
@@ -288,6 +290,23 @@ def _time(item: Mapping[str, Any], name: str) -> int | None:
     raise RecordError(f"`{name}` of the memory record is not a time")
 
 
+# The times of the memory record, each left out of it while it is `None`.
+_MEMORY_TIMES = (
+    "last_request_at",
+    "last_in_flight_at",
+    "above_target_since",
+    "last_scale_out_at",
+    "low_load_since",
+    "last_gateway_at",
+    "suspended_at",
+    "abandons_counted_from",
+    "last_rebalance_at",
+)
+# The attributes of the memory record that the scaler alone writes: all of them but the keys and
+# `launch_suspended`, which the admin clears.
+MEMORY_ATTRIBUTES = ("waiting_since", "queuing_since", "rebalance_number", *_MEMORY_TIMES)
+
+
 def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
     """The memory record as `Memory`; an empty one when the pool has no record yet."""
     if item is None:
@@ -328,17 +347,7 @@ def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
         LAUNCH_SUSPENDED: memory.launch_suspended,
         "waiting_since": dict(memory.waiting_since),
     }
-    for name in (
-        "last_request_at",
-        "last_in_flight_at",
-        "above_target_since",
-        "last_scale_out_at",
-        "low_load_since",
-        "last_gateway_at",
-        "suspended_at",
-        "abandons_counted_from",
-        "last_rebalance_at",
-    ):
+    for name in _MEMORY_TIMES:
         value = getattr(memory, name)
         if value is not None:
             item[name] = value
@@ -415,6 +424,33 @@ def _put(clients: Clients, table: str, item: Mapping[str, Any]) -> None:
     )
 
 
+def memory_update(table: str, pool: str, before: Memory, after: Memory) -> dict[str, Any]:
+    """The UpdateItem call, as the low-level client takes it, that stores `after` as the pool's
+    memory record, given the memory `before` that the run read.
+
+    Each of the scaler's own attributes is set, or removed while it has no value. The mark
+    `launch_suspended` is the admin's to clear: the call sets it only in the run that raises it, and
+    otherwise leaves it as it stands. An admin who clears it while a run that read it set is under
+    way therefore keeps it cleared, and the next run finds it so. Any other attribute that is not
+    the scaler's, such as who cleared the mark and when, is left as it is.
+    """
+    item = memory_to_item(pool, after)
+    raised = after.launch_suspended and not before.launch_suspended
+    present = [name for name in MEMORY_ATTRIBUTES if name in item] + ([LAUNCH_SUSPENDED] if raised else [])
+    absent = [name for name in MEMORY_ATTRIBUTES if name not in item]
+    names = {f"#s{n}": name for n, name in enumerate(present)} | {f"#r{n}": name for n, name in enumerate(absent)}
+    expression = "SET " + ", ".join(f"#s{n} = :s{n}" for n in range(len(present)))
+    if absent:
+        expression += " REMOVE " + ", ".join(f"#r{n}" for n in range(len(absent)))
+    return {
+        "TableName": table,
+        "Key": {"pool": {"S": pool}, "record": {"S": MEMORY_RECORD}},
+        "UpdateExpression": expression,
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": {f":s{n}": _SERIALIZER.serialize(item[name]) for n, name in enumerate(present)},
+    }
+
+
 def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) -> None:
     """Makes each pool's decision true, calling Auto Scaling only for what differs, then writes the
     pool's note and memory."""
@@ -444,4 +480,5 @@ def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) ->
             rebalance_number=pool.rebalance_number,
         )
         _put(clients, tables.pool_state, note.to_item())
-        _put(clients, tables.pool_state, memory_to_item(pool.pool, pool.memory))
+        before = next(read.memory for read in run.inputs.pools if read.config.name == pool.pool)
+        clients.dynamodb.update_item(**memory_update(tables.pool_state, pool.pool, before, pool.memory))

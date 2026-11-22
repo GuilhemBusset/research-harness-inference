@@ -29,18 +29,16 @@ settings still read.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rhi_common.pool_config import PoolConfigError, parse_pools
-from rhi_common.records import Mode
+from rhi_common.records import CONFIGURED_MODE
 from rhi_scaler.aws_io import PoolSettings, TableNames
 
 SETTINGS_VARIABLE = "RHI_SCALER_SETTINGS"
 REGION_VARIABLE = "AWS_REGION"
-
-# The mode a pool is in before anybody writes one, by its `wake`.
-_CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 
 
 class SettingsError(ValueError):
@@ -79,14 +77,16 @@ def _pool(name: str, value: object) -> PoolSettings:
     if not isinstance(entry, Mapping):
         raise SettingsError(f"{where}entry", "is missing" if entry is None else "must be an object")
     try:
-        (config,) = parse_pools({name: entry})
+        # The price limit is the configuration's, checked when the stage loaded it: the settings do
+        # not carry it, and the default would refuse a pool the deployment accepted.
+        (config,) = parse_pools({name: entry}, on_demand_price_limit=math.inf)
     except PoolConfigError as error:
         raise SettingsError(f"{where}entry", f"does not parse: {error}") from None
     return PoolSettings(
         config=config,
         group=_text(value, "group", where),
         target_group=_text(value, "target_group", where),
-        configured_mode=_CONFIGURED_MODE[config.wake],
+        configured_mode=CONFIGURED_MODE[config.wake],
     )
 
 

@@ -20,6 +20,7 @@ Template = dict[str, Any]
 
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
 HANDLER = "rhi_scaler.handler.handler"
+REPO = Path(__file__).resolve().parents[2]
 # What the template leaves to the deployment, as the test gives it: the workspace's endpoint ends
 # with a slash, as Managed Prometheus writes it.
 ENDPOINT = "https://aps-workspaces.example.com/workspaces/ws-example/"
@@ -253,3 +254,43 @@ def test_the_stage_reaches_the_function_and_nothing_else_may_invoke_it(app: cdk.
             "SourceArn": {"Fn::GetAtt": [rule_id, "Arn"]},
         }
     ]
+
+
+def test_the_admin_finds_the_function_and_the_pool_state_table_by_their_logical_ids(app: cdk.App) -> None:
+    from rhi_admin import main
+
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute]
+    assert stack.stack_name == main.POOLS_STACK_NAME
+    function = stack.resolve(stack.get_logical_id(stack.scaler.function.node.default_child))
+    table = stack.resolve(stack.get_logical_id(stack.tables.by_name["pool-state"].node.default_child))
+    assert (function, table) == (main.SCALER_FUNCTION_LOGICAL_ID, main.POOL_STATE_LOGICAL_ID)
+
+
+def test_the_settings_read_when_a_pool_is_priced_between_the_default_and_the_configured_limit(
+    app_module: Any, tmp_path: Path
+) -> None:
+    import json
+    import tomllib
+
+    import aws_cdk as cdk
+    from aws_cdk.assertions import Template as Assertions
+
+    # The deployment holds an on-demand pool's prices to the configuration's limit, which the
+    # settings do not carry: the scaler must read the pool the deployment accepted.
+    source = tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8"))
+    source["on_demand_price_limit"] = 8.0
+    mock = source["pools"]["mock"]
+    mock["prices"] = dict.fromkeys(mock["instance_types"], 6.0)
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app = cdk.App(outdir=str(tmp_path), context=context, analytics_reporting=False)
+    stage = app_module.EndpointStage(app, "Rhi", config=config.parse(source, "example"))
+    templates = {
+        child.stack_name: dict(Assertions.from_stack(child).to_json())
+        for child in stage.node.children
+        if isinstance(child, cdk.Stack)
+    }
+    _, function = scaler_function(templates["Rhi-Pools"])
+    settings = parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
+    (mock_pool,) = [pool for pool in settings.pools if pool.config.name == "mock"]
+    assert mock_pool.config.wake == "on-demand"
+    assert set(mock_pool.config.prices.values()) == {6.0}
