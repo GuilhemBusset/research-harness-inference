@@ -75,6 +75,7 @@ def issue(github_id: int, *, roster: Any, keys: Any, course_end: datetime.date, 
     return key
 
 
-def revoke(github_id: int, *, keys: Any, now: int) -> int:
-    """Revokes every key of the student that is not revoked yet; how many this revoked."""
-    return revoke_all(github_id, keys=keys, now=now)
+def revoke(github_id: int, *, keys: Any, course_end: datetime.date, now: int) -> int:
+    """Revokes every key of the student that is not revoked yet, each held to the course end plus
+    90 days (`rhi_issuer.revoke`); how many this revoked."""
+    return revoke_all(github_id, keys=keys, now=now, course_end=course_end)

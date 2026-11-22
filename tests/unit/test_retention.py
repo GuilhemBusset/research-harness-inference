@@ -20,17 +20,18 @@ import pytest
 from moto import mock_aws
 
 from rhi import config
-from rhi_admin import main
+from rhi_admin import keys as admin_keys
+from rhi_admin import main, privacy
 from rhi_admin import roster as admin_roster
 from rhi_common import retention
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.students import RosterEntry, StudentKey
 from rhi_common.tables import KEYS, ROSTER, USAGE, Table
 from rhi_gateway.budget import DynamoDBLedger, InMemoryLedger, Ledger, Reservation
-from rhi_issuer import rules
+from rhi_issuer import revoke, rules
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 COURSE_END = datetime.date(2027, 1, 15)
 # 15 April 2027, the course end plus 90 days, as DynamoDB's expiry reads it.
@@ -237,3 +238,88 @@ def test_the_lock_a_stopped_login_leaves_in_the_keys_table_expires_no_later_than
 
     lock = aws.keys.get_item(Key=rules.lock_key(GITHUB_ID), ConsistentRead=True)["Item"]
     assert NOW < lock["expires_at"] <= EXPIRY
+
+
+# The course end of a configuration before the owner moved it earlier, to the 15 January 2027 in
+# SSM: a key issued then works until 1 July 2027, past the 15 April 2027 every row now expires by.
+LATER_END = datetime.date(2027, 6, 30)
+# A key of a still earlier configuration, which expires on 1 January 2027: a later write keeps it.
+EARLIER_END = datetime.date(2026, 12, 31)
+
+
+def _stores(aws: SimpleNamespace, during_sleep: Callable[[], None]) -> privacy.Stores:
+    """What an erase reaches beyond the roster and the keys; its waits run `during_sleep`."""
+    return privacy.Stores(
+        usage=aws.usage, logs=None, log_group="", query=lambda *_: [], sleep=lambda _seconds: during_sleep()
+    )
+
+
+def _expiries(table: Any) -> list[int]:
+    return [int(item["expires_at"]) for item in table.scan(ConsistentRead=True)["Items"]]
+
+
+@pytest.mark.parametrize("command", ["remove", "erase"])
+def test_the_rows_that_take_a_student_off_the_roster_expire_by_the_course_end_plus_90_days(
+    aws: SimpleNamespace, command: str
+) -> None:
+    seen: list[int] = []
+    admin = dataclasses.replace(aws.admin, privacy=lambda: _stores(aws, lambda: seen.extend(_expiries(aws.roster))))
+    assert main.run(["roster", "add", str(GITHUB_ID), "otter"], admin, now=NOW, out=io.StringIO()) == 0
+
+    # On the course's last day for a removal, and an hour before the rows expire for an erase: the
+    # alias's hold and the erase's own hold of the GitHub ID would otherwise outlive them.
+    at = int(datetime.datetime(2027, 1, 15, tzinfo=datetime.UTC).timestamp()) if command == "remove" else EXPIRY - 3600
+    assert main.run(["privacy" if command == "erase" else "roster", command, str(GITHUB_ID)], admin, now=at) == 0
+
+    seen.extend(_expiries(aws.roster))
+    assert seen and max(seen) <= EXPIRY
+
+
+@pytest.mark.parametrize("command", [["roster", "set", "--limit", "2"], ["key", "revoke"], ["roster", "remove"], ["privacy", "erase"]])
+def test_every_key_row_the_admin_cli_writes_again_expires_by_the_course_end_plus_90_days(
+    aws: SimpleNamespace, command: list[str]
+) -> None:
+    seen: list[dict[str, int]] = []
+    admin = dataclasses.replace(aws.admin, privacy=lambda: _stores(aws, lambda: seen.append(by_hash())))
+    assert main.run(["roster", "add", str(GITHUB_ID), "otter"], admin, now=NOW, out=io.StringIO()) == 0
+    later, earlier = (
+        key_hash(admin_keys.issue(GITHUB_ID, roster=aws.roster, keys=aws.keys, course_end=end, now=NOW))
+        for end in (LATER_END, EARLIER_END)
+    )
+
+    def by_hash() -> dict[str, int]:
+        return {item["key_hash"]: int(item["expires_at"]) for item in aws.keys.scan(ConsistentRead=True)["Items"]}
+
+    kept = by_hash()[earlier]
+    assert by_hash()[later] > EXPIRY
+    argv = [*command[:2], str(GITHUB_ID), *command[2:]]
+    assert main.run(argv, admin, now=NOW + 60, out=io.StringIO()) == 0
+
+    # An erase deletes the keys once its waits are over: what they hold meanwhile is what counts.
+    for keys in seen or [by_hash()]:
+        assert keys == {later: EXPIRY, earlier: kept}
+
+
+@pytest.mark.parametrize("write", ["replace", "revoke", "revoke all"])
+def test_every_key_row_the_issuer_writes_again_expires_by_the_course_end_plus_90_days(
+    aws: SimpleNamespace, write: str
+) -> None:
+    other = rules.issue(_entry(), "installation-2", course_end=EARLIER_END, now=NOW, keys=aws.keys)
+    first = rules.issue(_entry(), "installation-1", course_end=LATER_END, now=NOW + 1, keys=aws.keys)
+    kept = int(aws.keys.get_item(Key={KEYS.partition_key.name: key_hash(other.key)})["Item"]["expires_at"])
+
+    if write == "replace":
+        # A login on the first installation, once the course end is 15 January 2027.
+        rules.issue(_entry(), "installation-1", course_end=COURSE_END, now=NOW + 60, keys=aws.keys)
+    elif write == "revoke":
+        revoke.revoke_key(first.key, keys=aws.keys, now=NOW + 60, course_end=COURSE_END)
+        revoke.revoke_key(other.key, keys=aws.keys, now=NOW + 60, course_end=COURSE_END)
+    else:
+        assert revoke.revoke_all(GITHUB_ID, keys=aws.keys, now=NOW + 60, course_end=COURSE_END) == 2
+
+    def expiry(minted: Any) -> tuple[int, bool]:
+        item = aws.keys.get_item(Key={KEYS.partition_key.name: key_hash(minted.key)}, ConsistentRead=True)["Item"]
+        return int(item["expires_at"]), "revoked_at" in item
+
+    assert expiry(first) == (EXPIRY, True)
+    assert expiry(other) == (kept, write != "replace")

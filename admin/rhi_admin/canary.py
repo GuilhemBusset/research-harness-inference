@@ -32,7 +32,7 @@ def run_canary(*, roster: Any, keys: Any, secrets: Any, course_end: datetime.dat
     """
     if get(CANARY_GITHUB_ID, roster=roster) is None:
         add(CANARY_GITHUB_ID, CANARY_ALIAS, roster=roster, course_end=course_end, now=now)
-    admin_keys.revoke(CANARY_GITHUB_ID, keys=keys, now=now)
+    admin_keys.revoke(CANARY_GITHUB_ID, keys=keys, course_end=course_end, now=now)
     key = admin_keys.issue(CANARY_GITHUB_ID, roster=roster, keys=keys, course_end=course_end, now=now)
     try:
         secrets.create_secret(Name=CANARY_SECRET, Description=_DESCRIPTION, SecretString=key)

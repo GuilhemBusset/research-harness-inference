@@ -51,7 +51,7 @@ def run_spike_keys(students: int, *, roster: Any, keys: Any, secrets: Any, cours
         github_id = spike_github_id(number)
         if get(github_id, roster=roster) is None:
             add(github_id, alias, roster=roster, course_end=course_end, now=now, daily_token_budget=budget)
-        admin_keys.revoke(github_id, keys=keys, now=now)
+        admin_keys.revoke(github_id, keys=keys, course_end=course_end, now=now)
         return admin_keys.issue(github_id, roster=roster, keys=keys, course_end=course_end, now=now)
 
     issued = SpikeKeys(

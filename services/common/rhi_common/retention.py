@@ -9,6 +9,9 @@ reads it from the configuration in SSM.
   90th day after the course end.
 - A key row expires at the end of its validity, the course end (section 6.4, `rhi_issuer.mint`),
   which is earlier, and never later than `expires_at(course_end)`.
+- Every other row these tables hold for a student (a held-back alias, an erase in progress, the
+  issuer's lock) and every later write of a row (a revocation, a change of budget) is held to the
+  same date with `no_later`, from the course end configured when it is written.
 
 The value is in the form DynamoDB's expiry reads: whole seconds since the epoch, a number.
 """
@@ -28,3 +31,13 @@ def expires_at(course_end: datetime.date) -> int:
     """
     day = course_end + datetime.timedelta(days=RETENTION_DAYS)
     return int(datetime.datetime.combine(day, datetime.time.min, datetime.UTC).timestamp())
+
+
+def no_later(expiry: int, course_end: datetime.date) -> int:
+    """An expiry held to the retention: `expiry`, or `expires_at(course_end)` when that is earlier.
+
+    Every write of a personal row sets its expiry through this, or to `expires_at` itself: a row
+    written again after the course end was moved earlier expires by the new date, and an earlier
+    expiry it already had stays.
+    """
+    return min(int(expiry), expires_at(course_end))

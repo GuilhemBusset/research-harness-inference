@@ -268,6 +268,7 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
             roster=admin.roster,
             keys=admin.keys,
             stores=admin.privacy(),
+            course_end=admin.course_end(),
             now=now,
             say=lambda line: print(line, file=out, flush=True),
         )
@@ -304,7 +305,9 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
         )
         print(f"Changed the entry and {changed} active key(s); the gateway applies it within 60 seconds.", file=out)
     elif command == ("roster", "remove"):
-        revoked = admin_roster.remove(arguments.github_id, roster=admin.roster, keys=admin.keys, now=now)
+        revoked = admin_roster.remove(
+            arguments.github_id, roster=admin.roster, keys=admin.keys, course_end=admin.course_end(), now=now
+        )
         print(f"Removed the entry and revoked {revoked} key(s).", file=out)
     elif command == ("key", "issue"):
         key = admin_keys.issue(
@@ -313,7 +316,7 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
         # The one time the key is shown: it is stored as its SHA-256 only.
         print(key, file=out)
     elif command == ("key", "revoke"):
-        revoked = admin_keys.revoke(arguments.github_id, keys=admin.keys, now=now)
+        revoked = admin_keys.revoke(arguments.github_id, keys=admin.keys, course_end=admin.course_end(), now=now)
         print(f"Revoked {revoked} key(s).", file=out)
     elif command == ("spike-keys", None):
         run_spike_keys(

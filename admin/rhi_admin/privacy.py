@@ -21,10 +21,10 @@ order leaves none of them a row behind:
    the token is still there (`rhi_admin.roster.erasing`): an erase run again takes the GitHub ID
    over and the first one stops, so no erase deletes a key or a usage row of an entry added once
    the GitHub ID was given back. Then the roster entry goes, replaced in the same write by the
-   item that holds its alias back for `ALIAS_HELD_DAYS` (`rhi_admin.roster.hold_alias`): a login
-   that reads the roster from then on gets no key, and no new entry is given the alias. The
-   admin's own `key issue` writes a key only while the very entry it read is there
-   (`rhi_admin.keys`).
+   item that holds its alias back for `ALIAS_HELD_DAYS`, and never past the course end plus 90
+   days (`rhi_admin.roster.hold_alias`, `alias_held_until`): a login that reads the roster from
+   then on gets no key, and no new entry is given the alias. The admin's own `key issue` writes a
+   key only while the very entry it read is there (`rhi_admin.keys`).
 2. Every key is revoked. A login that read the entry a moment before can still store a key until
    the issuer's function times out, so after `ISSUER_SECONDS` every key is revoked again.
    `GATEWAY_SECONDS` then outwaits the gateway's 60-second cache.
@@ -52,6 +52,7 @@ text: nothing here repeats what AWS answered.
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 import urllib.error
@@ -72,6 +73,7 @@ from rhi_admin.roster import (
     ERASE_TAKEN_OVER,
     RETENTION_DAYS,
     AdminError,
+    alias_held_until,
     begin_erase,
     check_github_id,
     end_erase,
@@ -79,8 +81,9 @@ from rhi_admin.roster import (
     get,
     hold_alias,
 )
+from rhi_common import retention
 from rhi_common.students import RosterEntry
-from rhi_common.tables import BY_STUDENT, KEYS, USAGE
+from rhi_common.tables import BY_STUDENT, EXPIRES_AT, KEYS, USAGE
 from rhi_issuer.rules import every_key, lock_key
 
 # `RETENTION_DAYS` is the retention of the workspace and of the gateway's log group (section 6.6),
@@ -289,21 +292,23 @@ class _Guarded:
             },
         )
 
-    def revoke_all(self, github_id: int, keys: Any, now: int) -> None:
-        """Revokes every key of the student not revoked yet, as `rhi_issuer.revoke.revoke_all` does."""
+    def revoke_all(self, github_id: int, keys: Any, now: int, course_end: datetime.date) -> None:
+        """Revokes every key of the student not revoked yet, as `rhi_issuer.revoke.revoke_all` does,
+        and holds each one's expiry to the course end plus 90 days (`rhi_common.retention.no_later`)."""
         for record in every_key(github_id, keys):
             if record.revoked_at is not None:
                 continue
+            student = KEYS.index(BY_STUDENT).partition_key.name
             self.write(
                 "Update",
                 {
                     "table": keys,
                     "TableName": keys.name,
                     "Key": {KEYS.partition_key.name: record.key_hash},
-                    "UpdateExpression": "SET #revoked = :now",
+                    "UpdateExpression": "SET #revoked = :now, #expires = :expires",
                     "ConditionExpression": "attribute_exists(#student) AND attribute_not_exists(#revoked)",
-                    "ExpressionAttributeNames": {"#student": KEYS.index(BY_STUDENT).partition_key.name, "#revoked": "revoked_at"},
-                    "ExpressionAttributeValues": {":now": now},
+                    "ExpressionAttributeNames": {"#student": student, "#revoked": "revoked_at", "#expires": EXPIRES_AT},
+                    "ExpressionAttributeValues": {":now": now, ":expires": retention.no_later(record.expires_at, course_end)},
                 },
             )
 
@@ -328,9 +333,20 @@ def _any_left(github_id: int, keys: Any, usage: Any) -> bool:
 
 
 def erase(
-    github_id: int, *, roster: Any, keys: Any, stores: Stores, now: int, say: Callable[[str], None] = lambda _: None
+    github_id: int,
+    *,
+    roster: Any,
+    keys: Any,
+    stores: Stores,
+    course_end: datetime.date,
+    now: int,
+    say: Callable[[str], None] = lambda _: None,
 ) -> Erased:
     """Deletes the student's entry, keys and usage rows, in the order of this module's docstring.
+
+    Every row it writes, and leaves if it stops, expires by the course end plus 90 days
+    (`rhi_common.retention`): the item that holds the GitHub ID, the one that holds the alias back,
+    and each key it revokes.
 
     An erase that was interrupted can be run again: it takes the GitHub ID over and, without the
     entry, deletes what is left. Refused, before anything is written, when the GitHub ID is none,
@@ -338,26 +354,27 @@ def erase(
     """
     check_github_id(github_id)
     token = uuid.uuid4().hex
-    begin_erase(github_id, roster=roster, token=token, until=now + ERASE_HELD_SECONDS)
+    begin_erase(github_id, roster=roster, token=token, until=retention.no_later(now + ERASE_HELD_SECONDS, course_end))
     guarded = _Guarded(github_id, roster, token)
     try:
         entry = get(github_id, roster=roster)
         if entry is None and not _any_left(github_id, keys, stores.usage):
             raise AdminError("that GitHub ID has no roster entry, no key and no usage row")
         if entry is not None:
-            hold_alias(entry, roster=roster, until=now + ALIAS_HELD_DAYS * 86_400, guard=erasing(github_id, roster=roster, token=token))
+            guard = erasing(github_id, roster=roster, token=token)
+            hold_alias(entry, roster=roster, until=alias_held_until(now, course_end), guard=guard)
     except AdminError as error:
         if str(error) != ERASE_TAKEN_OVER:
             # Nothing was deleted: the GitHub ID is given back.
             end_erase(github_id, roster=roster, token=token)
         raise
-    guarded.revoke_all(github_id, keys, now)
+    guarded.revoke_all(github_id, keys, now, course_end)
     say(
         f"The entry is removed and the keys revoked. Waiting {ISSUER_SECONDS + GATEWAY_SECONDS} seconds for "
         "the logins and the requests in flight before deleting the keys and the usage rows."
     )
     stores.sleep(ISSUER_SECONDS)
-    guarded.revoke_all(github_id, keys, now + ISSUER_SECONDS)
+    guarded.revoke_all(github_id, keys, now + ISSUER_SECONDS, course_end)
     stores.sleep(GATEWAY_SECONDS)
     deleted_keys, rows = guarded.sweep(github_id, keys, stores.usage)
     if _any_left(github_id, keys, stores.usage):
@@ -381,7 +398,8 @@ def report(erased: Erased, github_id: int) -> list[str]:
         f"{alias} names nobody:"
     )
     held = (
-        f"No new roster entry is given {alias} for {ALIAS_HELD_DAYS} days, so that none is given what was written under it."
+        f"No new roster entry is given {alias} for {ALIAS_HELD_DAYS} days, or until the course end plus "
+        f"{RETENTION_DAYS} days if that is sooner, so that none is given what was written under it."
         if erased.entry
         else "The entry was gone before this erase, which therefore holds back no alias."
     )

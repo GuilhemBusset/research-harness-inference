@@ -273,10 +273,13 @@ def _store(
     holder: str | None,
     now: int,
     keys: Any,
+    course_end: datetime.date,
 ) -> bool:
     """Writes the new key, revokes the replaced ones and names the new key as the latest key's successor, in one write.
 
-    `False` when the write is cancelled because another login wrote first.
+    Each older key it writes again has its expiry held to the course end plus 90 days
+    (`rhi_common.retention.no_later`): an earlier expiry stays. `False` when the write is
+    cancelled because another login wrote first.
     """
     hash_name = KEYS.partition_key.name
     names = {"#hash": hash_name}
@@ -291,26 +294,35 @@ def _store(
             }
         }
     ]
-    revoked = {old.key_hash for old in replaced}
+    revoked = {old.key_hash: old for old in replaced}
     revoke = "#revoked = if_not_exists(#revoked, :now)"
-    for key_hash in revoked - ({latest.record.key_hash} if latest else set()):
+    held = "#expires = :expires"
+    for key_hash, old in revoked.items():
+        if latest is not None and key_hash == latest.record.key_hash:
+            continue
         items.append(
             {
                 "Update": {
                     "TableName": keys.name,
                     "Key": {hash_name: key_hash},
                     # A revocation that landed in the meantime keeps its own time.
-                    "UpdateExpression": f"SET {revoke}",
+                    "UpdateExpression": f"SET {revoke}, {held}",
                     "ConditionExpression": "attribute_exists(#hash)",
-                    "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT},
-                    "ExpressionAttributeValues": {":now": now},
+                    "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT, "#expires": EXPIRES_AT},
+                    "ExpressionAttributeValues": {
+                        ":now": now,
+                        ":expires": retention.no_later(old.expires_at, course_end),
+                    },
                 }
             }
         )
     if latest is not None:
-        assignments = ["#successor = :new"]
-        values: dict[str, Any] = {":new": record.key_hash}
-        update_names = {**names, "#successor": _SUCCESSOR}
+        assignments = ["#successor = :new", held]
+        values: dict[str, Any] = {
+            ":new": record.key_hash,
+            ":expires": retention.no_later(latest.record.expires_at, course_end),
+        }
+        update_names = {**names, "#successor": _SUCCESSOR, "#expires": EXPIRES_AT}
         if latest.record.key_hash in revoked:
             assignments.append(revoke)
             values[":now"] = now
@@ -407,7 +419,7 @@ def issue(
             raise
         key, record = mint(entry, installation, course_end=course_end, now=now)
         replaced = [old for old in existing if _is_active(old, now) and old.installation == installation]
-        if _store(record, _ledger(record, existing, replaced, now), replaced, latest, holder, now, keys):
+        if _store(record, _ledger(record, existing, replaced, now), replaced, latest, holder, now, keys, course_end):
             previous = max((old.issued_at for old in existing), default=None)
             return Minted(
                 key=key, issued_at=record.issued_at, expires_at=record.expires_at, previous_issued_at=previous
