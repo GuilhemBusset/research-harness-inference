@@ -189,6 +189,27 @@ class RunLock:
     def __exit__(self, *exc) -> None:
         self.path.unlink(missing_ok=True)
 
+    def holder(self) -> dict:
+        """What the engine that took the lock wrote in it (its process, host and start), which
+        tells one invocation from the next; empty when no lock is there or it cannot be read."""
+        try:
+            holder = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return holder if isinstance(holder, dict) else {}
+
+    def held(self) -> bool:
+        """Whether an engine that is alive holds the lock: a lock left by a dead process on this
+        host is not held; one of another host, whose process cannot be asked, is taken as held."""
+        holder = self.holder()
+        try:
+            pid = int(holder.get("pid", 0))
+        except (ValueError, TypeError):
+            return False
+        if not holder:
+            return False
+        return holder.get("host") != socket.gethostname() or (pid > 0 and _pid_alive(pid))
+
 
 class RepoClaims:
     """Repo-wide claims shared by every run: the merge queue and shared files.

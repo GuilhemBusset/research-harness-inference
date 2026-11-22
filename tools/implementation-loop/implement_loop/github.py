@@ -94,6 +94,7 @@ class GitHub(Protocol):
     def list_blocked_by(self, n: int) -> list[dict]: ...
     def list_comments(self, n: int) -> list[dict]: ...
     def find_pr(self, head: str) -> dict | None: ...
+    def get_pr(self, n: int) -> dict: ...
     def required_check(self, sha: str, name: str) -> str | None: ...
     def required_check_run(self, sha: str, name: str) -> dict | None: ...
     def deploy_status(self, sha: str, context: str) -> dict | None: ...
@@ -208,6 +209,10 @@ class GhCli:
         prs = self._api(self._r(f"pulls?state=all&head={urllib.parse.quote(owner + ':' + head)}")) or []
         open_prs = [p for p in prs if p.get("state") == "open"]
         return (open_prs or prs or [None])[0]
+
+    def get_pr(self, n):
+        """The pull request numbered `n`, whatever has since used its branch."""
+        return self._api(self._r(f"pulls/{n}"))
 
     def required_check(self, sha, name):
         run = self.required_check_run(sha, name)
@@ -489,6 +494,11 @@ class FakeGitHub:
         matches = [p for p in self.prs.values() if p["head"]["ref"] == head]
         open_prs = [p for p in matches if p["state"] == "open"]
         return (open_prs or matches or [None])[0]
+
+    def get_pr(self, n):
+        if n not in self.prs:
+            raise GitHubError(f"pull request {n} not found")
+        return self.prs[n]
 
     def required_check(self, sha, name):
         run = self.required_check_run(sha, name)
