@@ -9,11 +9,18 @@ configuration sends that output to the gateway's log group. A record holds exact
 | `alias` | the student's roster alias, once the key is accepted; `null` before |
 | `time` | when the request arrived, ISO 8601 in UTC |
 | `pool` | the pool the request was for, once known; `null` otherwise |
+| `route` | the path of the route table's entry the request matched (`rhi_gateway.routes`); `null` for a path outside the table |
 | `wire_format` | the wire format of the route; `null` for a local route or a path outside the table |
 | `input_tokens`, `output_tokens` | what the request's settlement observed; 0 when nothing was forwarded |
+| `cached_input_tokens` | the part of `input_tokens` the engine reported read from its cache, as the usage parsers give it; 0 when it reported none |
+| `time_to_first_token_ms` | from the request accepted to its first token sent, in milliseconds, as the time-to-first-token histogram counts it (`rhi_gateway.experience`); `null` when no token was sent |
+| `held_ms` | how long the request was held while its pool started (`rhi_gateway.hold`), in milliseconds; 0 when it was not held |
 | `latency_ms` | from the request's arrival to its end, in milliseconds |
 | `status` | the HTTP status sent; `null` if none was |
 | `cause` | the cause the gateway gave (`rhi_common.causes`), `none` for its own fault, else `null` |
+
+A token count (`POST /v1/messages/count_tokens`) is told apart by its `route`: its `input_tokens` is
+the count it answered, a count asked and not tokens a student generated, and its `output_tokens` 0.
 
 Nothing else reaches a record: no body, no header's value, no key or its hash, no GitHub ID (the
 alias is the only name of a student in a log, section 6.6), and no text of an exception. A record
@@ -68,14 +75,14 @@ class RequestRecord:
     """What is logged of one request. Every field is metadata: none comes from a body or a header's value.
 
     `key_hash` is not logged: it is the hash of the accepted key, by which the metrics stop an
-    erased student's series (`rhi_gateway.metrics`). Nor are `cached_input_tokens`, the
-    part of the input the engine reported read from the cache, and `token_count`, whether the
-    request is a token count (`POST /v1/messages/count_tokens`), whose input is a count asked and
-    not a generation's: the metrics count both apart.
+    erased student's series (`rhi_gateway.metrics`). Nor is `token_count`, whether the request is
+    a token count (`POST /v1/messages/count_tokens`), whose input is a count asked and not a
+    generation's: the metrics count it apart, and the log tells it by its `route`.
     """
 
     time: str
     wire_format: str | None
+    route: str | None = None
     alias: str | None = None
     pool: str | None = None
     input_tokens: int = 0
@@ -86,15 +93,21 @@ class RequestRecord:
     key_hash: str | None = field(default=None, repr=False)
     cached_input_tokens: int = 0
     token_count: bool = False
+    time_to_first_token_ms: int | None = None
+    held_ms: int = 0
 
     def to_json(self) -> dict[str, object]:
         return {
             "alias": self.alias,
             "time": self.time,
             "pool": self.pool,
+            "route": self.route,
             "wire_format": self.wire_format,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "time_to_first_token_ms": self.time_to_first_token_ms,
+            "held_ms": self.held_ms,
             "latency_ms": self.latency_ms,
             "status": self.status,
             "cause": self.cause,
@@ -125,6 +138,24 @@ def note_tokens(input_tokens: int, output_tokens: int, cached_input_tokens: int 
         record.input_tokens = input_tokens
         record.output_tokens = output_tokens
         record.cached_input_tokens = cached_input_tokens
+
+
+def note_first_token(seconds: float) -> None:
+    """The seconds from the request accepted to its first token sent. Only the first noted is kept."""
+    record = _CURRENT.get()
+    if record is not None and record.time_to_first_token_ms is None:
+        record.time_to_first_token_ms = _milliseconds(seconds)
+
+
+def note_held(seconds: float) -> None:
+    """The seconds the request was held while its pool started."""
+    record = _CURRENT.get()
+    if record is not None:
+        record.held_ms = _milliseconds(seconds)
+
+
+def _milliseconds(seconds: float) -> int:
+    return max(0, round(seconds * 1000))
 
 
 def note_cause(cause: Cause) -> None:
@@ -171,7 +202,12 @@ class Telemetry:
             return
         entry = match(scope["method"], scope.get("raw_path"))
         wire_format = None if entry is None or entry.wire_format is None else entry.wire_format.value
-        record = RequestRecord(time=_arrival(self._clock()), wire_format=wire_format, token_count=entry == COUNT_TOKENS)
+        record = RequestRecord(
+            time=_arrival(self._clock()),
+            wire_format=wire_format,
+            route=None if entry is None else entry.path,
+            token_count=entry == COUNT_TOKENS,
+        )
         started = self._monotonic()
 
         faulted = False
@@ -202,7 +238,7 @@ class Telemetry:
                 record.cause = NO_CAUSE
         finally:
             _CURRENT.reset(token)
-            record.latency_ms = max(0, round((self._monotonic() - started) * 1000))
+            record.latency_ms = _milliseconds(self._monotonic() - started)
             if self._ended is not None:
                 self._ended(record)
             self._write(json.dumps(record.to_json(), separators=(",", ":")))
