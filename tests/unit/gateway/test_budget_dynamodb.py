@@ -168,18 +168,21 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
         expires_at=retention.expires_at(COURSE_END_DATE),
         leases={"request-1": lease},
     )
-    assert client.get_item(TableName=TABLE, Key=KEY)["Item"]["leases"]["M"]["request-1"]["M"].keys() == {
-        "tokens",
-        "estimate",
-        "expires",
-    }
+    # The release before reads these attributes and refuses an item that lacks one, so they are
+    # checked as stored, not through the reader of this release, which takes a missing one as 0.
+    stored_lease = {"tokens": {"N": "0"}, "estimate": {"N": "0"}, "expires": {"N": str(NOON + 2280)}}
+    item = client.get_item(TableName=TABLE, Key=KEY)["Item"]
+    assert item.get("tokens") == {"N": "0"}
+    assert item["leases"]["M"]["request-1"]["M"] == stored_lease
 
     # From then on a request is two calls, and each is a write.
     client.made.clear()
     second = reserve(ledger, who, "request-2")
-    assert written().leases["request-2"] == Lease(tokens=0, estimate=0, expires=NOON + 2280)
+    assert client.made == ["update_item"]
+    assert client.get_item(TableName=TABLE, Key=KEY)["Item"]["leases"]["M"]["request-2"]["M"] == stored_lease
+    client.made.clear()
     assert ledger.settle(second) is True
-    assert client.made == ["update_item", "update_item"]
+    assert client.made == ["update_item"]
 
     # A settlement frees the slot and charges nothing, and settles once.
     assert ledger.settle(first) is True
