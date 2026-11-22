@@ -1,7 +1,8 @@
 """The runbooks (system design, section 9): each has the sections when, check, act and verify, and
 every command of this repository it shows is one the repository has.
 
-A code block's line is told apart by its first word: `rhi` parses with the rhi CLI's parser, the
+Each command of a code block's line (the words between `|`, `||`, `&&` and `;`, less its
+redirections) is told apart by its first word: `rhi` parses with the rhi CLI's parser, the
 admin CLI's program name with the admin CLI's parser, and a path of the repository must exist.
 Any other first word (aws, gh, git, ...) is a step the walk-through on the deployed system tests.
 """
@@ -29,6 +30,9 @@ RUNBOOKS = [
     "leaked-key.md",
     "bad-deployment.md",
     "secret-rotation.md",
+    "park-and-unpark.md",
+    "image-and-engine-upgrade.md",
+    "course-end.md",
 ]
 SECTIONS = ["when", "check", "act", "verify"]
 
@@ -77,6 +81,27 @@ def _is_repository_path(word: str) -> bool:
     return "/" in word and not word.startswith(("/", "~", "$", "-")) and "://" not in word
 
 
+CONTROL = {"|", "||", "&&", ";"}
+REDIRECTION = {">", ">>", "<", "2>"}
+
+
+def commands(words: list[str]) -> list[list[str]]:
+    """The commands of a line: the words between its control operators, each without its
+    redirections and their files, so that each command of a pipeline is checked on its own."""
+    found: list[list[str]] = [[]]
+    target = False
+    for word in words:
+        if target:
+            target = False
+        elif word in CONTROL:
+            found.append([])
+        elif word in REDIRECTION:
+            target = True
+        else:
+            found[-1].append(word)
+    return [command for command in found if command]
+
+
 def problems(text: str, root: Path = ROOT) -> list[str]:
     """What is wrong with a runbook: a missing section, a command that does not parse, a path that is not there."""
     found = []
@@ -84,7 +109,7 @@ def problems(text: str, root: Path = ROOT) -> list[str]:
     if [h for h in headings if h in SECTIONS] != SECTIONS:
         found.append(f"the sections are {headings}, not {SECTIONS} in that order")
     admin = admin_main.parser()
-    for words in lines:
+    for words in (command for line in lines for command in commands(line)):
         first, rest = words[0], words[1:]
         if first == "rhi" and _refuses(rhi_main.parser(), rest):
             found.append(f"the rhi CLI refuses: {shlex.join(words)}")
@@ -111,6 +136,9 @@ def test_detects_an_unknown_command() -> None:
     assert problems(missing_script) == ["no such path in the repository: scripts/no-such-script.sh"]
     # A tilde fence is a code block too, and a backtick line inside it does not close it.
     assert problems(sections + "~~~sh\n```\nrhi frobnicate\n~~~\n") == ["the rhi CLI refuses: rhi frobnicate"]
+    # A redirection is not an argument, and each command of a pipeline or a list is checked.
+    redirected = "```sh\nrhi_admin privacy export 1234567 > \"$HOME/export.json\"\nrhi status | cat && rhi frobnicate\n```\n"
+    assert problems(sections + redirected) == ["the rhi CLI refuses: rhi frobnicate"]
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:
