@@ -111,6 +111,7 @@ def test_the_stack_creates_no_resource_of_its_own_and_nothing_reads_it(app: cdk.
         "guardrails_budget",
         "guardrails_anomaly",
         "guardrails_alarms_fleet",
+        "guardrails_alarms_gateway",
     }
     assert "Outputs" not in guardrails(templates)
 
