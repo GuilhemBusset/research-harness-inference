@@ -36,6 +36,14 @@ is then right after midnight, and after a request another task served, with no r
 read that fails gives no sample for that student at that scrape, never an old value, and the
 counters are served still.
 
+**An erased student's series stop** (section 6.6). At every scrape, before anything is read, the
+key last accepted for each alias is read again from the keys table; when the table no longer holds
+it, as the admin's erase leaves it (`rhi_admin.privacy`), every series of that alias is dropped
+from the registry and served no more. The samples already written then expire with the
+workspace's retention, and none is added under the alias after the erase. A key that is only
+revoked, as when a student is given a new one, drops nothing: the student's counts go on. A read
+that fails drops nothing at that scrape.
+
 Nothing here reaches CloudWatch: its metrics cannot be deleted for 15 months, so the gateway
 publishes none (section 6.6), and these series exist in Prometheus only.
 
@@ -45,6 +53,7 @@ so the series of two tasks never merge, and a sum over them is right across the 
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
@@ -53,11 +62,13 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from prometheus_client import CollectorRegistry, Counter, make_wsgi_app
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.exposition import ThreadingWSGIServer
+from prometheus_client.registry import Collector
 
 if TYPE_CHECKING:
     from prometheus_client import Metric
 
-    from rhi_gateway.budget import Ledger, Student
+    from rhi_gateway.budget import Ledger
+    from rhi_gateway.keystore import KeyRecord, KeyStore
     from rhi_gateway.telemetry import RequestRecord
 
 HOST = "127.0.0.1"
@@ -75,27 +86,39 @@ _StartResponse = Callable[[str, list[tuple[str, str]]], object]
 _Application = Callable[[dict[str, Any], _StartResponse], Iterable[bytes]]
 
 
-class _BudgetLeft:
-    """The budget each student has left of the day, read from the ledger at every scrape."""
+class _Students(Collector):
+    """The students whose key this task has accepted, by alias: pruned, then their budget read, at every scrape.
 
-    def __init__(self, ledger: Ledger) -> None:
-        self._ledger = ledger
+    It is registered before the counters, and a registry collects in the order of registration, so
+    an erased student's counters are dropped before the scrape reads them.
+    """
+
+    def __init__(self, ledger: Ledger | None, keys: KeyStore | None) -> None:
+        self._ledger, self._keys = ledger, keys
         self._lock = threading.Lock()
-        # By alias, the label: the record of the key last accepted for it.
-        self._students: dict[str, Student] = {}
+        # By alias, the label: the record of the key last accepted for it, and its labelled children.
+        self._students: dict[str, KeyRecord] = {}
+        self._children: dict[str, set[tuple[Counter, tuple[str, ...]]]] = {}
 
-    def seen(self, student: Student) -> None:
+    def seen(self, student: KeyRecord, children: Iterable[tuple[Counter, tuple[str, ...]]]) -> None:
         with self._lock:
             self._students[student.alias] = student
+            self._children.setdefault(student.alias, set()).update(children)
 
     def describe(self) -> Iterable[Metric]:
         # The registry asks the family's name when the collector is registered: no read for that.
-        return [self._family()]
+        return [] if self._ledger is None else [_budget_family()]
 
     def collect(self) -> Iterable[Metric]:
-        family = self._family()
         with self._lock:
             students = dict(self._students)
+        for alias, student in list(students.items()):
+            if self._gone(student):
+                self._drop(alias, student)
+                del students[alias]
+        if self._ledger is None:
+            return []
+        family = _budget_family()
         for alias, student in students.items():
             try:
                 left = self._ledger.tokens_left(student)
@@ -104,23 +127,44 @@ class _BudgetLeft:
             family.add_metric([alias], left)
         return [family]
 
-    @staticmethod
-    def _family() -> GaugeMetricFamily:
-        return GaugeMetricFamily(
-            BUDGET_LEFT, "Tokens of today's budget neither charged nor reserved.", labels=["alias"]
-        )
+    def _gone(self, student: KeyRecord) -> bool:
+        if self._keys is None:
+            return False
+        try:
+            record = self._keys.lookup(student.key_hash)
+        except Exception:  # noqa: BLE001 - a read that fails drops nothing; the next scrape reads again.
+            return False
+        return record is None
+
+    def _drop(self, alias: str, student: KeyRecord) -> None:
+        with self._lock:
+            # A request of the same alias with another key, accepted since the read, keeps the series.
+            if self._students.get(alias) is not student:
+                return
+            del self._students[alias]
+            children = self._children.pop(alias, set())
+        for counter, labels in children:
+            with contextlib.suppress(KeyError):
+                counter.remove(*labels)
+
+
+def _budget_family() -> GaugeMetricFamily:
+    return GaugeMetricFamily(BUDGET_LEFT, "Tokens of today's budget neither charged nor reserved.", labels=["alias"])
 
 
 class Metrics:
     """The gateway's registry and what it counts of each request.
 
     `ledger` is the one the requests reserve in and settle with: without it there is no budget
-    series. The registry is the gateway's own, not prometheus-client's default one, which also
+    series. `keys` is the store the keys are looked up in: without it no student's series are
+    dropped. The registry is the gateway's own, not prometheus-client's default one, which also
     describes the process.
     """
 
-    def __init__(self, ledger: Ledger | None = None) -> None:
+    def __init__(self, ledger: Ledger | None = None, keys: KeyStore | None = None) -> None:
         self.registry = CollectorRegistry()
+        self._students = _Students(ledger, keys)
+        self.registry.register(self._students)
         self._requests = Counter(REQUESTS, "Requests answered.", ["alias", "pool"], registry=self.registry)
         self._input_tokens = Counter(
             INPUT_TOKENS, "Input tokens settled, cached or not.", ["alias", "pool"], registry=self.registry
@@ -134,22 +178,22 @@ class Metrics:
             ["alias", "pool", "cause"],
             registry=self.registry,
         )
-        self._budget_left = None if ledger is None else _BudgetLeft(ledger)
-        if self._budget_left is not None:
-            self.registry.register(self._budget_left)
 
     def count(self, record: RequestRecord) -> None:
         """Count one request that has ended, from its log record. Reads nothing and never waits."""
         alias, pool = record.alias or "", record.pool or ""
-        self._requests.labels(alias, pool).inc()
+        children: list[tuple[Counter, tuple[str, ...]]] = [(self._requests, (alias, pool))]
         if record.input_tokens:
-            self._input_tokens.labels(alias, pool).inc(record.input_tokens)
+            children.append((self._input_tokens, (alias, pool)))
         if record.output_tokens:
-            self._output_tokens.labels(alias, pool).inc(record.output_tokens)
+            children.append((self._output_tokens, (alias, pool)))
         if record.cause is not None:
-            self._errors.labels(alias, pool, record.cause).inc()
-        if record.student is not None and self._budget_left is not None:
-            self._budget_left.seen(record.student)
+            children.append((self._errors, (alias, pool, record.cause)))
+        amounts = {self._input_tokens: record.input_tokens, self._output_tokens: record.output_tokens}
+        for counter, labels in children:
+            counter.labels(*labels).inc(amounts.get(counter, 1))
+        if record.student is not None:
+            self._students.seen(record.student, children)
 
     def serve(self, *, port: int = PORT) -> WSGIServer:
         """Start serving the endpoint, in a thread that ends with the gateway, and return its server.

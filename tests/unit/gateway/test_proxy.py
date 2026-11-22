@@ -8,7 +8,9 @@ the three wire formats. The student's key is generated when the tests run.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -120,7 +122,8 @@ class Upstream:
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())
 
 
-def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
+def gateway(upstream: Upstream, store: InMemoryKeyStore | None = None) -> tuple[Starlette, str, InMemoryLedger]:
+    """The gateway of one student, whose key item is put in `store` (a new store when none is given)."""
     key = generate_key()
     item = StudentKey(
         key_hash=key_hash(key),
@@ -133,6 +136,8 @@ def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
         daily_token_budget=2_000_000,
         concurrency_limit=4,
     )
+    store = InMemoryKeyStore() if store is None else store
+    store.put(item)
     ledger = InMemoryLedger(clock=lambda: float(NOW))
     filters = {
         routes.MESSAGES: BodyFilter(messages.MESSAGES, POOLS),
@@ -142,7 +147,7 @@ def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
     }
     client = proxy.upstream_client(httpx.MockTransport(upstream))
     forwarding = Forwarding(
-        authenticator=Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW)),
+        authenticator=Authenticator(store, wall_clock=lambda: float(NOW)),
         ledger=ledger,
         filters=filters,
         proxy=proxy.Proxy(client, UPSTREAM, SECRETS),
@@ -195,6 +200,85 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it()
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
     assert (day.tokens, day.leases) == (39, {})
+
+
+@pytest.mark.parametrize("change", ["revoked", "erased", "unreadable"])
+def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pytest.MonkeyPatch, change: str) -> None:
+    upstream, store = Upstream(), InMemoryKeyStore()
+    app, key, ledger = gateway(upstream, store)
+    # A request of the day already settled: what it wrote is no request's to take back.
+    student = store.lookup(key_hash(key))
+    assert student is not None
+    settled = ledger.reserve(student, "settled", b"{}", output_limit=10, hold_seconds=1, longest_request_seconds=1)
+    ledger.settle(settled, input_tokens=7, output_tokens=0, ended_cleanly=True)
+
+    def unreadable(_: str) -> None:
+        raise OSError
+
+    async def body() -> AsyncIterator[bytes]:
+        # The key was accepted from the headers. Before the body comes it is revoked, its student
+        # erased, which deletes it, or the store stops answering: the reservation comes after.
+        store.revoke(key_hash(key), at=NOW)
+        if change != "revoked":
+            monkeypatch.setattr(store, "lookup", (lambda _: None) if change == "erased" else unreadable)
+        yield json.dumps(CASES[routes.MESSAGES][0]).encode()
+
+    def send(client: httpx.AsyncClient) -> Any:
+        return client.post("/v1/messages", content=body(), headers={"x-api-key": key})
+
+    response = call(app, send)
+
+    assert (response.status_code, upstream.seen) == (500 if change == "unreadable" else 401, [])
+    day = ledger.day(STUDENT, utc_day(NOW))
+    assert day is not None and (day.tokens, day.leases) == (7, {})
+
+
+@pytest.mark.parametrize("cancelled", ["reserving", "confirming"])
+def test_a_request_cancelled_before_its_key_is_confirmed_keeps_no_reservation(
+    monkeypatch: pytest.MonkeyPatch, cancelled: str
+) -> None:
+    upstream = Upstream()
+    app, key, ledger = gateway(upstream)
+    reserve = ledger.reserve
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        stopped_at, write = asyncio.Event(), threading.Event()
+
+        def slow_reserve(*args: Any, **kwargs: Any) -> Any:
+            # The client goes while the reservation is written, which it cannot stop.
+            if cancelled == "reserving":
+                loop.call_soon_threadsafe(stopped_at.set)
+                write.wait(5)
+            return reserve(*args, **kwargs)
+
+        async def never_answers(self: Authenticator, student: Any) -> Any:
+            stopped_at.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(ledger, "reserve", slow_reserve)
+        if cancelled == "confirming":
+            monkeypatch.setattr(Authenticator, "confirm", never_answers)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example.com") as client:
+            body = CASES[routes.MESSAGES][0]
+            sending = asyncio.create_task(client.post("/v1/messages", json=body, headers={"x-api-key": key}))
+            await stopped_at.wait()
+            sending.cancel()
+            write.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sending
+        # The reservation's write, then the withdrawal, which may end after the request.
+        for _ in range(500):
+            if ledger.writes and ledger.day(STUDENT, utc_day(NOW)) is None:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+    assert upstream.seen == []
+    assert ledger.writes
+    assert ledger.day(STUDENT, utc_day(NOW)) is None
 
 
 def test_each_chunk_reaches_the_client_before_the_next_one_is_sent() -> None:

@@ -14,7 +14,7 @@ back as records that say so, and `rhi_gateway.auth` refuses them. It is given th
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Self
 
 from rhi_common.records import RecordError
@@ -28,7 +28,9 @@ class KeyRecord:
 
     `github_id` addresses the student's usage item and is never logged or used as a label
     (section 6.6): `alias` is the name logs and metrics carry. `expires_at` is in whole seconds
-    since the epoch.
+    since the epoch. `key_hash` names the key item, so that the gateway can read it again past its
+    cache (`rhi_gateway.auth.Authenticator.confirm`, `rhi_gateway.metrics`); it is neither logged
+    nor shown, and two records of the same student compare equal without it.
     """
 
     github_id: int
@@ -37,6 +39,7 @@ class KeyRecord:
     concurrency_limit: int
     expires_at: int
     revoked: bool
+    key_hash: str = field(default="", repr=False, compare=False)
 
     @classmethod
     def of(cls, key: StudentKey) -> Self:
@@ -47,6 +50,7 @@ class KeyRecord:
             concurrency_limit=key.concurrency_limit,
             expires_at=key.expires_at,
             revoked=key.revoked_at is not None,
+            key_hash=key.key_hash,
         )
 
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from rhi_admin import main
+from rhi_admin import main, roster
 from rhi_admin.roster import DEFAULT_DAILY_TOKEN_BUDGET
 from rhi_admin.spikes import SPENT_ALIAS
 from rhi_common import spike_keys
@@ -59,7 +59,7 @@ def test_the_command_fills_the_spikes_secret_and_prints_no_key(
     assert not set(earlier) & {*second.students, second.spent}
     assert [stored(admin, key).revoked_at for key in earlier] == [NOW + 1] * 4
     # The same four students both times.
-    assert len(admin.roster.scan(ConsistentRead=True)["Items"]) == 4
+    assert len(roster.entries(roster=admin.roster)) == 4
 
     assert "3 student" in printed
     assert re.search(KEY_PATTERN, printed) is None

@@ -186,7 +186,8 @@ def build(
     secrets = read_secrets(settings, aws.secretsmanager)
     pools, default_pool, maximum = settings.pools, settings.default_pool, settings.body_limit_bytes
 
-    authenticator = Authenticator(DynamoKeyStore(aws.tables.Table(settings.keys_table)))
+    keys = DynamoKeyStore(aws.tables.Table(settings.keys_table))
+    authenticator = Authenticator(keys)
     ledger = DynamoDBLedger(aws.dynamodb, settings.usage_table)
     readiness = Readiness(settings.target_groups, elbv2=aws.elbv2, table=aws.tables.Table(settings.pool_state_table))
     waker = Waker(readiness, lambda_client=aws.lambda_client, function_name=settings.scaler_function)
@@ -196,7 +197,7 @@ def build(
         [pool.name for pool in pools],
         waker=waker,
     )
-    gateway_metrics = Metrics(ledger)
+    gateway_metrics = Metrics(ledger, keys)
 
     def rewrites(route: routes.Route) -> dict[str, Rewrite]:
         """What a route's filter runs in its per-pool step: the pools' profiles on that route."""

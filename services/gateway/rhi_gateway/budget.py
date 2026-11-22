@@ -98,8 +98,16 @@ the record holds for the request's pool (`Reservation.cookie`), and the settleme
 the one the request ended with, when it ended with one. So affinity costs no call of its own,
 whatever else is in flight, and every gateway task sees the same cookie. No other write touches
 the map: not the write that takes a reservation back, not the removal of expired leases, and a
-settlement that finds nothing to settle stores nothing. A day's first reservation, which reads the
-day before for its stand-ins, writes the new day with the cookies that day held, so that a student
+settlement that finds nothing to settle stores nothing. Only a withdrawal (`Ledger.withdraw`, and
+a reservation refused once written) deletes a day with its map, and only a day that holds what its
+opening carried from the day before, which the next opening carries again. The opening records in
+the day it writes the cookies and rebalance numbers it carried (`carried_maps`). A withdrawal
+deletes the day only while its maps still equal that record, at no tokens and with stand-ins
+alone. The test reads the stored values, not a mark that every writer would have to maintain. So
+a settlement stored by a gateway task that predates the record, during a rollout where old and new
+tasks share the table, keeps the day as surely as one stored by a current task. A day written
+without the record, as every day before it existed was, is never deleted. A day's first
+reservation, which reads the day before for its stand-ins, writes the new day with the cookies that day held, so that a student
 keeps their instance across midnight. A request that started the day before settles into that
 day's item, and its cookie stays there. A student's requests in flight at once each store theirs,
 and for one pool the last settlement's stays.
@@ -253,6 +261,21 @@ class Ledger(Protocol):
         request was judged on, which the same write stores as the last one applied for the
         reservation's pool; `None`, for a request that was not judged, leaves the record's
         numbers as they are. A settlement that charges nothing stores and removes nothing.
+        """
+        ...
+
+    def withdraw(self, reservation: Reservation) -> None:
+        """Take back a reservation whose key no longer passes, charging nothing.
+
+        The day's row is then deleted if what is left in it is only what a day's opening carries
+        from the day before (`_carried_only`): no tokens, no lease but stand-ins, and cookies and
+        rebalance numbers equal to those the opening carried and recorded. All of that a later
+        opening carries again from the day before, if that day is still there. A day a request
+        stored a cookie or a number in keeps it, even at no tokens, even one equal to what the opening
+        carried, and whichever gateway task wrote it, and so does a day written without the record. A reservation refused after its write (its day
+        ended meanwhile) is taken back in the same way. A request whose student was erased while
+        its body arrived thus leaves no row behind, however many such requests take theirs back and in
+        whatever order, and what other requests charged or hold stays.
         """
         ...
 
@@ -437,6 +460,27 @@ def _charge(lease: Lease, input_tokens: int, output_tokens: int, ended_cleanly: 
     return used if ended_cleanly else max(used, lease.estimate)
 
 
+# What a day's opening carried from the day before: its cookies and its rebalance numbers, by pool.
+_Carried = tuple[Mapping[str, str], Mapping[str, int]]
+
+
+def _carried_only(day: UsageDay, carried: _Carried | None) -> bool:
+    """Whether the day holds only what its opening carries from the day before.
+
+    No tokens, stand-ins alone, and the cookies and rebalance numbers the opening recorded
+    (`carried`). A settlement that stores a cookie or a number, or drops one, also removes the
+    record, even when what it stores equals what the opening carried, and a day without the record
+    (`None`) is never deleted.
+    """
+    prefix = _day_before(day.day) + "/"
+    return (
+        carried is not None
+        and day.tokens == 0
+        and all(name.startswith(prefix) for name in day.leases)
+        and (day.affinity_cookies, day.rebalance_applied) == carried
+    )
+
+
 def _left(day: UsageDay | None, student: Student, now: int) -> int:
     if day is None:
         return max(0, student.daily_token_budget)
@@ -453,6 +497,8 @@ class InMemoryLedger:
         self._clock = clock
         self._lock = threading.Lock()
         self._days: dict[tuple[int, str], UsageDay] = {}
+        # What each day's opening carried here: the table's `carried_maps` attribute.
+        self._carried: dict[tuple[int, str], _Carried] = {}
         self.writes = 0
 
     def day(self, github_id: int, day: str) -> UsageDay | None:
@@ -475,12 +521,16 @@ class InMemoryLedger:
                 return self._days.get((reservation.github_id, _day_before(reservation.day)))
 
             with self._lock:
-                day = self._days.get((reservation.github_id, reservation.day))
+                key = (reservation.github_id, reservation.day)
+                day = self._days.get(key)
+                opened = day is None
                 if day is None:
                     day = _new_day(student, reservation.day, before(), now)
                 gone = _to_remove(day, student, request_id, reservation.lease, now, before)
                 written = _reserved(day, request_id, reservation.lease, gone)
                 self._write(written)
+                if opened:
+                    self._carried[key] = (dict(day.affinity_cookies), dict(day.rebalance_applied))
             return written
 
         return _reserve_within_the_day(
@@ -493,7 +543,7 @@ class InMemoryLedger:
             pool,
             write,
             self.day,
-            lambda reservation: self._remove(reservation, 0),
+            self.withdraw,
         )
 
     def settle(
@@ -525,12 +575,16 @@ class InMemoryLedger:
         """Remove the lease and replace its tokens by `charge`, if the lease is still there.
 
         The same write stores, for the reservation's pool, `cookie` and `rebalance_number`, each
-        if there is one, and removes the pool's cookie when there is none and it was dropped.
+        if there is one, and removes the pool's cookie when there is none and it was dropped. When
+        it stores or drops one, it also forgets what the day's opening carried (`_carried_only`).
         """
         with self._lock:
-            day = self._days.get((reservation.github_id, reservation.day))
+            key = (reservation.github_id, reservation.day)
+            day = self._days.get(key)
             if day is None or reservation.request_id not in day.leases:
                 return False
+            if reservation.pool is not None and (cookie is not None or rebalance_number is not None or cookie_dropped):
+                self._carried.pop(key, None)
             leases = {request: held for request, held in day.leases.items() if request != reservation.request_id}
             cookies, applied, pool = day.affinity_cookies, day.rebalance_applied, reservation.pool
             if pool is not None and cookie is not None:
@@ -549,6 +603,16 @@ class InMemoryLedger:
                 )
             )
         return True
+
+    def withdraw(self, reservation: Reservation) -> None:
+        self._remove(reservation, 0)
+        with self._lock:
+            key = (reservation.github_id, reservation.day)
+            day = self._days.get(key)
+            if day is not None and _carried_only(day, self._carried.get(key)):
+                del self._days[key]
+                self._carried.pop(key, None)
+                self.writes += 1
 
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
@@ -570,6 +634,9 @@ _COOKIES = "affinity_cookies"
 _APPLIED = "rebalance_applied"
 # The attribute of a day whose opener has not confirmed it yet (see the module's "Midnight").
 _OPENING = "opening"
+# The attribute in which a day's opening records the cookies and rebalance numbers it carried, under
+# the names of the two maps: a withdrawal deletes only a day whose maps still equal it.
+_CARRIED = "carried_maps"
 _CONDITION_FAILED = "ConditionalCheckFailedException"
 _serializer = TypeSerializer()
 _deserializer = TypeDeserializer()
@@ -653,7 +720,7 @@ class DynamoDBLedger:
             pool,
             lambda reservation, now: self._write_reservation(student, reservation, now),
             self._read,
-            lambda reservation: self._remove(reservation, 0),
+            self.withdraw,
         )
 
     def settle(
@@ -672,6 +739,39 @@ class DynamoDBLedger:
             reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
         )
         return charge if stored else None
+
+    def withdraw(self, reservation: Reservation) -> None:
+        self._remove(reservation, 0)
+        self._drop_if_carried_only(reservation)
+
+    def _drop_if_carried_only(self, reservation: Reservation) -> None:
+        """Delete the reservation's day if it holds only what its opening carried (`_carried_only`)."""
+        key = self._key(reservation.github_id, reservation.day)
+        for _ in range(_ATTEMPTS):
+            item = self._client.get_item(TableName=self._table, Key=key, ConsistentRead=True).get("Item")
+            if not item or not _carried_only(_day(item), _carried_of(item)):
+                return
+            # `_carried_only` as read, held by the delete: the same tokens, the same leases and the
+            # same maps, each absent where it was, whichever task wrote to the day since.
+            names = {**_NAMES, "#carriedmaps": _CARRIED}
+            values = {":zero": _serializer.serialize(0), ":leases": item["leases"]}
+            condition = "#tokens = :zero AND #leases = :leases AND attribute_exists(#carriedmaps)"
+            for placeholder, name in (("cookies", _COOKIES), ("applied", _APPLIED)):
+                names[f"#{placeholder}"] = name
+                if name in item:
+                    condition += f" AND #{placeholder} = :{placeholder}"
+                    values[f":{placeholder}"] = item[name]
+                else:
+                    condition += f" AND attribute_not_exists(#{placeholder})"
+            deleted, _ = self._conditional(
+                self._client.delete_item,
+                Key=key,
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            if deleted:
+                return
 
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
@@ -729,7 +829,9 @@ class DynamoDBLedger:
         stand-ins it missed; the write carries them into the day and confirms the day. The others
         are given only by a settlement, and the same write applies them to the reservation's pool:
         it stores `cookie` and `rebalance_number`, each if there is one, and removes the pool's
-        cookie when there is none and it was dropped.
+        cookie when there is none and it was dropped. When it stores or drops one, it also removes
+        the record of what the day's opening carried, so that a withdrawal keeps the day
+        (`_carried_only`) even when what it stored equals what the opening carried.
         """
         values: dict[str, object] = {":change": charge - reservation.lease.tokens}
         names, sets = _stand_in_updates(stand_ins or {}, values)
@@ -750,6 +852,9 @@ class DynamoDBLedger:
             names |= {"#applied": _APPLIED, "#pool": reservation.pool}
             sets.append("#applied.#pool = :number")
             values[":number"] = rebalance_number
+        if reservation.pool is not None and (cookie is not None or rebalance_number is not None or cookie_dropped):
+            names["#carriedmaps"] = _CARRIED
+            removals.append("#carriedmaps")
         update = "REMOVE " + ", ".join(removals) + " ADD #tokens :change"
         if sets:
             update += " SET " + ", ".join(sets)
@@ -831,8 +936,8 @@ class DynamoDBLedger:
 
         Returns the day it wrote, or `None` and the item that was there already. It holds a
         stand-in for each request still running from the day before, read here, and the cookies
-        and rebalance numbers that day held. The refusal is raised if the stand-ins leave no slot.
-        Opened within `OPENING_SECONDS` of midnight,
+        and rebalance numbers that day held, recorded again in `carried_maps`. The refusal is raised if
+        the stand-ins leave no slot. Opened within `OPENING_SECONDS` of midnight,
         it is written unconfirmed (`opening`): until a write confirms it, no reservation takes a
         slot in it without first reading the day before again and carrying the stand-ins missing
         from it. Opened later, the read above already holds every lease of the day before that
@@ -844,7 +949,10 @@ class DynamoDBLedger:
         _to_remove(fresh, student, reservation.request_id, reservation.lease, now, lambda: before)
         day = _reserved(fresh, reservation.request_id, reservation.lease, {})
         opening = now < _midnight(reservation.day) + OPENING_SECONDS
-        item = day.to_item()
+        item = {
+            **day.to_item(),
+            _CARRIED: {_COOKIES: dict(day.affinity_cookies), _APPLIED: dict(day.rebalance_applied)},
+        }
         if reservation.pool is not None:
             # The two maps, each empty if the day before held none: see `_add_lease`.
             item[_COOKIES] = dict(day.affinity_cookies)
@@ -864,6 +972,7 @@ class DynamoDBLedger:
         late = _missing_stand_ins(fresh, self._read(reservation.github_id, yesterday), now)
         if late:
             self._remove(reservation, 0, stand_ins=late)
+            self._drop_if_carried_only(reservation)
             raise GatewayError(Cause.CONCURRENCY_LIMIT, "the day before changed while this day was opened")
         return day, None
 
@@ -885,6 +994,14 @@ class DynamoDBLedger:
     @staticmethod
     def _key(github_id: int, day: str) -> dict[str, Any]:
         return _values({"github_id": github_id, "day": day})
+
+
+def _carried_of(item: Mapping[str, Any]) -> _Carried | None:
+    """What the opening of a usage item recorded it carried, or `None` for an item without the record."""
+    if _CARRIED not in item:
+        return None
+    carried = _deserializer.deserialize(item[_CARRIED])
+    return carried.get(_COOKIES, {}), {pool: int(number) for pool, number in carried.get(_APPLIED, {}).items()}
 
 
 def _day(item: Mapping[str, Any]) -> UsageDay:

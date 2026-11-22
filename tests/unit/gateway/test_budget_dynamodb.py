@@ -24,7 +24,14 @@ from rhi_common.causes import Cause
 from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
 from rhi_common.tables import USAGE
-from rhi_gateway.budget import BYTES_PER_TOKEN, USAGE_RETENTION_SECONDS, DynamoDBLedger, Reservation
+from rhi_gateway.budget import (
+    BYTES_PER_TOKEN,
+    USAGE_RETENTION_SECONDS,
+    DynamoDBLedger,
+    InMemoryLedger,
+    Ledger,
+    Reservation,
+)
 from rhi_gateway.errors import GatewayError, cause_of
 
 DAILY_BUDGET = 100_000_000
@@ -104,7 +111,7 @@ def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
 
 
 def reserve(
-    ledger: DynamoDBLedger,
+    ledger: Ledger,
     who: StudentKey,
     request: str,
     *,
@@ -347,6 +354,139 @@ def test_the_first_numbers_of_requests_in_flight_each_cost_one_settlement_call(c
     assert client.made == ["update_item"] * 2
     record = written()
     assert (record.rebalance_applied, record.leases) == ({"coursework": 7, "upgrade": 3}, {})
+
+
+def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger.withdraw(reserve(ledger, student(), "alone", pool="coursework"))
+    assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
+
+    settled = reserve(ledger, student(), "settled")
+    assert ledger.settle(settled, input_tokens=900, output_tokens=100, ended_cleanly=True) == 1000
+    ledger.withdraw(reserve(ledger, student(), "withdrawn"))
+    assert (written().tokens, written().leases) == (1000, {})
+
+
+@pytest.mark.parametrize("kind", ["memory", "dynamodb"])
+def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: Calls, kind: str) -> None:
+    ledger = InMemoryLedger(clock=Clock()) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=Clock())
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    settled = ledger.settle(
+        completed, input_tokens=0, output_tokens=0, ended_cleanly=True, cookie="kept-cookie", rebalance_number=7
+    )
+    assert settled == 0
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
+
+
+@pytest.mark.parametrize("kind", ["memory", "dynamodb"])
+def test_a_withdrawal_keeps_a_settlement_that_stored_again_what_the_day_carried(client: Calls, kind: str) -> None:
+    midnight = NOON + 43_200
+    clock = Clock(midnight - 10)
+    ledger = InMemoryLedger(clock=clock) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=clock)
+    first = reserve(ledger, student(), "first", pool="coursework")
+    ledger.settle(first, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="held", rebalance_number=7)
+    prior_day_turn = reserve(ledger, student(), "prior-day", pool="coursework")
+
+    clock.now = midnight + 1
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    assert (completed.cookie, completed.rebalance_applied) == ("held", 7)
+    # The day before changes after today's opening carried from it.
+    ledger.settle(
+        prior_day_turn, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="other", rebalance_number=8
+    )
+    # Today's request stores, at no tokens, the very cookie and number its day carried.
+    settled = ledger.settle(
+        completed, input_tokens=0, output_tokens=0, ended_cleanly=True, cookie="held", rebalance_number=7
+    )
+    assert settled == 0
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("held", 7)
+
+
+def test_a_withdrawal_keeps_a_settlement_from_a_draining_gateway(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    opening = reserve(ledger, student(), "opening", pool="coursework")
+    completed = reserve(ledger, student(), "completed", pool="coursework")
+    # During a rollout, an older task settles a request into a day a newer task opened. It writes
+    # only the attributes it knows.
+    boto3.resource("dynamodb").Table(TABLE).update_item(
+        Key={"github_id": 7, "day": completed.day},
+        UpdateExpression=(
+            "REMOVE leases.completed ADD tokens :delta "
+            "SET affinity_cookies.coursework = :cookie, rebalance_applied.coursework = :number"
+        ),
+        ExpressionAttributeValues={":delta": -completed.lease.tokens, ":cookie": "kept-cookie", ":number": 7},
+    )
+
+    ledger.withdraw(opening)
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
+
+
+def test_a_withdrawal_keeps_a_zero_token_day_written_without_what_its_opening_carried(client: Calls) -> None:
+    # A day an earlier gateway opened and settled into at no tokens holds its cookie, and no record.
+    day = UsageDay(
+        7,
+        "2026-11-15",
+        "student-07",
+        tokens=0,
+        expires_at=COURSE_END,
+        affinity_cookies={"coursework": "kept-cookie"},
+        rebalance_applied={"coursework": 7},
+    )
+    boto3.resource("dynamodb").Table(TABLE).put_item(Item=day.to_item())
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
+
+
+def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
+    client: Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    table = boto3.resource("dynamodb").Table(TABLE)
+    before = UsageDay(
+        7,
+        "2026-11-14",
+        "student-07",
+        tokens=5,
+        expires_at=COURSE_END,
+        leases={"running": Lease(tokens=10, estimate=10, expires=NOON + 600)},
+        affinity_cookies={"coursework": "AWSALB=cookie-of-yesterday"},
+        rebalance_applied={"coursework": 3},
+    )
+    deletes: list[dict[str, Any]] = []
+    delete = client.delete_item
+    monkeypatch.setattr(client, "delete_item", lambda **request: deletes.append(request) or delete(**request))
+    for order in (["opener"], ["opener", "other"], ["other", "opener"]):
+        table.put_item(Item=before.to_item())
+        held = {"opener": reserve(ledger, student(), "opener", pool="coursework")}
+        # The day before goes once the opening has read it, as the admin's erase deletes it.
+        table.delete_item(Key={"github_id": 7, "day": "2026-11-14"})
+        if "other" in order:
+            held["other"] = reserve(ledger, student(), "other", pool="coursework")
+        for request in order[:-1]:
+            ledger.withdraw(held[request])
+            # What another request holds keeps the day.
+            assert set(written().leases) == {"2026-11-14/running", order[-1]}
+        ledger.withdraw(held[order[-1]])
+        # The stand-in, the cookie and the number carried from the day before go with the last.
+        assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
+    # Every delete binds only the values its condition names, which DynamoDB requires.
+    assert deletes
+    for request in deletes:
+        assert all(name in request["ConditionExpression"] for name in request["ExpressionAttributeValues"])
 
 
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
