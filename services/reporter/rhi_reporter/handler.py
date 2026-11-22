@@ -43,7 +43,9 @@ in that order with `rhi_reporter.github`.
   or of a step before it, would hide the verdict already posted.
 - A pending status of `deploy/<stage>` follows the stage's manual approvals as CodePipeline's
   records of the event's own execution show them now, not as the events tell them: an approval
-  waits when the latest run of an approval action of that stage, by its start, is `InProgress`.
+  waits when the latest run of an approval action of that stage, by its start, is `InProgress`. A
+  record that omits its action's type is an approval's when the event names that action as its
+  approval, or when the pipeline's state shows that action's run holding an open approval request.
   While one waits, a status that would say the deployment runs says instead that it waits for the
   approval, so that a late or out-of-order event of the same execution cannot hide the wait. An
   approval's start that arrives once its own run has ended, and none waits, posts nothing, so that
@@ -339,7 +341,7 @@ def handle(
         return
     kind_of = detail.get("type")
     category = kind_of.get("category") if isinstance(kind_of, dict) else None
-    ended: tuple[set[str], bool] | None = None
+    ended: tuple[set[str], bool, set[tuple[object, object]]] | None = None
     records: list[_Records] = []
     listed: list[list[Mapping[str, Any]]] = []
 
@@ -363,11 +365,12 @@ def handle(
                 if execution_status in EXECUTION_ENDED:
                     continue
                 ended = _ended(aws.codepipeline, pipeline, execution) if ended is None else ended
-                stages_ended, stopped_short = ended
+                stages_ended, stopped_short, open_approvals = ended
                 if under in stages_ended or stopped_short:
                     continue
                 own = action if category == APPROVAL_CATEGORY and stage == under else None
-                status = _as_approvals_stand(status, runs, under, own)
+                known = {name for at, name in open_approvals if at == under} | ({own} - {None})
+                status = _as_approvals_stand(status, runs, under, own, known)
                 if status is None:
                     continue
             _post(client, status)
@@ -556,25 +559,39 @@ def _execution(codepipeline: Any, pipeline: object, execution: object) -> tuple[
     return None, record.get("status")
 
 
-def _ended(codepipeline: Any, pipeline: object, execution: object) -> tuple[set[str], bool]:
-    """The stages whose latest execution is this one and has ended, and whether one of them
-    stopped short: no stage of the execution runs on after that."""
+def _ended(codepipeline: Any, pipeline: object, execution: object) -> tuple[set[str], bool, set[tuple[object, object]]]:
+    """The stages whose latest execution is this one and has ended, whether one of them stopped
+    short: no stage of the execution runs on after that, and the approvals this execution leaves
+    open, by stage and action: those whose latest run carries the token of an approval request."""
     answer = codepipeline.get_pipeline_state(name=pipeline)
     ended: set[str] = set()
     stopped_short = False
+    open_approvals: set[tuple[object, object]] = set()
     for state in answer.get("stageStates", []):
         latest = state.get("latestExecution", {})
-        if latest.get("pipelineExecutionId") == execution and latest.get("status") in ENDED:
+        if latest.get("pipelineExecutionId") != execution:
+            continue
+        if latest.get("status") in ENDED:
             ended.add(state.get("stageName"))
             stopped_short = stopped_short or latest.get("status") in STOPPED_SHORT
-    return ended, stopped_short
+        for action in state.get("actionStates", []):
+            run = action.get("latestExecution", {})
+            if run.get("token") and run.get("status") == ACTIVE_RUN:
+                open_approvals.add((state.get("stageName"), action.get("actionName")))
+    return ended, stopped_short, open_approvals
 
 
 def _as_approvals_stand(
-    status: CommitStatus, runs: Callable[[], Sequence[Mapping[str, Any]]], stage: str, own: object
+    status: CommitStatus,
+    runs: Callable[[], Sequence[Mapping[str, Any]]],
+    stage: str,
+    own: object,
+    known: set[object],
 ) -> CommitStatus | None:
     """The pending status `status` of `stage`, as the stage's manual approvals stand in `runs`, the
-    action runs of the event's own execution. While one waits, a deployment that runs is one that
+    action runs of the event's own execution. A run is an approval as its record's type says; a
+    record that says no type is one when its action is among `known`, the approvals of `stage` the
+    event or the pipeline's state names. While one waits, a deployment that runs is one that
     waits for it. None, nothing to post, for the start of `own`, the event's approval of `stage`,
     once its own run has ended and none waits. The start of an approval of another stage (`own`
     None) is a step that runs. None too, after logging `NO_APPROVALS`, when the runs cannot be
@@ -587,10 +604,11 @@ def _as_approvals_stand(
     try:
         latest: dict[object, Mapping[str, Any]] = {}
         for run in runs():
-            # `input` is optional in a record: the event's own approval is known by its name alone.
+            # `input` is optional in a record: without it, an approval is known by its name alone.
             category = (run.get("input") or {}).get("actionTypeId", {}).get("category")
             name = run.get("actionName")
-            if run.get("stageName") != stage or (category != APPROVAL_CATEGORY and name != own):
+            approval = category == APPROVAL_CATEGORY if category is not None else name is not None and name in known
+            if run.get("stageName") != stage or not approval:
                 continue
             # A stage that is retried runs its approval again: the latest run is the one that counts.
             if name not in latest or run["startTime"] > latest[name]["startTime"]:

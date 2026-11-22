@@ -169,13 +169,23 @@ class Stub:
         return {"pipelineExecution": record}
 
     def get_pipeline_state(self, name: str) -> dict[str, Any]:
+        """The stages' latest executions, all this one's; an approval's latest run of this execution
+        holds the token of its request while it waits."""
         assert name == PIPELINE
-        return {
-            "stageStates": [
-                {"stageName": stage, "latestExecution": {"pipelineExecutionId": self.execution, "status": status}}
-                for stage, status in self.stage_states.items()
-            ]
-        }
+        runs = self.approvals.get(self.execution, [])
+        stages = self.stage_states | ({STAGE: self.stage_states.get(STAGE, "InProgress")} if runs else {})
+        states = []
+        for stage, status in stages.items():
+            state: dict[str, Any] = {
+                "stageName": stage,
+                "latestExecution": {"pipelineExecutionId": self.execution, "status": status},
+            }
+            if stage == STAGE and runs:
+                latest, _ = max(runs, key=lambda run: run[1])
+                token = {"token": str(uuid.uuid4())} if latest == "InProgress" else {}
+                state["actionStates"] = [{"actionName": "Check.Confirm", "latestExecution": {"status": latest} | token}]
+            states.append(state)
+        return {"stageStates": states}
 
     def list_pipeline_executions(self, pipelineName: str, maxResults: int) -> dict[str, Any]:
         assert pipelineName == PIPELINE
@@ -668,22 +678,56 @@ def test_progress_resumes_once_the_approval_resolves(
     assert deployment(client, commit) == [WAITING, RUNNING, RUNNING, ("success", Description.DEPLOYED)]
 
 
-def test_a_resolved_approval_without_its_input_does_not_restore_the_wait(
-    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def without_input(stub: Stub, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CodePipeline's records may omit `input`: the stub's records say no action's type."""
     listed = stub.list_action_executions
 
-    def without_input(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
-        # CodePipeline's records may omit `input`.
+    def listed_without_input(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
         details = listed(pipelineName, filter)["actionExecutionDetails"]
         return {"actionExecutionDetails": [{k: v for k, v in run.items() if k != "input"} for run in details]}
 
-    monkeypatch.setattr(stub, "list_action_executions", without_input)
+    monkeypatch.setattr(stub, "list_action_executions", listed_without_input)
+
+
+@pytest.mark.parametrize("start_first", [True, False], ids=["the approval's start first", "the approval's start last"])
+def test_a_waiting_approval_without_its_input_stays_visible(
+    stub: Stub, commit: str, start_first: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without_input(stub, monkeypatch)
+    stub.approvals[stub.execution] = [("InProgress", STARTED)]
+    events = progress(stub.execution)
+    events.insert(0 if start_first else len(events), approval(stub.execution, "STARTED"))
+    client = Client()
+    deliver(events, stub, client)
+    assert deployment(client, commit) == [WAITING] * 4
+
+
+def test_a_resolved_approval_without_its_input_does_not_restore_the_wait(
+    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without_input(stub, monkeypatch)
     stub.approvals[stub.execution] = [("Succeeded", STARTED)]
     client = Client()
     deliver([action_event(stub.execution, STAGE, "Network.Deploy", "Deploy", "STARTED")], stub, client)
     deliver([approval(stub.execution, "STARTED")], stub, client)
     assert deployment(client, commit) == [RUNNING]
+
+
+def test_a_step_that_runs_unnamed_is_not_an_approval(stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    listed = stub.list_action_executions
+
+    def with_unnamed_step(pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
+        # `actionName` is optional in a record too.
+        kind = {"actionTypeId": {"category": "Build", "provider": "CodeBuild"}}
+        record = {"stageName": STAGE, "status": "InProgress", "startTime": LATER, "input": kind}
+        return {"actionExecutionDetails": [*listed(pipelineName, filter)["actionExecutionDetails"], record]}
+
+    monkeypatch.setattr(stub, "list_action_executions", with_unnamed_step)
+    stub.approvals[stub.execution] = [("Succeeded", STARTED)]
+    client = Client()
+    deliver([stage_event(stub.execution, STAGE, "STARTED")], stub, client)
+    deliver([action_event(stub.execution, STAGE, "CopyWeights", "Build", "STARTED")], stub, client)
+    assert deployment(client, commit) == [RUNNING] * 2
 
 
 def test_an_approval_of_another_execution_changes_nothing(stub: Stub, commit: str) -> None:
