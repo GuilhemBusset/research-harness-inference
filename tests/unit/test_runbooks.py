@@ -13,6 +13,7 @@ import contextlib
 import io
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -115,3 +116,32 @@ def test_detects_an_unknown_command() -> None:
 def test_section_headings_count_only_outside_code_blocks() -> None:
     sections = "".join(f"## {section.title()}\n\n" for section in SECTIONS)
     assert len(problems("```sh\n" + sections + "rhi status\n```\n")) == 1
+
+
+def _factory_key_replacement() -> str:
+    """The shell block of the secret rotation runbook that installs a new key of the factory's App."""
+    text = (ROOT / "docs" / "runbooks" / "secret-rotation.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```sh\n(.*?)```", text, re.DOTALL)
+    return next(b for b in blocks if "Downloads/<new-key>" in b and "LOOP_GITHUB_APP_KEY_FILE" in b)
+
+
+@pytest.mark.parametrize("cut_short", [False, True])
+def test_the_factory_key_replacement_keeps_the_old_key_unless_the_copy_completes(
+    tmp_path: Path, cut_short: bool
+) -> None:
+    download = tmp_path / "Downloads" / "replacement.private-key.pem"
+    download.parent.mkdir()
+    download.write_bytes(b"new key\n" * 512)
+    key = tmp_path / "factory.pem"
+    key.write_bytes(b"old key\n")
+    # A file-size limit of one block cuts the copy short, as a full disk would.
+    script = ("ulimit -f 1\n" if cut_short else "") + _factory_key_replacement().replace("<new-key>", "replacement")
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LOOP_GITHUB_APP_KEY_FILE": str(key)}
+    subprocess.run(["bash", "-c", script], env=env, cwd=tmp_path, capture_output=True, check=False)
+    if cut_short:
+        assert key.read_bytes() == b"old key\n"
+        assert download.exists()
+        assert not Path(f"{key}.new").exists()
+    else:
+        assert key.read_bytes() == b"new key\n" * 512
+        assert not download.exists()

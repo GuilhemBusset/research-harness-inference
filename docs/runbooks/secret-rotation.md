@@ -235,16 +235,21 @@ key, and nothing restarts.
    and find where it is set before going on. Replacing another file would leave the engine on the
    old key, and the doctor too.
 
-3. **Replace the file at the configured path,** keeping its name and its mode. The download is
-   removed only when the file at the configured path is a copy of it: should `install` fail (a
-   destination that is not writable, say), the download is kept, the old file is still in place,
-   and the command says so:
+3. **Replace the file at the configured path,** keeping its name, with the mode `600`. The new
+   key is first copied beside the old file, under the name with `.new` added, and only a complete
+   copy is moved over the old file, which within one directory replaces it in one step. Should the
+   copy fail or be cut short (a directory that is not writable, a full disk, a file-size limit),
+   the old file is untouched and still signs, the partial copy is removed, the download is kept,
+   and the command says so. The download is removed only once the configured path holds the new
+   key:
 
    ```sh
-   install -m 600 "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE" \
-       && cmp -s "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE" \
+   install -m 600 "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE.new" \
+       && cmp -s "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE.new" \
+       && mv -f "$LOOP_GITHUB_APP_KEY_FILE.new" "$LOOP_GITHUB_APP_KEY_FILE" \
        && rm "$HOME/Downloads/<new-key>.private-key.pem" \
-       && echo "the new key is installed" || echo "not installed: the download is kept"
+       && echo "the new key is installed" \
+       || { rm -f "$LOOP_GITHUB_APP_KEY_FILE.new"; echo "not installed: the old key is in place and the download is kept"; }
    ```
 
    Go on to step 4 only after "the new key is installed". Otherwise the engine and the doctor
@@ -341,18 +346,59 @@ the next run uses the new key.
    - **A pool in mode `disabled`** answers `pool_disabled` and is not tested: enable it first, or
      test it when it is next enabled (runbook [a disabled pool](disabled-pool.md)).
 
-   An error is diagnosed by its cause, the `cause` in the answer's body, not taken as a failed
-   rotation by default:
+   An error is diagnosed by its cause, not taken as a failed rotation by default. The cause is the
+   answer's `error.type`: the gateway answers a Messages request with an error body
+   `{"type": "error", "error": {"type": ..., "message": ...}}`, whose `error.type` is one of the
+   causes below:
 
    - `engine_error`, the pool `ready`: the engine answered the gateway with an error, which a
-     bearer mismatch gives, and so do other faults of an engine. A mismatch is likely when the
-     gateway's deployment of step 1 has not completed, or the error came within minutes of the
-     rotation, while an engine was still restarting: wait for both and send it again. Should it
-     persist once step 1 reads `PRIMARY COMPLETED`, read the pool's log group `/rhi/pools/<pool>`
-     in CloudWatch around the time of the request: an engine that keeps failing its minute's
-     completion logs "the engine did not answer a completion: its unit was restarted" there, a
-     fault of the engine rather than of the gateway's value; with no such line, the engines hold
-     the new value and the gateway does not, so start the gateway's deployment again (Act).
+     bearer mismatch gives, and so do other faults of an engine. Within minutes of the rotation,
+     or before step 1 reads `PRIMARY COMPLETED`, an engine may still be restarting or an old
+     gateway task still serving: wait for both and send it again. Should it persist, establish
+     whether there is a mismatch before acting on one. A reader holds the new value only when it
+     started after the new version was written, since each reads the secret at its start. When
+     the current version was written:
+
+     ```sh
+     aws secretsmanager list-secret-version-ids --secret-id /rhi/pools/coursework/bearer \
+         --query "Versions[?contains(VersionStages, 'AWSCURRENT')].CreatedDate" --output text
+     ```
+
+     When each running gateway task started:
+
+     ```sh
+     aws ecs describe-tasks --cluster <gateway-cluster> \
+         --tasks $(aws ecs list-tasks --cluster <gateway-cluster> --service-name <gateway-service> --query taskArns --output text) \
+         --query 'tasks[].[startedAt,lastStatus]' --output text
+     ```
+
+     When each running instance of the pool last started (`<group>` is the pool's group, the one
+     tagged `rhi-pool` with the pool's name), and whether its engine was restarted since: in the
+     pool's log group `/rhi/pools/<pool>`, the line "the engine did not answer a completion: its
+     unit was restarted" marks a restart of an engine's unit:
+
+     ```sh
+     aws ec2 describe-instances \
+         --filters Name=tag:aws:autoscaling:groupName,Values=<group> Name=instance-state-name,Values=running \
+         --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' --output text
+     ```
+
+     Read the result this way:
+
+     - a gateway task that started before the version was written still sends the old value:
+       the mismatch is the gateway's, so start its deployment again (Act, step 3);
+     - an instance that last started before the version, with no restart line after it, still
+       runs an engine with the old value: its lifecycle agent did not restart it. Its log may say
+       why ("the pool's secret cannot be read: the engine is not checked this minute" means the
+       agent cannot read the secret; "its unit could not be restarted" means the restart failed).
+       Fix that cause; the instance's next start, or the agent's next successful check, gives the
+       engine the new value;
+     - every gateway task and every engine started after the version: both hold the new value, so
+       the error is not a bearer mismatch. It is another fault of the engine; the lifecycle
+       agent's minute check uses Chat Completions while this request uses Messages, so its silence
+       does not clear the engine. Read the engine's own lines in `/rhi/pools/<pool>` around the
+       time of the request, and follow the runbook [a disabled pool](disabled-pool.md) if the
+       pool must stop serving meanwhile.
    - `invalid_key`: the canary's key, not the pool's secret: the canary has no valid key (its
      part, below).
    - `budget_reached`, `concurrency_limit`, `capacity_unavailable`, `pool_ceiling_reached`,

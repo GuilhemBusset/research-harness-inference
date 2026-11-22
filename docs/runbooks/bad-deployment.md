@@ -52,13 +52,21 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    the same contexts. Read the statuses as a summary of the commit: the newest line of each
    context is the latest thing that any execution said there. When the commit was deployed by
    one execution only, and no stage of it was retried, that is the execution's own outcome. Find
-   out whether it was, with the executions of the pipeline, the newest first (or open the pipeline
-   in the CodePipeline console, whose history lists the same):
+   out whether it was, with every execution of the pipeline that names `<sha>` as its source
+   revision, the newest first:
 
    ```sh
-   aws codepipeline list-pipeline-executions --pipeline-name <pipeline> --max-items 10 \
-       --query 'pipelineExecutionSummaries[].[pipelineExecutionId,status,startTime,sourceRevisions[0].revisionId]'
+   aws codepipeline list-pipeline-executions --pipeline-name <pipeline> \
+       --query "pipelineExecutionSummaries[?sourceRevisions[0].revisionId=='<sha>'].[pipelineExecutionId,status,startTime]"
    ```
+
+   The command sets no `--max-items`, so the CLI reads every page of the history, older executions
+   included, before it filters; a limit would leave out an older execution of the same commit
+   and make the commit look deployed once. CodePipeline keeps the history of its executions for
+   12 months only, and the console's history pages through the same list. When the lookup is
+   inconclusive (it failed, or you cannot tell whether an execution is missing), do not treat the
+   commit as deployed once: take the outcome from the execution's own actions, below, or from the
+   owner's e-mail of its failure (step 2).
 
    When more than one execution names `<sha>` as its source revision (an execution started again
    by hand, a commit that a later execution covers), or a stage was retried (a retry keeps the
@@ -70,10 +78,15 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    ```sh
    aws codepipeline list-action-executions --pipeline-name <pipeline> \
        --filter pipelineExecutionId=<execution> \
-       --query 'actionExecutionDetails[].[stageName,actionName,status,startTime,output.executionResult.externalExecutionSummary]'
+       --query 'actionExecutionDetails[].[stageName,actionName,status,startTime,output.executionResult.errorDetails.code,output.executionResult.errorDetails.message,output.executionResult.externalExecutionSummary]'
    ```
 
-   or match the owner's e-mail of the failure (step 2), which names the execution, to it.
+   A failed action's error is in its `errorDetails`, a code and a message, which the provider's
+   summary (`externalExecutionSummary`, the last column) may leave empty. The message is AWS's
+   text: read it in your terminal and never paste it to GitHub. The CodePipeline console shows the
+   same error on the execution's page, under the failed action's details.
+
+   You can also match the owner's e-mail of the failure (step 2), which names the execution, to it.
 
    What each line says:
 
@@ -138,14 +151,36 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    - **A stack's `Prepare` action** (`<stack>.Prepare`, which makes a change set): the change set
      was refused, so no update of that stack started; the action's error says why.
    - **A stack's `Deploy` action** (`<stack>.Deploy`, which runs the change set), or an execution
-     stopped while such an action ran: an update of that stack started, and CloudFormation rolls
-     it back to its previous template; but the failed or stopped status does not say that the
-     rollback has finished, or that it succeeded. Read the state of that stack:
+     stopped while such an action ran: an update of that stack started. When the action failed,
+     the update failed and CloudFormation rolls it back to its previous template. When the
+     execution was stopped, CloudFormation is not told: with **Stop and wait**, the action waits
+     for the update to end, and with **Stop and abandon**, the action is dropped while the update
+     goes on. Either way the update may still be running, may have completed on the new template,
+     or may have failed and rolled back. The failed or stopped status says none of this: it does
+     not say which template is in effect, or that a rollback has finished or succeeded. Establish
+     it from the stack itself before any repair. Its state:
 
      ```sh
      aws cloudformation describe-stacks --stack-name <stack> --query 'Stacks[0].StackStatus'
      ```
 
+     and its latest events, the newest first, read back to the moment the action started (the
+     events of the stack itself, whose logical ID is the stack's name, mark where each update
+     began and how it ended):
+
+     ```sh
+     aws cloudformation describe-stack-events --stack-name <stack> --max-items 40 \
+         --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus]' --output text
+     ```
+
+     - `UPDATE_IN_PROGRESS` or `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`: the update is still running
+       (an abandoned action, or a stop that has not ended); wait and read it again.
+     - `UPDATE_COMPLETE`, with an event of the stack itself `UPDATE_COMPLETE` after the action
+       started: the update finished, and the stack is on the new template, the one the stopped
+       execution deployed, whatever the pipeline's status says. Treat it as deployed: when it is
+       the bad change, revert or fix it like any deployed change. `UPDATE_COMPLETE` with no update
+       of the stack after the action started: the change set never ran, and the stack holds the
+       previous deployment.
      - `UPDATE_ROLLBACK_IN_PROGRESS` or `UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS`: still
        rolling back; wait and read it again.
      - `UPDATE_ROLLBACK_COMPLETE`: that stack is back on its previous template. A stack that the

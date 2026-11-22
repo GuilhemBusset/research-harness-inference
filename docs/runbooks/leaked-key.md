@@ -95,8 +95,17 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 
    ```text
    filter alias = "ALIAS"
-   | stats count(*) as requests, sum(input_tokens) as input, sum(output_tokens) as output by pool
+   | stats count(*) as requests, sum(output_tokens) as output by pool
    ```
+
+   The log substantiates how many requests the alias made, when, and the output tokens; not the
+   input. A record's `input_tokens` is a generation's input for a generation, but for a token count
+   (`POST /v1/messages/count_tokens`, which generates nothing) it is the count asked, and the
+   record has no field that tells the two apart: a generation of 5,000 input tokens and a token
+   count of 900 sum to 5,900 in the log. Do not add up `input_tokens` from the log. For the input,
+   take the dashboard's two families apart, `input_tokens` for generations and `counted_tokens` for
+   token counts, and report them to the student apart. The requests the log counts include token
+   counts too, which also produce no output.
 
    When the hours matter, list each request instead:
 
@@ -129,9 +138,22 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 
    Each revoked key may still work for up to 60 seconds: the gateway keeps each lookup for 60
    seconds (section 6.4), so a gateway task that looked the key up just before the revocation keeps
-   accepting it until that lookup expires. A request that was accepted but whose body was still on
-   its way is checked again, past the cache, before it reserves anything, and is refused then.
-   Nothing makes the 60 seconds shorter; they bound the exposure.
+   accepting it until that lookup expires. A request accepted through the cache, once its body has
+   arrived, first writes its reservation against the student's budget, then has its key read again
+   past the cache; when the key is revoked by then, the gateway withdraws that reservation and
+   refuses the request, so it reaches no engine. Nothing makes the 60 seconds shorter; they bound
+   the exposure.
+
+   Run the revocation a second time now, before you tell the student anything and before any new
+   key can be issued to them (step 2): it revokes only keys that are not revoked yet, so it prints
+   that it revoked 0 keys. A number above 0 means a login stored a key between the two runs, and
+   that key is revoked too; run it again until it prints 0. Never run it after the student has
+   logged in again or been sent a key with `rhi_admin key issue`: it would revoke that replacement
+   key as well.
+
+   ```sh
+   rhi_admin key revoke 1234567
+   ```
 
    When the student is to lose access altogether rather than log in again, remove the entry
    instead, which revokes their keys as well:
@@ -143,8 +165,9 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 2. **Tell the student,** in the course's private channel, never in the place where the key leaked:
 
    - their keys were revoked, every installation's, and why; what the dashboard shows their alias
-     spent since the leak, if anything looked wrong (Check, step 2): token counts, not money, and
-     nothing the student owes;
+     spent since the leak, if anything looked wrong (Check, step 2): numbers of tokens, not money,
+     and nothing the student owes, with the input of generations and the tokens of token counts
+     given apart, never added together;
    - to log in again on each installation they use, which issues a new key there (the endpoint is
      stored from their first login):
 
@@ -174,14 +197,20 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 
 ## Verify
 
-1. **The keys are revoked.** Run the revocation again: it revokes only keys that are not revoked
-   yet, so it now prints that it revoked 0 keys, unless the student has logged in again in the
-   meantime, whose new key it would revoke too. Run it again only before the student has logged in
-   again.
+1. **The keys are revoked, and the replacement key is not.** This check writes nothing, so it
+   leaves a replacement key valid, whether from a new login or from `rhi_admin key issue`. Export
+   what is kept of the student and read its list `keys`, each with its `issued_at`,
+   `expires_at` and `revoked_at`, in seconds since the epoch:
 
    ```sh
-   rhi_admin key revoke 1234567
+   rhi_admin privacy export 1234567
    ```
+
+   Every key issued before the revocation of Act, step 1 has a `revoked_at` that is a time; a key
+   issued after it, the replacement, has `revoked_at` `null`. The export holds the student's data (their usage rows and log
+   records as well): read it in the terminal and keep no copy of it. A student removed from the
+   roster cannot be exported; for them the second run of the revocation in Act, step 1, which
+   printed 0, is the check, and no key can be issued to them any more.
 
 2. **The leaked key no longer works.** The proof is step 1: every key the student held is revoked
    in the keys table, and the gateway refuses a revoked key once its 60-second lookup has
