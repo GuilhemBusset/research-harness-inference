@@ -113,12 +113,17 @@ reader takes the new value when it next starts.
 
    ```sh
    aws ecs update-service --cluster <gateway-cluster> --service <gateway-service> \
-       --force-new-deployment --query 'service.deployments[0].rolloutState' --output text
+       --force-new-deployment --query "service.deployments[?status=='PRIMARY'].id" --output text
    ```
 
-   ECS starts the new tasks, then drains each old one, for up to 30 minutes, the gateway's
-   deregistration delay (section 8.5). After rotating the secrets of several pools, one deployment
-   of the gateway, after the last of them, is enough.
+   The command prints the deployment ID of the new deployment: note it, it is `<deployment-id>`
+   in Verify. ECS starts the new tasks, then drains each old one, for up to 30 minutes, the
+   gateway's deregistration delay (section 8.5). The service has ECS's deployment circuit breaker
+   with rollback: when the new tasks fail to start, ECS rolls back to the previous deployment,
+   which then runs and completes again with the old tasks and the old value. So it is the
+   deployment with this ID that must complete, not whichever deployment is primary at the end.
+   After rotating the secrets of several pools, one deployment of the gateway, after the last of
+   them, is enough.
 
 ### The status reporter App's private key
 
@@ -137,8 +142,12 @@ So the new key is added first, every reader is moved to it, and the old key is d
 
    ```sh
    setup/owner-setup.sh --step apps --reporter-key "$HOME/.config/rhi/reporter-app.pem" \
-       --factory-key "$HOME/.config/implement-loop/factory-app.pem"
+       --factory-key "$LOOP_GITHUB_APP_KEY_FILE"
    ```
+
+   `$HOME/.config/rhi/reporter-app.pem` is an example path: give the path where you put the new
+   key. `--factory-key` takes the factory's current key file, the one `LOOP_GITHUB_APP_KEY_FILE`
+   names (the factory App's part, below, says how to read it).
 
 3. **Move the reporter to the new key.** The reporter reads the secret once in each execution
    environment, at the first status it posts there, and keeps the key for that environment's
@@ -152,9 +161,21 @@ So the new key is added first, every reader is moved to it, and the old key is d
    ```
 
    The template sets no description, so the change does no harm; a later deployment that updates
-   the function may clear it.
+   the function may clear it. The command returns while the update is still `InProgress`, and
+   until the update has completed Lambda goes on invoking the function with its previous
+   configuration, in environments that may hold the old key. Wait for it, then read its result:
 
-4. **Check that statuses are posted with the new key** (Verify, step 2), and only then delete the
+   ```sh
+   aws lambda wait function-updated --function-name <reporter-function>
+   aws lambda get-function-configuration --function-name <reporter-function> \
+       --query '[LastUpdateStatus,LastUpdateStatusReasonCode]' --output text
+   ```
+
+   Go on only when it reads `Successful`. `Failed` means the rotation failed: warm environments
+   keep the old key, so do not delete it; read the reason in the Lambda console, fix it, and run
+   the update again.
+
+4. **Check that statuses are posted with the new key** (Verify, step 3), and only then delete the
    old key on the App's page, under **Private keys**, by the fingerprint you noted. Deleting it
    first would leave a warm environment unable to post a status until it is retired.
 
@@ -168,20 +189,36 @@ key, and nothing restarts.
 1. **Generate a new key** on the factory App's page, as for the reporter (step 1 above), and note
    the old key's fingerprint.
 
-2. **Replace the file,** keeping its name and its mode:
+2. **Find the file the engine reads.** The engine signs with the file `LOOP_GITHUB_APP_KEY_FILE`
+   names in the environment the loop is launched from: the walkthrough of
+   `docs/factory/green-light.md` sets it in the shell, or in a file outside the repository that
+   the shell reads, with an example path that yours may not match. Read it in a shell set up as
+   the one you launch the loop from, and check that it names an existing file:
 
    ```sh
-   install -m 600 "$HOME/Downloads/<new-key>.private-key.pem" "$HOME/.config/implement-loop/factory-app.pem"
+   printenv LOOP_GITHUB_APP_KEY_FILE
+   test -f "$LOOP_GITHUB_APP_KEY_FILE" && echo "the configured key file exists"
+   ```
+
+   An empty answer, or no file there, means the variable is not set where the loop runs: stop,
+   and find where it is set before going on. Replacing another file would leave the engine on the
+   old key, and the doctor too.
+
+3. **Replace the file at the configured path,** keeping its name and its mode:
+
+   ```sh
+   install -m 600 "$HOME/Downloads/<new-key>.private-key.pem" "$LOOP_GITHUB_APP_KEY_FILE"
    rm "$HOME/Downloads/<new-key>.private-key.pem"
    ```
 
-3. **Check the new key** with the doctor: the line `github identity` mints a token with it.
+4. **Check the new key** with the doctor, from the same shell: the line `github identity` mints a
+   token with the file the variable names.
 
    ```sh
    scripts/implement.sh doctor
    ```
 
-4. **Delete the old key** on the App's page, by its fingerprint, once the doctor passes.
+5. **Delete the old key** on the App's page, by its fingerprint, once the doctor passes.
 
 ### The student login App
 
@@ -216,42 +253,82 @@ the next run uses the new key.
 
 ## Verify
 
-1. **A pool's bearer secret.** The gateway's new deployment has completed, and only it runs:
+1. **A pool's bearer secret: the gateway's deployment.** The deployment the rotation started, by
+   the deployment ID that Act noted, has completed:
 
    ```sh
    aws ecs describe-services --cluster <gateway-cluster> --services <gateway-service> \
-       --query 'services[0].deployments[].[status,rolloutState,runningCount]' --output text
+       --query "services[0].deployments[?id=='<deployment-id>'].[status,rolloutState,rolloutStateReason]" \
+       --output text
    ```
 
-   One line, `PRIMARY COMPLETED` and the number of tasks. Then the endpoint serves through the new
-   value. For the mock pool, start a pipeline run with **Release change** on the pipeline's page in
-   the CodePipeline console and read the end of its Verify action's CodeBuild log: pytest's summary
-   reports tests `passed` and none `failed` or `error`. For a GPU pool, start the weekly canary
-   now, which wakes the coursework pool (one GPU start) and runs its smoke tests through the
-   gateway; its build ends `SUCCEEDED` in the CodeBuild console:
+   It reads `PRIMARY COMPLETED`. Anything else is not a reload: `IN_PROGRESS` is still rolling
+   out, so wait and read it again; `FAILED`, or a deployment that is no longer listed while
+   another one is primary, means the circuit breaker rolled back to the previous deployment,
+   whose tasks still send the old value. The rotation is then not done: read the service's
+   events in the ECS console and the log group `/rhi/gateway`, fix the cause, and start the
+   deployment again (Act).
+
+2. **A pool's bearer secret: the endpoint serves the rotated pool.** For each pool whose secret
+   you rotated, send one request through the gateway to that pool, with the canary's key: the
+   canary is the owner's roster entry, served whatever the session switch (section 8.2), and it
+   may wake a pool that students may not, a `scheduled-only` one. The request names the pool by
+   its `model`; the key goes from Secrets Manager to curl on a pipe, and is printed nowhere.
+   `<endpoint>` is the endpoint's address, as `rhi login` uses it:
 
    ```sh
-   aws codebuild start-build --project-name rhi-gpu-canary --query build.id --output text
+   aws secretsmanager get-secret-value --secret-id rhi/canary-key --query SecretString --output text \
+       | sed 's/^/Authorization: Bearer /' \
+       | curl -sS --fail-with-body --max-time 600 -H @- -H 'content-type: application/json' \
+           https://<endpoint>/v1/messages \
+           -d '{"model": "coursework", "max_tokens": 16, "messages": [{"role": "user", "content": "Say OK."}]}'
    ```
 
-2. **The status reporter's key.** A run of the pipeline posts statuses created after the update of
-   step 3: start one with **Release change**, wait for it to end, and read the statuses of the
-   commit it deployed, the head of `main`. The newest `deploy/<stage>` line carries a time after
-   the update. Read it once more after deleting the old key, from the next run.
+   with the rotated pool's name in place of `coursework`. An answer with a message's content is a
+   pass: the gateway sent the new value and the restarted engine took it. On a GPU pool with no
+   instance, the request wakes it, which is one GPU start; the gateway holds a call for up to 4
+   minutes (section 5.3), so an error whose cause is `warming` only means the pool is still
+   starting: send the request again until it answers. A pool the admin disabled answers
+   `pool_disabled` and is not tested: enable it first, or test it when it is next enabled
+   (runbook [a disabled pool](disabled-pool.md)). An error with any other cause after the pool is
+   `ready` is a failed rotation: the gateway and the engines do not hold the same value. The pool
+   goes back to sleep by itself when it is idle.
+
+   The weekly canary tests the coursework pool and no other, so it can stand in for this request
+   only for coursework (step 5 says how to read its result).
+
+3. **The status reporter's key.** A run of the pipeline posts statuses created after the update of
+   the reporter's configuration (its Act, step 3) completed: start one with **Release change**,
+   wait for it to end, and read the statuses of the commit it deployed, the head of `main`. The
+   newest `deploy/<stage>` line carries a time after the update. Read it once more after deleting
+   the old key, from the next run.
 
    ```sh
    gh api repos/OWNER/REPOSITORY/commits/main/statuses \
        --jq '.[] | "\(.created_at) \(.context) \(.state)"'
    ```
 
-3. **The factory's key.** `scripts/implement.sh doctor` shows `github identity` as `PASS`, with the
+4. **The factory's key.** `scripts/implement.sh doctor` shows `github identity` as `PASS`, with the
    App's name, after the old key was deleted.
 
-4. **The canary's key.** The next verification runs its tests: after a **Release change**, its
-   `verify/<stage>` status, and the end of its Verify log, say the tests ran and passed, not "No
-   test ran: the canary's key is missing.". Or start the canary build of step 1, which uses the
-   same key.
+5. **The canary's key.** A build that ends without error does not show that the key works: the
+   verification and the canary both end in success when no test ran, with the canary's secret
+   missing or the HTTPS listener off. Read what the tests did.
 
-5. **The login App.** A student, or your own roster entry, logs in with `rhi login`.
+   - The verification: after a **Release change**, its `verify/<stage>` status reads "The
+     verification's tests ran and passed.", not one that begins "No test ran", and the end of
+     its Verify action's CodeBuild log reports tests `passed` and none `failed` or `error`.
+   - Or the weekly canary, started now; it wakes the coursework pool, one GPU start:
+
+     ```sh
+     aws codebuild start-build --project-name rhi-gpu-canary --query build.id --output text
+     ```
+
+     In the CodeBuild console, the canary's log of that build ends with the line
+     `canary_result: gpu-canary pass sent for` and the day's date, after pytest's summary of tests
+     `passed` and none `failed`. A line `no test was run`, or a verdict `not_measured` or `fail`,
+     is not a pass, whatever the build's status.
+
+6. **The login App.** A student, or your own roster entry, logs in with `rhi login`.
 
 Walked through on the deployed system: not yet.

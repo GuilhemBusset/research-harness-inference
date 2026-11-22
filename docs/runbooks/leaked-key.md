@@ -64,12 +64,30 @@ A key that only expired at the course end is not a leak: there is nothing to rev
    alias and pool: "Requests, a second", "Input tokens, a second, cached or not", "Cached input
    tokens, a second", "Output tokens, a second", "Tokens of token counts, a second", and "Errors by
    cause, a second". Set the time range to start before the moment the key could first have
-   leaked (the date of the commit that holds it, for instance) and read the student's alias.
-   Usage outside the class's hours, or on days the student says they did not work, is someone
-   else's. The panels show rates; to read a total, use the panel's legend or Grafana's inspector
-   over the range. The dashboard counts by alias, not by key: a student with two installations
-   (section 6.4) has the usage of both keys in one series, so the panels say what the student's
-   keys spent together, never which of them spent it.
+   leaked (the date of the commit that holds it, for instance) and look at the student's alias:
+   these panels show *when* the alias asked, as rates a second, not how much it asked in all.
+
+   For a total over the range, use Grafana's Explore on the Prometheus data source, keep the same
+   time range, and run, with the student's alias in place of `ALIAS` and the family of the
+   quantity you want (`requests`, `input_tokens`, `cached_input_tokens`, `output_tokens`,
+   `counted_tokens`) in place of `output_tokens`:
+
+   ```text
+   sum by (pool, alias) (increase(rhi_gateway_student_output_tokens_total{alias="ALIAS"}[$__range]))
+   ```
+
+   The `increase` is taken on each series first, each gateway task's apart, and only then summed:
+   a task's counters restart from zero when it starts, and summing first would hide that. Choose
+   the "Instant" query type to get one number per pool for the whole range. Prometheus
+   extrapolates at the edges of the range, so the result is an estimate, close enough to tell the
+   student what their alias spent.
+
+   Read what the panels show as an indicator, never as proof of who sent a request. The dashboard
+   counts by alias, not by key, and the student's own key and the leaked key draw under the same
+   alias and pool: a student with two installations (section 6.4) also has the usage of both in
+   one series. Usage outside the class's hours, or on days the student says they did not work,
+   is a sign that the key is used by someone else; it does not show it, and it does not say which
+   requests were whose.
 
 3. **Do not wait for the reading to revoke.** The reading of step 2 is for what you tell the
    student, not a condition of acting: a key that is public is revoked whatever it has spent.
@@ -139,11 +157,15 @@ A key that only expired at the course end is not a leak: there is nothing to rev
    rhi_admin key revoke 1234567
    ```
 
-2. **The leaked key no longer works.** More than 60 seconds after Act, step 1, while a session is
-   on, the student's alias draws nothing more on the dashboard "Students" from the leaked key:
-   a revoked key is refused before the gateway accepts it, so its requests are no student's and
-   carry no alias. The student's own new key, once they have logged in again, draws under the same
-   alias again: from then on, every request under the alias is the student's.
+2. **The leaked key no longer works.** The proof is step 1: every key the student held is revoked
+   in the keys table, and the gateway refuses a revoked key once its 60-second lookup has
+   expired. The dashboard is not the proof. A revoked key's requests are refused before the
+   gateway accepts the key, so they carry no alias and draw on no student's series, but a request
+   accepted before the revocation can still finish, and count, a little after it. And once the
+   student logs in again, their new key draws under the same alias: the alias then shows the
+   student's usage and nothing else of a revoked key, but it never says who sent each request.
+   If the usage under the alias still looks wrong a few minutes after the student has logged in
+   again, start again from Check: another of their keys, or the new one, may be leaking.
 
 3. **The student is back.** The student confirms that `rhi login` succeeded on each of their
    installations and that their harness works during the next session.
