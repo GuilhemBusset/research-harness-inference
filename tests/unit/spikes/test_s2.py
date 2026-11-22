@@ -151,16 +151,37 @@ def test_the_harnesses_are_pinned(tmp_path: Path) -> None:
     binaries = harnesses.install(tmp_path, run)
     assert ran == [harnesses.install_command(tmp_path)]
     assert ran[0][:2] == ["npm", "install"]
-    assert ran[0][-4:] == [
+    assert ran[0][-5:] == [
+        f"node@{harnesses.NODE_VERSION}",
         "@anthropic-ai/claude-code@2.1.323",
         "@openai/codex@0.169.0",
         "opencode-ai@1.19.5",
         "@earendil-works/pi-coding-agent@1.5.2",
     ]
-    assert binaries == {name: tmp_path / "node_modules/.bin" / command for name, (_, command) in PACKAGES.items()}
+    assert binaries == {
+        name: tmp_path / ("bin" if name == "pi" else "node_modules/.bin") / command
+        for name, (_, command) in PACKAGES.items()
+    }
     assert harnesses.versions(binaries, run, {"openai": "3.57.0", "anthropic": "2.11.0"}.__getitem__) == VERSIONS
     with pytest.raises(RuntimeError, match="not its pin"):
         harnesses.versions(binaries, lambda argv: "codex-cli 0.170.0", lambda name: "1.0.0")
+
+
+def test_pi_runs_on_the_pinned_node_not_the_machine_s(tmp_path: Path) -> None:
+    # Pi starts on no Node older than 22.19, and the job's machine starts on an older one: what runs
+    # `pi` runs Pi's script with the Node the job installed.
+    installed = tmp_path / "harnesses" / "node_modules" / ".bin"
+    installed.mkdir(parents=True)
+    node = installed / "node"
+    node.write_text('#!/bin/sh\necho "pinned node: $*"\n', encoding="utf-8")
+    node.chmod(0o755)
+    (installed / "pi").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+
+    binaries = harnesses.install(tmp_path / "harnesses", lambda argv: "")
+    printed = harnesses.run_command([str(binaries["pi"]), "--version"])
+    assert printed == f"pinned node: {installed / 'pi'} --version\n"
+    assert harnesses.is_exact(harnesses.NODE_VERSION)
+    assert int(harnesses.NODE_VERSION.split(".")[0]) >= 22
 
 
 # The exchanges.
