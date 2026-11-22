@@ -260,13 +260,15 @@ reading anything:
   builder's plan read the item differently from the examiner, the issue text is ambiguous and is
   the thing to edit.
 - **From the fourth examination, no ledger verdict unmet**: past the examiner bound (ADR 0001,
-  amendment 12), only a finding that names a safety invariant, or one an earlier examination
-  raised and that is still open, sends the build back. Read the `examined` events' `findings` and
-  `bounded`, the findings in the issue's state in `state.json`, and the follow-up issues the bound
-  filed: findings carried over from early examinations, or new ones that name an invariant, show
-  which rule kept the issue going. A round there whose `examined` event has no blocking finding
-  was sent back by a missing verdict: its `missing` list is not empty, and the
-  `examination_incomplete` retries before it name the same items (below).
+  amendment 12), two things send the build back: a blocking finding (one that names a safety
+  invariant, or one an earlier examination raised and that is still open), or a missing verdict
+  (the examiner gave none on a ledger item even after two retries). Read each round's `examined`
+  event first: its `findings` and `bounded`, and its `missing`. With blocking findings, read the
+  findings in the issue's state in `state.json` and the follow-up issues the bound filed: findings
+  carried over from early examinations, or new ones that name an invariant, show which rule kept
+  the issue going. With no blocking finding and a non-empty `missing`, there is no finding to look
+  for: the round failed because the verdict retries ran out, and the `examination_incomplete`
+  events before it name the same items (below).
 - **Before the fourth examination**: each round's findings are in the `examined` event and in
   `state.json`. Findings that close and are replaced by new ones every round point at the examiner
   or at an issue that invites edge cases; a finding the builder did not fix shows instead under
