@@ -14,13 +14,14 @@ answered, its `HTTPCode_ELB_5XX_Count`: without it, a gateway that is down would
 never alarm.
 
 **The share.** The alarm divides the two counts, summed over one period of
-gateway_error_alarm_minutes, by the requests of the same period, and fires when the share is above
-gateway_error_alarm_percent (5% over 5 minutes by default). The requests are the load balancer's
-`RequestCount` plus its own 5xx answers: AWS counts in `RequestCount` only the requests for which
-the load balancer chose a target, so a 503 it gives while the gateway's service has no task is in
-neither half of `RequestCount`, and without the second term a gateway at zero tasks would divide by
-nothing. A 502 or 504 the load balancer gives after choosing a target is then counted twice among
-the requests, which only lowers the share a little.
+gateway_error_alarm_minutes, by the load balancer's `RequestCount` of the same period, and fires
+when the share is above gateway_error_alarm_percent (5% over 5 minutes by default). AWS counts in
+`RequestCount` only the requests for which the load balancer chose a target: a 502 or 504 it gives
+after choosing one is among them, but a 503 it gives while the gateway's service has no task is
+not. When no request reached a target, the period's requests are then the load balancer's own 5xx
+answers, and a gateway at zero tasks fails all of them: the share is 100% rather than a division by
+nothing. A 503 given while a target still answered other requests of the period is in the
+numerator and not in `RequestCount`, which can only raise the share a little.
 
 A missing count is 0. A period with no request at all has no share and does not breach, so the
 alarm clears once the failures stop.
@@ -118,7 +119,10 @@ class AlarmsGateway(Construct):
                 count("requests", LOAD_BALANCER_NAMESPACE, "RequestCount", load_balancer_dimensions),
                 cloudwatch.CfnAlarm.MetricDataQueryProperty(
                     id="share",
-                    expression="100 * (FILL(own, 0) + FILL(elb5xx, 0)) / (FILL(requests, 0) + FILL(elb5xx, 0))",
+                    expression=(
+                        "100 * (FILL(own, 0) + FILL(elb5xx, 0))"
+                        " / IF(FILL(requests, 0) > 0, FILL(requests, 0), FILL(elb5xx, 0))"
+                    ),
                     label="Requests failed for the gateway's own fault, in percent",
                     return_data=True,
                 ),

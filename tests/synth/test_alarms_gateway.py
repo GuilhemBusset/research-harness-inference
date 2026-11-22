@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,18 @@ def gateway_alarm(templates: Templates) -> dict[str, Any]:
     return alarm
 
 
+def share(alarm: dict[str, Any], **counts: float | None) -> float | None:
+    """The alarm's returned expression over one period's counts, by query id: None is a count with no
+    data point, and the result is None where the expression has no value."""
+    (expression,) = [q["Expression"] for q in alarm["Metrics"] if q.get("ReturnData")]
+    row = ", ".join(f'? AS "{query_id}"' for query_id in counts)
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.create_function("FILL", 2, lambda value, default: default if value is None else value)
+        db.create_function("IF", 3, lambda condition, yes, no: yes if condition else no)
+        (value,) = db.execute(f"SELECT {expression} FROM (SELECT {row})", tuple(counts.values())).fetchone()
+    return value
+
+
 def test_the_filter_counts_the_gateways_own_faults_with_no_dimension(
     templates: Templates, cloud_assembly: Path
 ) -> None:
@@ -81,14 +95,16 @@ def test_the_alarm_compares_the_failed_share_of_the_load_balancers_requests_with
         assert dimension["Name"] == "LoadBalancer"
         assert output(templates, dimension["Value"]) == {"Fn::GetAtt": [balancer_id, "LoadBalancerFullName"]}
     assert {(s["Stat"], s["Period"]) for s in stats.values()} == {("Sum", 300)}
-    (share,) = [q for q in alarm["Metrics"] if q.get("ReturnData")]
-    # The two 5xx counts over the requests, the ones the load balancer answered itself included.
-    assert share["Expression"].replace(" ", "") == (
-        "100*(FILL(own,0)+FILL(elb5xx,0))/(FILL(requests,0)+FILL(elb5xx,0))"
-    )
+    # The two 5xx counts over the requests that reached a target: one 504 in 19 such requests breaches.
+    assert share(alarm, own=None, elb5xx=1.0, requests=19.0) == 100 / 19
+    assert share(alarm, own=50.0, elb5xx=None, requests=1000.0) == 5
+    # A gateway at zero tasks: no request reaches a target, and the load balancer answers all of them.
+    assert share(alarm, own=None, elb5xx=40.0, requests=None) == 100
+    assert share(alarm, own=None, elb5xx=40.0, requests=0.0) == 100
     assert (alarm["ComparisonOperator"], alarm["Threshold"]) == ("GreaterThanThreshold", 5)
     assert (alarm["EvaluationPeriods"], alarm["DatapointsToAlarm"]) == (1, 1)
     # A period with no request has no share, and the alarm clears.
+    assert share(alarm, own=None, elb5xx=None, requests=None) is None
     assert alarm["TreatMissingData"] == "notBreaching"
 
 
