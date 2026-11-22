@@ -204,9 +204,22 @@ def build(
         return profile.rewrites(profiles, route)
 
     filters: dict[routes.Route, Filter] = {
-        routes.MESSAGES: BodyFilter(messages.MESSAGES, pools, default_pool, rewrites(routes.MESSAGES), maximum),
+        # Both Messages routes replace the blocks no engine here can serve, so a count counts what is read.
+        routes.MESSAGES: BodyFilter(
+            messages.MESSAGES,
+            pools,
+            default_pool,
+            rewrites(routes.MESSAGES),
+            maximum,
+            replacement=messages.blocks_as_text,
+        ),
         routes.COUNT_TOKENS: BodyFilter(
-            messages.COUNT_TOKENS, pools, default_pool, rewrites(routes.COUNT_TOKENS), maximum
+            messages.COUNT_TOKENS,
+            pools,
+            default_pool,
+            rewrites(routes.COUNT_TOKENS),
+            maximum,
+            replacement=messages.blocks_as_text,
         ),
         routes.CHAT_COMPLETIONS: ChatBodyFilter(pools, default_pool, rewrites(routes.CHAT_COMPLETIONS), maximum),
         routes.RESPONSES: BodyFilter(responses.RESPONSES, pools, default_pool, rewrites(routes.RESPONSES), maximum),
