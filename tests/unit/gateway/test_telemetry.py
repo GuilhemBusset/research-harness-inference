@@ -1,14 +1,19 @@
 """The gateway's log: one record of metadata per request, and its own faults told apart (`rhi_gateway.telemetry`).
 
 The gateway runs whole over the in-memory key store and ledger; the engine is an
-`httpx.MockTransport` that answers every forwarded route whole. Records are read from standard
-output, where the gateway writes them. Every key is generated when the tests run.
+`httpx.MockTransport` that answers every forwarded route whole, or, for the waits a record notes,
+streams the parts the test gives on the test's clock. The gateway is built without metrics: the
+record notes its waits all the same. Records are read from standard output, where the gateway
+writes them. Every key is generated when the tests run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
@@ -29,6 +34,7 @@ from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
+from rhi_gateway.hold import HELD_HEADER
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import PoolView, Readiness
@@ -39,7 +45,21 @@ NOW = 1_800_000_000
 COURSE_END_DATE = date(2027, 6, 30)
 GITHUB_ID = 98_765_431
 MARKER = "marker-5c1e-not-for-the-log"
-FIELDS = {"alias", "time", "pool", "wire_format", "input_tokens", "output_tokens", "latency_ms", "status", "cause"}
+FIELDS = {
+    "alias",
+    "time",
+    "pool",
+    "route",
+    "wire_format",
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "time_to_first_token_ms",
+    "held_ms",
+    "latency_ms",
+    "status",
+    "cause",
+}
 POOLS = parse_pools(
     {
         "coursework": {
@@ -96,8 +116,16 @@ class Aws:
         return {"StatusCode": 202}
 
 
-def gateway() -> tuple[Starlette, str]:
-    """The whole gateway, every route served; and the key of its one student."""
+def gateway(
+    engine: httpx.MockTransport | None = None,
+    holding: Holding | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[Starlette, str]:
+    """The whole gateway, every route served; and the key of its one student.
+
+    By default the engine answers whole and the coursework pool is ready; a test may give its own
+    engine, hold, and clock of a request's waits.
+    """
     key = generate_key()
     item = StudentKey(
         key_hash=key_hash(key),
@@ -114,7 +142,8 @@ def gateway() -> tuple[Starlette, str]:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     # The coursework pool is ready; the evening pool, scheduled only, is not.
     ready = lambda: {"coursework": PoolView(ready=True)}
-    engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))
+    if engine is None:
+        engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))
     forwarding = Forwarding(
         authenticator=authenticator,
         ledger=ledger,
@@ -125,7 +154,8 @@ def gateway() -> tuple[Starlette, str]:
             routes.RESPONSES: BodyFilter(responses.RESPONSES, POOLS),
         },
         proxy=proxy.Proxy(proxy.upstream_client(engine), "http://pools.example.com:8080", {"coursework": "secret"}),
-        holding=Holding(views=ready, wake=lambda pool: None),
+        holding=Holding(views=ready, wake=lambda pool: None) if holding is None else holding,
+        clock=clock,
     )
     readiness = Readiness({"coursework": "tg-coursework"}, elbv2=Aws(), table=Aws(), clock=lambda: float(NOW))
     local = LocalRoutes(
@@ -198,9 +228,13 @@ def test_a_forwarded_request_gives_one_record_of_the_stated_fields(capsys: pytes
     assert record == {
         "alias": "otter",
         "pool": "coursework",
+        "route": "/v1/messages",
         "wire_format": "messages",
         "input_tokens": 5000,
         "output_tokens": 7,
+        "cached_input_tokens": 0,
+        "time_to_first_token_ms": None,  # Not a stream: no token was sent as one.
+        "held_ms": 0,
         "status": 200,
         "cause": None,
     }
@@ -227,6 +261,16 @@ def test_a_refused_request_and_a_local_route_give_one_record_each(capsys: pytest
     assert call(app, "GET", "/v1/nowhere", key=key)[0] == 404
     [outside] = records(capsys)
     assert (outside["status"], outside["cause"]) == (404, "not_found")
+    assert (refused["route"], models["route"], hello["route"], outside["route"]) == (
+        "/v1/chat/completions",
+        "/v1/models",
+        "/api/hello",
+        None,
+    )
+    # A path of the table with another method is outside the table too.
+    assert call(app, "POST", "/v1/models", key=key)[0] == 404
+    [other_method] = records(capsys)
+    assert other_method["route"] is None
 
 
 def test_nothing_of_a_request_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
@@ -238,6 +282,119 @@ def test_nothing_of_a_request_is_logged(capsys: pytest.CaptureFixture[str]) -> N
     # Neither the marker of the body and headers, nor the key, its hash or the student's GitHub ID.
     for secret in (MARKER, key, key_hash(key), str(GITHUB_ID)):
         assert secret not in logged
+
+
+def sse(name: str, data: dict[str, Any]) -> bytes:
+    return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+# A Messages stream: its usage (100 tokens not cached, 900 read from the cache), a token at 2.5
+# seconds from the request's acceptance, and its end with 40 tokens out.
+STREAM = [
+    (
+        0.0,
+        sse(
+            "message_start",
+            {"type": "message_start", "message": {"usage": {"input_tokens": 100, "cache_read_input_tokens": 900}}},
+        ),
+    ),
+    (2.5, sse("content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}})),
+    (
+        3.0,
+        sse("message_delta", {"type": "message_delta", "usage": {"output_tokens": 40}})
+        + sse("message_stop", {"type": "message_stop"}),
+    ),
+]
+# A stream cut before it reports any usage: the engine stops after a ping.
+CUT = [(0.0, sse("ping", {"type": "ping"}))]
+
+
+@dataclass
+class Waits:
+    """The test's clocks: the gateway's (0 when a request is accepted, moved by the engine's stream) and the hold's."""
+
+    now: float = 0.0
+    hold_clock: float = float(NOW)
+    ready: bool = True  # Whether the pool is: a request for one that is not is held until the hold's first wait.
+    sends: list[tuple[float, bytes]] = field(default_factory=list)
+
+
+def streaming(waits: Waits) -> tuple[Starlette, str]:
+    """The gateway, without metrics, over an engine that streams `waits.sends`, each part at its second."""
+
+    async def engine(request: httpx.Request) -> httpx.Response:
+        async def parts() -> AsyncIterator[bytes]:
+            for at, part in waits.sends:
+                waits.now = at
+                yield part
+
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=parts())
+
+    async def sleep(seconds: float) -> None:
+        # The hold's first wait passes on the hold's clock, and the pool is ready at its end.
+        if not waits.ready and seconds > 0:
+            waits.hold_clock += seconds
+            waits.ready = True
+        await asyncio.sleep(0)
+
+    holding = Holding(
+        views=lambda: {"coursework": PoolView(ready=waits.ready)},
+        wake=lambda pool: None,
+        clock=lambda: waits.hold_clock,
+        sleep=sleep,
+    )
+    return gateway(httpx.MockTransport(engine), holding, clock=lambda: waits.now)
+
+
+def streamed(waits: Waits, *, ready: bool, sends: list[tuple[float, bytes]]) -> str:
+    """One streamed Messages request, held when the pool is not `ready`, its body and headers carrying the marker; its key."""
+    app, key = streaming(waits)
+    waits.ready, waits.sends = ready, sends
+    body = {**BODIES[routes.MESSAGES], "stream": True}
+    status, headers, _ = call(app, "POST", "/v1/messages", key=key, body=body, marker=True)
+    assert status == 200
+    assert any(name == HELD_HEADER.encode() for name, _ in headers) is not ready
+    return key
+
+
+def test_a_held_stream_logs_its_route_tokens_and_waits(capsys: pytest.CaptureFixture[str]) -> None:
+    waits = Waits()
+    key = streamed(waits, ready=False, sends=STREAM)
+    logged = capsys.readouterr().out
+    [record] = [json.loads(line) for line in logged.splitlines()]
+    assert set(record) == FIELDS
+    assert record["route"] == "/v1/messages"
+    # The tokens as the Messages parser gives them: the whole input, its cached part apart, and the output.
+    assert (record["input_tokens"], record["cached_input_tokens"], record["output_tokens"]) == (1000, 900, 40)
+    assert record["time_to_first_token_ms"] == 2500
+    assert record["held_ms"] == round((waits.hold_clock - NOW) * 1000) > 0
+    # Nothing of the request: not the marker of its body and headers, not its key, its hash or the GitHub ID.
+    for secret in (MARKER, key, key_hash(key), str(GITHUB_ID)):
+        assert secret not in logged
+
+
+def test_a_warm_stream_was_not_held(capsys: pytest.CaptureFixture[str]) -> None:
+    streamed(Waits(), ready=True, sends=STREAM)
+    [record] = records(capsys)
+    assert record["held_ms"] == 0
+    assert record["time_to_first_token_ms"] == 2500
+
+
+def test_a_stream_cut_before_any_usage_logs_no_tokens_and_no_first_token(capsys: pytest.CaptureFixture[str]) -> None:
+    streamed(Waits(), ready=True, sends=CUT)
+    [record] = records(capsys)
+    assert record["route"] == "/v1/messages"
+    assert (record["input_tokens"], record["cached_input_tokens"], record["output_tokens"]) == (0, 0, 0)
+    assert record["time_to_first_token_ms"] is None
+
+
+def test_a_token_count_logs_its_route_and_its_count(capsys: pytest.CaptureFixture[str]) -> None:
+    app, key = gateway()
+    assert call(app, "POST", "/v1/messages/count_tokens", key=key, body=BODIES[routes.COUNT_TOKENS])[0] == 200
+    [record] = records(capsys)
+    assert record["route"] == "/v1/messages/count_tokens"
+    assert (record["input_tokens"], record["output_tokens"]) == (12, 0)
+    assert (record["time_to_first_token_ms"], record["held_ms"]) == (None, 0)
 
 
 def test_an_unhandled_error_is_cause_none(capsys: pytest.CaptureFixture[str]) -> None:
