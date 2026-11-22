@@ -8,7 +8,8 @@ metrics (system design, section 6.6; evidence E27).
   default, which is longer.
 - No CloudWatch alarm, metric or metric filter has a dimension that identifies a student: alias,
   student or github_id, whatever its case. A metric is checked wherever a resource holds one: an
-  alarm, a dashboard, a scaling policy that tracks it. CloudWatch metrics cannot be deleted for 15
+  alarm, a dashboard, a scaling policy that tracks it, a service that publishes its events' metrics
+  by a dimension it is configured with. CloudWatch metrics cannot be deleted for 15
   months; the per-student series live in Prometheus only.
 
 These hold for the stage's templates, those of its nested assembly. The pipeline's own stack is not
@@ -79,7 +80,8 @@ def workspaces_kept_too_long(template: Mapping[str, Any]) -> list[str]:
 def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
     """Every dimension that identifies a student, with the resource that has it: in a CloudWatch
     metric of any resource (an alarm's, an anomaly detector's, a scaling policy's), in a metric
-    filter's metrics, or in a dashboard's metrics."""
+    filter's metrics, in the dimensions a service is configured to publish its events' metrics by
+    (an e-mail event destination's), or in a dashboard's metrics."""
     found: list[tuple[str, str]] = []
 
     def walk(node: object, resource: str) -> None:
@@ -93,6 +95,11 @@ def student_dimensions(template: Mapping[str, Any]) -> list[tuple[str, str]]:
             name = dimension.get("Name", dimension.get("Key")) if isinstance(dimension, dict) else None
             if isinstance(name, str) and name.lower() in STUDENT_DIMENSIONS:
                 found.append((resource, name))
+        # A dimension a service publishes to CloudWatch for its events (an e-mail event
+        # destination's) is configured by its `DimensionName`.
+        name = node.get("DimensionName")
+        if isinstance(name, str) and name.lower() in STUDENT_DIMENSIONS:
+            found.append((resource, name))
         for value in node.values():
             walk(value, resource)
 
@@ -217,6 +224,8 @@ def test_detects_a_student_dimension(cdk: ModuleType) -> None:
     from aws_cdk import aws_applicationautoscaling as scaling
     from aws_cdk import aws_cloudwatch as cloudwatch
     from aws_cdk import aws_logs as logs
+    from aws_cdk import aws_ses as ses
+    from constructs import Construct
 
     def alarm(stack: Any, construct_id: str, dimensions: dict[str, str]) -> None:
         metric = cloudwatch.Metric(namespace="rhi", metric_name="tokens", dimensions_map=dimensions)
@@ -249,11 +258,26 @@ def test_detects_a_student_dimension(cdk: ModuleType) -> None:
         )
         metric = cloudwatch.Metric(namespace="rhi", metric_name="requests", dimensions_map={"STUDENT": "a-student"})
         target.scale_to_track_metric("PerStudentTracking", custom_metric=metric, target_value=10)
+        destination = ses.CfnConfigurationSetEventDestination
+        dimension = destination.DimensionConfigurationProperty(
+            dimension_name="Alias", dimension_value_source="messageTag", default_dimension_value="unknown"
+        )
+        # Within a construct, so that its logical ID ends in a hash like those of the others.
+        destination(
+            Construct(stack, "PerStudentEvents"),
+            "Destination",
+            configuration_set_name="events",
+            event_destination=destination.EventDestinationProperty(
+                matching_event_types=["send"],
+                cloud_watch_destination=destination.CloudWatchDestinationProperty(dimension_configurations=[dimension]),
+            ),
+        )
 
     found = student_dimensions(synthesize(cdk, build))
     assert sorted((resource[:-8], name) for resource, name in found) == [
         ("Dashboard", "student"),
         ("PerGithubId", "GitHub_ID"),
         ("PerStudent", "Alias"),
+        ("PerStudentEventsDestination", "Alias"),
         ("TargetPerStudentTracking", "STUDENT"),
     ]
