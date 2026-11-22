@@ -18,22 +18,27 @@ showing a wrong number. Three belong to every panel, and are built here:
   over the same window.
 
 **An objective is read over the minutes a session was on** (section 7.3). PromQL knows nothing of
-the session switch, so the scaler sends a gauge, `rhi_scaler_session_on`, 1 while the switch reads
-on. `over_sessions` evaluates an expression at every minute of the dashboard's range, a subquery of
-one-minute steps, keeps it at a step only where the gauge read 1 both at the step and a minute
-before it (`in_session`), so that the whole minute the step stands for was in a session, and
-reduces the steps kept to one value: their sum, or another `*_over_time`. The first minute after
-the gauge reads 1 is not counted; nothing from before it is.
+the session switch, so the scaler sends a gauge, `rhi_scaler_session_on`, on every run: 1 while the
+switch reads on. `over_sessions` evaluates an expression at every minute of the dashboard's range,
+a subquery of one-minute steps, keeps it at a step only where every reading of the gauge in the
+minute up to the step is 1, or, where the gauge has no reading in that minute, its last one was
+(`in_session`), and reduces the steps kept to one value: their sum, or another `*_over_time`. So a
+minute in which the switch read off at any run is not counted, whatever it read at the minute's
+ends, and one in which every run read on is, from its start: the gauge says no more of the minute
+than its readings.
 
-What is gated is each minute's own contribution. A counter's is `minute_increase`: its value at
-the step less its value at the step before, for each series, then summed. The steps share their
-ends, so every increment falls in exactly one step, where adjacent `increase` windows would drop
-the one between their last and first scrapes. A series that was not there a step before counts
-all its value, since a counter starts from zero (the first request of a new label is counted), and
-one that fell, a restart, counts its value since the restart. Counts are summed over the session's
-minutes before a ratio is taken of them. An engine series read so is kept to the pool in service at
-the same step (`awake`, directly inside the gate): a value over a past range has no "now" to read
-"asleep" at, and reads no data when no minute had an instance.
+What is gated is each minute's own contribution. A counter's is `minute_increase`: what it rose by
+from each of its samples to the next in the minute, for each series, then summed. It is read at
+steps of `SAMPLE_STEP`, shorter than any scrape interval (every collector scrapes each 15 seconds),
+so that each such step holds at most one new sample: its value less the value before it, or all
+its value where it fell (a restart from zero) or was not there before (the first request of a new
+label). A restart between two steps of a minute is so counted as a restart, where the minute's two
+ends alone would read through it. The steps share their ends, so every increment falls in exactly
+one minute, where adjacent `increase` windows would drop the one between their last and first
+scrapes. Counts are summed over the session's minutes before a ratio is taken of them. An engine
+series read so is kept to the pool in service at the same step (`awake`, directly inside the gate):
+a value over a past range has no "now" to read "asleep" at, and reads no data when no minute had an
+instance.
 
 An engine names its metrics its own way, so an engine query never writes a name: `engine_series`
 reads it from the per-engine table (`rhi_common.engine_metrics`), at the row of the engine the
@@ -124,6 +129,9 @@ SESSION_ON = "rhi_scaler_session_on"
 # contribution is what happened since the step before, so the steps tile the range.
 SESSION_STEP = "1m"
 SESSION_RANGE = "$__range"
+# The steps a counter's minute is read in: shorter than any scrape interval (15 seconds), so that
+# each holds at most one new sample of a series.
+SAMPLE_STEP = "5s"
 
 # What the helpers themselves query. `rhi_dashboards.check` adds it to every module's own.
 METRICS: tuple[Declared, ...] = (
@@ -280,9 +288,12 @@ def asleep(pool: str) -> str:
 
 
 def in_session(expression: str) -> str:
-    """The expression's series where the scaler's session gauge reads 1 now and a step ago, and none
-    elsewhere: kept only for a minute that was in a session from its start to its end."""
-    return f"({expression}) and on () ({SESSION_ON} == 1) and on () ({SESSION_ON} offset {SESSION_STEP} == 1)"
+    """The expression's series at a step where every reading of the scaler's session gauge in the
+    minute up to it is 1, or, with no reading in that minute, the last one before it is; none
+    elsewhere. A minute in which the gauge read anything else, even once, is not kept."""
+    every = f"min_over_time({SESSION_ON}[{SESSION_STEP}]) == 1"
+    none_in_it = f"({SESSION_ON} == 1) unless on () (count_over_time({SESSION_ON}[{SESSION_STEP}]))"
+    return f"({expression}) and on () (({every}) or on () ({none_in_it}))"
 
 
 def over_sessions(expression: str, function: str = "sum_over_time") -> str:
@@ -294,11 +305,14 @@ def over_sessions(expression: str, function: str = "sum_over_time") -> str:
 
 def minute_increase(metric: str, matchers: Mapping[str, str] | None = None, *, by: Sequence[str] = ()) -> str:
     """What a counter rose by over one step of `over_sessions`, for each series, then summed by `by`
-    alone (no pool unless named): its value less its value a step before; all its value where it
-    was not there a step before, or where it fell (it restarted from zero)."""
+    alone (no pool unless named): the sum, over the steps of `SAMPLE_STEP` in the minute, of its
+    value less its value a step before, or all its value where it was not there a step before or
+    where it fell (it restarted from zero). Each step is one series of the same labels whichever
+    it takes, nameless (`sum without ()`), so that the minute's sum of it is one series too."""
     series = selector(metric, matchers)
     labels = ", ".join(by)
-    return f"sum by ({labels}) ((({series} - {series} offset {SESSION_STEP}) >= 0) or {series})"
+    step = f"sum without () ((({series} - {series} offset {SAMPLE_STEP}) >= 0) or {series})"
+    return f"sum by ({labels}) (sum_over_time(({step})[{SESSION_STEP}:{SAMPLE_STEP}]))"
 
 
 def engine_minute_increase(pool: Pool, quantity: EngineQuantity, sample: str = "") -> str:

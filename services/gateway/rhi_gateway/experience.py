@@ -59,7 +59,8 @@ The objectives of section 7.3 are read from this histogram against floors held i
 the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
 a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
 waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
-read exactly, so each floor is a bucket boundary.
+read exactly, so each floor is a bucket boundary: the configuration takes as a floor, of a wait
+or of a speed, only a boundary of its histogram (`rhi_common.boundaries`, `rhi.config`).
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
@@ -84,6 +85,8 @@ from typing import TYPE_CHECKING
 from prometheus_client import CollectorRegistry, Histogram
 from prometheus_client.core import GaugeMetricFamily
 
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
+
 if TYPE_CHECKING:
     from prometheus_client import Metric
 
@@ -100,18 +103,14 @@ FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 FIRST_ANSWER = "rhi_gateway_time_to_first_answer_seconds"
 SERIES = (SPEED, INPUT_TOKENS, OUTPUT_TOKENS, IN_FLIGHT, HELD, FIRST_TOKEN, FIRST_ANSWER)
 
-# Tokens per second. 10 and 15 are the floors of the objectives (sections 7.3 and 17): both are
-# boundaries, and the buckets are finest around them and across the estimate of section 4.7.
-SPEED_BUCKETS = (1, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 30, 35, 40, 45, 50, 60, 80, 100, 150, 200)
 # Tokens of one request. Zero is a request that settled with none observed. The last input boundary
 # is the full context of the coursework model (section 4.2).
 INPUT_BUCKETS = (0, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 262_144)
 OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000)
 
-# Seconds from a request accepted, for both waits. 5 is the floor of the objective (sections 7.3 and
-# 17): it is a boundary, and the buckets are finest below it. The last ones cover a hold (420 seconds
-# by default) and a turn that reasons up to the longest request (1,800).
-WAIT_BUCKETS = (0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 1800)
+# The seconds of both waits, and the tokens per second of a stream, are counted in the buckets of
+# `rhi_common.boundaries`, whose boundaries include the objectives' floors: the configuration takes
+# no other floor.
 
 _LABELS = ("pool", "wire_format")
 _SPEED_LABELS = (*_LABELS, "start")

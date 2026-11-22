@@ -85,7 +85,9 @@ retry_after_concurrency_limit_seconds = 5
 # turns of sessions are counted apart); the median stream and the slowest tenth of streams, in
 # tokens a second; and the cached share of input, in percent, below which the dashboard flags a
 # pool. They are held here so that the owner can move them once S5 has measured. Left out, each is
-# the value below, the default of section 17.
+# the value below, the default of section 17. Each of the three floors must be a boundary of the
+# gateway's histogram it is read in (services/common/rhi_common/boundaries.py), so that the
+# objective is read exactly: any other value is refused.
 target_ttft_p95_seconds = 5
 target_stream_median_tokens_per_second = 15
 target_stream_p10_tokens_per_second = 10

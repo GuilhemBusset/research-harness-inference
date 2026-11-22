@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.pool_config import DEFAULT_ON_DEMAND_PRICE_LIMIT, Pool, PoolConfigError, parse_pools
 
 if TYPE_CHECKING:
@@ -147,7 +148,9 @@ class Config:
     # 95th percentile of the time to first token in seconds, the median and the slowest tenth of a
     # stream's tokens a second, and the cached share of input, in percent, below which the
     # dashboard flags a pool. The dashboards read them at synthesis and spike S5's verdict when it
-    # loads the configuration; no running service reads them.
+    # loads the configuration; no running service reads them. The three floors are each a boundary
+    # of the gateway's histogram they are read in (`rhi_common.boundaries`), so that an objective
+    # is read exactly at its floor: a source that gives another value is refused.
     target_ttft_p95_seconds: float
     target_stream_median_tokens_per_second: float
     target_stream_p10_tokens_per_second: float
@@ -287,6 +290,22 @@ def _percent(value: object) -> float:
     return number
 
 
+def _boundary_of(boundaries: tuple[float, ...]) -> Callable[[object], float]:
+    # A floor of an objective is read exactly only at a boundary of the gateway's histogram.
+    def parse(value: object) -> float:
+        number = _number_above_zero(value)
+        if number not in boundaries:
+            raise ValueError
+        return number
+
+    return parse
+
+
+def _boundary_key(what: str, boundaries: tuple[float, ...]) -> Key:
+    listed = ", ".join(f"{boundary:g}" for boundary in boundaries)
+    return Key(f"{what} that is a boundary of the gateway's histogram: one of {listed}", _boundary_of(boundaries), _price_from_text)
+
+
 # What WAF accepts as the limit of a rate-based rule.
 RATE_LIMIT_RANGE = range(10, 2_000_000_001)
 # Section 17's rate limits.
@@ -350,6 +369,8 @@ _STRING = Key("a string that is not empty", _string)
 _EMPTY_LIST = Key("an empty list: its entries have no shape yet", _no_entries, _list_from_text)
 _WHOLE_NUMBER = Key("a whole number above zero", _whole_number, _number_from_text)
 _NUMBER_ABOVE_ZERO = Key("a number above zero", _number_above_zero, _price_from_text)
+_WAIT_FLOOR = _boundary_key("a number of seconds", WAIT_BUCKETS)
+_SPEED_FLOOR = _boundary_key("a number of tokens a second", SPEED_BUCKETS)
 
 # Every key a source may hold.
 KEYS: dict[str, Key] = {
@@ -384,9 +405,9 @@ KEYS: dict[str, Key] = {
         _rate_limits,
         _table_from_text,
     ),
-    "target_ttft_p95_seconds": _NUMBER_ABOVE_ZERO,
-    "target_stream_median_tokens_per_second": _NUMBER_ABOVE_ZERO,
-    "target_stream_p10_tokens_per_second": _NUMBER_ABOVE_ZERO,
+    "target_ttft_p95_seconds": _WAIT_FLOOR,
+    "target_stream_median_tokens_per_second": _SPEED_FLOOR,
+    "target_stream_p10_tokens_per_second": _SPEED_FLOOR,
     "cached_share_flag_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
     "pipeline_events_retention_days": Key(
         "a whole number of days that CloudWatch Logs takes as a retention period, such as 30, 90 or 365",

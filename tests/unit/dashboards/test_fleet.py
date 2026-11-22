@@ -155,10 +155,19 @@ def test_the_objectives_row_shows_each_objective_against_its_target(example: rhi
         assert measure.met(green) and not measure.met(math.nextafter(green, -math.inf))
         # Every query keeps only the minutes the session gauge reads 1, over the dashboard's range.
         for expression in queries(panel):
-            assert f"and on () ({rules.SESSION_ON} == 1)" in expression
+            assert f"min_over_time({rules.SESSION_ON}[{rules.SESSION_STEP}]) == 1" in expression
             assert f"[{rules.SESSION_RANGE}:{rules.SESSION_STEP}]" in expression
     shown = {panel["title"]: panel["fieldConfig"]["defaults"]["thresholds"]["steps"][1]["value"] for panel in row}
     assert shown["Gateway answers: not the gateway's fault"] == 0.995
     assert shown["Cold start from the warm pool: under 5 minutes"] == 0.9
     # A cached share of exactly 85% is not above 85%: it is shown red.
     assert shown["Cached share of input: coursework"] > 0.85
+
+
+def test_a_panel_states_the_target_it_applies(example: rhi_config.Config) -> None:
+    config = dataclasses.replace(example, cached_share_flag_percent=85.4)
+    objective = objectives.cached_share(config)
+    panel = fleet.objective_stat(objective, objective.measures[0]).build()
+    # The share it turns green above is the configured one.
+    assert "above 85.4%" in (panel.description or "")
+    assert objectives.threshold_step(objective.measures[0]) == math.nextafter(85.4 / 100, math.inf)

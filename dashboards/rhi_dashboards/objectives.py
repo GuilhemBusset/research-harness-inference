@@ -9,15 +9,15 @@ dry-run class is judged against them (section 14).
 | Time to first token, warm pool | The 95th percentile under `target_ttft_p95_seconds` | The share of the requests that were not held whose first token came under the target, first turns and later turns apart: at least 95% | The gateway's histogram of what students wait (`rhi_gateway.experience`) |
 | Output speed per stream, warm pool | The median at `target_stream_median_tokens_per_second` or more, the slowest tenth at `target_stream_p10_tokens_per_second` or more | For each pool whose engine is not the mock, the share of the streams that were not held at each floor or more: above 50%, above 90% | The gateway's histogram of each stream's speed |
 | Cached share of input | Above `cached_share_flag_percent` | For each pool: its engine's cached input tokens over its input tokens | The engine, by the per-engine table |
-| Cold start from the warm pool | The 90th percentile under 5 minutes, the design's | The share of the promotions from the warm pool completed in the session that took under 5 minutes: at least 90% | The lifecycle agent's seconds per stage (`rhi_lifecycle.stages`) |
+| Cold start from the warm pool | The 90th percentile under 5 minutes, the design's | The share of the promotions from the warm pool completed in the session that took under 5 minutes: at least 90% | The lifecycle agent's histogram of the seconds its stages took in each launch completed (`rhi_lifecycle.stages`) |
 
 The provisional targets are the configuration's (`rhi.config.Config`), until spike S5 has measured
 the pool; 99.5% and 5 minutes are fixed by the design.
 
 **Only what happened while a session was on.** Every query is built with `rules.over_sessions`:
-each minute's contribution (what a counter rose by in that minute, the launches completed in it) is
-kept only for the minutes that were in a session from start to end, at every minute of the
-dashboard's range, and summed over them. A share is taken of the sums, never of each minute's: the
+each minute's contribution (what a counter rose by in that minute) is kept only for the minutes in
+which every reading of the session gauge was 1, at every minute of the dashboard's range, and summed
+over them. A share is taken of the sums, never of each minute's: the
 share of the session's requests, of the session's streams. So the same query is right for any
 session, and over a range with no session it reads no data.
 
@@ -27,29 +27,31 @@ the smallest value with at least q of the observations at or under it, so it is 
 exactly when at least q of the observations are under it, and at a floor or more exactly when more
 than 1 - q are at the floor or more. That share is what each measure shows and is judged on, with
 the observations behind it, and `target` and `percentile` say which percentile it stands for. The
-gateway's buckets count the values strictly under their boundary (`rhi_gateway.experience`), so the
-share under a time to first token, or at a speed or more, is read exactly at a target that is a
-boundary of its histogram. The configured targets must be: a target between two boundaries reads
-no data.
+gateway's buckets count the values strictly under their boundary (`rhi_gateway.experience`), and
+so do the lifecycle agent's (`rhi_lifecycle.stages`), so the share under a time to first token or a
+cold start, or at a speed or more, is read exactly at a target that is a boundary of its histogram.
+The configuration takes as a floor only a boundary of its histogram (`rhi_common.boundaries`), and
+5 minutes is one of the agent's. A bucket is selected by its `le` label as the workspace holds it:
+the collectors (release 0.165.0) write a boundary in the fewest digits that give it back, with no
+exponent and no ".0" (`5`, `12.5`), not as the client library serves it (`5.0`).
 
 **Gateway answers.** Where there are requests and no fault was counted, zero faults are read, so a
 session without a fault reads 100%.
 
-**Cold start.** The lifecycle agent's gauge holds what each stage of an instance's last launch
-took, and its last stage, the hook, ends the launch. A launch is completed in the minute its hook
-first reads, or reads another value than a minute before (the next launch of the same instance),
-and it is counted once, then, with the sum of its stages. A launch completed before the session,
-or never completed, is not counted.
+**Cold start.** The lifecycle agent observes each launch whose hook Auto Scaling took with
+`CONTINUE`, once, with the seconds its stages took in all: a launch abandoned, or whose completion
+was refused, is not observed, and two launches are two observations whatever their seconds. Its
+count is read like a counter, so each launch is counted in the minute it was completed, and one
+completed before the session is not.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
-
-from prometheus_client.utils import floatToGoString
 
 from rhi_common.engine_metrics import Quantity
 from rhi_dashboards import rules
@@ -71,12 +73,9 @@ SPEED = "rhi_gateway_stream_output_tokens_per_second"
 START, WARM = "start", "warm"
 TURN, FIRST_TURN, LATER_TURN = "turn", "first", "later"
 BOUNDARY = "le"
-# What each stage of an instance's last launch took, the transition of a start from the warm pool,
-# and the stage that ends a launch.
-STAGE_SECONDS = "rhi_lifecycle_stage_seconds"
+# The seconds of each launch completed, and the transition of a start from the warm pool.
+LAUNCH_SECONDS = "rhi_lifecycle_launch_seconds"
 TRANSITION, PROMOTION = "transition", "promotion"
-STAGE, LAST_STAGE = "stage", "hook"
-INSTANCE = "instance"
 # The engine of the mock pool, which the speed objective leaves out: it runs no GPU.
 MOCK_ENGINE = "mock"
 
@@ -89,7 +88,7 @@ METRICS: tuple[rules.Declared, ...] = (
     rules.EmittedBy(OWN_FAULTS.removesuffix("_total"), GATEWAY_METRICS),
     rules.EmittedBy(FIRST_TOKEN, GATEWAY_EXPERIENCE),
     rules.EmittedBy(SPEED, GATEWAY_EXPERIENCE),
-    rules.EmittedBy(STAGE_SECONDS, LIFECYCLE),
+    rules.EmittedBy(LAUNCH_SECONDS, LIFECYCLE),
     rules.FromEngineTable(Quantity.INPUT_TOKENS),
     rules.FromEngineTable(Quantity.CACHED_INPUT_TOKENS),
 )
@@ -143,14 +142,17 @@ class Objective:
         return tuple(measure.expression for measure in self.measures)
 
 
-def _boundary(value: float) -> str:
-    """A bucket's boundary as the `le` label the gateway's client library writes it."""
-    return floatToGoString(value)
+def boundary(value: float) -> str:
+    """A bucket's boundary as the `le` label the workspace holds: as the collectors' remote write
+    formats it, Go's `strconv.FormatFloat(value, 'f', -1, 64)`, the fewest digits that give the
+    value back, with no exponent and no trailing zero."""
+    text = format(Decimal(repr(float(value))), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _under(histogram: str, matchers: dict[str, str], floor: float) -> tuple[str, str]:
     """The session's observations of the histogram under the floor, and all of them."""
-    under = rules.over_sessions(rules.minute_increase(f"{histogram}_bucket", {**matchers, BOUNDARY: _boundary(floor)}))
+    under = rules.over_sessions(rules.minute_increase(f"{histogram}_bucket", {**matchers, BOUNDARY: boundary(floor)}))
     count = rules.over_sessions(rules.minute_increase(f"{histogram}_count", matchers))
     return under, count
 
@@ -231,33 +233,18 @@ def cached_share(config: Config) -> Objective:
             rules.over_sessions(rules.awake(pool.name, rules.engine_minute_increase(pool, quantity)))
             for quantity in (Quantity.CACHED_INPUT_TOKENS, Quantity.INPUT_TOKENS)
         )
-        goal = f"above {target:.0%} of input tokens cached"
+        goal = f"above {config.cached_share_flag_percent:g}% of input tokens cached"
         measures.append(Measure(pool.name, f"({cached}) / ({total})", target, Comparison.ABOVE, target, "percentunit", goal))
     return Objective("Cached share of input", tuple(measures))
-
-
-def completed_promotions() -> str:
-    """At a step, each launch from the warm pool completed in the minute before it, by pool and
-    instance, with the seconds its stages took."""
-    by = f"{rules.POOL}, {INSTANCE}"
-    stages = rules.selector(STAGE_SECONDS, {TRANSITION: PROMOTION})
-    last = rules.selector(STAGE_SECONDS, {TRANSITION: PROMOTION, STAGE: LAST_STAGE})
-    seconds = f"sum by ({by}) (max by ({by}, {STAGE}) ({stages}))"
-    now, before = f"max by ({by}) ({last})", f"max by ({by}) ({last} offset {rules.SESSION_STEP})"
-    ended = f"(({now}) unless on ({by}) ({before})) or (({now}) != on ({by}) ({before}))"
-    return f"({seconds}) and on ({by}) ({ended})"
 
 
 def cold_start() -> Objective:
     """The 90th percentile of the seconds a start from the warm pool took, over the session's launches."""
     q, target = 0.9, COLD_START_TARGET_SECONDS
-    launches = completed_promotions()
-    under = rules.over_sessions(f"count(({launches}) < {target:g})")
-    count = rules.over_sessions(f"count({launches})")
-    share = f"(({under}) or on () (0 * ({count}))) / ({count})"
+    under, count = _under(LAUNCH_SECONDS, {TRANSITION: PROMOTION}, target)
     goal = f"p90 under {target / 60:g} minutes: at least {q:.0%} of the session's promotions under {target:g} s"
     measure = Measure(
-        f"under {target / 60:g} minutes", share, target, Comparison.AT_LEAST, q, "percentunit", goal, q, count
+        f"under {target / 60:g} minutes", f"({under}) / ({count})", target, Comparison.AT_LEAST, q, "percentunit", goal, q, count
     )
     return Objective("Cold start from the warm pool", (measure,))
 

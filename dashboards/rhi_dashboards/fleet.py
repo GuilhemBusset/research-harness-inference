@@ -86,7 +86,7 @@ STARTS = {
     "cold-launch": "Cold launch: seconds per stage, per launch",
 }
 
-# The objectives' row declares its own; the lifecycle agent's gauge is in both, and listed once.
+# The objectives' row declares its own, and a name both declare is listed once.
 METRICS: tuple[rules.Declared, ...] = tuple(
     dict.fromkeys(
         (
