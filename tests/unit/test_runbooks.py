@@ -1,8 +1,8 @@
 """The runbooks (system design, section 9): each has the sections when, check, act and verify, and
 every command of this repository it shows is one the repository has.
 
-Each command of a code block's line (the words between `|`, `||`, `&&` and `;`, less its
-redirections) is told apart by its first word: `rhi` parses with the rhi CLI's parser, the
+Each command of a code block's line (the words between its control operators, such as `|`, `||`,
+`&&` and `;`, less its redirections) is told apart by its first word: `rhi` parses with the rhi CLI's parser, the
 admin CLI's program name with the admin CLI's parser, and a path of the repository must exist.
 Any other first word (aws, gh, git, ...) is a step the walk-through on the deployed system tests.
 """
@@ -81,41 +81,53 @@ def _is_repository_path(word: str) -> bool:
     return "/" in word and not word.startswith(("/", "~", "$", "-")) and "://" not in word
 
 
-CONTROL = {"|", "||", "&&", ";"}
-REDIRECTION = {">", ">>", "<", "2>"}
+CONTROL = {"|", "|&", "||", "&&", "&", ";", ";;", ";&", ";;&"}
+REDIRECTION = {"<", ">", ">>", ">|", "<>", "<<", "<<-", "<<<", ">&", "<&", "&>", "&>>"}
+OPERATORS = sorted(CONTROL | REDIRECTION, key=len, reverse=True)  # longest first: `>>` before `>`
 
 
-def uncommented(line: str) -> str:
-    """The line without its comment. As in the shell, an unquoted `#` starts one only where a word
-    starts (after a blank or an operator character), so `report#draft` is one word."""
-    quote, escaped = "", False
-    for index, char in enumerate(line):
-        if escaped:
-            escaped = False
-        elif char == "\\" and quote != "'":
-            escaped = True
-        elif quote:
-            quote = "" if char == quote else quote
-        elif char in "'\"":
-            quote = char
-        elif char == "#" and (index == 0 or line[index - 1] in " \t|&;<>()"):
-            return line[:index]
-    return line
+def _quoted(line: str, index: int) -> tuple[str, int]:
+    """The text of the quoted string that starts at `line[index]`, and the index after it. Inside
+    double quotes a backslash escapes only `$`, a backtick, `"` and itself, as in the shell."""
+    quote, end, text = line[index], index + 1, ""
+    while end < len(line) and line[end] != quote:
+        if quote == '"' and line[end] == "\\" and line[end + 1 : end + 2] in ("$", "`", '"', "\\"):
+            end += 1
+        text, end = text + line[end], end + 1
+    return text, end + 1
 
 
 def split(line: str) -> list[tuple[str, bool]]:
-    """The words of a shell line, less its comment, as `shlex.split` gives them, each with whether it
-    is an operator: a control operator or a redirection the shell reads as one, unquoted. A quoted
-    `'|'` is a word."""
-    line = uncommented(line)
-    stream = io.StringIO(line)
-    lexer = shlex.shlex(stream, posix=True)
-    lexer.whitespace_split, lexer.commenters = True, ""
-    found, start = [], 0
-    for word in lexer:
-        end = stream.tell()
-        found.append((word, word in CONTROL | REDIRECTION and line[start:end].strip() == word))
-        start = end
+    """The words of a shell line, less its comment, each with whether it is an operator, read as the
+    shell reads them: an unquoted control operator or redirection ends a word with or without a
+    blank (`/dev/null;rhi` is a file, `;` and a command), a quoted or escaped one is part of a word,
+    a `#` starts a comment only where a word starts (so neither `report#draft` nor `report\\ #draft`
+    hides what follows), and the digits of a descriptor (`2>`) belong to their redirection."""
+    found: list[tuple[str, bool]] = []
+    word: str | None = None  # None between words; "" for a word of empty quotes so far
+    index = 0
+    while index < len(line):
+        char = line[index]
+        operator = next((op for op in OPERATORS if line.startswith(op, index)), "")
+        if char == "\\":
+            word, index = (word or "") + line[index + 1 : index + 2], index + 2
+        elif char in "'\"":
+            text, index = _quoted(line, index)
+            word = (word or "") + text
+        elif char == "#" and word is None:
+            break
+        elif operator or char in " \t":
+            descriptor = operator in REDIRECTION and word is not None and re.fullmatch(r"\d+", line[index - len(word) : index])
+            if word is not None and not descriptor:
+                found.append((word, False))
+            word = None
+            if operator:
+                found.append((operator, True))
+            index += len(operator) or 1
+        else:
+            word, index = (word or "") + char, index + 1
+    if word is not None:
+        found.append((word, False))
     return found
 
 
@@ -178,6 +190,12 @@ def test_detects_an_unknown_command() -> None:
     # A `#` inside a word starts no comment, so what follows it is still given to the CLI.
     hashed = "```sh\nrhi status > report#draft unexpected\nrhi status # a comment\n```\n"
     assert problems(sections + hashed) == ["the rhi CLI refuses: rhi status unexpected"]
+    # An operator ends the redirection's file without a blank, and an escaped blank does not end it.
+    joined = "```sh\nrhi status > /dev/null;rhi frobnicate\nrhi status 2>report\\ #draft unexpected\n```\n"
+    assert problems(sections + joined) == [
+        "the rhi CLI refuses: rhi frobnicate",
+        "the rhi CLI refuses: rhi status unexpected",
+    ]
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:
@@ -227,3 +245,44 @@ def test_the_factory_key_replacement_keeps_the_old_key_unless_the_copy_completes
         assert download.exists() == (fault == "download kept")
         assert "the new key is installed" in result.stdout
         assert "not installed" not in result.stdout
+
+
+def _retained_inventory() -> str:
+    """The shell block of the course-end runbook that lists what the stage's stacks retain."""
+    text = (ROOT / "docs" / "runbooks" / "course-end.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"^ *```sh\n(.*?)^ *```", text, re.DOTALL | re.MULTILINE)
+    return next(b for b in blocks if "get-template" in b and "describe-stack-resource" in b)
+
+
+# A stand-in for the aws CLI: each stack retains one resource, but Rhi-Gateway retains none, and the
+# read named by FAIL (an operation and a stack) fails.
+FAKE_AWS = """#!/bin/sh
+operation=$2; shift 2
+while [ "$#" -gt 0 ]; do
+  case "$1" in --stack-name) stack=$2;; --logical-resource-id) id=$2;; esac; shift
+done
+[ "$FAIL" = "$operation $stack" ] && exit 42
+case "$operation" in
+  get-template) [ "$stack" = Rhi-Gateway ] && retain=Delete || retain=Retain
+    echo '{"Resources": {"Kept": {"DeletionPolicy": "'$retain'"}, "Gone": {}}}';;
+  describe-stack-resource) printf '%s\\tAWS::Example\\t%s\\n' "$stack" "$id";;
+esac
+"""
+
+
+@pytest.mark.parametrize("fail", [None, "get-template Rhi-Access", "describe-stack-resource Rhi-Pools"])
+def test_the_retained_inventory_is_complete_or_fails(tmp_path: Path, fail: str | None) -> None:
+    aws = tmp_path / "aws"
+    aws.write_text(FAKE_AWS)
+    aws.chmod(0o700)
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin", "FAIL": fail or ""}
+    result = subprocess.run(["bash", "-c", _retained_inventory()], env=env, capture_output=True, check=False, text=True)
+    if fail is None:
+        assert result.returncode == 0, result.stderr
+        stacks = [line.split("\t")[0] for line in result.stdout.splitlines()[:-1]]
+        assert stacks == ["RhiPipeline", "Rhi-Network", "Rhi-Access", "Rhi-Observability", "Rhi-Pools", "Rhi-Guardrails"]
+        assert result.stdout.splitlines()[-1] == "The list is complete."
+    else:
+        assert result.returncode != 0
+        assert "complete." not in result.stdout
+        assert "INCOMPLETE" in result.stderr

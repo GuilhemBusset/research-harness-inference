@@ -179,13 +179,20 @@ that `rhi_admin roster list` prints.
       read it in your terminal and never paste it anywhere:
 
       ```sh
-      for stack in RhiPipeline Rhi-Network Rhi-Access Rhi-Observability Rhi-Pools Rhi-Gateway Rhi-Guardrails; do
-        for id in $(aws cloudformation get-template --stack-name "$stack" --query TemplateBody --output json | jq -r '.Resources | to_entries[] | select(.value.DeletionPolicy == "Retain" or .value.DeletionPolicy == "RetainExceptOnCreate") | .key'); do
-          aws cloudformation describe-stack-resource --stack-name "$stack" --logical-resource-id "$id" --query 'StackResourceDetail.[StackName,ResourceType,PhysicalResourceId]' --output text
+      (
+        for stack in RhiPipeline Rhi-Network Rhi-Access Rhi-Observability Rhi-Pools Rhi-Gateway Rhi-Guardrails; do
+          template=$(aws cloudformation get-template --stack-name "$stack" --query TemplateBody --output json) || { echo "INCOMPLETE: the template of $stack was not read" >&2; exit 1; }
+          ids=$(printf '%s' "$template" | jq -r '.Resources | to_entries[] | select(.value.DeletionPolicy == "Retain" or .value.DeletionPolicy == "RetainExceptOnCreate") | .key') || { echo "INCOMPLETE: the template of $stack was not understood" >&2; exit 1; }
+          for id in $ids; do
+            aws cloudformation describe-stack-resource --stack-name "$stack" --logical-resource-id "$id" --query 'StackResourceDetail.[StackName,ResourceType,PhysicalResourceId]' --output text || { echo "INCOMPLETE: $id of $stack was not read" >&2; exit 1; }
+          done
         done
-      done
+      ) && echo "The list is complete."
       ```
 
+      The list counts only when it ends with `The list is complete.` A read that fails stops it
+      with a line that starts with `INCOMPLETE:` and a failure status, so that no stack is left out
+      of it silently: run it again until it is complete, and do not go on to step b before it is.
       Each line is a stack, a type and an identifier. With the example configuration they are:
 
       | Stack | Type | What it is | Holds a student's data |
