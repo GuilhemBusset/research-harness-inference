@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from rhi import config
-from rhi_common.pool_config import group_logical_name
+from rhi_common.pool_config import group_name
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -98,17 +98,14 @@ def test_the_mock_pool_group(pools: dict[str, Any], group: tuple[str, dict[str, 
     assert of_type(pools, "AWS::AutoScaling::ScalingPolicy") == {}
 
 
-def test_each_pools_group_is_named_by_cloudformation_after_the_logical_id_the_cost_dashboard_reads(
-    pools: dict[str, Any],
-) -> None:
-    """A name of its own would replace the groups already deployed; CloudFormation's name for a group
-    holds its logical ID, which begins with the pool's, even once the group is replaced."""
+def test_each_pools_group_has_the_fixed_name_the_cost_dashboard_reads(pools: dict[str, Any]) -> None:
+    """A group deleted and created again keeps its name, so its metrics keep theirs."""
     groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
-    assert len(groups) == len(EXAMPLE.pools) == 2
-    assert all("AutoScalingGroupName" not in properties for properties in groups.values())
+    names = {properties["AutoScalingGroupName"]: properties["Tags"] for properties in groups.values()}
+    assert len(names) == len(groups) == len(EXAMPLE.pools) == 2
     for pool in EXAMPLE.pools:
-        (found,) = [name for name in groups if name.startswith(group_logical_name(pool.name))]
-        assert [tag["Value"] for tag in groups[found]["Tags"] if tag["Key"] == "rhi-pool"] == [pool.name]
+        assert [tag["Value"] for tag in names[group_name(pool.name)] if tag["Key"] == "rhi-pool"] == [pool.name]
+    assert group_name("mock") == "rhi-pool-mock"
 
 
 def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(

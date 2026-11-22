@@ -30,16 +30,15 @@ has one data point a minute, the count during that minute, so the `Sum` statisti
 the instance-minutes inside it. A period cut short by the window's edge, the hour that is still
 running included, holds only its own minutes: nothing counts a partial hour as a whole one.
 
-**One CloudWatch query reads both counts of the pool's group and adds them**: a metric math
-`SUM(SEARCH(...))` over the two metrics of every group whose name holds the start of the pool's
-group's logical ID (`rhi_common.pool_config.group_logical_name`), one series of the instance-minutes of each hour. A
-count that has no series, the warm pool's of a group without one, adds nothing to it, where two
-queries added in Grafana would give no number at all. CloudFormation names the group, and the name
-it makes holds the group's logical ID, which begins with the pool's: a group CloudFormation replaced
-keeps it, and its hours are counted too. A search finds only the metrics that reported in the past
-two weeks: the group in place reports every minute, and a group replaced more than two weeks ago
-is left out. Grafana's server-side expressions sum the series over the window and divide by 60: the
-instance-hours.
+**A pool's group is read by its name**, which the pools stack fixes, `rhi-pool-<pool>`
+(`rhi_common.pool_config.group_name`), and no other pool's group has: a group deleted and created
+again, a parked stage's once unparked, publishes under the same name, so its hours are counted too.
+Over the month, each count is one metric, read by its namespace, its name and the one dimension
+`AutoScalingGroupName` with that value exactly, which CloudWatch answers with every data point it
+keeps in the window: no search, which finds only the metrics that reported in the past two weeks.
+Such a read always gives a series, one with no point where the group published none (the warm
+pool's count of a group without one), which sums to zero. Grafana's server-side expressions sum
+each count over the window, add the two, and divide by 60: the instance-hours.
 
 **The price is the hourly price the configuration gives the pool's first instance type**, the one
 the group launches first (section 5.4): a fallback type launched in its place is counted at that
@@ -56,11 +55,12 @@ it again from zero if the alias is given a key: each time the series appears, or
 its value is tokens settled since, and is counted. A series is read by its latest sample in the
 five minutes up to each minute (`last_over_time`), not by Prometheus's instant value, so a series
 that settled and was removed between two minutes is counted. At every minute of the window after
-its start, the series' latest sample is compared with its latest a minute before; from the last
-minute to the window's end, the same; and what the first minute counted from before the start, the
-series' rise from the minute before the start to the start, is taken off. A restart inside a minute
-leaves out what the series settled in that minute before it. Grafana's server-side expressions
-divide the dollars, from CloudWatch, by the tokens, from Prometheus, in millions.
+its start, the series' latest sample is compared with its latest a minute before, or, at the first
+minute, with its latest at the window's start, so nothing settled before the start is counted and a
+restart in that first minute keeps what the series settled after it; from the last minute to the
+window's end, the same. A restart inside a minute leaves out what the series settled in that minute
+before it. Grafana's server-side expressions divide the dollars, from CloudWatch, by the tokens,
+from Prometheus, in millions.
 
 **The calendar windows are the dashboard's own range**: "this month" is from the start of the month
 to now, in UTC, as AWS bills, and "today" is the part of it from the start of the day. Grafana
@@ -68,10 +68,13 @@ gives every panel of a dashboard the dashboard's range once it is fixed dates (a
 start and end), whatever window a panel asks for (its query options, "Relative time"), and every
 query is bounded by the range it is given. So the calendar panels never ask for a window of their
 own: the dashboard's range is the month so far, its time picker is hidden, and the day is chosen
-inside CloudWatch's answer, which has one point an hour from the start of the month: CloudWatch's
-metric math keeps the points of the count whose UTC day of the month is the last one of the range,
-today's (`IF(DATE(n) == MAX(DATE(n)), n)`), with a zero for an hour of today that has no point, so
-a day with no instance reads no hours, not those of a day before. A session is chosen in the
+inside CloudWatch's answer, which has one point an hour from the start of the month: one query of
+CloudWatch's metric math adds both counts of the pool's group, found by a search for its name
+exactly (`SUM(SEARCH(...))`; a group that reported today reported in the past two weeks), and keeps
+the points whose UTC day of the month is the last one of the range, today's
+(`IF(DATE(x) == MAX(DATE(x)), x)`, the search written out for each `x`). Grafana sends each query of
+a panel with server-side expressions to its data source on its own, so this query refers to no
+other. A session is chosen in the
 companion's time picker, where the only number is the one over the range chosen.
 
 **The bill** is CloudWatch's billing metric, `EstimatedCharges` in `AWS/Billing` with the one
@@ -99,7 +102,7 @@ from grafana_foundation_sdk.builders import stat as stat_builders
 from grafana_foundation_sdk.models import cloudwatch, common
 from grafana_foundation_sdk.models import dashboard as models
 
-from rhi_common.pool_config import group_logical_name
+from rhi_common.pool_config import group_name
 from rhi_dashboards import rules
 
 if TYPE_CHECKING:
@@ -123,8 +126,8 @@ INSTANCE_COUNTS = ("GroupTotalInstances", "WarmPoolPendingCapacity")
 # minutes CloudWatch keeps one-minute data at after 15 days.
 PERIOD = 3600
 MINUTES_AN_HOUR = 60
-# Both counts of every group of the pool, added: the instance-minutes of each period.
-RUNNING = "SUM(SEARCH('{{{namespace},{dimension}}} ({metrics}) {dimension}={group}', 'Sum', {period}))"
+# Both counts of the group of that name exactly, added: the instance-minutes of each period.
+RUNNING = "SUM(SEARCH('{{{namespace},{dimension}}} {dimension}=\"{group}\" ({metrics})', 'Sum', {period}))"
 
 # The billing metric: where AWS publishes it, its namespace, name and dimension, and how often.
 BILLING_REGION = "us-east-1"
@@ -141,8 +144,7 @@ OWN_REGION = "default"
 THIS_MONTH = "now/M"
 NOW = "now"
 TIME_ZONE = "utc"
-# Of each count's hourly points in that month, today's: those of the range's last UTC day of the
-# month, and a zero for an hour of today with no point.
+# Of the count's hourly points in that month, today's: those of the range's last UTC day of the month.
 TODAY = "IF(DATE({count}) == MAX(DATE({count})), {count})"
 # The companion: the range it opens on, the hours of a class session and some.
 SESSION_UID = "cost-session"
@@ -154,7 +156,8 @@ SESSION_DEFAULT = "now-3h"
 # far back a series' latest sample is read: Prometheus's own lookback.
 WINDOW = rules.SESSION_RANGE
 WINDOW_START = "${__from:date:seconds}"
-TOKEN_STEP = "1m"
+TOKEN_STEP_SECONDS = 60
+TOKEN_STEP = f"{TOKEN_STEP_SECONDS}s"
 LOOKBACK = "5m"
 
 # Every number is one colour, with no threshold: nothing is a ceiling.
@@ -190,28 +193,30 @@ def metric(namespace: str, name: str, dimensions: cloudwatch.Dimensions, ref_id:
     )
 
 
-def running(pool: Pool, ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """Both counts of the pool's group, added, in the endpoint's region: its instance-minutes in each
-    period, hidden: an expression computes from it."""
+def count(pool: Pool, name: str, ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """One count of the pool's group, read by the group's name exactly, in the endpoint's region: its
+    instance-minutes in each period."""
+    query = metric(AUTO_SCALING, name, {GROUP_DIMENSION: group_name(pool.name)}, ref_id)
+    return query.statistic("Sum").region(OWN_REGION).period(str(PERIOD))
+
+
+def today(pool: Pool, ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """Both counts of the pool's group, added, of today: one query of CloudWatch's metric math that
+    refers to no other, in the endpoint's region, hidden."""
     metrics = " OR ".join(f'MetricName="{name}"' for name in INSTANCE_COUNTS)
-    expression = RUNNING.format(
+    running = RUNNING.format(
         namespace=AUTO_SCALING,
         dimension=GROUP_DIMENSION,
+        group=group_name(pool.name),
         metrics=metrics,
-        group=group_logical_name(pool.name),
         period=PERIOD,
     )
-    return code(expression, ref_id)
-
-
-def code(expression: str, ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """CloudWatch's metric math, in the endpoint's region, hidden."""
     return (
         cloudwatch_builders.MetricsQuery()
         .query_mode(cloudwatch.QueryMode.METRICS)
         .metric_query_type(cloudwatch.MetricQueryType.SEARCH)
         .metric_editor_mode(cloudwatch.MetricEditorMode.CODE)
-        .expression(expression)
+        .expression(TODAY.format(count=running))
         .id(ref_id.lower())
         .ref_id(ref_id)
         .hide(True)
@@ -219,11 +224,6 @@ def code(expression: str, ref_id: str) -> cloudwatch_builders.MetricsQuery:
         .period(str(PERIOD))
         .datasource(rules.CLOUDWATCH)
     )
-
-
-def today(of: cloudwatch_builders.MetricsQuery, ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """CloudWatch's metric math over the pool's count, of the same request: its points of today."""
-    return code(TODAY.format(count=of.build().id_val), ref_id)
 
 
 def charges(ref_id: str) -> cloudwatch_builders.MetricsQuery:
@@ -259,17 +259,18 @@ type Target = cloudwatch_builders.MetricsQuery | expr_builders.TypeReduce
 
 
 def hours(pool: Pool, suffix: str = "", *, of_today: bool = False) -> tuple[list[Target], str]:
-    """The query of the pool's count, summed over the window (today's points of it if `of_today`),
-    and the server-side expression of the hours it adds up to. `suffix` tells one pool's queries
+    """The queries of the pool's counts, each summed over the window (today's points if `of_today`),
+    and the server-side expression of the hours they add up to. `suffix` tells one pool's queries
     from another's."""
-    read = running(pool, "N" + suffix)
-    targets: list[Target] = [read]
-    summed = read.build().ref_id or ""
     if of_today:
-        targets.append(today(read, f"D{summed}"))
-        summed = f"D{summed}"
-    targets.append(reduce(f"S{suffix}", summed, "sum"))
-    return targets, f"$S{suffix} / {MINUTES_AN_HOUR}"
+        return [today(pool, f"D{suffix}"), reduce(f"S{suffix}", f"D{suffix}", "sum")], f"$S{suffix} / {MINUTES_AN_HOUR}"
+    targets: list[Target] = []
+    summed = []
+    for name, letter in zip(INSTANCE_COUNTS, ("N", "W"), strict=True):
+        targets.append(count(pool, name, f"{letter}{suffix}"))
+        targets.append(reduce(f"S{letter}{suffix}", f"{letter}{suffix}", "sum"))
+        summed.append(f"$S{letter}{suffix}")
+    return targets, f"({' + '.join(summed)}) / {MINUTES_AN_HOUR}"
 
 
 def dollars(pool: Pool, suffix: str = "", *, of_today: bool = False) -> tuple[list[Target], str]:
@@ -286,19 +287,21 @@ def settled(now: str, before: str) -> str:
 
 def output_tokens(pool: Pool) -> str:
     """The output tokens the gateway settled for the pool over the panel's window, read at its end:
-    summed over the minutes of the window after its start, and from its last minute to its end, less
-    what its first minute counted from before the start; none where that is no token."""
+    summed over the minutes of the window after its start, each step counted from the series' latest
+    sample a minute before, or at the window's start for the first, and from its last minute to its
+    end; none where that is no token."""
     series = rules.selector(OUTPUT_TOKENS + rules.COUNTER_SAMPLE, {rules.POOL: pool.name})
     latest = f"last_over_time({series}[{LOOKBACK}])"
+    first = f"vector(time()) - {TOKEN_STEP_SECONDS} < {WINDOW_START}"
     a_step_before = f"last_over_time({series}[{LOOKBACK}] offset {TOKEN_STEP})"
-    after_start = f"vector(time()) > {WINDOW_START}"
-    steps = f"sum_over_time((sum({settled(latest, a_step_before)}) and on () ({after_start}))[{WINDOW}:{TOKEN_STEP}])"
-    since_last_step = f"sum({settled(latest, f'last_over_time({latest}[{TOKEN_STEP}:{TOKEN_STEP}])')})"
     at_start = f"last_over_time({series}[{LOOKBACK}] @ {WINDOW_START})"
-    step_before_start = f"last_over_time({latest}[{TOKEN_STEP}:{TOKEN_STEP}] @ {WINDOW_START})"
-    before_start = f"sum({settled(at_start, step_before_start)})"
+    # Per series: its latest a step before, unless that is before the start; then its latest at the start.
+    before = f"(({a_step_before} unless on () ({first})) or ({at_start} and on () ({first})))"
+    after_start = f"vector(time()) > {WINDOW_START}"
+    steps = f"sum_over_time((sum({settled(latest, before)}) and on () ({after_start}))[{WINDOW}:{TOKEN_STEP}])"
+    since_last_step = f"sum({settled(latest, f'last_over_time({latest}[{TOKEN_STEP}:{TOKEN_STEP}])')})"
     total = " + ".join(f"(({one}) or vector(0))" for one in (steps, since_last_step))
-    return f"({total} - (({before_start}) or vector(0))) > 0"
+    return f"({total}) > 0"
 
 
 def _one_colour() -> dashboard_builders.ThresholdsConfig:

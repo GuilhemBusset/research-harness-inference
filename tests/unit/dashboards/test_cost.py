@@ -14,11 +14,11 @@ from rhi import config as rhi_config
 from rhi_dashboards import build, check, cost
 
 REPO = Path(__file__).resolve().parents[3]
-# A pool's count: both of its group's metrics, added in CloudWatch.
+# Today's count: both metrics of the group of that name exactly, added in CloudWatch.
 SEARCH = re.compile(
     r"SUM\(SEARCH\('\{AWS/AutoScaling,AutoScalingGroupName\} "
-    r'\(MetricName="GroupTotalInstances" OR MetricName="WarmPoolPendingCapacity"\) '
-    r"AutoScalingGroupName=(?P<group>\w+)', 'Sum', 3600\)\)"
+    r'AutoScalingGroupName="(?P<group>[^"]+)" '
+    r'\(MetricName="GroupTotalInstances" OR MetricName="WarmPoolPendingCapacity"\)\', \'Sum\', 3600\)\)'
 )
 
 
@@ -56,14 +56,38 @@ def of_type(panel: dict[str, Any], source: str) -> list[dict[str, Any]]:
 
 def counts(panel: dict[str, Any]) -> list[dict[str, Any]]:
     """The panel's queries of Auto Scaling's group metrics."""
-    return [one for one in of_type(panel, "cloudwatch") if "AWS/AutoScaling" in one.get("expression", "")]
+    return [
+        one
+        for one in of_type(panel, "cloudwatch")
+        if one.get("namespace") == "AWS/AutoScaling" or "AWS/AutoScaling" in one.get("expression", "")
+    ]
 
 
-def searched_group(query: dict[str, Any]) -> str:
-    """How the names of the groups a count adds begin: the pool's group's logical ID."""
-    match = SEARCH.fullmatch(query["expression"])
-    assert match, query["expression"]
-    return match["group"]
+def searched(expression: str) -> re.Match[str]:
+    """The search of today's count in a CloudWatch expression."""
+    match = SEARCH.search(expression)
+    assert match, expression
+    return match
+
+
+def groups_read(panel: dict[str, Any]) -> set[str]:
+    """The names of the groups whose counts the panel reads."""
+    found = set()
+    for query in counts(panel):
+        if "dimensions" in query:
+            found.add(query["dimensions"]["AutoScalingGroupName"])
+        else:
+            found.update(match["group"] for match in SEARCH.finditer(query["expression"]))
+    return found
+
+
+def read_exactly(panel: dict[str, Any], suffix: str = "") -> dict[str, str]:
+    """The group each count of the month is read from, by the count's name; each is read whole."""
+    reads = {one["metricName"]: one for one in counts(panel) if one["refId"].endswith(suffix)}
+    for one in reads.values():
+        assert (one["matchExact"], one["statistic"], one["period"], one["region"]) == (True, "Sum", "3600", "default")
+        assert "expression" not in one and list(one["dimensions"]) == ["AutoScalingGroupName"]
+    return {name: one["dimensions"]["AutoScalingGroupName"] for name, one in reads.items()}
 
 
 def shown(panel: dict[str, Any]) -> dict[str, str]:
@@ -104,45 +128,82 @@ def test_a_fixed_session_never_replaces_the_calendar_windows(example: rhi_config
     assert titles and not [title for title in titles if re.search(r"today|month", title)]
 
 
-def test_the_gpu_hours_add_both_counts_of_each_pools_group_in_cloudwatch(example: rhi_config.Config) -> None:
+def test_the_gpu_hours_read_both_counts_of_each_pools_group(example: rhi_config.Config) -> None:
     for pool in example.pools:
-        for panel in rows(example)[pool.name]:
-            (read,) = counts(panel)
-            # One series: both counts of every group whose CloudFormation name holds the pool's
-            # logical ID, a group replaced included, summed over each hour, in the endpoint's region.
-            assert searched_group(read) == f"Pool{pool.name}Group"
-            assert (read["refId"], read["id"], read["hide"], read["region"]) == ("N", "n", True, "default")
-            by_ref = {one["refId"]: one for one in panel["targets"]}
-            assert by_ref["S"]["reducer"] == "sum"
+        group = f"rhi-pool-{pool.name}"
+        for panel in rows(example)[pool.name][:4]:
+            assert groups_read(panel) == {group}
+            if "today" in panel["title"]:
+                (day,) = counts(panel)
+                assert searched(day["expression"])["group"] == group
+            else:
+                assert read_exactly(panel) == {"GroupTotalInstances": group, "WarmPoolPendingCapacity": group}
         hours = [panel for panel in rows(example)[pool.name] if panel["title"].startswith("GPU-hours")]
         assert [panel["title"] for panel in hours] == ["GPU-hours today, estimate", "GPU-hours this month, estimate"]
-        assert all(shown(panel) == {"H": "$S / 60"} for panel in hours)
+        assert [shown(panel) for panel in hours] == [{"H": "$S / 60"}, {"H": "($SN + $SW) / 60"}]
 
 
-def test_a_group_with_no_warm_pool_series_still_counts_its_instances(example: rhi_config.Config) -> None:
-    # Grafana gives no number for a sum one of whose terms has no series, as the warm pool's
-    # count of a group without one: CloudWatch adds the two counts, so Grafana reduces one series.
-    pool = dataclasses.replace(example.pools[0], warm_instances=0)
-    for panel in rows(dataclasses.replace(example, pools=(pool,)))[pool.name]:
-        reduced = [one["expression"] for one in panel["targets"] if one.get("type") == "reduce"]
-        assert reduced in (["$N"], ["$DN"], ["$N", "$B"])
-        assert all(target.get("metricName") is None for target in counts(panel))
+def test_pools_of_similar_names_read_only_their_own_groups(example: rhi_config.Config) -> None:
+    mock = next(pool for pool in example.pools if pool.name == "mock")
+    similar = dataclasses.replace(example, pools=(mock, dataclasses.replace(mock, name="mo-ck")))
+    for pool in similar.pools:
+        assert all(groups_read(panel) == {f"rhi-pool-{pool.name}"} for panel in rows(similar)[pool.name])
+    (bill,) = rows(similar)[cost.BILLING_ROW]
+    assert [read_exactly(bill, suffix) for suffix in "01"] == [
+        dict.fromkeys(cost.INSTANCE_COUNTS, "rhi-pool-mock"),
+        dict.fromkeys(cost.INSTANCE_COUNTS, "rhi-pool-mo-ck"),
+    ]
+
+
+def test_the_months_hours_never_rest_on_a_search(example: rhi_config.Config) -> None:
+    # A search finds only the metrics that reported in the past two weeks: a group deleted earlier in
+    # the month, a parked stage's, would leave the month's estimate and the bill's comparison.
+    monthly = [panel for panel in every_panel(example) if counts(panel) and "today" not in panel["title"]]
+    assert len(monthly) == 3 * len(example.pools) + 1 + len(example.pools)
+    for panel in monthly:
+        assert all("SEARCH" not in one.get("expression", "") for one in counts(panel))
+        assert {one["metricName"] for one in counts(panel)} == set(cost.INSTANCE_COUNTS)
+
+
+def test_a_count_with_no_point_adds_nothing_to_the_other(example: rhi_config.Config) -> None:
+    # Grafana gives no number for a sum one of whose terms is no data: each count is reduced on its
+    # own, and a read whole gives a series, with no point for a group without a warm pool.
+    for panel in every_panel(example):
+        reduced = {one["refId"]: one["expression"] for one in panel["targets"] if one.get("type") == "reduce"}
+        for read in counts(panel):
+            assert sum(expression == f"${read['refId']}" for expression in reduced.values()) == 1
+
+
+def test_each_cloudwatch_query_with_server_side_expressions_refers_to_no_other(example: rhi_config.Config) -> None:
+    # Grafana sends each query of a panel with server-side expressions to its data source on its own.
+    for panel in every_panel(example):
+        assert any(target["datasource"]["type"] == "__expr__" for target in panel["targets"])
+        queries = of_type(panel, "cloudwatch")
+        ids = {one["id"] for one in queries}
+        for one in queries:
+            words = set(re.findall(r"\b[a-z]\w*\b", re.sub(r"'[^']*'", "", one.get("expression", ""))))
+            assert not words & (ids - {one["id"]}), (panel["title"], one["expression"])
 
 
 def test_today_is_the_last_utc_day_of_the_months_hourly_points(example: rhi_config.Config) -> None:
     for pool in example.pools:
         for panel in rows(example)[pool.name][:4]:
-            by_ref = {one["refId"]: one for one in panel["targets"]}
             if "today" not in panel["title"]:
-                # The month: every point of the dashboard's range.
-                assert by_ref["S"]["expression"] == "$N"
                 continue
-            # The day: CloudWatch's metric math over the count, in the same request, keeps its points
-            # of the range's last UTC day of the month, a zero for an hour with none.
-            assert by_ref["S"]["expression"] == "$DN"
-            day = by_ref["DN"]
-            assert (day["expression"], day["id"], day["hide"]) == ("IF(DATE(n) == MAX(DATE(n)), n)", "dn", True)
-            assert (day["region"], day["period"], day["metricEditorMode"]) == ("default", "3600", 1)
+            # The day: CloudWatch's metric math over the count, of one query, keeps its points of the
+            # range's last UTC day of the month.
+            by_ref = {one["refId"]: one for one in panel["targets"]}
+            assert by_ref["S"]["expression"] == "$D"
+            day = by_ref["D"]
+            count = searched(day["expression"])[0]
+            assert day["expression"] == f"IF(DATE({count}) == MAX(DATE({count})), {count})"
+            assert (day["id"], day["hide"], day["region"], day["period"], day["metricEditorMode"]) == (
+                "d",
+                True,
+                "default",
+                "3600",
+                1,
+            )
 
 
 def test_the_price_is_the_example_configurations(example: rhi_config.Config) -> None:
@@ -151,9 +212,9 @@ def test_the_price_is_the_example_configurations(example: rhi_config.Config) -> 
         for panel in rows(example)[pool.name]:
             if panel["title"].startswith("Cost"):
                 (expression,) = shown(panel).values()
-                assert f"$S / 60 * {example_price(pool.name)!r}" in expression
+                assert f" / 60 * {example_price(pool.name)!r}" in expression
     (bill,) = rows(example)[cost.BILLING_ROW]
-    assert shown(bill)["D"] == "($S0 / 60 * 3.36) + ($S1 / 60 * 0.02)"
+    assert shown(bill)["D"] == "(($SN0 + $SW0) / 60 * 3.36) + (($SN1 + $SW1) / 60 * 0.02)"
 
 
 def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_millions(
@@ -169,7 +230,7 @@ def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_m
         for panel in per_million:
             assert panel["datasource"] == {"type": "datasource", "uid": "-- Mixed --"}
             by_ref = {target["refId"]: target for target in panel["targets"]}
-            assert shown(panel) == {"E": f"$S / 60 * {example_price(pool.name)!r} / ($D / 1000000)"}
+            assert shown(panel) == {"E": f"($SN + $SW) / 60 * {example_price(pool.name)!r} / ($D / 1000000)"}
             assert (by_ref["D"]["expression"], by_ref["D"]["reducer"]) == ("$B", "last")
             assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (cost.output_tokens(pool), True)
 
@@ -183,19 +244,22 @@ def test_the_tokens_are_counted_from_the_windows_start_by_the_samples_taken_in_i
     selectors = re.findall(re.escape(series) + r"(\[[^]]+\])?", expression)
     assert selectors and all(window == "[5m]" for window in selectors)
     assert expression.count(f"last_over_time({series}[5m]") == len(selectors)
-    # Every minute of the window after its start, a step from the series' latest sample a minute before.
+    # Every minute of the window after its start, a step from the series' latest sample a minute
+    # before, or, at the first minute, at the window's start: nothing settled before it is counted,
+    # and a restart in that minute keeps what the series settled after it.
     latest = f"last_over_time({series}[5m])"
-    step = f"sum(((({latest} - last_over_time({series}[5m] offset 1m)) >= 0) or {latest}))"
+    first = "vector(time()) - 60 < ${__from:date:seconds}"
+    before = (
+        f"((last_over_time({series}[5m] offset 60s) unless on () ({first}))"
+        f" or (last_over_time({series}[5m] @ ${{__from:date:seconds}}) and on () ({first})))"
+    )
+    step = f"sum(((({latest} - {before}) >= 0) or {latest}))"
     after_start = "and on () (vector(time()) > ${__from:date:seconds})"
-    assert f"sum_over_time(({step} {after_start})[${{__range_ms}}ms:1m])" in expression
-    # What the first minute counted from before the start is taken off: the series' rise from the
-    # minute's step before the start to the start.
-    at_start = f"last_over_time({series}[5m] @ ${{__from:date:seconds}})"
-    before = f"last_over_time({latest}[1m:1m] @ ${{__from:date:seconds}})"
-    assert f"- ((sum(((({at_start} - {before}) >= 0) or {at_start}))) or vector(0))" in expression
-    # From the last minute's step to the window's end; no number where no token was settled.
-    assert f"(sum(((({latest} - last_over_time({latest}[1m:1m])) >= 0) or {latest}))) or vector(0)" in expression
-    assert expression.endswith(" > 0")
+    assert f"sum_over_time(({step} {after_start})[${{__range_ms}}ms:60s])" in expression
+    # From the last minute's step to the window's end; nothing is taken off what the steps counted.
+    since = f"(sum(((({latest} - last_over_time({latest}[60s:60s])) >= 0) or {latest}))) or vector(0)"
+    assert expression.endswith(f" + ({since})) > 0")
+    assert not re.search(r"-\s*\(+sum\(", expression)
 
 
 def test_no_panel_shows_a_ceiling(example: rhi_config.Config) -> None:
@@ -229,9 +293,7 @@ def test_exactly_one_panel_reads_the_billing_metric_in_us_east_1_beside_the_mont
     by_ref = {target["refId"]: target for target in panel["targets"]}
     assert (charge["statistic"], charge["hide"]) == ("Maximum", True)
     assert (by_ref["C"]["reducer"], by_ref["C"]["settings"]["mode"]) == ("last", "dropNN")
-    assert {searched_group(one) for one in counts(panel)} == {
-        f"Pool{pool.name}Group" for pool in example.pools
-    }
+    assert groups_read(panel) == {f"rhi-pool-{pool.name}" for pool in example.pools}
     # Every other CloudWatch query reads the endpoint's own region.
     others = [
         target
