@@ -1,0 +1,44 @@
+name: Engine advisories
+
+# Patching (docs/design/system-design.md, section 9): once a day, check the pinned engine version
+# (services/engine/vllm/VERSION) against GitHub's global security advisory database for the pip
+# package vllm. When it is inside the affected range of an advisory the database rates high or
+# critical, the run fails and opens one plain issue per advisory, giving its public identifier,
+# the pinned version and the fixed version (tools/advisories/check.py). Turning the issue into
+# backlog work is the owner's step.
+#
+# Rules this file keeps (tests/unit/test_ci_workflow.py):
+#   - It is the only workflow allowed to write issues. Its token reads the contents and writes
+#     issues, nothing more.
+#   - No AWS credential, and no secret: the only token is the one GitHub gives the run.
+#   - Every action is pinned by commit SHA, with its tag in a comment.
+#   - One run at a time, repository-wide: a scheduled run and a manual dispatch never both list
+#     the open issues before either has opened its own, so an advisory gets one issue.
+
+on:
+  schedule:
+    - cron: '41 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: engine-advisories
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The script uses the standard library only: the runner's python3, nothing installed.
+      - name: Check the pinned engine against the advisory database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/advisories/check.py --open-issues

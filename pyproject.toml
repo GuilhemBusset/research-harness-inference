@@ -128,7 +128,8 @@ package = false
 # defaults, which a value here replaces.
 [tool.pytest.ini_options]
 testpaths = [
-    "tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests", "tools/examiner-pilot/tests", "tests",
+    "tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests", "tools/examiner-pilot/tests",
+    "tools/advisories/tests", "tests",
 ]
 norecursedirs = [
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
