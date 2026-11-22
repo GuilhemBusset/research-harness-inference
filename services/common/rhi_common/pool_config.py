@@ -7,6 +7,13 @@ dashboards all read the same entry, so its shape is decided here and nowhere els
 needs the standard library only, and knows nothing of where the configuration comes from:
 `parse_pools` takes the table as the source gave it.
 
+The entry's key is the pool's name, the model name students choose it by (section 4.2): it holds
+only lower-case letters, digits and hyphens. The rule also keeps the session switch's partition key
+free (section 5.6; `SESSION_PARTITION` in `rhi_common.records`): the switch is an item of the
+pool-state table beside the pools' own items, which sit under the pool's name, and its key starts
+with `_`, which no pool's name may hold. A rule that admitted it would let a pool's records and the
+switch share one partition.
+
 Seven fields have a default of section 17, which gives them to every pool: the two holds, the idle
 time, the drain and the three settings of student affinity, below. `target_concurrency` and `gpu_hours_per_day` are a pool's own values, so
 every pool gives the first and every vllm pool the second. A mock pool serves canned responses
