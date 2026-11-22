@@ -108,6 +108,12 @@ cost_anomaly_detection = false
 # alerts topic (system design, sections 11.3 and 17). Left out, it is 1.
 outside_sessions_alarm_hours = 1
 
+# The share of the gateway's requests, in percent, that may fail for the gateway's own fault, and
+# the whole minutes of the period it is measured over, before an alarm says so on the alerts topic
+# (system design, sections 7.3 and 17). Left out, they are 5 and 5.
+gateway_error_alarm_percent = 5
+gateway_error_alarm_minutes = 5
+
 # Whether the stage is parked: the whole endpoint switched off, between cohorts or between sessions
 # (system design, sections 5.6 and 11.2). Parked, the stage keeps its data and the pipeline and
 # drops the load balancers, the NAT gateway, the Fargate services, the pools' groups and the

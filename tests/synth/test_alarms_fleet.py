@@ -99,11 +99,13 @@ def test_every_alarm_acts_on_the_alerts_topic_which_cloudwatch_may_publish_to(te
     guardrails = template(templates, "RhiGuardrails")
     alarms = of_type(guardrails, "AWS::CloudWatch::Alarm")
     (topic_id,) = of_type(guardrails, "AWS::SNS::Topic")
-    assert len(alarms) == 1 + 4 * len(POOLS)
+    # The fleet's, and the gateway's error-rate alarm (`rhi.guardrails.alarms_gateway`).
+    assert len(alarms) == 1 + 4 * len(POOLS) + 1
     for alarm in alarms.values():
         assert alarm["AlarmActions"] == [{"Ref": topic_id}]
-        # A group's name or a pool's name: no dimension that could identify a student.
-        assert {d["Name"] for m in metrics(alarm) for d in m.get("Dimensions", [])} <= {"AutoScalingGroupName", "Pool"}
+        # A group's name, a pool's name or the load balancer's: no dimension that could identify a student.
+        names = {d["Name"] for m in metrics(alarm) for d in m.get("Dimensions", [])}
+        assert names <= {"AutoScalingGroupName", "Pool", "LoadBalancer"}
     (policy,) = of_type(guardrails, "AWS::SNS::TopicPolicy").values()
     (grant,) = [
         s for s in policy["PolicyDocument"]["Statement"] if s.get("Principal") == {"Service": "cloudwatch.amazonaws.com"}
