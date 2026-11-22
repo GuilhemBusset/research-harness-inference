@@ -274,7 +274,7 @@ def test_the_check_reads_a_query_kept_to_the_session() -> None:
     # An engine series read over the session is kept to the pool in service at the step it counts
     # at, and has no "now" to read asleep at; read so without that, or kept only at the range's
     # end, it is not.
-    tokens = rules.engine_minute_increase(MOCK, Quantity.INPUT_TOKENS)
+    tokens = rules.engine_step_increase(MOCK, Quantity.INPUT_TOKENS)
     assert broken(rules.over_sessions(rules.awake(MOCK.name, tokens))) == set()
     assert broken(rules.over_sessions(tokens)) == {"asleep"}
     assert broken(rules.awake(MOCK.name, rules.over_sessions(tokens))) == {"asleep"}

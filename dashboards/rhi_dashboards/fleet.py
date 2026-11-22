@@ -1,7 +1,7 @@
 """The fleet and scaling dashboard: what the scaler decided and why, and what each start cost.
 
 The first of the six dashboards of the system design (section 7.3). Its first row shows the five
-objectives of section 7.3 (`rhi_dashboards.objectives`), each against its target, over the minutes
+objectives of section 7.3 (`rhi_dashboards.objectives`), each against its target, over the time
 a session was on in the dashboard's time range: one stat per measure, green where it meets its
 target and red where it does not, with the count of observations behind a percentile beside it. A
 percentile is shown as the share of observations it is judged on (`rhi_dashboards.objectives`), and
@@ -168,11 +168,11 @@ def _target(measure: objectives.Measure) -> dashboard_builders.ThresholdsConfig:
 
 
 def objective_stat(objective: objectives.Objective, measure: objectives.Measure) -> stat_builders.Panel:
-    """One measure of an objective over the session's minutes in the range, coloured by its target."""
+    """One measure of an objective over the time a session was on in the range, coloured by its target."""
     panel = (
         stat_builders.Panel()
         .title(f"{objective.name}: {measure.legend}")
-        .description(f"Target: {measure.goal}, over the minutes a session was on")
+        .description(f"Target: {measure.goal}, over the time a session was on")
         .datasource(rules.PROMETHEUS)
         .reduce_options(common_builders.ReduceDataOptions().calcs(["lastNotNull"]))
         .unit(measure.unit)

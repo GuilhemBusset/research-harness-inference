@@ -3,9 +3,9 @@ stream's speed (system design, sections 7.2 and 7.3).
 
 The gateway counts what students experience in these buckets (`rhi_gateway.experience`), and the
 objectives of section 7.3 are read at their floors (`rhi_dashboards.objectives`). A histogram
-reads a share exactly only at one of its boundaries, so the floors of section 17 are boundaries; a
-floor the configuration revises to fall between two is read between them. The two lists are here so
-that both read the same ones.
+reads a share exactly only at one of its boundaries, so the floors of section 17 are boundaries of
+the lists below, and the gateway adds the floors its configuration holds to them (`with_floors`):
+a floor the owner revises is a boundary too, wherever it falls.
 """
 
 from __future__ import annotations
@@ -18,3 +18,8 @@ SPEED_BUCKETS = (1, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 30, 35, 40, 4
 # 17): it is a boundary, and the buckets are finest below it. The last ones cover a hold (420 seconds
 # by default) and a turn that reasons up to the longest request (1,800).
 WAIT_BUCKETS = (0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 1800)
+
+
+def with_floors(buckets: tuple[float, ...], *floors: float) -> tuple[float, ...]:
+    """The buckets with each floor among their boundaries, in order, each boundary once."""
+    return tuple(sorted({*map(float, buckets), *map(float, floors)}))

@@ -153,9 +153,9 @@ def test_the_objectives_row_shows_each_objective_against_its_target(example: rhi
         assert [step["color"] for step in steps] == ["red", "green"]
         green = steps[1]["value"]
         assert measure.met(green) and not measure.met(math.nextafter(green, -math.inf))
-        # Every query keeps only the minutes the session gauge reads 1, over the dashboard's range.
+        # Every query keeps only the steps the session gauge reads 1 throughout, over the dashboard's range.
         for expression in queries(panel):
-            assert f"min_over_time({rules.SESSION_ON}[{rules.SESSION_STEP}]) == 1" in expression
+            assert rules.in_session("x").removeprefix("(x)") in expression
             assert f"[{rules.SESSION_RANGE}:{rules.SESSION_STEP}]" in expression
     shown = {panel["title"]: panel["fieldConfig"]["defaults"]["thresholds"]["steps"][1]["value"] for panel in row}
     assert shown["Gateway answers: not the gateway's fault"] == 0.995

@@ -190,13 +190,19 @@ OTHER_NUMBERS = {
     "retry_after_capacity_unavailable_seconds": 61,
     "retry_after_concurrency_limit_seconds": 6,
 }
+# Two floors of the objectives between the gateway's own boundaries, and one left at its default.
+OTHER_FLOORS = {
+    "target_ttft_p95_seconds": 6,
+    "target_stream_median_tokens_per_second": 16.5,
+    "target_stream_p10_tokens_per_second": 10,
+}
 
 
 @pytest.fixture(scope="module")
 def one_task(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> Gateway:
     """The gateway under a configuration of one task and of other numeric settings."""
     return synthesize(
-        app_module, tmp_path_factory.mktemp("one-task"), lambda data: data.update(OTHER_NUMBERS, gateway_tasks=1)
+        app_module, tmp_path_factory.mktemp("one-task"), lambda data: data.update(OTHER_NUMBERS, **OTHER_FLOORS, gateway_tasks=1)
     )
 
 
@@ -323,6 +329,14 @@ def test_the_numeric_settings_are_the_configuration_s(gateway: Gateway, one_task
         "retry_after_capacity_unavailable_seconds": read.retry_after_capacity_unavailable,
         "retry_after_concurrency_limit_seconds": read.retry_after_concurrency_limit,
     } == OTHER_NUMBERS
+    # The floors are the configuration's, and boundaries of the histograms they are read in.
+    assert set(gateway_settings.FLOOR_DEFAULTS) <= set(gateway.environment(gateway.container))
+    assert {
+        "target_ttft_p95_seconds": read.target_ttft_p95_seconds,
+        "target_stream_median_tokens_per_second": read.target_stream_median_tokens_per_second,
+        "target_stream_p10_tokens_per_second": read.target_stream_p10_tokens_per_second,
+    } == OTHER_FLOORS
+    assert 6 in read.wait_buckets and 16.5 in read.speed_buckets
 
 
 def test_each_pool_s_secret_is_given_by_reference_never_by_value(gateway: Gateway) -> None:

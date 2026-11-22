@@ -59,7 +59,9 @@ The objectives of section 7.3 are read from this histogram against floors held i
 the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
 a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
 waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
-read exactly, so each floor of section 17 is a bucket boundary (`rhi_common.boundaries`).
+read exactly, so each floor of section 17 is a bucket boundary (`rhi_common.boundaries`), and the
+gateway adds the floors its configuration holds (`rhi_gateway.settings`), so that a revised one is
+read exactly too.
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
@@ -108,7 +110,7 @@ INPUT_BUCKETS = (0, 1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 50_000, 75_000,
 OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000)
 
 # The seconds of both waits, and the tokens per second of a stream, are counted in the buckets of
-# `rhi_common.boundaries`, whose boundaries include the objectives' floors.
+# `rhi_common.boundaries`, with the configured floors of the objectives among them (`Settings`).
 
 _LABELS = ("pool", "wire_format")
 _SPEED_LABELS = (*_LABELS, "start")
@@ -189,6 +191,8 @@ class Experience:
     `demand` gives the heartbeat's rows as they would be written now (`Heartbeat.rows`): without it
     there are no series of requests in flight and held. `clock` gives the seconds a request's
     acceptance and its token times are read in, on a clock that never goes back; a test gives its own.
+    `wait_buckets` and `speed_buckets` are the boundaries of the two waits and of the speed: the
+    gateway's settings give them with the configured floors among them.
     """
 
     def __init__(
@@ -197,27 +201,29 @@ class Experience:
         demand: Callable[[], Iterable[GatewayHeartbeat]] | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wait_buckets: tuple[float, ...] = WAIT_BUCKETS,
+        speed_buckets: tuple[float, ...] = SPEED_BUCKETS,
     ) -> None:
         self.clock = clock
         self.first_token = Histogram(
             FIRST_TOKEN,
             "Seconds from a streamed request accepted to its first token sent, reasoning included.",
             _WAIT_LABELS,
-            buckets=WAIT_BUCKETS,
+            buckets=wait_buckets,
             registry=registry,
         )
         self.first_answer = Histogram(
             FIRST_ANSWER,
             "Seconds from a streamed request accepted to its first answer text or tool call sent.",
             _WAIT_LABELS,
-            buckets=WAIT_BUCKETS,
+            buckets=wait_buckets,
             registry=registry,
         )
         self.speed = Histogram(
             SPEED,
             "Output tokens after the first, over the seconds from the first token sent to the last, per stream.",
             _SPEED_LABELS,
-            buckets=SPEED_BUCKETS,
+            buckets=speed_buckets,
             registry=registry,
         )
         self.input_tokens = Histogram(

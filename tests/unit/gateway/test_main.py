@@ -298,6 +298,8 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
         "RHI_LONGEST_REQUEST_SECONDS": "900",
         "RHI_KEEPALIVE_SECONDS": "7",
         "RHI_RETRY_AFTER_WARMING": "31",
+        "RHI_TARGET_TTFT_P95_SECONDS": "6",
+        "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND": "16.5",
     }
     key = issue_key()
     scaler = Scaler()
@@ -356,6 +358,17 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
         Cause.CAPACITY_UNAVAILABLE: 60,
         Cause.CONCURRENCY_LIMIT: 5,
     }
+    # The floors of the environment are boundaries of what students experience, beside the gateway's own.
+    experience = gateway.app.state.experience
+    experience.first_token.labels("mock", "messages", "warm", "first").observe(1)
+    experience.speed.labels("mock", "messages", "warm").observe(1)
+    bounds: dict[str, set[str]] = {}
+    for family in gateway.metrics.registry.collect():
+        for sample in family.samples:
+            if sample.name.endswith("_bucket"):
+                bounds.setdefault(sample.name, set()).add(sample.labels["le"])
+    assert {"5.0", "6.0"} <= bounds["rhi_gateway_time_to_first_token_seconds_bucket"]
+    assert {"10.0", "15.0", "16.5"} <= bounds["rhi_gateway_stream_output_tokens_per_second_bucket"]
 
 
 # --- The entry point ---------------------------------------------------------------------------------

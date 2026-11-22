@@ -10,6 +10,7 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 from rhi import config as rhi_config
+from rhi_common.boundaries import WAIT_BUCKETS, with_floors
 from rhi_common.engine_metrics import Quantity, metric_names
 from rhi_dashboards import check, objectives, rules
 from rhi_gateway import experience
@@ -17,8 +18,11 @@ from rhi_gateway import metrics as gateway
 from rhi_lifecycle import stages
 from rhi_scaler import metrics as scaler
 
-# Every reading of the gauge in the minute: a minute counted only if each one was 1.
-GATE = f"min_over_time({rules.SESSION_ON}[{rules.SESSION_STEP}]) == 1"
+# A step is counted only if the gauge read 1 for the whole of it: at its start, and at every reading in it.
+GATE = (
+    f"({rules.SESSION_ON} offset {rules.SESSION_STEP} == 1)"
+    f" unless on () (min_over_time({rules.SESSION_ON}[{rules.SESSION_STEP}]) < 1)"
+)
 SUBQUERY = f"[{rules.SESSION_RANGE}:{rules.SESSION_STEP}]"
 COLLECTORS = ("services/gateway/collector/config.yaml", "services/engine/collector/config.yaml")
 AT_LEAST, ABOVE = objectives.Comparison.AT_LEAST, objectives.Comparison.ABOVE
@@ -43,7 +47,7 @@ def selectors(expression: str) -> dict[str, list[dict[str, str]]]:
 
 def ungated(expression: str) -> list[str]:
     """The metrics the expression reads outside an expression that a session span gates over every
-    minute of the dashboard's range: each read's innermost such span, with its range and step."""
+    step of the dashboard's range: each read's innermost such span, with its range and step."""
     read = check._read(expression)
     sessions = check._sessions(read.tokens)
     subquery = check._tokens(SUBQUERY)[0]
@@ -92,12 +96,10 @@ def test_a_counter_counts_each_step_from_the_step_before() -> None:
     # No window of its own: adjacent windows would drop the increment between their scrapes, and one
     # ending at a step would bring in what came before the session.
     assert "increase(" not in expression and "rate(" not in expression
-    step = rules.minute_increase(objectives.REQUESTS)
     series = objectives.REQUESTS
-    # Each sample less the one before, or all of it after a restart: summed over the minute's
-    # sample steps, so that a restart between the minute's ends is still read as one.
-    each = f"sum without () ((({series} - {series} offset {rules.SAMPLE_STEP}) >= 0) or {series})"
-    assert step == f"sum by () (sum_over_time(({each})[{rules.SESSION_STEP}:{rules.SAMPLE_STEP}]))"
+    # Each sample less the one a step before, or all of it after a restart, gated at its own step.
+    step = f"sum by () ((({series} - {series} offset {rules.SESSION_STEP}) >= 0) or {series})"
+    assert rules.step_increase(series) == step
     assert rules.over_sessions(step) in expression
 
 
@@ -106,21 +108,27 @@ def seconds(duration: str) -> int:
     return int(number) * {"s": 1, "m": 60}[unit]
 
 
-def test_a_sample_step_holds_at_most_one_scrape() -> None:
-    # Every collector that writes a series the objectives read scrapes less often than a sample step.
+def test_a_step_holds_at_most_one_scrape(example: rhi_config.Config) -> None:
+    # Every collector that writes a series the objectives read scrapes less often than a step.
     intervals = [seconds(one) for path in COLLECTORS for one in re.findall(r"scrape_interval: (\S+)", Path(path).read_text())]
-    assert intervals and min(intervals) > seconds(rules.SAMPLE_STEP)
-    assert seconds(rules.SESSION_STEP) % seconds(rules.SAMPLE_STEP) == 0
+    assert intervals and min(intervals) > seconds(rules.SESSION_STEP)
+    # And no query reads a counter over a longer span than its step, or over steps other than the
+    # range's: a sample counts by the gauge's reading at its own step, and only when that step ends
+    # in the dashboard's range, the last one up to the range's end.
+    for objective in objectives.objectives(example):
+        for query in (q for measure in objective.measures for q in (measure.expression, measure.count) if q):
+            spans = set(re.findall(r"\[[^\]]*\]", query))
+            assert spans == {SUBQUERY, f"[{rules.SESSION_STEP}]"}, query
 
 
-def test_a_minute_is_kept_only_if_every_reading_of_the_gauge_in_it_is_on() -> None:
+def test_a_step_is_kept_only_while_the_gauge_reads_on_throughout_it() -> None:
     gate = rules.in_session("x")
     gauge = rules.SESSION_ON
-    # One reading off between two on ones takes the minute out; the readings at its ends do not decide it.
-    assert f"min_over_time({gauge}[{rules.SESSION_STEP}]) == 1" in gate
-    assert "offset" not in gate
-    # A minute in which the scaler did not run takes the last reading before it.
-    assert f"({gauge} == 1) unless on () (count_over_time({gauge}[{rules.SESSION_STEP}]))" in gate
+    # The reading in force when the step starts: a scrape taken while the last reading was off is
+    # not counted, even in the minute the switch comes on.
+    assert f"({gauge} offset {rules.SESSION_STEP} == 1)" in gate
+    # And no reading within the step that is not on.
+    assert f"unless on () (min_over_time({gauge}[{rules.SESSION_STEP}]) < 1)" in gate
 
 
 def test_first_turns_apart(example: rhi_config.Config) -> None:
@@ -168,38 +176,33 @@ def test_the_targets_follow_the_configuration(example: rhi_config.Config) -> Non
     assert "above 85.4% " in objectives.cached_share(dataclasses.replace(other, cached_share_flag_percent=85.4)).measures[0].goal
 
 
-def test_a_target_between_two_boundaries_is_read_between_their_buckets(tmp_path: Path) -> None:
-    # A revised target the configuration takes, whose boundary the gateway does not count.
+def test_a_revised_floor_is_read_exactly_at_a_boundary_the_gateway_counts(tmp_path: Path) -> None:
+    # Floors the configuration takes, between the gateway's own boundaries.
     text = Path("config.example.toml").read_text(encoding="utf-8")
     for key, value in (("target_ttft_p95_seconds", "6"), ("target_stream_median_tokens_per_second", "16")):
         text = re.sub(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
     (tmp_path / "revised.toml").write_text(text, encoding="utf-8")
     config = rhi_config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(tmp_path / "revised.toml")})
-    found = by_name(config)
-    for objective, histogram, matchers, lower, upper, measure in (
-        ("Time to first token, warm pool", experience.FIRST_TOKEN, {"start": "warm", "turn": "first"}, 5, 7.5, 0),
-        ("Output speed per stream, warm pool", experience.SPEED, {"pool": "coursework", "start": "warm"}, 15, 17.5, 0),
-    ):
-        expression = found[objective].measures[measure].expression
-        bucket, count = (
-            rules.over_sessions(rules.minute_increase(f"{histogram}_{kind}", {**matchers, **extra}))
-            for kind, extra in (("bucket", {"le": objectives.boundary(lower)}), ("count", {}))
-        )
-        high = rules.over_sessions(rules.minute_increase(f"{histogram}_bucket", {**matchers, "le": objectives.boundary(upper)}))
-        # The two buckets the gateway counts around it, the target 0.4 of the way from the lower.
-        under = f"({bucket}) + (({high}) - ({bucket})) * 0.4"
-        assert expression in (f"({under}) / ({count})", f"(({count}) - ({under})) / ({count})")
-
-
-@pytest.mark.parametrize(("target", "selected"), [(4, {"4"}), (6, {"5", "7.5"}), (0.1, {"0.25"}), (2000, {"1800"})])
-def test_a_first_token_target_is_read_at_the_gateways_boundaries(
-    example: rhi_config.Config, target: float, selected: set[str]
-) -> None:
-    # At a boundary, its bucket; between two, both; under the first, the first; beyond the last, the last.
-    first, _ = objectives.first_token(dataclasses.replace(example, target_ttft_p95_seconds=target)).measures
-    read = {one["le"] for one in selectors(first.expression)[f"{experience.FIRST_TOKEN}_bucket"]}
-    assert read == selected
-    assert read <= {objectives.boundary(bound) for bound in experience.WAIT_BUCKETS}
+    first, _ = objectives.first_token(config).measures
+    median, _ = objectives.stream_speed(config).measures
+    assert {one["le"] for one in selectors(first.expression)[f"{experience.FIRST_TOKEN}_bucket"]} == {"6"}
+    assert {one["le"] for one in selectors(median.expression)[f"{experience.SPEED}_bucket"]} == {"16"}
+    # The gateway counts its waits with the floor among its boundaries (`rhi_gateway.settings`): 95
+    # of 100 first tokens under 6 seconds meet the objective, 90 do not.
+    wait_buckets = with_floors(WAIT_BUCKETS, config.target_ttft_p95_seconds)
+    labels = {"pool": "coursework", "wire_format": "messages", "start": "warm", "turn": "first"}
+    for waits, met in (([4.0] * 90 + [5.5] * 5 + [7.0] * 5, True), ([4.0] * 90 + [7.0] * 10, False)):
+        registry = CollectorRegistry()
+        histogram = experience.Experience(registry, wait_buckets=wait_buckets).first_token
+        for wait in waits:
+            histogram.labels(*labels.values()).observe(wait)
+        under = {
+            objectives.boundary(float(sample.labels["le"])): sample.value
+            for family in registry.collect()
+            for sample in family.samples
+            if sample.name == f"{experience.FIRST_TOKEN}_bucket"
+        }["6"]
+        assert first.met(under / len(waits)) is met
 
 
 def test_a_percentile_is_judged_exactly_at_its_floor(example: rhi_config.Config) -> None:
@@ -262,8 +265,8 @@ def test_the_gateway_counts_as_its_fault_a_5xx_that_names_no_cause(example: rhi_
     # Summed whatever their labels: no pool, no student.
     assert all(matchers == {} for name, each in read.items() if name != rules.SESSION_ON for matchers in each)
     assert "sum by () (" in measure.expression
-    faults = rules.over_sessions(rules.minute_increase(objectives.OWN_FAULTS))
-    requests = rules.over_sessions(rules.minute_increase(objectives.REQUESTS))
+    faults = rules.over_sessions(rules.step_increase(objectives.OWN_FAULTS))
+    requests = rules.over_sessions(rules.step_increase(objectives.REQUESTS))
     # Where no fault was counted, zero faults are read: the share of a session without one is 1.
     assert measure.expression == f"(({requests}) - (({faults}) or on () (0 * ({requests})))) / ({requests})"
 
@@ -284,7 +287,7 @@ def test_the_cached_share_is_each_pools_engine_kept_to_the_pool_in_service(examp
     for pool, measure in zip(example.pools, shares, strict=True):
         names = metric_names(pool.engine)
         cached, total = (
-            rules.over_sessions(rules.awake(pool.name, rules.engine_minute_increase(pool, quantity)))
+            rules.over_sessions(rules.awake(pool.name, rules.engine_step_increase(pool, quantity)))
             for quantity in (Quantity.CACHED_INPUT_TOKENS, Quantity.INPUT_TOKENS)
         )
         assert measure.expression == f"({cached}) / ({total})"
@@ -301,9 +304,9 @@ def test_the_cold_start_counts_each_promotion_completed_in_the_session_once() ->
     assert set(read) == {f"{stages.LAUNCH_METRIC}_count", f"{stages.LAUNCH_METRIC}_bucket", rules.SESSION_ON}
     assert all(one == promotion for one in read[f"{stages.LAUNCH_METRIC}_count"])
     assert all(one == {**promotion, "le": "300"} for one in read[f"{stages.LAUNCH_METRIC}_bucket"])
-    # Counted as counters are, each in the minute it was completed: the share of them under 5
+    # Counted as counters are, each at the step it was completed in: the share of them under 5
     # minutes, and how many there were.
-    under = rules.over_sessions(rules.minute_increase(f"{stages.LAUNCH_METRIC}_bucket", {**promotion, "le": "300"}))
-    count = rules.over_sessions(rules.minute_increase(f"{stages.LAUNCH_METRIC}_count", promotion))
+    under = rules.over_sessions(rules.step_increase(f"{stages.LAUNCH_METRIC}_bucket", {**promotion, "le": "300"}))
+    count = rules.over_sessions(rules.step_increase(f"{stages.LAUNCH_METRIC}_count", promotion))
     assert measure.expression == f"({under}) / ({count})"
     assert measure.count == count

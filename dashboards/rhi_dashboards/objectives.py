@@ -15,10 +15,10 @@ The provisional targets are the configuration's (`rhi.config.Config`), until spi
 the pool; 99.5% and 5 minutes are fixed by the design.
 
 **Only what happened while a session was on.** Every query is built with `rules.over_sessions`:
-each minute's contribution (what a counter rose by in that minute) is kept only for the minutes in
-which every reading of the session gauge was 1, at every minute of the dashboard's range, and summed
-over them. A share is taken of the sums, never of each minute's: the
-share of the session's requests, of the session's streams. So the same query is right for any
+each step's contribution (what a counter rose by in that step, 5 seconds, which holds at most one
+of its samples) is kept only where the session gauge read 1 for the whole step, at every step of
+the dashboard's range, and summed over them. A share is taken of the sums, never of each step's:
+the share of the session's requests, of the session's streams. So the same query is right for any
 session, and over a range with no session it reads no data.
 
 **A percentile is judged by a share.** The q-th percentile is the smallest value with at least q
@@ -27,17 +27,12 @@ observations are under it, and at a floor or more exactly when more than 1 - q a
 more. That share is what each measure shows and is judged on, with the observations behind it, and
 `target` and `percentile` say which percentile it stands for. The gateway's buckets count the
 values strictly under their boundary (`rhi_gateway.experience`), and so do the lifecycle agent's
-(`rhi_lifecycle.stages`), so at a target that is a boundary of its histogram the share is read
-exactly: the floors of section 17 (5 seconds, 15 and 10 tokens a second) are boundaries of the
-gateway's (`rhi_common.boundaries`), and 5 minutes is one of the agent's.
-
-The configuration takes any target above zero, so a revised one may fall between two boundaries.
-Its share is then read as Prometheus reads a value inside a bucket (`histogram_quantile`): the
-observations of the bucket around it spread evenly between its two boundaries, from zero under
-the first boundary. A target beyond the last finite boundary is read at that boundary, which is
-all a histogram knows. A bucket is selected by its `le` label as the workspace holds it: the
-collectors (release 0.165.0) write a boundary in the fewest digits that give it back, with no
-exponent and no ".0" (`5`, `12.5`), not as the client library serves it (`5.0`).
+(`rhi_lifecycle.stages`), and each target is a boundary of its histogram, so the share is read
+from that one bucket, exactly: the gateway takes the configured floors among its boundaries
+(`rhi_gateway.settings`), whatever the owner sets them to, and 5 minutes is a boundary of the
+agent's. A bucket is selected by its `le` label as the workspace holds it: the collectors (release
+0.165.0) write a boundary in the fewest digits that give it back, with no exponent and no ".0"
+(`5`, `12.5`), not as the client library serves it (`5.0`).
 
 **Gateway answers.** Where there are requests and no fault was counted, zero faults are read, so a
 session without a fault reads 100%.
@@ -45,7 +40,7 @@ session without a fault reads 100%.
 **Cold start.** The lifecycle agent observes each launch whose hook Auto Scaling took with
 `CONTINUE`, once, with the seconds its stages took in all: a launch abandoned, or whose completion
 was refused, is not observed, and two launches are two observations whatever their seconds. Its
-count is read like a counter, so each launch is counted in the minute it was completed, and one
+count is read like a counter, so each launch is counted at the step it was completed in, and one
 completed before the session is not.
 """
 
@@ -57,7 +52,6 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.engine_metrics import Quantity
 from rhi_dashboards import rules
 
@@ -118,7 +112,7 @@ class Measure:
     second, 85%, 300 seconds), and `percentile`, from 0 to 1, the percentile it bounds, if any. The
     value of `expression` meets the objective when it is `comparison` `threshold`: the target itself,
     or, for a percentile, the share of the observations it needs. `unit` is Grafana's unit of the
-    value, and `count` the query of the observations behind a share, over the same minutes.
+    value, and `count` the query of the observations behind a share, over the same steps.
     """
 
     legend: str
@@ -155,35 +149,16 @@ def boundary(value: float) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _under(
-    histogram: str, matchers: dict[str, str], floor: float, boundaries: tuple[float, ...] | None = None
-) -> tuple[str, str]:
-    """The session's observations of the histogram under the floor, and all of them.
-
-    `boundaries` are the histogram's finite ones; left out, the floor is one of them. At a boundary
-    the share is its bucket; between two, the two buckets interpolated linearly, from zero under the
-    first; beyond the last, the last bucket."""
-
-    def bucket(bound: float) -> str:
-        return rules.over_sessions(rules.minute_increase(f"{histogram}_bucket", {**matchers, BOUNDARY: boundary(bound)}))
-
-    count = rules.over_sessions(rules.minute_increase(f"{histogram}_count", matchers))
-    if boundaries is None or floor in boundaries:
-        return bucket(floor), count
-    lower = max((bound for bound in boundaries if bound < floor), default=None)
-    upper = min((bound for bound in boundaries if bound > floor), default=None)
-    if upper is None:
-        return bucket(max(boundaries)), count
-    if lower is None:
-        return f"({bucket(upper)}) * {floor / upper!r}", count
-    fraction = (floor - lower) / (upper - lower)
-    return f"({bucket(lower)}) + (({bucket(upper)}) - ({bucket(lower)})) * {fraction!r}", count
+def _under(histogram: str, matchers: dict[str, str], floor: float) -> tuple[str, str]:
+    """The session's observations of the histogram under the floor, one of its boundaries, and all of them."""
+    under = rules.over_sessions(rules.step_increase(f"{histogram}_bucket", {**matchers, BOUNDARY: boundary(floor)}))
+    return under, rules.over_sessions(rules.step_increase(f"{histogram}_count", matchers))
 
 
 def gateway_answers() -> Objective:
     """The share of the session's requests that were not a 5xx of the gateway's own fault."""
-    requests = rules.over_sessions(rules.minute_increase(REQUESTS))
-    faults = rules.over_sessions(rules.minute_increase(OWN_FAULTS))
+    requests = rules.over_sessions(rules.step_increase(REQUESTS))
+    faults = rules.over_sessions(rules.step_increase(OWN_FAULTS))
     share = f"(({requests}) - (({faults}) or on () (0 * ({requests})))) / ({requests})"
     goal = f"at least {GATEWAY_TARGET:.1%} of requests not a 5xx of the gateway's own fault"
     measure = Measure(
@@ -197,7 +172,7 @@ def first_token(config: Config) -> Objective:
     target, q = config.target_ttft_p95_seconds, 0.95
     measures = []
     for turn in (FIRST_TURN, LATER_TURN):
-        under, count = _under(FIRST_TOKEN, {START: WARM, TURN: turn}, target, WAIT_BUCKETS)
+        under, count = _under(FIRST_TOKEN, {START: WARM, TURN: turn}, target)
         goal = f"p95 under {target:g} s: at least {q:.0%} of warm {turn} turns with a first token under {target:g} s"
         measures.append(
             Measure(
@@ -223,7 +198,7 @@ def stream_speed(config: Config) -> Objective:
             (0.5, "median", config.target_stream_median_tokens_per_second),
             (0.1, "slowest tenth", config.target_stream_p10_tokens_per_second),
         ):
-            under, count = _under(SPEED, {rules.POOL: pool.name, START: WARM}, floor, SPEED_BUCKETS)
+            under, count = _under(SPEED, {rules.POOL: pool.name, START: WARM}, floor)
             needed = round(1 - q, 12)
             goal = f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of warm streams at {floor:g} or more"
             measures.append(
@@ -253,7 +228,7 @@ def cached_share(config: Config) -> Objective:
     measures = []
     for pool in config.pools:
         cached, total = (
-            rules.over_sessions(rules.awake(pool.name, rules.engine_minute_increase(pool, quantity)))
+            rules.over_sessions(rules.awake(pool.name, rules.engine_step_increase(pool, quantity)))
             for quantity in (Quantity.CACHED_INPUT_TOKENS, Quantity.INPUT_TOKENS)
         )
         goal = f"above {config.cached_share_flag_percent:g}% of input tokens cached"
