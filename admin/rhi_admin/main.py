@@ -1,5 +1,5 @@
 """The admin CLI: the roster, direct keys, revocation, the canary, the spikes' students and the
-pools' operating state (system design, sections 6.4 and 11.3).
+pools' operating state and the session switch (system design, sections 5.6, 6.4 and 11.3).
 
 There is no public admin API: the admin runs this with their own AWS credentials, from the
 repository, and it reaches the tables directly.
@@ -19,6 +19,9 @@ repository, and it reaches the tables directly.
     pool enable <pool>                                          the pool's configured mode again
     pool clear-suspension <pool>                                the mark launch_suspended cleared
     pool run                                                    one run of the scaler, now
+    session on                                                  the session on: the gateway serves students
+    session off                                                 the session off: each pool falls to zero when idle
+    session status                                              whether a session is on, who switched it and when
     privacy export <github-id>                                  everything kept of a student, as one JSON document
     privacy erase <github-id>                                   a student's entry, keys and usage rows deleted
 
@@ -32,6 +35,9 @@ table by its logical ID, and the scaler's function by the logical ID of the scal
 (`tests/synth/test_scaler.py` holds it to the synthesized one), so this file names no function
 either. Each change they make carries who made it, the caller's identity from STS without its
 account, and when (`rhi_admin.pools`).
+
+The commands `session` (`rhi_admin.session`) reach, once one of them runs, the same pool-state
+table, where the session switch is one item, and record who switched it the same way.
 
 The commands `privacy` (`rhi_admin.privacy`) reach, once one of them runs, the usage table by its
 logical ID, the gateway's log group by its logical ID in the gateway stack, and the Prometheus
@@ -58,6 +64,7 @@ from rhi_admin import keys as admin_keys
 from rhi_admin import pools as admin_pools
 from rhi_admin import privacy as admin_privacy
 from rhi_admin import roster as admin_roster
+from rhi_admin import session as admin_session
 from rhi_admin.canary import CANARY_SECRET, run_canary
 from rhi_admin.roster import AdminError
 from rhi_admin.spikes import run_spike_keys
@@ -85,7 +92,7 @@ COURSE_END_PARAMETER = "/rhi/config/course_end"
 @dataclass(frozen=True)
 class Admin:
     """What the commands act on: the two tables, a Secrets Manager client, the course end, and
-    what the commands `pool` and `privacy` act on, each made when one of them runs."""
+    what the commands `pool`, `privacy` and `session` act on, each made when one of them runs."""
 
     roster: Any
     keys: Any
@@ -93,6 +100,7 @@ class Admin:
     course_end: Callable[[], datetime.date]
     pools: Callable[[], admin_pools.Pools]
     privacy: Callable[[], admin_privacy.Stores]
+    switch: Callable[[], admin_session.Switch]
 
 
 def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -> str:
@@ -124,6 +132,13 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
             caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
         )
 
+    def switch() -> admin_session.Switch:
+        sts = session.client("sts")
+        return admin_session.Switch(
+            table=dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME)),
+            caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
+        )
+
     def privacy() -> admin_privacy.Stores:
         # A workspace's physical ID is its ARN, which ends with its ID.
         workspace = physical_id(cloudformation, WORKSPACE_LOGICAL_ID, OBSERVABILITY_STACK_NAME).rsplit("/", 1)[-1]
@@ -142,12 +157,14 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
         course_end=course_end,
         pools=pools,
         privacy=privacy,
+        switch=switch,
     )
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rhi_admin", description="The admin CLI of the inference endpoint.")
-    commands = parser.add_subparsers(dest="group", required=True)
+def parser() -> argparse.ArgumentParser:
+    """The admin CLI's command line, under its program name `rhi_admin`."""
+    cli = argparse.ArgumentParser(prog="rhi_admin", description="The admin CLI of the inference endpoint.")
+    commands = cli.add_subparsers(dest="group", required=True)
 
     roster = commands.add_parser("roster", help="the students who may log in").add_subparsers(
         dest="command", required=True
@@ -179,12 +196,19 @@ def _parser() -> argparse.ArgumentParser:
     pool.add_parser("clear-suspension", help="clear the mark launch_suspended of a pool").add_argument("pool")
     pool.add_parser("run", help="ask the scaler to run now")
 
+    switch = commands.add_parser(
+        "session", help="the session switch: whether the endpoint serves students"
+    ).add_subparsers(dest="command", required=True)
+    switch.add_parser("on", help="switch the session on: the gateway serves students")
+    switch.add_parser("off", help="switch the session off: each pool falls to zero by its idle rule")
+    switch.add_parser("status", help="whether a session is on, who switched it and when")
+
     privacy = commands.add_parser("privacy", help="one student's data").add_subparsers(dest="command", required=True)
     privacy.add_parser("export", help="export what is kept of a student, as JSON").add_argument("github_id", type=int)
     privacy.add_parser(
         "erase", help="delete a student's entry, keys and usage rows, and say what only retention removes"
     ).add_argument("github_id", type=int)
-    return parser
+    return cli
 
 
 def _pool_command(command: str, arguments: argparse.Namespace, pools: admin_pools.Pools, now: int, out: TextIO) -> None:
@@ -205,10 +229,30 @@ def _pool_command(command: str, arguments: argparse.Namespace, pools: admin_pool
             print(f"{decision['pool']}\t{decision['desired']}\t{decision['reason']}", file=out)
 
 
+def _session_command(command: str, switch: admin_session.Switch, now: int, out: TextIO) -> None:
+    if command == "status":
+        state = admin_session.status(switch)
+        print("session\tset_by\tset_at", file=out)
+        if state is None:
+            print("off\t-\t-", file=out)
+        else:
+            print(f"{'on' if state.on else 'off'}\t{state.set_by}\t{state.set_at}", file=out)
+        return
+    state, written = admin_session.turn(command == "on", switch=switch, now=now)
+    if state is None:
+        print("The session is already off: it has never been switched on.", file=out)
+    elif written:
+        print(f"The session is {command}, switched by {state.set_by} at {state.set_at}.", file=out)
+    else:
+        print(f"The session is already {command}, switched by {state.set_by} at {state.set_at}.", file=out)
+
+
 def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO) -> None:
     command = (arguments.group, getattr(arguments, "command", None))
     if arguments.group == "pool":
         _pool_command(arguments.command, arguments, admin.pools(), now, out)
+    elif arguments.group == "session":
+        _session_command(arguments.command, admin.switch(), now, out)
     elif command == ("privacy", "export"):
         document = admin_privacy.export(
             arguments.github_id, roster=admin.roster, keys=admin.keys, stores=admin.privacy(), now=now
@@ -295,7 +339,7 @@ def run(
     err: TextIO | None = None,
 ) -> int:
     """Runs one command; its exit status. `admin` is what it acts on, or what makes it once the arguments parse."""
-    arguments = _parser().parse_args(list(argv))
+    arguments = parser().parse_args(list(argv))
     target = admin if isinstance(admin, Admin) else admin()
     try:
         _dispatch(arguments, target, int(time.time()) if now is None else now, out or sys.stdout)

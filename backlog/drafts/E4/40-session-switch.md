@@ -28,6 +28,12 @@ found the same way, by its logical ID in that stack. The repository holds no tab
 
 The pools' own modes and the commands that change them are issue #191's; this issue adds none.
 
+**What is already there.** The record and its keys are in `services/common/rhi_common/records.py`
+and `services/common/rhi_common/tables.py`, which the scaler reads. The commands session on,
+session off and session status landed with issue #215, whose class-day runbook shows them
+(`admin/rhi_admin/session.py`, `tests/unit/admin/test_session.py`). This issue checks them against
+its deliverables and adds what they lack.
+
 ## Deliverables
 
 - [ ] `services/common/rhi_common/records.py` defines the record of the session switch: on or off, who set it and when, read from and written to the pool-state item with partition key _session and sort key switch, and a missing item reads as off.
