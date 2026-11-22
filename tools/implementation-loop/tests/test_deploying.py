@@ -286,7 +286,8 @@ def test_loop_toml_has_the_verified_description_and_the_discharge_contexts_and_b
             path.write_text(f"[deploy]\ndischarge_contexts = {not_a_list_of_contexts}\n")
             with pytest.raises(TypeError, match="discharge_contexts"):
                 L.config.load_policy(path)
-        for another_form in (DEPLOY, "verify/", "Verify/beta", "verify/a stage", "verify/beta/x", ""):
+        for another_form in (DEPLOY, "verify/", "Verify/beta", "verify/a stage", "verify/beta/x", "verify/beta:blue",
+                             "verify/" + "b" * 101, ""):   # a stage's name as CodePipeline accepts it
             path.write_text(f'[deploy]\ndischarge_contexts = ["{VERIFY}", "{another_form}"]\n')
             with pytest.raises(ValueError, match="discharge_contexts"):
                 L.config.load_policy(path)

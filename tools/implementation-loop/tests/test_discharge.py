@@ -17,7 +17,7 @@ from test_deploying import DEPLOYED, GPU, LEFT_OUT, NEEDS_GPU, PARKED, SIGNS_IN,
 RHI = "verify/Rhi"
 EPIC = 1
 # What the discharge may call on the GitHub client: its reads, and the writes of the evidence step.
-READS = {"find_pr", "deploy_status", "list_comments", "get_issue"}
+READS = {"get_pr", "deploy_status", "list_comments", "get_issue"}
 WRITES = {"edit_issue", "create_comment", "update_comment"}
 
 
@@ -70,14 +70,20 @@ def delivered(*numbers, item=SIGNS_IN, capability=DEPLOYED, files=(SMOKE,), cont
         run.repo.cleanup()
 
 
-def push_main(run, files=(), base="origin/main", force=False):
-    """A commit pushed to `main` on top of `base`, holding `files`: what landed after the issue."""
+def push_main(run, files=(), base="origin/main", force=False, links=(), removed=()):
+    """A commit pushed to `main` on top of `base`, holding `files`, each of `links` as a symbolic
+    link to a file that does not exist, and none of `removed`: what landed after the issue."""
     merger = run.repo.merger
     git("fetch", "-q", "origin", cwd=merger)
     git("checkout", "-q", "-B", "later", base, cwd=merger)
-    for path in (*files, "docs/later.txt"):
+    for path in (*files, *links, "docs/later.txt"):
         (merger / path).parent.mkdir(parents=True, exist_ok=True)
-        (merger / path).write_text("# later\n")
+        if path in links:
+            (merger / path).symlink_to("missing.py")
+        else:
+            (merger / path).write_text("# later\n")
+    for path in removed:
+        (merger / path).unlink()
     git("add", "-A", cwd=merger)
     git("commit", "-q", "-m", "Later", cwd=merger)
     git("push", "-q", *(["--force"] if force else []), "origin", "HEAD:main", cwd=merger)
@@ -144,6 +150,7 @@ def test_a_later_verification_discharges_and_the_issue_is_done(on, discharge):
     pytest.param({"item": SIGNS_IN.replace(SMOKE, LEFT_OUT), "files": (LEFT_OUT,)}, id="a-test-among-unverified-tests"),
     pytest.param({"files": ()}, id="a-test-the-commit-does-not-hold"),
     pytest.param({"files": (f"{SMOKE}/test_inside.py",)}, id="a-directory-of-the-test-s-name"),
+    pytest.param({"files": (), "on": "a-link"}, id="a-symbolic-link-to-no-file"),
     pytest.param({"item": NEEDS_GPU}, id="another-capability"),
     pytest.param({"item": NEEDS_GPU, "capability": GPU}, id="another-capability-by-the-plan-too"),
     pytest.param({"context": "verify/Other"}, id="a-context-not-among-discharge-contexts"),
@@ -157,7 +164,9 @@ def test_what_discharges_nothing(case, discharge):
         before = snapshot(run)
         assert before[0] == Phase.DELIVERED and len(before[1]) == 1
         [sha] = run.fake.commits[2]
-        if case.get("on"):   # main rewritten from before the merge, with the test file in it
+        if case.get("on") == "a-link":   # a later main whose only entry at the test's path is a dangling link
+            sha = push_main(run, links=(SMOKE,))
+        elif case.get("on"):   # main rewritten from before the merge, with the test file in it
             sha = push_main(run, files=(SMOKE,), base="origin/main~1", force=True)
         run.fake.set_status(sha, case.get("context", RHI), case.get("state", "success"), case.get("said", VERIFIED))
         discharge.failing.update({case["failing"]} if "failing" in case else set())
@@ -167,7 +176,7 @@ def test_what_discharges_nothing(case, discharge):
         assert not [e for e in run.issue(2).evidence if e["criterion"] == "D2"]
 
 
-@pytest.mark.parametrize("failing", ["find_pr", "deploy_status", "list_comments", "update_comment", "get_issue"])
+@pytest.mark.parametrize("failing", ["get_pr", "deploy_status", "list_comments", "update_comment", "get_issue"])
 def test_an_unanswered_read_or_write_is_tried_again_by_the_next_run(failing, discharge):
     with delivered() as run:
         before = snapshot(run)
@@ -182,3 +191,100 @@ def test_an_unanswered_read_or_write_is_tried_again_by_the_next_run(failing, dis
         pr = present(run.issue(2).pr)
         assert len([c for c in run.fake.comments[pr] if L.report.EVIDENCE_MARKER in c["body"]]) == 1, \
             "a list of comments that was not read is not an empty one"
+
+
+def test_an_issue_edited_while_the_statuses_are_read_is_left_as_it_is():
+    with delivered() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        issue, other = run.fake.issues[2], "tests/smoke/deployed/test_other.py"
+        run.fake.before_read = lambda: issue.update(body=issue["body"].replace(SMOKE, other))
+        run.run()
+        assert issue["state"] == "open" and run.issue(2).obligations
+        assert any(other in line and line.lstrip().startswith("- [ ]") for line in issue["body"].splitlines())
+
+
+def test_the_verifier_s_record_of_an_item_s_agent_part_stays(monkeypatch):
+    build = L.agents.FakeAgents.build
+
+    def with_a_command_for_d2(self, *args, **kwargs):
+        result = build(self, *args, **kwargs)
+        result.commands.append(dataclasses.replace(result.commands[0], criterion="D2"))
+        return result
+    monkeypatch.setattr(L.agents.FakeAgents, "build", with_a_command_for_d2)
+    with delivered() as run:
+        def kinds():
+            return sorted(e["kind"] for e in run.issue(2).evidence if e["criterion"] == "D2")
+        assert kinds() == ["command"]
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        run.run()
+        assert kinds() == sorted(["command", L.engine.COMMIT_STATUS_EVIDENCE])
+        [comment] = [c["body"] for c in run.fake.comments[present(run.issue(2).pr)] if L.report.EVIDENCE_MARKER in c["body"]]
+        assert len([line for line in comment.splitlines() if line.startswith("| D2 ")]) == 2
+
+
+@pytest.mark.parametrize("path", [SMOKE, "tests/smoke/deployed/test_caf\u00e9.py"], ids=["ascii", "non-ascii"])
+def test_a_pull_request_reusing_the_branch_hides_nothing_nor_does_git_s_quoting(path):
+    with delivered(item=SIGNS_IN.replace(SMOKE, path), files=(path,)) as run:
+        run.fake.create_pr(run.issue(2).branch, "main", "Later work", "")   # the branch is used again
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        run.run()
+        assert run.issue(2).phase == Phase.DONE and run.fake.issues[2]["state"] == "closed"
+
+
+def test_each_context_not_verified_on_the_merge_commit_is_read_on_main():
+    other = "verify/Other"
+    with delivered(files=(), contexts=(RHI, other)) as run:
+        [merge] = run.fake.commits[2]
+        head = push_main(run, files=(SMOKE,))
+        run.fake.set_status(merge, RHI, "success", VERIFIED)   # on a merge commit without the test
+        run.fake.set_status(head, other, "success", VERIFIED)
+        run.run()
+        [record] = [e for e in run.issue(2).evidence if e["criterion"] == "D2"]
+        assert (record["head_sha"], record["context"]) == (head, other)
+        assert run.fake.issues[2]["state"] == "closed"
+
+
+def test_an_unconfirmed_close_leaves_the_issue_delivered_until_github_closes_it():
+    with delivered() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        edit = run.fake.edit_issue
+
+        def no_close(n, **fields):
+            if fields.get("state") == "closed":
+                raise L.github.GitHubError("HTTP 502")
+            return edit(n, **fields)
+        run.fake.edit_issue = no_close
+        run.run()
+        assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DELIVERED, "open")
+        assert not run.issue(2).obligations, "discharged all the same"
+        run.fake.edit_issue = edit
+        run.run()
+        assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DONE, "closed")
+
+
+def test_a_discharge_keeps_the_rows_another_root_s_run_published():
+    later = "tests/smoke/deployed/test_later.py"
+    owner = ((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, later), DEPLOYED))
+    run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
+    run.deploy = dataclasses.replace(run.deploy, discharge_contexts=(RHI,))
+    try:
+        run.add_work(2, owner=owner, files=(SMOKE,))
+        run.run(root=EPIC)
+        run.fake.set_status(push_main(run), RHI, "success", VERIFIED)
+        run.run(root=2)   # a run of the issue alone adopts the delivery and proves D2
+        pr = present(run.issue(2, root=2).pr)
+
+        def rows():
+            return {line.split("|")[1].strip() for line in run.comment(pr, L.report.EVIDENCE_MARKER).splitlines()
+                    if line.startswith("| D")}
+        assert "D2" in rows()
+        run.fake.set_status(push_main(run, files=(later,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+        run.run(root=EPIC)   # the epic's run, which never saw D2 proven, proves D3
+        assert {"D2", "D3"} <= rows()
+        assert run.fake.issues[2]["state"] == "closed"
+    finally:
+        run.repo.cleanup()

@@ -185,8 +185,9 @@ class Deploy:
     discharge_contexts: tuple[str, ...] = ()
 
 
-# A context `discharge_contexts` accepts: a stage's verification, as the pipeline's reporter posts it.
-DISCHARGE_CONTEXT = re.compile(r"verify/[^/\s]+")
+# A context `discharge_contexts` accepts: a stage's verification, as the pipeline's reporter posts it,
+# under a name CodePipeline accepts for a stage (letters, digits and `.@_-`, at most 100 of them).
+DISCHARGE_CONTEXT = re.compile(r"verify/[A-Za-z0-9.@_-]{1,100}")
 
 
 def load_deploy(table) -> Deploy:
