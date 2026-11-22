@@ -22,15 +22,15 @@ after the first resuming it by the id Claude Code gave (`--resume`):
 | `open` | Opens the session: no skill in the folder, no MCP server | Claude Code answered and gave the session's id |
 | `skill` | The job puts the skill of `s3_second_session/skill/` in the folder's `.claude/skills/`, then asks for what only the skill says how to do | The skill's output: `field-note.txt` holds the skill's word and the run's reference |
 | `echo` | Resumes with an MCP configuration that adds the server of `s3_second_session/echo_server.py`, whose tool echo Claude Code then announces mid-conversation, and asks the model to call echo with a random text | echo was called and returned the text, and the answer quotes all it returned |
-| `pdf` | Asks the model to read a PDF the job generated (`s3_second_session/make_pdf.py`) and give its code word | An answer after the PDF: one of a turn that called a tool on the PDF's file or sent it as a document block |
+| `pdf` | Asks the model to read a PDF the job generated (`s3_second_session/make_pdf.py`) and give its code word | An answer after the PDF: one of a turn that sent it as a document block or in which a tool returned its text (its random word) |
 | `agents` | Part 1 of the task: two agents in parallel, then a figure | The figure's file, `figure.svg` |
 | `search` | Part 2 of the task: a web search | The search's answer: the reply gives an address that Claude Code's web search returned |
 
 The skill and the tool both arrive in the middle of the session, as a pack's do. Every turn from
 `echo` on keeps the MCP configuration, so the tool is not removed again. Each step's line holds,
 besides its result, what shows how the result came about: whether the skill was called, whether a
-request declared echo, whether Claude Code sent the PDF as a document block and whether the answer
-names the PDF's word, how many agents it started and how many in one message, and whether the web
+request declared echo, whether Claude Code sent the PDF as a document block, whether a tool returned
+its text and whether the answer names the PDF's word, how many agents it started and how many in one message, and whether the web
 search was called, failed, and returned addresses. An agent asked for counts as started only once a
 subagent's message names its call or its call returned no error. A reply that says the search could
 not be made is no search answer: only an address the search itself returned counts, its path as
@@ -111,9 +111,6 @@ SKILL_WORD = "lanternfish"
 ECHO_SERVER_NAME = "rhi_echo"
 ECHO_TOOL = f"mcp__{ECHO_SERVER_NAME}__echo"
 PDF_FILE = "notes.pdf"
-# The tools that can access a file, each with the field of its input that names what it reads or
-# runs: a call that names the PDF there tried to read it (a command may convert it to text first).
-PDF_READS = {"Read": "file_path", "Bash": "command", "Grep": "path"}
 FIGURE_FILE = "figure.svg"
 # Claude Code's tools that start an agent, by their names in its versions.
 AGENT_TOOLS = frozenset({"Task", "Agent"})
@@ -360,26 +357,23 @@ def echo_of(turn: Turn, text: str, servers: Mapping[str, str]) -> dict[str, Any]
     }
 
 
-def reads_pdf(block: Mapping[str, Any]) -> bool:
-    """Whether a tool call accesses the PDF: its file named where the tool reads (`PDF_READS`), not
-    anywhere in its input, which may be text written to another file."""
-    field = PDF_READS.get(block.get("name"))
-    held = block.get("input")
-    named = held.get(field) if field is not None and isinstance(held, dict) else None
-    return isinstance(named, str) and PDF_FILE in named
-
-
 def pdf_of(turn: Turn, word: str) -> dict[str, Any]:
-    """An answer after the PDF is an answer of a turn that shows the PDF was read, or tried: a tool
-    call that accesses its file, or a request that carries a document block. A reply to the prompt
-    alone, or one after only writing about the PDF, is recorded as `answered`, and is none."""
+    """An answer after the PDF is an answer of a turn in which the PDF reached the model: Claude Code
+    sent it as a document block (the endpoint's line in its place is that step's limit), or a tool
+    returned its text, which the random word only the PDF holds shows, whatever tool or command
+    converted it. A call that only names the file (a listing, a note about it) reads none of it: a
+    reply after one, or to the prompt alone, is recorded as `answered`, and is none."""
     answer = turn.answer()
     document = any(carries_document(one) for one in turn.exchanges)
-    read = any(reads_pdf(block) for _, block in turn.tool_uses())
+    text = any(word in held for error, held in turn.tool_results().values() if not error)
+    read_call = any(
+        PDF_FILE in str((block.get("input") or {}).get("file_path", "")) for block in turn.calls("Read")
+    )
     return {
-        "result_present": answer is not None and (document or read),
+        "result_present": answer is not None and (document or text),
         "answered": answer is not None,
-        "pdf_tool_call": read,
+        "pdf_read_call": read_call,
+        "pdf_text_returned": text,
         "document_block_sent": document,
         "names_word": answer is not None and word in answer,
     }

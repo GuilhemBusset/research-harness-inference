@@ -304,14 +304,24 @@ def test_echo_is_quoted_only_when_the_answer_holds_all_it_returned() -> None:
     assert not quoted("reply echo-a1b2", "echo-a1b2")
 
 
-def test_an_answer_after_the_pdf_needs_the_pdf_read_or_sent() -> None:
-    def present(*events: dict[str, Any]) -> bool:
-        return job.pdf_of(turn_of(job.Step.PDF, *events), "rhi0a1b2c")["result_present"]
+def test_an_answer_after_the_pdf_needs_the_pdf_sent_or_its_text_returned() -> None:
+    word = "rhi0a1b2c"
+
+    def present(*events: dict[str, Any], exchanges: list[Any] | None = None) -> bool:
+        return job.pdf_of(turn_of(job.Step.PDF, *events, exchanges=exchanges), word)["result_present"]
 
     assert not present(answer("The folder is ready."))
-    assert present(calls("m1", ("Read", {"file_path": job.PDF_FILE})), answer("It cannot be read here."))
-    assert present(calls("m1", ("Bash", {"command": f"pdftotext {job.PDF_FILE} -"})), answer("Done."))
-    # Writing about the PDF into another file is not reading it.
+    # Read sends the PDF as a document block: the reply after it counts, even one saying it cannot read it.
+    sent = {"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "base64"}}]}]}
+    read = calls("m1", ("Read", {"file_path": job.PDF_FILE}))
+    exchange = job.s2.Exchange("POST", "/v1/messages", json.dumps(sent).encode(), 0.5)
+    assert present(read, answer("It cannot be read here."), exchanges=[exchange])
+    # Its text returned by any command, which the PDF's word shows, counts.
+    convert = calls("m1", ("Bash", {"command": "pdftotext ./*.pdf -"}))
+    assert present(convert, returned("m1-0", f"The code word is {word}."), answer(word))
+    # Naming the file, to list it or to write about it, reads none of it.
+    listing = calls("m1", ("Bash", {"command": f"ls -l {job.PDF_FILE}"}))
+    assert not present(listing, returned("m1-0", f"-rw-r--r-- 1 600 {job.PDF_FILE}"), answer("The file is there."))
     note = ("Write", {"file_path": "summary.txt", "content": f"Could not read {job.PDF_FILE}."})
     assert not present(calls("m1", note), returned("m1-0", "Created summary.txt"), answer("I wrote a note."))
 
