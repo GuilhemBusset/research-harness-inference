@@ -14,9 +14,9 @@ from grafana_foundation_sdk.builders import stat as sdk_stat
 from grafana_foundation_sdk.builders import timeseries as sdk_timeseries
 from grafana_foundation_sdk.cog.encoder import JSONEncoder
 
-from rhi_common.engine_metrics import ENGINES, Kind, Quantity, metric_names
+from rhi_common.engine_metrics import ENGINES, Further, Kind, Quantity, further_names, metric_names
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_dashboards import rules
+from rhi_dashboards import check, rules
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -225,3 +225,39 @@ def test_every_query_names_its_data_source_by_the_identifier_the_image_provision
     panels = [*engine_panels(MOCK).values(), rules.percentile_timeseries("First token", "rhi_first_token_seconds")]
     for panel in map(as_json, panels):
         assert [target["datasource"] for target in panel["targets"]] == [prometheus] * len(panel["targets"])
+
+
+def test_a_further_quantity_is_read_from_the_row_that_names_it_with_the_labels_that_select_it() -> None:
+    vllm = dataclasses.replace(MOCK, engine="vllm", name="gpu")
+    computed = further_names("vllm")[Further.COMPUTED_INPUT_TOKENS]
+
+    assert rules.engine_reports(vllm, Further.COMPUTED_INPUT_TOKENS)
+    assert rules.engine_reports(MOCK, Quantity.OUTPUT_TOKENS)
+    assert not any(rules.engine_reports(MOCK, quantity) for quantity in Further)
+    # The computed input is one source of a family: every selector holds the label that selects it.
+    selector = f'{computed}_total{{pool="gpu", source="local_compute"}}'
+    assert rules.engine_selector(vllm, Further.COMPUTED_INPUT_TOKENS) == selector
+    assert (
+        rules.engine_rate(vllm, Further.COMPUTED_INPUT_TOKENS) == f"sum by (pool) (rate({selector}[$__rate_interval]))"
+    )
+    queue = further_names("vllm")[Further.QUEUE_TIME]
+    assert f"rate({queue}_bucket{{pool=" in rules.engine_quantile(vllm, 0.5, Further.QUEUE_TIME)
+    assert rules.engine_request_count(vllm, Further.QUEUE_TIME) == rules.request_count(queue, {"pool": "gpu"})
+    # A row that leaves the quantity out gives no name for it.
+    with pytest.raises(KeyError, match="leaves out"):
+        rules.engine_series(MOCK, Further.QUEUE_TIME, "_count")
+
+
+def test_the_check_holds_a_further_name_to_the_row_of_its_pools_engine() -> None:
+    vllm = dataclasses.replace(MOCK, engine="vllm", name="gpu")
+    pools = (MOCK, vllm)
+    declared = [rules.FromEngineTable(Further.DECODE_TIME)]
+    decode = rules.engine_rate(vllm, Further.DECODE_TIME, "_sum")
+    panel = as_json(rules.pool_timeseries(vllm, "Decode", [rules.Series("decode", decode, engine=True)]))
+    document = {"panels": [panel]}
+
+    assert check.violations(document, declared, pools) == []
+    # Undeclared, or queried for a pool whose engine leaves it out.
+    assert {one.rule for one in check.violations(document, [], pools)} == {"undeclared"}
+    on_mock = json.loads(json.dumps(document).replace('pool=\\"gpu\\"', 'pool=\\"mock\\"'))
+    assert "engine-row" in {one.rule for one in check.violations(on_mock, declared, pools)}

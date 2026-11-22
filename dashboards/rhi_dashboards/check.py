@@ -8,7 +8,7 @@ without the helpers is held to the same rules as one made with them. It reports:
 | `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
 | `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range |
-| `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise |
+| `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise or leaves its quantity out. An engine metric is any name of the per-engine table, its further quantities included |
 | `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
 | `undeclared` | A metric name no declaration covers: neither a declared family nor that family's name followed by a sample's suffix |
 | `declaration` | A declared file that is not in the repository or does not contain the name; an exporter with no exact version |
@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from rhi_common.engine_metrics import ENGINES, Kind, Quantity, metric_names
+from rhi_common.engine_metrics import ENGINES, Kind, further_names, metric_names
 from rhi_dashboards import rules
 
 if TYPE_CHECKING:
@@ -196,16 +196,21 @@ def _read(expression: str) -> _Expression:
     return _Expression(tuple(texts), tuple(selectors), tuple(calls))
 
 
-def _engine_names() -> dict[str, list[tuple[str, Quantity]]]:
-    """Every series name of the per-engine table: the engines and the quantity it names."""
-    names: dict[str, list[tuple[str, Quantity]]] = {}
+def _engine_names() -> dict[str, list[tuple[str, rules.EngineQuantity]]]:
+    """Every series name of the per-engine table, the further quantities' included: the engines and
+    the quantity it names."""
+    names: dict[str, list[tuple[str, rules.EngineQuantity]]] = {}
     for engine in ENGINES:
-        for quantity, family in metric_names(engine).items():
+        row: list[tuple[rules.EngineQuantity, Kind, str]] = [
+            *((quantity, quantity.kind, family) for quantity, family in metric_names(engine).items()),
+            *((quantity, family.kind, family) for quantity, family in further_names(engine).items()),
+        ]
+        for quantity, kind, family in row:
             samples = {
                 Kind.GAUGE: ("",),
                 Kind.COUNTER: ("", rules.COUNTER_SAMPLE),
                 Kind.HISTOGRAM: ("", *rules.HISTOGRAM_SAMPLES),
-            }[quantity.kind]
+            }[kind]
             for sample in samples:
                 names.setdefault(family + sample, []).append((engine, quantity))
     return names
@@ -333,7 +338,7 @@ def _reads_asleep(panel: Mapping[str, Any], pool: str) -> bool:
 
 def _panel_problems(
     panel: Mapping[str, Any],
-    covered: frozenset[Quantity],
+    covered: frozenset[rules.EngineQuantity],
     families: frozenset[str],
     pools: Mapping[str, Pool],
 ) -> Iterator[Violation]:
