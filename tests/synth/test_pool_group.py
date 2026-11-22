@@ -97,6 +97,17 @@ def test_the_mock_pool_group(pools: dict[str, Any], group: tuple[str, dict[str, 
     assert of_type(pools, "AWS::AutoScaling::ScalingPolicy") == {}
 
 
+def test_the_cost_dashboard_finds_each_pools_group_by_its_logical_id(pools: dict[str, Any]) -> None:
+    """CloudFormation names a group after its logical ID, which the cost dashboard searches for."""
+    from rhi_dashboards import cost
+
+    groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
+    assert len(groups) == len(EXAMPLE.pools) == 2
+    for pool in EXAMPLE.pools:
+        properties = groups[cost.group_logical_id(pool)]
+        assert [tag["Value"] for tag in properties["Tags"] if tag["Key"] == "rhi-pool"] == [pool.name]
+
+
 def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
     pools: dict[str, Any], group: tuple[str, dict[str, Any]]
 ) -> None:

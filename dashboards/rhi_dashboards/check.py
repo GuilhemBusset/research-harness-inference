@@ -5,7 +5,7 @@ without the helpers is held to the same rules as one made with them. It reports:
 
 | Rule | What breaks it |
 | --- | --- |
-| `data-source` | A query, or anything else in the dashboard, that does not name one of the two fixed data sources |
+| `data-source` | A query, or anything else in the dashboard, that names none of the two fixed data sources, nor one of Grafana's own two: its server-side expressions, or the mixed source of a panel whose queries each name their own |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
 | `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine counter, or a histogram's buckets or count, read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again. An engine gauge always does: it falls as well as rises, and what its samples "added" is no count |
 | `session` | In a panel of one value, a query, shown, that reads the session gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
@@ -40,6 +40,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The data sources a dashboard may name: identifier and type.
 DATA_SOURCES = {rules.PROMETHEUS_UID: "prometheus", rules.CLOUDWATCH_UID: "cloudwatch"}
+# Grafana's own, which read nothing themselves: identifier and type.
+BUILT_IN = {str(one.uid): str(one.type_val) for one in (rules.EXPRESSIONS, rules.MIXED)}
 # The functions that read a counter, which restarts from zero with its instance.
 COUNTER_FUNCTIONS = frozenset({"rate", "irate", "increase"})
 # The panels that show one value for each series, not its course over the range.
@@ -285,11 +287,12 @@ def _data_sources(value: object) -> Iterator[object]:
 
 
 def _is_fixed(source: object) -> bool:
-    """Whether a data source is named by one of the two fixed identifiers, with its type."""
+    """Whether a data source is named by one of the two fixed identifiers, or of Grafana's own two, with its type."""
     if not isinstance(source, dict):
         return False
     uid = source.get("uid")
-    return uid in DATA_SOURCES and source.get("type") == DATA_SOURCES[uid]
+    known = DATA_SOURCES | BUILT_IN
+    return uid in known and source.get("type") == known[uid]
 
 
 def _declaration_problems(declared: Iterable[rules.Declared], root: Path) -> Iterator[Violation]:
@@ -481,7 +484,7 @@ def violations(
     declared = (*rules.METRICS, *declared)
     found = list(_declaration_problems(declared, root))
     found += [
-        Violation("data-source", "the dashboard", "a data source that is not one of the two fixed ones")
+        Violation("data-source", "the dashboard", "a data source that is neither one of the two fixed ones nor Grafana's own")
         for source in _data_sources(document)
         if not _is_fixed(source)
     ]

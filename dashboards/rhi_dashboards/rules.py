@@ -81,6 +81,10 @@ PROMETHEUS_UID = "rhi-prometheus"
 CLOUDWATCH_UID = "rhi-cloudwatch"
 PROMETHEUS = common.DataSourceRef(type_val="prometheus", uid=PROMETHEUS_UID)
 CLOUDWATCH = common.DataSourceRef(type_val="cloudwatch", uid=CLOUDWATCH_UID)
+# Grafana's own, which are no data source: its server-side expressions, which compute from the
+# queries of a panel, and the mixed source of a panel whose queries each name their own.
+EXPRESSIONS = common.DataSourceRef(type_val="__expr__", uid="__expr__")
+MIXED = common.DataSourceRef(type_val="datasource", uid="-- Mixed --")
 
 # The label every series carries for its pool: the collector adds it to the engine's (7.2).
 POOL = "pool"
