@@ -9,6 +9,10 @@ log groups by their fixed names (`rhi.observability.grafana`). The stack and the
 logical ID are recorded in `tests/policy/stateful_logical_ids.json`: moving the workspace to
 another stack replaces it.
 
+Parked (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no Grafana service:
+the workspace and Grafana's log group, whose name is fixed (`rhi.observability.grafana.log_group`),
+stay, and the stack then reads nothing of another stack.
+
 Self-hosted Grafana is decision 11 of the design (section 15). Were the owner to choose Amazon
 Managed Grafana, the swap is this stack's `grafana` and nothing outside it.
 
@@ -24,13 +28,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
+from constructs import Construct
 
-from rhi.observability.grafana import Grafana
+from rhi.observability import grafana
 from rhi.observability.prometheus import PrometheusWorkspace
 
 if TYPE_CHECKING:
-    from constructs import Construct
-
     from rhi.access.stack import AccessStack
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
@@ -44,7 +47,7 @@ class ObservabilityStack(cdk.Stack):
     (`prometheus.workspace`, `prometheus.write_policy`, `prometheus.query_policy`), the
     workspace's query address, as the output `workspace_url`, and Grafana, as `grafana`, reached
     through the network's HTTPS listener behind the access stack's sign-in, or from nowhere while
-    there is no listener."""
+    there is no listener; parked, `grafana` is None."""
 
     def __init__(
         self,
@@ -71,7 +74,12 @@ class ObservabilityStack(cdk.Stack):
             description="The metrics workspace's query address.",
             value=self.prometheus.workspace.attr_prometheus_endpoint,
         )
-        self.grafana = Grafana(
+        self.grafana: grafana.Grafana | None = None
+        if config.parked:
+            # Grafana's log group alone, at Grafana's path.
+            grafana.log_group(Construct(self, "Grafana"))
+            return
+        self.grafana = grafana.Grafana(
             self,
             "Grafana",
             config=config,

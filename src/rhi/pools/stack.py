@@ -14,6 +14,17 @@ The stack declares two outputs, which the pipeline's verification takes as input
   the JSON of an action's configuration as it is.
 - `HeartbeatsTable`: the name of the heartbeats table, which CloudFormation generates. The
   verification reads there the last lifecycle stage each instance reached.
+
+**Parked** (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no internal load
+balancer, no group, warm pool or lifecycle hook, no release and no scaler or its schedule: nothing
+runs. The tables, the model bucket, each pool's instance role with its log group, each pool's
+secret and the scaler's log group, whose name is fixed (`rhi.pools.scaler.log_group`), stay, and
+`ReleaseParameters` reads `NO_POOL`. The stack still deploys after the network stack and the
+observability stack, whose exports it imports: the model bucket's policy names the S3 endpoint, and
+the instance roles the workspace. So the exports of those two stacks that it imports unparked and
+that name what stays (`_keep_exports`) are kept, through the exporting stack's `export_value`: an
+export that a deployed stack imports cannot be deleted, and this stack's update, which drops the
+import, comes after theirs.
 """
 
 from __future__ import annotations
@@ -22,7 +33,9 @@ from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
+from constructs import Construct
 
+from rhi.network.vpc import PRIVATE
 from rhi.pools import image
 from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
@@ -30,14 +43,12 @@ from rhi.pools.model_store import ModelStore
 from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
-from rhi.pools.scaler import Scaler
+from rhi.pools.scaler import Scaler, log_group
 from rhi.pools.secret import PoolSecret
 from rhi.pools.tables import PoolTables
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from constructs import Construct
 
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
@@ -95,6 +106,8 @@ class PoolsStack(cdk.Stack):
         self.add_stack_dependency(
             network, "The internal load balancer logs to a bucket whose policy is in the network stack."
         )
+        if config.parked:
+            self._keep_exports(network, observability)
         self.tables = PoolTables(self, "Tables")
         # The heartbeat table's name, which the deployment generates, for the pipeline's verification.
         self.heartbeats_table_output = cdk.CfnOutput(
@@ -106,15 +119,6 @@ class PoolsStack(cdk.Stack):
         # The pools' weights, read through the network's S3 gateway endpoint and no other way. The
         # stage holds the one bucket whatever its pools: a pool's weights outlive the pool.
         self.model_store = ModelStore(self, "ModelStore", endpoint=network.s3_endpoint)
-        # With the pools table empty, the listener and its default 404, and no target group.
-        self.routing = Routing(
-            self,
-            "Routing",
-            vpc=network.vpc,
-            security_group=network.security_groups.internal_load_balancer,
-            access_logs_bucket=network.access_logs.bucket,
-            pools=config.pools,
-        )
         # One instance role per pool, with its log group, by the pool's name. A GPU pool's role is
         # under the GPU pools' path and reads its own pool's weights; the mock pool has none.
         self.roles = {
@@ -133,6 +137,45 @@ class PoolsStack(cdk.Stack):
             pool.name: PoolSecret(self, f"Secret-{pool.name}", pool=pool.name, role=self.roles[pool.name].role)
             for pool in config.pools
         }
+        self.routing: Routing | None = None
+        self.groups: dict[str, PoolGroup] = {}
+        self.scaler: Scaler | None = None
+        self.releases: dict[str, PoolRelease] = {}
+        self.hooks: dict[str, PoolHooks] = {}
+        if config.parked:
+            # The scaler's log group alone, at the scaler's path.
+            log_group(Construct(self, "Scaler"))
+        else:
+            self._fleet(config, network, observability)
+        # The name of each pool's release parameter, by the pool's name, as text: a stack that does
+        # not hold the parameter, the pipeline's, names it so. The output holds the same names.
+        self.release_parameters = {name: release_parameter(name) for name in self.releases}
+        self.release_parameters_output = cdk.CfnOutput(
+            self,
+            "ReleaseParameters",
+            description="Each pool's name and the name of its release parameter.",
+            value=release_parameters_text(self.release_parameters),
+        )
+        # The groups' and the releases' AWS SDK custom resources run on one function the CDK puts at the stack's root. That
+        # function names its role's ARN, which orders the two already; its `DependsOn` on the role
+        # repeats it, and cfn-lint warns (W3005).
+        provider = self.node.try_find_child("AWS" + cr.AwsCustomResource.PROVIDER_FUNCTION_UUID.replace("-", ""))
+        if provider is not None:
+            function = provider.node.find_child("Resource")
+            assert isinstance(function, cdk.CfnResource)
+            function.add_deletion_override("DependsOn")
+
+    def _fleet(self, config: Config, network: NetworkStack, observability: ObservabilityStack) -> None:
+        """What runs: the internal load balancer, the groups, the scaler, the releases and the hooks."""
+        # With the pools table empty, the listener and its default 404, and no target group.
+        self.routing = Routing(
+            self,
+            "Routing",
+            vpc=network.vpc,
+            security_group=network.security_groups.internal_load_balancer,
+            access_logs_bucket=network.access_logs.bucket,
+            pools=config.pools,
+        )
         # One launch template and group per pool, by the pool's name; none with the table empty.
         self.groups = {
             pool.name: PoolGroup(
@@ -162,7 +205,6 @@ class PoolsStack(cdk.Stack):
         # One release per pool, by the pool's name: its engine image, the parameter its instances
         # read at every start, and the refresh of its group when the release changes. The pools
         # share the release's files and what runs the refreshes; with the table empty there is none.
-        self.releases: dict[str, PoolRelease] = {}
         if config.pools:
             files = ReleaseFiles(self, "ReleaseFiles")
             refresher = InstanceRefresher(self, "InstanceRefresher", pools=config.pools)
@@ -180,15 +222,6 @@ class PoolsStack(cdk.Stack):
                 )
                 for pool in config.pools
             }
-        # The name of each pool's release parameter, by the pool's name, as text: a stack that does
-        # not hold the parameter, the pipeline's, names it so. The output holds the same names.
-        self.release_parameters = {name: release_parameter(name) for name in self.releases}
-        self.release_parameters_output = cdk.CfnOutput(
-            self,
-            "ReleaseParameters",
-            description="Each pool's name and the name of its release parameter.",
-            value=release_parameters_text(self.release_parameters),
-        )
         # One launch hook and one termination hook per pool, by the pool's name. They come last among
         # a pool's pieces: with them, an instance enters service only when its agent completes the
         # launch hook, which takes the role, the secret and the release above.
@@ -196,11 +229,16 @@ class PoolsStack(cdk.Stack):
             pool.name: PoolHooks(self, f"Hooks-{pool.name}", pool=pool, group=self.groups[pool.name].group)
             for pool in config.pools
         }
-        # The groups' and the releases' AWS SDK custom resources run on one function the CDK puts at the stack's root. That
-        # function names its role's ARN, which orders the two already; its `DependsOn` on the role
-        # repeats it, and cfn-lint warns (W3005).
-        provider = self.node.try_find_child("AWS" + cr.AwsCustomResource.PROVIDER_FUNCTION_UUID.replace("-", ""))
-        if provider is not None:
-            function = provider.node.find_child("Resource")
-            assert isinstance(function, cdk.CfnResource)
-            function.add_deletion_override("DependsOn")
+
+    def _keep_exports(self, network: NetworkStack, observability: ObservabilityStack) -> None:
+        """Parked, keeps the exports this stack imports unparked of what stays in the network stack
+        and the observability stack (the module's docstring)."""
+        for value in (
+            network.vpc.vpc_id,
+            *network.vpc.select_subnets(subnet_group_name=PRIVATE).subnet_ids,
+            network.security_groups.internal_load_balancer.security_group_id,
+            network.security_groups.instances.security_group_id,
+            network.access_logs.bucket.bucket_name,
+        ):
+            network.export_value(value)
+        observability.export_value(observability.prometheus.workspace.attr_prometheus_endpoint)

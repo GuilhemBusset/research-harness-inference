@@ -195,6 +195,19 @@ TARGET_HEALTH_ACTIONS = ["elasticloadbalancing:DescribeTargetHealth"]
 INVOKE_ACTIONS = ["lambda:InvokeFunction"]
 
 
+def log_group(scope: Construct) -> logs.LogGroup:
+    """The gateway's log group, of a fixed name, as the child `Logs` of `scope`: the construct's own, or,
+    for a parked stage, a construct of the same ID that holds the log group alone, so that it keeps
+    its logical ID while what writes to it is gone (system design, section 5.6)."""
+    return logs.LogGroup(
+        scope,
+        "Logs",
+        log_group_name=LOG_GROUP_NAME,
+        retention=LOG_RETENTION,
+        removal_policy=cdk.RemovalPolicy.DESTROY,
+    )
+
+
 class GatewayService(Construct):
     """The gateway's cluster, as `cluster`, its task definition, as `task_definition`, the task's
     role, as `task_role`, the two containers' log group, as `log_group`, and the service, as
@@ -251,13 +264,7 @@ class GatewayService(Construct):
             iam.PolicyStatement(actions=list(prometheus.WRITE_ACTIONS), resources=[workspace.workspace.attr_arn])
         )
 
-        self.log_group = logs.LogGroup(
-            self,
-            "Logs",
-            log_group_name=LOG_GROUP_NAME,
-            retention=LOG_RETENTION,
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-        )
+        self.log_group = log_group(self)
 
         # The gateway's metrics go to the workspace: Container Insights would be a second store.
         self.cluster = ecs.Cluster(self, "Cluster", vpc=vpc, container_insights_v2=ecs.ContainerInsights.DISABLED)

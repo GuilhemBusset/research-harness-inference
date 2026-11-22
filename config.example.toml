@@ -108,6 +108,12 @@ cost_anomaly_detection = false
 # alerts topic (system design, sections 11.3 and 17). Left out, it is 1.
 outside_sessions_alarm_hours = 1
 
+# Whether the stage is parked: the whole endpoint switched off, between cohorts or between sessions
+# (system design, sections 5.6 and 11.2). Parked, the stage keeps its data and the pipeline and
+# drops the load balancers, the NAT gateway, the Fargate services, the pools' groups and the
+# scaler. Left out, it is false.
+parked = false
+
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They
 # are in the order of their names, which is the order the configuration in SSM is read in.

@@ -10,6 +10,10 @@ Each module of the stack defines a construct class, so that a cdk-nag finding on
 resources belongs to that module's acknowledgement file: `rhi.guardrails.alerts`,
 `rhi.guardrails.anomaly` and `rhi.guardrails.alarms_fleet`, whose alarms read the pools' groups from
 the pools stack. The stack creates no resource of its own.
+
+Parked (the configuration's `parked`, sections 5.6 and 11.2), there is no pool group, no scaler
+and no gateway to watch: the stack holds no fleet alarm, and keeps the alerts topic and Cost
+Anomaly Detection, since the budget still counts.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ if TYPE_CHECKING:
 
 class GuardrailsStack(cdk.Stack):
     """Holds the alerts topic and its key, as `alerts`, Cost Anomaly Detection, as `anomaly`, and the
-    fleet's alarms over the pools' groups, `groups` by the pool's name, as `alarms_fleet`."""
+    fleet's alarms over the pools' groups, `groups` by the pool's name, as `alarms_fleet`, which is
+    None for a parked stage."""
 
     def __init__(
         self, scope: Construct, construct_id: str, *, config: Config, groups: Mapping[str, PoolGroup]
@@ -46,4 +51,6 @@ class GuardrailsStack(cdk.Stack):
         cdk.CrossStackReferences.of(self).consume(cdk.ReferenceStrength.WEAK)
         self.alerts = Alerts(self, "Alerts", config=config)
         self.anomaly = Anomaly(self, "Anomaly", config=config, topic=self.alerts.topic)  # ty: ignore[invalid-argument-type] - as in `rhi.guardrails.alerts`
-        self.alarms_fleet = AlarmsFleet(self, "AlarmsFleet", config=config, groups=groups, topic=self.alerts.topic)  # ty: ignore[invalid-argument-type] - as in `rhi.guardrails.alerts`
+        self.alarms_fleet: AlarmsFleet | None = None
+        if not config.parked:
+            self.alarms_fleet = AlarmsFleet(self, "AlarmsFleet", config=config, groups=groups, topic=self.alerts.topic)  # ty: ignore[invalid-argument-type] - as in `rhi.guardrails.alerts`
