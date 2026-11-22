@@ -14,6 +14,15 @@ expression in UTC. Section 8.5 holds deployments outside session windows; the ca
 deployment, so the hold does not apply to it. Neither the configuration nor the design gives a
 time: this module fixes it.
 
+**While the system is parked** (the configuration's `parked`, sections 8.5 and 11.2), there is no
+endpoint to test, and the canary does not run: the construct creates no schedule, and with it
+neither the job nor its role, so that nothing is left that could start a build, by hand or
+otherwise, and the rule of `tests/policy/test_pipeline.py` that gives the canary's job exactly one
+schedule holds in the parked synthesis too. Only the job's log group stays, under its logical ID,
+with the logs of the runs before; unparked, the job, its role and its schedule are created again
+as they were. The pipeline is synthesized from the stage's configuration, so the flag is known
+here at synthesis.
+
 **What the job is told**, as text built at synthesis, since this stack holds no reference to a
 resource of the stage:
 
@@ -86,7 +95,7 @@ COMMANDS = ["uv sync --locked", f"uv run --locked python {SCRIPT}"]
 class GpuCanary(Construct):
     """The canary's job, as a project of the stack, and its weekly schedule. `connection_arn` is
     the pipeline's connection, `repository` the repository as owner/name, and `stage` the stage
-    whose endpoint the job tests."""
+    whose endpoint the job tests. While `parked`, only the job's log group: no job, no schedule."""
 
     def __init__(
         self,
@@ -96,6 +105,7 @@ class GpuCanary(Construct):
         connection_arn: str,
         repository: str,
         stage: cdk.Stage,
+        parked: bool = False,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -106,26 +116,32 @@ class GpuCanary(Construct):
             retention=LOG_RETENTION,
             removal_policy=cdk.RemovalPolicy.DESTROY,
         )
+        self.role: iam.Role | None = None
+        self.project: codebuild.Project | None = None
+        self.rule: events.Rule | None = None
+        if parked:
+            # No endpoint to test: no schedule, and no job for one to start.
+            return
         # ty reads the CDK's generated principal and role as unlike their protocols: jsii passes a
         # renamed parameter by position.
         codebuild_service = iam.ServicePrincipal("codebuild.amazonaws.com")
-        self.role = iam.Role(self, "Role", assumed_by=codebuild_service)  # ty: ignore[invalid-argument-type]
+        role = iam.Role(self, "Role", assumed_by=codebuild_service)  # ty: ignore[invalid-argument-type]
         environment: dict[str, str] = {"PYTHONPATH": ":".join(import_path())}
         for statement in self._statements(stack, stage, environment):
-            self.role.add_to_policy(statement)
+            role.add_to_policy(statement)
         connection_access = iam.Grant.add_to_principal(
-            grantee=self.role, actions=CONNECTION_ACTIONS, resource_arns=[connection_arn]
+            grantee=role, actions=CONNECTION_ACTIONS, resource_arns=[connection_arn]
         )
-        reporter.measuring_job(self.role, environment)
+        reporter.measuring_job(role, environment)
 
         owner, _, name = repository.partition("/")
-        self.project = codebuild.Project(
+        project = codebuild.Project(
             self,
             "Project",
             project_name=NAME,
             description=f"The weekly GPU canary: {SCRIPT}, started by its schedule.",
             # A role that takes no statement: what CodeBuild's construct would add is not added.
-            role=self.role.without_policy_updates(),
+            role=role.without_policy_updates(),
             # No webhook, and no status of CodeBuild's own: the result reaches GitHub only through
             # the reporter, in its fixed vocabulary.
             source=codebuild.Source.git_hub(
@@ -150,13 +166,14 @@ class GpuCanary(Construct):
             timeout=TIMEOUT,
         )
         # The repository through the pipeline's connection, not through a credential of the account.
-        resource = self.project.node.default_child
+        resource = project.node.default_child
         assert isinstance(resource, codebuild.CfnProject)
         resource.add_property_override("Source.Auth", {"Type": "CODECONNECTIONS", "Resource": connection_arn})
-        connection_access.apply_before(self.project)
+        connection_access.apply_before(project)
+        self.role, self.project = role, project
 
         # The schedule, whose one target is the job. Its role may start a build of the job alone.
-        target = targets.CodeBuildProject(self.project)
+        target = targets.CodeBuildProject(project)
         self.rule = events.Rule(
             self,
             "Schedule",

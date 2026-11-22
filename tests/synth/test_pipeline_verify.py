@@ -131,6 +131,20 @@ class Verification:
         return [s for s in self.statements if any(a.startswith(f"{service}:") for a in as_list(s["Action"]))]
 
 
+def fake_aws(folder: Path) -> Path:
+    """A folder that holds the AWS CLI, as far as the post-build phase uses it: `aws s3 cp <file>
+    s3://<bucket>/<key>` copies into the folder `$BUCKETS`, and fails while `$REFUSES` is set."""
+    tools = folder / "tools"
+    tools.mkdir()
+    (tools / "aws").write_text(
+        '#!/bin/sh\n[ "$#" = 4 ] && [ "$1 $2" = "s3 cp" ] || exit 64\n[ -z "$REFUSES" ] || exit 1\n'
+        'to="$BUCKETS/${4#s3://}"\nmkdir -p "$(dirname "$to")" && cp "$3" "$to"\n',
+        encoding="utf-8",
+    )
+    (tools / "aws").chmod(0o755)
+    return tools
+
+
 @pytest.fixture(scope="module")
 def verification(templates: Templates) -> Verification:
     """The verification of the app's pipeline."""
@@ -180,15 +194,7 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
     for file in (reason_file, failed_file, stages_file):
         assert Path(by_project[file]).is_absolute() and not by_project[file].startswith("/codebuild")
 
-    # The AWS CLI, as far as the phase uses it: `aws s3 cp <file> s3://<bucket>/<key>`, into a folder.
-    tools, buckets = tmp_path / "tools", tmp_path / "buckets"
-    tools.mkdir()
-    (tools / "aws").write_text(
-        '#!/bin/sh\n[ "$#" = 4 ] && [ "$1 $2" = "s3 cp" ] || exit 64\n[ -z "$REFUSES" ] || exit 1\n'
-        'to="$BUCKETS/${4#s3://}"\nmkdir -p "$(dirname "$to")" && cp "$3" "$to"\n',
-        encoding="utf-8",
-    )
-    (tools / "aws").chmod(0o755)
+    tools, buckets = fake_aws(tmp_path), tmp_path / "buckets"
 
     def post_build(
         reason: str | None, *, failed: str | None = None, stages: str | None = None, refuses: bool = False
@@ -475,3 +481,59 @@ def test_a_stage_with_no_pool_gives_no_parameter_to_read(app_module: ModuleType,
     _, value, _ = verification.output(script.RELEASE_PARAMETERS_VARIABLE)
     assert script.release_parameters(value) == {}
     assert verification.allowed("ssm") == []
+
+
+def test_parked_the_verification_runs_no_test_and_leaves_parked_as_not_run(
+    app_module: ModuleType, tmp_path: Path
+) -> None:
+    parked = build(app_module, tmp_path / "cdk.out", lambda data: data.update(parked=True))
+    # Still the one action named Verify, after every deployment action of the stage, on the source.
+    assert parked.action["ActionTypeId"]["Provider"] == "CodeBuild"
+    assert parked.action["RunOrder"] > max(action["RunOrder"] for action in parked.deployments())
+    (source,) = parked.pipeline["Stages"][0]["Actions"]
+    assert parked.action["InputArtifacts"] == source["OutputArtifacts"]
+    # No smoke test, no decision, no environment to run them in, and nothing read of the stage.
+    commands = [command for phase in parked.phases.values() for command in phase["commands"]]
+    assert not any(word in command for command in commands for word in ("uv ", "verify.py", "gpu_verification.py"))
+    by_action, by_project = parked.given_by_the_action(), parked.given_by_the_project()
+    assert list(by_action.values()) == [EXECUTION_ID]
+    assert "OutputArtifacts" not in parked.action or not parked.action["OutputArtifacts"]
+
+    # The post-build phase writes the one line parked to the execution's not-run mark, and passes;
+    # a copy that fails fails it.
+    tools, buckets = fake_aws(tmp_path), tmp_path / "buckets"
+    (execution,) = [name for name, value in by_action.items() if value == EXECUTION_ID]
+    (bucket,) = [name for name, value in by_project.items() if value == parked.pipeline["ArtifactStore"]["Location"]]
+
+    def post_build(*, refuses: bool) -> tuple[int, dict[str, str]]:
+        shutil.rmtree(buckets, ignore_errors=True)
+        environ = {
+            "PATH": f"{tools}:/usr/bin:/bin",
+            "BUCKETS": str(buckets),
+            "REFUSES": "yes" if refuses else "",
+            script.REASON_FILE_VARIABLE: str(tmp_path / "reason"),
+            bucket: "artifacts",
+            execution: "an-execution",
+        }
+        script_text = "set -e\n" + "\n".join(parked.phases["post_build"]["commands"])
+        exit_code = subprocess.run(["/bin/sh", "-c", script_text], env=environ, check=False).returncode
+        objects = {
+            path.relative_to(buckets).as_posix(): path.read_text(encoding="utf-8")
+            for path in buckets.rglob("*")
+            if path.is_file()
+        }
+        return exit_code, objects
+
+    assert post_build(refuses=False) == (0, {"artifacts/verification/an-execution/not-run": "parked\n"})
+    assert post_build(refuses=True)[0] != 0
+
+    # The role writes under verification/ and holds nothing else but CodeBuild's own.
+    services = {action.partition(":")[0] for s in parked.statements for action in as_list(s["Action"])}
+    assert services == {"s3", "logs", "codebuild"}
+    store = parked.pipeline["ArtifactStore"]["Location"]["Ref"]
+    writes = [
+        statement
+        for statement in parked.allowed("s3")
+        if not all(re.fullmatch(r"s3:(Get|List)\w*\*?", action) for action in as_list(statement["Action"]))
+    ]
+    assert [(w["Action"], text(w["Resource"])) for w in writes] == [("s3:PutObject", f"<{store}.Arn>/verification/*")]

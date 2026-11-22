@@ -27,6 +27,9 @@
 # The schedule's role, which EventBridge assumes to start the job:
 # - codebuild:StartBuild on the canary's project only. Nothing else.
 #
+# While the configuration is parked, the construct creates neither role, nor the project or the
+# schedule: only the job's log group stays, which has no role and brings no finding.
+#
 # What the AWS Solutions pack finds on the project is fixed where it can be: the project runs
 # CodeBuild's standard image (AwsSolutions-CB5) and is not privileged (AwsSolutions-CB3). The key
 # AWS manages encrypts what CodeBuild stores of a build (AwsSolutions-CB4), acknowledged below.
