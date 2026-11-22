@@ -88,11 +88,12 @@ that `rhi_admin roster list` prints.
 
    ```sh
    for table in <keys-table> <usage-table>; do
-       aws dynamodb scan --table-name "$table" --projection-expression github_id --query 'Items[].github_id.N' --output text || echo "INCOMPLETE: $table was not read" >&2
+       aws dynamodb scan --table-name "$table" --consistent-read --projection-expression github_id --query 'Items[].github_id.N' --output text || echo "INCOMPLETE: $table was not read" >&2
    done | tr '\t' '\n' | sort -u
    ```
 
-   Each ID it prints that the roster does not list is a student removed during the course (or one
+   The scan reads with strong consistency. A default scan reads with eventual consistency, so
+   it can miss a row written a moment before. Each ID it prints that the roster does not list is a student removed during the course (or one
    whose earlier erase was interrupted). Note those IDs, in your terminal only, for Act, step 3. A
    line `INCOMPLETE` means the list is not whole: run it again.
 

@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -40,11 +41,12 @@ SECTIONS = ["when", "check", "act", "verify"]
 FENCE = re.compile(r"^(`{3,}|~{3,})")
 
 
-def read(text: str) -> tuple[list[str], list[list[tuple[str, bool]]]]:
+def read(text: str) -> tuple[list[str], list[list[Word]]]:
     """The level-2 headings outside the code blocks, and the words of every line of every fenced code
-    block (backticks or tildes): a `\\` continues a line, and blank and comment lines are left out."""
+    block (backticks or tildes), then of every substitution's command in it: a `\\` continues a
+    line, and blank and comment lines are left out."""
     headings: list[str] = []
-    lines: list[list[tuple[str, bool]]] = []
+    lines: list[list[Word]] = []
     fence, pending = "", ""
     for line in text.splitlines():
         opening = FENCE.match(line.strip())
@@ -61,9 +63,11 @@ def read(text: str) -> tuple[list[str], list[list[tuple[str, bool]]]]:
         if pending.endswith("\\"):
             pending = pending[:-1] + " "
             continue
-        words = split(pending)
-        if words:
-            lines.append(words)
+        bodies = [pending]
+        while bodies:
+            words = split(bodies.pop(0), bodies)
+            if words:
+                lines.append(words)
         pending = ""
     return headings, lines
 
@@ -81,34 +85,78 @@ def _is_repository_path(word: str) -> bool:
     return "/" in word and not word.startswith(("/", "~", "$", "-")) and "://" not in word
 
 
-CONTROL = {"|", "|&", "||", "&&", "&", ";", ";;", ";&", ";;&"}
+CONTROL = {"|", "|&", "||", "&&", "&", ";", ";;", ";&", ";;&", "(", ")"}
 REDIRECTION = {"<", ">", ">>", ">|", "<>", "<<", "<<-", "<<<", ">&", "<&", "&>", "&>>"}
 OPERATORS = sorted(CONTROL | REDIRECTION, key=len, reverse=True)  # longest first: `>>` before `>`
 NUMBERED = REDIRECTION - {"&>", "&>>"}  # the redirections a descriptor's number may start: `2&>` is `2`, then `&>`
+SUBSTITUTIONS = ("$(", "<(", ">(")  # a command's output, or a file that stands for it: never a redirection
+EXPANDING = set("$*?[{")  # unquoted, what the shell may replace by any number of words
 
 
-def _quoted(line: str, index: int) -> tuple[str, int]:
-    """The text of the quoted string that starts at `line[index]`, and the index after it. Inside
-    double quotes a backslash escapes only `$`, a backtick, `"` and itself, as in the shell."""
-    quote, end, text = line[index], index + 1, ""
+class Word(NamedTuple):
+    """A word of a shell line: an operator, or a word the shell may expand (`$x`, `*`, `<(cmd)`), or literal text."""
+
+    text: str
+    operator: bool = False
+    expanded: bool = False
+
+
+def _substitution(line: str, index: int, bodies: list[str]) -> int:
+    """The index after the substitution whose `(` or backtick is `line[index]`; its body joins `bodies`."""
+    close, depth, end = ("`" if line[index] == "`" else ")"), 1, index + 1
+    while end < len(line):
+        char = line[end]
+        if char == "\\":
+            end += 2
+            continue
+        if close == ")" and char in "'\"":
+            end = _quoted(line, end, bodies)[1]
+            continue
+        if close == ")" and (line.startswith(SUBSTITUTIONS, end) or char == "`"):
+            end = _substitution(line, end + (char != "`"), bodies)
+            continue
+        depth += close == ")" and char == "("
+        depth -= char == close
+        if depth == 0:
+            bodies.append(line[index + 1 : end])
+            return end + 1
+        end += 1
+    raise ValueError(f"no end of the substitution in: {line}")  # the shell refuses the line too
+
+
+def _quoted(line: str, index: int, bodies: list[str]) -> tuple[str, int, bool]:
+    """The text of the quoted string that starts at `line[index]`, the index after it, and whether it
+    holds an expansion (`$`, a backtick: double quotes only). Inside double quotes a backslash escapes
+    only `$`, a backtick, `"` and itself, as in the shell."""
+    quote, end, text, expanded = line[index], index + 1, "", False
     while end < len(line) and line[end] != quote:
+        start = end
         if quote == '"' and line[end] == "\\" and line[end + 1 : end + 2] in ("$", "`", '"', "\\"):
             end += 1
+        elif quote == '"' and (line.startswith("$(", end) or line[end] == "`"):
+            end, expanded = _substitution(line, end + (line[end] == "$"), bodies), True
+            text += line[start:end]
+            continue
+        elif quote == '"' and line[end] == "$":
+            expanded = True
         text, end = text + line[end], end + 1
     if end >= len(line):
         raise ValueError(f"no closing quotation in: {line}")  # as shlex.split, where the shell refuses the line
-    return text, end + 1
+    return text, end + 1, expanded
 
 
-def split(line: str) -> list[tuple[str, bool]]:
-    """The words of a shell line, less its comment, each with whether it is an operator, read as the
-    shell reads them: an unquoted control operator or redirection ends a word with or without a
-    blank (`/dev/null;rhi` is a file, `;` and a command), a quoted or escaped one is part of a word,
-    a `#` starts a comment only where a word starts (so neither `report#draft` nor `report\\ #draft`
-    hides what follows), and the digits of a descriptor (`2>`) belong to their redirection."""
-    found: list[tuple[str, bool]] = []
+def split(line: str, bodies: list[str] | None = None) -> list[Word]:
+    """The words of a shell line, less its comment, read as the shell reads them: an unquoted control
+    operator or redirection ends a word with or without a blank (`/dev/null;rhi` is a file, `;` and a
+    command), a quoted or escaped one is part of a word, a `#` starts a comment only where a word
+    starts (so neither `report#draft` nor `report\\ #draft` hides what follows), the digits of a
+    descriptor (`2>`) belong to their redirection, and a substitution (`$(cmd)`, `<(cmd)`, a
+    backtick) is part of its word, which is marked expanded, its command joining `bodies`."""
+    bodies = [] if bodies is None else bodies
+    found: list[Word] = []
     word: str | None = None  # None between words; "" for a word of empty quotes so far
     digits = False  # whether the word so far is only unquoted, unescaped digits, which a redirection takes
+    expanded = False
     index = 0
     while index < len(line):
         char = line[index]
@@ -116,36 +164,41 @@ def split(line: str) -> list[tuple[str, bool]]:
         if char == "\\":
             word, index, digits = (word or "") + line[index + 1 : index + 2], index + 2, False
         elif char in "'\"":
-            text, index = _quoted(line, index)
-            word, digits = (word or "") + text, False
+            text, index, quoted_expansion = _quoted(line, index, bodies)
+            word, digits, expanded = (word or "") + text, False, expanded or quoted_expansion
         elif char == "#" and word is None:
             break
+        elif line.startswith(SUBSTITUTIONS, index) or char == "`":
+            end = _substitution(line, index + (char != "`"), bodies)
+            word, index, digits, expanded = (word or "") + line[index:end], end, False, True
         elif operator or char in " \t":
             if word is not None and not (digits and operator in NUMBERED):
-                found.append((word, False))
-            word, digits = None, False
+                found.append(Word(word, expanded=expanded))
+            word, digits, expanded = None, False, False
             if operator:
-                found.append((operator, True))
+                found.append(Word(operator, operator=True))
             index += len(operator) or 1
         else:
             digits = char in "0123456789" and (word is None or digits)  # ASCII only, as the shell reads them
+            lone = char == "$" and line[index + 1 : index + 2] in ("", " ", "\t")  # a `$` before a blank is a `$`
+            expanded = expanded or (char in EXPANDING and not lone)
             word, index = (word or "") + char, index + 1
     if word is not None:
-        found.append((word, False))
+        found.append(Word(word, expanded=expanded))
     return found
 
 
-def commands(words: list[tuple[str, bool]]) -> list[list[str]]:
+def commands(words: list[Word]) -> list[list[Word]]:
     """The commands of a line: the words between its control operators, each without its
     redirections and their files, so that each command of a pipeline is checked on its own."""
-    found: list[list[str]] = [[]]
+    found: list[list[Word]] = [[]]
     target = False
-    for word, operator in words:
+    for word in words:
         if target:
             target = False
-        elif operator and word in CONTROL:
+        elif word.operator and word.text in CONTROL:
             found.append([])
-        elif operator:
+        elif word.operator:
             target = True
         else:
             found[-1].append(word)
@@ -153,18 +206,23 @@ def commands(words: list[tuple[str, bool]]) -> list[list[str]]:
 
 
 def problems(text: str, root: Path = ROOT) -> list[str]:
-    """What is wrong with a runbook: a missing section, a command that does not parse, a path that is not there."""
+    """What is wrong with a runbook: a missing section, a command that does not parse, a path that
+    is not there, or a command of this repository whose words the shell decides only when it runs."""
     found = []
     headings, lines = read(text)
     if [h for h in headings if h in SECTIONS] != SECTIONS:
         found.append(f"the sections are {headings}, not {SECTIONS} in that order")
     admin = admin_main.parser()
+    clis = {"rhi": ("the rhi CLI", rhi_main.parser), admin.prog: ("the admin CLI", lambda: admin)}
     for words in (command for line in lines for command in commands(line)):
-        first, rest = words[0], words[1:]
-        if first == "rhi" and _refuses(rhi_main.parser(), rest):
-            found.append(f"the rhi CLI refuses: {shlex.join(words)}")
-        elif first == admin.prog and _refuses(admin, rest):
-            found.append(f"the admin CLI refuses: {shlex.join(words)}")
+        first, rest = words[0].text, [word.text for word in words[1:]]
+        shown = shlex.join(word.text for word in words)
+        if first in clis and any(word.expanded for word in words[1:]):
+            found.append(f"the arguments are known only when the shell runs: {shown}")
+        elif first not in clis and any(word in clis for word in rest):
+            found.append(f"a command of this repository the check cannot read: {shown}")
+        elif first in clis and _refuses(clis[first][1](), rest):
+            found.append(f"{clis[first][0]} refuses: {shown}")
         elif _is_repository_path(first) and not (root / first.removeprefix("./")).exists():
             found.append(f"no such path in the repository: {first}")
     return found
@@ -184,8 +242,9 @@ def test_detects_an_unknown_command() -> None:
     assert problems(sections + "```sh\nrhi status\nscripts/check.sh fast\n```\n") == []
     assert problems(unknown_rhi) == ["the rhi CLI refuses: rhi frobnicate coursework"]
     assert problems(missing_script) == ["no such path in the repository: scripts/no-such-script.sh"]
-    # A tilde fence is a code block too, and a backtick line inside it does not close it.
-    assert problems(sections + "~~~sh\n```\nrhi frobnicate\n~~~\n") == ["the rhi CLI refuses: rhi frobnicate"]
+    # A tilde fence is a code block too, and a backtick line inside it (here two empty substitutions,
+    # which the shell reads) does not close it.
+    assert problems(sections + "~~~sh\n````\nrhi frobnicate\n~~~\n") == ["the rhi CLI refuses: rhi frobnicate"]
     # A redirection is not an argument, and each command of a pipeline or a list is checked.
     redirected = "```sh\nrhi_admin privacy export 1234567 > \"$HOME/export.json\"\nrhi status | cat && rhi frobnicate\n```\n"
     assert problems(sections + redirected) == ["the rhi CLI refuses: rhi frobnicate"]
@@ -209,6 +268,24 @@ def test_detects_an_unknown_command() -> None:
     # A line the shell refuses for an unterminated quote is refused here too.
     with pytest.raises(ValueError, match="no closing quotation"):
         problems(sections + '```sh\nrhi "status\n```\n')
+
+
+def test_refuses_arguments_the_shell_decides_and_checks_commands_inside_substitutions() -> None:
+    sections = "".join(f"## {section.title()}\n\n" for section in SECTIONS)
+    # Bash gives each of these a word, or any number of words, that the text does not show.
+    for argument in ["<(true)", ">(cat)", "$id", '"$id"', "`id`", "*", "{a,b}"]:
+        found = problems(sections + f"```sh\nrhi status {argument}\n```\n")
+        assert [p.split(":")[0] for p in found] == ["the arguments are known only when the shell runs"], argument
+    # A command that runs inside a substitution or a subshell is checked; one behind a prefix cannot be read.
+    nested = "```sh\nx=$(rhi frobnicate)\ncat <(rhi frobnicate) \"`rhi frobnicate`\"\n( rhi frobnicate )\n```\n"
+    assert problems(sections + nested) == ["the rhi CLI refuses: rhi frobnicate"] * 4
+    assert problems(sections + "```sh\nX=1 rhi status\n```\n") == [
+        "a command of this repository the check cannot read: X=1 rhi status"
+    ]
+    # A redirection's file may expand: it is not an argument. A substitution the shell cannot end is refused.
+    assert problems(sections + '```sh\nrhi status > "$HOME/status.txt" 2>/dev/null\n```\n') == []
+    with pytest.raises(ValueError, match="no end of the substitution"):
+        problems(sections + "```sh\nrhi status $(true\n```\n")
 
 
 def test_section_headings_count_only_outside_code_blocks() -> None:

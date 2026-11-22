@@ -277,9 +277,11 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    rhi status
    ```
 
-   It lists each pool with its state. A refusal names its cause: a key that expired means the
-   course end has passed (Check, step 3), and a revoked one that the key was revoked, not that
-   parking lost it.
+   It lists each pool with its state. A refusal reads `invalid_key` whatever its cause: the
+   gateway never says whether a key expired, was revoked or was never issued. Parking deletes no
+   key, so look for the cause elsewhere. If the course end has passed (Check, step 3), every key
+   has expired. Otherwise the key may have been revoked. Log in again for a new key and ask for
+   the status once more.
 
 5. **The pools are back.** In Grafana, on the dashboard "Fleet and scaling", in each pool's row,
    the panel "Instances: desired, in service, warm" reads the pool's `warm_instances` for warm once
