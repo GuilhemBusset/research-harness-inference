@@ -264,10 +264,19 @@ reading anything:
   raised and that is still open, sends the build back. Read the `examined` events' `findings` and
   `bounded`, the findings in the issue's state in `state.json`, and the follow-up issues the bound
   filed: findings carried over from early examinations, or new ones that name an invariant, show
-  which rule kept the issue going.
+  which rule kept the issue going. A round there with no blocking finding at all was most often
+  sent back by a missing verdict (below).
 - **Before the fourth examination**: each round's findings are in the `examined` event and in
   `state.json`. Findings that close and are replaced by new ones every round point at the examiner
   or at an issue that invites edge cases; a finding the builder did not fix shows instead under
   `verification, open finding reproduced`.
+
+In either line without an unmet verdict, a round can also come from a missing verdict rather than
+a finding: the examiner gave no verdict on some ledger item, the engine asked it again twice (the
+`examination_incomplete` events before the round, with their `missing` and `retry`), and the third
+answer still omitted it, so the round failed with "no verdict ... after two requests". Read the
+`examined` event's `missing` list next to its `findings`: a non-empty `missing` with no blocking
+finding means the examiner never judged that item, and the same item missing across runs points at
+how the item is worded or at the examiner's prompt, not at the build.
 
 Quote only the counts in an issue or a pull request, never what the journal or a call says.
