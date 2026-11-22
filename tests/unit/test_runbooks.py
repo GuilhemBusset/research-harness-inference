@@ -21,7 +21,14 @@ from rhi_admin import main as admin_main
 from rhi_cli import main as rhi_main
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNBOOKS = ["session-on-and-off.md", "capacity-failure.md", "disabled-pool.md"]
+RUNBOOKS = [
+    "session-on-and-off.md",
+    "capacity-failure.md",
+    "disabled-pool.md",
+    "leaked-key.md",
+    "bad-deployment.md",
+    "secret-rotation.md",
+]
 SECTIONS = ["when", "check", "act", "verify"]
 
 
