@@ -578,3 +578,68 @@ def test_a_row_never_ticked_is_withdrawn_once_its_test_is_left_out():
         run.deploy = dataclasses.replace(run.deploy, unverified_tests=(SMOKE,))   # no item is left to discharge
         run.run()
         assert not rows(run) and snapshot(run) == before
+
+
+def test_a_withdrawal_github_does_not_answer_is_tried_again():
+    with delivered() as run:
+        before = snapshot(run)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        edit, list_comments = run.fake.edit_issue, run.fake.list_comments
+        pr = present(run.issue(2).pr)
+
+        def unanswered(number, **fields):
+            if "body" in fields:
+                raise L.github.GitHubUnavailable("HTTP 502")
+            return edit(number, **fields)
+        run.fake.edit_issue = unanswered
+        run.run()   # D2's row is written, its tick is not
+        run.fake.edit_issue = edit
+        run.fake.set_status(merge, RHI, "failure", "Verification failed.")
+
+        def comments(number):
+            if number == pr:
+                raise L.github.GitHubUnavailable("HTTP 502")
+            return list_comments(number)
+
+        def once_the_statuses_are_read():   # the comment that would withdraw the row cannot be read
+            run.fake.list_comments = comments
+        run.fake.before_read = once_the_statuses_are_read
+        run.run()
+        run.fake.before_read, run.fake.list_comments = (lambda: None), list_comments
+        assert rows(run)
+        run.run()
+        assert not rows(run) and snapshot(run) == before
+
+
+def test_a_write_in_flight_keeps_the_row_of_a_box_another_run_ticks_meanwhile():
+    with two_roots() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(push_main(run, files=(LATER,), removed=(SMOKE,)), RHI, "success", VERIFIED)
+        update, edit, writing, resume = run.fake.update_comment, run.fake.edit_issue, Event(), Event()
+
+        def held(number, body):   # the issue's run writes D3's row once the epic's run has published D2
+            if L.report.EVIDENCE_MARKER in body and not writing.is_set():
+                writing.set()
+                resume.wait(10)
+            return update(number, body)
+
+        def reply_lost(number, **fields):
+            answer = edit(number, **fields)
+            if "body" in fields:
+                raise L.github.GitHubUnavailable("the reply was lost")
+            return answer
+        run.fake.update_comment = held
+        with ThreadPoolExecutor() as pool:
+            issue_run = pool.submit(run.run, root=2)
+            try:
+                assert writing.wait(10)
+                run.fake.set_status(merge, RHI, "success", VERIFIED)
+                run.fake.edit_issue = reply_lost
+                run.run(root=EPIC)   # D2's row and tick are published; the epic's run never hears it
+                run.fake.edit_issue = edit
+            finally:
+                resume.set()
+            issue_run.result()
+        assert f"- [x] {SIGNS_IN} ([evidence]" in run.fake.issues[2]["body"]
+        assert rows(run) and rows(run, "D3")

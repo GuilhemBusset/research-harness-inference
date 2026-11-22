@@ -2977,7 +2977,8 @@ class Engine:
         discharged by another run: it is dropped and that run's record adopted, never written over
         it, nor proven again. Any other was never published (an owner's tick carries no such link):
         the next run drops it, even if the item is no longer one it can discharge, writes the
-        evidence comment again without it, in case its row was written, and reads the statuses of
+        evidence comment again without it, in case its row was written (it stays saved, marked
+        failed, until that write is answered, so the run after tries the withdrawal again), and reads the statuses of
         the contexts then configured again. The issue is read before and after the statuses: an
         issue edited meanwhile, whose items may no longer be the ones proven, is left as it is."""
         st = self.store.issue(n)
@@ -2989,28 +2990,30 @@ class Engine:
         proven = {i: e for i, e in kept.items() if self._published(body, comment, e)}
         taken = {i for i in kept if i not in proven and self._linked(body, comment.get("html_url") or "", {i})}
         stale = self._unrecorded(st) - set(proven)
-        # Never published by this run: proven again, by the statuses of now, or not at all.
-        keep = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE
-                                               and e.get(PUBLISHING) and e.get("criterion") in stale)]
+
+        def is_stale(e: dict) -> bool:
+            return e.get("kind") == COMMIT_STATUS_EVIDENCE and bool(e.get(PUBLISHING)) and e.get("criterion") in stale
+        # Never published by this run: proven again, by the statuses of now, or not at all. Each is
+        # kept, marked failed, until a comment without its row is written: a write GitHub does not
+        # answer leaves it for the next run, which withdraws its row again.
+        keep = [e for e in st.evidence if not is_stale(e)]
+        withdrawn = [{**e, PUBLISHING: "failed"} for e in st.evidence if is_stale(e)]
         todo = {i: tests for i, tests in items.items() if i not in proven and i not in taken}
         if todo:
             proven |= self._read_proofs(st, todo, contexts, said, head)
-        if stale:   # the comment written below holds none of them: a row it may have written is withdrawn
-            st.evidence = keep
-            self.store.put(st)
         if not proven and not stale:
             return
         if proven and self._as_delivered(n, st) is None:
             return
         # The verifier's records of an item's agent part stay: only a status record of the item is replaced.
-        mine = {e.get("criterion") for e in st.evidence if e.get("kind") == COMMIT_STATUS_EVIDENCE}
-        base = [e for e in st.evidence if not (e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get("criterion") in proven)]
+        mine = {e.get("criterion") for e in keep if e.get("kind") == COMMIT_STATUS_EVIDENCE}
+        base = [e for e in keep if not (e.get("kind") == COMMIT_STATUS_EVIDENCE and e.get("criterion") in proven)]
         writer = self.store.lock().holder()   # this invocation, as its run lock names it
         base += [{**e, PUBLISHING: "writing", WRITER: writer} for e in proven.values()]
         # Saved before the comment and the body are written, with the obligations still owed: a run of
         # another root that writes them meanwhile then finds the records (`_status_elsewhere`) once it
         # has written, and writes their rows and their ticks again.
-        st.evidence = base
+        st.evidence = [*base, *(e for e in withdrawn if e["criterion"] not in proven)]
         self.store.put(st)
         recorded, done, adopted = False, set(), {}
         try:
@@ -3084,18 +3087,27 @@ class Engine:
         them, the next run tries again). A record another run saved and did not publish, its run
         having given up or ended, is adopted only if GitHub published it: its row in the evidence
         comment as read before the first write, and its box ticked with the link to that comment
-        (`_published`). So the first write keeps the row of a box already ticked so, even if its
-        run never heard GitHub's reply; what that run never published is not proven by this one,
-        nor by an owner's tick."""
+        (`_published`), or, failing that, its box ticked with that link, which only a run that
+        wrote its row in that comment does. So the first write keeps the row of a box already
+        ticked so, even if its run never heard GitHub's reply, and a write in flight while another
+        run published and ticked a row is written again with it; what that run never published is
+        not proven by this one, nor by an owner's tick, which carries no link."""
         before = self._evidence_comment(st.pr or 0)   # what readers of the linked comment see now
 
         def elsewhere(body: str, link: str) -> dict[str, dict]:
+            # Best first: a record published or being published; one whose row and linked tick GitHub
+            # holds; one whose box alone is ticked with the link, which only a run that wrote its row
+            # in this comment does, though a write of this run that was in flight may have erased it.
+            found = self._status_elsewhere(n, st.pr or 0)
+            tests = (lambda e, published: published,
+                     lambda e, _: self._published(body, {**before, "html_url": link}, e),
+                     lambda e, _: bool(self._linked(body, link, {e["criterion"]})))
             out: dict[str, dict] = {}
-            for e, published in self._status_elsewhere(n, st.pr or 0):
-                c = e["criterion"]
-                if c not in proven and c not in mine and (
-                        published or self._published(body, {**before, "html_url": link}, e)):
-                    out.setdefault(c, e)
+            for test in tests:
+                for e, published in found:
+                    c = e["criterion"]
+                    if c not in proven and c not in mine and c not in out and test(e, published):
+                        out[c] = e
             return out
         evidence_head = st.verified_sha or next((e["head_sha"] for e in st.evidence if e.get("kind") == "command"), "")
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
