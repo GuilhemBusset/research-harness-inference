@@ -24,7 +24,7 @@ github_repo = "example-repository"
 # The client ID of the GitHub App students log in with.
 login_client_id = "Iv1.0000example0000"
 
-# The monthly budget, in whole US dollars, that latches every pool.
+# The monthly budget, in whole US dollars, whose thresholds e-mail the admin (alerts only).
 monthly_budget_usd = 1000
 
 # The schedule: the time zone its times are in, the day the course ends, and the session windows.
@@ -107,6 +107,12 @@ cost_anomaly_detection = false
 # The whole hours a pool may be in service while no session is on before an alarm says so on the
 # alerts topic (system design, sections 11.3 and 17). Left out, it is 1.
 outside_sessions_alarm_hours = 1
+
+# Whether the stage is parked: the whole endpoint switched off, between cohorts or between sessions
+# (system design, sections 5.6 and 11.2). Parked, the stage keeps its data and the pipeline and
+# drops the load balancers, the NAT gateway, the Fargate services, the pools' groups and the
+# scaler. Left out, it is false.
+parked = false
 
 # One entry per pool, under the model name students choose it by (section 4.2). An empty table,
 # `pools = {}`, has no pool. TOML puts a table after every key above, so the pools come last. They

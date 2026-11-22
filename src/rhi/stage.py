@@ -3,6 +3,17 @@
 The pipeline stack deploys this stage as a nested assembly of the cloud assembly (system design,
 section 8.2). The stage and its stacks are environment-agnostic: none is given an account or a
 region, so both come from the credentials that deploy (section 10).
+
+**Parked** (the configuration's `parked`, sections 5.6 and 11.2), every stack is given the flag
+and builds no load balancer, NAT gateway, Fargate service, group, warm pool or scaler: the stage
+keeps its data and the pipeline. CloudFormation refuses to delete an export that a deployed stack
+still imports, and the pipeline deploys a stack before the stacks that depend on it. So a stack
+that imports, unparked, an export that parking deletes deploys first when parked: the gateway
+stack, the observability stack and the access stack then import nothing, and each deploys before
+every stack it imported from (`PARKED_ORDER`). The pools stack still imports from the network stack
+and the observability stack, and keeps the exports of theirs it imported unparked
+(`rhi.pools.stack`); the guardrails stack reads the pools stack through outputs, not exports.
+`tests/synth/test_parked.py` holds the rule over both syntheses.
 """
 
 from __future__ import annotations
@@ -26,6 +37,13 @@ if TYPE_CHECKING:
 
 # The name the bounded bootstrap gives the permissions boundary (`setup/bootstrap/policies.yaml`).
 PERMISSIONS_BOUNDARY = "rhi-permissions-boundary"
+
+# Parked, each stack by its ID, with the stacks it deploys before: those it imports from unparked.
+PARKED_ORDER = {
+    "Gateway": ("Network", "Access", "Observability", "Pools"),
+    "Observability": ("Network", "Access"),
+    "Access": ("Network",),
+}
 
 
 class EndpointStage(cdk.Stage):
@@ -74,3 +92,15 @@ class EndpointStage(cdk.Stage):
         # The alerts topic and what reports to it. Its alarms read the stacks above, so no stack
         # reads it (`rhi.guardrails.stack`).
         self.guardrails = GuardrailsStack(self, "Guardrails", config=config, groups=self.pools.groups)
+        if config.parked:
+            for first, later in PARKED_ORDER.items():
+                for stack in later:
+                    self.stack(stack).add_stack_dependency(
+                        self.stack(first), f"Parked, {first} drops its imports of {stack} before {stack} drops the exports."
+                    )
+
+    def stack(self, construct_id: str) -> cdk.Stack:
+        """The stack of the stage by its construct ID."""
+        stack = self.node.find_child(construct_id)
+        assert isinstance(stack, cdk.Stack)
+        return stack

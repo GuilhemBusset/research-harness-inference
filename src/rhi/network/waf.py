@@ -19,7 +19,10 @@ header, and no rule here does. So the ACL's data protection also substitutes bot
 values, wherever WAF writes them, whichever rule matches, with no exception for a rule's match
 details or a rate rule's keys.
 
-The load balancer exists whether or not its HTTPS listener is on, so the ACL always does too.
+The load balancer exists whether or not its HTTPS listener is on, so the ACL always does too, but
+for a parked stage (sections 5.6 and 11.2): with no load balancer there is no ACL, and its log
+group stays, at the ACL's path, through `log_group`. A log group of a fixed name that left the
+template would stay in the account by its retention, and the ACL's return would fail on its name.
 """
 
 from __future__ import annotations
@@ -96,6 +99,18 @@ def _data_protection() -> wafv2.CfnWebACL.DataProtectionConfigProperty:
     )
 
 
+def log_group(scope: Construct) -> logs.LogGroup:
+    """The ACL's log group, as the child `Logs` of `scope`: the ACL's, or, parked, a construct of
+    the ACL's ID that holds the log group alone, so that it keeps its logical ID."""
+    return logs.LogGroup(
+        scope,
+        "Logs",
+        log_group_name=LOG_GROUP_NAME,
+        retention=logs.RetentionDays.THREE_MONTHS,  # section 6.6 (`rhi.retention`)
+        removal_policy=cdk.RemovalPolicy.DESTROY,
+    )
+
+
 class WebAcl(Construct):
     """The web ACL, as `web_acl`, attached to `load_balancer`, and its logging configuration, as
     `logging`, to `log_group`."""
@@ -137,13 +152,7 @@ class WebAcl(Construct):
         wafv2.CfnWebACLAssociation(
             self, "Association", resource_arn=load_balancer.load_balancer_arn, web_acl_arn=self.web_acl.attr_arn
         )
-        self.log_group = logs.LogGroup(
-            self,
-            "Logs",
-            log_group_name=LOG_GROUP_NAME,
-            retention=logs.RetentionDays.THREE_MONTHS,  # section 6.6 (`rhi.retention`)
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-        )
+        self.log_group = log_group(self)
         stack = cdk.Stack.of(self)
         self.logging = wafv2.CfnLoggingConfiguration(
             self,

@@ -186,6 +186,19 @@ def image_context(config: Config, *, folder: Path = IMAGE_FOLDER) -> str:
     return str(context)
 
 
+def log_group(scope: Construct) -> logs.LogGroup:
+    """Grafana's log group, of a fixed name, as the child `Logs` of `scope`: the construct's own, or,
+    for a parked stage, a construct of the same ID that holds the log group alone, so that it keeps
+    its logical ID while what writes to it is gone (system design, section 5.6)."""
+    return logs.LogGroup(
+        scope,
+        "Logs",
+        log_group_name=LOG_GROUP_NAME,
+        retention=LOG_RETENTION,
+        removal_policy=cdk.RemovalPolicy.DESTROY,
+    )
+
+
 class Grafana(Construct):
     """Grafana's cluster, as `cluster`, its task definition, as `task_definition`, the task's
     role, as `task_role`, the container's log group, as `log_group`, and the service, as
@@ -238,13 +251,7 @@ class Grafana(Construct):
         )
         self.task_role.add_to_policy(iam.PolicyStatement(actions=list(EVERY_RESOURCE_ACTIONS), resources=["*"]))
 
-        self.log_group = logs.LogGroup(
-            self,
-            "Logs",
-            log_group_name=LOG_GROUP_NAME,
-            retention=LOG_RETENTION,
-            removal_policy=cdk.RemovalPolicy.DESTROY,
-        )
+        self.log_group = log_group(self)
 
         # Grafana shows the metrics; its own are not collected: Container Insights stays off.
         self.cluster = ecs.Cluster(self, "Cluster", vpc=vpc, container_insights_v2=ecs.ContainerInsights.DISABLED)

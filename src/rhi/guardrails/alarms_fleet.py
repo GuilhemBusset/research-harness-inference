@@ -37,6 +37,12 @@ to it). The only dimensions their metrics carry are a group's name and a pool's 
 identifies a student (section 6.6).
 
 The construct creates alarms only, which hold no role and no IAM action.
+
+**What it reads, and how.** The groups are the pools stack's, which deploys before the guardrails
+stack: each alarm names its group through the pools stack's outputs, never an export
+(`rhi.guardrails.stack`), so that the pools stack may remove a group, as parking does, while an
+alarm still names it. A parked stage holds none of these alarms (sections 5.6 and 11.2): there is
+no group, no scaler and no gateway to watch.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
-"""The guardrails stack: the alerts topic, its key and its subscription, and Cost Anomaly Detection
-behind cost_anomaly_detection (`rhi.guardrails`)."""
+"""The guardrails stack: the alerts topic, its key and its subscription, the cost budget, and Cost
+Anomaly Detection behind cost_anomaly_detection (`rhi.guardrails`)."""
 
 from __future__ import annotations
 
@@ -67,6 +67,26 @@ def test_the_topic_has_one_e_mail_subscription_to_the_admin_address(templates: T
     assert EXAMPLE.admin_email == "admin@example.com"
 
 
+def test_the_budget_alerts_the_topic_at_each_threshold_of_the_monthly_amount(templates: Templates) -> None:
+    template = guardrails(templates)
+    (topic_id,) = of_type(template, "AWS::SNS::Topic")
+    ((budget_id, budget),) = of_type(template, "AWS::Budgets::Budget").items()
+    data = budget["Budget"]
+    assert (data["BudgetType"], data["TimeUnit"]) == ("COST", "MONTHLY")
+    assert data["BudgetLimit"] == {"Amount": EXAMPLE.monthly_budget_usd, "Unit": "USD"}
+    notifications = budget["NotificationsWithSubscribers"]
+    assert sorted(n["Notification"]["Threshold"] for n in notifications) == [50, 80, 100]
+    for n in notifications:
+        assert (n["Notification"]["NotificationType"], n["Notification"]["ThresholdType"]) == ("ACTUAL", "PERCENTAGE")
+        assert n["Subscribers"] == [{"Address": {"Ref": topic_id}, "SubscriptionType": "SNS"}]
+    # AWS Budgets may publish, from the stack's own account, before the budget exists.
+    ((policy_id, policy),) = of_type(template, "AWS::SNS::TopicPolicy").items()
+    (grant,) = [s for s in policy["PolicyDocument"]["Statement"] if services(s) == {"budgets.amazonaws.com"}]
+    assert (grant["Effect"], grant["Action"], grant["Resource"]) == ("Allow", "sns:Publish", {"Ref": topic_id})
+    assert grant["Condition"] == {"StringEquals": {"aws:SourceAccount": {"Ref": "AWS::AccountId"}}}
+    assert policy_id in template["Resources"][budget_id]["DependsOn"]
+
+
 def test_without_the_flag_there_is_no_anomaly_monitor(templates: Templates) -> None:
     assert EXAMPLE.cost_anomaly_detection is False
     everything = [r["Type"] for template in templates.values() for r in template.get("Resources", {}).values()]
@@ -88,6 +108,7 @@ def test_the_stack_creates_no_resource_of_its_own_and_nothing_reads_it(app: cdk.
     assert resources
     assert {nag.created_by(r, nag.SOURCE) for r in resources} <= {
         "guardrails_alerts",
+        "guardrails_budget",
         "guardrails_anomaly",
         "guardrails_alarms_fleet",
     }
