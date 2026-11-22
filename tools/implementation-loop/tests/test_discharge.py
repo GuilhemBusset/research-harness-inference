@@ -249,7 +249,7 @@ def test_each_context_not_verified_on_the_merge_commit_is_read_on_main():
         assert run.fake.issues[2]["state"] == "closed"
 
 
-def test_an_unconfirmed_close_leaves_the_issue_delivered_until_github_closes_it():
+def test_an_unconfirmed_close_leaves_the_issue_open_until_github_closes_it():
     with delivered() as run:
         [merge] = run.fake.commits[2]
         run.fake.set_status(merge, RHI, "success", VERIFIED)
@@ -261,13 +261,36 @@ def test_an_unconfirmed_close_leaves_the_issue_delivered_until_github_closes_it(
             return edit(n, **fields)
         run.fake.edit_issue = no_close
         run.run()
-        assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DELIVERED, "open")
+        assert run.fake.issues[2]["state"] == "open" and run.issue(2).phase not in (Phase.DONE, Phase.DELIVERED)
         assert not run.issue(2).obligations, "discharged all the same"
         done = L.report.render_progress(dataclasses.replace(run.issue(2), phase=Phase.DONE), EPIC).splitlines()[1]
         assert done not in run.comment(2, L.report.PROGRESS_MARKER).splitlines(), "the open issue does not say done"
         run.fake.edit_issue = edit
         run.run()
         assert (run.issue(2).phase, run.fake.issues[2]["state"]) == (Phase.DONE, "closed")
+
+
+@pytest.mark.parametrize("reread", ["answered", "unanswered"])
+def test_a_close_github_applied_without_its_reply_ends_done(reread):
+    with delivered() as run:
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        edit, get = run.fake.edit_issue, run.fake.get_issue
+
+        def reply_lost(n, **fields):
+            answer = edit(n, **fields)
+            if fields.get("state") == "closed":
+                if reread == "unanswered":   # nor is the issue read again in this run
+                    run.fake.get_issue = lambda m: (_ for _ in ()).throw(L.github.GitHubError("HTTP 502"))
+                raise L.github.GitHubUnavailable("the reply was lost")
+            return answer
+        run.fake.edit_issue = reply_lost
+        run.run()
+        run.fake.edit_issue, run.fake.get_issue = edit, get
+        assert run.fake.issues[2]["state"] == "closed"
+        if reread == "unanswered":   # the next run, whose work the closed issue no longer is, settles it
+            run.run()
+        assert run.issue(2).phase == Phase.DONE
 
 
 def test_a_discharge_keeps_the_rows_another_root_s_run_published():
@@ -294,10 +317,11 @@ def test_a_discharge_keeps_the_rows_another_root_s_run_published():
         run.repo.cleanup()
 
 
-def test_a_tick_github_applied_without_its_reply_is_recorded_before_the_issue_closes():
+@pytest.mark.parametrize("then", ["main-stays", "main-moves"])
+def test_a_tick_github_applied_without_its_reply_is_recorded_before_the_issue_closes(then):
     with delivered() as run:
-        [merge] = run.fake.commits[2]
-        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        verified = push_main(run)   # proven on a later main alone
+        run.fake.set_status(verified, RHI, "success", VERIFIED)
         edit = run.fake.edit_issue
 
         def reply_lost(n, **fields):
@@ -309,14 +333,17 @@ def test_a_tick_github_applied_without_its_reply_is_recorded_before_the_issue_cl
         run.run()
         assert "- [x]" in run.fake.issues[2]["body"] and run.fake.issues[2]["state"] == "open"
         run.fake.edit_issue = edit
+        if then == "main-moves":   # the proof is no longer on the head the next run reads
+            push_main(run, files=("docs/change.md",))
         run.run()
         st = run.issue(2)
         assert (st.phase, run.fake.issues[2]["state"], st.obligations) == (Phase.DONE, "closed", [])
-        assert [e["head_sha"] for e in st.evidence if e["criterion"] == "D2"] == [merge]
+        assert [e["head_sha"] for e in st.evidence if e["criterion"] == "D2"] == [verified]
         assert run.events("obligations_discharged", 2)
 
 
-def test_runs_of_two_roots_discharging_at_once_keep_each_ticked_item_s_row():
+@pytest.mark.parametrize("held", ["the-comment", "the-body"])
+def test_runs_of_two_roots_discharging_at_once_keep_each_ticked_item_s_row(held):
     later = "tests/smoke/deployed/test_later.py"
     owner = ((SIGNS_IN, DEPLOYED), (SIGNS_IN.replace(SMOKE, later), DEPLOYED))
     run = Loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=())
@@ -326,14 +353,26 @@ def test_runs_of_two_roots_discharging_at_once_keep_each_ticked_item_s_row():
         run.run(root=EPIC)
         run.run(root=2)
         run.fake.set_status(push_main(run), RHI, "success", VERIFIED)   # proves D2 alone
-        update, writing, resume = run.fake.update_comment, Event(), Event()
+        update, edit, writing, resume = run.fake.update_comment, run.fake.edit_issue, Event(), Event()
 
-        def held(number, body):   # the epic's run writes its D2 row once the issue's run has written D3's
-            if L.report.EVIDENCE_MARKER in body and not writing.is_set():
+        def hold():   # the epic's run writes D2's row, or its tick, once the issue's run has done all for D3
+            if not writing.is_set():
                 writing.set()
                 resume.wait(10)
+
+        def held_comment(number, body):
+            if L.report.EVIDENCE_MARKER in body:
+                hold()
             return update(number, body)
-        run.fake.update_comment = held
+
+        def held_body(n, **fields):
+            if "body" in fields:
+                hold()
+            return edit(n, **fields)
+        if held == "the-comment":
+            run.fake.update_comment = held_comment
+        else:
+            run.fake.edit_issue = held_body
         with ThreadPoolExecutor() as pool:
             epic = pool.submit(run.run, root=EPIC)
             assert writing.wait(10)
