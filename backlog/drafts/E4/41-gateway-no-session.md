@@ -3,7 +3,6 @@ id = "E4-41"
 title = "Gateway: while no session is on, answer a student's request and wake with no_session"
 labels = ["size:M", "kind:app"]
 epic = 6
-blocked_by = ["E4-40"]
 +++
 
 ## Context
@@ -19,9 +18,12 @@ session starts), and a fixed sentence that holds no number and no name of the de
 `services/common/rhi_common/causes.py` (section 6.2, step 8), and renders in each wire format as the
 others do. The two causes answered 402 stay until a later change removes the budget (section 14).
 
-**Reading the switch.** The gateway already reads each pool's records from the pool-state table
-every 5 seconds (`services/gateway/rhi_gateway/readiness.py`). It reads the switch with them. A
-read that fails keeps the last value read; before the first read succeeds the switch reads off.
+**Reading the switch.** The switch's record and its item are built: `SessionSwitch` and
+`session_is_on` in `services/common/rhi_common/records.py`, `SESSION_SWITCH_KEY` in
+`services/common/rhi_common/tables.py`, which the scaler and the admin CLI already read. The gateway
+already reads each pool's records from the pool-state table every 5 seconds
+(`services/gateway/rhi_gateway/readiness.py`). It reads the switch with them. A read that fails
+keeps the last value read; before the first read succeeds the switch reads off.
 
 **What it refuses, and what it does not.** While the switch is off, for a student's key:
 
