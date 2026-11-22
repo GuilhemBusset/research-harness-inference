@@ -13,6 +13,14 @@ entry and to each of the student's active key items; the gateway applies them wi
 60-second cache. `remove` deletes the entry, so no login can be issued a key any more, and then
 revokes every key of the student.
 
+An erased student's alias stays out of reach while what was written under it is kept
+(`rhi_admin.privacy`): the series and the log records under an alias cannot tell two students
+apart, so another student given it would be given the first one's too. `hold_alias` replaces the
+entry, in one write, by an item that holds the alias and its expiry and nothing else: no GitHub
+ID, no budget. Its partition key is a negative number made from the alias, which no GitHub ID is,
+so no login and no command reads it as a student; `add` refuses the alias until the table's expiry
+removes the item, and `entries` lists none.
+
 Every function takes the tables as the table resources of the AWS SDK and the time as whole
 seconds since the epoch. Nothing here prints or logs: the command line (`rhi_admin.main`) does.
 """
@@ -20,13 +28,14 @@ seconds since the epoch. Nothing here prints or logs: the command line (`rhi_adm
 from __future__ import annotations
 
 import datetime
+import hashlib
 import re
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from rhi_common.students import RosterEntry
-from rhi_common.tables import BY_ALIAS, BY_STUDENT, KEYS, ROSTER
+from rhi_common.tables import BY_ALIAS, BY_STUDENT, EXPIRES_AT, KEYS, ROSTER
 from rhi_issuer.mint import expiry
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key
@@ -59,6 +68,35 @@ def _check_numbers(daily_token_budget: int | None, concurrency_limit: int | None
 
 def _failed_condition(error: ClientError) -> bool:
     return error.response.get("Error", {}).get("Code") == _CONDITION_FAILED
+
+
+def held_alias_id(alias: str) -> int:
+    """The partition key of the item that holds back an erased alias: a negative number, never a GitHub ID."""
+    return -1 - int.from_bytes(hashlib.sha256(alias.encode()).digest()[:7], "big")
+
+
+def hold_alias(entry: RosterEntry, *, roster: Any, until: int) -> None:
+    """Replaces the entry by the item that holds back its alias until `until`, in one write.
+
+    Refused when the entry is no longer the one given (removed, or given another alias meanwhile).
+    """
+    held = {ROSTER.partition_key.name: held_alias_id(entry.alias), "alias": entry.alias, EXPIRES_AT: until}
+    delete = {
+        "TableName": roster.name,
+        "Key": {ROSTER.partition_key.name: entry.github_id},
+        "ConditionExpression": "#alias = :alias",
+        "ExpressionAttributeNames": {"#alias": "alias"},
+        "ExpressionAttributeValues": {":alias": entry.alias},
+    }
+    try:
+        # The table resource's client, which takes the item's values as the table resource does.
+        roster.meta.client.transact_write_items(
+            TransactItems=[{"Delete": delete}, {"Put": {"TableName": roster.name, "Item": held}}]
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            raise AdminError("the roster entry changed meanwhile: run the command again") from None
+        raise
 
 
 def get(github_id: int, *, roster: Any) -> RosterEntry | None:
@@ -96,6 +134,8 @@ def add(
     _check_alias(alias)
     _check_numbers(daily_token_budget, concurrency_limit)
     owner = _alias_owner(alias, roster)
+    if owner is not None and owner < 0:
+        raise AdminError("that alias was erased, and is held back while its series and log records are kept")
     if owner is not None and owner != github_id:
         raise AdminError("another roster entry has that alias")
     entry = RosterEntry(
@@ -125,7 +165,9 @@ def entries(*, roster: Any) -> list[RosterEntry]:
     found: list[RosterEntry] = []
     while True:
         answer = roster.scan(**scan)
-        found.extend(RosterEntry.from_item(item) for item in answer.get("Items") or [])
+        # A held-back alias (`hold_alias`) is no entry.
+        items = [item for item in answer.get("Items") or [] if int(item[ROSTER.partition_key.name]) >= 0]
+        found.extend(RosterEntry.from_item(item) for item in items)
         if "LastEvaluatedKey" not in answer:
             return sorted(found, key=lambda entry: entry.github_id)
         scan["ExclusiveStartKey"] = answer["LastEvaluatedKey"]

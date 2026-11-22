@@ -256,19 +256,46 @@ def test_two_students_are_counted_apart(capsys: pytest.CaptureFixture[str]) -> N
     assert sum(record["input_tokens"] for record in logged) == 5000 + 1200 + 800 + 40
 
 
-def test_a_student_whose_key_is_gone_is_served_no_more() -> None:
+def test_a_student_whose_key_is_gone_is_served_no_more(monkeypatch: pytest.MonkeyPatch) -> None:
     made = gateway(OTTER, HERON)
     for alias in ("otter", "heron"):
         assert call(made.app, "POST", "/v1/messages", key=made.keys[alias], body=body(routes.MESSAGES)) == 200
     assert value(made.metrics, REQUESTS, alias="otter", pool="coursework") == 1
 
     # The admin erases otter: the key is revoked, then deleted. No request of otter comes after.
-    made.store.revoke(key_hash(made.keys["otter"]), at=NOW)
+    erased, lookup = key_hash(made.keys["otter"]), made.store.lookup
+    monkeypatch.setattr(made.store, "lookup", lambda digest: None if digest == erased else lookup(digest))
 
     # From the next scrape on, nothing is served under the alias, so its samples age out.
     for _ in range(2):
         assert {sample.labels.get("alias") for sample in samples(made.metrics)} - {None, ""} == {"heron"}
     assert value(made.metrics, metrics.BUDGET_LEFT, alias="heron") is not None
+
+
+def test_a_student_given_a_new_key_is_counted_on() -> None:
+    made = gateway(OTTER)
+    alias, github_id, budget = OTTER
+    old, new = made.keys[alias], generate_key()
+    assert call(made.app, "POST", "/v1/messages", key=old, body=body(routes.MESSAGES)) == 200
+    replacement = StudentKey(
+        key_hash=key_hash(new),
+        github_id=github_id,
+        alias=alias,
+        installation=None,
+        issued_at=NOW,
+        expires_at=NOW + 86_400,
+        daily_token_budget=budget,
+        concurrency_limit=4,
+        revoked_at=None,
+    )
+    made.store.put(replacement)
+    made.store.revoke(key_hash(old), at=NOW)
+
+    # A scrape between the revocation and the next request keeps the count; the new key adds to it.
+    assert value(made.metrics, REQUESTS, alias=alias, pool="coursework") == 1
+    samples(made.metrics)
+    assert call(made.app, "POST", "/v1/messages", key=new, body=body(routes.MESSAGES)) == 200
+    assert value(made.metrics, REQUESTS, alias=alias, pool="coursework") == 2
 
 
 def test_students_are_aliases() -> None:

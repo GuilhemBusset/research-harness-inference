@@ -16,9 +16,10 @@ is reserved for the proxy's own time limit, so that the two cannot differ.
 
 The reservation is made once the body is read and filtered, because it needs what only the body
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
-long the lease lasts. It is still made before anything is sent to the engine, and right after the
-key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`), so that a key
-revoked or erased while the body arrived reserves nothing. It names the pool,
+long the lease lasts. It is still made before anything is sent to the engine. Right after it, the
+key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`): a key revoked
+while the body arrived has its reservation taken back, and a key erased meanwhile has the usage
+row deleted (`Ledger.withdraw`), so that no request undoes an erase. The reservation names the pool,
 and returns the load balancer's cookie the student's record holds for it: the proxy sends that
 cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`). It
 returns the last rebalance number the record has applied for the pool as well: the request is
@@ -110,7 +111,7 @@ from rhi_gateway import routes, telemetry
 from rhi_gateway.affinity import Affinity
 from rhi_gateway.body import BodySource, Forwarded
 from rhi_gateway.budget import Ledger
-from rhi_gateway.errors import GatewayError, WireFormat, render_json
+from rhi_gateway.errors import GatewayError, KeyGone, WireFormat, render_json
 from rhi_gateway.experience import Experience
 from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, Action, End, Forward, Hold, KeepAlive, Wake
 from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
@@ -521,8 +522,6 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 held = _Held(
                     holding, forwarded.pool, entry.wire_format or WireFormat.MESSAGES, streams=_streams(forwarded)
                 )
-            # The body may have taken long: the key is read again before anything is written of the student.
-            student = await forwarding.authenticator.confirm(student)
             reservation = await run_in_threadpool(
                 forwarding.ledger.reserve,
                 student,
@@ -534,6 +533,13 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 pool=forwarded.pool.name,
             )
         except GatewayError as refused:
+            return _refusal(refused, entry, forwarding.retry_after)
+        # The body may have taken long: the key is read again once the reservation is written. A
+        # key revoked meanwhile has it taken back; a key erased meanwhile has its usage row deleted.
+        try:
+            student = await forwarding.authenticator.confirm(student)
+        except GatewayError as refused:
+            await run_in_threadpool(forwarding.ledger.withdraw, reservation, erased=isinstance(refused, KeyGone))
             return _refusal(refused, entry, forwarding.retry_after)
         # The load balancer's cookie the student's record holds for the pool: the proxy sends it,
         # and the settlement stores the one the request ends with (section 5.5). The request is

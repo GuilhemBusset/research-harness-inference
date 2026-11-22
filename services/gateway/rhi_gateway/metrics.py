@@ -37,12 +37,12 @@ read that fails gives no sample for that student at that scrape, never an old va
 counters are served still.
 
 **An erased student's series stop** (section 6.6). At every scrape, before anything is read, the
-key last accepted for each alias is read again from the keys table; when it is gone or revoked,
-every series of that alias is dropped from the registry and served no more. The samples already
-written then expire with the workspace's retention, and none is added under the alias after the
-admin erases the student (`rhi_admin.privacy`). A student who goes on with another key is counted
-again from 0 at their next request, which Prometheus reads as a counter reset. A read that fails
-drops nothing at that scrape.
+key last accepted for each alias is read again from the keys table; when the table no longer holds
+it, as the admin's erase leaves it (`rhi_admin.privacy`), every series of that alias is dropped
+from the registry and served no more. The samples already written then expire with the
+workspace's retention, and none is added under the alias after the erase. A key that is only
+revoked, as when a student is given a new one, drops nothing: the student's counts go on. A read
+that fails drops nothing at that scrape.
 
 Nothing here reaches CloudWatch: its metrics cannot be deleted for 15 months, so the gateway
 publishes none (section 6.6), and these series exist in Prometheus only.
@@ -134,7 +134,7 @@ class _Students(Collector):
             record = self._keys.lookup(student.key_hash)
         except Exception:  # noqa: BLE001 - a read that fails drops nothing; the next scrape reads again.
             return False
-        return record is None or record.revoked
+        return record is None
 
     def _drop(self, alias: str, student: KeyRecord) -> None:
         with self._lock:

@@ -349,6 +349,15 @@ def test_the_first_numbers_of_requests_in_flight_each_cost_one_settlement_call(c
     assert (record.rebalance_applied, record.leases) == ({"coursework": 7, "upgrade": 3}, {})
 
 
+def test_a_withdrawal_takes_the_reservation_back_or_deletes_the_day_of_an_erased_key(client: Calls) -> None:
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger.withdraw(reserve(ledger, student(), "revoked"), erased=False)
+    assert (written().tokens, written().leases) == (0, {})
+
+    ledger.withdraw(reserve(ledger, student(), "erased"), erased=True)
+    assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
+
+
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
     ledger = DynamoDBLedger(client, TABLE, clock=Clock())
     who = student(limit=4)

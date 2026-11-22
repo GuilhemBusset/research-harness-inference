@@ -13,10 +13,11 @@ a key that was replaced or revoked stops working within 60 seconds. Expiry is ch
 request, from the cached record.
 
 A forwarded request reads its body after it is accepted, and a body may take long to arrive. So
-right before it reserves budget, the write that makes the student's usage row, the request has its
-key read once more, past the cache (`Authenticator.confirm`): a key revoked or erased while the
-body was arriving reserves nothing, and an erase of the student (`rhi_admin.privacy`) is not undone
-by a request accepted before it.
+right after it reserves budget, the write that makes the student's usage row, the request has its
+key read once more, past the cache (`Authenticator.confirm`). A key revoked while the request was
+on its way has its reservation taken back. A key gone from the store, as the admin's erase leaves
+it (`rhi_admin.privacy`), has the usage row it reserved in deleted: the read comes after the write,
+so a request accepted before the erase, however late its write, leaves no row behind.
 
 Every refusal is the cause `invalid_key` and nothing else: the error never says whether the key
 was missing, malformed, unknown, revoked or expired.
@@ -41,7 +42,7 @@ from rhi_common.causes import Cause
 from rhi_common.keys import is_valid_key, key_hash
 from rhi_gateway import telemetry
 from rhi_gateway.app import Handler
-from rhi_gateway.errors import GatewayError, WireFormat, render_json
+from rhi_gateway.errors import GatewayError, KeyGone, WireFormat, render_json
 from rhi_gateway.keystore import KeyRecord, KeyStore
 from rhi_gateway.routes import Route
 
@@ -111,11 +112,16 @@ class Authenticator:
         return record
 
     async def confirm(self, student: KeyRecord) -> KeyRecord:
-        """The key of that accepted record, read again past the cache; `invalid_key` if it no longer passes."""
+        """The key of that accepted record, read again past the cache; `invalid_key` if it no longer passes.
+
+        The refusal is a `KeyGone` when the store no longer holds the key.
+        """
         now = self._monotonic()
         record = await run_in_threadpool(self._store.lookup, student.key_hash)
         self._remember(student.key_hash, now, record)
-        if record is None or record.revoked or record.expires_at <= self._wall_clock():
+        if record is None:
+            raise KeyGone
+        if record.revoked or record.expires_at <= self._wall_clock():
             raise _refused()
         return record
 

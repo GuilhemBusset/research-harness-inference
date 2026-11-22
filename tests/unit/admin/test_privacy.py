@@ -265,25 +265,24 @@ def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(
     for named in ("workspace's series", "gateway's log records", "load balancers' access logs", "WAF's logs"):
         assert named in retention
     assert "3 key(s)" in printed and "2 usage row(s)" in printed
+    assert f"No new roster entry is given the alias otter for {privacy.ALIAS_HELD_DAYS} days" in printed
 
 
-def test_an_alias_given_again_exports_nothing_of_its_former_student(deployed: Deployed) -> None:
+def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_kept(deployed: Deployed) -> None:
     assert deployed.run("erase", str(OTTER))[0] == 0
-    admin_roster.add(6060, "otter", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
-    # The former otter's records and samples are all older than the new entry: none is read.
-    expected = {
-        "logGroupName": LOG_GROUP,
-        "filterPattern": '{ $.alias = "otter" }',
-        "startTime": NOW * 1000,
-        "endTime": (NOW + 1) * 1000,
-    }
-    deployed.stubs["logs"].add_response("filter_log_events", {"events": []}, expected)
+    roster = deployed.admin.roster
 
-    status, printed = deployed.run("export", "6060")
+    # Its series and log records cannot tell two students apart: no one else is given them.
+    with pytest.raises(admin_roster.AdminError, match="held back"):
+        admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW)
+    (held,) = [item for item in roster.scan(ConsistentRead=True)["Items"] if item["alias"] == "otter"]
+    # What holds it names no student, and the table's expiry removes it once the telemetry is gone.
+    assert held == {"github_id": admin_roster.held_alias_id("otter"), "alias": "otter", "expires_at": held["expires_at"]}
+    assert held["github_id"] < 0 and held["expires_at"] == NOW + privacy.ALIAS_HELD_DAYS * 86_400
+    assert [entry.alias for entry in admin_roster.entries(roster=roster)] == ["heron"]
 
-    assert status == 0
-    document = json.loads(printed)
-    assert (document["entry"]["github_id"], document["logs"], document["series"]) == (6060, [], [])
+    roster.delete_item(Key={"github_id": held["github_id"]})
+    assert admin_roster.add(6060, "otter", roster=roster, course_end=COURSE_END, now=NOW).alias == "otter"
 
 
 def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed: Deployed) -> None:
@@ -291,8 +290,10 @@ def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed:
 
     def erase_first(**_: Any) -> None:
         # The erase runs to its end between the command's read of the entry and its write of the key.
+        # The erase's own transaction passes here too: it runs once.
         if not erased:
-            erased.append(deployed.run("erase", str(OTTER))[0])
+            erased.append(-1)
+            erased[0] = deployed.run("erase", str(OTTER))[0]
 
     deployed.admin.keys.meta.client.meta.events.register("before-call.dynamodb.TransactWriteItems", erase_first)
     out = io.StringIO()

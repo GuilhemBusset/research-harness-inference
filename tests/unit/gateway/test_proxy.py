@@ -200,19 +200,25 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it()
     assert (day.tokens, day.leases) == (39, {})
 
 
-def test_a_key_revoked_while_the_body_arrives_reserves_nothing() -> None:
+@pytest.mark.parametrize("erased", [False, True])
+def test_a_key_revoked_or_erased_while_the_body_arrives_keeps_nothing(monkeypatch: pytest.MonkeyPatch, erased: bool) -> None:
     upstream, store = Upstream(), InMemoryKeyStore()
     app, key, ledger = gateway(upstream, store)
 
     async def body() -> AsyncIterator[bytes]:
-        # The key was accepted from the headers; it is revoked (or its student erased) before the body comes.
+        # The key was accepted from the headers. Before the body comes it is revoked, or its
+        # student erased, which deletes it: the reservation's write may come after either.
         store.revoke(key_hash(key), at=NOW)
+        if erased:
+            monkeypatch.setattr(store, "lookup", lambda _: None)
         yield json.dumps(CASES[routes.MESSAGES][0]).encode()
 
     response = call(app, lambda client: client.post("/v1/messages", content=body(), headers={"x-api-key": key}))
 
-    assert response.status_code == 401
-    assert (ledger.day(STUDENT, utc_day(NOW)), upstream.seen) == (None, [])
+    assert (response.status_code, upstream.seen) == (401, [])
+    day = ledger.day(STUDENT, utc_day(NOW))
+    # Revoked: the reservation is taken back, nothing charged. Erased: the usage row is deleted.
+    assert (day is None) if erased else (day is not None and (day.tokens, day.leases) == (0, {}))
 
 
 def test_each_chunk_reaches_the_client_before_the_next_one_is_sent() -> None:

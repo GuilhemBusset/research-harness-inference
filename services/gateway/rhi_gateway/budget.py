@@ -256,6 +256,15 @@ class Ledger(Protocol):
         """
         ...
 
+    def withdraw(self, reservation: Reservation, *, erased: bool) -> None:
+        """Take back a reservation whose key no longer passes, charging nothing.
+
+        `erased` says the key is gone from the store, as the admin's erase leaves it: the student's
+        usage row of the reservation's day is then deleted, whatever it holds, so that a request
+        accepted before the erase leaves no row behind.
+        """
+        ...
+
     def tokens_left(self, student: Student) -> int:
         """The tokens of today's budget neither charged nor reserved. Writes nothing."""
         ...
@@ -550,6 +559,14 @@ class InMemoryLedger:
             )
         return True
 
+    def withdraw(self, reservation: Reservation, *, erased: bool) -> None:
+        if not erased:
+            self._remove(reservation, 0)
+            return
+        with self._lock:
+            self._days.pop((reservation.github_id, reservation.day), None)
+            self.writes += 1
+
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())
         return _left(self.day(student.github_id, utc_day(now)), student, now)
@@ -672,6 +689,12 @@ class DynamoDBLedger:
             reservation, charge, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped
         )
         return charge if stored else None
+
+    def withdraw(self, reservation: Reservation, *, erased: bool) -> None:
+        if not erased:
+            self._remove(reservation, 0)
+            return
+        self._client.delete_item(TableName=self._table, Key=self._key(reservation.github_id, reservation.day))
 
     def tokens_left(self, student: Student) -> int:
         now = int(self._clock())

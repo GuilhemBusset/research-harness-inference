@@ -50,6 +50,13 @@ class GatewayError(Exception):
         self.cause = cause
 
 
+class KeyGone(GatewayError):
+    """The refusal of a key that the store no longer holds, as the admin's erase leaves it: `invalid_key`."""
+
+    def __init__(self) -> None:
+        super().__init__(Cause.INVALID_KEY)
+
+
 # The causes that ask the client to come back: the only ones whose seconds a caller may give.
 _CARRIES_RETRY_AFTER = frozenset(cause for cause in Cause if cause.retry_after is not None)
 

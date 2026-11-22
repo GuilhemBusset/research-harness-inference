@@ -8,24 +8,28 @@ labelled with that alias.
 `export` gathers all of it as one JSON document: the entry, each key's issue, expiry and
 revocation times (no key and no SHA-256), the usage rows, the log records whose `alias` is the
 student's, and the samples of every series labelled with the alias, read day by day over the
-workspace's 90 days. An alias is free again once its entry is erased, and another student may then
-be given it while the records and samples of the first are still kept: so the export reads the log
-records and the samples written since the entry was added, and none from before.
+workspace's 90 days, from the entry's addition on. An erased alias is held back from any new entry
+while what was written under it is kept (`rhi_admin.roster.hold_alias`), so what an export reads
+under the alias is the student's own.
 
 `erase` deletes what can be deleted: the keys, revoked first, the usage rows and the roster entry.
 Logins, a `key issue` and the gateway's requests may still be at work when it starts, and its
 order leaves none of them a row behind:
 
-1. The roster entry goes first: a login that reads the roster from then on gets no key.
-   The admin's own `key issue` writes a key only while the entry is there (`rhi_admin.keys`).
+1. The roster entry goes first, replaced in the same write by the item that holds its alias back
+   for `ALIAS_HELD_DAYS` (`rhi_admin.roster.hold_alias`): a login that reads the roster from then
+   on gets no key, and no new entry is given the alias. The admin's own `key issue` writes a key
+   only while the entry is there (`rhi_admin.keys`).
 2. Every key is revoked. A login that read the entry a moment before can still store a key until
    the issuer's function times out, so after `ISSUER_SECONDS` every key is revoked again.
-3. The gateway reads the key again, past its cache, right before a request reserves, which is the
-   write that makes a usage row (`rhi_gateway.auth.Authenticator.confirm`); a settlement writes
-   only to a row that holds its lease, so it creates none. `GATEWAY_SECONDS` outwaits a
-   reservation whose read came before the revocation, and the gateway's 60-second cache.
-4. Then every key item, the issuer's lock of the student and every usage row are deleted, each
+   `GATEWAY_SECONDS` then outwaits the gateway's 60-second cache.
+3. Then every key item, the issuer's lock of the student and every usage row are deleted, each
    read with a consistent read, and a last read confirms that none is left.
+4. A request accepted before the erase reads its key again, past its cache, right after it writes
+   its reservation, the write that makes a usage row (`rhi_gateway.auth.Authenticator.confirm`).
+   It finds the key revoked, and takes the reservation back before step 3 deletes the row; or it
+   finds the key gone, and deletes the row itself (`rhi_gateway.budget.Ledger.withdraw`). A
+   settlement writes only to a row that holds its lease, so it creates none.
 
 At its next scrape, the gateway stops serving the series of a student whose key it last accepted
 is gone (`rhi_gateway.metrics`), so no sample is written under the alias after the erase.
@@ -52,15 +56,17 @@ from urllib.parse import urlencode
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
-from rhi_admin.roster import AdminError, get
+from rhi_admin.roster import AdminError, get, hold_alias
 from rhi_common.students import RosterEntry
-from rhi_common.tables import KEYS, ROSTER, USAGE
+from rhi_common.tables import KEYS, USAGE
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key, lock_key
 
 # The retention of the workspace and of the gateway's log group (section 6.6), from a sample's or
 # a record's writing: what an export reads, and how long what an erase cannot delete is kept.
 RETENTION_DAYS = 90
+# How long an erased alias is held back: the retention, and a day for the requests still running.
+ALIAS_HELD_DAYS = RETENTION_DAYS + 1
 # The workspace is read one day at a time, so that no query asks for 90 days of samples at once.
 WINDOW_SECONDS = 86_400
 # Logins in flight: the issuer's function stops after 30 seconds (`rhi.access.issuer.TIMEOUT`).
@@ -250,10 +256,11 @@ def erase(
     An erase that was interrupted can be run again: without the entry, it deletes what is left.
     Refused when there is no row of that GitHub ID at all: no entry, no key, no lock, no usage row.
     """
-    old = roster.delete_item(Key={ROSTER.partition_key.name: github_id}, ReturnValues="ALL_OLD").get("Attributes")
-    alias = str(old["alias"]) if old and "alias" in old else None
-    if not old and not _any_left(github_id, keys, stores.usage):
+    entry = get(github_id, roster=roster) if github_id >= 0 else None
+    if entry is None and not _any_left(github_id, keys, stores.usage):
         raise AdminError("that GitHub ID has no roster entry, no key and no usage row")
+    if entry is not None:
+        hold_alias(entry, roster=roster, until=now + ALIAS_HELD_DAYS * 86_400)
     revoke_all(github_id, keys=keys, now=now)
     say(
         f"The entry is removed and the keys revoked. Waiting {ISSUER_SECONDS + GATEWAY_SECONDS} seconds for "
@@ -265,7 +272,9 @@ def erase(
     deleted_keys, rows = _sweep(github_id, keys, stores.usage)
     if _any_left(github_id, keys, stores.usage):
         raise AdminError("rows of the student were written during the erase: run it again")
-    return Erased(entry=bool(old), alias=alias, keys=deleted_keys, usage_rows=rows)
+    return Erased(
+        entry=entry is not None, alias=None if entry is None else entry.alias, keys=deleted_keys, usage_rows=rows
+    )
 
 
 def report(erased: Erased, github_id: int) -> list[str]:
@@ -280,4 +289,9 @@ def report(erased: Erased, github_id: int) -> list[str]:
         f"Removed by retention only, {RETENTION_DAYS} days after each was written; with the entry gone, "
         f"{alias} names nobody:"
     )
-    return [deleted, retention, *(f"- {line}" for line in RETENTION_ONLY)]
+    held = (
+        f"No new roster entry is given {alias} for {ALIAS_HELD_DAYS} days, so that none is given what was written under it."
+        if erased.entry
+        else "The entry was gone before this erase, which therefore holds back no alias."
+    )
+    return [deleted, retention, *(f"- {line}" for line in RETENTION_ONLY), held]
