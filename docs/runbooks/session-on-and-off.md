@@ -60,21 +60,31 @@ for each on-demand pool the class uses (configured `wake = "on-demand"`, mode `e
 Do these the day before the class, while no session is on.
 
 1. **The GPU quota covers one instance more than each pool's `max_instances`** (section 5.4): a
-   draining instance and a cold launch can overlap. A coursework instance takes 8 vCPUs, so a pool
-   of `max_instances` instances needs 8 × (`max_instances` + 1) vCPUs of the G-family quota: 24 for
-   the example's 2, 32 for 3. Read the quota in the region of the endpoint:
+   draining instance and a cold launch can overlap. The quota counts vCPUs, so a pool needs
+   (`max_instances` + 1) times the vCPUs of one instance of the largest type its `instance_types`
+   lists, since a fallback type may be the one launched. For the example's coursework pool, whose
+   only type is `g7e.2xlarge` with 8 vCPUs, that is 8 × (`max_instances` + 1): 24 for the example's
+   2, 32 for 3. Look up the vCPUs of your pool's types in the EC2 console's instance types page if
+   they differ. Every G-family pool the class uses counts against the same quota, so add their
+   needs. Read the quota in the region of the endpoint:
 
    ```sh
    aws service-quotas list-service-quotas --service-code ec2 --query "Quotas[?QuotaName=='Running On-Demand G and VT instances'].Value" --output text
    ```
 
-   If it is short, request more with the quota step of the owner-setup script. Use the coursework
-   pool's actual `max_instances` as `N`, or the new maximum if step 2 raises it; the script adds the
-   one instance more. An increase can take days, so do this well ahead of the class:
+   If it is short, request more, well ahead of the class, since an increase can take days. The quota
+   step of the owner-setup script computes the request for a coursework pool of `g7e.2xlarge`
+   (8 vCPUs an instance) alone, the example's: use the pool's actual `max_instances` as `N`, or the
+   new maximum if step 2 raises it; the script adds the one instance more.
 
    ```sh
    setup/owner-setup.sh --step quotas --max-instances N
    ```
+
+   If your pools list another type, or several G-family pools are used together, the script's
+   figure is not yours: request the total you computed above instead, in the Service Quotas console,
+   under Amazon EC2, for the quota "Running On-Demand G and VT instances", with **Request increase
+   at account level**.
 
 2. **A pool's maximum, if the class needs more instances.** Edit `max_instances` of the pool in
    your configuration file, kept outside the working tree, then validate and write it to SSM:
@@ -91,26 +101,59 @@ Do these the day before the class, while no session is on.
    the `deploy/<stage>` status of step 3 can still be an earlier run's success; only this execution
    says what happened to the edit. In the stage the class uses, it runs the deployment actions
    first and the verification (the action Verify, the smoke tests against the deployed endpoint)
-   after them, so read the two apart:
+   after them. Read the deployment first:
 
-   - The execution Succeeded, with every action of that stage Succeeded, Verify included: the new
-     value is deployed and the endpoint passed its smoke tests.
    - A deployment action of that stage failed, or the execution failed or was stopped before
      reaching them: the new value may not be deployed, or only partly. Fix the cause and start
      another run.
    - Every deployment action Succeeded and Verify failed: the new value **is** deployed, and the
      endpoint did not pass its smoke tests with it. Do not start the class on it. Fix the cause (or
      put the previous value back, by the same configuration step) and start another run.
+   - Every action of that stage Succeeded, Verify included: the new value is deployed. This alone
+     does **not** say that a smoke test ran. Verify also succeeds when it has nothing to test,
+     without running one: when the endpoint has no HTTPS listener, or when the canary's key is
+     missing because the canary command has not been run yet. Read what the verification did from
+     the same execution, below.
+
+   **Whether the smoke tests ran and passed.** The pipeline's reporter posts the verification's
+   verdict as the commit status `verify/<stage>` on the commit the execution deployed, which for a
+   run started with **Release change** is the latest commit of `main`. An earlier execution left a
+   status of the same name on that commit, so read only the newest one, and check that it was
+   created after the time you noted. On GitHub, with the name of the stage the class uses in place
+   of `<stage>`:
+
+   ```sh
+   gh api repos/OWNER/REPOSITORY/commits/main/statuses --jq '[.[] | select(.context == "verify/<stage>")][0] | "\(.created_at) \(.state) \(.description)"'
+   ```
+
+   - `success` with the description "The verification's tests ran and passed.": the smoke tests
+     ran against the endpoint with the new value, and passed.
+   - `success` with a description that begins "No test ran": the deployment is not verified, even
+     though Verify Succeeded. The description says why. For a missing canary key, create it with
+     the canary command below, then start another run with **Release change** and read its status
+     again; for a missing HTTPS listener, the listener must be turned on first (it is off by
+     default).
+   - `failure` or `error`: the verification failed, as in the case above where Verify failed.
+   - No status created after the time you noted: the reporter has not posted this execution's
+     verdict yet. Wait a few minutes and read it again; until it is there, the deployment is not
+     verified.
+
+   ```sh
+   rhi_admin canary
+   ```
 
    Switch the session on only once an execution started after your last configuration change has
-   succeeded through Verify.
+   succeeded through Verify **and** its `verify/<stage>` status reads "The verification's tests ran
+   and passed.".
 
 3. **Every configuration change has landed, and no deployment is running.** A deployment that has
    passed the deployment hold's check runs to its end even after the session is switched on, so
    none may be under way when you switch it on. A change merged to `main` has landed when the
-   latest commit of `main` carries a `deploy/<stage>` status that reads success; a change made in
-   SSM alone has landed only when the execution of step 2 succeeded, which this status cannot show.
-   On GitHub:
+   latest commit of `main` carries a `deploy/<stage>` status that reads success; it has also been
+   tested only when the commit's `verify/<stage>` status reads success with the description "The
+   verification's tests ran and passed.", not one that begins "No test ran" (step 2 says what each
+   means). A change made in SSM alone has landed only when the execution of step 2 succeeded, which
+   the `deploy/<stage>` status cannot show. On GitHub:
 
    ```sh
    gh api repos/OWNER/REPOSITORY/commits/main/status --jq '.statuses[] | "\(.context) \(.state)"'
@@ -222,10 +265,12 @@ Do these the day before the class, while no session is on.
    its last held or in-flight request cleared, not from when that request arrived: a request that
    was still running when you switched the session off (one may run up to 30 minutes) keeps the
    pool up until it ends, and the idle interval starts only then. So first wait until no request
-   of the pool is held or in flight: in Grafana, the panel of concurrent streams and the queue
-   shows the gateway's requests in flight and held for the pool at zero (section 7.2). Then allow
-   the full `idle_minutes` (20 for the example's coursework), plus a few minutes for the scaler to
-   act, before checking that each pool has no instance in service: in Grafana, the panel Instances of the fleet and scaling dashboard shows no instance in
-   service and a desired capacity of zero for each pool.
+   of the pool is running: in Grafana, on the dashboard "Fleet and scaling", in the pool's row, the
+   panel "Engine requests: running and waiting, per instance" reads zero running and zero waiting
+   for every instance. With the session off, the gateway takes no new request, so none is held
+   either. Then allow the full `idle_minutes` (20 for the example's coursework), plus a few minutes
+   for the scaler to act, before checking that each pool has no instance in service: on the same
+   dashboard, in each pool's row, the panel "Instances: desired, in service, warm" reads zero for
+   desired and for in service.
 
 Walked through on the deployed system: not yet.

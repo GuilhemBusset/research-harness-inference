@@ -115,7 +115,16 @@ only when the admin asks for its capacity, which is not part of this runbook.
    rhi status
    ```
 
-3. After disabling, in Grafana, the panel Instances of the fleet and scaling dashboard shows the
-   pool's desired capacity at zero once its last request has finished.
+3. After disabling, the pool's capacity falls to zero, though not always as soon as its last
+   request finishes. The scaler releases at once each instance whose fresh heartbeat reports
+   nothing running and nothing waiting. An instance that reports no fresh heartbeat (one still
+   starting when you disabled the pool, or one whose lifecycle agent is silent) is not known to be
+   idle, so it is kept until the pool's idle rule takes it: `idle_minutes` after the pool's last
+   request (20 for the example's coursework), plus a few minutes for the scaler to act (section
+   5.1). In Grafana, on the dashboard "Fleet and scaling", in the pool's row, the panel
+   "Engine requests: running and waiting, per instance" first reads zero for every instance; then,
+   within those minutes, the panel "Instances: desired, in service, warm" reads zero for desired
+   and for in service. Capacity still there after that is not this runbook's to explain: read the
+   pool's scale decisions on the panel "Scale decisions by reason" of the same row.
 
 Walked through on the deployed system: not yet.

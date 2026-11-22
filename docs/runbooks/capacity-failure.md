@@ -49,8 +49,10 @@ During a session, a pool does not come up:
   found no capacity in the zones in the past 10 minutes, and `warming` otherwise (section 5.3).
   `warming` at the deadline does not prove a launch is under way: the scaler records only a
   shortage in the zones, so a launch refused for the account's vCPU quota leaves the cause
-  `warming`, and `rhi status` lists the pool as `warming` while no instance is starting. Check,
-  step 3, tells a slow start, a shortage in the zones and a quota refusal apart.
+  `warming`, and `rhi status` lists the pool as `warming` while no instance is starting, unless
+  another launch met a shortage in the past 10 minutes, when it reads `capacity_unavailable`
+  though the quota is what refuses the launches now. Check, step 3, tells a slow start, a shortage
+  in the zones and a quota refusal apart, whichever cause shows.
 
 ## Check
 
@@ -77,18 +79,24 @@ During a session, a pool does not come up:
    unavailable for capacity is passed to it, and it tries again.
 
 3. **What the launches met: a slow start, a shortage in the zones, or the quota.** A launch refused
-   for the vCPU quota does not show as `capacity_unavailable`: students' held calls end with
-   `warming`, and `rhi status` and `rhi wait` read `warming` until `rhi wait` gives up at its
-   timeout, as if the pool were only slow to start. In the EC2 console, open the Auto Scaling group
-   of the pool and read its recent launch attempts under **Activity**:
+   for the vCPU quota does not itself show as `capacity_unavailable`: alone, it leaves students'
+   held calls ending with `warming`, and `rhi status` and `rhi wait` reading `warming` until
+   `rhi wait` gives up at its timeout, as if the pool were only slow to start. But the two can come
+   together: when another launch of the pool met a shortage in the zones in the past 10 minutes,
+   the pool reads `capacity_unavailable` even while the launches after it are refused for the
+   quota. So `capacity_unavailable` does not rule the quota out, and `warming` does not rule a
+   refusal out: read the launches themselves either way. In the EC2 console, open the Auto Scaling
+   group of the pool and read its recent launch attempts under **Activity**:
 
    - an attempt in progress or successful, and no failed one: a slow start, not this runbook; wait
      for `ready` (Verify);
    - failed attempts whose status message names insufficient instance capacity: a shortage in the
      zones, this runbook (Act);
-   - failed attempts whose status message names the vCPU limit or quota: the quota is the limit.
-     Waking the pool again does not help, since every launch is refused the same way until the
-     quota is raised. It is fixed by the quota step of the runbook
+   - failed attempts whose status message names the vCPU limit or quota, whether or not others
+     name insufficient capacity: the quota is a limit, and the newest attempts say which one holds
+     now. While the newest are refused for the quota, waking the pool again does not help, since
+     every launch is refused the same way until the quota is raised, or until an instance of
+     another pool in the same family is released. It is fixed by the quota step of the runbook
      [a session switched on and off](session-on-and-off.md), which can take days, so not during
      the class: tell the students to work with their own subscriptions (Act, step 1).
 
