@@ -23,6 +23,11 @@ action that sets the group's desired capacity to zero every night, at the config
 `nightly_stop` in its `time_zone` (sections 5.1 and 17). It sets neither the minimum nor the
 maximum, which the fleet cap checks, and leaves the warm pool as it is.
 
+The group publishes its group metrics to CloudWatch every minute, the warm pool's among them,
+whether or not the pool has a warm pool: the alarms that guard money from outside the scaler read
+them (`rhi.guardrails.alarms_fleet`; sections 5.1 and 7.3). Auto Scaling publishes them at no
+charge.
+
 Zone rebalancing is suspended, because it replaces instances in service (section 4.3). No property
 of the group suspends a process for good, so a custom resource calls `SuspendProcesses` for
 `AZRebalance` when the group is created, and again when it is replaced: a replaced group has a new
@@ -101,6 +106,32 @@ REBALANCING = "AZRebalance"
 
 # The size, in GiB, of a GPU pool's volume (sections 4.3 and 5.2).
 GPU_VOLUME_GIB = 150
+
+# The group metrics the group publishes, every minute: the group's and its warm pool's, every one
+# Auto Scaling has.
+METRICS_GRANULARITY = "1Minute"
+GROUP_METRICS = (
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupPendingInstances",
+    "GroupStandbyInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
+    "GroupInServiceCapacity",
+    "GroupPendingCapacity",
+    "GroupStandbyCapacity",
+    "GroupTerminatingCapacity",
+    "GroupTotalCapacity",
+    "WarmPoolDesiredCapacity",
+    "WarmPoolWarmedCapacity",
+    "WarmPoolPendingCapacity",
+    "WarmPoolTerminatingCapacity",
+    "WarmPoolTotalCapacity",
+    "GroupAndWarmPoolDesiredCapacity",
+    "GroupAndWarmPoolTotalCapacity",
+)
 
 
 def machine_image(pool: Pool) -> tuple[ec2.IMachineImage, str]:
@@ -186,6 +217,11 @@ class PoolGroup(Construct):
                     on_demand_percentage_above_base_capacity=100,
                 ),
             ),
+            metrics_collection=[
+                autoscaling.CfnAutoScalingGroup.MetricsCollectionProperty(
+                    granularity=METRICS_GRANULARITY, metrics=list(GROUP_METRICS)
+                )
+            ],
             # The template's tags reach the instances; the group's tags say which pool it is, and
             # which engine it runs.
             tags=[

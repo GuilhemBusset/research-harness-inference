@@ -86,7 +86,11 @@ def test_the_stack_creates_no_resource_of_its_own_and_nothing_reads_it(app: cdk.
         if isinstance(c, cdk.CfnResource) and c.cfn_resource_type != "AWS::CDK::Metadata"
     ]
     assert resources
-    assert {nag.created_by(r, nag.SOURCE) for r in resources} <= {"guardrails_alerts", "guardrails_anomaly"}
+    assert {nag.created_by(r, nag.SOURCE) for r in resources} <= {
+        "guardrails_alerts",
+        "guardrails_anomaly",
+        "guardrails_alarms_fleet",
+    }
     assert "Outputs" not in guardrails(templates)
 
 

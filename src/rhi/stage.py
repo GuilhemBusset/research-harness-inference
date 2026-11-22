@@ -73,4 +73,4 @@ class EndpointStage(cdk.Stage):
         )
         # The alerts topic and what reports to it. Its alarms read the stacks above, so no stack
         # reads it (`rhi.guardrails.stack`).
-        self.guardrails = GuardrailsStack(self, "Guardrails", config=config)
+        self.guardrails = GuardrailsStack(self, "Guardrails", config=config, groups=self.pools.groups)
