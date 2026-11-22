@@ -25,7 +25,6 @@ import scrub
 from harness import Capture, Replayed, Settled
 from rhi_common.keys import generate_key
 from rhi_gateway import profile
-from rhi_gateway.budget import estimate_input_tokens
 from rhi_gateway.errors import WireFormat
 
 CAPTURES = harness.folder()
@@ -116,16 +115,16 @@ def entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
 
 
 def assert_whole(capture: Capture, replayed: Replayed) -> None:
-    """The client has the recorded bytes, and the one reservation is settled once, to the usage expected."""
+    """The client has the recorded bytes, and the one reservation is settled once, having observed the usage expected."""
     cut = replayed.cut if len(replayed.cut) <= 1 else f"{len(replayed.cut)} positions"
     where = f"{capture.name}, cut at {cut}"
     assert replayed.status == capture.status, where
     assert replayed.received == capture.answer, where
-    assert len(replayed.estimates) == 1, where
+    assert replayed.reserved == 1, where
     usage = capture.usage
-    assert replayed.settled == (Settled(usage.input_tokens, usage.output_tokens, True, usage.total),), where
-    # The student's record agrees: no lease is left, and the day holds the usage and nothing reserved.
-    assert (replayed.leases, replayed.charged) == (0, usage.total), where
+    assert replayed.settled == (Settled(usage.input_tokens, usage.output_tokens, True, True),), where
+    # The student's record agrees: no lease is left, and the day's tokens hold nothing charged.
+    assert (replayed.leases, replayed.tokens) == (0, 0), where
 
 
 @pytest.mark.parametrize("capture", CAPTURES, ids=lambda capture: capture.name)
@@ -159,7 +158,7 @@ def test_the_folder_holds_each_format_streamed_and_not() -> None:
 
 
 def stream_that_reports_much() -> Capture:
-    """A Messages stream whose usage is far above the estimate of its request, as a long cached transcript's is."""
+    """A Messages stream whose usage is far above the size of its request, as a long cached transcript's is."""
 
     def event(name: str, **data: Any) -> str:
         return f"event: {name}\ndata: {json.dumps({'type': name, **data})}\n\n"
@@ -178,13 +177,12 @@ def stream_that_reports_much() -> Capture:
     return harness.parse("built-stream", built(answer=answer, usage={"input_tokens": 9000, "output_tokens": 40}))
 
 
-def test_disconnects_are_charged() -> None:
+def test_disconnects_settle_once_with_what_was_observed() -> None:
     streamed = [capture for capture in CAPTURES if capture.streamed]
     assert streamed
-    above = below = 0
     for capture in (*streamed, stream_that_reports_much()):
         events = harness.events(capture.answer)
-        # The harness's own reading of a stream's usage, which the charges below are held to: of
+        # The harness's own reading of a stream's usage, which the settlements below are held to: of
         # the whole stream, it is the usage the capture expects.
         assert harness.reported(b"".join(events)) == capture.usage
         replays = list(harness.replay_disconnects(capture))
@@ -194,18 +192,12 @@ def test_disconnects_are_charged() -> None:
             # The client took these events and no more, and the gateway was handed no more either.
             assert replayed.received == b"".join(events[:after]), where
             assert replayed.forwarded is not None, where
-            (estimate,) = replayed.estimates
-            assert estimate == estimate_input_tokens(replayed.forwarded), where
-            # The tokens observed are those the events handed over report; never less than the estimate.
+            assert replayed.reserved == 1, where
+            # The tokens observed are those the events handed over report, and nothing is charged.
             observed = replayed.handed
             assert observed == harness.reported(b"".join(events[:after])), where
-            charge = max(observed.total, estimate)
-            assert replayed.settled == (Settled(observed.input_tokens, observed.output_tokens, False, charge),), where
-            assert (replayed.leases, replayed.charged) == (0, charge), where
-            above += observed.total > estimate
-            below += observed.total < estimate
-    # Both sides of the rule were met: disconnects charged what was observed, and others the estimate.
-    assert above and below
+            assert replayed.settled == (Settled(observed.input_tokens, observed.output_tokens, False, True),), where
+            assert (replayed.leases, replayed.tokens) == (0, 0), where
 
 
 def test_the_forwarded_body_is_checked(entries: None) -> None:

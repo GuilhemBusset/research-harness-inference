@@ -15,8 +15,8 @@ runs, and a key that is not well formed is refused with no lookup.
 
 A pool's state comes from what the gateway already keeps of it (`rhi_gateway.readiness`): whether
 it has a healthy target, its mode and the scaler's note. Answering reads nothing else, asks for no
-wake and reserves no budget: cheap calls never wake a GPU, and a status call is not demand
-(sections 5.1 and 5.3). Only the wake is given the waker and the ledger.
+wake and takes no concurrency slot: cheap calls never wake a GPU, and a status call is not demand
+(sections 5.1 and 5.3). Only the wake is given the waker.
 
 | State | When |
 | --- | --- |
@@ -33,13 +33,11 @@ is a value that is dropped here.
 **The wake** starts a pool without a request, under a request's rules (sections 5.1 and 5.3). Its
 body is a JSON object whose `model` names the pool as a request's does (`rhi_gateway.body.pool_named`):
 a configured pool's name, or a `claude-` name for the default pool; anything else is
-`request_refused`. A student with no tokens left of the day, by the ledger's read, is refused with
-`budget_reached` and nothing is asked. Otherwise the answer is the pool's record, as the status
-gives it. When that record is unavailable for one of the hold's immediate causes the wake asks for
+`request_refused`. Otherwise the answer is the pool's record, as the status gives it. When that record is unavailable for one of the hold's immediate causes the wake asks for
 nothing; for any other pool, one unavailable for capacity included, the scaler is asked to run
 (`rhi_gateway.waker.Waker.ask`, which the scaler retries) and the wake is recorded as an explicit
-wake, demand until the pool is ready or 10 minutes have passed. The wake reads the ledger and never
-writes it: it reserves no tokens and takes no concurrency slot.
+wake, demand until the pool is ready or 10 minutes have passed. The wake takes no concurrency
+slot and writes no student's record.
 """
 
 from __future__ import annotations
@@ -50,7 +48,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -61,7 +58,6 @@ from rhi_gateway import routes, telemetry
 from rhi_gateway.app import Handler, RequestBody
 from rhi_gateway.auth import Authenticator, authenticated
 from rhi_gateway.body import MODEL_FIELD, parse, pool_named, read_body
-from rhi_gateway.budget import Ledger
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.hold import NO_CAPACITY_SECONDS, End, Hold
 from rhi_gateway.keystore import KeyRecord
@@ -141,7 +137,7 @@ class LocalRoutes:
     (`rhi_gateway.readiness.Readiness.views`); a pool it does not hold yet reads as not ready with
     no records. `clock` gives the seconds since the epoch, the clock of the scaler's note.
 
-    `waker` and `ledger` are the wake's, given together: without them the wake is not served here.
+    `waker` is the wake's: without it the wake is not served here.
     """
 
     authenticator: Authenticator
@@ -150,13 +146,10 @@ class LocalRoutes:
     default_pool: Pool | None = None
     clock: Callable[[], float] = time.time
     waker: Waker | None = None
-    ledger: Ledger | None = None
 
     def __post_init__(self) -> None:
         if self.default_pool is not None and self.default_pool not in self.pools:
             raise ValueError("the default pool is not one of the configured pools")
-        if (self.waker is None) != (self.ledger is None):
-            raise ValueError("the wake needs both the waker and the ledger")
 
     def statuses(self) -> list[PoolStatus]:
         """One record per configured pool, in the configuration's order."""
@@ -180,16 +173,13 @@ class LocalRoutes:
         return _json({"pools": [record.to_json() for record in self.statuses()]})
 
     async def wake(self, request: Request, entry: Route, student: KeyRecord) -> Response:
-        waker, ledger = self.waker, self.ledger
-        if waker is None or ledger is None:
-            raise RuntimeError("the wake is served only with a waker and a ledger")
+        waker = self.waker
+        if waker is None:
+            raise RuntimeError("the wake is served only with a waker")
         try:
             body = parse(await read_body(RequestBody(request.receive)))
             pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
             telemetry.note_pool(pool.name)
-            # The ledger's read: it reserves nothing and holds no slot.
-            if await run_in_threadpool(ledger.tokens_left, student) <= 0:
-                raise GatewayError(Cause.BUDGET_REACHED)
         except GatewayError as refused:
             telemetry.note_cause(refused.cause)
             answer = render_json(refused, WireFormat.MESSAGES)
@@ -204,7 +194,7 @@ class LocalRoutes:
         return _json(record.to_json())
 
     def handlers(self) -> dict[Route, Handler]:
-        """The handlers of the local routes: all but the hello behind authentication, the wake when it is given its parts."""
+        """The handlers of the local routes: all but the hello behind authentication, the wake when it is given the waker."""
         served: dict[Route, Handler] = {
             routes.MODELS: authenticated(self.authenticator, self.models),
             routes.STATUS: authenticated(self.authenticator, self.status),

@@ -1116,7 +1116,7 @@ def _replays(capture: Mapping[str, Any]) -> bool:
         replayed = harness.replay(read)
     except Exception:  # noqa: BLE001 - whatever stops a replay, the capture is not one the replay tests can replay.
         return False
-    settled = (harness.Settled(usage.input_tokens, usage.output_tokens, True, usage.total),)
+    settled = (harness.Settled(usage.input_tokens, usage.output_tokens, True, True),)
     return (replayed.status, replayed.received, replayed.settled) == (read.status, read.answer, settled)
 
 

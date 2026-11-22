@@ -170,7 +170,7 @@ def gateway(*students: tuple[str, int]) -> Gateway:
         for alias, github_id in students
     ]
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
-    made = Gateway(Starlette(), metrics.Metrics(ledger), keys)
+    made = Gateway(Starlette(), metrics.Metrics(), keys)
 
     async def engine(request: httpx.Request) -> httpx.Response:
         if not json.loads(await request.aread()).get("stream"):

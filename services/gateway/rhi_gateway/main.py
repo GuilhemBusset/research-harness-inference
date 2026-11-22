@@ -197,7 +197,7 @@ def build(
         [pool.name for pool in pools],
         waker=waker,
     )
-    gateway_metrics = Metrics(ledger, keys)
+    gateway_metrics = Metrics(keys)
 
     def rewrites(route: routes.Route) -> dict[str, Rewrite]:
         """What a route's filter runs in its per-pool step: the pools' profiles on that route."""
@@ -231,7 +231,6 @@ def build(
         views=readiness.views,
         default_pool=default_pool,
         waker=waker,
-        ledger=ledger,
     )
     app = build_app(
         forwarding_handlers(forwarding),

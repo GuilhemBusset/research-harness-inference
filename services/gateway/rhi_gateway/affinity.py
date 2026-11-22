@@ -6,8 +6,8 @@ therefore has duration-based stickiness: the internal load balancer names the ta
 a cookie on its answer, and a request that carries the cookie goes to that target (evidence E13).
 
 The gateway is the load balancer's client, so the gateway keeps the cookie, one per student and
-pool, on the student's budget record. The write that reserves budget returns it and the write that
-settles stores it (`rhi_gateway.budget`), so every gateway task sees the same cookie and a
+pool, on the student's usage record. The write that takes the concurrency slot returns it and the
+write that releases it stores it (`rhi_gateway.budget`), so every gateway task sees the same cookie and a
 student's parallel requests follow the same one. This module is one request's part in that:
 
 - `Affinity.judged(...)` is made from the cookie the reservation returned, `None` if the record

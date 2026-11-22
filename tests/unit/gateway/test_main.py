@@ -326,8 +326,11 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
         # The bearer is the value Secrets Manager holds under the pool's ARN, which no variable held.
         assert request.headers["Authorization"] == "Bearer " + pool_secrets["mock"]
         assert pool_secrets["mock"] not in "".join(environ.values())
-        # The ledger is the usage table's: the day is charged what the engine reported.
-        assert [(int(day["github_id"]), int(day["tokens"])) for day in items(USAGE_TABLE)] == [(7, 17)]
+        # The ledger is the usage table's: the request's slot was taken and released there, and
+        # nothing was charged.
+        assert [(int(day["github_id"]), int(day["tokens"]), day["leases"]) for day in items(USAGE_TABLE)] == [
+            (7, 0, {})
+        ]
 
         # The body limit of the environment: a body above it is refused, and nothing is forwarded.
         long = {**MESSAGE, "messages": [{"role": "user", "content": "x" * 600}]}

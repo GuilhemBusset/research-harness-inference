@@ -10,8 +10,9 @@ rewritten here. What stands in is around it:
   replay (a capture holds none), and can leave in the middle of an answer;
 - **the upstream** is the transport of the proxy's own client: it keeps the body it is sent and
   answers the recorded bytes in the chunks the replay chooses;
-- **the ledger** is the gateway's in-memory one, which also notes each reservation and each
-  settlement with what it charged.
+- **the ledger** is the gateway's in-memory one, which also notes each reservation and whether
+  each settlement removed its lease; the proxy is the gateway's own, which also notes what each
+  settlement observed.
 
 **The cuts.** The network cuts an answer wherever it likes, so an answer is replayed once for each
 cut of `cuts`: the whole answer still arrives, in chunks that end at the cut's positions. A short
@@ -50,22 +51,24 @@ import itertools
 import json
 import random
 import tomllib
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
-from starlette.types import Message, Scope
+from starlette.responses import Response
+from starlette.types import Message, Receive, Scope
 
 import scrub
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import profile, proxy, routes
+from rhi_gateway.affinity import Affinity
 from rhi_gateway.app import Filter, Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
-from rhi_gateway.body import CACHE_SALT_FIELD, REQUEST_ID_FIELD, BodyFilter, Rewrite
+from rhi_gateway.body import CACHE_SALT_FIELD, REQUEST_ID_FIELD, BodyFilter, Forwarded, Rewrite
 from rhi_gateway.budget import InMemoryLedger, Reservation
 from rhi_gateway.errors import WireFormat
 from rhi_gateway.formats import messages, responses
@@ -299,12 +302,12 @@ def reported(answer: bytes) -> Usage:
 
 @dataclass(frozen=True)
 class Settled:
-    """One settlement the ledger was asked for: what was observed, and the charge (`None`: nothing was charged)."""
+    """One settlement: what the proxy observed, and whether the ledger removed the lease (`False`: nothing was there)."""
 
     input_tokens: int
     output_tokens: int
     ended_cleanly: bool
-    charge: int | None
+    removed: bool
 
 
 @dataclass(frozen=True)
@@ -322,14 +325,14 @@ class Replayed:
     """The body the upstream received; `None` if the gateway forwarded nothing."""
     handed: Usage
     """The usage reported by what the upstream had handed to the gateway when the replay ended."""
-    estimates: tuple[int, ...]
-    """The input estimate of each reservation the gateway made: one, for a request that was forwarded."""
+    reserved: int
+    """The reservations the gateway made: one, for a request that was forwarded."""
     settled: tuple[Settled, ...]
     """Every settlement the ledger was asked for, in order."""
     leases: int
     """The leases still in the student's record at the end."""
-    charged: int
-    """The tokens of the student's day at the end: what was charged, and what is still reserved."""
+    tokens: int
+    """The tokens of the student's day at the end: 0, since nothing is charged."""
 
 
 class _Ledger(InMemoryLedger):
@@ -338,21 +341,41 @@ class _Ledger(InMemoryLedger):
     def __init__(self) -> None:
         super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.reserved: list[Reservation] = []
-        self.settled: list[Settled] = []
+        self.settled: list[bool] = []
 
     def reserve(self, *arguments: Any, **named: Any) -> Reservation:
         reservation = super().reserve(*arguments, **named)
         self.reserved.append(reservation)
         return reservation
 
-    def settle(
-        self, reservation: Reservation, *, input_tokens: int, output_tokens: int, ended_cleanly: bool, **named: Any
-    ) -> int | None:
-        charge = super().settle(
-            reservation, input_tokens=input_tokens, output_tokens=output_tokens, ended_cleanly=ended_cleanly, **named
-        )
-        self.settled.append(Settled(input_tokens, output_tokens, ended_cleanly, charge))
-        return charge
+    def settle(self, reservation: Reservation, **named: Any) -> bool:
+        removed = super().settle(reservation, **named)
+        self.settled.append(removed)
+        return removed
+
+
+class _Proxy(proxy.Proxy):
+    """The gateway's proxy, noting what each settlement it makes observed."""
+
+    def __init__(self, *arguments: Any, **named: Any) -> None:
+        super().__init__(*arguments, **named)
+        self.observed: list[proxy.Observed] = []
+
+    async def forward(
+        self,
+        route: routes.Route,
+        forwarded: Forwarded,
+        on_end: Callable[[proxy.Observed], Awaitable[None]],
+        *,
+        receive: Receive | None = None,
+        token_sent: proxy.TokenSent | None = None,
+        affinity: Affinity | None = None,
+    ) -> Response:
+        async def noted(observed: proxy.Observed) -> None:
+            self.observed.append(observed)
+            await on_end(observed)
+
+        return await super().forward(route, forwarded, noted, receive=receive, token_sent=token_sent, affinity=affinity)
 
 
 class _Upstream:
@@ -476,11 +499,12 @@ async def _replay(
     upstream = _Upstream(capture, chunks, client.left)
     ledger = _Ledger()
     secrets = {pool.name: "the-pool-secret-of-a-replay" for pool in POOLS}
+    gateway_proxy = _Proxy(proxy.upstream_client(httpx.MockTransport(upstream)), "http://pools.example.com", secrets)
     forwarding = Forwarding(
         authenticator=Authenticator(InMemoryKeyStore(student), wall_clock=lambda: float(NOW)),
         ledger=ledger,
         filters=filters(capture.profile),
-        proxy=proxy.Proxy(proxy.upstream_client(httpx.MockTransport(upstream)), "http://pools.example.com", secrets),
+        proxy=gateway_proxy,
         # Every pool is ready: the request is forwarded at once, with no hold.
         holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
     )
@@ -495,10 +519,13 @@ async def _replay(
         received=client.received,
         forwarded=upstream.received,
         handed=reported(upstream.handed),
-        estimates=tuple(reservation.lease.estimate for reservation in ledger.reserved),
-        settled=tuple(ledger.settled),
+        reserved=len(ledger.reserved),
+        settled=tuple(
+            Settled(observed.input_tokens, observed.output_tokens, observed.ended_cleanly, removed)
+            for observed, removed in zip(gateway_proxy.observed, ledger.settled, strict=True)
+        ),
         leases=0 if day is None else len(day.leases),
-        charged=0 if day is None else day.tokens,
+        tokens=0 if day is None else day.tokens,
     )
 
 

@@ -124,13 +124,32 @@ def test_each_item_survives_a_round_trip(record: StudentKey | RosterEntry | Usag
 
 @pytest.mark.parametrize(
     "name",
-    ["key_hash", "github_id", "alias", "issued_at", "expires_at", "daily_token_budget", "concurrency_limit"],
+    ["key_hash", "github_id", "alias", "issued_at", "expires_at", "concurrency_limit"],
 )
 def test_a_key_item_without_a_required_attribute_is_refused(name: str) -> None:
     item: dict[str, object] = dict(KEY.to_item())
     del item[name]
     with pytest.raises(RecordError):
         StudentKey.from_item(item)
+
+
+def without(item: Mapping[str, object], *names: str) -> dict[str, object]:
+    return {name: value for name, value in item.items() if name not in names}
+
+
+def test_items_without_the_token_budget_s_attributes_read_back_and_are_written_with_them() -> None:
+    key = StudentKey.from_item(as_read(without(KEY.to_item(), "daily_token_budget")))
+    roster = RosterEntry.from_item(as_read(without(ROSTER.to_item(), "daily_token_budget")))
+    lease = {"req-1": without(USAGE.leases["req-1"].to_map(), "tokens", "estimate")}
+    day = UsageDay.from_item(as_read({**without(USAGE.to_item(), "tokens"), "leases": lease}))
+
+    assert (key.daily_token_budget, key.concurrency_limit) == (0, KEY.concurrency_limit)
+    assert (roster.daily_token_budget, roster.concurrency_limit) == (0, ROSTER.concurrency_limit)
+    assert (day.tokens, day.leases) == (0, {"req-1": Lease(tokens=0, estimate=0, expires=NOW + 1800)})
+    # A task of the release before reads all four: each item is still written with them.
+    assert key.to_item()["daily_token_budget"] == roster.to_item()["daily_token_budget"] == 0
+    assert day.to_item()["tokens"] == 0
+    assert day.to_item()["leases"] == {"req-1": {"tokens": 0, "estimate": 0, "expires": NOW + 1800}}
 
 
 def test_a_key_in_clear_is_refused_as_a_key_hash() -> None:

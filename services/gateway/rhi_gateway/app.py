@@ -8,20 +8,20 @@ has no handler answers as a route outside the table does.
 `forwarding_handlers` fills the four forwarded slots with the warm path of a request (section 3):
 authentication from the headers, the body filter of the route's wire format, the reservation, and
 the proxy (`rhi_gateway.proxy`), whose answer goes back to the client. The proxy settles every end
-of the request exactly once: a clean end is charged the usage the engine reported; any other end (a
-client that leaves, an engine that fails, the time limit), the tokens observed and never less than
-the input estimate (`rhi_gateway.budget`). An engine that fails is told to the client with the
-cause `engine_error`, and the time limit with `time_limit`, in the request's wire format. The lease
-is reserved for the proxy's own time limit, so that the two cannot differ.
+of the request exactly once, a clean end or any other (a client that leaves, an engine that fails,
+the time limit): the settlement frees the request's concurrency slot and charges nothing
+(`rhi_gateway.budget`). An engine that fails is told to the client with the cause `engine_error`,
+and the time limit with `time_limit`, in the request's wire format. The lease is taken for the
+proxy's own time limit, so that the two cannot differ.
 
 The reservation is made once the body is read and filtered, because it needs what only the body
-gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
-long the lease lasts. It is still made before anything is sent to the engine. Right after it, the
+gives: the pool, whose hold sets how long the lease lasts, and whose cookie the reservation
+returns. It is still made before anything is sent to the engine. Right after it, the
 key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`): a key revoked or
 erased while the body arrived, a read that fails, or a request cancelled before the read ends, has
 the reservation taken back, and the day's row deleted when it holds only what its opening carried
 from the day before (`Ledger.withdraw`), so that no request undoes an erase and none takes what
-another request charged, holds or stored. The reservation names the pool, and returns the load
+another request holds or stored. The reservation names the pool, and returns the load
 balancer's cookie the student's record holds for it: the proxy sends that cookie, and the
 settlement stores the one the request ended with (`rhi_gateway.affinity`). It returns the last
 rebalance number the record has applied for the pool as well: the request is
@@ -47,7 +47,7 @@ request forwarded with no hold never does: a hold that ends before its first kee
 other sign a client can see.
 
 A hold that ends, at its deadline (`warming`, or `capacity_unavailable`) or for any other cause,
-settles the reservation with nothing observed, which the ledger charges the input estimate, and
+settles the reservation with nothing observed, which frees its slot, and
 ends the request with its cause: the error event of its format on a stream, the JSON answer (503
 with `Retry-After` for `warming`) otherwise. The seconds of `Retry-After` are the design's for each
 cause that carries the header, or those `Forwarding.retry_after` gives. Token counting is a cheap
@@ -62,8 +62,7 @@ application and, at shutdown, stops them with a last row of zeros. Given the rea
 runs its cycle for as long as the application does.
 
 The models, status, wake and hello routes are answered by `rhi_gateway.local`: `build_app` fills
-their slots from the `LocalRoutes` it is given (the wake's only when that is given the waker and
-the ledger).
+their slots from the `LocalRoutes` it is given (the wake's only when that is given the waker).
 
 Everything outside the table is answered 404 with the cause `not_found`, by this application and
 not by Starlette: no redirect to or from a trailing slash, and no 405 for another method on a
@@ -93,7 +92,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
@@ -263,14 +261,6 @@ def build_app(
     return app
 
 
-# Where each format's body carries its output limit, the first of them that holds a number counting.
-_OUTPUT_LIMIT_FIELDS = {
-    WireFormat.MESSAGES: ("max_tokens",),
-    WireFormat.CHAT_COMPLETIONS: ("max_completion_tokens", "max_tokens"),
-    WireFormat.RESPONSES: ("max_output_tokens",),
-}
-
-
 class RequestBody:
     """A request's body as the filter reads it (`rhi_gateway.body.BodySource`), from ASGI messages."""
 
@@ -337,7 +327,7 @@ class Holding:
 
 @dataclass(frozen=True)
 class Forwarding:
-    """What the forwarded routes are made of: who is let in, the budget, the filters, the hold and the proxy.
+    """What the forwarded routes are made of: who is let in, the concurrency slots, the filters, the hold and the proxy.
 
     `filters` holds the body filter of each forwarded route of the table, under its entry. The
     longest a request may run is the proxy's. `heartbeat`, when given, counts the demand.
@@ -356,22 +346,6 @@ class Forwarding:
     def __post_init__(self) -> None:
         # Refused when the gateway is built, not at the first refusal it would render.
         render_json(Cause.WARMING, WireFormat.MESSAGES, self.retry_after)
-
-
-def output_limit(entry: Route, forwarded: Forwarded) -> int:
-    """The output a request may produce, which its reservation counts: none for a token count.
-
-    The body is the filter's, so the number in it is already clamped to the pool's largest output;
-    a body that names none may produce that much.
-    """
-    if entry == routes.COUNT_TOKENS or entry.wire_format is None:
-        return 0
-    body = json.loads(forwarded.body)
-    for name in _OUTPUT_LIMIT_FIELDS[entry.wire_format]:
-        value = body.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return max(0, math.ceil(value))
-    return forwarded.pool.largest_output
 
 
 def _streams(forwarded: Forwarded) -> bool:
@@ -408,7 +382,7 @@ class _Held:
     Made before the reservation, with the hold's first step: a request the rule ends at once is
     refused then and reserves nothing, and a pool already ready is forwarded with no hold. What
     else the first step asks (the wake) is done only once the reservation is made, by `waiting`:
-    a request the budget refuses never reaches the scaler (section 5.1).
+    a request the concurrency limit refuses never reaches the scaler (section 5.1).
     """
 
     def __init__(self, holding: Holding, pool: Pool, wire_format: WireFormat, *, streams: bool) -> None:
@@ -585,8 +559,6 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 forwarding.ledger.reserve,
                 student,
                 request_id,
-                forwarded.body,
-                output_limit=output_limit(entry, forwarded),
                 hold_seconds=forwarded.pool.hold_seconds,
                 longest_request_seconds=forwarding.proxy.longest_request_seconds,
                 pool=forwarded.pool.name,
@@ -637,9 +609,6 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             await run_in_threadpool(
                 forwarding.ledger.settle,
                 reservation,
-                input_tokens=observed.input_tokens,
-                output_tokens=observed.output_tokens,
-                ended_cleanly=observed.ended_cleanly,
                 cookie=affinity.ended,
                 rebalance_number=affinity.number,
                 cookie_dropped=affinity.dropped,

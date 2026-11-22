@@ -13,7 +13,7 @@ a key that was replaced or revoked stops working within 60 seconds. Expiry is ch
 request, from the cached record.
 
 A forwarded request reads its body after it is accepted, and a body may take long to arrive. So
-right after it reserves budget, the write that makes the student's usage row, the request has its
+right after it takes its concurrency slot, the write that makes the student's usage row, the request has its
 key read once more, past the cache (`Authenticator.confirm`). A key revoked while the request was
 on its way, or gone from the store as the admin's erase leaves it (`rhi_admin.privacy`), has its
 reservation taken back, and the usage row deleted when nothing else is left in it: the read comes
@@ -25,7 +25,7 @@ was missing, malformed, unknown, revoked or expired.
 
 `Authenticator.authenticate` is given the headers and has no way to read a body. `authenticated`
 fills a handler slot of `rhi_gateway.app` with a handler that is called only for an accepted key,
-so whatever that handler does (reading the body, reserving budget) is not done for a refused
+so whatever that handler does (reading the body, taking a concurrency slot) is not done for a refused
 request.
 """
 

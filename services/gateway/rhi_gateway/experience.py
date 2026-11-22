@@ -24,7 +24,7 @@ gateway's own: a configured pool's name, one of the three formats, `warm` or `he
 **The two waits of a request** (sections 4.2 and 7.2). What a student waits for is the first token,
 and then the first token that is not reasoning, which is when they see an answer begin: the model
 reasons before it answers. Both are counted in seconds from the request accepted, which is the
-moment `Experience.request` is called: its key, its body and its budget have passed, and its wait
+moment `Experience.request` is called: its key, its body and its concurrency limit have passed, and its wait
 for its pool, if it has one, has not begun. The first is observed at the first `Turn.token_sent` of the request,
 the second at the first one that reports answer text or a tool call (`rhi_gateway.proxy` tells
 which, as each format's reference marks its events). Like the speed, both only mean something on a

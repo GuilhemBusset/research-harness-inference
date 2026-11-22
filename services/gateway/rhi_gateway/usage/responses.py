@@ -1,7 +1,7 @@
 """Token usage read from a Responses answer (system design, section 6.2, steps 3 and 6).
 
-The gateway settles a student's reservation to the usage the engine reports, and a stream that
-ends badly is charged the tokens observed and never less than the input estimate. So this parser
+The gateway logs the usage the engine reports for each request, and for a stream that ends badly
+the tokens observed. So this parser
 can be asked at any moment what it has seen so far, and whether the stream has ended cleanly.
 
 Where Responses reports usage:
@@ -16,14 +16,13 @@ Where Responses reports usage:
 How the counts are made:
 
 - The input is `input_tokens` as reported. In OpenAI's reference it already includes the tokens
-  read from the cache, which `input_tokens_details.cached_tokens` details apart. The daily budget
+  read from the cache, which `input_tokens_details.cached_tokens` details apart. The log
   counts every input token, cached or not (sections 11.3 and 17), so the cached part is not added
   again: it is read apart, as `cached_input_tokens`, 0 when the usage details none.
 - The output is `output_tokens` as reported; it already includes the reasoning tokens that
   `output_tokens_details` details apart.
 - A usage object counts when both fields are whole numbers that are not negative. Anything else
-  (`null`, a missing field) is no usage at all: nothing is observed, and the caller charges its
-  estimate.
+  (`null`, a missing field) is no usage at all: nothing is observed.
 - A stream has ended cleanly once a `response.completed` or `response.incomplete` event that
   carries a usage has been read: the answer is over and there is a reported usage to settle to. A
   stream cut before it has not, nor has one that ends with `response.failed` or an `error` event;

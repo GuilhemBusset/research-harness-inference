@@ -169,8 +169,16 @@ def call(app: Starlette, sends: Callable[[httpx.AsyncClient], Any]) -> Any:
     return asyncio.run(run())
 
 
+def logged_tokens(capsys: pytest.CaptureFixture[str]) -> int:
+    """The input and output tokens of the last request's log record (`rhi_gateway.telemetry`), on standard output."""
+    record = json.loads(capsys.readouterr().out.splitlines()[-1])
+    return record["input_tokens"] + record["output_tokens"]
+
+
 @pytest.mark.parametrize("entry", list(CASES), ids=lambda entry: entry.path)
-def test_an_answer_reaches_the_client_whole_and_its_usage_is_settled(entry: routes.Route) -> None:
+def test_an_answer_reaches_the_client_whole_and_its_usage_is_settled(
+    entry: routes.Route, capsys: pytest.CaptureFixture[str]
+) -> None:
     upstream = Upstream()
     app, key, ledger = gateway(upstream)
     body, answer = CASES[entry]
@@ -181,7 +189,9 @@ def test_an_answer_reaches_the_client_whole_and_its_usage_is_settled(entry: rout
     assert response.content == answer
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
-    assert (day.tokens, day.leases) == (REPORTED[entry], {})
+    # The slot is freed and nothing is charged; the usage the engine reported is logged.
+    assert (day.tokens, day.leases) == (0, {})
+    assert logged_tokens(capsys) == REPORTED[entry]
     assert len(upstream.seen) == 1
     sent = upstream.seen[0]
     assert sent.headers["authorization"] == "Bearer " + SECRETS["coursework"]
@@ -189,7 +199,9 @@ def test_an_answer_reaches_the_client_whole_and_its_usage_is_settled(entry: rout
     assert key.encode() not in sent.content
 
 
-def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it() -> None:
+def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     upstream = Upstream()
     app, key, ledger = gateway(upstream)
     body = {"model": "coursework", "stream": True, "messages": []}
@@ -202,7 +214,8 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it()
     assert json.loads(upstream.seen[0].content)["stream_options"] == {"include_usage": True}
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
-    assert (day.tokens, day.leases) == (39, {})
+    assert (day.tokens, day.leases) == (0, {})
+    assert logged_tokens(capsys) == REPORTED[routes.CHAT_COMPLETIONS]
 
 
 @pytest.mark.parametrize("change", ["revoked", "erased", "unreadable"])
@@ -212,8 +225,8 @@ def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pyte
     # A request of the day already settled: what it wrote is no request's to take back.
     student = store.lookup(key_hash(key))
     assert student is not None
-    settled = ledger.reserve(student, "settled", b"{}", output_limit=10, hold_seconds=1, longest_request_seconds=1)
-    ledger.settle(settled, input_tokens=7, output_tokens=0, ended_cleanly=True)
+    settled = ledger.reserve(student, "settled", hold_seconds=1, longest_request_seconds=1, pool="coursework")
+    ledger.settle(settled, cookie="kept-cookie")
 
     def unreadable(_: str) -> None:
         raise OSError
@@ -233,7 +246,7 @@ def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pyte
 
     assert (response.status_code, upstream.seen) == (500 if change == "unreadable" else 401, [])
     day = ledger.day(STUDENT, utc_day(NOW))
-    assert day is not None and (day.tokens, day.leases) == (7, {})
+    assert day is not None and (day.affinity_cookies, day.leases) == ({"coursework": "kept-cookie"}, {})
 
 
 @pytest.mark.parametrize("cancelled", ["reserving", "confirming"])

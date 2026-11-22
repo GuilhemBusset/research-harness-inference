@@ -141,8 +141,6 @@ class Instance:
         reservation = self.ledger.reserve(
             who,
             uuid.uuid4().hex,
-            b"{}",
-            output_limit=100,
             hold_seconds=POOLS[pool].hold_seconds,
             longest_request_seconds=1800,
             pool=pool,
@@ -161,9 +159,6 @@ class Instance:
         request.affinity.answered(self.balancer.set_cookie())
         self.ledger.settle(
             request.reservation,
-            input_tokens=21,
-            output_tokens=7,
-            ended_cleanly=True,
             cookie=request.affinity.ended,
             rebalance_number=request.affinity.number,
             cookie_dropped=request.affinity.dropped,

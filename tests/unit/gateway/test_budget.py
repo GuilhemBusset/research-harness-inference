@@ -1,13 +1,13 @@
-"""Reserve budget before a request, settle after it (`rhi_gateway.budget`; section 6.2, step 3).
+"""Take a concurrency slot before a request, release it after (`rhi_gateway.budget`; section 6.2, step 3).
 
 These tests run the in-memory ledger, on a clock they control. The DynamoDB ledger decides with
-the same functions and is run against moto in `test_budget_dynamodb.py`.
+the same functions and is run against moto in `test_budget_dynamodb.py`. Every student here has a
+key whose daily budget is 0: no budget takes part in a reservation.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -18,18 +18,10 @@ from rhi_common import retention
 from rhi_common.causes import Cause
 from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
-from rhi_gateway.budget import (
-    BYTES_PER_TOKEN,
-    InMemoryLedger,
-    Reservation,
-    estimate_input_tokens,
-    lease_seconds,
-)
+from rhi_gateway.budget import InMemoryLedger, Reservation, lease_seconds
 from rhi_gateway.errors import GatewayError
-from rhi_gateway.usage.messages import read_answer
 
-# The defaults of section 17: 100 million tokens a day, and a longest request of 30 minutes.
-DAILY_BUDGET = 100_000_000
+# The longest request of section 17: 30 minutes.
 LONGEST_REQUEST_SECONDS = 1800
 NOON = int(datetime(2026, 11, 15, 12, tzinfo=UTC).timestamp())
 COURSE_END = NOON + 30 * 86_400
@@ -45,7 +37,7 @@ class Clock:
         return self.now
 
 
-def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
+def student(*, limit: int = 4) -> StudentKey:
     return StudentKey(
         key_hash=hashlib.sha256(b"not a key").hexdigest(),
         github_id=7,
@@ -54,26 +46,16 @@ def student(*, budget: int = DAILY_BUDGET, limit: int = 4) -> StudentKey:
         issued_at=NOON - 86_400,
         expires_at=COURSE_END,
         revoked_at=None,
-        daily_token_budget=budget,
+        daily_token_budget=0,
         concurrency_limit=limit,
     )
 
 
-def reserve(
-    ledger: InMemoryLedger,
-    who: StudentKey,
-    request: str,
-    *,
-    estimate: int = 1000,
-    output: int = 500,
-    pool: str | None = None,
-) -> Reservation:
-    """Reserve for a request whose body is estimated at `estimate` tokens, with the defaults of section 17."""
+def reserve(ledger: InMemoryLedger, who: StudentKey, request: str, *, pool: str | None = None) -> Reservation:
+    """Take a slot for a request, with the defaults of section 17."""
     return ledger.reserve(
         who,
         request,
-        b"x" * (estimate * BYTES_PER_TOKEN),
-        output_limit=output,
         hold_seconds=DEFAULT_HOLD_SECONDS,
         longest_request_seconds=LONGEST_REQUEST_SECONDS,
         pool=pool,
@@ -87,17 +69,9 @@ def settle(
     cookie: str | None = None,
     rebalance_number: int | None = None,
     cookie_dropped: bool = False,
-) -> int | None:
-    """Settle a clean end of 1,000 input tokens and 200 output tokens, with what the request's affinity gives."""
-    return ledger.settle(
-        reservation,
-        input_tokens=1000,
-        output_tokens=200,
-        ended_cleanly=True,
-        cookie=cookie,
-        rebalance_number=rebalance_number,
-        cookie_dropped=cookie_dropped,
-    )
+) -> bool:
+    """Settle a request, with what its affinity gives."""
+    return ledger.settle(reservation, cookie=cookie, rebalance_number=rebalance_number, cookie_dropped=cookie_dropped)
 
 
 def refusal(ledger: InMemoryLedger, who: StudentKey, request: str) -> Cause:
@@ -114,32 +88,21 @@ def written(ledger: InMemoryLedger, day: str = "2026-11-15") -> UsageDay:
     return record
 
 
-def charged(ledger: InMemoryLedger, day: str = "2026-11-15") -> int:
-    return written(ledger, day).tokens
-
-
-def test_the_estimate_is_computed_from_the_body_alone() -> None:
-    assert [estimate_input_tokens(b"x" * size) for size in (0, 1, 4, 5, 400)] == [0, 1, 1, 2, 100]
-    assert lease_seconds(DEFAULT_HOLD_SECONDS, LONGEST_REQUEST_SECONDS) == 2280
-
-
-def test_a_reservation_adds_the_estimate_and_the_output_limit_and_takes_a_slot() -> None:
+def test_a_reservation_takes_a_slot_and_writes_tokens_and_estimate_0() -> None:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    who = student()
 
-    reservation = reserve(ledger, who, "request-1", estimate=1000, output=500)
+    reservation = reserve(ledger, student(), "request-1")
 
-    lease = Lease(tokens=1500, estimate=1000, expires=NOON + 2280)
+    lease = Lease(tokens=0, estimate=0, expires=NOON + 2280)
     assert reservation == Reservation(github_id=7, day="2026-11-15", request_id="request-1", lease=lease)
     record = written(ledger)
-    assert (record.alias, record.tokens, record.leases) == ("student-07", 1500, {"request-1": lease})
+    assert (record.alias, record.tokens, record.leases) == ("student-07", 0, {"request-1": lease})
     assert record.expires_at == retention.expires_at(COURSE_END_DATE)
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 1500
 
 
-def test_fifty_reservations_at_once_against_a_budget_that_fits_ten_admit_ten() -> None:
+def test_fifty_reservations_at_once_against_a_limit_of_ten_admit_ten() -> None:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    who = student(budget=10 * 1500, limit=50)
+    who = student(limit=10)
     together = threading.Barrier(50)
 
     def one(number: int) -> Reservation | Cause:
@@ -153,10 +116,9 @@ def test_fifty_reservations_at_once_against_a_budget_that_fits_ten_admit_ten() -
         answers = list(threads.map(one, range(50)))
 
     assert sum(isinstance(answer, Reservation) for answer in answers) == 10
-    assert answers.count(Cause.BUDGET_REACHED) == 40
+    assert answers.count(Cause.CONCURRENCY_LIMIT) == 40
     record = written(ledger)
-    assert (record.tokens, len(record.leases)) == (15_000, 10)
-    assert ledger.tokens_left(who) == 0
+    assert (record.tokens, len(record.leases)) == (0, 10)
 
 
 def test_a_fifth_concurrent_request_is_refused_until_one_has_ended() -> None:
@@ -167,74 +129,28 @@ def test_a_fifth_concurrent_request_is_refused_until_one_has_ended() -> None:
     assert refusal(ledger, who, "request-4") is Cause.CONCURRENCY_LIMIT
     assert ledger.writes == 4
 
-    # Either end frees the slot.
-    ledger.settle(held[0], input_tokens=1000, output_tokens=20, ended_cleanly=True)
+    # Each end frees the slot, and charges nothing.
+    assert settle(ledger, held[0]) is True
+    assert written(ledger).tokens == 0
     reserve(ledger, who, "request-5")
     assert refusal(ledger, who, "request-6") is Cause.CONCURRENCY_LIMIT
-    ledger.settle(held[1], input_tokens=0, output_tokens=0, ended_cleanly=False)
+    settle(ledger, held[1])
     reserve(ledger, who, "request-6")
-    assert len(written(ledger).leases) == 4
-    # A student over the budget and at the limit is told the one no retry cures.
-    assert refusal(ledger, student(budget=0, limit=4), "request-7") is Cause.BUDGET_REACHED
+    record = written(ledger)
+    assert (record.tokens, len(record.leases)) == (0, 4)
 
 
-def test_a_clean_end_replaces_the_reservation_by_the_reported_usage() -> None:
+def test_a_reservation_is_settled_once() -> None:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    who = student()
-    reservation = reserve(ledger, who, "request-1", estimate=1000, output=500)
+    reservation = reserve(ledger, student(), "request-1")
 
-    # Less than the estimate, and no floor: the engine's count replaces the estimate.
-    assert ledger.settle(reservation, input_tokens=700, output_tokens=40, ended_cleanly=True) == 740
-    assert charged(ledger) == 740
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 740
-
-
-def test_hanging_up_early_is_charged() -> None:
-    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    who = student()
-    reservation = reserve(ledger, who, "request-1", estimate=1000, output=500)
-
-    # The client hangs up when 100 tokens have been observed.
-    assert ledger.settle(reservation, input_tokens=0, output_tokens=100, ended_cleanly=False) == 1000
-    assert charged(ledger) == 1000
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 1000
-
-    # A second settlement charges nothing, whatever it reports.
-    assert ledger.settle(reservation, input_tokens=5000, output_tokens=500, ended_cleanly=True) is None
-    assert charged(ledger) == 1000
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 1000
-
-
-def test_an_end_that_is_not_clean_charges_what_was_observed_above_the_estimate() -> None:
-    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    reservation = reserve(ledger, student(), "request-1", estimate=1000, output=500)
-
-    assert ledger.settle(reservation, input_tokens=1200, output_tokens=300, ended_cleanly=False) == 1500
-    assert charged(ledger) == 1500
-
-
-def test_cached_input_is_charged() -> None:
-    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
-    who = student()
-    before = ledger.tokens_left(who)
-    assert before == DAILY_BUDGET
-    reservation = reserve(ledger, who, "request-1", estimate=85_000, output=4000)
-
-    # 90,000 input tokens, of which 80,000 were read from the cache, and 500 output tokens.
-    usage = read_answer(
-        json.dumps({"usage": {"input_tokens": 10_000, "cache_read_input_tokens": 80_000, "output_tokens": 500}})
-    )
-    assert (usage.input_tokens, usage.output_tokens, usage.ended_cleanly) == (90_000, 500, True)
-    settled = ledger.settle(
-        reservation,
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        ended_cleanly=usage.ended_cleanly,
-    )
-
-    assert settled == 90_500
-    assert charged(ledger) == 90_500
-    assert before - ledger.tokens_left(who) == 90_500
+    assert settle(ledger, reservation) is True
+    assert ledger.writes == 2
+    # A second settlement finds nothing to settle, and writes nothing.
+    assert settle(ledger, reservation) is False
+    assert ledger.writes == 2
+    record = written(ledger)
+    assert (record.tokens, record.leases) == (0, {})
 
 
 def test_two_writes_per_request() -> None:
@@ -247,8 +163,7 @@ def test_two_writes_per_request() -> None:
     settle(ledger, reservation, cookie="first-cookie", rebalance_number=7)
     assert ledger.writes == 2
 
-    # The read writes nothing, and neither does a settlement that finds nothing to settle.
-    ledger.tokens_left(who)
+    # A settlement that finds nothing to settle writes nothing.
     settle(ledger, reservation, cookie="late-cookie", rebalance_number=9)
     assert ledger.writes == 2
 
@@ -276,19 +191,19 @@ def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
     first = reserve(ledger, who, "request-1", pool="coursework")
     assert first.cookie is None
     assert cookies() == {}
-    ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-cookie")
+    ledger.settle(first, cookie="coursework-cookie")
 
     # Another pool's reservation returns none of it, and its settlement leaves it in place.
     other = reserve(ledger, who, "request-2", pool="upgrade")
     assert other.cookie is None
-    ledger.settle(other, input_tokens=1000, output_tokens=20, ended_cleanly=False, cookie="upgrade-cookie")
+    ledger.settle(other, cookie="upgrade-cookie")
     assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
     assert reserve(ledger, who, "request-3", pool="upgrade").cookie == "upgrade-cookie"
 
     # A request that ended with none stores none, and removes none.
     fourth = reserve(ledger, who, "request-4", pool="coursework")
     assert fourth.cookie == "coursework-cookie"
-    ledger.settle(fourth, input_tokens=0, output_tokens=0, ended_cleanly=False, cookie=None)
+    ledger.settle(fourth, cookie=None)
     assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
 
     # The reservation that removes an expired lease leaves the cookies as they are, and so does
@@ -296,7 +211,7 @@ def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
     fifth = reserve(ledger, who, "request-5", pool="coursework")
     clock.now = NOON + 2280
     reserve(ledger, who, "request-6", pool="coursework")
-    assert ledger.settle(fifth, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="too-late") is None
+    assert ledger.settle(fifth, cookie="too-late") is False
     assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
 
 
@@ -349,7 +264,7 @@ def test_a_rebalance_number_is_kept_per_pool_and_only_a_settlement_stores_one() 
     late = reserve(ledger, who, "request-7", pool="coursework")
     clock.now = NOON + 2280
     assert reserve(ledger, who, "request-8", pool="coursework").rebalance_applied == 10
-    assert settle(ledger, late, rebalance_number=11, cookie_dropped=True) is None
+    assert settle(ledger, late, rebalance_number=11, cookie_dropped=True) is False
     record = written(ledger)
     assert (record.affinity_cookies, record.rebalance_applied["coursework"]) == ({"coursework": "moved"}, 10)
 
@@ -358,50 +273,44 @@ def test_a_lease_expires_after_2280_seconds() -> None:
     clock = Clock()
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock)
     who = student(limit=1)
-    first = reserve(ledger, who, "request-1", estimate=1000, output=500)
+    first = reserve(ledger, who, "request-1")
     assert first.lease.expires - NOON == lease_seconds(DEFAULT_HOLD_SECONDS, LONGEST_REQUEST_SECONDS) == 2280
 
     clock.now = NOON + 2279
     assert refusal(ledger, who, "request-2") is Cause.CONCURRENCY_LIMIT
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 1500
 
-    # Expired, the lease holds no slot and is worth its estimate, before any write removes it.
+    # Expired, the lease holds no slot: the reservation that needs it removes it in its own write.
     clock.now = NOON + 2281
-    assert ledger.tokens_left(who) == DAILY_BUDGET - 1000
-    reserve(ledger, who, "request-2", estimate=1000, output=500)
+    reserve(ledger, who, "request-2")
     record = written(ledger)
-    assert (record.tokens, set(record.leases)) == (1000 + 1500, {"request-2"})
+    assert (record.tokens, set(record.leases)) == (0, {"request-2"})
 
-    # The request of the expired lease ends at last: it was settled at its expiry, and is not again.
-    assert ledger.settle(first, input_tokens=9000, output_tokens=500, ended_cleanly=True) is None
-    assert charged(ledger) == 1000 + 1500
+    # The request of the expired lease ends at last: its lease is gone, and nothing is written.
+    assert settle(ledger, first) is False
+    assert ledger.writes == 2
 
 
-def test_a_settlement_after_the_expiry_charges_the_estimate() -> None:
+def test_a_settlement_after_the_expiry_removes_the_lease() -> None:
     clock = Clock()
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock)
-    who = student()
-    reservation = reserve(ledger, who, "request-1", estimate=1000, output=500)
+    reservation = reserve(ledger, student(), "request-1")
 
     clock.now = NOON + 2280
-    assert ledger.settle(reservation, input_tokens=9000, output_tokens=500, ended_cleanly=True) == 1000
+    assert settle(ledger, reservation) is True
     record = written(ledger)
-    assert (record.tokens, record.leases) == (1000, {})
+    assert (record.tokens, record.leases) == (0, {})
 
 
 def test_a_request_belongs_to_the_utc_day_it_started() -> None:
     clock = Clock(NOON + 12 * 3600 - 30)  # 23:59:30 UTC
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock)
-    who = student()
-    reservation = reserve(ledger, who, "request-1", estimate=1000, output=500)
+    reservation = reserve(ledger, student(), "request-1")
     assert reservation.day == "2026-11-15"
 
     clock.now += 60
-    assert ledger.tokens_left(who) == DAILY_BUDGET
-    assert ledger.settle(reservation, input_tokens=1000, output_tokens=100, ended_cleanly=True) == 1100
-    assert charged(ledger, "2026-11-15") == 1100
+    assert settle(ledger, reservation) is True
+    assert written(ledger, "2026-11-15").leases == {}
     assert ledger.day(7, "2026-11-16") is None
-    assert ledger.tokens_left(who) == DAILY_BUDGET
 
 
 def test_a_request_id_reserves_once() -> None:

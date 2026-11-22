@@ -36,7 +36,7 @@ from rhi_gateway import metrics, proxy, routes
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
-from rhi_gateway.budget import InMemoryLedger, Student
+from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.keystore import InMemoryKeyStore
@@ -62,8 +62,9 @@ POOL = {
 }
 POOLS = parse_pools({"coursework": POOL, "research": POOL})
 # The students of these tests: the alias, the GitHub ID, and the tokens of a day.
-OTTER = ("otter", 600_600_601, 2_000_000)
-HERON = ("heron", 600_600_707, 500_000)
+# Each student: the alias, the GitHub ID and the concurrency limit of the key.
+OTTER = ("otter", 600_600_601, 4)
+HERON = ("heron", 600_600_707, 4)
 REQUESTS, INPUT, OUTPUT, ERRORS = (
     f"{name}_total" for name in (metrics.REQUESTS, metrics.INPUT_TOKENS, metrics.OUTPUT_TOKENS, metrics.ERRORS)
 )
@@ -116,7 +117,7 @@ class Gateway:
     store: InMemoryKeyStore = field(default_factory=InMemoryKeyStore)
 
 
-def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
+def gateway(*students: tuple[str, int, int]) -> Gateway:
     keys = {alias: generate_key() for alias, _, _ in students}
     items = [
         StudentKey(
@@ -127,14 +128,14 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=budget,
-            concurrency_limit=4,
+            daily_token_budget=0,
+            concurrency_limit=limit,
         )
-        for alias, github_id, budget in students
+        for alias, github_id, limit in students
     ]
-    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW)) if ledger is None else ledger
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     store = InMemoryKeyStore(*items)
-    made = Gateway(Starlette(), metrics.Metrics(ledger, store), keys, Aws(), store=store)
+    made = Gateway(Starlette(), metrics.Metrics(store), keys, Aws(), store=store)
 
     def engine(request: httpx.Request) -> httpx.Response:
         # One answer every forwarded route reads as whole, with the usage under each format's names.
@@ -177,7 +178,6 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
         default_pool=POOLS[0],
         clock=lambda: float(NOW),
         waker=Waker(readiness, lambda_client=made.aws, function_name="scaler", clock=lambda: float(NOW)),
-        ledger=ledger,
     )
     made.app = build_app(forwarding_handlers(forwarding), local=local, metrics=made.metrics)
     return made
@@ -256,11 +256,8 @@ def test_two_students_are_counted_apart(capsys: pytest.CaptureFixture[str]) -> N
         assert {(sample.labels["alias"], sample.labels["pool"]) for sample in samples(made.metrics, name)} == set(sent)
     assert samples(made.metrics, ERRORS) == []
 
-    # A clean end is charged the usage the engine reported, so that is what the day's budget has lost.
-    for alias, _, budget in (OTTER, HERON):
-        charged = sum(i + o for (student, _), requests in sent.items() if student == alias for _, i, o in requests)
-        assert value(made.metrics, metrics.BUDGET_LEFT, alias=alias) == budget - charged
-    assert len(samples(made.metrics, metrics.BUDGET_LEFT)) == 2
+    # No series of a budget: nothing is charged against one.
+    assert [sample.name for sample in samples(made.metrics) if "budget" in sample.name] == []
     # The log says the same of each request as the counters do.
     logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert sum(record["input_tokens"] for record in logged) == 5000 + 1200 + 800 + 40
@@ -295,12 +292,12 @@ def test_a_student_whose_key_is_gone_is_served_no_more(monkeypatch: pytest.Monke
     # From the next scrape on, nothing is served under the alias, so its samples age out.
     for _ in range(2):
         assert {sample.labels.get("alias") for sample in samples(made.metrics)} - {None, ""} == {"heron"}
-    assert value(made.metrics, metrics.BUDGET_LEFT, alias="heron") is not None
+    assert value(made.metrics, REQUESTS, alias="heron", pool="coursework") == 1
 
 
 def test_a_student_given_a_new_key_is_counted_on() -> None:
     made = gateway(OTTER)
-    alias, github_id, budget = OTTER
+    alias, github_id, limit = OTTER
     old, new = made.keys[alias], generate_key()
     assert call(made.app, "POST", "/v1/messages", key=old, body=body(routes.MESSAGES)) == 200
     replacement = StudentKey(
@@ -310,8 +307,8 @@ def test_a_student_given_a_new_key_is_counted_on() -> None:
         installation=None,
         issued_at=NOW,
         expires_at=NOW + 86_400,
-        daily_token_budget=budget,
-        concurrency_limit=4,
+        daily_token_budget=0,
+        concurrency_limit=limit,
         revoked_at=None,
     )
     made.store.put(replacement)
@@ -337,7 +334,7 @@ def test_students_are_aliases() -> None:
     exposed = samples(made.metrics)
     of_a_student = [sample for sample in exposed if sample.labels.get("alias")]
     assert {sample.labels["alias"] for sample in of_a_student} == {alias}
-    assert {sample.name for sample in of_a_student} >= {REQUESTS, INPUT, OUTPUT, ERRORS, metrics.BUDGET_LEFT}
+    assert {sample.name for sample in of_a_student} >= {REQUESTS, INPUT, OUTPUT, ERRORS}
     # A student has no other name in any series: no label but these three, and nowhere the ID or the key.
     # The two others are those of what students experience (`rhi_gateway.experience`), which names no student.
     labels = {name for sample in exposed for name in sample.labels}
@@ -352,10 +349,10 @@ def test_students_are_aliases() -> None:
 
 
 def test_errors_by_cause() -> None:
-    made = gateway(OTTER, ("heron", HERON[1], 50))
-    # A student over the day's budget is refused once the body has named the pool.
-    assert call(made.app, "POST", "/v1/messages", key=made.keys["heron"], body=body(routes.MESSAGES)) == 402
-    assert value(made.metrics, ERRORS, alias="heron", pool="coursework", cause="budget_reached") == 1
+    made = gateway(OTTER, ("heron", HERON[1], 0))
+    # A student with no concurrency slot is refused once the body has named the pool.
+    assert call(made.app, "POST", "/v1/messages", key=made.keys["heron"], body=body(routes.MESSAGES)) == 429
+    assert value(made.metrics, ERRORS, alias="heron", pool="coursework", cause="concurrency_limit") == 1
     # A key nobody issued is refused before any student or pool is known.
     assert call(made.app, "POST", "/v1/messages", key=generate_key(), body=body(routes.MESSAGES)) == 401
     assert value(made.metrics, ERRORS, alias="", pool="", cause="invalid_key") == 1
@@ -449,7 +446,6 @@ def test_the_endpoint_serves_on_the_loopback_address_only() -> None:
                 for sample in family.samples
             }
         assert scraped[REQUESTS, "otter"] == 1
-        assert scraped[metrics.BUDGET_LEFT, "otter"] == OTTER[2] - 5007
         with pytest.raises(urllib.error.HTTPError) as refused:
             urllib.request.urlopen(f"http://{metrics.HOST}:{port}/", timeout=10)
         assert refused.value.code == 404
@@ -463,17 +459,6 @@ def test_the_endpoint_takes_no_other_address() -> None:
     serve: Any = metrics.Metrics().serve
     with pytest.raises(TypeError):
         serve(host="0.0.0.0", port=0).server_close()
-
-
-def test_a_budget_that_cannot_be_read_leaves_the_counters_served() -> None:
-    class Unread(InMemoryLedger):
-        def tokens_left(self, student: Student) -> int:
-            raise OSError("the table did not answer")
-
-    made = gateway(OTTER, ledger=Unread(course_end=COURSE_END_DATE, clock=lambda: float(NOW)))
-    assert call(made.app, "GET", "/v1/models", key=made.keys["otter"]) == 200
-    assert value(made.metrics, REQUESTS, alias="otter", pool="") == 1
-    assert samples(made.metrics, metrics.BUDGET_LEFT) == []
 
 
 def test_the_gateway_publishes_no_cloudwatch_metric() -> None:

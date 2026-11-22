@@ -1,7 +1,7 @@
 """Token usage read from a Messages response (system design, section 6.2, steps 3 and 6).
 
-The gateway settles a student's reservation to the usage the engine reports, and a stream that
-ends badly is charged the tokens observed. So this parser can be asked at any moment what it has
+The gateway logs the usage the engine reports for each request, and for a stream that ends badly
+the tokens observed. So this parser can be asked at any moment what it has
 seen so far, and whether the stream has ended cleanly.
 
 Where Messages reports usage:
@@ -17,8 +17,8 @@ How the counts are made:
 
 - The input is the sum of the three input fields of the usage object as Anthropic's reference
   defines them: `input_tokens` (not cached), `cache_creation_input_tokens` (written to the cache)
-  and `cache_read_input_tokens` (read from it). Together they are the whole input, and the daily
-  budget counts all of it, cached or not (sections 11.3 and 17). The `cache_creation` object some
+  and `cache_read_input_tokens` (read from it). Together they are the whole input, and the log
+  counts all of it, cached or not (sections 11.3 and 17). The `cache_creation` object some
   responses carry is a breakdown of `cache_creation_input_tokens` and is not added again. The
   cached part (`cached_input_tokens`) is `cache_read_input_tokens`, 0 when the usage reports none:
   it is part of the input, not added to it.

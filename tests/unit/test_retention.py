@@ -122,7 +122,7 @@ def _student() -> StudentKey:
 
 def _reserve(ledger: Ledger, request: str) -> Reservation:
     return ledger.reserve(
-        _student(), request, b"x" * 400, output_limit=100, hold_seconds=420, longest_request_seconds=1800, pool="mock"
+        _student(), request, hold_seconds=420, longest_request_seconds=1800, pool="mock"
     )
 
 
@@ -133,9 +133,9 @@ def test_every_usage_row_the_in_memory_ledger_writes_expires_at_the_course_end_p
     expiries.append(ledger.day(GITHUB_ID, DAY))
     second = _reserve(ledger, "request-2")
     expiries.append(ledger.day(GITHUB_ID, DAY))
-    ledger.settle(first, input_tokens=100, output_tokens=10, ended_cleanly=True, cookie="a-cookie")
+    ledger.settle(first, cookie="a-cookie")
     expiries.append(ledger.day(GITHUB_ID, DAY))
-    ledger.settle(second, input_tokens=100, output_tokens=10, ended_cleanly=True)
+    ledger.settle(second)
     expiries.append(ledger.day(GITHUB_ID, DAY))
 
     assert [day.expires_at if day else None for day in expiries] == [EXPIRY] * 4
@@ -164,7 +164,7 @@ def test_every_usage_row_the_dynamodb_ledger_writes_expires_at_the_course_end_pl
     second = _reserve(ledger, "request-2")
     assert stored() == EXPIRY
     written_before(EXPIRY + 86_400)
-    ledger.settle(first, input_tokens=100, output_tokens=10, ended_cleanly=True, cookie="a-cookie")
+    ledger.settle(first, cookie="a-cookie")
     assert stored() == EXPIRY
     written_before(EXPIRY + 86_400)
     ledger.withdraw(second)
