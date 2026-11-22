@@ -130,7 +130,7 @@ from rhi_cli import store
 from rhi_common.causes import Cause
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from rhi_common.spike_keys import SpikeKeys
 
@@ -335,6 +335,8 @@ class Exchange:
     completed: bool = False
     closed_at: float | None = None
     ended_at: float | None = None
+    # The request's headers as the client sent them, without its key and its cookies (`replayable`).
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def route(self) -> str:
@@ -459,6 +461,15 @@ def whole_json(body: bytes) -> bool:
     return True
 
 
+# The headers an exchange does not keep: the key and the cookies, which a recorded session never holds.
+_NOT_KEPT = frozenset({"authorization", "x-api-key", "cookie", "proxy-authorization"})
+
+
+def replayable(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """A request's headers without its key, its cookies and the hop's own: what a replay of it may send."""
+    return {name: value for name, value in headers if name.lower() not in _NOT_KEPT | _HOP_BY_HOP}
+
+
 def directed(body: bytes, model: str) -> bytes:
     """The body with `model` as its model, when it is a JSON object that names one; otherwise as it is."""
     try:
@@ -532,7 +543,7 @@ class Forwarder:
         handler.close_connection = True
         length = int(handler.headers.get("Content-Length") or 0)
         body = directed(handler.rfile.read(length), self.model) if length else b""
-        exchange = Exchange(handler.command, handler.path, body, self.clock())
+        exchange = Exchange(handler.command, handler.path, body, self.clock(), headers=replayable(handler.headers.items()))
         with self._lock:
             self.exchanges.append(exchange)
         headers = {name: value for name, value in handler.headers.items() if name.lower() not in _HOP_BY_HOP}
@@ -540,7 +551,12 @@ class Forwarder:
         headers["Accept-Encoding"] = "identity"
         upstream = self._connection()
         done = threading.Event()
-        watcher = threading.Thread(target=self._watch, args=(handler.connection, upstream, exchange, done), daemon=True)
+        # Set once the client has been sent, or is being sent, all the gateway declared: its close is
+        # then the end of what it was given, not a client giving up.
+        delivered = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch, args=(handler.connection, upstream, exchange, done, delivered), daemon=True
+        )
         # Which side the exchange is at: an error while writing to the client is the client closing
         # it; one while reading the gateway is the gateway ending it, which no client did.
         to_client = False
@@ -576,6 +592,8 @@ class Forwarder:
                 if not chunk:
                     break
                 to_client = True
+                if answer.length == 0:
+                    delivered.set()
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
                 if streaming:
@@ -602,17 +620,23 @@ class Forwarder:
             upstream.close()
 
     def _watch(
-        self, client: socket.socket, upstream: http.client.HTTPConnection, exchange: Exchange, done: threading.Event
+        self,
+        client: socket.socket,
+        upstream: http.client.HTTPConnection,
+        exchange: Exchange,
+        done: threading.Event,
+        delivered: threading.Event,
     ) -> None:
         """Notes when the client closes the exchange before its end, and closes the gateway's side
-        then, as a client that gives up does."""
+        then, as a client that gives up does. A client that closes once it has all the gateway
+        declared has not given up: what became of the exchange is the gateway's doing."""
         while not done.is_set():
             try:
                 readable, _, _ = select.select([client], [], [], 0.2)
                 if readable and not client.recv(1, socket.MSG_PEEK):
                     raise ConnectionResetError
             except (OSError, ValueError):
-                if not done.is_set():
+                if not done.is_set() and not delivered.is_set():
                     exchange.closed_at = self.clock()
                     with contextlib.suppress(OSError):
                         if upstream.sock is not None:
