@@ -156,7 +156,7 @@ class Workspace:
         cold = {"instance": self.during, "transition": "cold-launch"}
         rows.append((cold, {stage: launched[stage] for stage in EARLY}, START + 60))
         rows.append((cold, {stage: launched[stage] for stage in launched if stage not in EARLY}, START + 155))
-        rows.append(({"instance": self.after, "transition": "promotion"}, {"boot": 10.0}, START + 90))
+        rows.append(({"instance": self.after, "transition": "promotion"}, {"boot": 10.0}, START + 105))
         series = []
         for labels, stages, first in rows:
             # A promotion's labels last until the launch turns out to be a cold one.
@@ -328,7 +328,8 @@ def test_the_readings_name_instances_and_tell_a_launch_in_the_hour_from_one_befo
     (started,) = [line for line in written if line["kind"] == "instance_started"]
     assert (started["instance"], started["transition"]) == ("instance-2", "cold-launch")
     assert started["stages"] == {stage: seconds + 3 for stage, seconds in STAGES.items()}
-    assert hour["started_at"] < started["began_at"] <= hour["ends_at"]
+    assert hour["started_at"] < started["began_after_at"] < started["began_at"] <= hour["ends_at"]
+    assert started["in_hour"] == "certain"
 
 
 @pytest.mark.parametrize("boot", [40.0, 108.0], ids=["seen-after-the-hour", "booting-past-the-final-reads"])
@@ -359,18 +360,22 @@ def test_a_launch_that_began_just_before_the_hour_ended_is_written(boot: float) 
     assert dry.utc(START + rehearsal.duration - 3) <= started["began_at"] <= hour["ends_at"]
 
 
-@pytest.mark.parametrize(("kernel", "written"), [(-2.0, 0), (58.0, 1)], ids=["just-before", "just-inside"])
+@pytest.mark.parametrize(
+    ("kernel", "phase", "in_hour"),
+    [(-2.0, 4.0, []), (58.0, 4.0, ["certain"]), (56.0, 0.0, ["uncertain"])],
+    ids=["just-before", "just-inside", "scraped-long-after-the-hour-ended"],
+)
 def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_step(
-    kernel: float, written: int
+    kernel: float, phase: float, in_hour: list[str]
 ) -> None:
     lines: list[str] = []
     rehearsal, _, instances = _rehearsal(lines, after_wake=[])
-    stages = {"boot": 20.0, "image": 2.0, "release-check": 1.0, "container-start": 3.0, "weights": 17.0}
+    stages = {"boot": 20.0, "image": 2.0, "release-check": 1.0, "container-start": 3.0, "weights": 148.0}
     stages |= {"warm-up": 3.0, "hook": 1.0}
     ends = list(itertools.accumulate(stages.values(), initial=START + kernel))[1:]
 
     class OutOfPhase(Workspace):
-        """The collector scrapes 4 seconds after each step of the query's grid; at each step the
+        """The collector scrapes `phase` seconds after each step of the query's grid; at each step the
         query returns the last sample scraped before it."""
 
         def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
@@ -379,18 +384,23 @@ def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_ste
             series = []
             for (stage, seconds), ended in zip(stages.items(), ends, strict=True):
                 steps = [start + n * step for n in range(int((end - start) // step) + 1)]
-                scrapes = {t: START + 4 + ((t - START - 4) // 15) * 15 for t in steps}
+                scrapes = {t: START + phase + ((t - START - phase) // 15) * 15 for t in steps}
                 taken = [(t, scrapes[t]) for t in steps if scrapes[t] >= ended]
                 values = [(t, scrape if query.startswith("timestamp(") else seconds) for t, scrape in taken]
                 series.append(_series({"instance": self.after, "transition": "promotion", "stage": stage}, *values))
             return [one for one in series if one.samples]
 
     rehearsal.workspace = OutOfPhase(*instances)
-    rehearsal.clock.at = START + 180  # ty: ignore[unresolved-attribute] - the test's clock
-    asyncio.run(rehearsal.started_instances(START, START + rehearsal.duration))
+    rehearsal.clock.at = START + 300  # ty: ignore[unresolved-attribute] - the test's clock
+    deadline = START + rehearsal.duration
+    asyncio.run(rehearsal.started_instances(START, deadline))
     started = [line for line in _kinds(lines) if line["kind"] == "instance_started"]
-    assert len(started) == written
+    # A launch whose stages were each scraped up to a scrape after they ended may have begun in the
+    # hour though the latest it can have begun is after it: it is written, with both bounds.
+    assert [line["in_hour"] for line in started] == in_hour
     assert all(line["stages"] == stages for line in started)
+    if in_hour == ["uncertain"]:
+        assert started[0]["began_after_at"] <= dry.utc(deadline) < started[0]["began_at"]
 
 
 def test_a_counter_that_cannot_be_read_leaves_the_others_written() -> None:

@@ -57,7 +57,7 @@ number and its cause only when that is one of the gateway's own (`rhi_common.cau
 | `cache_capacity` | At the start: the cache capacity in tokens each instance's engine reported (`rhi_lifecycle.cache`) |
 | `in_service` | At the start and the end: the scaler's count of the pool's instances in service, and the instances that write their release, which only one in service does (`rhi_lifecycle.serving`) |
 | `request` | One request: its session (the student), agent and conversation, whether it was the conversation's first turn, when it was sent and its first and last token came, its input, cached and output tokens, whether it was held, its status, its cause and its failure |
-| `instance_started` | An instance whose launch began during the hour: its transition, when it began at the latest, and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
+| `instance_started` | An instance whose launch may have begun during the hour: its transition, when it began at the earliest and at the latest, whether that is in the hour for certain, and the seconds of each stage, from the lifecycle agent's metric (`rhi_lifecycle.stages`) |
 | `error` | A reading that could not be made, by its step, its quantity for a counter, and its kind; the hour goes on, and the counters read are written with the names of those that were not (`unread`) |
 | `end` | The requests recorded |
 
@@ -72,7 +72,11 @@ promotion until it finds no image on the disk, and then moves its stages to `col
 launch is written once, under its last label (`launches_of`). It began, at the latest, when the
 sample that showed it was scraped, which the job reads with `timestamp()` rather than taking the
 query's step, less the seconds of the stages it had ended by then; each later sample of it, with more stages
-ended, can only make that earlier (`Launch.began`), and it is written when that is in the hour.
+ended, can only make that earlier (`Launch.began`). A stage's seconds are scraped at most one scrape
+after it ended, so the launch began no earlier than that less `SCRAPE_SECONDS`
+(`Launch.began_after`). A launch is written when these two bounds overlap the hour, with both:
+`in_hour` is `certain` when both are in it, and `uncertain` when the hour's start or end falls
+between them, as for a launch that began in the hour's last seconds and was first scraped after it.
 A launch shows no stage before its boot has ended, so one that began near the hour's end is seen
 only after it: the job goes on reading for `DISCOVERY_SECONDS` after the hour, and a launch that
 began in the hour keeps the stages it ends after it: the job waits for each to end its `hook`, the
@@ -209,6 +213,11 @@ class Launch:
     first_seen: float
     began: float
     stages: Snapshot
+
+    @property
+    def began_after(self) -> float:
+        """The earliest it can have begun: each stage's seconds are scraped within one scrape of its end."""
+        return self.began - SCRAPE_SECONDS
 
 
 def _same_launch(earlier: Snapshot, later: Snapshot) -> bool:
@@ -397,15 +406,17 @@ class Rehearsal:
         )
 
     async def _launches(self, start: float, deadline: float) -> list[Launch]:
-        """The launches that began between `start` and `deadline`, with every stage they ended up to now."""
+        """The launches that may have begun between `start` and `deadline`, with every stage they ended
+        up to now: those whose bounds, `began_after` to `began`, overlap the hour."""
         until = max(deadline, self.clock.now())
         selector = f'{STAGE_METRIC}{{pool="{POOL}"}}'
         series = await self._read(selector, start - LOOKBACK_SECONDS, until)
         scraped = await self._read(f"timestamp({selector})", start - LOOKBACK_SECONDS, until)
-        return [launch for launch in launches_of(series, start, scraped) if start < launch.began <= deadline]
+        launches = launches_of(series, start, scraped)
+        return [launch for launch in launches if start < launch.began and launch.began_after <= deadline]
 
     async def started_instances(self, start: float, deadline: float, *, wait: float = 0.0) -> None:
-        """A line for each launch that began between `start` and `deadline`, from the stage metric
+        """A line for each launch that may have begun between `start` and `deadline`, from the stage metric
         (`launches_of`). It reads until `DISCOVERY_SECONDS` after `deadline`, so that a launch still in
         its boot then is seen, and until each launch has ended its last stage; never longer than
         `wait` seconds from now."""
@@ -425,6 +436,8 @@ class Rehearsal:
                 instance=self.names(launch.instance),
                 transition=launch.transition,
                 began_at=utc(launch.began),
+                began_after_at=utc(launch.began_after),
+                in_hour="certain" if start < launch.began_after and launch.began <= deadline else "uncertain",
                 first_seen_at=utc(launch.first_seen),
                 stages=launch.stages,
             )
