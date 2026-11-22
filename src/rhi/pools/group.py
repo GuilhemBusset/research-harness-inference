@@ -28,19 +28,17 @@ whether or not the pool has a warm pool: the alarms that guard money from outsid
 them (`rhi.guardrails.alarms_fleet`; sections 5.1 and 7.3). Auto Scaling publishes them at no
 charge.
 
-The group has a fixed name, `rhi-pool-<pool>` (`rhi_common.pool_config.group_name`), so that its
-metrics keep one name whatever happens to the group: the cost dashboard counts a pool's hours over
-the month by that name, those of a group deleted and created again included, which a name
-CloudFormation made up would lose (system design, section 7.3). One stage is deployed to an account
-and region, as the fixed names of the log groups already require. CloudFormation cannot replace a
-resource that has a name of its own, so no change may require replacing the group. The first
-deployment that names the group replaces, once, the group CloudFormation had named, and its instances.
+CloudFormation names the group, `<stack>-<logical ID>-<suffix>`, and the logical ID begins with
+`Pool<pool>Group` (`rhi_common.pool_config.group_logical_name`): the cost dashboard finds the
+group's metrics by it, those of a group CloudFormation replaced included, which keeps the logical
+ID (system design, section 7.3). The group has no name of its own, so a change that requires
+replacing it can be deployed, and the groups already deployed are kept as they are.
 
 Zone rebalancing is suspended, because it replaces instances in service (section 4.3). No property
 of the group suspends a process for good, so a custom resource calls `SuspendProcesses` for
-`AZRebalance` when the group is created, and again when its name changes, which changes the custom
-resource's call, and CloudFormation then updates it. The scaler resumes only the process `Launch`,
-so rebalancing stays suspended.
+`AZRebalance` when the group is created, and again when it is replaced: a replaced group has a new
+name, which changes the custom resource's call, and CloudFormation then updates it. The scaler
+resumes only the process `Launch`, so rebalancing stays suspended.
 
 The launch template gives an instance the pool's role (`rhi.pools.role`), no public address and no
 key pair, requires IMDSv2, lets the instance read its own tags through the instance metadata and encrypts its volume. It tags the
@@ -82,7 +80,6 @@ from aws_cdk import custom_resources as cr
 from constructs import Construct
 
 from rhi.pools import image
-from rhi_common import pool_config
 
 if TYPE_CHECKING:
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
@@ -203,7 +200,6 @@ class PoolGroup(Construct):
         self.group = autoscaling.CfnAutoScalingGroup(
             self,
             "Group",
-            auto_scaling_group_name=pool_config.group_name(pool.name),
             min_size="0",
             max_size=str(pool.max_instances),
             vpc_zone_identifier=vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnet_ids,

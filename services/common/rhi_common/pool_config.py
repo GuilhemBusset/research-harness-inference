@@ -161,10 +161,12 @@ _PARSER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 _PROFILE_ENTRY = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
 
 
-def group_name(pool: str) -> str:
-    """The name of the pool's Auto Scaling group. The pools stack gives the group this name, and the cost
-    dashboard reads the group's metrics by it, the hours of a group deleted and created again included."""
-    return f"rhi-pool-{pool}"
+def group_logical_name(pool: str) -> str:
+    """How the logical ID of the pool's Auto Scaling group begins: the pools stack's construct
+    `Pool-<pool>/Group`, its letters and digits, before the CDK's hash. CloudFormation names the group
+    `<stack>-<logical ID>-<suffix>`, so the cost dashboard finds the group's metrics by it, those of a
+    group CloudFormation replaced included."""
+    return "Pool" + re.sub(r"[^A-Za-z0-9]", "", pool) + "Group"
 
 
 class PoolConfigError(ValueError):
