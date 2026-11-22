@@ -48,6 +48,8 @@ def test_the_topic_is_encrypted_with_a_rotating_key_the_three_services_may_use(t
     assert set().union(*map(services, allowed)) == PUBLISHERS
     for statement in allowed:
         assert set(statement["Action"]) == {"kms:GenerateDataKey*", "kms:Decrypt"}
+        # Only for the stack's own account, never a service acting for another.
+        assert statement["Condition"] == {"StringEquals": {"aws:SourceAccount": {"Ref": "AWS::AccountId"}}}
     # Unencrypted transport is refused.
     (policy,) = of_type(template, "AWS::SNS::TopicPolicy").values()
     assert policy["Topics"] == [{"Ref": topic_id}]

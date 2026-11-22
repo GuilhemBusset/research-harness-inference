@@ -7,8 +7,10 @@ findings publish to it (system design, sections 7.3 and 11.3).
   policies govern the key, and adds one that lets the three services' principals,
   `cloudwatch.amazonaws.com`, `budgets.amazonaws.com` and `costalerts.amazonaws.com`, call
   `kms:GenerateDataKey*` and `kms:Decrypt` on it, the two calls SNS makes for a publisher of an
-  encrypted topic, as each service's documentation gives them. A key policy's `*` is the key
-  itself. Other topics of the stack may use the same key, from `key`.
+  encrypted topic, as each service's documentation gives them, and only for a request made for
+  the stack's own account (`aws:SourceAccount`), so that no service acting for another account may
+  use the key. A key policy's `*` is the key itself. Other topics of the stack may use the same
+  key, from `key`: the condition names the account, not the topic.
 - **Refusing unencrypted transport.** The topic's policy denies every request whose
   `aws:SecureTransport` is false. Which service may publish is said where that service's
   construct is made: `rhi.guardrails.anomaly` for Cost Anomaly Detection.
@@ -57,6 +59,7 @@ class Alerts(Construct):
                 principals=[iam.ServicePrincipal(service) for service in PUBLISHERS],  # ty: ignore[invalid-argument-type]
                 actions=list(KEY_ACTIONS),
                 resources=["*"],
+                conditions={"StringEquals": {"aws:SourceAccount": cdk.Aws.ACCOUNT_ID}},
             )
         )
         self.topic = sns.Topic(self, "Topic", master_key=self.key, enforce_ssl=True)  # ty: ignore[invalid-argument-type]
