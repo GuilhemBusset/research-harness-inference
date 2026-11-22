@@ -3,7 +3,8 @@
 An agent re-sends its whole transcript on every turn, so a pool is measured with sessions, not with
 independent requests (evidence E31). `replay` sends sessions through the gateway, as students do, so
 that the per-student cache salt, the request profile, the hold and affinity are all in the path and
-the numbers are what a student gets. The spikes S3, S5 and S6 call it; it has no command line.
+the numbers are what a student gets. The spikes S3, S5 and S6 and the dry-run class call it; it has no
+command line.
 
 **A session** is an ordered list of requests, each sent when the answer to the one before has
 ended and the session's pause has passed. There are two kinds:
@@ -49,11 +50,21 @@ sessions, run at once. Both draw their sizes from a seed, so a run can be repeat
 - the input (whole, cached or not), cached input and output tokens the answer reported, read from
   its usage where each wire format puts them (`None` for a count the answer did not report);
 - the student, the session, whether the request was its session's first turn, and the status of
-  the answer.
+  the answer;
+- the time on the replay's clock the request was sent, and the seconds from then to its last token;
+- whether the gateway sent a keep-alive before the engine's first event, which only a held stream
+  gets (`rhi_gateway.hold`): a `ping` event on Messages, an SSE comment on the OpenAI formats. A hold
+  that ends before its first keep-alive is due leaves none, so its absence does not say a request
+  was not held;
+- the gateway's cause, when the answer is one of its errors, a refusal or an error event, and the
+  cause is one of its own (`rhi_common.causes.Cause`); nothing else of an error is kept.
 
 A session ends at its first request that is not answered 200: a transcript cannot grow by an
 answer that did not come. A connection that fails raises, and ends the replay: a run with one is
-not a measurement.
+not a measurement. A replay given `keep_failures` records such a request instead, with what was
+seen of it before it failed and the fixed kind of its failure (`Failure`), ends its session alone,
+and goes on with the others. `on_record` is given each record as soon as it is made, so that what a
+replay saw is kept even when it ends early.
 
 `replay` takes its clock and its `sleep`, so a test controls both.
 """
@@ -70,6 +81,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from rhi_common.causes import Cause
 from rhi_gateway.sse import SseEvent, SseReader
 
 if TYPE_CHECKING:
@@ -90,6 +102,9 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=1200.0, write=60.0, pool=None)
 
 MESSAGES_PATH = "/v1/messages"
 STREAM_TYPE = "text/event-stream"
+# The gateway's keep-alive on a held Messages stream; on the OpenAI formats, an SSE comment.
+PING_EVENT = "ping"
+_CAUSES = frozenset(cause.value for cause in Cause)
 # The headers of a capture that are not replayed: the recording's host and length, and a key.
 _NOT_REPLAYED = frozenset({"host", "content-length", "authorization", "x-api-key"})
 # What stands for the answer in a synthetic transcript when the answer held no text.
@@ -386,7 +401,8 @@ class Record:
     """The session's position in the load."""
     first_turn: bool
     """Whether the request was its session's first."""
-    status: int
+    status: int | None
+    """`None` for a failure before the answer's status came."""
     first_token_seconds: float | None
     """From the request sent to its first token; `None` when the answer streamed none."""
     first_answer_seconds: float | None
@@ -397,52 +413,126 @@ class Record:
     """The whole input the answer reported, cached or not."""
     cached_input_tokens: int | None
     output_tokens: int | None
+    sent_at: float | None = None
+    """The time on the replay's clock the request was sent."""
+    last_token_seconds: float | None = None
+    """From the request sent to its last token; `None` when the answer streamed none."""
+    kept_alive: bool = False
+    """Whether the gateway sent a keep-alive before the engine's first event: the stream was held."""
+    cause: str | None = None
+    """The gateway's cause, when the answer was one of its errors and the cause one of its own."""
+    failure: Failure | None = None
+    """How the request failed before its answer ended, for a replay that keeps failures."""
+
+
+class Failure(StrEnum):
+    """The fixed kind of a request that failed before its answer ended: never the error's text."""
+
+    TIMEOUT = "timeout"
+    CONNECT_ERROR = "connect_error"
+    READ_ERROR = "read_error"
+    PROTOCOL_ERROR = "protocol_error"
+    HTTP_ERROR = "http_error"
+
+
+def failure_of(error: httpx.HTTPError) -> Failure:
+    """The kind of an error of httpx."""
+    if isinstance(error, httpx.TimeoutException):
+        return Failure.TIMEOUT
+    if isinstance(error, httpx.ConnectError):
+        return Failure.CONNECT_ERROR
+    if isinstance(error, httpx.ReadError):
+        return Failure.READ_ERROR
+    if isinstance(error, httpx.RemoteProtocolError):
+        return Failure.PROTOCOL_ERROR
+    return Failure.HTTP_ERROR
+
+
+def cause_of(data: Mapping[str, Any]) -> str | None:
+    """The gateway's cause an error object carries in any of the three formats, when it is one of its own."""
+    holders = [data.get("error"), data.get("response")]
+    response = holders[1]
+    if isinstance(response, dict):
+        holders.append(response.get("error"))
+    for holder in holders:
+        if isinstance(holder, dict):
+            for field in ("type", "code"):
+                if holder.get(field) in _CAUSES:
+                    return holder[field]
+    return None
 
 
 async def _send(
-    http: httpx.AsyncClient, request: Request, key: str, clock: Callable[[], float]
+    http: httpx.AsyncClient,
+    request: Request,
+    key: str,
+    clock: Callable[[], float],
+    *,
+    keep_failure: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Sends one request as the student whose key is given and reads its answer to the end: the text
-    of the answer, and the fields of a `Record` that the answer gives."""
+    of the answer, and the fields of a `Record` that the answer gives. An error of httpx raises,
+    unless `keep_failure` is given: the fields are then what was seen before it, with its kind."""
     wire = wire_of(request.path)
     headers = {name: value for name, value in request.headers.items() if name.lower() not in _NOT_REPLAYED}
     headers["authorization"] = f"Bearer {key}"
     reader, usage, text, whole = SseReader(), {}, [], bytearray()
     first = answered = last = None
+    status: int | None = None
+    streamed = engine = kept_alive = False
+    cause: str | None = None
+    failure: Failure | None = None
     sent = clock()
-    async with http.stream(request.method, request.path, headers=headers, content=request.body) as answer:
-        streamed = answer.headers.get("content-type", "").startswith(STREAM_TYPE)
-        async for chunk in answer.aiter_bytes():
-            if not streamed:
-                whole += chunk
-                continue
-            now = clock()
-            for event in reader.feed(chunk):
-                data = _object(event.data)
-                usage |= _usage(data)
-                carried = output_of(wire, event) if wire else None
-                if carried is None:
+    try:
+        async with http.stream(request.method, request.path, headers=headers, content=request.body) as answer:
+            status = answer.status_code
+            streamed = answer.headers.get("content-type", "").startswith(STREAM_TYPE)
+            async for chunk in answer.aiter_bytes():
+                if not streamed:
+                    whole += chunk
                     continue
-                first, last = (now if first is None else first), now
-                if carried and answered is None:
-                    answered = now
-                delta = data.get("delta")
-                if wire is Wire.MESSAGES and isinstance(delta, dict) and delta.get("type") == "text_delta":
-                    text.append(delta["text"])
+                now = clock()
+                for event in reader.feed(chunk):
+                    if event.comment or event.name == PING_EVENT:
+                        kept_alive = kept_alive or not engine
+                        continue
+                    engine = True
+                    data = _object(event.data)
+                    cause = cause or cause_of(data)
+                    usage |= _usage(data)
+                    carried = output_of(wire, event) if wire else None
+                    if carried is None:
+                        continue
+                    first, last = (now if first is None else first), now
+                    if carried and answered is None:
+                        answered = now
+                    delta = data.get("delta")
+                    if wire is Wire.MESSAGES and isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        text.append(delta["text"])
+    except httpx.HTTPError as error:
+        if not keep_failure:
+            raise
+        failure = failure_of(error)
     if not streamed:
-        usage = _usage(_object(whole.decode(errors="replace")))
+        whole_answer = _object(whole.decode(errors="replace"))
+        usage, cause = _usage(whole_answer), cause_of(whole_answer)
     input_tokens, cached, output_tokens = tokens_of(wire, usage)
     speed = None
     if first is not None and last is not None and last > first and output_tokens is not None and output_tokens >= 2:
         speed = (output_tokens - 1) / (last - first)
     return "".join(text), {
-        "status": answer.status_code,
+        "status": status,
         "first_token_seconds": None if first is None else first - sent,
         "first_answer_seconds": None if answered is None else answered - sent,
         "output_tokens_per_second": speed,
         "input_tokens": input_tokens,
         "cached_input_tokens": cached,
         "output_tokens": output_tokens,
+        "sent_at": sent,
+        "last_token_seconds": None if last is None else last - sent,
+        "kept_alive": kept_alive,
+        "cause": cause,
+        "failure": failure,
     }
 
 
@@ -455,6 +545,8 @@ async def replay(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     transport: httpx.AsyncBaseTransport | None = None,
+    keep_failures: bool = False,
+    on_record: Callable[[Record], None] | None = None,
 ) -> list[Record]:
     """Replays the load's sessions through the gateway at `endpoint`, `at_once` of them at a time,
     each as its student, and returns a record for every request sent, by session and then by turn.
@@ -462,7 +554,9 @@ async def replay(
     `keys` are the canary students' keys, one student each. ValueError, with nothing sent, for a
     load with more students than keys or for less than one session at once. `clock` gives the
     seconds every time is read in, and `sleep` waits a session's pauses; `transport` is what the
-    requests are sent through, httpx's own unless given.
+    requests are sent through, httpx's own unless given. `keep_failures` records a request that
+    fails in its connection, and ends its session alone, rather than raising; `on_record` is given
+    each record as it is made.
     """
     if load.students > len(keys):
         raise ValueError("the load has more students than there are keys")
@@ -481,8 +575,11 @@ async def replay(
                     await sleep(pause)
                 if not load.sending():
                     break
-                text, read = await _send(http, request, keys[student], clock)
-                records.append(Record(student=student, session=number, first_turn=not records, **read))
+                text, read = await _send(http, request, keys[student], clock, keep_failure=keep_failures)
+                record = Record(student=student, session=number, first_turn=not records, **read)
+                records.append(record)
+                if on_record is not None:
+                    on_record(record)
                 try:
                     step = requests.send(text) if read["status"] == httpx.codes.OK else None
                 except StopIteration:
