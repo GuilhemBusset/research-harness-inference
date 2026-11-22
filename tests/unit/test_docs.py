@@ -126,9 +126,13 @@ def provider_entries(text: str) -> dict[str, tuple[str, str]]:
 
 # Where each harness reads the base URL in a provider, by its exact field names.
 BASE_URL = {"OpenCode": ("settings", "baseURL"), "Pi": ("baseUrl",)}
-# A credential may only be named by where it comes from: Pi's command `rhi token`, or an
-# environment variable (Pi's `$NAME`, OpenCode's `{env:NAME}`).
-REFERENCE = r"!\s*rhi token\s*|\$\{?[A-Z_][A-Z0-9_]*\}?|\{env:[A-Z_][A-Z0-9_]*\}"
+# A credential may only be named by where it comes from, in the harness's own syntax: Pi's command
+# `rhi token` or an environment variable `$NAME`, OpenCode's `{env:NAME}`. Either harness sends
+# anything else, including the other's syntax, as the key itself.
+REFERENCE = {
+    "OpenCode": r"\{env:[A-Z_][A-Z0-9_]*\}",
+    "Pi": r"!\s*rhi token\s*|\$(?:[A-Z_][A-Z0-9_]*|\{[A-Z_][A-Z0-9_]*\})",
+}
 CREDENTIAL = re.compile(r"key|token|secret|auth|password|credential|header", re.IGNORECASE)
 
 
@@ -148,6 +152,8 @@ def _strings(value: object) -> Iterator[str]:
 
 def _check_base_url(harness: str, value: object) -> None:
     url = urlsplit(str(value))
+    assert url.scheme in {"http", "https"}, (harness, url)  # a harness resolves no relative URL
+    assert url.username is None and url.password is None, harness  # no credential in the URL
     host = url.hostname or ""
     assert host == "example.com" or host.endswith(".example.com"), (harness, url)
     assert url.path.rstrip("/").endswith("/v1"), (harness, url)
@@ -174,7 +180,7 @@ def check_provider_entries(text: str) -> None:
         for name, value in pairs:
             if CREDENTIAL.search(name):
                 for string in _strings(value):
-                    assert re.fullmatch(REFERENCE, string), (harness, name)
+                    assert re.fullmatch(REFERENCE[harness], string), (harness, name)
         assert "rhi token" in section.replace(block, ""), harness
 
 
@@ -198,7 +204,30 @@ def _other_command(provider: dict) -> None:
     provider["apiKey"] = "!cat key.txt"
 
 
-@pytest.mark.parametrize("breaks", [_literal_key, _bearer_header, _misspelled_base_url, _other_command])
+def _opencode_syntax(provider: dict) -> None:
+    provider["apiKey"] = "{env:RHI_API_KEY}"  # Pi sends this text as the key
+
+
+def _relative_base_url(provider: dict) -> None:
+    provider["baseUrl"] = "//inference.example.com/v1"
+
+
+def _credential_in_base_url(provider: dict) -> None:
+    provider["baseUrl"] = provider["baseUrl"].replace("://", "://student:" + secrets.token_urlsafe(24) + "@", 1)
+
+
+@pytest.mark.parametrize(
+    "breaks",
+    [
+        _literal_key,
+        _bearer_header,
+        _misspelled_base_url,
+        _other_command,
+        _opencode_syntax,
+        _relative_base_url,
+        _credential_in_base_url,
+    ],
+)
 def test_a_broken_pi_entry_is_refused(breaks: Callable[[dict], None]) -> None:
     text = GUIDE.read_text(encoding="utf-8")
     pi = provider_entries(text)["Pi"][1]
