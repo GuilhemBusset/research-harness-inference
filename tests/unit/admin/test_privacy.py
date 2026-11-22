@@ -29,6 +29,8 @@ from rhi_common.keys import key_hash
 from rhi_common.students import UsageDay
 from rhi_common.tables import KEYS, ROSTER, USAGE, Table
 from rhi_gateway.auth import CACHE_SECONDS
+from rhi_gateway.budget import DynamoDBLedger
+from rhi_gateway.errors import GatewayError
 from rhi_gateway.keystore import DynamoKeyStore
 from rhi_issuer import rules
 
@@ -266,6 +268,24 @@ def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(
         assert named in retention
     assert "3 key(s)" in printed and "2 usage row(s)" in printed
     assert f"No new roster entry is given the alias otter for {privacy.ALIAS_HELD_DAYS} days" in printed
+
+
+def test_a_reservation_refused_at_midnight_after_an_erase_leaves_no_usage_row(deployed: Deployed) -> None:
+    # A request authenticated before the erase reserves just before midnight; its write answers
+    # after the next day's opening grace, so the ledger refuses it.
+    student = DynamoKeyStore(deployed.admin.keys).lookup(key_hash(issue(deployed, OTTER)))
+    assert student is not None and deployed.run("erase", str(OTTER))[0] == 0
+    midnight = NOW - NOW % 86_400 + 86_400
+    reads: list[int] = []
+
+    def clock() -> int:
+        reads.append(midnight - 1 if not reads else midnight + 120)
+        return reads[-1]
+
+    ledger = DynamoDBLedger(boto3.client("dynamodb"), deployed.usage.name, clock=clock)
+    with pytest.raises(GatewayError):
+        ledger.reserve(student, "late", b"{}", output_limit=10, hold_seconds=420, longest_request_seconds=1800)
+    assert deployed.rows(OTTER) == []
 
 
 def test_an_erased_alias_is_held_back_from_any_new_entry_while_its_telemetry_is_kept(

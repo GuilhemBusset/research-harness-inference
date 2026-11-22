@@ -382,6 +382,26 @@ def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: C
     assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
 
 
+def test_a_withdrawal_keeps_a_zero_token_day_written_before_settlements_were_marked(client: Calls) -> None:
+    # A day an earlier gateway settled into at no tokens holds its cookie, and no mark of either.
+    day = UsageDay(
+        7,
+        "2026-11-15",
+        "student-07",
+        tokens=0,
+        expires_at=COURSE_END,
+        affinity_cookies={"coursework": "kept-cookie"},
+        rebalance_applied={"coursework": 7},
+    )
+    boto3.resource("dynamodb").Table(TABLE).put_item(Item=day.to_item())
+    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+
+    ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
+
+    following = reserve(ledger, student(), "following", pool="coursework")
+    assert (following.cookie, following.rebalance_applied) == ("kept-cookie", 7)
+
+
 def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
     client: Calls, monkeypatch: pytest.MonkeyPatch
 ) -> None:
