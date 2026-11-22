@@ -31,8 +31,8 @@ def network(
     import aws_cdk as cdk
 
     stage = app.node.find_child("Rhi")
-    stack = stage.network  # ty: ignore[unresolved-attribute] - the app's stage, typed as a construct
-    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[unresolved-attribute]
+    stack = stage.network  # ty: ignore[missing-attribute] - the app's stage, typed as a construct
+    path = (Path(stage.outdir) / stack.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute]
     ids = {}
     for name in GROUPS:
         resource = getattr(stack.security_groups, name).node.default_child

@@ -310,7 +310,7 @@ def test_each_launch_completed_is_counted_once_and_no_other(tmp_path: Path) -> N
         refused.now += COMPLETE
         raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "CompleteLifecycleAction")
 
-    refused.complete_lifecycle_action = refuse  # ty: ignore[invalid-assignment] - a stand-in that refuses
+    refused.complete_lifecycle_action = refuse
     assert refused.launch().run() is Outcome.NOT_COMPLETED
     (tmp_path / "abandoned").mkdir()
     abandoned = World(tmp_path / "abandoned", IN_SERVICE, on_disk=True, measured=200)

@@ -563,7 +563,7 @@ class MergeStateTests(IsolationCase):
         self.assertEqual(len(self.events("conflict_unresolved")), 1)
         self.assertNotEqual(result(wt, "rev-parse", "--verify", "MERGE_HEAD").returncode, 0)
         self.assertEqual([c for c in self.gh.calls if c[0] == "merge_pr"], [])
-        self.agents.build = build  # ty: ignore[invalid-assignment]  # test double
+        self.agents.build = build
         (self.store.dir / "STOP").unlink()
         self.engine = self.new_engine()
         self.engine.run()

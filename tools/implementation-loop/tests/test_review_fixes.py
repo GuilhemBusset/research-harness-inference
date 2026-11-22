@@ -212,7 +212,7 @@ class Finding02RevertGates(FixCase):
             if any(p["head"]["ref"].endswith("-revert") for p in self.gh.prs.values()):
                 return {"id": 999, "status": "completed", "conclusion": "failure"}
             return real(sha, name)
-        self.gh.required_check_run = red_on_reverts  # ty: ignore[invalid-assignment]  # test double
+        self.gh.required_check_run = red_on_reverts
         self.run_engine()
         st = self.store.issue(3)
         assert st.fail is not None

@@ -334,7 +334,7 @@ class ConcurrentRunsTests(LoopCase):
             finally:
                 finished.set()
 
-        b.git = observe  # ty: ignore[invalid-assignment]  # test double
+        b.git = observe
         thread = threading.Thread(target=contender, daemon=True)
         try:
             with a._mutex:
