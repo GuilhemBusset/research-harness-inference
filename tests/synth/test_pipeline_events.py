@@ -92,6 +92,31 @@ def test_the_rule_sends_this_pipeline_s_state_changes_to_the_log_group_alone(tem
     assert "RoleArn" not in target
 
 
+def test_a_record_keeps_the_run_s_fields_and_not_the_commit_s_author(templates: dict[str, Template]) -> None:
+    template = templates[PIPELINE_TEMPLATE]
+    log_group_id, _ = the_log_group(template)
+    ((target,),) = [rule["Targets"] for rule in rules_targeting(template, log_group_id)]
+    # The target writes a record made of chosen fields, never the whole event or its detail, whose
+    # trigger names the commit's author.
+    assert "Input" not in target and "InputPath" not in target
+    transformer = target["InputTransformer"]
+    assert transformer["InputPathsMap"] == {
+        "time": "$.time",
+        "detail-type": "$.detail-type",
+        "pipeline": "$.detail.pipeline",
+        "execution-id": "$.detail.execution-id",
+        "state": "$.detail.state",
+        "stage": "$.detail.stage",
+        "action": "$.detail.action",
+    }
+    assert "<aws.events." not in transformer["InputTemplate"]
+    # The record CloudWatch Logs takes: the event's time, and a message as text, a JSON object.
+    record = json.loads(transformer["InputTemplate"].replace("<time>", '"TIME"'))
+    assert record["timestamp"] == "TIME"
+    message = json.loads(record["message"])
+    assert message == {field: f"<{field}>" for field in set(transformer["InputPathsMap"]) - {"time"}}
+
+
 def test_the_log_group_keeps_its_events_for_the_configured_days(templates: dict[str, Template]) -> None:
     _, log_group = the_log_group(templates[PIPELINE_TEMPLATE])
     assert config.load({"RHI_CONFIG": "example"}).pipeline_events_retention_days == 90

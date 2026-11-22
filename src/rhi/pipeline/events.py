@@ -6,6 +6,11 @@ the default bus matches those of this pipeline and no other, the same three kind
 listens to (`rhi.pipeline.reporter.DETAIL_TYPES`), and its one target is the log group
 `LOG_GROUP_NAME`. The deployments dashboard reads the runs and their results there.
 
+**What a record keeps.** The target does not write the whole event: an execution started by a
+commit carries its author's name and e-mail address in its trigger. An input transformer keeps
+the event's time, its kind, the pipeline, the execution ID, the state, and the stage and action
+where the event has them (`FIELDS`), so the log group holds no personal data.
+
 **A fixed name.** The log group is in this stack and Grafana in the stage, another assembly: the
 role of Grafana's task names it by this name, as text, and holds no reference to this stack.
 Grafana reads no build project's log group, which holds real configuration; a state-change event
@@ -24,6 +29,7 @@ no function and no role. The rule waits for the policy.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
@@ -46,6 +52,27 @@ POLICY_NAME = "rhi-pipeline-events"
 # What a log-group target of EventBridge needs on the log group, and who writes for it.
 WRITE_ACTIONS = ("logs:CreateLogStream", "logs:PutLogEvents")
 WRITERS = ("events.amazonaws.com", "delivery.logs.amazonaws.com")
+# What each record keeps of an event: its kind and, from its detail, the run, its state, and the
+# stage and action where the event has them (empty where it has not). By field of the record, the
+# path in the event. Nothing else is kept: an execution's trigger names the commit's author.
+FIELDS = {
+    "detail-type": "$.detail-type",
+    "pipeline": "$.detail.pipeline",
+    "execution-id": "$.detail.execution-id",
+    "state": "$.detail.state",
+    "stage": "$.detail.stage",
+    "action": "$.detail.action",
+}
+
+
+def log_event() -> events.CfnRule.InputTransformerProperty:
+    """The record a log-group target writes for an event: the event's time as its timestamp, and
+    as its message a JSON object of `FIELDS`, as text, which is what CloudWatch Logs takes."""
+    message = json.dumps({field: f"<{field}>" for field in FIELDS})
+    return events.CfnRule.InputTransformerProperty(
+        input_paths_map={"time": "$.time", **FIELDS},
+        input_template=f'{{"timestamp":<time>,"message":{json.dumps(message)}}}',
+    )
 
 
 class PipelineEvents(Construct):
@@ -100,6 +127,8 @@ class PipelineEvents(Construct):
                 "resources": [pipeline.pipeline_arn],
             },
             state="ENABLED",
-            targets=[events.CfnRule.TargetProperty(id="LogGroup", arn=target)],
+            targets=[
+                events.CfnRule.TargetProperty(id="LogGroup", arn=target, input_transformer=log_event())
+            ],
         )
         self.rule.node.add_dependency(self.policy)
