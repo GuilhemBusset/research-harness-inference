@@ -147,7 +147,8 @@ class Config:
     # 95th percentile of the time to first token in seconds, the median and the slowest tenth of a
     # stream's tokens a second, and the cached share of input, in percent, below which the
     # dashboard flags a pool. The dashboards read them at synthesis and spike S5's verdict when it
-    # loads the configuration; no running service reads them.
+    # loads the configuration; the gateway is given the three floors, which its histograms take
+    # among their boundaries (`rhi_gateway.settings`), so that each is read exactly.
     target_ttft_p95_seconds: float
     target_stream_median_tokens_per_second: float
     target_stream_p10_tokens_per_second: float

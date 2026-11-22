@@ -112,7 +112,7 @@ def test_the_class_size_runs_are_judged_against_the_floors(at_class: dict[str, A
 def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     # Left out, the keys take section 17's values.
     assert s5.floors_of(settings(**dict.fromkeys(FLOORS))) == s5.Floors(5, 15, 10)
-    stricter = settings(target_stream_median_tokens_per_second=17)
+    stricter = settings(target_stream_median_tokens_per_second=17.5)
     assert verdict(job(median=16.0)) is Verdict.PASS
     assert verdict(job(median=16.0), stricter) is Verdict.FAIL
 

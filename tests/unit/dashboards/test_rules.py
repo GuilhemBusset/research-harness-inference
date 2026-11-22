@@ -261,3 +261,34 @@ def test_the_check_holds_a_further_name_to_the_row_of_its_pools_engine() -> None
     assert {one.rule for one in check.violations(document, [], pools)} == {"undeclared"}
     on_mock = json.loads(json.dumps(document).replace('pool=\\"gpu\\"', 'pool=\\"mock\\"'))
     assert "engine-row" in {one.rule for one in check.violations(on_mock, declared, pools)}
+
+
+def test_the_check_reads_a_query_kept_to_the_session() -> None:
+    def broken(*queries: str, instant: bool = True) -> set[str]:
+        panel = sdk_stat.Panel().title("Objective").datasource(rules.PROMETHEUS)
+        for index, expression in enumerate(queries):
+            panel.with_target(rules.query(expression, "", "ABC"[index], instant=instant))
+        declared = [rules.FromEngineTable(Quantity.INPUT_TOKENS), rules.FromEngineTable(Quantity.RUNNING_REQUESTS)]
+        return {one.rule for one in check.violations({"panels": [as_json(panel)]}, declared, (MOCK,))}
+
+    # An engine counter read as what each of its samples added in the session has no "now" to read
+    # asleep at, and counts nothing an instance last reported: a series no instance updates adds
+    # nothing. Read so, it needs no "asleep".
+    tokens = rules.engine_step_increase(MOCK, Quantity.INPUT_TOKENS)
+    assert broken(rules.over_sessions(tokens)) == set()
+    # A gauge read the same way still does: it falls as requests finish, which is no restart.
+    running = rules.step_increase(
+        rules.engine_series(MOCK, Quantity.RUNNING_REQUESTS), rules.engine_matchers(MOCK, Quantity.RUNNING_REQUESTS)
+    )
+    assert broken(rules.over_sessions(running)) == {"asleep"}
+    # Read as its value over the session's steps, not its increment, it does.
+    series = rules.engine_selector(MOCK, Quantity.INPUT_TOKENS)
+    value = f"sum_over_time((sum by (pool) ({series} and on () ({rules.SESSION_ON} == 1)))[{rules.SESSION_RANGE}:{rules.SESSION_STEP}])"
+    assert broken(value) == {"asleep"}
+    # A stat read over the session asks for its one value at the range's end: a query over the
+    # range would show, at its last point, a session from before the dashboard's range.
+    assert broken(rules.over_sessions(tokens), instant=False) == {"session"}
+    windowed = rules.awake(MOCK.name, rules.engine_increase(MOCK, Quantity.INPUT_TOKENS, window="1m"))
+    assert "session" in broken(f"sum_over_time(({windowed} and on () ({rules.SESSION_ON} == 1))[1h:1m])", instant=False)
+
+

@@ -17,6 +17,32 @@ showing a wrong number. Three belong to every panel, and are built here:
   `engine_percentile_timeseries` add, beside the quantiles, the increase of the histogram's count
   over the same window.
 
+**An objective is read over the time a session was on** (section 7.3). PromQL knows nothing of the
+session switch, so the scaler sends a gauge, `rhi_scaler_session_on`, on every run, once a minute,
+stamped with the run's time: 1 while the switch reads on. What is counted is each sample of a
+counter, by what it adds: `session_increment` takes, for each series, its value less its value at
+the step before, or all of it where it fell (a restart from zero) or was not there before (the
+first request of a new label), and keeps it only where that sample was taken while a session was
+on, inside the dashboard's range:
+
+- **By the reading in force when it was taken.** A sample is compared with the gauge's readings by
+  their timestamps (`timestamp`), not by the step it falls in: it is counted when the latest reading
+  at or before its own time was 1. That reading is the gauge's latest at the step, if it was taken
+  no later than the sample; otherwise it is the latest at the step before, the gauge being read at
+  most once a step. So a scrape taken while the switch read off is not counted, even a second
+  before it came on, and one taken while it read on is, even a second before it went off.
+- **Inside the range.** A sample taken at or before the range's start (`$__from`) is not counted.
+
+`over_sessions` sums those increments at every step of `SESSION_STEP` across the dashboard's range,
+a subquery over exactly the range (`$__range_ms`), and adds what came after its last step, which
+lies on a multiple of the step at or before the range's end: the increment of each series since
+that step, read at the end. So every sample taken in the range is counted once and none from
+outside it. The step, 5 seconds, is shorter than any scrape interval (every collector scrapes each
+15 seconds), so each step holds at most one new sample of a series, and each sample is judged by
+its own time. Counts are summed over the session before a ratio is taken of them. A series no
+instance updates any more rises by nothing, so an engine series read so counts nothing an instance
+last reported, and needs no "asleep": over a past range there is no "now" to read it at.
+
 An engine names its metrics its own way, so an engine query never writes a name: `engine_series`
 reads it from the per-engine table (`rhi_common.engine_metrics`), at the row of the engine the
 pool's configuration names. That holds for the contract's quantities (`Quantity`) and for the
@@ -46,7 +72,7 @@ from grafana_foundation_sdk.models import dashboard as models
 from rhi_common.engine_metrics import Further, Kind, Quantity, further_names, metric_names
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from rhi_common.pool_config import Pool
 
@@ -100,16 +126,31 @@ class ExportedBy:
 
 type Declared = FromEngineTable | EmittedBy | ExportedBy
 
+# The scaler's gauge of the session switch: 1 while it reads on, 0 otherwise (section 7.3).
+SESSION_ON = "rhi_scaler_session_on"
+# The steps an objective is counted at: each shorter than any scrape interval (15 seconds), so that
+# each holds at most one new sample of a series, across exactly the dashboard's range, which starts
+# at `SESSION_START`, in seconds.
+SESSION_STEP = "5s"
+SESSION_RANGE = "${__range_ms}ms"
+SESSION_START = "$__from / 1000"
+
 # What the helpers themselves query. `rhi_dashboards.check` adds it to every module's own.
-METRICS: tuple[Declared, ...] = (EmittedBy(IN_SERVICE, "services/scaler/rhi_scaler/metrics.py"),)
+METRICS: tuple[Declared, ...] = (
+    EmittedBy(IN_SERVICE, "services/scaler/rhi_scaler/metrics.py"),
+    EmittedBy(SESSION_ON, "services/scaler/rhi_scaler/metrics.py"),
+)
 
 
-def selector(metric: str, matchers: Mapping[str, str] | None = None) -> str:
-    """`metric{label="value"}`: the series of a metric whose labels equal the values given."""
-    if not matchers:
+def selector(metric: str, matchers: Mapping[str, str] | None = None, *, matching: Mapping[str, str] | None = None) -> str:
+    """`metric{label="value", other=~"pattern"}`: the series of a metric whose labels equal the
+    values of `matchers` and match the regular expressions of `matching`."""
+    pairs = [(label, "=", value) for label, value in (matchers or {}).items()]
+    pairs += [(label, "=~", value) for label, value in (matching or {}).items()]
+    if not pairs:
         return metric
     quoted = ", ".join(
-        '{}="{}"'.format(label, value.replace("\\", "\\\\").replace('"', '\\"')) for label, value in matchers.items()
+        '{}{}"{}"'.format(label, op, value.replace("\\", "\\\\").replace('"', '\\"')) for label, op, value in pairs
     )
     return f"{metric}{{{quoted}}}"
 
@@ -249,6 +290,67 @@ def awake(pool: str, expression: str) -> str:
 def asleep(pool: str) -> str:
     """One series, of value zero, while the scaler counts no instance in service; none otherwise."""
     return f"{in_service(pool)} == 0"
+
+
+# What an expression read at the step before the one it is evaluated at.
+type Previous = Callable[[str], str]
+# What one step adds, given how to read the step before it: see `over_sessions`.
+type Contribution = Callable[[Previous], str]
+
+
+def a_step_before(expression: str) -> str:
+    """The expression at the step before, inside the subquery of `over_sessions`."""
+    return f"{expression} offset {SESSION_STEP}"
+
+
+def at_the_last_step(expression: str) -> str:
+    """The expression at the last step of the subquery of `over_sessions`, read at the range's end:
+    the step on the multiple of `SESSION_STEP` at or before it."""
+    return f"last_over_time({expression}[{SESSION_STEP}:{SESSION_STEP}])"
+
+
+# The two ways a step before is read, in that order.
+PREVIOUS: tuple[Previous, ...] = (a_step_before, at_the_last_step)
+
+
+def taken_in_session(series: str, previous: Previous) -> str:
+    """The series' samples taken after the range's start while the gauge's latest reading was 1:
+    the reading at this step if taken no later than the sample, else the one at `previous`."""
+    gauge = SESSION_ON
+    since = f"timestamp({series}) > {SESSION_START}"
+    after = f"timestamp({series}) >= on () group_left () (timestamp({gauge}) and on () ({gauge} == 1))"
+    before = f"timestamp({series}) < on () group_left () (timestamp({gauge}) and on () ({previous(gauge)} == 1))"
+    return f"(({since}) and (({after}) or ({before})))"
+
+
+def session_increment(series: str, previous: Previous) -> str:
+    """What each series of the selector rose by since `previous`, kept where its sample was taken
+    while a session was on, inside the range: its value less its value then, or all of it where it
+    was not there then or fell (it restarted from zero)."""
+    risen = f"(({series} - {previous(series)}) >= 0) or {series}"
+    return f"(({risen}) and {taken_in_session(series, previous)})"
+
+
+def over_sessions(contribution: Contribution) -> str:
+    """What the steps of the dashboard's range contributed while a session was on, summed: at every
+    step of `SESSION_STEP` across it, and from its last step to its end. `contribution` writes one
+    step's, given how to read the step before; it aggregates `session_increment`s."""
+    steps = f"sum_over_time(({contribution(a_step_before)})[{SESSION_RANGE}:{SESSION_STEP}])"
+    last = contribution(at_the_last_step)
+    return f"(({steps}) + ({last})) or ({steps}) or ({last})"
+
+
+def step_increase(metric: str, matchers: Mapping[str, str] | None = None, *, by: Sequence[str] = ()) -> Contribution:
+    """A step's contribution of a counter: the `session_increment` of each of its series, summed by
+    `by` alone (no pool unless named)."""
+    series = selector(metric, matchers)
+    labels = ", ".join(by)
+    return lambda previous: f"sum by ({labels}) ({session_increment(series, previous)})"
+
+
+def engine_step_increase(pool: Pool, quantity: EngineQuantity, sample: str = "") -> Contribution:
+    """`step_increase` of an engine's counter, for this pool, summed by pool."""
+    return step_increase(engine_series(pool, quantity, sample), engine_matchers(pool, quantity), by=(POOL,))
 
 
 def query(expression: str, legend: str, ref_id: str, *, instant: bool = False) -> prometheus_builders.Dataquery:

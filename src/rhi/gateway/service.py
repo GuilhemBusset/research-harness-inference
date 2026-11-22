@@ -45,6 +45,8 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 - `RHI_COURSE_END`: the configuration's course end date, YYYY-MM-DD, by which every usage row
   the gateway writes expires (section 6.6);
 - the six numeric variables, each from its configuration key (`NUMERIC`).
+- the three floors of the objectives, each from its configuration key (`FLOORS`), which the
+  gateway's histograms take among their boundaries.
 
 With no pool the environment is still one the gateway starts with, so the service reaches a
 steady state on a configuration whose pools table is empty.
@@ -95,6 +97,7 @@ it deploys the owner creates that role once, unless the account already has it:
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import aws_cdk as cdk
@@ -166,6 +169,13 @@ NUMERIC = {
     "RHI_RETRY_AFTER_WARMING": "retry_after_warming_seconds",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "retry_after_capacity_unavailable_seconds",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "retry_after_concurrency_limit_seconds",
+}
+# Each floor of the objectives, and the configuration key it is written from: the gateway takes
+# it among its histograms' boundaries (`rhi_gateway.settings`).
+FLOORS = {
+    "RHI_TARGET_TTFT_P95_SECONDS": "target_ttft_p95_seconds",
+    "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND": "target_stream_median_tokens_per_second",
+    "RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND": "target_stream_p10_tokens_per_second",
 }
 
 # The container that listens, by the name the task definition gives it.
@@ -278,6 +288,7 @@ class GatewayService(Construct):
             SCALER_FUNCTION_VARIABLE: scaler.function_name,
             COURSE_END_VARIABLE: config.course_end.isoformat(),
             **{variable: str(getattr(config, key)) for variable, key in NUMERIC.items()},
+            **{variable: _decimal(getattr(config, key)) for variable, key in FLOORS.items()},
         }
         if config.default_pool is not None:
             environment[DEFAULT_POOL_VARIABLE] = config.default_pool
@@ -354,6 +365,12 @@ class GatewayService(Construct):
             conditions=[elbv2.ListenerCondition.path_patterns(PATH_PATTERNS)],
             action=elbv2.ListenerAction.forward([self.target_group]),
         )
+
+
+def _decimal(value: float) -> str:
+    """A floor in the digits the gateway reads: the fewest that give it back, with no exponent."""
+    text = format(Decimal(repr(float(value))), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _as_it_stands(text: str) -> str:

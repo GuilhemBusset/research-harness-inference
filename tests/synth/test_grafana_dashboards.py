@@ -1,7 +1,7 @@
 """The dashboards in Grafana's image (system design, sections 4.7 and 7.4): the image's build
 context is assembled at synthesis, from the files of `services/grafana/` and the dashboards built
 from the configuration that is synthesized. So the fleet dashboard of the image has one row for
-each pool of that configuration, and the image's asset hash, which decides whether Grafana is
+each pool of that configuration, after the row of the objectives, and the image's asset hash, which decides whether Grafana is
 deployed again, follows the configuration's pools and nothing of the run.
 
 Nothing here starts a container: the build context is read where synthesis stages it, in the cloud
@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 IMAGE_FOLDER = REPO / "services" / "grafana"
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
 FLEET = "dashboards/fleet.json"
+OBJECTIVES_ROW = "Objectives, while a session is on"
 
 
 @dataclass(frozen=True)
@@ -44,9 +45,12 @@ class Image:
 
 
 def fleet_rows(context: Path) -> list[str]:
-    """The titles of the rows of the fleet dashboard a build context holds, in their order."""
+    """The titles of the pools' rows of the fleet dashboard a build context holds, in their order:
+    every row after the first, the objectives'."""
     fleet = json.loads((context / FLEET).read_text(encoding="utf-8"))
-    return [panel["title"] for panel in fleet["panels"] if panel["type"] == "row"]
+    titles = [panel["title"] for panel in fleet["panels"] if panel["type"] == "row"]
+    assert titles[0] == OBJECTIVES_ROW
+    return titles[1:]
 
 
 def files(folder: Path) -> dict[str, bytes]:

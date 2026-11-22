@@ -25,7 +25,9 @@ of the gateway: the client is answered 500 with no body, so none of the exceptio
 it, and the record carries the cause `none`. So is any answer of 500 or above that names no cause
 (one that no part of the gateway noted a cause for before it started): it is replaced, before
 anything of it is sent, by the same 500 with no body. The exception is not raised further: the
-server would log its text.
+server would log its text. An exception raised once the answer has started is a fault only of an
+answer that named no cause: one that did (a 503 of a pool warming, say) was sent whole as what it
+is, and keeps its cause.
 
 `Telemetry` is the middleware that `rhi_gateway.app.build_app` installs. The parts of the gateway
 that learn something of a request note it on the request's record through the `note_*`
@@ -187,9 +189,11 @@ class Telemetry:
         try:
             await self._app(scope, receive, sending)
         except Exception:  # noqa: BLE001 - any exception is the gateway's own fault: answered 500, logged as cause none, never its text.
-            record.cause = NO_CAUSE
             if record.status is None:
+                record.cause = NO_CAUSE
                 await _answer_fault(sending)
+            elif record.cause is None:
+                record.cause = NO_CAUSE
         finally:
             _CURRENT.reset(token)
             record.latency_ms = max(0, round((self._monotonic() - started) * 1000))

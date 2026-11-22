@@ -14,6 +14,7 @@ import traceback
 import pytest
 
 from rhi import config
+from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.causes import Cause
 from rhi_common.pool_config import parse_pools
 from rhi_gateway.settings import Settings, SettingsError, read_settings
@@ -76,6 +77,13 @@ NUMERIC = {
     "RHI_RETRY_AFTER_WARMING": ("retry_after_warming", 30),
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": ("retry_after_capacity_unavailable", 60),
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": ("retry_after_concurrency_limit", 5),
+}
+
+# The floors of the objectives, the field each fills and its default (the configuration's, section 17).
+FLOORS = {
+    "RHI_TARGET_TTFT_P95_SECONDS": ("target_ttft_p95_seconds", 5),
+    "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND": ("target_stream_median_tokens_per_second", 15),
+    "RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND": ("target_stream_p10_tokens_per_second", 10),
 }
 
 # A value that must never be shown, drawn now. Its capitals and its underscore keep it from being a
@@ -193,6 +201,20 @@ def test_every_numeric_variable_left_unset_gives_the_defaults_of_the_design() ->
     assert settings.retry_after == {cause: cause.retry_after for cause in Cause if cause.retry_after is not None}
 
 
+def test_the_floors_are_boundaries_of_the_histograms_they_are_read_in() -> None:
+    # Left out, the configuration's defaults, which are boundaries of the gateway's own already.
+    default = read_settings(FULL)
+    assert {field: getattr(default, field) for field, _ in FLOORS.values()} == dict(FLOORS.values())
+    assert (default.wait_buckets, default.speed_buckets) == (WAIT_BUCKETS, SPEED_BUCKETS)
+    # Revised between two boundaries, each is one, beside the gateway's own.
+    revised = read_settings(
+        {**FULL, **dict(zip(FLOORS, ("6", "16.5", "10"), strict=True))}
+    )
+    assert (revised.target_ttft_p95_seconds, revised.target_stream_median_tokens_per_second) == (6, 16.5)
+    assert revised.wait_buckets == tuple(sorted({*WAIT_BUCKETS, 6}))
+    assert revised.speed_buckets == tuple(sorted({*SPEED_BUCKETS, 16.5}))
+
+
 @pytest.mark.parametrize("variable", REQUIRED)
 def test_a_required_variable_left_out_raises_an_error_that_names_it(variable: str) -> None:
     error = refusal(without(variable))
@@ -268,6 +290,21 @@ def test_a_required_variable_left_out_raises_an_error_that_names_it(variable: st
                 ("another-order", "15/01/2027"),
                 ("a-time", "2027-01-15T00:00:00"),
                 ("then-text", f"2027-01-15{SECRET}"),
+            )
+        ),
+        *(
+            pytest.param(variable, value, id=f"{variable}-{case}")
+            for variable in FLOORS
+            for case, value in (
+                ("text", SECRET),
+                ("empty", ""),
+                ("zero", "0"),
+                ("zero-point-zero", "0.0"),
+                ("negative", "-5"),
+                ("an-exponent", "1e3"),
+                ("a-bare-point", "5."),
+                ("spaces", " 10 "),
+                ("digits-then-text", f"10{SECRET}"),
             )
         ),
         *(
