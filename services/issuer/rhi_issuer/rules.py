@@ -25,8 +25,10 @@ cancelled login reads the keys again, following `successor` with consistent read
 the rules to what it now finds. A student with no key from a login has no latest key to name:
 the first issuance holds a short lock instead, an item under `lock#` and the student's GitHub ID,
 taken before the keys are read again and deleted in the write that stores the key. A lock older
-than `LOCK_SECONDS` is taken over. A login that loses this race `ATTEMPTS` times is refused with
-`Refusal.LOGIN_CONFLICT`.
+than `LOCK_SECONDS` is taken over. Its key holds the student's GitHub ID, so a lock that a login
+left behind expires like every personal row: `LOCK_SECONDS` after it was taken, and never later
+than the course end plus 90 days (`rhi_common.retention`). A login that loses this race
+`ATTEMPTS` times is refused with `Refusal.LOGIN_CONFLICT`.
 
 The index by student is updated after the table, so it may not show yet a key stored a moment
 before, or show only some of the student's keys. The rules do not rest on it alone:
@@ -52,10 +54,11 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from rhi_common import retention
 from rhi_common.records import RecordError
 from rhi_common.students import RosterEntry, StudentKey
-from rhi_common.tables import BY_STUDENT, KEYS
-from rhi_issuer.mint import Minted, mint
+from rhi_common.tables import BY_STUDENT, EXPIRES_AT, KEYS
+from rhi_issuer.mint import Minted, held_to_validity, mint
 from rhi_issuer.redeem import Refusal, Refused
 
 DEFAULT_ISSUANCES_PER_DAY = 5
@@ -214,12 +217,16 @@ def lock_key(github_id: int) -> dict[str, str]:
     return {KEYS.partition_key.name: f"{_LOCK_PREFIX}{github_id}"}
 
 
-def _take_lock(github_id: int, now: int, keys: Any) -> str | None:
-    """Takes the student's lock, unless another login holds it; the holder's token, or `None`."""
+def _take_lock(github_id: int, now: int, keys: Any, course_end: datetime.date) -> str | None:
+    """Takes the student's lock, unless another login holds it; the holder's token, or `None`.
+
+    The lock expires once it may be taken over, and never after the course end plus 90 days.
+    """
     holder = secrets.token_hex(16)
+    expires = min(now + LOCK_SECONDS, retention.expires_at(course_end))
     try:
         keys.put_item(
-            Item={**lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder},
+            Item={**lock_key(github_id), _LOCKED_AT: now, _HOLDER: holder, EXPIRES_AT: expires},
             ConditionExpression="attribute_not_exists(#hash) OR #locked < :stale",
             ExpressionAttributeNames={"#hash": KEYS.partition_key.name, "#locked": _LOCKED_AT},
             ExpressionAttributeValues={":stale": now - LOCK_SECONDS},
@@ -266,10 +273,14 @@ def _store(
     holder: str | None,
     now: int,
     keys: Any,
+    course_end: datetime.date,
 ) -> bool:
     """Writes the new key, revokes the replaced ones and names the new key as the latest key's successor, in one write.
 
-    `False` when the write is cancelled because another login wrote first.
+    Each older key it revokes has its expiry held to the course end plus 90 days
+    (`rhi_common.retention.no_later`), and a latest key it leaves in use to the end of its validity
+    (`rhi_issuer.mint.held_to_validity`): an earlier expiry stays. `False` when the write is
+    cancelled because another login wrote first.
     """
     hash_name = KEYS.partition_key.name
     names = {"#hash": hash_name}
@@ -284,26 +295,37 @@ def _store(
             }
         }
     ]
-    revoked = {old.key_hash for old in replaced}
+    revoked = {old.key_hash: old for old in replaced}
     revoke = "#revoked = if_not_exists(#revoked, :now)"
-    for key_hash in revoked - ({latest.record.key_hash} if latest else set()):
+    held = "#expires = :expires"
+    for key_hash, old in revoked.items():
+        if latest is not None and key_hash == latest.record.key_hash:
+            continue
         items.append(
             {
                 "Update": {
                     "TableName": keys.name,
                     "Key": {hash_name: key_hash},
                     # A revocation that landed in the meantime keeps its own time.
-                    "UpdateExpression": f"SET {revoke}",
+                    "UpdateExpression": f"SET {revoke}, {held}",
                     "ConditionExpression": "attribute_exists(#hash)",
-                    "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT},
-                    "ExpressionAttributeValues": {":now": now},
+                    "ExpressionAttributeNames": {**names, "#revoked": _REVOKED_AT, "#expires": EXPIRES_AT},
+                    "ExpressionAttributeValues": {
+                        ":now": now,
+                        ":expires": retention.no_later(old.expires_at, course_end),
+                    },
                 }
             }
         )
     if latest is not None:
-        assignments = ["#successor = :new"]
-        values: dict[str, Any] = {":new": record.key_hash}
-        update_names = {**names, "#successor": _SUCCESSOR}
+        assignments = ["#successor = :new", held]
+        # A latest key this write does not revoke stays in use: its expiry is held to its validity.
+        bound = retention.no_later if latest.record.key_hash in revoked else held_to_validity
+        values: dict[str, Any] = {
+            ":new": record.key_hash,
+            ":expires": bound(latest.record.expires_at, course_end),
+        }
+        update_names = {**names, "#successor": _SUCCESSOR, "#expires": EXPIRES_AT}
         if latest.record.key_hash in revoked:
             assignments.append(revoke)
             values[":now"] = now
@@ -383,7 +405,7 @@ def issue(
             found = _scanned_keys(entry.github_id, keys)
             latest = _latest(found, keys, consistent=consistent)
         if latest is None:
-            holder = _take_lock(entry.github_id, now, keys)
+            holder = _take_lock(entry.github_id, now, keys, course_end)
             if holder is None:
                 continue
             # What another login stored before the lock was taken.
@@ -400,7 +422,7 @@ def issue(
             raise
         key, record = mint(entry, installation, course_end=course_end, now=now)
         replaced = [old for old in existing if _is_active(old, now) and old.installation == installation]
-        if _store(record, _ledger(record, existing, replaced, now), replaced, latest, holder, now, keys):
+        if _store(record, _ledger(record, existing, replaced, now), replaced, latest, holder, now, keys, course_end):
             previous = max((old.issued_at for old in existing), default=None)
             return Minted(
                 key=key, issued_at=record.issued_at, expires_at=record.expires_at, previous_issued_at=previous

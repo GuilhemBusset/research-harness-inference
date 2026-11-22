@@ -42,6 +42,8 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 - `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_HEARTBEAT_TABLE`, `RHI_POOL_STATE_TABLE`: the names the
   deployment gives the four tables;
 - `RHI_SCALER_FUNCTION`: the scaler function's name;
+- `RHI_COURSE_END`: the configuration's course end date, YYYY-MM-DD, by which every usage row
+  the gateway writes expires (section 6.6);
 - the six numeric variables, each from its configuration key (`NUMERIC`).
 - the three floors of the objectives, each from its configuration key (`FLOORS`), which the
   gateway's histograms take among their boundaries.
@@ -158,6 +160,7 @@ USAGE_TABLE_VARIABLE = "RHI_USAGE_TABLE"
 HEARTBEAT_TABLE_VARIABLE = "RHI_HEARTBEAT_TABLE"
 POOL_STATE_TABLE_VARIABLE = "RHI_POOL_STATE_TABLE"
 SCALER_FUNCTION_VARIABLE = "RHI_SCALER_FUNCTION"
+COURSE_END_VARIABLE = "RHI_COURSE_END"
 # Each numeric variable, and the configuration key it is written from.
 NUMERIC = {
     "RHI_BODY_LIMIT_BYTES": "request_body_limit_bytes",
@@ -283,6 +286,7 @@ class GatewayService(Construct):
             HEARTBEAT_TABLE_VARIABLE: heartbeats.table_name,
             POOL_STATE_TABLE_VARIABLE: pool_state.table_name,
             SCALER_FUNCTION_VARIABLE: scaler.function_name,
+            COURSE_END_VARIABLE: config.course_end.isoformat(),
             **{variable: str(getattr(config, key)) for variable, key in NUMERIC.items()},
             **{variable: _decimal(getattr(config, key)) for variable, key in FLOORS.items()},
         }

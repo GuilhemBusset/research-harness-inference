@@ -10,7 +10,9 @@ the key may be issued and stores it.
 
 A key expires at the course end. The course end is a date, and the key works through that day:
 its `expires_at` is the first second of the next day, in UTC. The function is given the date and
-no time zone.
+no time zone. A key item is personal data, and its table deletes it at its `expires_at`: that is
+never later than the course end plus 90 days, when every personal row expires
+(`rhi_common.retention`, section 6.6).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 
+from rhi_common import retention
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.students import RosterEntry, StudentKey
 
@@ -33,9 +36,23 @@ class Minted:
 
 
 def expiry(course_end: datetime.date) -> int:
-    """When a key of a course that ends on that date stops working: the end of that day, in UTC."""
+    """When a key of a course that ends on that date stops working: the end of that day, in UTC.
+
+    It is the expiry of the key's item too, so it is held to the retention of personal rows.
+    """
     day_after = course_end + datetime.timedelta(days=1)
-    return int(datetime.datetime.combine(day_after, datetime.time.min, datetime.UTC).timestamp())
+    end_of_day = int(datetime.datetime.combine(day_after, datetime.time.min, datetime.UTC).timestamp())
+    return min(end_of_day, retention.expires_at(course_end))
+
+
+def held_to_validity(expires_at: int, course_end: datetime.date) -> int:
+    """The expiry of an active key written again: its own, or `expiry(course_end)` when that is earlier.
+
+    A key's validity ends at the course end (section 6.4), so a key still in use that is written
+    again after the course end was moved earlier stops working by the new date; an earlier expiry
+    it already had stays.
+    """
+    return min(int(expires_at), expiry(course_end))
 
 
 def mint(entry: RosterEntry, installation: str, *, course_end: datetime.date, now: int) -> tuple[str, StudentKey]:

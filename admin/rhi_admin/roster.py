@@ -22,7 +22,8 @@ ID is, so no login and no command reads it as a student, and `entries` lists non
 in the transaction that writes the entry and only if it is not there, naming the entry's GitHub
 ID: of two additions given one alias at once, one is refused. `hold_alias` replaces the entry and
 that item, in one write, by an item that holds the alias and its expiry and nothing else: no
-GitHub ID, no budget. `add` refuses the alias until the table's expiry removes it. A student put
+GitHub ID, no budget. `add` refuses the alias until the table's expiry removes it, `ALIAS_HELD_DAYS`
+later and never after the course end plus 90 days (`alias_held_until`). A student put
 back on the roster is given another alias.
 
 While an erase runs, `begin_erase` holds the GitHub ID the same way, under a negative key of its
@@ -47,18 +48,20 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from rhi_common import retention
 from rhi_common.students import RosterEntry
 from rhi_common.tables import BY_ALIAS, BY_STUDENT, EXPIRES_AT, KEYS, ROSTER
-from rhi_issuer.mint import expiry
+from rhi_issuer.mint import held_to_validity
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key
 
 DEFAULT_DAILY_TOKEN_BUDGET = 100_000_000
 DEFAULT_CONCURRENCY_LIMIT = 4
 # Every store is kept until the course end plus 90 days (section 6.6); a key stops at the course end.
-RETENTION_DAYS = 90
+RETENTION_DAYS = retention.RETENTION_DAYS
 # How long an alias taken off the roster is held back from any other entry: the retention of what
-# was written under it, and a day for the requests still running.
+# was written under it, and a day for the requests still running; never past the course end plus
+# 90 days, when the hold itself, a personal row, expires (`alias_held_until`).
 ALIAS_HELD_DAYS = RETENTION_DAYS + 1
 # The attribute of an alias's own item that names the entry given the alias (`add`).
 CLAIMED_BY = "claimed_by"
@@ -214,7 +217,7 @@ def add(
         daily_token_budget=DEFAULT_DAILY_TOKEN_BUDGET if daily_token_budget is None else daily_token_budget,
         concurrency_limit=DEFAULT_CONCURRENCY_LIMIT if concurrency_limit is None else concurrency_limit,
         added_at=now,
-        expires_at=expiry(course_end) + RETENTION_DAYS * 86400,
+        expires_at=retention.expires_at(course_end),
     )
     absent = {"ConditionExpression": "attribute_not_exists(#id)", "ExpressionAttributeNames": {"#id": ROSTER.partition_key.name}}
     # The alias's own item, which the alias's hold replaces (`hold_alias`); it goes with the entry.
@@ -267,19 +270,25 @@ def entries(*, roster: Any) -> list[RosterEntry]:
         scan["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
-def remove(github_id: int, *, roster: Any, keys: Any, now: int) -> int:
+def alias_held_until(now: int, course_end: datetime.date) -> int:
+    """Until when an alias taken off the roster at `now` is held back: `ALIAS_HELD_DAYS` later, and
+    never after the course end plus 90 days, when every personal row expires (`rhi_common.retention`)."""
+    return retention.no_later(now + ALIAS_HELD_DAYS * 86_400, course_end)
+
+
+def remove(github_id: int, *, roster: Any, keys: Any, course_end: datetime.date, now: int) -> int:
     """Removes the student's entry and revokes every key they hold; how many keys this revoked.
 
     The entry goes first, so that no login is issued a key while the keys are revoked. It is
-    replaced, in the same write, by the item that holds its alias back for `ALIAS_HELD_DAYS`
+    replaced, in the same write, by the item that holds its alias back until `alias_held_until`
     (`hold_alias`): what was written under the alias stays the student's alone. Refused when the
     student is not on the roster; `rhi_admin.keys.revoke` revokes keys without an entry.
     """
     entry = get(github_id, roster=roster)
     if entry is None:
         raise AdminError("that GitHub ID is not on the roster")
-    hold_alias(entry, roster=roster, until=now + ALIAS_HELD_DAYS * 86_400)
-    return revoke_all(github_id, keys=keys, now=now)
+    hold_alias(entry, roster=roster, until=alias_held_until(now, course_end))
+    return revoke_all(github_id, keys=keys, now=now, course_end=course_end)
 
 
 def change(
@@ -287,6 +296,7 @@ def change(
     *,
     roster: Any,
     keys: Any,
+    course_end: datetime.date,
     now: int,
     daily_token_budget: int | None = None,
     concurrency_limit: int | None = None,
@@ -294,7 +304,9 @@ def change(
     """Writes a new budget, limit or both to the entry and to each active key item; how many keys it changed.
 
     A key revoked in the meantime is left as it is: the write to a key is conditional on it not
-    being revoked.
+    being revoked. The write to the entry also sets its expiry, the course end plus 90 days, as
+    every write of an entry does (`add`). A key it writes stays in use, so the write holds the key's
+    expiry to the end of its validity, the course end (`rhi_issuer.mint.held_to_validity`).
     """
     _check_numbers(daily_token_budget, concurrency_limit)
     values = {
@@ -310,10 +322,10 @@ def change(
     try:
         roster.update_item(
             Key={ROSTER.partition_key.name: github_id},
-            UpdateExpression=f"SET {assignments}",
+            UpdateExpression=f"SET {assignments}, #expires = :expires",
             ConditionExpression="attribute_exists(#id)",
-            ExpressionAttributeNames={**names, "#id": ROSTER.partition_key.name},
-            ExpressionAttributeValues=numbers,
+            ExpressionAttributeNames={**names, "#id": ROSTER.partition_key.name, "#expires": EXPIRES_AT},
+            ExpressionAttributeValues={**numbers, ":expires": retention.expires_at(course_end)},
         )
     except ClientError as error:
         if _failed_condition(error):
@@ -326,14 +338,15 @@ def change(
         try:
             keys.update_item(
                 Key={KEYS.partition_key.name: record.key_hash},
-                UpdateExpression=f"SET {assignments}",
+                UpdateExpression=f"SET {assignments}, #expires = :expires",
                 ConditionExpression="attribute_exists(#student) AND attribute_not_exists(#revoked)",
                 ExpressionAttributeNames={
                     **names,
                     "#student": KEYS.index(BY_STUDENT).partition_key.name,
                     "#revoked": "revoked_at",
+                    "#expires": EXPIRES_AT,
                 },
-                ExpressionAttributeValues=numbers,
+                ExpressionAttributeValues={**numbers, ":expires": held_to_validity(record.expires_at, course_end)},
             )
         except ClientError as error:
             if _failed_condition(error):

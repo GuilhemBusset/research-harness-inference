@@ -20,13 +20,13 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from rhi_common import retention
 from rhi_common.causes import Cause
 from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
 from rhi_common.tables import USAGE
 from rhi_gateway.budget import (
     BYTES_PER_TOKEN,
-    USAGE_RETENTION_SECONDS,
     DynamoDBLedger,
     InMemoryLedger,
     Ledger,
@@ -38,6 +38,8 @@ DAILY_BUDGET = 100_000_000
 LONGEST_REQUEST_SECONDS = 1800
 NOON = int(datetime(2026, 11, 15, 12, tzinfo=UTC).timestamp())
 COURSE_END = NOON + 30 * 86_400
+# The same course end as a date, which the ledger is given.
+COURSE_END_DATE = datetime.fromtimestamp(COURSE_END, UTC).date()
 TABLE = "usage-of-the-test"
 KEY = {"github_id": {"N": "7"}, "day": {"S": "2026-11-15"}}
 
@@ -143,7 +145,7 @@ def written(day: str = "2026-11-15") -> UsageDay:
 
 
 def test_fifty_reservations_from_parallel_threads_against_a_budget_that_fits_ten_admit_ten(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student(budget=10 * 1500, limit=50)
     together = threading.Barrier(50)
 
@@ -167,7 +169,7 @@ def test_fifty_reservations_from_parallel_threads_against_a_budget_that_fits_ten
 
 
 def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
     assert ledger.tokens_left(who) == DAILY_BUDGET
 
@@ -180,7 +182,7 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
         day="2026-11-15",
         alias="student-07",
         tokens=1500,
-        expires_at=COURSE_END + USAGE_RETENTION_SECONDS,
+        expires_at=retention.expires_at(COURSE_END_DATE),
         leases={"request-1": lease},
     )
 
@@ -200,7 +202,7 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
 
 
 def test_the_two_writes_of_a_request_carry_the_cookie_of_its_pool(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
 
     # The record holds no cookie: none is returned, the item reads as holding none, and the
@@ -235,7 +237,7 @@ def test_the_two_writes_of_a_request_carry_the_cookie_of_its_pool(client: Calls)
 
 
 def test_the_first_cookies_of_requests_in_flight_each_cost_one_settlement_call(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
     # A day's item that no reservation naming a pool has written holds no map of cookies.
     ledger.settle(reserve(ledger, who, "request-0"), input_tokens=0, output_tokens=0, ended_cleanly=True)
@@ -262,7 +264,7 @@ def test_the_first_cookies_of_requests_in_flight_each_cost_one_settlement_call(c
 
 
 def test_the_first_cookies_of_two_requests_in_flight_are_both_kept(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
     # The first reservation writes the day's item whole, and the second adds to it.
     one = reserve(ledger, who, "request-1", pool="coursework")
@@ -277,7 +279,7 @@ def test_the_first_cookies_of_two_requests_in_flight_are_both_kept(client: Calls
 
 def test_the_first_request_of_a_day_returns_the_cookie_of_the_day_before(client: Calls) -> None:
     clock = Clock()
-    ledger = DynamoDBLedger(client, TABLE, clock=clock)
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=clock)
     who = student()
     first = reserve(ledger, who, "request-1", pool="coursework")
     ledger.settle(first, input_tokens=1000, output_tokens=20, ended_cleanly=True, cookie="coursework-1")
@@ -289,7 +291,7 @@ def test_the_first_request_of_a_day_returns_the_cookie_of_the_day_before(client:
 
 def test_the_two_writes_of_a_request_carry_the_last_rebalance_number_of_its_pool(client: Calls) -> None:
     clock = Clock()
-    ledger = DynamoDBLedger(client, TABLE, clock=clock)
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=clock)
     who = student()
 
     def settle(reservation: Reservation, **affinity: Any) -> int | None:
@@ -340,7 +342,7 @@ def test_the_two_writes_of_a_request_carry_the_last_rebalance_number_of_its_pool
 
 
 def test_the_first_numbers_of_requests_in_flight_each_cost_one_settlement_call(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
     # A day's item that no reservation naming a pool has written holds no map of numbers.
     ledger.settle(reserve(ledger, who, "request-0"), input_tokens=0, output_tokens=0, ended_cleanly=True)
@@ -357,7 +359,7 @@ def test_the_first_numbers_of_requests_in_flight_each_cost_one_settlement_call(c
 
 
 def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     ledger.withdraw(reserve(ledger, student(), "alone", pool="coursework"))
     assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
 
@@ -369,7 +371,7 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
 
 @pytest.mark.parametrize("kind", ["memory", "dynamodb"])
 def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: Calls, kind: str) -> None:
-    ledger = InMemoryLedger(clock=Clock()) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock()) if kind == "memory" else DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     completed = reserve(ledger, student(), "completed", pool="coursework")
     settled = ledger.settle(
         completed, input_tokens=0, output_tokens=0, ended_cleanly=True, cookie="kept-cookie", rebalance_number=7
@@ -386,7 +388,7 @@ def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: C
 def test_a_withdrawal_keeps_a_settlement_that_stored_again_what_the_day_carried(client: Calls, kind: str) -> None:
     midnight = NOON + 43_200
     clock = Clock(midnight - 10)
-    ledger = InMemoryLedger(clock=clock) if kind == "memory" else DynamoDBLedger(client, TABLE, clock=clock)
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock) if kind == "memory" else DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=clock)
     first = reserve(ledger, student(), "first", pool="coursework")
     ledger.settle(first, input_tokens=1, output_tokens=1, ended_cleanly=True, cookie="held", rebalance_number=7)
     prior_day_turn = reserve(ledger, student(), "prior-day", pool="coursework")
@@ -411,7 +413,7 @@ def test_a_withdrawal_keeps_a_settlement_that_stored_again_what_the_day_carried(
 
 
 def test_a_withdrawal_keeps_a_settlement_from_a_draining_gateway(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     opening = reserve(ledger, student(), "opening", pool="coursework")
     completed = reserve(ledger, student(), "completed", pool="coursework")
     # During a rollout, an older task settles a request into a day a newer task opened. It writes
@@ -443,7 +445,7 @@ def test_a_withdrawal_keeps_a_zero_token_day_written_without_what_its_opening_ca
         rebalance_applied={"coursework": 7},
     )
     boto3.resource("dynamodb").Table(TABLE).put_item(Item=day.to_item())
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
 
     ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
 
@@ -454,7 +456,7 @@ def test_a_withdrawal_keeps_a_zero_token_day_written_without_what_its_opening_ca
 def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
     client: Calls, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     table = boto3.resource("dynamodb").Table(TABLE)
     before = UsageDay(
         7,
@@ -490,7 +492,7 @@ def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
 
 
 def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
-    ledger = DynamoDBLedger(client, TABLE, clock=Clock())
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student(limit=4)
     held = [reserve(ledger, who, f"request-{number}") for number in range(4)]
 
@@ -510,7 +512,7 @@ def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
 
 def test_an_expired_lease_frees_its_slot_and_is_charged_its_estimate(client: Calls) -> None:
     clock = Clock()
-    ledger = DynamoDBLedger(client, TABLE, clock=clock)
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=clock)
     who = student(limit=2)
     first = reserve(ledger, who, "request-1", estimate=1000, output=500)
     clock.now = NOON + 1
@@ -586,7 +588,7 @@ def test_the_opening_of_a_day_admits_no_more_than_the_limit_across_midnight(clie
         except GatewayError as refused:
             return refused.cause
 
-    ordinary = DynamoDBLedger(client, TABLE, clock=clock)
+    ordinary = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=clock)
     running = [answer(ordinary, f"running-{number}") for number in range(2)]
     late = [Paused(client, "update_item") for _ in range(2)]
     opening = Paused(client, "put_item", after=True)
@@ -595,14 +597,14 @@ def test_the_opening_of_a_day_admits_no_more_than_the_limit_across_midnight(clie
             # Two reservations of the old day have reached the table but are not yet applied.
             clock.now = midnight - 1
             pending = [
-                threads.submit(answer, DynamoDBLedger(paused, TABLE, clock=clock), f"late-{number}")
+                threads.submit(answer, DynamoDBLedger(paused, TABLE, course_end=COURSE_END_DATE, clock=clock), f"late-{number}")
                 for number, paused in enumerate(late)
             ]
             for paused in late:
                 assert paused.reached.wait(timeout=10)
             # The first reservation of the new day has read the old day and is about to write its item.
             clock.now = midnight + 1
-            opener = threads.submit(answer, DynamoDBLedger(opening, TABLE, clock=clock), "opener")
+            opener = threads.submit(answer, DynamoDBLedger(opening, TABLE, course_end=COURSE_END_DATE, clock=clock), "opener")
             assert opening.reached.wait(timeout=10)
             for paused in late:
                 paused.release()
@@ -624,7 +626,7 @@ def test_the_opening_of_a_day_admits_no_more_than_the_limit_across_midnight(clie
 
 def test_a_reservation_gives_up_on_a_record_that_keeps_changing_and_raises_any_other_error(client: Calls) -> None:
     who = student()
-    reserve(DynamoDBLedger(client, TABLE, clock=Clock()), who, "request-1")
+    reserve(DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock()), who, "request-1")
     room = {
         name: value for name, value in client.get_item(TableName=TABLE, Key=KEY)["Item"].items() if name != "leases"
     }
@@ -641,11 +643,11 @@ def test_a_reservation_gives_up_on_a_record_that_keeps_changing_and_raises_any_o
 
     changing = Changing()
     with pytest.raises(GatewayError) as gave_up:
-        reserve(DynamoDBLedger(changing, TABLE, clock=Clock()), who, "request-2")
+        reserve(DynamoDBLedger(changing, TABLE, course_end=COURSE_END_DATE, clock=Clock()), who, "request-2")
     assert (gave_up.value.cause, changing.sent) == (Cause.CONCURRENCY_LIMIT, 10)
 
     # Any other error of DynamoDB is raised as it is, with no cause: the gateway renders `engine_error`.
     with pytest.raises(ClientError) as failed:
-        reserve(DynamoDBLedger(client, "no-such-table", clock=Clock()), who, "request-3")
+        reserve(DynamoDBLedger(client, "no-such-table", course_end=COURSE_END_DATE, clock=Clock()), who, "request-3")
     assert cause_of(failed.value) is Cause.ENGINE_ERROR
     assert set(written().leases) == {"request-1"}

@@ -9,6 +9,7 @@ gateway's metrics endpoint, as the collector reads it. Every student is made whe
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import secrets
 from collections.abc import AsyncIterator
@@ -49,6 +50,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 MOCK = {
     "engine": "mock",
     "instance_types": ["t3.small"],
@@ -144,7 +147,7 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
         )
         for alias, github_id in students
     ]
-    ledger = InMemoryLedger(clock=lambda: float(NOW))
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     heartbeat = Heartbeat(Table(), "task", [pool.name for pool in POOLS], clock=lambda: float(NOW))
     made = Gateway(Starlette(), metrics.Metrics(ledger), heartbeat, keys, ready=ready)
 

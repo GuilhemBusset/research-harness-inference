@@ -4,7 +4,7 @@ pools' operating state and the session switch (system design, sections 5.6, 6.4 
 There is no public admin API: the admin runs this with their own AWS credentials, from the
 repository, and it reaches the tables directly.
 
-    env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main <command>
+    env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main <command>
 
     roster add <github-id> <alias> [--budget N] [--limit N]   a student, 100 million tokens and 4 unless given
     roster list                                                 every entry
@@ -28,7 +28,10 @@ repository, and it reaches the tables directly.
 The account and the region are the caller's, from the AWS SDK's own configuration. Each table is
 found in the deployed access stack by its logical ID, which `tests/policy/stateful_logical_ids.json`
 pins, so this file names no account, region or table. The course end, which a key and an entry
-expire by, is read from the configuration's SSM parameter when a command needs it.
+expire by, is read when a command needs it from the configuration in SSM, with the configuration
+loader's source `ssm` (`rhi.config.read_ssm`, hence `src` on the path) and the caller's credentials:
+the whole configuration is read and checked, and a configuration that does not load refuses the
+command with the loader's own message, which names a key and never a value of AWS.
 
 The commands `pool` reach the pools stack the same way, once one of them runs: the pool-state
 table by its logical ID, and the scaler's function by the logical ID of the scaler's construct
@@ -60,6 +63,7 @@ from typing import Any, TextIO
 
 import boto3
 
+from rhi.config import ConfigError, read_ssm
 from rhi_admin import keys as admin_keys
 from rhi_admin import pools as admin_pools
 from rhi_admin import privacy as admin_privacy
@@ -85,8 +89,6 @@ WORKSPACE_LOGICAL_ID = "PrometheusWorkspaceF3098DB6"
 POOLS_STACK_NAME = "Rhi-Pools"
 POOL_STATE_LOGICAL_ID = "TablesPoolState68A872F7"
 SCALER_FUNCTION_LOGICAL_ID = "ScalerFunction8891241E"
-# The configuration's key `course_end`, under the prefix `SSM_PREFIX` of src/rhi/config.py.
-COURSE_END_PARAMETER = "/rhi/config/course_end"
 
 
 @dataclass(frozen=True)
@@ -120,8 +122,10 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
     ssm = session.client("ssm")
 
     def course_end() -> datetime.date:
-        value = ssm.get_parameter(Name=COURSE_END_PARAMETER)["Parameter"]["Value"]
-        return datetime.date.fromisoformat(value)
+        try:
+            return read_ssm(ssm).course_end
+        except ConfigError as error:
+            raise AdminError(str(error)) from None
 
     def pools() -> admin_pools.Pools:
         sts = session.client("sts")
@@ -264,6 +268,7 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
             roster=admin.roster,
             keys=admin.keys,
             stores=admin.privacy(),
+            course_end=admin.course_end(),
             now=now,
             say=lambda line: print(line, file=out, flush=True),
         )
@@ -293,13 +298,16 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
             arguments.github_id,
             roster=admin.roster,
             keys=admin.keys,
+            course_end=admin.course_end(),
             now=now,
             daily_token_budget=arguments.budget,
             concurrency_limit=arguments.limit,
         )
         print(f"Changed the entry and {changed} active key(s); the gateway applies it within 60 seconds.", file=out)
     elif command == ("roster", "remove"):
-        revoked = admin_roster.remove(arguments.github_id, roster=admin.roster, keys=admin.keys, now=now)
+        revoked = admin_roster.remove(
+            arguments.github_id, roster=admin.roster, keys=admin.keys, course_end=admin.course_end(), now=now
+        )
         print(f"Removed the entry and revoked {revoked} key(s).", file=out)
     elif command == ("key", "issue"):
         key = admin_keys.issue(
@@ -308,7 +316,7 @@ def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO
         # The one time the key is shown: it is stored as its SHA-256 only.
         print(key, file=out)
     elif command == ("key", "revoke"):
-        revoked = admin_keys.revoke(arguments.github_id, keys=admin.keys, now=now)
+        revoked = admin_keys.revoke(arguments.github_id, keys=admin.keys, course_end=admin.course_end(), now=now)
         print(f"Revoked {revoked} key(s).", file=out)
     elif command == ("spike-keys", None):
         run_spike_keys(

@@ -13,6 +13,7 @@ one, are generated when it runs.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import Readiness
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 MOCK = {
     "engine": "mock",
     "instance_types": ["t3.small"],
@@ -182,7 +185,7 @@ class Gateways:
 
     def __init__(self, students: int, *, number: int = 3, pool: str = "coursework") -> None:
         self.scaler = Scaler()
-        self.ledger = InMemoryLedger(clock=lambda: float(NOW))
+        self.ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.balancer = LoadBalancer()
         self.instances = [Instance(self.scaler, self.ledger, self.balancer) for _ in range(2)]
         self.students = [student(github_id) for github_id in range(1, students + 1)]
@@ -340,7 +343,7 @@ def test_the_gateway_judges_each_request_on_the_number_its_reader_holds() -> Non
     kept = next(github_id for github_id, by in chosen.items() if by == (False, False))
     keys = {moved: generate_key(), kept: generate_key()}
     scaler, balancer = Scaler(), LoadBalancer()
-    ledger = InMemoryLedger(clock=lambda: float(NOW))
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     groups = {name: f"group-{name}" for name in POOLS}
     readiness = Readiness(groups, elbv2=Healthy(), table=scaler, clock=lambda: float(NOW))
     pools = tuple(POOLS.values())

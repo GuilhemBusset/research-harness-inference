@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import threading
 from collections.abc import AsyncIterator, Callable
@@ -33,6 +34,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 STUDENT = 4242
 UPSTREAM = "http://pools.example.com:8080"
 SECRETS = {"coursework": "coursework-secret", "upgrade": "upgrade-secret"}
@@ -138,7 +141,7 @@ def gateway(upstream: Upstream, store: InMemoryKeyStore | None = None) -> tuple[
     )
     store = InMemoryKeyStore() if store is None else store
     store.put(item)
-    ledger = InMemoryLedger(clock=lambda: float(NOW))
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     filters = {
         routes.MESSAGES: BodyFilter(messages.MESSAGES, POOLS),
         routes.COUNT_TOKENS: BodyFilter(messages.COUNT_TOKENS, POOLS),

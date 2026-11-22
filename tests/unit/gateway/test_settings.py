@@ -6,6 +6,7 @@ the placeholder account, and the secret a test places in a variable is drawn whe
 
 from __future__ import annotations
 
+import datetime
 import json
 import secrets
 import traceback
@@ -48,6 +49,7 @@ FULL = {
     "RHI_HEARTBEAT_TABLE": "heartbeats-of-the-test",
     "RHI_POOL_STATE_TABLE": "pool-state-of-the-test",
     "RHI_SCALER_FUNCTION": "scaler-of-the-test",
+    "RHI_COURSE_END": "2027-01-15",
     "RHI_BODY_LIMIT_BYTES": "1048576",
     "RHI_LONGEST_REQUEST_SECONDS": "900",
     "RHI_KEEPALIVE_SECONDS": "7",
@@ -65,6 +67,7 @@ REQUIRED = (
     "RHI_HEARTBEAT_TABLE",
     "RHI_POOL_STATE_TABLE",
     "RHI_SCALER_FUNCTION",
+    "RHI_COURSE_END",
 )
 # Each numeric variable, the field it fills and what the field is when the variable is unset (section 17).
 NUMERIC = {
@@ -118,6 +121,7 @@ def test_a_full_environment_gives_the_settings() -> None:
         heartbeat_table="heartbeats-of-the-test",
         pool_state_table="pool-state-of-the-test",
         scaler_function="scaler-of-the-test",
+        course_end=datetime.date(2027, 1, 15),
         body_limit_bytes=1048576,
         longest_request_seconds=900,
         keepalive_seconds=7,
@@ -279,6 +283,16 @@ def test_a_required_variable_left_out_raises_an_error_that_names_it(variable: st
         pytest.param("RHI_SCALER_FUNCTION", SECRET * 2, id="RHI_SCALER_FUNCTION-too-long"),
         pytest.param("RHI_SCALER_FUNCTION", f"{SECRET}.name", id="RHI_SCALER_FUNCTION-a-dot"),
         *(
+            pytest.param("RHI_COURSE_END", value, id=f"RHI_COURSE_END-{case}")
+            for case, value in (
+                ("no-such-day", "2027-02-30"),
+                ("one-digit-month", "2027-1-15"),
+                ("another-order", "15/01/2027"),
+                ("a-time", "2027-01-15T00:00:00"),
+                ("then-text", f"2027-01-15{SECRET}"),
+            )
+        ),
+        *(
             pytest.param(variable, value, id=f"{variable}-{case}")
             for variable in FLOORS
             for case, value in (
@@ -358,3 +372,7 @@ def test_the_tables_of_pools_must_agree_with_an_empty_pools_table_too() -> None:
     assert refusal({**empty, "RHI_DEFAULT_POOL": "mock"}).variable == "RHI_DEFAULT_POOL"
     assert refusal({**empty, "RHI_TARGET_GROUPS": FULL["RHI_TARGET_GROUPS"]}).variable == "RHI_TARGET_GROUPS"
     assert refusal({**empty, "RHI_POOL_SECRETS": FULL["RHI_POOL_SECRETS"]}).variable == "RHI_POOL_SECRETS"
+
+
+def test_the_course_end_is_the_date_the_deployment_wrote() -> None:
+    assert read_settings({**FULL, "RHI_COURSE_END": "2027-01-15"}).course_end == datetime.date(2027, 1, 15)

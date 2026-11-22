@@ -11,6 +11,7 @@ answer is recorded with the second it arrived.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -37,6 +38,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import Readiness
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 STUDENT = 4242
 ENGINE_TEXT = "engine-internal-detail-7f3a"
 MOCK = {
@@ -212,7 +215,7 @@ class Ledger(InMemoryLedger):
     """The in-memory ledger, recording each settlement."""
 
     def __init__(self) -> None:
-        super().__init__(clock=lambda: float(NOW))
+        super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.reservations = 0
         self.settled: list[tuple[int, int, bool]] = []
 

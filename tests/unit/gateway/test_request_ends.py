@@ -9,6 +9,7 @@ The client is driven over raw ASGI, so that it can leave in the middle of a stre
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -34,6 +35,8 @@ from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 STUDENT = 4242
 LIMIT = 1800
 ENGINE_TEXT = "engine-internal-detail-7f3a"
@@ -141,7 +144,7 @@ class Ledger(InMemoryLedger):
     """The in-memory ledger, recording each reservation and each settlement with what it charged."""
 
     def __init__(self) -> None:
-        super().__init__(clock=lambda: float(NOW))
+        super().__init__(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.reserved: list[Reservation] = []
         self.settled: list[tuple[int, int, bool, int | None]] = []
 

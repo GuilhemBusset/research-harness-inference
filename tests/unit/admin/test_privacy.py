@@ -179,7 +179,10 @@ def deployed(monkeypatch: pytest.MonkeyPatch) -> Iterator[Deployed]:
                 during_sleep.pop(0)()
 
         made = admin.privacy
-        admin = dataclasses.replace(admin, privacy=lambda: dataclasses.replace(made(), sleep=sleep))
+        # The course end the configuration in SSM would give.
+        admin = dataclasses.replace(
+            admin, privacy=lambda: dataclasses.replace(made(), sleep=sleep), course_end=lambda: COURSE_END
+        )
         for github_id, alias in ((OTTER, "otter"), (HERON, "heron")):
             admin_roster.add(github_id, alias, roster=roster, course_end=COURSE_END, now=ADDED)
         yield Deployed(admin, usage, stubs, sleeps, during_sleep)
@@ -200,7 +203,7 @@ def use(deployed: Deployed, github_id: int, alias: str, day: str, cookies: dict[
 
 def test_the_export_holds_the_student_s_data_and_no_key_and_no_hash(deployed: Deployed) -> None:
     keys = [issue(deployed, OTTER), issue(deployed, OTTER)]
-    admin_keys.revoke(OTTER, keys=deployed.admin.keys, now=NOW - 60)
+    admin_keys.revoke(OTTER, keys=deployed.admin.keys, course_end=COURSE_END, now=NOW - 60)
     keys.append(issue(deployed, OTTER))
     use(deployed, OTTER, "otter", "2027-01-14", {"mock": "AWSALB=cookie-of-otter"})
     use(deployed, OTTER, "otter", "2027-01-15")
@@ -282,7 +285,7 @@ def test_a_reservation_refused_at_midnight_after_an_erase_leaves_no_usage_row(de
         reads.append(midnight - 1 if not reads else midnight + 120)
         return reads[-1]
 
-    ledger = DynamoDBLedger(boto3.client("dynamodb"), deployed.usage.name, clock=clock)
+    ledger = DynamoDBLedger(boto3.client("dynamodb"), deployed.usage.name, course_end=COURSE_END, clock=clock)
     with pytest.raises(GatewayError):
         ledger.reserve(student, "late", b"{}", output_limit=10, hold_seconds=420, longest_request_seconds=1800)
     assert deployed.rows(OTTER) == []

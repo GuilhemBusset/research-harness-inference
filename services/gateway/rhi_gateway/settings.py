@@ -11,6 +11,7 @@ The deployment fills these variables in, and nothing else configures the gateway
 | `RHI_POOL_SECRETS` | Each pool's secret, as JSON from the pool's name to the secret's ARN; `{}` with no pool | required |
 | `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_HEARTBEAT_TABLE`, `RHI_POOL_STATE_TABLE` | The deployed tables' names | required |
 | `RHI_SCALER_FUNCTION` | The scaler function's name | required |
+| `RHI_COURSE_END` | The configuration's course end date, `YYYY-MM-DD`: every usage row the gateway writes expires 90 days after it (section 6.6) | required |
 | `RHI_BODY_LIMIT_BYTES` | The largest request body the filter reads, in bytes | 8388608 |
 | `RHI_LONGEST_REQUEST_SECONDS` | The longest a request may run | 1800 |
 | `RHI_KEEPALIVE_SECONDS` | The interval between the keep-alives of a held request | 10 |
@@ -57,6 +58,7 @@ message or an error chained to it: the task's log shows it.
 
 from __future__ import annotations
 
+import datetime
 import json
 import math
 import re
@@ -79,6 +81,7 @@ USAGE_TABLE = "RHI_USAGE_TABLE"
 HEARTBEAT_TABLE = "RHI_HEARTBEAT_TABLE"
 POOL_STATE_TABLE = "RHI_POOL_STATE_TABLE"
 SCALER_FUNCTION = "RHI_SCALER_FUNCTION"
+COURSE_END = "RHI_COURSE_END"
 BODY_LIMIT_BYTES = "RHI_BODY_LIMIT_BYTES"
 LONGEST_REQUEST_SECONDS = "RHI_LONGEST_REQUEST_SECONDS"
 KEEPALIVE_SECONDS = "RHI_KEEPALIVE_SECONDS"
@@ -100,6 +103,7 @@ REQUIRED = (
     HEARTBEAT_TABLE,
     POOL_STATE_TABLE,
     SCALER_FUNCTION,
+    COURSE_END,
 )
 
 # The numeric variables and what each is when unset (section 17).
@@ -131,6 +135,8 @@ _POOL_FIELDS = FIELDS | {"name"}
 # The names DynamoDB and Lambda accept, as their APIs document them.
 _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
 _FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+# A date as the deployment writes it, YYYY-MM-DD.
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 # An ARN's partition, service, region and account, then the resource of the one kind a variable holds.
 _ARN = r"arn:aws(?:-[a-z]+)*:{service}:[a-z0-9-]+:[0-9]{{12}}:{resource}"
 _TARGET_GROUP_ARN = re.compile(
@@ -165,6 +171,7 @@ class Settings:
     heartbeat_table: str
     pool_state_table: str
     scaler_function: str
+    course_end: datetime.date
     body_limit_bytes: int = NUMERIC_DEFAULTS[BODY_LIMIT_BYTES]
     longest_request_seconds: int = NUMERIC_DEFAULTS[LONGEST_REQUEST_SECONDS]
     keepalive_seconds: int = NUMERIC_DEFAULTS[KEEPALIVE_SECONDS]
@@ -216,6 +223,18 @@ def _function(environ: Mapping[str, str], variable: str) -> str:
     if _FUNCTION_NAME.fullmatch(value) is None:
         raise SettingsError(variable, "must be a function's name: 1 to 64 letters, digits, '_' and '-'")
     return value
+
+
+def _date(environ: Mapping[str, str], variable: str) -> datetime.date:
+    value = _required(environ, variable)
+    refusal = SettingsError(variable, "must be a date, written YYYY-MM-DD")
+    if _DATE.fullmatch(value) is None:
+        raise refusal
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        # The parser's own error quotes the text it was given.
+        raise refusal from None
 
 
 def _url(environ: Mapping[str, str], variable: str) -> str:
@@ -323,6 +342,7 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         heartbeat_table=_table(environ, HEARTBEAT_TABLE),
         pool_state_table=_table(environ, POOL_STATE_TABLE),
         scaler_function=_function(environ, SCALER_FUNCTION),
+        course_end=_date(environ, COURSE_END),
         body_limit_bytes=_number(environ, BODY_LIMIT_BYTES),
         longest_request_seconds=_number(environ, LONGEST_REQUEST_SECONDS),
         keepalive_seconds=_number(environ, KEEPALIVE_SECONDS),

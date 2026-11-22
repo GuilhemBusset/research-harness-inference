@@ -36,7 +36,7 @@ The admin CLI is run from the repository's root, with your own AWS credentials. 
 call it `rhi_admin`; define that name once in your shell:
 
 ```sh
-alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer uv run --locked --no-dev python -m rhi_admin.main'
+alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main'
 ```
 
 `rhi` is the students' CLI. Log in once with your own roster entry; the endpoint's address, here

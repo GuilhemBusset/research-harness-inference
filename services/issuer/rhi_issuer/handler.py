@@ -179,13 +179,14 @@ class Issuer:
         }
 
     def _revoke(self, event: Mapping[str, Any]) -> dict[str, object]:
-        revoke_key(_bearer_key(event), keys=self.keys, now=int(self.clock()))
+        revoke_key(_bearer_key(event), keys=self.keys, now=int(self.clock()), course_end=self.course_end)
         return {"revoked": 1}
 
     def _revoke_all(self, event: Mapping[str, Any]) -> dict[str, object]:
         device_code = _revoke_all_request(event)
         entry = redeem(device_code, client_id=self.client_id, roster=self.roster, github=self.github)
-        return {"revoked": revoke_all(entry.github_id, keys=self.keys, now=int(self.clock()))}
+        revoked = revoke_all(entry.github_id, keys=self.keys, now=int(self.clock()), course_end=self.course_end)
+        return {"revoked": revoked}
 
 
 @functools.cache

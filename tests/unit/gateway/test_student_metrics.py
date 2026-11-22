@@ -8,6 +8,7 @@ gateway's registry, as a scrape reads them. Every key is generated when the test
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import re
 import urllib.error
@@ -46,6 +47,8 @@ from rhi_gateway.waker import Waker
 
 ROOT = Path(__file__).resolve().parents[3]
 NOW = 1_800_000_000
+# The course end the ledger's rows expire by.
+COURSE_END_DATE = datetime.date(2027, 6, 30)
 POOL = {
     "engine": "mock",
     "instance_types": ["t3.small"],
@@ -126,7 +129,7 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
         )
         for alias, github_id, budget in students
     ]
-    ledger = InMemoryLedger(clock=lambda: float(NOW)) if ledger is None else ledger
+    ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW)) if ledger is None else ledger
     store = InMemoryKeyStore(*items)
     made = Gateway(Starlette(), metrics.Metrics(ledger, store), keys, Aws(), store=store)
 
@@ -446,7 +449,7 @@ def test_a_budget_that_cannot_be_read_leaves_the_counters_served() -> None:
         def tokens_left(self, student: Student) -> int:
             raise OSError("the table did not answer")
 
-    made = gateway(OTTER, ledger=Unread(clock=lambda: float(NOW)))
+    made = gateway(OTTER, ledger=Unread(course_end=COURSE_END_DATE, clock=lambda: float(NOW)))
     assert call(made.app, "GET", "/v1/models", key=made.keys["otter"]) == 200
     assert value(made.metrics, REQUESTS, alias="otter", pool="") == 1
     assert samples(made.metrics, metrics.BUDGET_LEFT) == []
