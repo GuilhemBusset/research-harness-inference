@@ -25,7 +25,7 @@ dependencies = [
     "constructs==10.8.1",
     "cdk-nag==3.0.2",
     "boto3[crt]==1.43.126",
-    "grafana-foundation-sdk==0.0.22",
+    "grafana-foundation-sdk==1769699998!10.1.0",
 ]
 
 # Exact pins, shared with the vendored implement loop (tools/implementation-loop/UPSTREAM.md) so
