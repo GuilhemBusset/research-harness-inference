@@ -227,3 +227,47 @@ protected paths, and `loop.toml` and `config.py` are on the safety surface.
 The run directory holds full prompts and answers, which include issue text and file contents. It
 stays on the machine; only what the engine publishes (comments, pull request bodies, fault
 issues) reaches GitHub.
+
+## What sends issues back for another build
+
+`tools/implementation-loop/round_report.py` reads a run's `events.jsonl` and counts the failed
+rounds of the issues merged in an inclusive range of pull requests, by what triggered each round:
+examination (split by before or from the fourth examination since the latest plan, and by whether
+a ledger verdict was unmet), verification that reproduced an open finding, a protected-path
+refusal, a rejected request, or `unknown`. An issue's rounds count up to its first merge in the
+range. A round the journal cannot attribute (an older engine wrote fewer fields, or the trigger was
+something else, such as a failed check or a red `required` check) is `unknown`. The command only
+reads the journal and prints fixed labels and counts, never text from the journal, so its output
+can be quoted. The journal itself holds agent-supplied text and stays on the machine.
+
+To compare runs, report the same range on each run's journal, the current one and an archived
+one, and diff the two outputs line by line (run from the main checkout):
+
+```sh
+runs="$(git rev-parse --path-format=absolute --git-common-dir)/implementation-loop"
+report() { python3 tools/implementation-loop/round_report.py --journal "$1/events.jsonl" --from "$2" --to "$3"; }
+diff <(report "$runs/issue-<root>.archived-<time>" 531 559) <(report "$runs/issue-<root>" <first> <last>)
+```
+
+Each run merges different pull requests, so give each the range of its own merges; compare the
+proportions of the triggers, not raw counts, when the ranges differ in size.
+
+When examination is the largest category, look at which of its four lines dominates before
+reading anything:
+
+- **Ledger verdict unmet**: the examiner judged an item not delivered. Read the issue's `examined`
+  events (`unmet`, `findings`, `examination`) and the examiner's answers under `calls/`: if the
+  builder's plan read the item differently from the examiner, the issue text is ambiguous and is
+  the thing to edit.
+- **From the fourth examination, no ledger verdict unmet**: past the examiner bound (ADR 0001,
+  amendment 12), only a finding that names a safety invariant, or one an earlier examination
+  raised and that is still open, sends the build back. Read the `examined` events' `findings` and
+  `bounded`, the findings in the issue's state in `state.json`, and the follow-up issues the bound
+  filed: findings carried over from early examinations, or new ones that name an invariant, show
+  which rule kept the issue going.
+- **Before the fourth examination**: each round's findings are in the `examined` event and in
+  `state.json`. Findings that close and are replaced by new ones every round point at the examiner
+  or at an issue that invites edge cases; a finding the builder did not fix shows instead under
+  `verification, open finding reproduced`.
+
+Quote only the counts in an issue or a pull request, never what the journal or a call says.
