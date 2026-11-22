@@ -26,13 +26,11 @@ KEY = StudentKey(
     issued_at=NOW,
     expires_at=COURSE_END,
     revoked_at=NOW + 60,
-    daily_token_budget=2_000_000,
     concurrency_limit=4,
 )
 ROSTER = RosterEntry(
     github_id=4242,
     alias="otter",
-    daily_token_budget=2_000_000,
     concurrency_limit=4,
     added_at=NOW - 86400,
     expires_at=COURSE_END + 90 * 86400,
@@ -41,12 +39,8 @@ USAGE = UsageDay(
     github_id=4242,
     day="2027-01-15",
     alias="otter",
-    tokens=150_000,
     expires_at=COURSE_END + 90 * 86400,
-    leases={
-        "req-1": Lease(tokens=40_000, estimate=32_000, expires=NOW + 1800),
-        "req-2": Lease(tokens=9_000, estimate=1_000, expires=NOW + 1900),
-    },
+    leases={"req-1": Lease(expires=NOW + 1800), "req-2": Lease(expires=NOW + 1900)},
     affinity_cookies={"coursework": "opaque-cookie", "upgrade": "another-opaque-cookie"},
     rebalance_applied={"coursework": 7},
 )
@@ -62,22 +56,22 @@ LISTED: dict[type, set[str]] = {
         "issued_at",
         "expires_at",
         "revoked_at",
-        "daily_token_budget",
         "concurrency_limit",
     },
-    RosterEntry: {"github_id", "alias", "daily_token_budget", "concurrency_limit", "added_at", "expires_at"},
+    RosterEntry: {"github_id", "alias", "concurrency_limit", "added_at", "expires_at"},
     UsageDay: {
         "github_id",
         "day",
         "alias",
-        "tokens",
         "leases",
         "expires_at",
         "affinity_cookies",
         "rebalance_applied",
     },
 }
-LEASE = {"tokens", "estimate", "expires"}
+LEASE = {"expires"}
+# What items an earlier release wrote can still hold, and no item is written with any more.
+BUDGET = {"daily_token_budget", "tokens", "estimate"}
 
 
 def as_read(item: Mapping[str, object]) -> dict[str, object]:
@@ -110,10 +104,9 @@ def unlisted(item: Mapping[str, object], listed: set[str]) -> set[str]:
             issued_at=NOW,
             expires_at=COURSE_END,
             revoked_at=None,
-            daily_token_budget=0,
             concurrency_limit=1,
         ),
-        UsageDay(github_id=7, day="2027-01-16", alias="heron", tokens=0, expires_at=COURSE_END),
+        UsageDay(github_id=7, day="2027-01-16", alias="heron", expires_at=COURSE_END),
     ],
 )
 def test_each_item_survives_a_round_trip(record: StudentKey | RosterEntry | UsageDay) -> None:
@@ -133,23 +126,34 @@ def test_a_key_item_without_a_required_attribute_is_refused(name: str) -> None:
         StudentKey.from_item(item)
 
 
-def without(item: Mapping[str, object], *names: str) -> dict[str, object]:
-    return {name: value for name, value in item.items() if name not in names}
+def written_names(item: Mapping[str, object]) -> set[str]:
+    """Every attribute of an item, a lease's too."""
+    leases = item.get("leases", {})
+    assert isinstance(leases, Mapping)
+    return set(item) | {name for lease in leases.values() for name in lease}
 
 
-def test_items_without_the_token_budget_s_attributes_read_back_and_are_written_with_them() -> None:
-    key = StudentKey.from_item(as_read(without(KEY.to_item(), "daily_token_budget")))
-    roster = RosterEntry.from_item(as_read(without(ROSTER.to_item(), "daily_token_budget")))
-    lease = {"req-1": without(USAGE.leases["req-1"].to_map(), "tokens", "estimate")}
-    day = UsageDay.from_item(as_read({**without(USAGE.to_item(), "tokens"), "leases": lease}))
-
-    assert (key.daily_token_budget, key.concurrency_limit) == (0, KEY.concurrency_limit)
-    assert (roster.daily_token_budget, roster.concurrency_limit) == (0, ROSTER.concurrency_limit)
-    assert (day.tokens, day.leases) == (0, {"req-1": Lease(tokens=0, estimate=0, expires=NOW + 1800)})
-    # A task of the release before reads all four: each item is still written with them.
-    assert key.to_item()["daily_token_budget"] == roster.to_item()["daily_token_budget"] == 0
-    assert day.to_item()["tokens"] == 0
-    assert day.to_item()["leases"] == {"req-1": {"tokens": 0, "estimate": 0, "expires": NOW + 1800}}
+def test_items_an_earlier_release_wrote_with_the_token_budget_read_as_without_it() -> None:
+    # Each item as the release before wrote it: a key's and an entry's budget, a day's tokens and
+    # its leases' tokens and estimate, as boto3 gives them back.
+    old_lease = {"tokens": 40_000, "estimate": 32_000}
+    old: list[tuple[StudentKey | RosterEntry | UsageDay, Mapping[str, object]]] = [
+        (KEY, {**KEY.to_item(), "daily_token_budget": 100_000_000}),
+        (ROSTER, {**ROSTER.to_item(), "daily_token_budget": 0}),
+        (
+            USAGE,
+            {
+                **USAGE.to_item(),
+                "tokens": 150_000,
+                "leases": {request: {**lease.to_map(), **old_lease} for request, lease in USAGE.leases.items()},
+            },
+        ),
+    ]
+    for record, item in old:
+        read = type(record).from_item(as_read(item))
+        assert read == record
+        assert not written_names(read.to_item()) & BUDGET
+    assert Lease.from_map(as_read({"expires": NOW, **old_lease})) == Lease(expires=NOW)
 
 
 def test_a_key_in_clear_is_refused_as_a_key_hash() -> None:
@@ -164,7 +168,7 @@ def test_an_absent_optional_attribute_is_not_written() -> None:
     bare = StudentKey.from_item({**KEY.to_item(), "installation": None, "revoked_at": None}).to_item()
     assert "installation" not in bare
     assert "revoked_at" not in bare
-    first_day = UsageDay(github_id=7, day="2027-01-16", alias="heron", tokens=0, expires_at=COURSE_END).to_item()
+    first_day = UsageDay(github_id=7, day="2027-01-16", alias="heron", expires_at=COURSE_END).to_item()
     assert first_day["leases"] == {}
     assert "affinity_cookies" not in first_day
     assert "rebalance_applied" not in first_day
@@ -173,9 +177,7 @@ def test_an_absent_optional_attribute_is_not_written() -> None:
 def test_a_day_of_usage_reads_back_its_two_leases() -> None:
     read = UsageDay.from_item(as_read(USAGE.to_item()))
     assert set(read.leases) == {"req-1", "req-2"}
-    first, second = read.leases["req-1"], read.leases["req-2"]
-    assert (first.tokens, first.estimate, first.expires) == (40_000, 32_000, NOW + 1800)
-    assert (second.tokens, second.estimate, second.expires) == (9_000, 1_000, NOW + 1900)
+    assert (read.leases["req-1"].expires, read.leases["req-2"].expires) == (NOW + 1800, NOW + 1900)
 
 
 def test_a_day_of_usage_reads_back_each_pool_s_cookie() -> None:
@@ -212,9 +214,10 @@ def test_a_day_of_usage_reads_back_each_pool_s_rebalance_number() -> None:
     [
         ("day", "2027-02-30"),
         ("day", "20270115"),
-        ("tokens", Decimal("1.5")),
+        ("expires_at", Decimal("1.5")),
         ("github_id", "4242"),
         ("leases", {"req-1": {"tokens": 1, "estimate": 1}}),
+        ("leases", {"req-1": {"expires": "soon"}}),
         ("leases", {"req-1": 40_000}),
         ("leases", ["req-1"]),
         ("affinity_cookies", {"coursework": 7}),

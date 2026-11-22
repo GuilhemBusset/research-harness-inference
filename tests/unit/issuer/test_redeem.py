@@ -42,16 +42,17 @@ USER_PATH = "/user"
 # What the stub says in its own words, which no answer of the issuer's may repeat.
 MARKER = "said-by-the-stub " + secrets.token_hex(8)
 
-# Two students whose budgets and limits differ from each other and from the defaults.
+# Two students whose limits differ from each other and from the default.
 OTTER = RosterEntry(
     github_id=4242,
     alias="otter",
-    daily_token_budget=3_000_000,
     concurrency_limit=3,
     added_at=NOW - 86400,
     expires_at=EXPIRES_AT + 90 * 86400,
 )
-HERON = dataclasses.replace(OTTER, github_id=5151, alias="heron", daily_token_budget=7_000_000, concurrency_limit=2)
+HERON = dataclasses.replace(OTTER, github_id=5151, alias="heron", concurrency_limit=2)
+# What the release before wrote on a roster entry, and this release ignores.
+WRITTEN_BEFORE = {HERON.github_id: {"daily_token_budget": 7_000_000}}
 
 
 class Stub:
@@ -177,7 +178,7 @@ def tables(monkeypatch: pytest.MonkeyPatch) -> Iterator[Tables]:
         dynamodb = boto3.resource("dynamodb")
         tables = Tables(_create(dynamodb, ROSTER), _create(dynamodb, KEYS))
         for entry in (OTTER, HERON):
-            tables.roster.put_item(Item=entry.to_item())
+            tables.roster.put_item(Item={**entry.to_item(), **WRITTEN_BEFORE.get(entry.github_id, {})})
         yield tables
 
 
@@ -380,8 +381,9 @@ def test_the_key_carries_the_roster_limits(
     item = tables.keys.get_item(Key={"key_hash": key_hash(answer["key"])})["Item"]
     stored = StudentKey.from_item(item)
     assert stored.alias == student.alias
-    assert stored.daily_token_budget == student.daily_token_budget
     assert stored.concurrency_limit == student.concurrency_limit
+    # No budget, even from an entry the release before wrote with one.
+    assert "daily_token_budget" not in item
     # The expiry is the course end the function was given, and the answer says the same.
     assert stored.expires_at == EXPIRES_AT == answer["expires_at"]
     assert stored.revoked_at is None

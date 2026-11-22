@@ -8,16 +8,15 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import pytest
 
 from rhi_admin import main
 from rhi_admin import roster as admin_roster
 from rhi_admin.canary import CANARY_ALIAS, CANARY_GITHUB_ID, CANARY_SECRET
 from rhi_common.keys import is_valid_key, key_hash
 from rhi_common.students import RosterEntry, StudentKey
-
-if TYPE_CHECKING:
-    import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 NOW = 1_800_000_000
@@ -41,16 +40,17 @@ def student_keys(admin: main.Admin, github_id: int) -> list[StudentKey]:
 
 def test_an_entry_is_added_listed_and_removed(admin: main.Admin, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli(admin, capsys, "roster", "add", str(OTTER), "otter")[0] == 0
-    assert cli(admin, capsys, "roster", "add", str(HERON), "heron", "--budget", "0", "--limit", "2")[0] == 0
-    # Without numbers, the defaults; a budget of 0 is kept.
+    assert cli(admin, capsys, "roster", "add", str(HERON), "heron", "--limit", "2")[0] == 0
+    # Without a limit, the default; there is no budget to give.
     # The roster's other items, under negative keys, are its aliases' own.
     entries = {item["github_id"]: RosterEntry.from_item(item) for item in items(admin.roster) if item["github_id"] >= 0}
-    assert (entries[OTTER].daily_token_budget, entries[OTTER].concurrency_limit) == (100_000_000, 4)
-    assert (entries[HERON].daily_token_budget, entries[HERON].concurrency_limit) == (0, 2)
+    assert (entries[OTTER].concurrency_limit, entries[HERON].concurrency_limit) == (4, 2)
+    assert all("daily_token_budget" not in item for item in items(admin.roster))
     code, listed = cli(admin, capsys, "roster", "list")
     assert code == 0
-    assert re.search(rf"^{OTTER}\totter\t100000000\t4$", listed, re.MULTILINE)
-    assert re.search(rf"^{HERON}\theron\t0\t2$", listed, re.MULTILINE)
+    assert re.search(rf"^{OTTER}\totter\t4$", listed, re.MULTILINE)
+    assert re.search(rf"^{HERON}\theron\t2$", listed, re.MULTILINE)
+    assert "budget" not in listed
     # A second entry for the ID, or the alias of another student, is refused.
     assert cli(admin, capsys, "roster", "add", str(OTTER), "stoat")[0] == 1
     assert cli(admin, capsys, "roster", "add", "6161", "otter")[0] == 1
@@ -96,7 +96,7 @@ def test_two_entries_added_at_once_are_never_given_one_alias(
 def test_a_directly_issued_key_verifies_and_is_stored_as_its_sha256_only(
     admin: main.Admin, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli(admin, capsys, "roster", "add", str(OTTER), "otter", "--budget", "7000000", "--limit", "3")
+    cli(admin, capsys, "roster", "add", str(OTTER), "otter", "--limit", "3")
 
     code, printed = cli(admin, capsys, "key", "issue", str(OTTER))
 
@@ -106,7 +106,8 @@ def test_a_directly_issued_key_verifies_and_is_stored_as_its_sha256_only(
     (item,) = items(admin.keys)
     record = StudentKey.from_item(item)
     assert record.key_hash == key_hash(key)
-    assert (record.alias, record.daily_token_budget, record.concurrency_limit) == ("otter", 7_000_000, 3)
+    assert (record.alias, record.concurrency_limit) == ("otter", 3)
+    assert "daily_token_budget" not in item
     assert record.installation is None
     assert record.revoked_at is None
     assert key not in json.dumps(items(admin.keys) + items(admin.roster), default=str)
@@ -115,7 +116,7 @@ def test_a_directly_issued_key_verifies_and_is_stored_as_its_sha256_only(
     assert student_keys(admin, OTTER)[0].revoked_at == NOW
 
 
-def test_a_budget_change_reaches_the_keys(admin: main.Admin, capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_limit_change_reaches_the_keys(admin: main.Admin, capsys: pytest.CaptureFixture[str]) -> None:
     cli(admin, capsys, "roster", "add", str(OTTER), "otter")
     cli(admin, capsys, "roster", "add", str(HERON), "heron")
     issued = [cli(admin, capsys, "key", "issue", str(OTTER))[1].strip() for _ in range(3)]
@@ -127,19 +128,42 @@ def test_a_budget_change_reaches_the_keys(admin: main.Admin, capsys: pytest.Capt
         ExpressionAttributeValues={":now": NOW - 60},
     )
 
-    assert cli(admin, capsys, "roster", "set", str(OTTER), "--budget", "250000", "--limit", "1")[0] == 0
+    # A change needs a limit.
+    assert cli(admin, capsys, "roster", "set", str(OTTER))[0] == 1
+    assert cli(admin, capsys, "roster", "set", str(OTTER), "--limit", "1")[0] == 0
 
     roster_item = admin.roster.get_item(Key={"github_id": OTTER})["Item"]
-    assert (roster_item["daily_token_budget"], roster_item["concurrency_limit"]) == (250_000, 1)
+    assert roster_item["concurrency_limit"] == 1
     by_hash = {record.key_hash: record for record in student_keys(admin, OTTER)}
     for key in issued[1:]:
-        assert (by_hash[key_hash(key)].daily_token_budget, by_hash[key_hash(key)].concurrency_limit) == (250_000, 1)
-    assert (by_hash[key_hash(revoked)].daily_token_budget, by_hash[key_hash(revoked)].concurrency_limit) == (
-        100_000_000,
-        4,
+        assert by_hash[key_hash(key)].concurrency_limit == 1
+    assert by_hash[key_hash(revoked)].concurrency_limit == 4
+    # Another student's key is left alone, and no item is given a budget.
+    assert student_keys(admin, HERON)[0].concurrency_limit == 4
+    assert all("daily_token_budget" not in item for item in items(admin.keys) + items(admin.roster))
+
+
+def test_an_entry_the_release_before_wrote_with_a_budget_is_listed_and_issued_a_key_without_it(
+    admin: main.Admin, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli(admin, capsys, "roster", "add", str(OTTER), "otter", "--limit", "3")
+    admin.roster.update_item(
+        Key={"github_id": OTTER},
+        UpdateExpression="SET daily_token_budget = :budget",
+        ExpressionAttributeValues={":budget": 0},
     )
-    # Another student's key is left alone.
-    assert student_keys(admin, HERON)[0].daily_token_budget == 100_000_000
+
+    code, listed = cli(admin, capsys, "roster", "list")
+    assert code == 0 and re.search(rf"^{OTTER}\totter\t3$", listed, re.MULTILINE)
+    assert cli(admin, capsys, "key", "issue", str(OTTER))[0] == 0
+    (item,) = items(admin.keys)
+    assert (StudentKey.from_item(item).concurrency_limit, "daily_token_budget" in item) == (3, False)
+
+
+def test_the_roster_commands_take_no_budget() -> None:
+    for argv in (["roster", "add", str(OTTER), "otter", "--budget", "5"], ["roster", "set", str(OTTER), "--budget", "5"]):
+        with pytest.raises(SystemExit):
+            main.parser().parse_args(argv)
 
 
 def test_the_canary_key_is_never_printed(admin: main.Admin, capsys: pytest.CaptureFixture[str]) -> None:

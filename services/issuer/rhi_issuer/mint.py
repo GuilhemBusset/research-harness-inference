@@ -3,8 +3,8 @@
 `mint` makes a key in the format of `rhi_common.keys` and the item it is stored as, a
 `rhi_common.students.StudentKey`, under the key's SHA-256: the key itself is in what `mint`
 returns and nowhere else, neither in a table nor in a log, and this module logs nothing. The item
-carries the alias, the daily token budget and the concurrency limit of the student's roster entry
-as they are when the key is minted, so that the gateway answers a request with one read of the
+carries the alias and the concurrency limit of the student's roster entry as they are when the
+key is minted, so that the gateway answers a request with one read of the
 keys table and never reads the roster. `mint` writes nothing: `rhi_issuer.rules` decides whether
 the key may be issued and stores it.
 
@@ -70,7 +70,6 @@ def mint(entry: RosterEntry, installation: str, *, course_end: datetime.date, no
         issued_at=now,
         expires_at=expiry(course_end),
         revoked_at=None,
-        daily_token_budget=entry.daily_token_budget,
         concurrency_limit=entry.concurrency_limit,
     )
     return key, record

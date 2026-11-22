@@ -128,7 +128,6 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
             issued_at=NOW - 3600,
             expires_at=NOW + 86400,
             revoked_at=None,
-            daily_token_budget=0,
             concurrency_limit=limit,
         )
         for alias, github_id, limit in students
@@ -307,7 +306,6 @@ def test_a_student_given_a_new_key_is_counted_on() -> None:
         installation=None,
         issued_at=NOW,
         expires_at=NOW + 86_400,
-        daily_token_budget=0,
         concurrency_limit=limit,
         revoked_at=None,
     )

@@ -1,9 +1,8 @@
 """The DynamoDB ledger of `rhi_gateway.budget`, against moto (section 6.2, step 3).
 
 moto evaluates the condition of a write in process, so these tests show the expressions the
-ledger sends: the reservation's, the settlement's, and the one that removes expired leases. Every
-student here has a key whose daily budget is 0: no budget takes part in a reservation. The
-table is created with the key schema of `rhi_common.tables.USAGE`. Nothing here reaches AWS: the
+ledger sends: the reservation's, the settlement's, and the one that removes expired leases. No
+budget takes part in a reservation: a key has none. The table is created with the key schema of `rhi_common.tables.USAGE`. Nothing here reaches AWS: the
 credentials and the region are placeholders that moto never checks.
 """
 
@@ -101,7 +100,6 @@ def student(*, limit: int = 4) -> StudentKey:
         issued_at=NOON - 86_400,
         expires_at=COURSE_END,
         revoked_at=None,
-        daily_token_budget=0,
         concurrency_limit=limit,
     )
 
@@ -124,8 +122,21 @@ def refusal(ledger: DynamoDBLedger, who: StudentKey, request: str) -> Cause:
 
 def written(day: str = "2026-11-15") -> UsageDay:
     """The student's item of a day, read with the table resource, as the other components read it."""
+    return UsageDay.from_item(stored(day))
+
+
+def stored(day: str = "2026-11-15") -> dict[str, Any]:
+    """The student's item of a day as the table holds it, attributes no record reads included."""
     table = boto3.resource("dynamodb").Table(TABLE)
-    return UsageDay.from_item(table.get_item(Key={"github_id": 7, "day": day}, ConsistentRead=True)["Item"])
+    return table.get_item(Key={"github_id": 7, "day": day}, ConsistentRead=True)["Item"]
+
+
+def by_the_release_before(day: UsageDay, tokens: int = 0, *, lease_tokens: int = 0, estimate: int = 0) -> dict[str, Any]:
+    """A day's item as the release before wrote it: the day's tokens, and each lease's tokens and estimate."""
+    item: dict[str, Any] = dict(day.to_item())
+    leases: dict[str, Any] = item["leases"]
+    item["leases"] = {request: {**lease, "tokens": lease_tokens, "estimate": estimate} for request, lease in leases.items()}
+    return {**item, "tokens": tokens}
 
 
 def test_fifty_reservations_from_parallel_threads_against_a_limit_of_ten_admit_ten(client: Calls) -> None:
@@ -146,33 +157,30 @@ def test_fifty_reservations_from_parallel_threads_against_a_limit_of_ten_admit_t
     admitted = [answer for answer in answers if isinstance(answer, Reservation)]
     assert len(admitted) == 10
     assert answers.count(Cause.CONCURRENCY_LIMIT) == 40
-    record = written()
-    assert record.tokens == 0
-    assert record.leases == {reservation.request_id: reservation.lease for reservation in admitted}
+    assert "tokens" not in stored()
+    assert written().leases == {reservation.request_id: reservation.lease for reservation in admitted}
 
 
 def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> None:
     ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
     who = student()
 
-    # The student's first request of the day writes the item whole, with tokens 0 for the day and
-    # tokens and estimate 0 for the lease.
+    # The student's first request of the day writes the item whole: no tokens for the day, and a
+    # lease of its expiry alone.
     first = reserve(ledger, who, "request-1")
-    lease = Lease(tokens=0, estimate=0, expires=NOON + 2280)
+    lease = Lease(expires=NOON + 2280)
     assert first == Reservation(github_id=7, day="2026-11-15", request_id="request-1", lease=lease)
     assert written() == UsageDay(
         github_id=7,
         day="2026-11-15",
         alias="student-07",
-        tokens=0,
         expires_at=retention.expires_at(COURSE_END_DATE),
         leases={"request-1": lease},
     )
-    # The release before reads these attributes and refuses an item that lacks one, so they are
-    # checked as stored, not through the reader of this release, which takes a missing one as 0.
-    stored_lease = {"tokens": {"N": "0"}, "estimate": {"N": "0"}, "expires": {"N": str(NOON + 2280)}}
+    # Checked as stored, not through the reader, which ignores what it does not read.
+    stored_lease = {"expires": {"N": str(NOON + 2280)}}
     item = client.get_item(TableName=TABLE, Key=KEY)["Item"]
-    assert item.get("tokens") == {"N": "0"}
+    assert "tokens" not in item
     assert item["leases"]["M"]["request-1"]["M"] == stored_lease
 
     # From then on a request is two calls, and each is a write.
@@ -187,8 +195,8 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
     # A settlement frees the slot and charges nothing, and settles once.
     assert ledger.settle(first) is True
     assert ledger.settle(first) is False
-    record = written()
-    assert (record.tokens, record.leases) == (0, {})
+    assert written().leases == {}
+    assert "tokens" not in stored()
 
 
 def test_the_two_writes_of_a_request_carry_the_cookie_of_its_pool(client: Calls) -> None:
@@ -250,7 +258,7 @@ def test_the_first_cookies_of_requests_in_flight_each_cost_one_settlement_call(c
     assert client.made == ["update_item"] * 3
     record = written()
     assert record.affinity_cookies == {"coursework": "coursework-2", "upgrade": "upgrade-1"}
-    assert (record.tokens, record.leases) == (0, {})
+    assert record.leases == {}
 
 
 def test_the_first_cookies_of_two_requests_in_flight_are_both_kept(client: Calls) -> None:
@@ -358,7 +366,7 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
     ledger.withdraw(reserve(ledger, student(), "withdrawn"))
     assert set(written().leases) == {"held"}
 
-    # So do tokens a gateway task of the release before added to the day, during a rollout.
+    # So do tokens other than 0, which only an earlier release can have added to the day.
     boto3.resource("dynamodb").Table(TABLE).update_item(
         Key={"github_id": 7, "day": "2026-11-15"},
         UpdateExpression="ADD tokens :charge",
@@ -366,11 +374,11 @@ def test_a_withdrawal_deletes_the_day_only_when_nothing_else_is_left_in_it(clien
     )
     assert ledger.settle(held) is True
     ledger.withdraw(reserve(ledger, student(), "withdrawn-again"))
-    assert (written().tokens, written().leases) == (1000, {})
+    assert (stored()["tokens"], written().leases) == (1000, {})
 
 
 @pytest.mark.parametrize("kind", ["memory", "dynamodb"])
-def test_a_withdrawal_keeps_what_a_settlement_stored_even_at_no_tokens(client: Calls, kind: str) -> None:
+def test_a_withdrawal_keeps_what_a_settlement_stored(client: Calls, kind: str) -> None:
     ledger = (
         InMemoryLedger(course_end=COURSE_END_DATE, clock=Clock())
         if kind == "memory"
@@ -403,7 +411,7 @@ def test_a_withdrawal_keeps_a_settlement_that_stored_again_what_the_day_carried(
     assert (completed.cookie, completed.rebalance_applied) == ("held", 7)
     # The day before changes after today's opening carried from it.
     ledger.settle(prior_day_turn, cookie="other", rebalance_number=8)
-    # Today's request stores, at no tokens, the very cookie and number its day carried.
+    # Today's request stores the very cookie and number its day carried.
     assert ledger.settle(completed, cookie="held", rebalance_number=7) is True
 
     ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
@@ -417,14 +425,14 @@ def test_a_withdrawal_keeps_a_settlement_from_a_draining_gateway(client: Calls) 
     opening = reserve(ledger, student(), "opening", pool="coursework")
     completed = reserve(ledger, student(), "completed", pool="coursework")
     # During a rollout, an older task settles a request into a day a newer task opened. It writes
-    # only the attributes it knows.
+    # only the attributes it knows, and adds the lease's tokens back, 0, to the day's.
     boto3.resource("dynamodb").Table(TABLE).update_item(
         Key={"github_id": 7, "day": completed.day},
         UpdateExpression=(
             "REMOVE leases.completed ADD tokens :delta "
             "SET affinity_cookies.coursework = :cookie, rebalance_applied.coursework = :number"
         ),
-        ExpressionAttributeValues={":delta": -completed.lease.tokens, ":cookie": "kept-cookie", ":number": 7},
+        ExpressionAttributeValues={":delta": 0, ":cookie": "kept-cookie", ":number": 7},
     )
 
     ledger.withdraw(opening)
@@ -439,12 +447,11 @@ def test_a_withdrawal_keeps_a_zero_token_day_written_without_what_its_opening_ca
         7,
         "2026-11-15",
         "student-07",
-        tokens=0,
         expires_at=COURSE_END,
         affinity_cookies={"coursework": "kept-cookie"},
         rebalance_applied={"coursework": 7},
     )
-    boto3.resource("dynamodb").Table(TABLE).put_item(Item=day.to_item())
+    boto3.resource("dynamodb").Table(TABLE).put_item(Item=by_the_release_before(day))
     ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
 
     ledger.withdraw(reserve(ledger, student(), "withdrawn", pool="coursework"))
@@ -462,9 +469,8 @@ def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
         7,
         "2026-11-14",
         "student-07",
-        tokens=5,
         expires_at=COURSE_END,
-        leases={"running": Lease(tokens=10, estimate=10, expires=NOON + 600)},
+        leases={"running": Lease(expires=NOON + 600)},
         affinity_cookies={"coursework": "AWSALB=cookie-of-yesterday"},
         rebalance_applied={"coursework": 3},
     )
@@ -472,7 +478,7 @@ def test_withdrawals_delete_a_day_left_with_only_what_its_opening_carried(
     delete = client.delete_item
     monkeypatch.setattr(client, "delete_item", lambda **request: deletes.append(request) or delete(**request))
     for order in (["opener"], ["opener", "other"], ["other", "opener"]):
-        table.put_item(Item=before.to_item())
+        table.put_item(Item=by_the_release_before(before, 5, lease_tokens=10, estimate=10))
         held = {"opener": reserve(ledger, student(), "opener", pool="coursework")}
         # The day before goes once the opening has read it, as the admin's erase deletes it.
         table.delete_item(Key={"github_id": 7, "day": "2026-11-14"})
@@ -503,8 +509,7 @@ def test_the_refusals_and_the_slot_an_end_frees(client: Calls) -> None:
 
     # The limit the key's lookup gives is the one counted, whatever the day already holds.
     reserve(ledger, student(limit=5), "request-7")
-    record = written()
-    assert (record.tokens, len(record.leases)) == (0, 5)
+    assert len(written().leases) == 5
     with pytest.raises(ValueError, match="already"):
         reserve(ledger, who, "request-7")
 
@@ -526,16 +531,14 @@ def test_an_expired_lease_frees_its_slot(client: Calls) -> None:
     client.made.clear()
     third = reserve(ledger, who, "request-3")
     assert client.made == ["update_item", "update_item"]  # the one refused, then the one written
-    record = written()
-    assert (record.tokens, set(record.leases)) == (0, {"request-2", "request-3"})
+    assert set(written().leases) == {"request-2", "request-3"}
     assert ledger.settle(first) is False
 
     # A settlement that comes after the expiry removes the lease as any settlement does.
     clock.now = NOON + 2281
     assert ledger.settle(second) is True
     assert ledger.settle(third) is True
-    record = written()
-    assert (record.tokens, record.leases) == (0, {})
+    assert written().leases == {}
 
 
 def test_leases_the_release_before_wrote_are_settled_and_swept_and_the_day_s_tokens_kept(
@@ -543,33 +546,31 @@ def test_leases_the_release_before_wrote_are_settled_and_swept_and_the_day_s_tok
 ) -> None:
     # A task of the release before reserved its estimate and output limit in each lease, and the
     # day's tokens hold them; one lease is still running and one has expired.
-    running = Lease(tokens=1500, estimate=1000, expires=NOON + 600)
-    expired = Lease(tokens=800, estimate=300, expires=NOON - 1)
+    running = Lease(expires=NOON + 600)
     day = UsageDay(
         7,
         "2026-11-15",
         "student-07",
-        tokens=2300,
         expires_at=COURSE_END,
-        leases={"old-running": running, "old-expired": expired},
+        leases={"old-running": running, "old-expired": Lease(expires=NOON - 1)},
     )
-    boto3.resource("dynamodb").Table(TABLE).put_item(Item=day.to_item())
+    item = by_the_release_before(day, 2300, lease_tokens=1500, estimate=1000)
+    boto3.resource("dynamodb").Table(TABLE).put_item(Item=item)
     ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
 
     # At the limit of two, the reservation sweeps the expired lease to take its slot.
     reservation = reserve(ledger, student(limit=2), "request-1")
     record = written()
-    assert (record.tokens, set(record.leases)) == (2300, {"old-running", "request-1"})
-    assert record.leases["request-1"] == Lease(tokens=0, estimate=0, expires=NOON + 2280)
+    assert (stored()["tokens"], set(record.leases)) == (2300, {"old-running", "request-1"})
+    assert stored()["leases"]["request-1"] == {"expires": NOON + 2280}
 
     # The running one is settled like any other: its slot is freed and nothing is charged or given back.
     assert ledger.settle(Reservation(7, "2026-11-15", "old-running", running)) is True
     assert ledger.settle(reservation) is True
-    record = written()
-    assert (record.tokens, record.leases) == (2300, {})
+    assert (stored()["tokens"], written().leases) == (2300, {})
 
 
-def test_the_stand_ins_a_day_s_opening_and_its_confirmation_write_hold_tokens_and_estimate_0(client: Calls) -> None:
+def test_the_stand_ins_a_day_s_opening_and_its_confirmation_write_hold_only_their_expiry(client: Calls) -> None:
     # Just after midnight, the day before holds a lease of the release before, with its tokens and estimate.
     midnight = NOON - 43_200
     table = boto3.resource("dynamodb").Table(TABLE)
@@ -577,25 +578,19 @@ def test_the_stand_ins_a_day_s_opening_and_its_confirmation_write_hold_tokens_an
         7,
         "2026-11-14",
         "student-07",
-        tokens=2500,
         expires_at=COURSE_END,
-        leases={"running": Lease(tokens=1500, estimate=1000, expires=midnight + 600)},
+        leases={"running": Lease(expires=midnight + 600)},
     )
-    table.put_item(Item=before.to_item())
+    table.put_item(Item=by_the_release_before(before, 2500, lease_tokens=1500, estimate=1000))
     ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock(midnight + 1))
 
     def stored_stand_in(request: str) -> dict[str, Any]:
         item = client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)["Item"]
         return item["leases"]["M"][f"2026-11-14/{request}"]["M"]
 
-    # The opening writes the day whole, with a stand-in for the running lease; the release before
-    # reads both attributes of each lease, so they are checked as stored.
+    # The opening writes the day whole, with a stand-in for the running lease, checked as stored.
     reserve(ledger, student(), "opener")
-    assert stored_stand_in("running") == {
-        "tokens": {"N": "0"},
-        "estimate": {"N": "0"},
-        "expires": {"N": str(midnight + 600)},
-    }
+    assert stored_stand_in("running") == {"expires": {"N": str(midnight + 600)}}
 
     # A lease of the day before written after that opening read it: the next reservation's write
     # confirms the day and adds its stand-in.
@@ -603,15 +598,52 @@ def test_the_stand_ins_a_day_s_opening_and_its_confirmation_write_hold_tokens_an
         Key={"github_id": 7, "day": "2026-11-14"},
         UpdateExpression="SET leases.#late = :lease",
         ExpressionAttributeNames={"#late": "late"},
-        ExpressionAttributeValues={":lease": Lease(tokens=900, estimate=400, expires=midnight + 700).to_map()},
+        ExpressionAttributeValues={":lease": {"tokens": 900, "estimate": 400, "expires": midnight + 700}},
     )
     reserve(ledger, student(), "follower")
-    assert stored_stand_in("late") == {
-        "tokens": {"N": "0"},
-        "estimate": {"N": "0"},
-        "expires": {"N": str(midnight + 700)},
-    }
+    assert stored_stand_in("late") == {"expires": {"N": str(midnight + 700)}}
     assert set(written().leases) == {"2026-11-14/running", "2026-11-14/late", "opener", "follower"}
+
+
+@pytest.mark.parametrize("release", ["before", "this"])
+def test_a_reservation_a_settlement_and_a_withdrawal_on_a_day_of_either_release(client: Calls, release: str) -> None:
+    # A day opened just now, with a stand-in for a request of the day before and the record of what
+    # its opening carried, and a request in flight. The release before wrote the day's tokens, 0,
+    # and each lease's tokens and estimate; this release writes none of them.
+    day = UsageDay(
+        7,
+        "2026-11-15",
+        "student-07",
+        expires_at=COURSE_END,
+        leases={"2026-11-14/running": Lease(expires=NOON + 600), "in-flight": Lease(expires=NOON + 900)},
+    )
+    yesterday = UsageDay(7, "2026-11-14", "student-07", expires_at=COURSE_END, leases={"running": Lease(NOON + 600)})
+
+    def shaped(written_day: UsageDay) -> dict[str, Any]:
+        if release == "before":
+            return by_the_release_before(written_day, lease_tokens=1500, estimate=1000)
+        return dict(written_day.to_item())
+
+    table = boto3.resource("dynamodb").Table(TABLE)
+    table.put_item(Item=shaped(yesterday))
+    table.put_item(Item={**shaped(day), "carried_maps": {"affinity_cookies": {}, "rebalance_applied": {}}})
+    tokens = stored().get("tokens")
+    ledger = DynamoDBLedger(client, TABLE, course_end=COURSE_END_DATE, clock=Clock())
+
+    # The reservation counts the leases of either shape against the limit, and writes its expiry alone.
+    reservation = reserve(ledger, student(limit=3), "request-1")
+    assert refusal(ledger, student(limit=3), "request-2") is Cause.CONCURRENCY_LIMIT
+    assert stored()["leases"]["request-1"] == {"expires": NOON + 2280}
+
+    # The settlements remove the leases, and leave the day's tokens as they were.
+    assert ledger.settle(Reservation(7, "2026-11-15", "in-flight", Lease(expires=NOON + 900))) is True
+    assert ledger.settle(reservation) is True
+    assert set(written().leases) == {"2026-11-14/running"}
+    assert stored().get("tokens") == tokens
+
+    # Left with only what its opening carried, the day goes with a withdrawal, in either shape.
+    ledger.withdraw(reserve(ledger, student(limit=3), "withdrawn"))
+    assert "Item" not in client.get_item(TableName=TABLE, Key=KEY, ConsistentRead=True)
 
 
 class Paused:

@@ -165,7 +165,6 @@ def issue_key() -> str:
         issued_at=now - 60,
         expires_at=now + 86_400,
         revoked_at=None,
-        daily_token_budget=1_000_000,
         concurrency_limit=2,
     ).to_item()
     boto3.resource("dynamodb").Table(TABLES["RHI_KEYS_TABLE"][1]).put_item(Item=item)

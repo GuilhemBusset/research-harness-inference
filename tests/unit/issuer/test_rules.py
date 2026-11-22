@@ -31,7 +31,6 @@ DAY_END = NOW - NOW % 86400 + 86400
 STUDENT = RosterEntry(
     github_id=4242,
     alias="otter",
-    daily_token_budget=3_000_000,
     concurrency_limit=3,
     added_at=NOW - 86400,
     expires_at=expiry(COURSE_END) + 86400,
@@ -84,6 +83,7 @@ def test_a_second_login_from_the_same_installation_leaves_it_one_active_key(keys
 
     assert first != second
     assert active(keys, laptop) == [key_hash(second)]
+    assert all("daily_token_budget" not in item for item in keys.scan()["Items"])
     (old,) = [record for record in stored(keys) if record.key_hash == key_hash(first)]
     assert old.revoked_at == NOW + 60
 

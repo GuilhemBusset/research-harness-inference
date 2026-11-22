@@ -36,7 +36,6 @@ def issued(key: str, *, expires_at: int = COURSE_END, revoked_at: int | None = N
         issued_at=NOW - 3600,
         expires_at=expires_at,
         revoked_at=revoked_at,
-        daily_token_budget=2_000_000,
         concurrency_limit=4,
     )
 
@@ -45,7 +44,6 @@ def issued(key: str, *, expires_at: int = COURSE_END, revoked_at: int | None = N
 RECORD = KeyRecord(
     github_id=4242,
     alias="otter",
-    daily_token_budget=2_000_000,
     concurrency_limit=4,
     expires_at=COURSE_END,
     revoked=False,
@@ -99,6 +97,14 @@ def test_a_key_item_is_read_back(table: Any) -> None:
     table.put_item(Item=issued(key).to_item())
 
     assert DynamoKeyStore(table).lookup(key_hash(key)) == RECORD
+
+
+def test_a_key_item_the_release_before_wrote_with_a_budget_is_read_back_without_it(table: Any) -> None:
+    key = generate_key()
+    table.put_item(Item={**issued(key).to_item(), "daily_token_budget": 2_000_000})
+    record = DynamoKeyStore(table).lookup(key_hash(key))
+    assert record == RECORD
+    assert not hasattr(record, "daily_token_budget")
 
 
 def test_a_lookup_is_one_read_of_the_keys_table(table: Any) -> None:
