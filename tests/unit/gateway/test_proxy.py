@@ -120,7 +120,8 @@ class Upstream:
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())
 
 
-def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
+def gateway(upstream: Upstream, store: InMemoryKeyStore | None = None) -> tuple[Starlette, str, InMemoryLedger]:
+    """The gateway of one student, whose key item is put in `store` (a new store when none is given)."""
     key = generate_key()
     item = StudentKey(
         key_hash=key_hash(key),
@@ -133,6 +134,8 @@ def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
         daily_token_budget=2_000_000,
         concurrency_limit=4,
     )
+    store = InMemoryKeyStore() if store is None else store
+    store.put(item)
     ledger = InMemoryLedger(clock=lambda: float(NOW))
     filters = {
         routes.MESSAGES: BodyFilter(messages.MESSAGES, POOLS),
@@ -142,7 +145,7 @@ def gateway(upstream: Upstream) -> tuple[Starlette, str, InMemoryLedger]:
     }
     client = proxy.upstream_client(httpx.MockTransport(upstream))
     forwarding = Forwarding(
-        authenticator=Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW)),
+        authenticator=Authenticator(store, wall_clock=lambda: float(NOW)),
         ledger=ledger,
         filters=filters,
         proxy=proxy.Proxy(client, UPSTREAM, SECRETS),
@@ -195,6 +198,21 @@ def test_a_chat_client_that_did_not_ask_for_usage_is_settled_without_seeing_it()
     day = ledger.day(STUDENT, utc_day(NOW))
     assert day is not None
     assert (day.tokens, day.leases) == (39, {})
+
+
+def test_a_key_revoked_while_the_body_arrives_reserves_nothing() -> None:
+    upstream, store = Upstream(), InMemoryKeyStore()
+    app, key, ledger = gateway(upstream, store)
+
+    async def body() -> AsyncIterator[bytes]:
+        # The key was accepted from the headers; it is revoked (or its student erased) before the body comes.
+        store.revoke(key_hash(key), at=NOW)
+        yield json.dumps(CASES[routes.MESSAGES][0]).encode()
+
+    response = call(app, lambda client: client.post("/v1/messages", content=body(), headers={"x-api-key": key}))
+
+    assert response.status_code == 401
+    assert (ledger.day(STUDENT, utc_day(NOW)), upstream.seen) == (None, [])
 
 
 def test_each_chunk_reaches_the_client_before_the_next_one_is_sent() -> None:

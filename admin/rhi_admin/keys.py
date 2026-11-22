@@ -3,7 +3,8 @@
 GitHub confirms at most 50 device codes an hour per app, so an admin command that issues a key
 without a login is the fallback. The key is the same item a login stores (`rhi_common.students`):
 its SHA-256 and no clear key, the roster entry's alias, budget and limit, no installation, and the
-course end as its expiry. `issue` returns the key, which the command line prints once; it is in
+course end as its expiry. The key is written only while the student's entry is still on the
+roster, so an erase that runs between the read of the entry and the write leaves no key. `issue` returns the key, which the command line prints once; it is in
 no table and no log. `revoke` revokes every key of a student, as `rhi revoke --all` does, whether
 or not the student is still on the roster.
 """
@@ -18,7 +19,7 @@ from botocore.exceptions import ClientError
 from rhi_admin.roster import AdminError, get
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.students import StudentKey
-from rhi_common.tables import KEYS
+from rhi_common.tables import KEYS, ROSTER
 from rhi_issuer.mint import expiry
 from rhi_issuer.revoke import revoke_all
 
@@ -40,15 +41,31 @@ def issue(github_id: int, *, roster: Any, keys: Any, course_end: datetime.date, 
         daily_token_budget=entry.daily_token_budget,
         concurrency_limit=entry.concurrency_limit,
     )
+    put = {
+        "TableName": keys.name,
+        "Item": record.to_item(),
+        # Never over an item that is there: two keys do not share a SHA-256.
+        "ConditionExpression": "attribute_not_exists(#hash)",
+        "ExpressionAttributeNames": {"#hash": KEYS.partition_key.name},
+    }
+    # The entry read above may be erased before the key is written: the write holds only while
+    # the entry is still there, so an erase that ran in between leaves no key behind.
+    still_listed = {
+        "TableName": roster.name,
+        "Key": {ROSTER.partition_key.name: entry.github_id},
+        "ConditionExpression": "attribute_exists(#id)",
+        "ExpressionAttributeNames": {"#id": ROSTER.partition_key.name},
+    }
     try:
-        keys.put_item(
-            Item=record.to_item(),
-            # Never over an item that is there: two keys do not share a SHA-256.
-            ConditionExpression="attribute_not_exists(#hash)",
-            ExpressionAttributeNames={"#hash": KEYS.partition_key.name},
-        )
+        # The table resource's client, which takes the item's values as the table resource does.
+        keys.meta.client.transact_write_items(TransactItems=[{"ConditionCheck": still_listed}, {"Put": put}])
     except ClientError as error:
-        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+        if error.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+            raise
+        reasons = [reason.get("Code") for reason in error.response.get("CancellationReasons") or []]
+        if reasons[:1] == ["ConditionalCheckFailed"]:
+            raise AdminError("that GitHub ID is not on the roster") from None
+        if reasons[1:2] == ["ConditionalCheckFailed"]:
             raise AdminError("the new key collided with a stored one: issue it again") from None
         raise
     return key

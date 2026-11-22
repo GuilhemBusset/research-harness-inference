@@ -8,19 +8,27 @@ labelled with that alias.
 `export` gathers all of it as one JSON document: the entry, each key's issue, expiry and
 revocation times (no key and no SHA-256), the usage rows, the log records whose `alias` is the
 student's, and the samples of every series labelled with the alias, read day by day over the
-workspace's 90 days.
+workspace's 90 days. An alias is free again once its entry is erased, and another student may then
+be given it while the records and samples of the first are still kept: so the export reads the log
+records and the samples written since the entry was added, and none from before.
 
 `erase` deletes what can be deleted: the keys, revoked first, the usage rows and the roster entry.
-Two writers may still be at work when it starts, and its order leaves neither a row behind:
+Logins, a `key issue` and the gateway's requests may still be at work when it starts, and its
+order leaves none of them a row behind:
 
 1. The roster entry goes first: a login that reads the roster from then on gets no key.
+   The admin's own `key issue` writes a key only while the entry is there (`rhi_admin.keys`).
 2. Every key is revoked. A login that read the entry a moment before can still store a key until
    the issuer's function times out, so after `ISSUER_SECONDS` every key is revoked again.
-3. The gateway accepts a key from its cache for 60 seconds after its revocation, and a request it
-   accepts writes the student's usage row. After `GATEWAY_SECONDS` more, no task accepts any key
-   of the student; a settlement writes only to a row that holds its lease, so it creates none.
+3. The gateway reads the key again, past its cache, right before a request reserves, which is the
+   write that makes a usage row (`rhi_gateway.auth.Authenticator.confirm`); a settlement writes
+   only to a row that holds its lease, so it creates none. `GATEWAY_SECONDS` outwaits a
+   reservation whose read came before the revocation, and the gateway's 60-second cache.
 4. Then every key item, the issuer's lock of the student and every usage row are deleted, each
    read with a consistent read, and a last read confirms that none is left.
+
+At its next scrape, the gateway stops serving the series of a student whose key it last accepted
+is gone (`rhi_gateway.metrics`), so no sample is written under the alias after the erase.
 
 Managed Prometheus has no call that deletes series, and CloudWatch Logs none that deletes one
 record. With the entry gone the alias names nobody, and those series and records expire with
@@ -45,6 +53,7 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
 from rhi_admin.roster import AdminError, get
+from rhi_common.students import RosterEntry
 from rhi_common.tables import KEYS, ROSTER, USAGE
 from rhi_issuer.revoke import revoke_all
 from rhi_issuer.rules import every_key, lock_key
@@ -146,12 +155,17 @@ def _usage_rows(github_id: int, usage: Any) -> Iterator[dict[str, Any]]:
         query["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
-def _log_records(alias: str, stores: Stores, now: int) -> list[dict[str, Any]]:
-    """The gateway's log records whose `alias` is that one, over the log group's retention."""
+def _since(entry: RosterEntry, now: int) -> int:
+    """When the export starts reading the alias's telemetry: the entry's addition, within the retention."""
+    return max(entry.added_at, now - RETENTION_DAYS * 86_400)
+
+
+def _log_records(alias: str, stores: Stores, since: int, now: int) -> list[dict[str, Any]]:
+    """The gateway's log records whose `alias` is that one, written from `since` on."""
     request: dict[str, Any] = {
         "logGroupName": stores.log_group,
         "filterPattern": f"{{ $.alias = {json.dumps(alias)} }}",
-        "startTime": (now - RETENTION_DAYS * 86_400) * 1000,
+        "startTime": since * 1000,
         "endTime": (now + 1) * 1000,
     }
     records: list[dict[str, Any]] = []
@@ -171,16 +185,17 @@ def _log_records(alias: str, stores: Stores, now: int) -> list[dict[str, Any]]:
         request["nextToken"] = token
 
 
-def _series(alias: str, query: Query, now: int) -> list[dict[str, Any]]:
-    """The samples of every series labelled with the alias, over the workspace's retention, by series."""
+def _series(alias: str, query: Query, since: int, now: int) -> list[dict[str, Any]]:
+    """The samples of every series labelled with the alias, written from `since` on, by series."""
     selector = f"{{alias={json.dumps(alias)}}}[{WINDOW_SECONDS}s]"
     found: dict[tuple[tuple[str, str], ...], dict[float, str]] = {}
-    for end in range(now - (RETENTION_DAYS - 1) * WINDOW_SECONDS, now + 1, WINDOW_SECONDS):
+    # Each query reads the day that ends at `end`, from now back to the day that holds `since`.
+    for end in range(now, since - WINDOW_SECONDS, -WINDOW_SECONDS):
         for result in query(selector, float(end)):
             labels = tuple(sorted((result.get("metric") or {}).items()))
-            samples = found.setdefault(labels, {})
             for at, value in result.get("values") or []:
-                samples[float(at)] = value
+                if float(at) >= since:
+                    found.setdefault(labels, {})[float(at)] = value
     return [
         {"labels": dict(labels), "values": [[at, samples[at]] for at in sorted(samples)]}
         for labels, samples in sorted(found.items())
@@ -200,8 +215,8 @@ def export(github_id: int, *, roster: Any, keys: Any, stores: Stores, now: int) 
             for record in sorted(every_key(github_id, keys), key=lambda record: record.issued_at)
         ],
         "usage": [_plain(item) for item in _usage_rows(github_id, stores.usage)],
-        "logs": _log_records(entry.alias, stores, now),
-        "series": _series(entry.alias, stores.query, now),
+        "logs": _log_records(entry.alias, stores, _since(entry, now), now),
+        "series": _series(entry.alias, stores.query, _since(entry, now), now),
     }
 
 
@@ -220,17 +235,24 @@ def _sweep(github_id: int, keys: Any, usage: Any) -> tuple[int, int]:
     return deleted_keys, rows
 
 
+def _any_left(github_id: int, keys: Any, usage: Any) -> bool:
+    """Whether a key item, the issuer's lock or a usage row of the student is still there."""
+    if every_key(github_id, keys) or next(_usage_rows(github_id, usage), None) is not None:
+        return True
+    return "Item" in keys.get_item(Key=lock_key(github_id), ConsistentRead=True)
+
+
 def erase(
     github_id: int, *, roster: Any, keys: Any, stores: Stores, now: int, say: Callable[[str], None] = lambda _: None
 ) -> Erased:
     """Deletes the student's entry, keys and usage rows, in the order of this module's docstring.
 
     An erase that was interrupted can be run again: without the entry, it deletes what is left.
-    Refused when there is neither an entry nor a key nor a usage row of that GitHub ID.
+    Refused when there is no row of that GitHub ID at all: no entry, no key, no lock, no usage row.
     """
     old = roster.delete_item(Key={ROSTER.partition_key.name: github_id}, ReturnValues="ALL_OLD").get("Attributes")
     alias = str(old["alias"]) if old and "alias" in old else None
-    if not old and not every_key(github_id, keys) and next(_usage_rows(github_id, stores.usage), None) is None:
+    if not old and not _any_left(github_id, keys, stores.usage):
         raise AdminError("that GitHub ID has no roster entry, no key and no usage row")
     revoke_all(github_id, keys=keys, now=now)
     say(
@@ -241,7 +263,7 @@ def erase(
     revoke_all(github_id, keys=keys, now=now + ISSUER_SECONDS)
     stores.sleep(GATEWAY_SECONDS)
     deleted_keys, rows = _sweep(github_id, keys, stores.usage)
-    if every_key(github_id, keys) or next(_usage_rows(github_id, stores.usage), None) is not None:
+    if _any_left(github_id, keys, stores.usage):
         raise AdminError("rows of the student were written during the erase: run it again")
     return Erased(entry=bool(old), alias=alias, keys=deleted_keys, usage_rows=rows)
 

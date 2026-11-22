@@ -16,7 +16,9 @@ is reserved for the proxy's own time limit, so that the two cannot differ.
 
 The reservation is made once the body is read and filtered, because it needs what only the body
 gives: the estimate of the input, the request's output limit, and the pool, whose hold sets how
-long the lease lasts. It is still made before anything is sent to the engine. It names the pool,
+long the lease lasts. It is still made before anything is sent to the engine, and right after the
+key is read once more past the cache (`rhi_gateway.auth.Authenticator.confirm`), so that a key
+revoked or erased while the body arrived reserves nothing. It names the pool,
 and returns the load balancer's cookie the student's record holds for it: the proxy sends that
 cookie, and the settlement stores the one the request ended with (`rhi_gateway.affinity`). It
 returns the last rebalance number the record has applied for the pool as well: the request is
@@ -519,6 +521,8 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
                 held = _Held(
                     holding, forwarded.pool, entry.wire_format or WireFormat.MESSAGES, streams=_streams(forwarded)
                 )
+            # The body may have taken long: the key is read again before anything is written of the student.
+            student = await forwarding.authenticator.confirm(student)
             reservation = await run_in_threadpool(
                 forwarding.ledger.reserve,
                 student,

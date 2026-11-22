@@ -34,6 +34,8 @@ from rhi_issuer import rules
 
 REPO = Path(__file__).resolve().parents[3]
 NOW = 1_800_000_000
+# When the two students were put on the roster: their telemetry is read from then on.
+ADDED = NOW - 30 * 86_400
 COURSE_END = datetime.date(2027, 6, 30)
 OTTER, HERON = 4242, 5151
 WORKSPACE = "arn:aws:aps:us-east-1:123456789012:workspace/ws-example"
@@ -177,7 +179,7 @@ def deployed(monkeypatch: pytest.MonkeyPatch) -> Iterator[Deployed]:
         made = admin.privacy
         admin = dataclasses.replace(admin, privacy=lambda: dataclasses.replace(made(), sleep=sleep))
         for github_id, alias in ((OTTER, "otter"), (HERON, "heron")):
-            admin_roster.add(github_id, alias, roster=roster, course_end=COURSE_END, now=NOW - 86_400)
+            admin_roster.add(github_id, alias, roster=roster, course_end=COURSE_END, now=ADDED)
         yield Deployed(admin, usage, stubs, sleeps, during_sleep)
         for stub in stubs.values():
             stub.deactivate()
@@ -205,7 +207,7 @@ def test_the_export_holds_the_student_s_data_and_no_key_and_no_hash(deployed: De
     expected = {
         "logGroupName": LOG_GROUP,
         "filterPattern": '{ $.alias = "otter" }',
-        "startTime": (NOW - 90 * 86_400) * 1000,
+        "startTime": ADDED * 1000,
         "endTime": (NOW + 1) * 1000,
     }
     deployed.stubs["logs"].add_response("filter_log_events", {"events": events[:1], "nextToken": "more"}, expected)
@@ -263,6 +265,53 @@ def test_after_an_erase_no_table_holds_a_row_of_the_student_and_no_key_verifies(
     for named in ("workspace's series", "gateway's log records", "load balancers' access logs", "WAF's logs"):
         assert named in retention
     assert "3 key(s)" in printed and "2 usage row(s)" in printed
+
+
+def test_an_alias_given_again_exports_nothing_of_its_former_student(deployed: Deployed) -> None:
+    assert deployed.run("erase", str(OTTER))[0] == 0
+    admin_roster.add(6060, "otter", roster=deployed.admin.roster, course_end=COURSE_END, now=NOW)
+    # The former otter's records and samples are all older than the new entry: none is read.
+    expected = {
+        "logGroupName": LOG_GROUP,
+        "filterPattern": '{ $.alias = "otter" }',
+        "startTime": NOW * 1000,
+        "endTime": (NOW + 1) * 1000,
+    }
+    deployed.stubs["logs"].add_response("filter_log_events", {"events": []}, expected)
+
+    status, printed = deployed.run("export", "6060")
+
+    assert status == 0
+    document = json.loads(printed)
+    assert (document["entry"]["github_id"], document["logs"], document["series"]) == (6060, [], [])
+
+
+def test_a_key_issue_that_read_the_entry_before_an_erase_leaves_no_key(deployed: Deployed) -> None:
+    erased: list[int] = []
+
+    def erase_first(**_: Any) -> None:
+        # The erase runs to its end between the command's read of the entry and its write of the key.
+        if not erased:
+            erased.append(deployed.run("erase", str(OTTER))[0])
+
+    deployed.admin.keys.meta.client.meta.events.register("before-call.dynamodb.TransactWriteItems", erase_first)
+    out = io.StringIO()
+    admin = dataclasses.replace(deployed.admin, course_end=lambda: COURSE_END)
+
+    status = main.run(["key", "issue", str(OTTER)], admin, now=NOW, out=out, err=out)
+
+    assert (erased, status) == ([0], 1)
+    assert deployed.rows(OTTER) == []
+
+
+def test_an_erase_run_again_removes_a_login_s_lock_left_alone(deployed: Deployed) -> None:
+    deployed.admin.roster.delete_item(Key={"github_id": OTTER})
+    deployed.admin.keys.put_item(Item={**rules.lock_key(OTTER), "locked_at": NOW, "holder": "a-login"})
+
+    status, printed = deployed.run("erase", str(OTTER))
+
+    assert status == 0, printed
+    assert deployed.rows(OTTER) == []
 
 
 def test_the_usage_table_and_the_workspace_are_found_by_their_pinned_logical_ids() -> None:

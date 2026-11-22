@@ -53,7 +53,7 @@ from rhi_common.causes import Cause
 from rhi_gateway.routes import match
 
 if TYPE_CHECKING:
-    from rhi_gateway.budget import Student
+    from rhi_gateway.keystore import KeyRecord
 
 # The cause of an answer that names none of `rhi_common.causes`: a fault of the gateway itself.
 NO_CAUSE = "none"
@@ -78,7 +78,7 @@ class RequestRecord:
     latency_ms: int = 0
     status: int | None = None
     cause: str | None = None
-    student: Student | None = field(default=None, repr=False)
+    student: KeyRecord | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -97,7 +97,7 @@ class RequestRecord:
 _CURRENT: ContextVar[RequestRecord | None] = ContextVar("rhi_gateway_request_record", default=None)
 
 
-def note_student(student: Student) -> None:
+def note_student(student: KeyRecord) -> None:
     """The request's student, once the key is accepted. The log names the alias: never the GitHub ID."""
     record = _CURRENT.get()
     if record is not None:

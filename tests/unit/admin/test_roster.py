@@ -142,4 +142,5 @@ def test_the_tables_are_found_by_their_pinned_logical_ids() -> None:
     source = "".join(path.read_text() for path in (REPO / "admin/rhi_admin").glob("*.py"))
     assert re.search(r"\b\d{12}\b", source) is None
     assert re.search(r"\b(?:us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d\b", source) is None
-    assert "TableName" not in source
+    # A table's name comes from its resource (`table.name`), never from a literal.
+    assert re.search(r"""TableName["']?\s*[:=]\s*f?["']""", source) is None

@@ -105,6 +105,7 @@ class Gateway:
     aws: Aws
     # The usage the engine reports for the next request: input and output tokens.
     usage: list[int] = field(default_factory=lambda: [5000, 7])
+    store: InMemoryKeyStore = field(default_factory=InMemoryKeyStore)
 
 
 def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
@@ -124,7 +125,8 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
         for alias, github_id, budget in students
     ]
     ledger = InMemoryLedger(clock=lambda: float(NOW)) if ledger is None else ledger
-    made = Gateway(Starlette(), metrics.Metrics(ledger), keys, Aws())
+    store = InMemoryKeyStore(*items)
+    made = Gateway(Starlette(), metrics.Metrics(ledger, store), keys, Aws(), store=store)
 
     def engine(request: httpx.Request) -> httpx.Response:
         # One answer every forwarded route reads as whole, with the usage under each format's names.
@@ -137,7 +139,7 @@ def gateway(*students: tuple[str, int, int], ledger: Any = None) -> Gateway:
         }
         return httpx.Response(200, json={"type": "message", "input_tokens": used_in, "usage": usage})
 
-    authenticator = Authenticator(InMemoryKeyStore(*items), wall_clock=lambda: float(NOW))
+    authenticator = Authenticator(store, wall_clock=lambda: float(NOW))
     ready = lambda: {pool.name: PoolView(ready=True) for pool in POOLS}
     forwarding = Forwarding(
         authenticator=authenticator,
@@ -252,6 +254,21 @@ def test_two_students_are_counted_apart(capsys: pytest.CaptureFixture[str]) -> N
     # The log says the same of each request as the counters do.
     logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert sum(record["input_tokens"] for record in logged) == 5000 + 1200 + 800 + 40
+
+
+def test_a_student_whose_key_is_gone_is_served_no_more() -> None:
+    made = gateway(OTTER, HERON)
+    for alias in ("otter", "heron"):
+        assert call(made.app, "POST", "/v1/messages", key=made.keys[alias], body=body(routes.MESSAGES)) == 200
+    assert value(made.metrics, REQUESTS, alias="otter", pool="coursework") == 1
+
+    # The admin erases otter: the key is revoked, then deleted. No request of otter comes after.
+    made.store.revoke(key_hash(made.keys["otter"]), at=NOW)
+
+    # From the next scrape on, nothing is served under the alias, so its samples age out.
+    for _ in range(2):
+        assert {sample.labels.get("alias") for sample in samples(made.metrics)} - {None, ""} == {"heron"}
+    assert value(made.metrics, metrics.BUDGET_LEFT, alias="heron") is not None
 
 
 def test_students_are_aliases() -> None:
