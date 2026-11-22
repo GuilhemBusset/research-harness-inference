@@ -33,14 +33,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rhi_common.pool_config import PoolConfigError, parse_pools
-from rhi_common.records import Mode
+from rhi_common.records import CONFIGURED_MODE
 from rhi_scaler.aws_io import PoolSettings, TableNames
 
 SETTINGS_VARIABLE = "RHI_SCALER_SETTINGS"
 REGION_VARIABLE = "AWS_REGION"
-
-# The mode a pool is in before anybody writes one, by its `wake`.
-_CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 
 
 class SettingsError(ValueError):
@@ -86,7 +83,7 @@ def _pool(name: str, value: object) -> PoolSettings:
         config=config,
         group=_text(value, "group", where),
         target_group=_text(value, "target_group", where),
-        configured_mode=_CONFIGURED_MODE[config.wake],
+        configured_mode=CONFIGURED_MODE[config.wake],
     )
 
 

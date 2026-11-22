@@ -253,3 +253,13 @@ def test_the_stage_reaches_the_function_and_nothing_else_may_invoke_it(app: cdk.
             "SourceArn": {"Fn::GetAtt": [rule_id, "Arn"]},
         }
     ]
+
+
+def test_the_admin_finds_the_function_and_the_pool_state_table_by_their_logical_ids(app: cdk.App) -> None:
+    from rhi_admin import main
+
+    stack = app.node.find_child("Rhi").pools  # ty: ignore[unresolved-attribute]
+    assert stack.stack_name == main.POOLS_STACK_NAME
+    function = stack.resolve(stack.get_logical_id(stack.scaler.function.node.default_child))
+    table = stack.resolve(stack.get_logical_id(stack.tables.by_name["pool-state"].node.default_child))
+    assert (function, table) == (main.SCALER_FUNCTION_LOGICAL_ID, main.POOL_STATE_LOGICAL_ID)

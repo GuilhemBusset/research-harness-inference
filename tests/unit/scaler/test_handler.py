@@ -16,7 +16,7 @@ from botocore.stub import ANY, Stubber
 
 from rhi_common.records import GatewayHeartbeat
 from rhi_scaler import handler as scaler
-from rhi_scaler.aws_io import Clients, memory_to_item
+from rhi_scaler.aws_io import Clients, memory_to_item, memory_update
 from rhi_scaler.metrics import DECISIONS, GAUGES, DecisionCounts, RemoteWriter, decode
 from rhi_scaler.model import Memory, Reason
 from rhi_scaler.settings import read_settings
@@ -106,9 +106,11 @@ class Edge:
             }
             self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
 
-    def expect_writes(self, note: dict[str, Any], memory: dict[str, Any] | None) -> None:
-        for item in (note, memory):
-            self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": ANY if item is None else serialize(item)})
+    def expect_writes(self, note: dict[str, Any], memory: Memory | None) -> None:
+        """The note put whole, then the memory of a pool that had none updated to `memory`."""
+        self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
+        update = None if memory is None else memory_update("pool-state-table", "mock", Memory(), memory)
+        self.dynamodb.add_response("update_item", {}, update)
 
     def queue_first_run(self) -> None:
         """A pool at zero, a request held: one instance asked for, and the memory stored."""
@@ -117,7 +119,7 @@ class Edge:
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
         stored = Memory(last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1)
-        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, memory_to_item("mock", stored))
+        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, stored)
 
 
 @pytest.fixture
