@@ -29,6 +29,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from typing import Any
 
 import pytest
 
+from rhi_gateway.readiness import INTERVAL_SECONDS
 from rhi_reporter.report import build_report, statuses_of
 
 SMOKE = Path(__file__).resolve().parent
@@ -121,11 +123,32 @@ class FirstStream:
     after: str
 
 
-@pytest.fixture(scope="module")
-def first_stream(stack: Any) -> FirstStream:
+# How long the pool's state may take to read the same on every gateway task. A deployed stack runs
+# several, the load balancer may send a status read to another task than the one that served the
+# stream, and each task's view of the pool is up to one readiness cycle old.
+SETTLE_SECONDS = 2 * INTERVAL_SECONDS
+
+
+def settled(read: Callable[[], str], expected: str, within: float = SETTLE_SECONDS) -> str:
+    """What `read` gives once it gives `expected`, or what it gives after `within` seconds."""
+    deadline = time.monotonic() + within
+    state = read()
+    while state != expected and time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = read()
+    return state
+
+
+def first_stream_of(stack: Any) -> FirstStream:
+    """The first stream, and the pool's state before it and once every gateway task reads it ready."""
     before = stack.pool_state()
     stream = stack.stream("/v1/messages", messages_body(stack.pool))
-    return FirstStream(before=before, stream=stream, after=stack.pool_state())
+    return FirstStream(before=before, stream=stream, after=settled(stack.pool_state, "ready"))
+
+
+@pytest.fixture(scope="module")
+def first_stream(stack: Any) -> FirstStream:
+    return first_stream_of(stack)
 
 
 # --- What both stacks answer ---------------------------------------------------------------------
@@ -327,6 +350,25 @@ def test_deployed_tests_need_an_endpoint() -> None:
     # A node's ID is its file's path, `::`, its function and, in brackets, its parameters.
     collected = {node.partition("[")[0].rpartition("/")[2] for node, _ in collect(DEPLOYED, endpoint=True)}
     assert collected == defined
+
+
+@pytest.mark.smoke_id("first-stream-settles")
+def test_the_state_after_the_first_stream_is_read_until_every_gateway_task_reads_it_ready() -> None:
+    # On a deployed stack the read after the stream may reach another gateway task, still warming.
+    class Lagging:
+        pool = "mock"
+
+        def __init__(self) -> None:
+            self.states = iter(["cold", "warming", "ready"])
+
+        def pool_state(self) -> str:
+            return next(self.states)
+
+        def stream(self, path: str, body: Mapping[str, Any]) -> str:
+            return "the stream"
+
+    first = first_stream_of(Lagging())
+    assert (first.before, first.stream, first.after) == ("cold", "the stream", "ready")
 
 
 @pytest.mark.smoke_id("environment")
