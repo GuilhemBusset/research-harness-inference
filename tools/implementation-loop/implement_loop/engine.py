@@ -1932,8 +1932,10 @@ class Engine:
         """The pull request's body for `head`, whose examination section names the head the
         examiner examined when `head` carries its certificate."""
         carried = self._carried_note(st, head)
-        return report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other,
-                                     examination=f"Built by {self.op}. {carried}" if carried else None)
+        # `examination` is passed only for a carried certificate: a head the examiner examined
+        # renders the body exactly as before, through the same call as before.
+        extra = {"examination": f"Built by {self.op}. {carried}"} if carried else {}
+        return report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other, **extra)
 
     def _render_evidence(self, n: int, records: list[dict], head: str, verdicts: dict) -> str:
         """The evidence comment of issue `n` for `head`, naming the head the examiner examined
