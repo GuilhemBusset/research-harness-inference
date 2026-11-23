@@ -305,6 +305,7 @@ class Scraped:
         return float(number) / (1000 if unit == "ms" else 1)
 
     def read_samples(self, query: str, *, at: float) -> list[common.Series]:
+        refuse_anchored(query)
         left = at - self._range(query)
         found = []
         for name, labels, samples in self._held(query):
@@ -532,9 +533,13 @@ def test_a_counter_scraped_only_before_the_run_counts_nothing_not_zero() -> None
 def test_the_job_sends_the_workspace_no_query_with_the_anchored_modifier() -> None:
     # The stand-in refuses one, as Amazon Managed Prometheus does; a run on a vllm pool reads every
     # quantity there is.
-    with pytest.raises(urllib.error.HTTPError) as refused:
-        Scraped().read_series("sum(increase(x[1m] anchored))", start=END, end=END, step=1.0)
-    assert refused.value.code == 400
+    for refusing in (
+        lambda query: Scraped().read_series(query, start=END, end=END, step=1.0),
+        lambda query: Scraped().read_samples(query, at=END),
+    ):
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            refusing("sum(increase(x[1m] anchored))")
+        assert refused.value.code == 400
     base = {"instance_type": "g7e.2xlarge", "model_revision": "build"}
     scraped = Scraped(*scrapes(base, "worker", {990.0: 0.0, 1005.0: 10.0, 1020.0: 20.0}))
     run_on(scraped, 1000.0, 1010.0)
