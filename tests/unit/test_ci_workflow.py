@@ -401,7 +401,8 @@ def cooldown_problems(config: dict[str, Any]) -> list[str]:
 
 def test_updates_wait_a_week() -> None:
     config = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))
-    assert len(config["updates"]) >= 3, "the entries were not read"
+    # The actions and the base images; the Python pins move by hand (see the file's comment).
+    assert {entry["package-ecosystem"] for entry in config["updates"]} == {"github-actions", "docker"}
     assert cooldown_problems(config) == []
 
     def changed(change: Any) -> list[str]:

@@ -19,25 +19,10 @@ updates:
       prefix: chore
     labels: []
 
-  # The Python dependencies locked in uv.lock (pyproject.toml).
-  - package-ecosystem: uv
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: chore
-    labels: []
-    ignore:
-      # Pinned in more than one place; bumped by hand, everywhere at once:
-      #   ruff     also `required-version` in ruff.toml
-      #   pytest   also the engine tests command (scripts/check.sh, ci.yml) and the pin the
-      #            implement loop's verifier runs tests with (tools/implementation-loop/)
-      - dependency-name: ruff
-      - dependency-name: pytest
-      - dependency-name: pytest-xdist
+  # No entry for the Python dependencies of uv.lock: most pins also live elsewhere (ruff's
+  # required-version, the pytest of the engine tests and of the verifier, the boto3 extra a test
+  # asserts), and a bump can change what the gates find, so none merged as proposed. A pin moves
+  # by hand, in a change of its own, when an issue needs a newer version.
 
   # The base images the Dockerfiles under services/ pin by digest: the gateway, Grafana, the mock
   # engine and vLLM. A bump of vLLM's FROM line also needs its VERSION file, which Dependabot does
