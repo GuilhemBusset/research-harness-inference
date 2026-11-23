@@ -10,14 +10,16 @@ from contextlib import contextmanager
 from dataclasses import replace
 
 from helpers import SHIP, TempRepo, git, issue_body
-from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import Caps, Config
-from implement_loop.engine import Engine
-from implement_loop.github import FakeGitHub
-from implement_loop.graph import build_plan
-from implement_loop.model import Phase
-from implement_loop.state import RunStore
-from implement_loop.workspace import Workspace
+from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
+
+FakeAgents, Script = L.agents.FakeAgents, L.agents.Script
+Caps, Config = L.config.Caps, L.config.Config
+Engine = L.engine.Engine
+FakeGitHub = L.github.FakeGitHub
+build_plan = L.graph.build_plan
+Phase = L.model.Phase
+RunStore = L.state.RunStore
+Workspace = L.workspace.Workspace
 
 EPIC, ISSUE = 1, 2
 

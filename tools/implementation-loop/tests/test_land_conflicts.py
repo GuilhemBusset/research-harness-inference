@@ -10,17 +10,23 @@ import subprocess
 import threading
 import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest import mock
 
 from helpers import SHIP, TempRepo, git, issue_body
-from implement_loop import workspace
-from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import CEILINGS, Caps, Config
-from implement_loop.engine import MERGE_QUEUE, Engine
-from implement_loop.github import FakeGitHub
-from implement_loop.graph import build_plan
-from implement_loop.model import Phase
-from implement_loop.state import RunStore
+from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
+
+if TYPE_CHECKING:   # the type of `L.engine.Engine`, for the annotations
+    from implement_loop.engine import Engine as EngineType
+
+workspace = L.workspace
+FakeAgents, Script = L.agents.FakeAgents, L.agents.Script
+CEILINGS, Caps, Config = L.config.CEILINGS, L.config.Caps, L.config.Config
+MERGE_QUEUE, Engine = L.engine.MERGE_QUEUE, L.engine.Engine
+FakeGitHub = L.github.FakeGitHub
+build_plan = L.graph.build_plan
+Phase = L.model.Phase
+RunStore = L.state.RunStore
 
 # The unresolved-conflict tests run to the call ceiling: a low one keeps them short.
 LOW_CEILING = {"M": 10}
@@ -105,12 +111,12 @@ class LandConflictTests(unittest.TestCase):
         self.scripts = {}
         self.shared_paths = ["shared/suites.txt"]
         self.seed_main({self.shared_paths[0]: "base-suite\n"})
-        self._engine: Engine | None = None
-        self.peer: Engine | None = None
+        self._engine: EngineType | None = None
+        self.peer: EngineType | None = None
         self.boundary_errors = []
 
     @property
-    def engine(self) -> Engine:
+    def engine(self) -> "EngineType":
         assert self._engine is not None, "run_engine() has not run in this fixture"
         return self._engine
 
@@ -569,7 +575,7 @@ class LandConflictTests(unittest.TestCase):
             finally:
                 engine.claims.release(MERGE_QUEUE, engine.owner)
 
-        with mock.patch("implement_loop.engine.VERSION", "0.2.0"), \
+        with mock.patch.object(L.engine, "VERSION", "0.2.0"), \
                 mock.patch.object(workspace.Workspace, "push", old_push), \
                 mock.patch.object(Engine, "_step_land", old_land):
             self.run_engine(agents)
