@@ -8,6 +8,7 @@ GitHub are fakes. Main moves once the examiner has certified, so the land step f
 
 from contextlib import contextmanager
 from dataclasses import replace
+from shlex import quote
 
 from helpers import SHIP, TempRepo, git, issue_body
 from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
@@ -170,6 +171,32 @@ def test_a_merged_head_that_failed_verification_does_not_carry_after_its_command
         [failed] = [e for e in run.events("verified") if not e["ok"]]
         assert run.events("round_failed") and not run.events("certificate_carried")
         assert failed["head"] not in run.merged() or failed["head"] in run.agents.examined
+
+
+def test_a_carried_head_that_fails_a_later_verification_is_examined_before_it_lands(tmp_path, monkeypatch):
+    with loop() as run:
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        outside = tmp_path / "format"   # what the check reads changes; the head does not
+        outside.write_text("first\n")
+        run.agents.extra_check = f" && grep -qx first {quote(str(outside))}"
+        merge = run.fake.merge_pr
+
+        def refuse_once(*args):   # GitHub refuses the carried head's merge once: it is verified again
+            monkeypatch.setattr(run.fake, "merge_pr", merge)
+            outside.write_text("second\n")
+            raise L.github.GitHubError("merge refused")
+
+        def repair_command(worktree):   # the builder repairs its command, not the commit
+            if outside.read_text() == "second\n":
+                run.agents.extra_check = f" && grep -qx second {quote(str(outside))}"
+        monkeypatch.setattr(run.fake, "merge_pr", refuse_once)
+        run.agents.fix = repair_command
+        run.run()
+
+        [carry] = run.events("certificate_carried")
+        assert [v["ok"] for v in run.events("verified") if v["head"] == carry["head"]][:2] == [True, False]
+        assert run.merged() == [carry["head"]] and run.agents.examined[-1] == carry["head"]
+        assert run.store.issue(ISSUE).phase == Phase.DONE
 
 
 def test_a_conflicting_update_goes_to_the_builder_and_its_resolution_is_examined():
