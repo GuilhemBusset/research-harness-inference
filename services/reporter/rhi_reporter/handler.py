@@ -73,11 +73,11 @@ carry it. An execution that names none yet posts nothing.
   mark `last-stages` of the execution. The report keeps a line only when it is in
   `lifecycle_stages`, the allow-list of stages, and counts every other line as dropped: nothing
   else of an instance's row, and no text that is not a stage's name, reaches a status. The
-  allow-list is the stages of the lifecycle agent's enumeration (`rhi_lifecycle.stages`), which
-  the function's construct reads at synthesis and gives in `RHI_LIFECYCLE_STAGES`, comma-separated
-  (`lifecycle_stages`). No mark names no stage, and no variable is an empty allow-list. An
-  instance in service writes its row under the serving module's own name, which is no member of
-  the enumeration: its line counts as dropped.
+  allow-list is the stages of a start, the lifecycle agent's enumeration (`rhi_lifecycle.stages`),
+  and the stage serving, under which an instance in service writes its row
+  (`rhi_lifecycle.serving`), which the function's construct reads at synthesis and gives in
+  `RHI_LIFECYCLE_STAGES`, comma-separated (`lifecycle_stages`): a report names an instance that
+  was serving. No mark names no stage, and no variable is an empty allow-list.
 
 What cannot be read for the report leaves it out: a resource then counts as dropped, and marks
 that cannot be read name no test, after logging `NO_FAILED_TESTS`, and no stage, after logging

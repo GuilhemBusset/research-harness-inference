@@ -50,11 +50,13 @@ What the function is told, as environment variables:
   of the tests, and a report names a failed smoke test only by an ID of this list (section 8.4).
   A change to the list changes the function's configuration, so the same deployment carries it;
 - `RHI_LIFECYCLE_STAGES`: the allow-list of lifecycle stages, comma-separated: the members of the
-  lifecycle agent's enumeration, `rhi_lifecycle.stages.Stage`, each by its value, the name a
-  heartbeat's row holds, read at synthesis (`lifecycle_stages`). The app can import that module
-  because it puts every package root on its import path; the function's bundle holds the
-  reporter's package and `rhi_common` only, so the enumeration reaches it as data. A report names
-  the last stage an instance reached only by a name of this list;
+  lifecycle agent's enumeration of the stages of a start, `rhi_lifecycle.stages.Stage`, each by
+  its value, the name a heartbeat's row holds, and then the stage serving, which an instance in
+  service names in its row instead (`rhi_lifecycle.serving.STAGE`), read at synthesis
+  (`lifecycle_stages`). The app can import those modules because it puts every package root on its
+  import path; the function's bundle holds the reporter's package and `rhi_common` only, so the
+  stages reach it as data. A report names the last stage an instance reached only by a name of
+  this list;
 - `RHI_REPORTER_ARTIFACTS`: the name of the pipeline's artifact bucket, where the verification
   leaves its marks.
 """
@@ -73,6 +75,7 @@ from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from rhi import packaging
+from rhi_lifecycle import serving
 from rhi_lifecycle.stages import Stage
 
 if TYPE_CHECKING:
@@ -135,9 +138,9 @@ def smoke_test_ids(path: Path = SMOKE_TEST_IDS_FILE) -> tuple[str, ...]:
 
 def lifecycle_stages() -> tuple[str, ...]:
     """The name of every stage of a start, as the lifecycle agent's enumeration lists them and as
-    a heartbeat's row holds them: the reporter's allow-list. ValueError for a name the variable
-    cannot carry."""
-    names = tuple(stage.value for stage in Stage)
+    a heartbeat's row holds them, and then the stage serving, which the row of an instance in
+    service names: the reporter's allow-list. ValueError for a name the variable cannot carry."""
+    names = tuple(dict.fromkeys([*(stage.value for stage in Stage), serving.STAGE]))
     if not all(isinstance(name, str) and name and SEPARATOR not in name for name in names):
         raise ValueError(f"a lifecycle stage's name is text with no {SEPARATOR!r} in it")
     return names

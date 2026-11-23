@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from rhi import config
+from rhi_lifecycle import serving
 from rhi_lifecycle.stages import Stage
 from rhi_reporter import handler, measure
 
@@ -131,7 +132,7 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
         handler.STAGES_VARIABLE: "Rhi",
         handler.TOPIC_VARIABLE: {"Ref": topic_id},
         "RHI_SMOKE_TEST_IDS": ",".join(SMOKE_TEST_IDS),
-        "RHI_LIFECYCLE_STAGES": ",".join(stage.value for stage in Stage),
+        "RHI_LIFECYCLE_STAGES": ",".join([*(stage.value for stage in Stage), serving.STAGE]),
         # The bucket the verification step writes its marks to: the pipeline's artifact bucket.
         handler.ARTIFACTS_VARIABLE: pipeline["ArtifactStore"]["Location"],
     }
@@ -140,16 +141,16 @@ def test_the_function_is_told_the_secret_and_the_repository(templates: dict[str,
     assert handler.smoke_test_ids(function["Environment"]["Variables"]) == SMOKE_TEST_IDS != ()
 
 
-def test_the_function_s_lifecycle_stages_are_the_members_of_the_stages_enumeration(
+def test_the_function_s_lifecycle_stages_are_the_stages_of_a_start_and_the_stage_serving(
     templates: dict[str, dict[str, Any]],
 ) -> None:
     (function,) = reporter_functions(templates[PIPELINE_TEMPLATE]).values()
-    # Each member by its value, the name a launch writes into its instance's heartbeat row: what
-    # the function reads back from the variable is the enumeration, whole and nothing else.
-    members = tuple(stage.value for stage in Stage)
+    # Each name a heartbeat's row can hold: a stage of a start, by its member's value, or the stage
+    # an instance in service names, which is no member of the enumeration.
+    read = handler.lifecycle_stages(function["Environment"]["Variables"])
     assert handler.LIFECYCLE_STAGES_VARIABLE == "RHI_LIFECYCLE_STAGES"
-    assert handler.lifecycle_stages(function["Environment"]["Variables"]) == members
-    assert "weights" in members and len(set(members)) == len(members)
+    assert set(read) == {stage.value for stage in Stage} | {serving.STAGE}
+    assert serving.STAGE not in {stage.value for stage in Stage} and len(set(read)) == len(read)
 
 
 def test_one_encrypted_topic_that_refuses_unencrypted_transport(templates: dict[str, dict[str, Any]]) -> None:
