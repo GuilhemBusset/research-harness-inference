@@ -175,6 +175,31 @@ def test_a_merged_head_that_failed_verification_does_not_carry_after_its_command
         assert failed["head"] not in run.merged() or failed["head"] in run.agents.examined
 
 
+def test_a_run_stopped_once_a_merged_head_failure_is_saved_does_not_carry_it(tmp_path, monkeypatch):
+    with loop() as run:
+        available = tmp_path / "available"   # what the check reads changes; the head does not
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        run.agents.extra_check = f" && (test ! -f docs/later.txt || test -f {quote(str(available))})"
+        put, failed = run.store.put, []
+
+        def stop_once_failure_saved(st):   # the run stops before the failure reaches the journal
+            put(st)
+            if not failed and any(e.get("passed") is False for e in st.evidence):
+                failed.append(run.events("updated_from_main")[-1]["to"])
+                (run.store.dir / "STOP").touch()
+                raise L.agents.AgentStopped("stopped once the failed evidence was saved")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(run.store, "put", stop_once_failure_saved)
+            run.run()
+        [head] = failed
+        available.touch()   # the same check passes when the run resumes
+        run.run()
+
+        assert run.store.issue(ISSUE).phase == Phase.DONE
+        assert head not in run.merged() or head in run.agents.examined
+
+
 @pytest.mark.parametrize("case", ["certified", "withheld", "main moves"])
 def test_a_carried_head_that_fails_a_later_verification_lands_only_on_a_new_certificate(case, tmp_path, monkeypatch):
     with loop() as run:

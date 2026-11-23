@@ -1868,13 +1868,15 @@ class Engine:
         problems += gate.protected_problems(self.ws.changed_files(wt, base), st.grants, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
         env = environment_problem(evidence) if problems else ""
-        revoked = st.certified_sha if problems and not env and st.certified_sha != st.examined_sha else None
+        # A carried certificate (`_carried`) stands on the engine's verification of the merged head:
+        # once that fails, it is revoked, for landing and for any further carry, and only a new
+        # examination that certifies can let a head of this issue land. So is the certificate a
+        # failing merged head would have carried, on its first verification. The revocation is saved
+        # with the failed evidence, before the failure is journaled, so a run that stops after
+        # either resumes without it.
+        revoked = st.certified_sha if problems and not env and st.certified_sha and (
+            st.certified_sha != st.examined_sha or self._carried(n, st, wt, head) is not None) else None
         if revoked:
-            # A carried certificate (`_carried`) stands on the engine's verification of the merged
-            # head: once that fails, it is revoked, for landing and for any further carry, and only
-            # a new examination that certifies can let a head of this issue land. The revocation is
-            # saved before the failure is journaled, so a run that stops after either resumes
-            # without it.
             st.certified_sha = None
         st.evidence, st.base_sha = evidence, base
         self.store.put(st)
