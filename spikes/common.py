@@ -11,8 +11,10 @@ as a canary student, and reads what it measures from the Prometheus workspace.
 that falls between two samples is interpolated between them, as Prometheus's own
 `quantile_over_time` does, so a spike and a dashboard give one number for the same samples.
 
-**The workspace.** `Workspace.read_series` runs a range query, with a request signed with SigV4
-for the service `aps`, and returns each series as its labels and its samples.
+**The workspace.** `Workspace.read_series` runs a range query, and `Workspace.read_samples` an
+instant query of a range selector, which answers each series' samples as they were scraped, each
+with a request signed with SigV4 for the service `aps`; both return each series as its labels and
+its samples.
 
 **The canary students.** `canary_keys` reads their keys from the spikes' secret
 (`rhi_common.spike_keys`), one key for each student.
@@ -149,8 +151,17 @@ class Workspace:
     def read_series(self, query: str, *, start: float, end: float, step: float) -> list[Series]:
         """Every series the range query `query` returns from `start` to `end`, times in seconds since
         the epoch, one sample each `step` seconds. ValueError for an answer that is not a range query's."""
-        url = f"{self.url.rstrip('/')}/api/v1/query_range"
-        body = urlencode({"query": query, "start": repr(start), "end": repr(end), "step": repr(step)}).encode()
+        return self._ask("query_range", {"query": query, "start": repr(start), "end": repr(end), "step": repr(step)})
+
+    def read_samples(self, query: str, *, at: float) -> list[Series]:
+        """Every series the range selector `query` (`name{...}[range]`) holds at `at`, time in seconds
+        since the epoch: the samples scraped within its range, at the times they were scraped, which
+        no stale marker is among. ValueError for an answer that holds anything else."""
+        return self._ask("query", {"query": query, "time": repr(at)})
+
+    def _ask(self, path: str, form: Mapping[str, str]) -> list[Series]:
+        url = f"{self.url.rstrip('/')}/api/v1/{path}"
+        body = urlencode(form).encode()
         request = AWSRequest(
             method="POST", url=url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
@@ -159,8 +170,9 @@ class Workspace:
 
 
 def series_of(answer: bytes | str) -> list[Series]:
-    """The series an answer to a range query holds, in the format of the Prometheus HTTP API.
-    ValueError, which repeats nothing of the answer, for any other answer."""
+    """The series an answer to a range query, or to an instant query of a range selector, holds, in
+    the format of the Prometheus HTTP API. ValueError, which repeats nothing of the answer, for any
+    other answer."""
     refusal = ValueError("the workspace's answer is not the result of a range query")
     try:
         held = json.loads(answer)
