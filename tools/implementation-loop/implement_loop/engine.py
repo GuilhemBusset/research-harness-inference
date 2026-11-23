@@ -1867,9 +1867,20 @@ class Engine:
         # surface in a fault-repair run, is a problem here.
         problems += gate.protected_problems(self.ws.changed_files(wt, base), st.grants, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
-        self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
+        env = environment_problem(evidence) if problems else ""
+        revoked = st.certified_sha if problems and not env and st.certified_sha != st.examined_sha else None
+        if revoked:
+            # A carried certificate (`_carried`) stands on the engine's verification of the merged
+            # head: once that fails, it is revoked, for landing and for any further carry, and only
+            # a new examination that certifies can let a head of this issue land. The revocation is
+            # saved before the failure is journaled, so a run that stops after either resumes
+            # without it.
+            st.certified_sha = None
         st.evidence, st.base_sha = evidence, base
         self.store.put(st)
+        self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
+        if revoked:
+            self.store.event("certificate_revoked", issue=n, head=head, certified=revoked)
         if not problems:
             carried = self._carried(n, st, wt, head)
             if carried is not None:
@@ -1879,16 +1890,8 @@ class Engine:
                 return self._set_phase(n, Phase.LAND, certified_sha=head, verified_sha=head, head_sha=head)
             nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
-        env = environment_problem(evidence)
         if env:
             return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}", resume=Phase.VERIFY)
-        if st.certified_sha and st.certified_sha != st.examined_sha:
-            # A carried certificate (`_carried`) stands on the engine's verification of the merged
-            # head: once that fails, it is revoked, for landing and for any further carry, and only
-            # a new examination that certifies can let a head of this issue land.
-            self.store.event("certificate_revoked", issue=n, head=head, certified=st.certified_sha)
-            st.certified_sha = None
-            self.store.put(st)
         # The feedback here is what the build left for its builder: the decisions on its requests
         # (and the notes above). A failed verification used to replace it, so #32's builder never
         # learnt that its restated commands were refused, nor why, and restated them nine times.

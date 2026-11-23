@@ -333,3 +333,44 @@ def test_a_run_that_adopts_the_delivery_keeps_the_examined_head_in_the_evidence(
         evidence = run.comment(pr, L.report.EVIDENCE_MARKER)
         assert head in evidence
         assert "claude examined" not in evidence.lower() and "claude certified" not in evidence.lower()
+
+
+@pytest.mark.parametrize("stop_after", ["verified", "certificate_revoked"])
+def test_a_run_resumed_after_a_carried_head_failed_verification_examines_it_before_it_lands(
+        stop_after, tmp_path, monkeypatch):
+    with loop() as run:
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        available = tmp_path / "available"   # what the check reads changes; the head does not
+        available.touch()
+        run.agents.extra_check = f" && test -f {quote(str(available))}"
+        merge, record = run.fake.merge_pr, run.store.event
+
+        def refuse_once(*args):   # GitHub refuses the carried head's merge once: it is verified again, and fails
+            monkeypatch.setattr(run.fake, "merge_pr", merge)
+            available.unlink()
+            raise L.github.GitHubError("merge refused")
+
+        def interrupt(kind, **fields):   # the run stops right after the failure is journaled
+            record(kind, **fields)
+            if kind == stop_after and not fields.get("ok", False):
+                (run.store.dir / "STOP").touch()
+                raise L.agents.AgentStopped("interrupted after the failed verification")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(run.fake, "merge_pr", refuse_once)
+            patch.setattr(run.store, "event", interrupt)
+            run.run()
+        [failed] = [e for e in run.events("verified") if not e["ok"]]
+        [carried] = run.events("certificate_carried")
+        assert failed["head"] == carried["head"]
+
+        available.touch()   # the same check passes when the run resumes
+        run.run()
+
+        assert run.store.issue(ISSUE).phase == Phase.DONE
+        [merged] = run.merged()
+        later = [e for e in run.store.events() if e.get("issue") == ISSUE and e["seq"] > failed["seq"]]
+        certified = [e["head"] for e in later if e["kind"] == "examined" and e["certify"]]
+        assert certified, "a new examination certified after the failure"
+        assert merged == certified[-1] or any(
+            e["kind"] == "certificate_carried" and e["head"] == merged and e["certified"] == certified[-1] for e in later)
