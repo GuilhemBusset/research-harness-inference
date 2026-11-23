@@ -1829,6 +1829,7 @@ class Engine:
         if self._drop_probes(n, wt):
             st = self.store.issue(n)
         head = self.ws.head(wt)
+        carried = self._carried(n, st, head)   # read before this verification journals its own event
         problems: list[str] = []
         notes: list[str] = []
         if st.dropped:
@@ -1871,6 +1872,10 @@ class Engine:
         st.evidence, st.base_sha = evidence, base
         self.store.put(st)
         if not problems:
+            if carried is not None:
+                self.store.event("certificate_carried", issue=n, certified=carried["frm"], head=head,
+                                 main=carried["main"])
+                return self._set_phase(n, Phase.LAND, certified_sha=head, verified_sha=head, head_sha=head)
             nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
         env = environment_problem(evidence)
@@ -1881,6 +1886,51 @@ class Engine:
         # learnt that its restated commands were refused, nor why, and restated them nine times.
         self._round_failed(n, problems, [f["id"] for f in still], notes=notes,
                            told=[f for f in st.feedback if f not in notes] + failed_output(evidence))
+
+    def _carried(self, n: int, st: IssueState, head: str) -> dict | None:
+        """The `updated_from_main` record of the land step that made `head`, when `head` may carry
+        the certificate of the head it merged: the land step merged main into the certified head
+        without a conflict, and nothing has verified `head` since. Only that merge carries. A head
+        a build round made, a merge included, is examined; so is the same head again after a
+        verification of it failed, whatever the builder's round then left."""
+        if not st.certified_sha or head == st.certified_sha:
+            return None
+        last = None
+        for e in self.store.events():
+            if e.get("issue") == n and e.get("kind") in ("updated_from_main", "verified"):
+                last = e
+        if (last and last["kind"] == "updated_from_main" and last.get("phase") == Phase.LAND.value
+                and last.get("to") == head and last.get("frm") == st.certified_sha and last.get("main")):
+            return last
+        return None
+
+    def _examiner_certified(self, n: int, head: str) -> str:
+        """The head the examiner certified, of which `head` carries the certificate: `head` itself
+        unless clean updates from main carried it, one `certificate_carried` event each."""
+        carried = {e["head"]: e["certified"] for e in self.store.events()
+                   if e.get("issue") == n and e.get("kind") == "certificate_carried"}
+        seen = {head}
+        while head in carried and carried[head] not in seen:
+            head = carried[head]
+            seen.add(head)
+        return head
+
+    def _carried_note(self, n: int, head: str) -> str:
+        """What the pull request and its evidence comment say of a head that carries the certificate
+        of another (`certificate_carried`): the head the examiner certified. Empty for a head the
+        examiner certified itself."""
+        certified = self._examiner_certified(n, head)
+        if not head or certified == head:
+            return ""
+        return (f"{self.other} certified `{certified}`. This head `{head}` merges main into it without a conflict, "
+                f"so it carries that certificate (ADR 0001, amendment 14): it was verified again on this exact head, "
+                f"and the `required` check runs on it before the merge.")
+
+    def _render_evidence(self, n: int, records: list[dict], head: str, verdicts: dict) -> str:
+        """The evidence comment of issue `n` for `head`, naming the head the examiner certified
+        when `head` carries its certificate."""
+        text, carried = report.render_evidence(n, records, head, verdicts), self._carried_note(n, head)
+        return f"{text}\n\n{carried}" if carried else text
 
     def _close_findings(self, n: int, st: IssueState, wt: Path, evidence: list[dict]) -> list[str]:
         """An open finding closes only when its reproduction passes on the new head (a probe's
@@ -2198,7 +2248,10 @@ class Engine:
                 if st.probes or any(c.get("author") == "examiner" for c in st.commands):
                     return self._set_phase(n, Phase.VERIFY)   # an earlier engine's probes leave the branch first
                 # Main may have moved since the certificate. Merging it makes a new head, which is
-                # verified and certified again (a focused delta examination) before it may land.
+                # verified again on its exact head before it may land. Merged without a conflict, it
+                # keeps the certificate of the head it merged (`_carried`; ADR 0001, amendment 14):
+                # main's change was certified in its own issue, and CI's `required` still runs on
+                # it. A conflict is the builder's work, and the head that resolves it is examined.
                 sync = self.ws.update(wt)
                 if sync.status == "conflict":
                     self.ws.abort_in_progress(wt)
@@ -2342,6 +2395,8 @@ class Engine:
         assert st.branch is not None
         issue = self.plan.issues[n]
         body = report.render_pr_body(n, issue.title, st, self.op, self.other)
+        carried = self._carried_note(n, head)
+        body += f"\n\n{carried}" if carried else ""
         pr = self.gh.find_pr(st.branch)
         if pr is None or pr.get("state") != "open":
             pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
@@ -2349,7 +2404,7 @@ class Engine:
             self.gh.update_pr(pr["number"], body)
         st.pr = pr["number"]
         self.store.put(st)
-        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, self._render_evidence(n, st.evidence, head, st.verdicts))
         return pr
 
     # ------------------------------------------------------------------ landed by the owner
@@ -2732,7 +2787,7 @@ class Engine:
         discharged = checked | verified
         records = evidence + deployed + list(discharged.values())
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
-                                                 report.render_evidence(n, records, head, verdicts))
+                                                 self._render_evidence(n, records, head, verdicts))
                             if st.pr else None)
         link = (evidence_comment or {}).get("html_url", "")
         proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts) | set(discharged)
@@ -3121,7 +3176,7 @@ class Engine:
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         adopted = elsewhere(self.gh.get_issue(n).get("body") or "", before.get("html_url") or "")
         for _ in range(DISCHARGE_WRITES):
-            comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, report.render_evidence(
+            comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, self._render_evidence(
                 n, [*base, *adopted.values()], evidence_head, verdicts))
             link = (comment or {}).get("html_url", "")
             body = self.gh.get_issue(n).get("body") or ""

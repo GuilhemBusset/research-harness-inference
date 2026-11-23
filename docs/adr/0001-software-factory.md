@@ -379,6 +379,19 @@ are recorded here as proposed and are part of what the owner approves.
     and go back to astra 30 minutes later; a refused call did no work and is charged to no
     budget, as amendment 8 does for Claude. Every other Codex call stays on the default model,
     and `plan` and `build` stay on Fable, then Opus.
+14. **A clean update from `main` keeps the certificate (2026-11-23).** When `main` moved since
+    an issue's certificate, the land step merges it into the certified head, and that head used
+    to be examined again. With three roots landing at once, that was 20 examinations, 17% of the
+    period's Codex tokens and 62 minutes of examiner time, each shown a change of `main` already
+    certified in its own issue. A merge the land step makes without a conflict now carries the
+    certificate of the head it merged: the merged head is still verified again on its exact
+    head, and the `required` check of CI still runs on it before the merge, but it is not
+    examined again. The engine journals each carry (`certificate_carried`: the issue, the
+    certified head, the merged head, the commit of `main`), and the evidence comment names the
+    head the examiner certified. A merged head whose verification fails goes back to the
+    builder as a failed round and does not land. A merge with a conflict is the builder's work,
+    and the head that resolves it is examined, as is every head a build round makes. Landing a
+    head the owner lands is unchanged.
 
 ## Verified and taken on trust
 

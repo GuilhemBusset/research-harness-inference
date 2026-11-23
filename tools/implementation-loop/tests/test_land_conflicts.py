@@ -230,8 +230,10 @@ class LandConflictTests(unittest.TestCase):
             self.assert_exact_gates(self.peer)
 
     def assert_exact_gates(self, engine):
-        """No merge without a certificate for the exact head: after the last update from main, the
-        head was verified, then examined and certified, then verified again as it lands."""
+        """No merge without a certificate for the exact head: after the last conflict or update from
+        main that carried no certificate, the head was verified, then examined and certified, then
+        verified again as it lands. A head the land step merged main into without a conflict carries
+        the certificate of the head it merged (ADR 0001, amendment 14), once verified itself."""
         events = engine.store.events()
         merged = [e for e in events if e["kind"] == "merged"]
         self.assertTrue(merged, events)
@@ -241,13 +243,21 @@ class LandConflictTests(unittest.TestCase):
             self.assertIn((event["pr"], head), calls)
             self.assertEqual(self.gh.prs[event["pr"]]["head"]["sha"], head)
             mine = [e for e in events if e.get("issue") == n and e["seq"] < event["seq"]]
-            barrier = max((e["seq"] for e in mine if e["kind"] in ("conflict", "updated_from_main")), default=0)
+            carried = {e["head"]: e for e in mine if e["kind"] == "certificate_carried"}
+            certified = head
+            while certified in carried:   # back to the head the examiner certified, each carried head verified
+                carry = carried[certified]
+                self.assertTrue([e for e in mine if e["kind"] == "verified" and e["ok"] is True
+                                 and e["head"] == certified and e["seq"] < carry["seq"]], events)
+                certified = carry["certified"]
+            barrier = max((e["seq"] for e in mine if e["kind"] == "conflict" or (
+                e["kind"] == "updated_from_main" and e.get("to") not in carried)), default=0)
             exams = [e for e in mine if e["kind"] == "examined" and e["seq"] > barrier]
             self.assertTrue(exams, f"no examination after the last update from main: {events}")
             exam = exams[-1]
             self.assertTrue(exam["certify"])
             examined = exam["head"]
-            self.assertEqual(examined, head, "the examined head is the head that lands")
+            self.assertEqual(examined, certified, "the examined head is the head that lands, or carries its certificate")
             verified = [e for e in mine if e["kind"] == "verified" and e["ok"] is True and e["seq"] > barrier]
             self.assertTrue([e for e in verified if e["head"] == examined and e["seq"] < exam["seq"]],
                             f"{examined} was examined before it was verified: {events}")
@@ -309,7 +319,8 @@ class LandConflictTests(unittest.TestCase):
         self.assertEqual(len(land_conflicts(self.events())), 1)
         updates = self.events("updated_from_main")
         self.assertTrue(any(e.get("phase") == "land" for e in updates))
-        self.assertGreaterEqual(len(self.events("examined")), 3)
+        self.assertGreaterEqual(len(self.events("examined")), 2)
+        self.assertTrue(self.events("certificate_carried"), "the clean update before land kept the certificate")
         self.assertFalse(self.events("round_failed"))
         # No operation is left in any worktree of either run.
         assert self.peer is not None

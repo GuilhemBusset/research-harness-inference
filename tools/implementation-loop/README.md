@@ -204,7 +204,7 @@ place and the rule, never the line around a value.
 | build | builder, then engine | Before anything is committed the engine runs the standing checks on the working tree: a round they refuse is not committed and goes back with their output. The builder writes the code, its tests, the registrations and one or more commands per item (all of them run; each names exactly one item id as its criterion, and one that names no item is reported back, not kept; an item it gives commands for runs those from then on). It may change any file, tests included, except a protected path it was not granted. Never commits. Asks with a typed request (`protected_change`, `reclassify`, `depends`, `dispute`), decided by a fresh call of the other vendor (disputes: the arbiter). A branch an earlier engine locked tests on gets one commit that releases them in CI's loop guard (`locks_released`). |
 | verify | engine | Runs the standing checks and the history checks, then every command and adopted probe from its own code (a command that several items name runs once, and its result counts for each): no skips, per-process pytest reports, protected paths changed only with a grant, open findings re-run. |
 | examine | examiner | In a disposable copy of the exact head: verdicts on review items, every finding at once (with memory of earlier rounds), probes, and a certificate. A probe only witnesses a finding and is never committed: the finding keeps it, and the verifier writes it into its copy of each head. A finding blocks only if the engine reproduces it and it quotes the item or names a safety invariant; others become a follow-up issue. From an issue's fourth examination since its latest plan (`Caps.examiner_bound`), only a safety invariant blocks, and a head whose items are all met is certified even without the examiner's certificate. A change that weakens a test is a finding, under the safety invariant about a weakened check when the test proves a gate or an invariant, and otherwise quoting the item: nothing locks a test, the examiner reviews it in the diff. The certified head is the one that lands. |
-| land | engine | One at a time across runs (a run that finds the queue held waits): the history checks once more on the exact head, then push without force, PR with `Refs #N`, evidence comment, the `required` check on the exact certified head, merge with that head SHA. A red check is never run again: it goes back to the builder with the failed job's log. Main moving means verify and a delta examination again. |
+| land | engine | One at a time across runs (a run that finds the queue held waits): the history checks once more on the exact head, then push without force, PR with `Refs #N`, evidence comment, the `required` check on the exact certified head, merge with that head SHA. A red check is never run again: it goes back to the builder with the failed job's log. Main moving means a clean merge of it, verified again on the exact head, which carries the certificate of the head it merged (`certificate_carried`), or a conflict for the builder, whose resolved head is examined. |
 | merged → delivered/done | engine | Takes the verifier's evidence of the head that landed (nothing runs again on `main`, where CI runs every test), ticks the checkboxes with evidence links, files the follow-up issue, and closes the issue, or keeps it open as delivered with its owner and deferred obligations. A failed deployment, or a ledger item without evidence, gets one fix-forward, then a revert PR. |
 
 Budgets: a persistent per-issue call ceiling (S 20, M 30, L 45; infra ×1.5), a per-issue dollar
@@ -233,9 +233,18 @@ commits), at two points:
   gets the conflict markers and feedback naming the files, and may change them that round.
   The engine then concludes the merge, or aborts it if markers remain (`conflict_unresolved`) and the next round
   tries again.
-- **At land, before pushing.** A clean merge makes a new head, so the issue is verified and
-  certified again (a delta examination) before it may land. A conflict, there or in
-  `scripts/ship.sh`, is aborted and sends the issue back to build (`conflict`).
+- **At land, before pushing.** A clean merge makes a new head, which is verified again on its
+  exact head before it may land. When that verification passes, the merged head carries the
+  certificate of the head it merged and is not examined again: main's change was certified in
+  its own issue, and the `required` check still runs on the merged head before the merge. The
+  engine journals one `certificate_carried` event per carry (`issue`, `certified`: the head
+  merged, `head`: the merged head, `main`: the commit of main merged), and the pull request's
+  evidence comment names the head the examiner certified. Only this merge carries: a head a
+  build round makes, a merge of main included, is examined, and a merged head whose
+  verification fails is a failed round for the builder that lands nothing. A conflict, there or
+  in `scripts/ship.sh`, is aborted and sends the issue back to build (`conflict`); the head that
+  resolves it is examined. A head the owner lands is not brought up to date (as before). A head
+  that `scripts/ship.sh` makes by merging main at the push is still examined.
 
 A conflict is work for the builder, never an engine fault, and costs no round: main moving is
 nobody's design fault (ADR 0012). No worktree keeps an unfinished rebase or merge between steps, and when a

@@ -63,7 +63,12 @@ scripts/implement.sh supervise <issue> --operator claude --yes --detach   # run 
 - `--yes` records the one confirmation a supervision needs: **the runs merge their own pull
   requests** once every gate passes (the verifier on the exact commit, the examiner's certificate
   for that commit, the `required` check green on it). Once the deployment pipeline exists, a
-  merge is also a deployment to the real AWS account.
+  merge is also a deployment to the real AWS account. When `main` moved since the certificate,
+  the land step merges it in: merged without a conflict, the new head carries the certificate of
+  the head it merged (journal event `certificate_carried`; ADR 0001, amendment 14), is verified
+  again on its exact head and gets the `required` check before the merge, with no new
+  examination. Its evidence comment names the head the examiner certified. A conflict goes to the
+  builder, and the head that resolves it is examined.
 - `--detach` keeps the supervisor running after the terminal closes. It prints its process id
   and the path of its log.
 
