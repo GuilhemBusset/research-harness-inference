@@ -191,8 +191,8 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
             ("budget_alert_percentages", value)
             for value in (
                 *("[50, 0, 100]", f"[{MARK}, {MARK}]", "[]", f"[{MARK}.5]", f"[-{MARK}]", "[true]", f"{MARK}"),
-                # One budget holds at most 10 notifications, each at most 1,000,000% of the amount.
-                str(list(range(10, 111, 10))),
+                # One budget holds at most five notifications, each at most 1,000,000% of the amount.
+                str(list(range(10, 61, 10))),
                 f"[1000001, {MARK}]",
             )
         ),
@@ -287,6 +287,8 @@ def test_budget_alert_percentages_read_50_80_and_100_when_left_out(tmp_path: Pat
     assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["budget_alert_percentages"] == [50, 80, 100]
     given = load_text(tmp_path, example_with(budget_alert_percentages="[25, 90]"))
     assert given.budget_alert_percentages == (25, 90)
+    most = load_text(tmp_path, example_with(budget_alert_percentages="[10, 20, 30, 40, 50]"))
+    assert most.budget_alert_percentages == (10, 20, 30, 40, 50)
     # AWS Budgets takes a percentage threshold up to 1,000,000% of the amount, and no higher.
     highest = load_text(tmp_path, example_with(budget_alert_percentages="[1000000]"))
     assert highest.budget_alert_percentages == (1_000_000,)
