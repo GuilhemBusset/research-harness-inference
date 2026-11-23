@@ -160,6 +160,23 @@ def test_a_recorded_answer_of_the_workspace_reads_back_as_its_series() -> None:
         assert "told" not in str(refused.value)
 
 
+def test_a_range_selector_is_read_as_an_instant_query_of_its_samples() -> None:
+    sent: list[tuple[str, Mapping[str, str], bytes]] = []
+
+    def send(url: str, headers: Mapping[str, str], body: bytes) -> bytes:
+        sent.append((url, headers, body))
+        return RECORDED_ANSWER
+
+    workspace = common.Workspace(WORKSPACE_URL, "us-east-1", Credentials("stub", "stub"), send=send)
+    coursework, _ = workspace.read_samples("vllm:num_requests_running[45s]", at=1_800_000_030.5)
+
+    assert coursework.samples == ((1_800_000_000.0, 0.0), (1_800_000_015.0, 3.0), (1_800_000_030.5, 8.0))
+    ((url, headers, body),) = sent
+    assert url == "https://aps-workspaces.example.com/workspaces/ws-example/api/v1/query"
+    assert parse_qs(body.decode()) == {"query": ["vllm:num_requests_running[45s]"], "time": ["1800000030.5"]}
+    assert "/us-east-1/aps/aws4_request" in headers["Authorization"]
+
+
 def test_the_canary_keys_come_from_the_spikes_secret() -> None:
     held = SpikeKeys(students=(generate_key(), generate_key()))
     asked: list[str] = []

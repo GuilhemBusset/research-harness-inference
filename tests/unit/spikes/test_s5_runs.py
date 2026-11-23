@@ -20,7 +20,7 @@ import s5_capacity as s5
 from rhi_common.keys import generate_key
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Generator, Mapping, Sequence
 
 Key = s5.Key
 END = 10_000.0
@@ -174,7 +174,7 @@ def refuse_anchored(query: str) -> None:
     """Refuses, as Amazon Managed Prometheus does, a query that holds the `anchored` range modifier:
     an HTTP 400, which the workspace's client raises as urllib does."""
     if "anchored" in query:
-        url = "https://workspace.example.com/api/v1/query_range"
+        url = "https://workspace.example.com/api/v1/query"
         raise urllib.error.HTTPError(url, 400, "the anchored modifier is not enabled", Message(), None)
 
 
@@ -187,6 +187,10 @@ class Workspace:
             return []
         labels = {"instance": "instance-a", "instance_type": "g7e.2xlarge", "model_revision": "build-4bit"}
         return [common.Series(labels, ((start, start), (end, end)))]
+
+    def read_samples(self, query: str, *, at: float) -> list[common.Series]:
+        refuse_anchored(query)
+        return []
 
 
 def test_the_runs_follow_the_inputs() -> None:
@@ -278,31 +282,53 @@ def test_a_pool_serving_two_builds_in_a_run_is_refused() -> None:
 
 
 class Scraped:
-    """A workspace holding raw scrapes, which answers the job's queries as Prometheus would: a range
-    query at each point of its grid, from the last sample at or before it; `last_over_time` from the
-    last in its range. It refuses the `anchored` modifier, and keeps every query it was asked."""
+    """A workspace holding raw scrapes, `None` for a stale marker, which answers the job's queries as
+    Prometheus would: a range query at each point of its grid, from the last sample at or before it,
+    none after a stale marker; `last_over_time` from the last in its range; a range selector read at
+    one time with the samples in its range, as scraped, its stale markers left out. It refuses the
+    `anchored` modifier, and keeps every query it was asked."""
 
-    def __init__(self, *series: tuple[str, dict[str, str], dict[float, float]]) -> None:
+    def __init__(self, *series: tuple[str, dict[str, str], Mapping[float, float | None]]) -> None:
         self.series = series
         self.asked: list[str] = []
 
-    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+    def _held(self, query: str) -> list[tuple[str, dict[str, str], list[tuple[float, float | None]]]]:
         self.asked.append(query)
         refuse_anchored(query)
-        held = [(labels, sorted(samples.items())) for name, labels, samples in self.series if f"{name}{{" in query]
+        return [
+            (name, labels, sorted(samples.items())) for name, labels, samples in self.series if f"{name}{{" in query
+        ]
+
+    @staticmethod
+    def _range(query: str) -> float:
+        number, unit = re.findall(r"\[(\d+)(ms|s)\]", query)[-1]
+        return float(number) / (1000 if unit == "ms" else 1)
+
+    def read_samples(self, query: str, *, at: float) -> list[common.Series]:
+        left = at - self._range(query)
+        found = []
+        for name, labels, samples in self._held(query):
+            kept = tuple((t, value) for t, value in samples if left < t <= at and value is not None)
+            if kept:
+                found.append(common.Series({"__name__": name, **labels}, kept))
+        return found
+
+    def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
+        held = self._held(query)
         by: dict[tuple[tuple[str, str], ...], list[tuple[float, float]]] = {}
         if "last_over_time" in query:
-            number, unit = re.findall(r"\[(\d+)(ms|s)\]", query)[0]
-            left = end - float(number) / (1000 if unit == "ms" else 1)
-            lasts = [(labels, [value for at, value in samples if left < at <= end][-1:]) for labels, samples in held]
+            left = end - self._range(query)
+            lasts = [
+                (labels, [v for at, v in samples if left < at <= end and v is not None][-1:])
+                for _, labels, samples in held
+            ]
             return [common.Series(labels, ((end, last[0]),)) for labels, last in lasts if last]
         points = [start + n * step for n in range(int((end - start) / step) + 1)]
-        for labels, samples in held:
+        for _, labels, samples in held:
             for point in points:
-                seen = [(at, value) for at, value in samples if point - 300 < at <= point][-1:]
-                for at, value in seen:
-                    kept = {"instance": labels["instance"]} if "sum by" in query else labels
-                    by.setdefault(tuple(kept.items()), []).append((point, at if "timestamp(" in query else value))
+                for at, value in [(at, value) for at, value in samples if point - 300 < at <= point][-1:]:
+                    if value is not None:
+                        by.setdefault(tuple(labels.items()), []).append((point, at if "timestamp(" in query else value))
         return [common.Series(dict(k), tuple(sorted(s))) for k, s in by.items()]
 
 
@@ -426,64 +452,27 @@ def test_a_release_reported_only_after_the_run_does_not_label_it() -> None:
 def test_a_counter_that_went_stale_before_the_run_and_resumed_in_it_counts_only_the_runs_output() -> None:
     # The worker's counter held 1,000, went stale at END + 15, and its engine resumed in the run, from
     # END + 15.25 to END + 45.75, generating 500 tokens. A plain selector shows nothing after the stale
-    # marker; a range one ignores it, so the increase starts from 1,000 and sees the reset.
-    scrapes = [(END, 1000.0), (END + 15, None), (END + 30, 500.0), (END + 45, 500.0), (END + 60, 500.0)]
-    clock = Clock()
-    clock.now = END + 15.25
-
-    class Stale(Workspace):
-        def read_series(self, query: str, *, start: float, end: float, step: float) -> list[common.Series]:
-            refuse_anchored(query)
-            if "vllm:generation_tokens_total" not in query:
-                return super().read_series(query, start=start, end=end, step=step)
-            ranged = "last_over_time(" in query
-            points = [start + n * step for n in range(int((end - start) / step) + 1)]
-            seen = [
-                (point, latest[-1][1])
-                for point in points
-                if (latest := [s for s in scrapes if s[0] <= point and (s[1] is not None or not ranged)])
-                and latest[-1][1] is not None
-            ]
-            return [common.Series({"instance": "instance-a"}, tuple(seen))] if seen else []
-
-    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
-        clock.now = END + 45.75
-        return [record(True, 1.0)]
-
-    job = s5.Job(
-        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
-        class_size=1, duration=30, keys=[generate_key()], endpoint="https://gateway.example.com",
-        gateway=Gateway(), workspace=Stale(), replay=replay, wall=clock, sleep=lambda _: None,
-    )  # fmt: skip
-    run = job.run(job.runs[0])
-    assert run.instances["instance-a"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
+    # marker; a range one leaves it out, so the increase starts from 1,000 and sees the reset.
+    labels = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    scraped = Scraped(
+        ("rhi_lifecycle_release_info", labels, {END + n: 1.0 for n in (0, 15, 30, 45, 60)}),
+        ("vllm:generation_tokens_total", labels, {END: 1000.0, END + 15: None, END + 30: 500.0, END + 45: 500.0}),
+    )
+    run = run_on(scraped, END + 15.25, END + 45.75)
+    assert run.instances["worker"].engine.output_tokens_per_second == pytest.approx(500 / 30.5)
 
 
 def test_each_engine_counter_uses_its_own_baseline_before_the_instance_sum() -> None:
     resident = {"__name__": "vllm:generation_tokens_total", "instance": "worker", "engine": "0"}
-    joined = {**resident, "engine": "1"}
     # Engine 0 held 1,000 tokens at the start and added 200. Engine 1 emitted its first 500 tokens
-    # before its first scrape and added 50 after it.
-    at_start = [common.Series({"instance": "worker", "engine": "0"}, ((1000.0, 1000.0),))]
-    raw = [
-        common.Series(resident, ((1000.0, 1000.0), (1015.0, 1200.0), (1030.0, 1200.0))),
-        common.Series(joined, ((1015.0, 500.0), (1030.0, 550.0))),
+    # before its first scrape and added 50 after it; a series with one label more is another series,
+    # and the same.
+    samples = [
+        common.Series(resident, ((985.0, 900.0), (1000.0, 1000.0), (1015.0, 1200.0), (1030.0, 1200.0))),
+        common.Series({**resident, "engine": "1"}, ((1015.0, 500.0), (1030.0, 550.0))),
+        common.Series({**resident, "zone": "example-zone"}, ((1015.0, 500.0), (1030.0, 550.0))),
     ]
-    assert s5.counted_of(raw, at_start, 1000.0)[("worker", "")] == 750.0
-
-
-def test_an_extra_label_makes_a_counter_series_with_its_own_baseline() -> None:
-    labels = {"instance": "worker", "engine": "0"}
-    original = {**labels, "__name__": "vllm:generation_tokens_total"}
-    # A series with one label more is another series: it adds its first 500 tokens to the 200 the
-    # series held at the start added, and does not start from that series' baseline.
-    added = {**original, "zone": "example-zone"}
-    at_start = [common.Series(labels, ((1000.0, 1000.0),))]
-    raw = [
-        common.Series(original, ((1000.0, 1000.0), (1015.0, 1200.0))),
-        common.Series(added, ((1015.0, 500.0), (1030.0, 550.0))),
-    ]
-    assert s5.counted_of(raw, at_start, 1000.0)[("worker", "")] == 750.0
+    assert s5.counted_of(samples, 1000.0)[("worker", "")] == 1300.0
 
 
 def run_on(workspace: s5.Reader, start: float, end: float) -> s5.Measured:
@@ -504,8 +493,8 @@ def run_on(workspace: s5.Reader, start: float, end: float) -> s5.Measured:
 
 
 def scrapes(
-    base: dict[str, str], instance: str, values: dict[float, float]
-) -> list[tuple[str, dict[str, str], dict[float, float]]]:
+    base: dict[str, str], instance: str, values: Mapping[float, float]
+) -> list[tuple[str, dict[str, str], Mapping[float, float]]]:
     """An instance's release, and every counter and histogram a vllm pool is read by, all holding `values`."""
     labels = {**base, "instance": instance}
     names = [one.query.split("{")[0] for one in s5.reads("coursework", "vllm", 1.0).values() if one.how is s5.How.SUM]
@@ -516,10 +505,11 @@ def scrapes(
 def test_a_counter_reset_and_a_series_born_in_the_run_count_as_the_anchored_increase_did() -> None:
     # The run lasts from 1000.25 to 1045.75; scrapes every 15 seconds from 990. The resident
     # instance's counters held 1,000 before the run, rose to 1,300, restarted with their engine and
-    # reached 200, then 400: 300 + 200 + 200. The joined instance's were first scraped in the run, at
-    # 500, then 550: all of it is the run's.
+    # were scraped again at 200 a tenth of a second later, then reached 400: 300 + 200 + 200. The
+    # joined instance's were first scraped in the run, at 500, then 550: all of it is the run's.
     base = {"instance_type": "g7e.2xlarge", "model_revision": "build"}
-    resident = dict(zip((990.0, 1005.0, 1020.0, 1035.0, 1050.0), (1000.0, 1300.0, 200.0, 400.0, 400.0), strict=True))
+    at = (990.0, 1005.0, 1005.1, 1020.0, 1050.0)
+    resident = dict(zip(at, (1000.0, 1300.0, 200.0, 400.0, 400.0), strict=True))
     scraped = Scraped(*scrapes(base, "resident", resident), *scrapes(base, "joined", {1035.0: 500.0, 1050.0: 550.0}))
     run = run_on(scraped, 1000.25, 1045.75)
     there, new = run.instances["resident"].engine, run.instances["joined"].engine
@@ -527,6 +517,16 @@ def test_a_counter_reset_and_a_series_born_in_the_run_count_as_the_anchored_incr
     assert (there.first_token_requests, new.first_token_requests) == (700, 550)
     assert (there.preemptions, new.preemptions) == (700, 550)
     assert there.input_tokens_per_request == {"+Inf": 700}
+
+
+def test_a_counter_scraped_only_before_the_run_counts_nothing_not_zero() -> None:
+    # The worker serves the whole run, but its preemption counter was last scraped before it.
+    labels = {"instance": "worker", "instance_type": "g7e.2xlarge", "model_revision": "build"}
+    scraped = Scraped(
+        ("rhi_lifecycle_release_info", labels, {990.0: 1.0, 1005.0: 1.0, 1020.0: 1.0}),
+        ("vllm:num_preemptions_total", labels, {990.0: 7.0}),
+    )
+    assert run_on(scraped, 1000.0, 1010.0).instances["worker"].engine.preemptions is None
 
 
 def test_the_job_sends_the_workspace_no_query_with_the_anchored_modifier() -> None:
@@ -539,5 +539,5 @@ def test_the_job_sends_the_workspace_no_query_with_the_anchored_modifier() -> No
     scraped = Scraped(*scrapes(base, "worker", {990.0: 0.0, 1005.0: 10.0, 1020.0: 20.0}))
     run_on(scraped, 1000.0, 1010.0)
     every = {one.query for one in s5.reads("coursework", "vllm", 10.0).values() if one.how is not s5.How.LAST}
-    assert every <= set(scraped.asked)
+    assert all(any(asked.startswith(query) for asked in scraped.asked) for query in every)
     assert not [query for query in scraped.asked if "anchored" in query]
