@@ -1,4 +1,4 @@
-"""The eleven causes, and an error rendered in each wire format (`rhi_common.causes`, `rhi_gateway.errors`).
+"""The causes, and an error rendered in each wire format (`rhi_common.causes`, `rhi_gateway.errors`).
 
 The statuses and the Retry-After seconds are written here from the table of the system design,
 section 6.2, and not read from the enumeration. The sentences are the enumeration's: a test here
@@ -24,6 +24,7 @@ DESIGN = {
     "capacity_unavailable": (503, 60),
     "pool_scheduled_only": (503, None),
     "pool_disabled": (503, None),
+    "no_session": (503, None),
     "engine_error": (502, None),
     "time_limit": (504, None),
 }
@@ -52,7 +53,7 @@ def read_event(raw: bytes) -> tuple[str | None, object]:
 
 def test_statuses_are_the_designs() -> None:
     assert {cause.value: (cause.status, cause.retry_after) for cause in Cause} == DESIGN
-    assert len(Cause) == 10
+    assert len(Cause) == 11
 
     for name, (status, seconds) in DESIGN.items():
         for wire in FORMATS:
@@ -70,7 +71,7 @@ def test_statuses_are_the_designs() -> None:
     only_warming = {Cause.WARMING: 45}
     assert render_json(Cause.CAPACITY_UNAVAILABLE, WireFormat.MESSAGES, only_warming).headers["Retry-After"] == "60"
     assert "Retry-After" not in render_json(Cause.POOL_DISABLED, WireFormat.MESSAGES, only_warming).headers
-    # No caller can give the header to one of the nine others.
+    # No caller can give the header to one of the eight others.
     for name, (_, seconds) in DESIGN.items():
         if seconds is None:
             with pytest.raises(ValueError, match="carries none"):

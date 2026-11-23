@@ -190,6 +190,8 @@ def test_read_every_5_seconds_for_every_pool() -> None:
         assert [at for read, at in elbv2.reads if read == group] == [START + 5 * n for n in range(6)]
         assert table.reads.count((pool, "mode")) == 6
         assert table.reads.count((pool, "note")) == 6
+    # The session switch, once a cycle with the pools' records.
+    assert table.reads.count(("_session", "switch")) == 6
     alone = (len(elbv2.reads), len(table.reads))
 
     clock, elbv2, table, readiness = build()

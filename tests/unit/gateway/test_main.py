@@ -44,7 +44,7 @@ from moto import mock_aws
 from rhi_common import tables
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
-from rhi_common.records import GatewayHeartbeat
+from rhi_common.records import GatewayHeartbeat, SessionSwitch
 from rhi_common.students import StudentKey
 from rhi_gateway import main as entry
 from rhi_gateway import metrics
@@ -137,6 +137,9 @@ def create_tables() -> None:
             AttributeDefinitions=[{"AttributeName": key.name, "AttributeType": key.type.value} for key, _ in keys],
             BillingMode="PAY_PER_REQUEST",
         )
+    # A session is on: the student of these tests is served (section 5.6).
+    switch = SessionSwitch(on=True, set_by="owner", set_at=int(time.time())).to_item()
+    boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).put_item(Item=switch)
 
 
 def environment(*pools: str) -> tuple[dict[str, str], dict[str, str]]:
@@ -264,6 +267,22 @@ def test_the_application_built_from_an_environment_answers_from_the_tables_moto_
 
     # The heartbeat is the heartbeats table's, under the task's ID: its last row is one of zeros.
     assert [(row.task, row.pool, row.in_flight, row.held) for row in heartbeat_rows()] == [(TASK, "mock", 0, 0)]
+
+
+@pytest.mark.usefixtures("aws")
+def test_a_gateway_whose_table_holds_no_switch_refuses_a_student_with_no_session() -> None:
+    environ, _ = environment("mock")
+    boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).delete_item(Key=tables.SESSION_SWITCH_KEY)
+    key = issue_key()
+    gateway = build(read_settings(environ), aws_clients(), task=TASK)
+
+    async def scenario(client: httpx.AsyncClient) -> None:
+        refused = await client.post("/v1/messages", headers=bearer(key), json=MESSAGE)
+        assert (refused.status_code, refused.json()["error"]["type"]) == (503, "no_session")
+        assert "retry-after" not in refused.headers
+
+    started(gateway, scenario)
+    assert not items(USAGE_TABLE)
 
 
 @pytest.mark.usefixtures("aws")

@@ -234,7 +234,12 @@ def build(
             secrets,
             longest_request_seconds=settings.longest_request_seconds,
         ),
-        holding=Holding(views=readiness.views, wake=waker.ask, keepalive_seconds=settings.keepalive_seconds),
+        holding=Holding(
+            views=readiness.views,
+            wake=waker.ask,
+            session=readiness.session_is_on,
+            keepalive_seconds=settings.keepalive_seconds,
+        ),
         heartbeat=heartbeat,
         retry_after=settings.retry_after,
     )
@@ -244,6 +249,7 @@ def build(
         views=readiness.views,
         default_pool=default_pool,
         waker=waker,
+        session=readiness.session_is_on,
     )
     app = build_app(
         forwarding_handlers(forwarding),

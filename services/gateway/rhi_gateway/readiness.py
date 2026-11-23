@@ -8,10 +8,15 @@ nothing else (section 5.3).
 On the same cycle it reads the pool's two records in the pool-state table: `mode`, the admin's
 (`rhi_common.records.PoolState`, section 11.3), and `note`, the scaler's (`ScalerNote`: whether
 it asked for capacity, when a launch last found none, and the pool's rebalance number, which
-`PoolView.rebalance_number` gives: section 5.5).
+`PoolView.rebalance_number` gives: section 5.5). Once a cycle, with them, it reads the session
+switch (`rhi_common.records.SessionSwitch`, under `rhi_common.tables.SESSION_SWITCH_KEY`, section
+5.6), which `Readiness.session_is_on` gives: no item reads as off, a failed read, or an item that is
+not the switch's record, keeps the value last read, and the switch reads off until a first read
+succeeds. While it is off the gateway serves no student but the owner's own entries
+(`rhi_gateway.app`, `rhi_gateway.local`).
 
 `Readiness.run` repeats the cycle every 5 seconds for every pool, whether or not anyone asks, and
-keeps the last values. Callers read only the kept values (`Readiness.pool`): no request causes a
+keeps the last values. Callers read only the kept values (`Readiness.pool`, `Readiness.session_is_on`): no request causes a
 read of the AWS API or of the table. A failed health read keeps the pool not ready; a failed read
 of a record keeps the value the previous cycle read. Nothing here sends a request through the
 load balancer: the only calls are `describe_target_health` and the table's `get_item`.
@@ -31,8 +36,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from rhi_common.records import MODE_RECORD, NOTE_RECORD, PoolState, ScalerNote
-from rhi_common.tables import POOL_STATE
+from rhi_common.records import MODE_RECORD, NOTE_RECORD, PoolState, ScalerNote, SessionSwitch, session_is_on
+from rhi_common.tables import POOL_STATE, SESSION_SWITCH_KEY
 
 # How often every pool is read (section 5.3).
 INTERVAL_SECONDS = 5.0
@@ -87,7 +92,11 @@ class Readiness:
         self._elbv2 = elbv2
         self._table = table
         self._clock = clock
-        self._views: Mapping[str, PoolView] = MappingProxyType({pool: PoolView() for pool in self._target_groups})
+        # The views and the switch, kept together: one cycle replaces both in one assignment.
+        self._kept: tuple[Mapping[str, PoolView], bool] = (
+            MappingProxyType({pool: PoolView() for pool in self._target_groups}),
+            False,
+        )
         self._subscribers: list[Subscriber] = []
 
     @property
@@ -96,11 +105,15 @@ class Readiness:
 
     def pool(self, name: str) -> PoolView:
         """The kept view of one pool. Reads nothing; a pool the gateway was not given raises `KeyError`."""
-        return self._views[name]
+        return self._kept[0][name]
 
     def views(self) -> Mapping[str, PoolView]:
         """The kept view of every pool, as one consistent snapshot."""
-        return self._views
+        return self._kept[0]
+
+    def session_is_on(self) -> bool:
+        """Whether a session is on, as the switch last read says; off until a read succeeds. Reads nothing."""
+        return self._kept[1]
 
     def subscribe(self, subscriber: Subscriber) -> None:
         """Call `subscriber` after every cycle, with the new views."""
@@ -119,8 +132,8 @@ class Readiness:
             next_at = max(next_at + INTERVAL_SECONDS, self._clock())
             await sleep(next_at - self._clock())
 
-    def _read_all(self) -> dict[str, PoolView]:
-        previous = self._views
+    def _read_all(self) -> tuple[dict[str, PoolView], bool]:
+        previous, session = self._kept
         views = {}
         for pool, target_group in self._target_groups.items():
             before = previous[pool]
@@ -132,14 +145,15 @@ class Readiness:
                 note=self._read_record(pool, NOTE_RECORD, ScalerNote.from_item, before.note),
                 observed_at=observed_at,
             )
-        return views
+        return views, self._read_switch(session)
 
-    def _apply(self, views: dict[str, PoolView]) -> None:
+    def _apply(self, cycle: tuple[dict[str, PoolView], bool]) -> None:
+        views, session = cycle
         # One assignment: a caller sees either the previous cycle or this one, never a mix.
-        self._views = MappingProxyType(views)
+        self._kept = (MappingProxyType(views), session)
         for subscriber in self._subscribers:
             try:
-                subscriber(self._views)
+                subscriber(self._kept[0])
             except Exception:  # noqa: BLE001 - a failing subscriber must not stop the reads
                 _LOG.exception("a readiness subscriber failed")
 
@@ -165,4 +179,13 @@ class Readiness:
             return None if item is None else parse(item)
         except Exception as error:  # noqa: BLE001 - any failed read keeps the previous value
             _LOG.warning("read of record %s failed for pool %s (%s)", record, pool, type(error).__name__)
+            return kept
+
+    def _read_switch(self, kept: bool) -> bool:
+        try:
+            item = self._table.get_item(Key=SESSION_SWITCH_KEY).get("Item")
+            # No item is an answer: no session is on. An item that is not the switch's record is not.
+            return session_is_on(None if item is None else SessionSwitch.from_item(item))
+        except Exception as error:  # noqa: BLE001 - any failed read keeps the previous value
+            _LOG.warning("read of the session switch failed (%s)", type(error).__name__)
             return kept

@@ -253,3 +253,18 @@ def test_an_attribute_outside_the_lists_is_reported() -> None:
     lease = {**USAGE.leases["req-2"].to_map(), "request_body": "x"}
     usage = {**USAGE.to_item(), "leases": {"req-2": lease}}
     assert unlisted(usage, LISTED[UsageDay]) == {"leases.req-2.request_body"}
+
+
+def test_the_owners_entries_are_the_canary_and_the_spikes_students() -> None:
+    assert students.is_owner_entry(0)
+    assert students.is_owner_entry(10**18)
+    assert students.is_owner_entry(10**18 + 3)
+    assert not students.is_owner_entry(1)
+    assert not students.is_owner_entry(4242)
+    assert not students.is_owner_entry(10**18 - 1)
+    # The admin CLI puts its entries under these same numbers.
+    from rhi_admin import canary, spikes
+
+    assert canary.CANARY_GITHUB_ID == students.CANARY_GITHUB_ID == 0
+    assert spikes.SPIKE_GITHUB_ID_BASE == students.SPIKE_GITHUB_ID_BASE == 10**18
+    assert students.is_owner_entry(spikes.spike_github_id(1))

@@ -54,6 +54,13 @@ cause that carries the header, or those `Forwarding.retry_after` gives. Token co
 call (section 5.3): it is never held and never asks for a wake, and on a pool that is not ready it
 is answered `warming` at once, before any reservation.
 
+**The session** (section 5.6): while no session is on, a student's request ends at once with the
+cause `no_session`, in its wire format, as the handler's first step: before its body is read, so
+nothing is reserved, held or woken and the scaler sees no demand from it. Whether a session is on is
+the switch as the gateway last read it (`rhi_gateway.readiness.Readiness.session_is_on`), given as
+`Holding.session`. The owner's own entries, the canary and the spikes' students
+(`rhi_common.students.is_owner_entry`), are served whatever the switch says (`in_session`).
+
 **The demand** (section 5.1): with a heartbeat (`rhi_gateway.heartbeat`), a request counts as
 held while it is held and as in flight from its forwarding to its end, which the settlement marks;
 it is received once its reservation is made. Token counting is never demand, and neither is
@@ -117,6 +124,7 @@ from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
+from rhi_common.students import is_owner_entry
 from rhi_gateway import routes, telemetry
 from rhi_gateway.affinity import Affinity
 from rhi_gateway.body import BodySource, Forwarded
@@ -308,6 +316,11 @@ HOLD_READ_SECONDS = 1.0
 _CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 
 
+def in_session(session: Callable[[], bool], student: KeyRecord) -> bool:
+    """Whether the student is served now: while a session is on, and always for the owner's own entries (section 5.6)."""
+    return is_owner_entry(student.github_id) or session()
+
+
 @dataclass(frozen=True)
 class Holding:
     """What the hold reads and asks (section 5.3): the kept views of the pools, and the wake.
@@ -315,7 +328,9 @@ class Holding:
     `views` gives the kept view of every pool (`rhi_gateway.readiness.Readiness.views`); a pool it
     does not hold reads as not ready with no records. `wake` asks the scaler to run for a pool and
     returns at once (`rhi_gateway.waker.Waker.ask`). `clock` gives the seconds since the epoch, the
-    clock of the scaler's note, and `sleep` waits on it: a test gives its own.
+    clock of the scaler's note, and `sleep` waits on it: a test gives its own. `session` gives
+    whether a session is on (`rhi_gateway.readiness.Readiness.session_is_on`), which the gateway's
+    builder gives; left out, a session is always on.
     """
 
     views: Callable[[], Mapping[str, PoolView]]
@@ -323,6 +338,7 @@ class Holding:
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     keepalive_seconds: float = DEFAULT_KEEPALIVE_SECONDS
+    session: Callable[[], bool] = lambda: True
 
     def view(self, pool: Pool) -> PoolView:
         """The kept view of one pool. Reads nothing."""
@@ -565,6 +581,9 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         holding = forwarding.holding
         held: _Held | None = None
         try:
+            if not in_session(holding.session, student):
+                # Before the body is read: nothing is reserved, held or woken (section 5.6).
+                raise GatewayError(Cause.NO_SESSION)
             forwarded = await body_filter.read(
                 RequestBody(request.receive), student=str(student.github_id), request_id=request_id
             )
