@@ -101,8 +101,11 @@ repository's requirements:
    on the exact head and it quotes the issue or names a safety invariant, and the examiner's own
    probes are executed, not believed. A Fable examiner would need an engine change, would remove
    the only decorrelation available, and would rest on the evaluator behaviour Anthropic itself
-   describes as lenient. The examiner's catch rate on infrastructure code is unmeasured; a
-   seeded-defect pilot is a backlog item (see Consequences).
+   describes as lenient. The examiner's catch rate on infrastructure code was unmeasured; a
+   seeded-defect pilot was a backlog item (see Consequences). The pilot ran once, on 2026-11-22,
+   on defects seeded into one recorded commit; the owner decided on its result (#121). Its patches
+   applied to that commit only, so the pilot was removed on 2026-11-23 (#642): a new pilot would
+   need a new corpus, and the old one can be restored from the history.
 
 3. **Every agent call and every check command runs in a bubblewrap sandbox with no AWS
    material.** A new module wraps the two places the engine starts processes that run
@@ -240,10 +243,11 @@ repository's requirements:
   wrong-but-green change can reach `main`. It is visible in the pull request's Decisions section
   and revertible.
 - Follow-ups this decision creates, to be filed in the factory epic: measure the examiner on
-  seeded defects in CDK changes before trusting its certificates on IAM and networking; move
-  AWS-only items from `owner` to status contexts as smoke tests appear; redact published
-  evidence with the hygiene patterns; revisit a scheduler that picks up ready issues without a
-  launch.
+  seeded defects in CDK changes before trusting its certificates on IAM and networking (the
+  seeded-defect pilot ran once, the owner decided (#121), and the pilot was removed; see
+  decision 2); move AWS-only items from `owner` to status contexts as smoke tests appear; redact
+  published evidence with the hygiene patterns; revisit a scheduler that picks up ready issues
+  without a launch.
 
 ## Alternatives considered
 
@@ -257,8 +261,9 @@ repository's requirements:
 3. **Adopt Archon or Fabro as the engine (design C).** Rejected: pre-1.0 dependencies read only
    from their READMEs, with the same isolation gap and every workflow still to write. Kept from
    it: invariants as protected tests, and not dispatching work that has no checkable end.
-4. **Fable on both sides.** Rejected for now (decision 2). To be reopened if the seeded-defect
-   pilot shows the Codex examiner adds nothing on infrastructure code.
+4. **Fable on both sides.** Rejected for now (decision 2). It was to be reopened if the
+   seeded-defect pilot showed the Codex examiner adds nothing on infrastructure code. The pilot
+   ran once, the owner decided (#121), and the pilot was removed (decision 2).
 5. **A second OS user, or a separate WSL distribution, as the boundary.** Not needed for the
    credential rule once the sandbox exists, and it requires `sudo`. It remains the stronger
    option if the owner wants the engine itself away from their own `gh` login.

@@ -59,6 +59,7 @@ from .config import (
     history_checks,
     is_protected,
     is_safety_surface,
+    load_policy,
     standing_checks,
     usd_ceiling,
 )
@@ -243,10 +244,22 @@ RETIRED_REQUESTS = ("paths", "command_change", "test_change")
 NEEDS_END = re.compile(r"\(needs ([^()\s]+)\)\.?\s*$")
 
 
+# The engine's own loop.toml: where its safety invariants come from when a caller passes none.
+ENGINE_CONFIG = Path(__file__).resolve().parent.parent / "loop.toml"
+
+
 class Engine:
     def __init__(self, plan: Plan, store: RunStore, gh: GitHub, ws: Workspace, agents: Agents, cfg: Config,
                  repo_root: Path, log: Callable[[str], None] = print, sleep: Callable[[float], None] = time.sleep,
                  environment: dict | None = None, invoked_at: float | None = None, policy: dict | None = None):
+        policy = policy or {}
+        # The safety invariants have one list, `[invariants] names` in loop.toml: the caller's,
+        # loaded from it, or, when the caller gives no `invariants`, the engine's own. None: no start.
+        names = policy["invariants"] if "invariants" in policy else load_policy(ENGINE_CONFIG)["invariants"]
+        if not names:
+            raise ValueError("loop.toml: the table [invariants] gives no names; the engine needs its safety "
+                             "invariants to classify findings and will not start without them")
+        self.invariants: tuple[str, ...] = tuple(names)
         self.plan, self.store, self.gh, self.ws, self.agents, self.cfg = plan, store, gh, ws, agents, cfg
         self.repo_root = repo_root
         self.log, self.sleep = log, sleep
@@ -258,10 +271,8 @@ class Engine:
         environment = environment or {}
         self.env_fingerprint: str | None = environment.get("fingerprint")
         self.check_env: dict[str, str] = dict(environment.get("check_env") or {})
-        policy = policy or {}
         self.lacks: list[str] = sorted(policy.get("lacks", []))
         self.ci_jobs: dict[str, str] = dict(policy.get("ci_jobs") or {})   # capability -> the CI job that provides it
-        self.invariants: tuple[str, ...] = tuple(policy.get("invariants") or gate.DEFAULT_INVARIANTS)
         self.admit = bool(policy.get("admit_prerequisites", plan.mode == "epic"))
         self.repair = bool(policy.get("repair", False))
         self._accept_lock = threading.Lock()   # one evidence step at a time

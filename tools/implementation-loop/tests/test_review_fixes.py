@@ -19,7 +19,7 @@ from unittest import mock
 from helpers import HAS_PYTEST, SHIP, git, issue_body, present
 from implement_loop import VERSION, gate, verify
 from implement_loop.agents import FakeAgents, Objection, Probe, Request, Script
-from implement_loop.config import Caps, Config
+from implement_loop.config import Caps, Config, load_policy
 from implement_loop.engine import Engine
 from implement_loop.graph import build_plan
 from implement_loop.model import CheckSpec, Finding, IssueState, Phase
@@ -303,6 +303,8 @@ class Finding08TriageDependency(FixCase):
 
 # #3 is still in flight when #2 asks for it: with one writer, whichever issue takes the slot
 # first decides the order, and #3 may land before #2 ever asks
+# The safety invariants, as the engine takes them: from loop.toml alone.
+INVARIANTS = tuple(load_policy(Path(__file__).resolve().parents[1] / "loop.toml")["invariants"])
 TWO_WRITERS = Caps(ci_poll_s=0, queue_poll_s=0, max_parallel_writers=2)
 
 
@@ -608,7 +610,7 @@ class Finding02RevertFindings(FixCase):
         return self.store.issue(3)
 
     def test_2_a_reproduced_invariant_finding_refuses_the_revert(self):
-        st = self.revert_with([Finding(id="", title="the revert drops the owner's notes", invariant="data loss",
+        st = self.revert_with([Finding(id="", title="the revert drops the owner's notes", invariant="stored data deleted or made unrecoverable",
                                        observed="docs/notes.txt is gone", expected="a revert keeps work it did not bring",
                                        reproduction="test -f docs/notes.txt")])
         self.assertEqual((st.phase, st.fail["cause"]), (Phase.FAILED, "main_broken"))
@@ -619,7 +621,7 @@ class Finding02RevertFindings(FixCase):
         probe = Probe("checks/revert_probe.sh", "", "bash checks/revert_probe.sh",
                       content='#!/usr/bin/env bash\ntest "$(cat docs/a.txt)" = beta\n')
         st = self.revert_with([Finding(id="", title="the revert restores a stale value", probe=probe.file,
-                                       invariant="wrong results presented as correct", observed="alpha",
+                                       invariant="an item or check reported as passed that did not pass", observed="alpha",
                                        expected="beta")], [probe])
         self.assertEqual((st.phase, st.fail["cause"]), (Phase.FAILED, "main_broken"))
         self.assertIn("the revert restores a stale value", st.fail["detail"])
@@ -627,7 +629,7 @@ class Finding02RevertFindings(FixCase):
 
     def test_2_findings_that_do_not_reproduce_or_name_no_invariant_let_the_revert_land(self):
         self.revert_with([
-            Finding(id="", title="it might lose data", invariant="data loss", observed="o", expected="e",
+            Finding(id="", title="it might lose data", invariant="stored data deleted or made unrecoverable", observed="o", expected="e",
                     reproduction="test -f README.md"),                     # passes on the revert head
             Finding(id="", title="a nicer revert message", observed="terse", expected="friendlier",
                     reproduction="test -f docs/friendlier.txt")])          # reproduced, but no invariant
@@ -715,7 +717,7 @@ class FindingNew1OwnerFindings(unittest.TestCase):
     def classify(self, quote, reproduced=True, invariant=None):
         f = Finding(id="F", title="t", item="D2", quote=quote, invariant=invariant, observed="slow", expected="fast",
                     reproduction="test -f timing.txt")
-        return gate.classify(f, self.item_text, gate.DEFAULT_INVARIANTS, reproduced, {"D1"}, {"D2"}, self.parts)
+        return gate.classify(f, self.item_text, INVARIANTS, reproduced, {"D1"}, {"D2"}, self.parts)
 
     def test_new_1_a_finding_quoting_the_owner_items_own_text_never_blocks(self):
         f = self.classify("under a second on a 2020 laptop")
@@ -729,7 +731,7 @@ class FindingNew1OwnerFindings(unittest.TestCase):
         self.assertEqual(self.classify("time the page on this host", reproduced=False).blocking, False)
 
     def test_new_1_an_invariant_on_an_owner_item_still_blocks(self):
-        f = self.classify("under a second on a 2020 laptop", invariant="data loss")
+        f = self.classify("under a second on a 2020 laptop", invariant="stored data deleted or made unrecoverable")
         self.assertEqual((f.status, f.blocking), ("open", True))
 
 
