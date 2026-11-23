@@ -13,7 +13,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from helpers import INVARIANTS, git, identify, load_fixture
+from helpers import git, identify, load_fixture
 from implement_loop import live
 from implement_loop.agents import IssueRequest
 from implement_loop.issue_parser import parse
@@ -88,7 +88,7 @@ class CodexEscalationTests(unittest.TestCase):
                                       clock=lambda: self.now)
         self.agents.meter = self.meter = Meter()
         issue = Issue.from_api(load_fixture()["issues"]["28"])
-        self.req = IssueRequest(issue=issue, spec=parse(issue), context="", facts={"invariants": list(INVARIANTS)})
+        self.req = IssueRequest(issue=issue, spec=parse(issue), context="", facts={"invariants": ["secret exposure"]})
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         git("init", "-q", "-b", "main", cwd=self.repo)

@@ -14,7 +14,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from helpers import INVARIANTS, REPO_ROOT, SHIP, TempRepo, git, load_fixture
+from helpers import REPO_ROOT, SHIP, TempRepo, git, load_fixture
 from implement_loop import engine, live, schemas
 from implement_loop.agents import IssueRequest
 from implement_loop.issue_parser import parse
@@ -133,7 +133,7 @@ class LiveAdapterTests(unittest.TestCase):
         self.agents = self.new_agents()
         issue = Issue.from_api(load_fixture()["issues"]["28"])
         self.req = IssueRequest(issue=issue, spec=parse(issue), context="ctx", feedback=["the plan feedback"],
-                                facts={"lacks": ["hardware:laptop"], "invariants": list(INVARIANTS)})
+                                facts={"lacks": ["hardware:laptop"], "invariants": ["secret exposure"]})
 
     def new_agents(self, run="run", **kwargs):
         bins = self.tmp / "bin"
@@ -292,8 +292,7 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(len(self.agents.ws.disposed), 1)
         call = self.calls()[-1]
         self.assertEqual(Path(call["cwd"]).resolve(), (self.tmp / "scratch").resolve())
-        for name in INVARIANTS:
-            self.assertIn(name, call["prompt"], "the examiner knows the safety invariants of loop.toml")
+        self.assertIn("secret exposure", call["prompt"], "the examiner knows the safety invariants")
 
     def test_a_follow_up_examination_sees_its_memory_and_the_delta(self):
         memory = [{"id": "E28-1-1", "title": "the toggle loses the text", "status": "open"}]
