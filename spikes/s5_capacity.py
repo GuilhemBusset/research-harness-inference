@@ -60,18 +60,20 @@ names of the per-engine table (`rhi_common.engine_metrics`), as section 7.2 defi
 
 A quantity an engine's row leaves out (the mock's has none of the further ones) reads `None`, not
 zero, as does one with nothing to divide. Counters and histograms are increased per series before
-they are summed per instance: an instance's counters restart from zero with its engine. They are
-read one scrape after the run's end, from the run's start to then, with Prometheus' `anchored`
-range modifier, over a range to the millisecond that starts at the run's start: the increase starts
-from the last sample at or before the run's start, what each counter held when the run began, so
-what the run added before its first scrape is counted, nothing from before the run is, and it is
-not extended past the samples it saw. A series with no sample within the lookback before the run's
-start (`last_over_time` over it, read at the start itself, which a stale marker does not hide), an
-instance that joined during it, began at zero with its engine: its first sample is added to its
-increase, which `anchored` takes from that sample (`counted_of`); a series with one is not, whatever
-time its first point in the window carries, even one that went stale and resumed in the run, whose
-increase is anchored on the sample before its stale marker. The quantiles are computed from
-the buckets so counted (`quantile_of`), as `histogram_quantile` would. The scrape after the run's
+they are summed per instance: an instance's counters restart from zero with its engine. The job
+asks the workspace for no increase: Amazon Managed Prometheus refuses the `anchored` range
+modifier, and a plain `increase` extrapolates to its range's edges. It reads two things of each
+counter and computes the increase itself (`counted_of`): its samples, on a grid finer than a scrape
+from the run's start to one scrape after the run's end, and the last sample each series held within
+the lookback at the run's start (`last_over_time` over it, read at the start itself, which a stale
+marker does not hide). A series' increase runs from that sample, what the counter held when the run
+began, to its last sample in the window, each drop counted as a restart from zero: what the run
+added before its first scrape is counted, nothing from before the run is, and nothing is extended
+past the samples seen. A series with no sample at the start, an instance that joined during the
+run, began at zero with its engine, and its first sample is added in full; a series with one counts
+from it, whatever time its first point in the window carries, even one that went stale and resumed
+in the run. The quantiles are computed from the buckets so counted (`quantile_of`), as
+`histogram_quantile` would. The scrape after the run's
 end holds the tokens of the last answers, which the workspace sees only then; nothing else is sent
 to the pool in it. The gauges are read over the run alone, on a grid of a second (`fine_step`) that
 ends at the run's end, so that every scrape of the run shows, however short the run. Rates are over
@@ -212,7 +214,6 @@ from rhi_reporter.measure import MEASURE_CONTEXT, Verdict, context_parts
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Mapping, Sequence
-    from collections.abc import Set as AbstractSet
     from types import ModuleType
 
 JOB = "s5_capacity"
@@ -259,8 +260,8 @@ TURNS_PER_SESSION = 10
 # within a few scrapes, and the job waits that long before it reads.
 SCRAPE_SECONDS = 15
 SETTLE_SECONDS = 4 * SCRAPE_SECONDS
-# Seconds. Prometheus' lookback delta, its default: how far back before a range `anchored` looks
-# for the sample it starts an increase from.
+# Seconds. Prometheus' lookback delta, its default: how far back before the run's start the job
+# looks for the sample a counter's increase starts from.
 LOOKBACK_SECONDS = 300
 # Seconds. While the pool wakes: its status is read this often, and the wake repeated this often,
 # as `rhi wait` does; a cold launch may take 40 minutes at worst (spike S1).
@@ -605,9 +606,9 @@ class How(StrEnum):
     """How the answer to one query becomes one number an instance."""
 
     SUM = "sum"
-    """An increase, read at one time, with the series born in the run counted from zero."""
+    """A counter's samples over the run, their increase computed (`counted_of`)."""
     QUANTILE = "quantile"
-    """A histogram's bucket increases, so read, then its quantile at `Read.fraction`."""
+    """A histogram's buckets, so counted, then its quantile at `Read.fraction`."""
     MEAN = "mean"
     """A gauge, read over the run on a fine grid: the mean of its points."""
     PEAK = "peak"
@@ -618,34 +619,31 @@ class How(StrEnum):
 
 @dataclass(frozen=True)
 class Read:
-    """One query of the engine's quantities, and how its answer becomes a number an instance. `raw`
-    is the selector of the series an increase sums, for those born in the run."""
+    """One query of the engine's quantities, and how its answer becomes a number an instance. A
+    counter's or a histogram's query is the selector of its series, whose samples the job reads."""
 
     query: str
     how: How
-    raw: str = ""
     fraction: float = 0.0
 
 
 def reads(pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None) -> dict[Key, Read]:
     """The reads of the engine's quantities on the pool, by the names of `engine`'s row; a further
-    quantity the row leaves out has none. The counters and histograms are increased over the
-    `counted_seconds` that end where they are read, the window's unless given; the lifecycle agent's
-    cache capacity is the last it reported over those seconds and a scrape before them; the gauges
-    are read over the run as they are."""
+    quantity the row leaves out has none. The counters and histograms are their series' selectors,
+    whose increase over the run the job computes from their samples (`counted_of`); the lifecycle
+    agent's cache capacity is the last it reported over the `counted_seconds` that end where it is
+    read, the window's unless given, and a scrape before them; the gauges are read over the run as
+    they are."""
     names, further = metric_names(engine), further_names(engine)
     counted_seconds = window_seconds if counted_seconds is None else counted_seconds
-    counted = _range(counted_seconds)
 
-    def increase(name: Name, suffix: str = "", by: str = "instance") -> Read:
+    def increase(name: Name, suffix: str = "") -> Read:
         if not suffix:
             suffix = "_total" if name.kind is Kind.COUNTER else ""
-        raw = _selector(name, suffix, pool)
-        return Read(f"sum by ({by}) (increase({raw}[{counted}] anchored))", How.SUM, raw)
+        return Read(_selector(name, suffix, pool), How.SUM)
 
     def quantile(fraction: float, name: Name) -> Read:
-        buckets = increase(name, "_bucket", "instance, le")
-        return Read(buckets.query, How.QUANTILE, buckets.raw, fraction)
+        return Read(_selector(name, "_bucket", pool), How.QUANTILE, fraction)
 
     def gauge(how: How, aggregate: str, name: Name) -> Read:
         return Read(f"{aggregate} by (instance) ({_selector(name, '', pool)})", how)
@@ -684,15 +682,13 @@ def reads(pool: str, engine: str, window_seconds: float, counted_seconds: float 
         Key.OUTPUT_DISTRIBUTION: Further.REQUEST_OUTPUT_TOKENS,
     }
     found |= {
-        key: increase(further[quantity], "_bucket", "instance, le")
-        for key, quantity in distributions.items()
-        if quantity in further
+        key: increase(further[quantity], "_bucket") for key, quantity in distributions.items() if quantity in further
     }
     return found
 
 
 def queries(pool: str, engine: str, window_seconds: float, counted_seconds: float | None = None) -> dict[Key, str]:
-    """The query of each read (`reads`): a quantile's is the bucket increases it is computed from."""
+    """The query of each read (`reads`): a quantile's is the selector of the buckets it is computed from."""
     return {key: one.query for key, one in reads(pool, engine, window_seconds, counted_seconds).items()}
 
 
@@ -706,41 +702,34 @@ def _identity(one: common.Series) -> frozenset[tuple[str, str]]:
     return frozenset((label, value) for label, value in one.labels.items() if label != "__name__")
 
 
-def _held(one: common.Series, there: AbstractSet[frozenset[tuple[str, str]]]) -> bool:
-    """Whether the start held raw series `one`: a series at the start with exactly `one`'s labels,
-    its name aside, as `last_over_time` answers. A series with one label more or less is another
-    series, with a baseline of its own."""
-    return _identity(one) in there
-
-
 def counted_of(
-    increases: Sequence[common.Series], raw: Sequence[common.Series], at_start: Sequence[common.Series]
+    raw: Sequence[common.Series], at_start: Sequence[common.Series], start: float
 ) -> dict[tuple[str, str], float]:
-    """Each instance's increase, by bucket (`le`, empty for none): the anchored increases, plus, for
-    each series of `raw` (read over the window) that `at_start` does not hold, matched on all its
-    labels but the name (one engine's series is not anchored on another's of the same instance),
-    its first value. `at_start` is the selector's last sample within the lookback, read at the
-    window's start, as `anchored` looks for the sample it starts from; a stale marker does not hide
-    it. A series without one began at zero with its engine, and with nothing to anchor on, its
-    increase is taken from its first sample, which would leave out what the engine counted before
-    it was first scraped. A series `at_start` holds is anchored on the value it held then, which is
-    counted once, also when it went stale before the start and resumed after it. The answers carry
-    the times they were evaluated at, not the times of the samples, so whether a series was there
-    at the start is read at the start, never from the time of its first point."""
+    """Each instance's increase over the run from `start`, by bucket (`le`, empty for none): the sum
+    of its series' increases, computed from `raw`, the selector's samples over the window on a grid
+    finer than a scrape, and `at_start`, its last sample within the lookback, read at `start` (a
+    stale marker does not hide it). A series of `raw` is matched to the one `at_start` holds with
+    exactly its labels, its name aside (one engine's series does not start from another's of the
+    same instance; a series with one label more or less is another series). Its increase runs from
+    the value it held at the start to its last point after `start`, each rise added and each drop
+    counted as a restart from zero, its new value added in full: also a series that went stale
+    before the start and resumed after it. A series the start does not hold began at zero with its
+    engine, and its first value is added in full, so what the engine counted before its first
+    scrape is counted. The answers carry the times they were evaluated at, not the times of the
+    samples, so whether a series was there at the start is read at the start, never from the time
+    of its first point."""
     totals: dict[tuple[str, str], float] = {}
-    there = {_identity(one) for one in at_start if one.samples and one.labels.get("instance")}
-
-    def add(one: common.Series, value: float) -> None:
-        where = _where(one)
-        if where[0]:
-            totals[where] = totals.get(where, 0.0) + value
-
-    for one in increases:
-        if one.samples:
-            add(one, one.samples[-1][1])
+    there = {_identity(one): one.samples[-1][1] for one in at_start if one.samples and one.labels.get("instance")}
     for one in raw:
-        if one.samples and not _held(one, there):
-            add(one, min(one.samples)[1])
+        where = _where(one)
+        inside = [value for at, value in sorted(one.samples) if at > start]
+        if not where[0] or not inside:
+            continue
+        held, added = there.get(_identity(one), 0.0), 0.0
+        for value in inside:
+            added += value - held if value >= held else value
+            held = value
+        totals[where] = totals.get(where, 0.0) + added
     return totals
 
 
@@ -1045,9 +1034,9 @@ class Job:
                 answers[key] = [one(instance, end, summary(values)) for instance, values in points.items()]
             else:
                 step = read_at[after]
-                raw = read(how.raw, grid_before(start, after, step), after, step)
-                there = read(f"last_over_time({how.raw}[{_range(LOOKBACK_SECONDS)}])", start, start, step)
-                counted = counted_of(read(how.query, after, after, SCRAPE_SECONDS), raw, there)
+                raw = read(how.query, grid_before(start, after, step), after, step)
+                there = read(f"last_over_time({how.query}[{_range(LOOKBACK_SECONDS)}])", start, start, step)
+                counted = counted_of(raw, there, start)
                 if how.how is How.SUM:
                     answers[key] = [one(instance, after, value, le) for (instance, le), value in counted.items()]
                     continue
@@ -1069,7 +1058,7 @@ class Job:
         self.sleep(SETTLE_SECONDS)
         window = max(end - start, 1.0)
         # The scrape after the run's end holds what the run's last answers added; the counters'
-        # increase is anchored on what they held at the run's start.
+        # increase starts from what they held at the run's start.
         after = end + SCRAPE_SECONDS
         step = fine_step(after - start)
         release = self._read(release_query(self.pool), grid_start(start, after, step), after, step)
