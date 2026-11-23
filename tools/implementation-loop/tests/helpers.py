@@ -36,6 +36,11 @@ HISTORY_CHECKS = config.HISTORY_CHECKS
 config.STANDING_CHECKS = ()
 config.HISTORY_CHECKS = ()
 
+# The safety invariants, as the engine takes them: from loop.toml alone. A test that needs a finding
+# to name one takes it from here, so renaming one in loop.toml leaves the tests' meaning intact.
+LOOP_TOML = HERE.parent / "loop.toml"
+INVARIANTS = tuple(config.load_policy(LOOP_TOML)["invariants"])
+
 REPO_ROOT = HERE.parents[2]
 SHIP = REPO_ROOT / "scripts" / "ship.sh"
 HOOKS = REPO_ROOT / ".githooks"

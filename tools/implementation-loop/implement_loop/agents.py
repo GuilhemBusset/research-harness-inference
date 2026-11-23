@@ -361,10 +361,10 @@ class FakeAgents:
                 findings.append(Finding(id=f"N{n}-{k}", title=f"corner case {k} breaks the item", item=item.id,
                                         quote=quote, observed=f"corners_{n}/case_{k}.txt is missing",
                                         expected="the corner case is handled", reproduction=f"test -f corners_{n}/case_{k}.txt"))
-            if k < s.invariant_findings:
-                findings.append(Finding(id=f"I{n}-{k}", title=f"corner case {k} exposes a secret",
-                                        invariant="secret exposure", observed=f"corners_{n}/guard_{k}.txt is missing",
-                                        expected="no secret is exposed", reproduction=f"test -f corners_{n}/guard_{k}.txt"))
+            if k < s.invariant_findings:   # names the first safety invariant the engine gave the examiner
+                findings.append(Finding(id=f"I{n}-{k}", title=f"corner case {k} breaks a safety invariant",
+                                        invariant=next(iter(req.facts.get("invariants") or ()), None), observed=f"corners_{n}/guard_{k}.txt is missing",
+                                        expected="the invariant holds", reproduction=f"test -f corners_{n}/guard_{k}.txt"))
             if k < s.advisory_findings:
                 findings.append(Finding(id=f"A{n}-{k}", title="the edge case may break the item", item=item.id,
                                         quote=quote, observed="unclear", expected="the edge case is handled"))

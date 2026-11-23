@@ -255,10 +255,14 @@ class Engine:
         policy = policy or {}
         # The safety invariants have one list, `[invariants] names` in loop.toml: the caller's,
         # loaded from it, or, when the caller gives no `invariants`, the engine's own. None: no start.
+        # A blank name is no name: it would match every finding's invariant.
         names = policy["invariants"] if "invariants" in policy else load_policy(ENGINE_CONFIG)["invariants"]
         if not names:
             raise ValueError("loop.toml: the table [invariants] gives no names; the engine needs its safety "
                              "invariants to classify findings and will not start without them")
+        if not all(isinstance(n, str) and gate.normalize(n) for n in names):
+            raise ValueError("loop.toml: the table [invariants] holds a blank name, which would match every "
+                             "finding; the engine will not start until each name says what it guards")
         self.invariants: tuple[str, ...] = tuple(names)
         self.plan, self.store, self.gh, self.ws, self.agents, self.cfg = plan, store, gh, ws, agents, cfg
         self.repo_root = repo_root
