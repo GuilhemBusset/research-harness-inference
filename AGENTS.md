@@ -168,8 +168,8 @@ backticked paths as zones). `scripts/backlog.sh lint` checks it with the engine'
 `scripts/backlog.sh plan` shows the order, and `scripts/backlog.sh publish` creates the GitHub
 issues (a dry run unless `--apply` is given); a draft joins a published epic, or waits for a
 published issue, by its number. Use the shared `backlog` skill to write one (`/backlog` in Claude
-Code, `$backlog` in Codex). Once published, a draft is removed by a later change: between two
-publications `backlog/drafts/` is empty.
+Code, `$backlog` in Codex). Drafts are reviewed in a pull request and published from its head
+once its CI is green; the pull request is then closed unmerged, so `main` never holds a draft.
 
 Every acceptance item is either checkable by a command or a test, or names the capability it
 needs (`(needs aws:deployed-environment)`). An item with neither does not pass the lint.

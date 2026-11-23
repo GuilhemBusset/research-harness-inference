@@ -6,9 +6,9 @@ loop reads it and writes its evidence there.
 
 The implement loop reads GitHub issues; it does not write them from a design. So new work is
 drafted here first, as files, one per issue, in the shape the loop's engine parses, then linted and
-published by `tools/backlog/` ([ADR 0001](../docs/adr/0001-software-factory.md), decision 7). Once
-published, a draft is removed by a later change, so `backlog/drafts/` is empty between two
-publications.
+published by `tools/backlog/` ([ADR 0001](../docs/adr/0001-software-factory.md), decision 7). Drafts
+are reviewed in a pull request and published from its head; the pull request is then closed
+unmerged, so `main` never holds a draft.
 
 ```
 scripts/backlog.sh lint               # every draft against the engine's input contract
@@ -27,11 +27,13 @@ file is the reference for the format.
 
 1. **Draft.** A file under `backlog/drafts/`, written from the design or from a need.
 2. **Lint.** `scripts/backlog.sh lint` until it prints no problem, then `plan` to read the order.
-3. **Commit.** Drafts are reviewed and merged like any change.
-4. **Publish.** The owner runs `publish`, reads the dry run, then runs `publish --apply`.
+3. **Review.** The drafts go in a pull request, whose CI lints them like any change.
+4. **Publish.** Once that CI is green, the owner runs `publish` at the pull request's head, reads
+   the dry run, then runs `publish --apply` there, and closes the pull request unmerged. The closed
+   pull request keeps the reviewed text; `main` never holds a draft, and no second change is needed
+   to remove one.
 5. **After publication the issue on GitHub is the truth.** The publisher never edits, closes or
-   deletes an issue. To change published work, edit the issue. The draft is history: a later
-   housekeeping change removes it. An id is never used again.
+   deletes an issue. To change published work, edit the issue. An id is never used again.
 
 Work that comes later enters the same way. A new draft joins a published epic, or waits for a
 published issue, by naming its GitHub number (see `epic` and `blocked_by` below).
