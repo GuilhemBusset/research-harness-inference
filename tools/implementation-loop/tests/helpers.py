@@ -13,6 +13,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+# The tests judge the engine beside them. A verifier that records this run has already imported
+# its own engine's `implement_loop` (its pytest plugin, `implement_loop.loop_pytest`): forget that
+# package here, so the imports below load this tree's. The plugin keeps the module it was given.
+_loaded = sys.modules.get("implement_loop")
+if _loaded is not None and Path(_loaded.__path__[0]).resolve().parent != HERE.parent:
+    for _name in [n for n in sys.modules if n == "implement_loop" or n.startswith("implement_loop.")]:
+        del sys.modules[_name]
 
 from implement_loop import config, sandbox  # the engine is on sys.path only from here
 
@@ -28,6 +35,11 @@ STANDING_CHECKS = config.STANDING_CHECKS
 HISTORY_CHECKS = config.HISTORY_CHECKS
 config.STANDING_CHECKS = ()
 config.HISTORY_CHECKS = ()
+
+# The safety invariants, as the engine takes them: from loop.toml alone. A test that needs a finding
+# to name one takes it from here, so renaming one in loop.toml leaves the tests' meaning intact.
+LOOP_TOML = HERE.parent / "loop.toml"
+INVARIANTS = tuple(config.load_policy(LOOP_TOML)["invariants"])
 
 REPO_ROOT = HERE.parents[2]
 SHIP = REPO_ROOT / "scripts" / "ship.sh"

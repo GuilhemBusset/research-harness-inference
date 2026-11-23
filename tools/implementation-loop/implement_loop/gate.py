@@ -22,15 +22,6 @@ from .config import is_protected, is_safety_surface
 from .model import AGENT_PROOFS, PROOF_KINDS, Finding
 
 MIN_QUOTE_WORDS = 3
-DEFAULT_INVARIANTS = (
-    "secret exposure",
-    "check or gate bypass",
-    "data loss",
-    "cross-run corruption",
-    "wrong results presented as correct",
-    "a false done",
-    "edits to another issue's merged deliverable",
-)
 
 
 def normalize(text: str) -> str:

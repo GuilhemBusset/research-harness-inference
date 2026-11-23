@@ -42,7 +42,6 @@ tools/implementation-loop/  the implement loop engine, vendored (see its UPSTREA
 tools/hygiene/              the public-repository scanner: no account ID, ARN or secret gets committed
 tools/backlog/              lints and publishes the backlog
 tools/measurements/         writes the numbers a spike or a canary posted into docs/measurements/
-tools/examiner-pilot/       measures the examiner on defects seeded in CDK changes (ADR 0001, decision 2)
 scripts/                    check.sh (the one gate script), implement.sh, ship.sh, backlog.sh
 setup/                      one-time setup: git hooks, the GitHub ruleset
 .githooks/, .github/        the local and server-side gates

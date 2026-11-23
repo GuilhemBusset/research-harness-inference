@@ -24,7 +24,6 @@ src = [
   "tools/backlog", "tools/backlog/tests",
   "tools/measurements",
   "tools/advisories",
-  "tools/examiner-pilot",
   "tests/examiner",
   "tests/replay",
   "tests/unit/spikes",

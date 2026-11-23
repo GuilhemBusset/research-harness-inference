@@ -103,6 +103,8 @@ ci_jobs = { "host:container-runtime" = "container-tests" }
 # Safety invariants: a finding that names one blocks even when it quotes no ledger item, and from
 # an issue's fourth examination on only such a finding blocks. Each names a specific harm: a broad
 # name ("data loss", "a false done") matches almost any finding, and the bound then never applies.
+# This is the only list of them: the engine and its tests read it here, and an engine whose
+# loop.toml gives no names refuses to start.
 [invariants]
 names = [
   "secret exposure",
