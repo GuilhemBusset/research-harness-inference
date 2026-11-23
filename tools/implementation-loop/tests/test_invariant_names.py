@@ -37,6 +37,13 @@ class InvariantNames(EngineCase):
                 with self.assertRaisesRegex(ValueError, r"\[invariants\]"):
                     self.engine_for(policy=load_policy(path))
 
+    def test_no_engine_code_or_test_spells_an_invariant_name(self):
+        """loop.toml alone holds the names: a test that spelled one would keep passing on a stale name."""
+        for path in sorted(LOOP_TOML.parent.rglob("*.py")):
+            text = path.read_text()
+            for name in INVARIANTS:
+                self.assertNotIn(name, text, f"{path.relative_to(REPO_ROOT)} spells an invariant of loop.toml")
+
     def test_the_tests_that_need_an_invariant_still_hold_when_loop_toml_renames_one(self):
         """The engine's tests name an invariant through loop.toml: renaming every one keeps them passing."""
         with tempfile.TemporaryDirectory() as tmp:
