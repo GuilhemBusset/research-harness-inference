@@ -1829,7 +1829,6 @@ class Engine:
         if self._drop_probes(n, wt):
             st = self.store.issue(n)
         head = self.ws.head(wt)
-        carried = self._carried(n, st, head)   # read before this verification journals its own event
         problems: list[str] = []
         notes: list[str] = []
         if st.dropped:
@@ -1872,9 +1871,11 @@ class Engine:
         st.evidence, st.base_sha = evidence, base
         self.store.put(st)
         if not problems:
+            carried = self._carried(n, st, wt, head)
             if carried is not None:
-                self.store.event("certificate_carried", issue=n, certified=carried["frm"], head=head,
-                                 main=carried["main"])
+                if not any(e.get("issue") == n and e.get("kind") == "certificate_carried" and e.get("head") == head
+                           for e in self.store.events()):   # one event per carry, a resumed one included
+                    self.store.event("certificate_carried", issue=n, head=head, **carried)
                 return self._set_phase(n, Phase.LAND, certified_sha=head, verified_sha=head, head_sha=head)
             nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
@@ -1887,49 +1888,57 @@ class Engine:
         self._round_failed(n, problems, [f["id"] for f in still], notes=notes,
                            told=[f for f in st.feedback if f not in notes] + failed_output(evidence))
 
-    def _carried(self, n: int, st: IssueState, head: str) -> dict | None:
-        """The `updated_from_main` record of the land step that made `head`, when `head` may carry
-        the certificate of the head it merged: the land step merged main into the certified head
-        without a conflict, and nothing has verified `head` since. Only that merge carries. A head
-        a build round made, a merge included, is examined; so is the same head again after a
-        verification of it failed, whatever the builder's round then left."""
-        if not st.certified_sha or head == st.certified_sha:
+    def _carried(self, n: int, st: IssueState, wt: Path, head: str) -> dict | None:
+        """{certified, main} when `head` may carry the certificate of the head it merged (ADR 0001,
+        amendment 14): `head` is exactly `main` merged into the certified head without a conflict,
+        whoever made the merge (the land step, or `scripts/ship.sh` at the push). That is two
+        parents, the certified head first and a commit of `main` second, and the tree git's own
+        merge of the two makes. A head that resolves a conflict is no such merge, nor is a rebase
+        or a head with any other change: those are examined. Read from git alone, so a run that
+        resumes, or another run, reaches the same answer."""
+        certified = st.certified_sha
+        if not certified or head == certified:
             return None
-        last = None
-        for e in self.store.events():
-            if e.get("issue") == n and e.get("kind") in ("updated_from_main", "verified"):
-                last = e
-        if (last and last["kind"] == "updated_from_main" and last.get("phase") == Phase.LAND.value
-                and last.get("to") == head and last.get("frm") == st.certified_sha and last.get("main")):
-            return last
-        return None
+        parents = self.ws.git("rev-list", "--parents", "-n1", head, cwd=wt).split()[1:]
+        if len(parents) != 2 or parents[0] != certified:
+            return None
+        main = parents[1]
+        if not self.ws.is_ancestor(wt, main, self.ws.base_ref()):
+            return None
+        merge = subprocess.run(["git", "merge-tree", "--write-tree", certified, main], cwd=wt,
+                               capture_output=True, text=True, check=False)
+        tree = merge.stdout.split("\n", 1)[0].strip() if merge.returncode == 0 else ""
+        if not tree or tree != self.ws.git("rev-parse", f"{head}^{{tree}}", cwd=wt):
+            return None
+        return {"certified": certified, "main": main}
 
-    def _examiner_certified(self, n: int, head: str) -> str:
-        """The head the examiner certified, of which `head` carries the certificate: `head` itself
-        unless clean updates from main carried it, one `certificate_carried` event each."""
-        carried = {e["head"]: e["certified"] for e in self.store.events()
-                   if e.get("issue") == n and e.get("kind") == "certificate_carried"}
-        seen = {head}
-        while head in carried and carried[head] not in seen:
-            head = carried[head]
-            seen.add(head)
-        return head
-
-    def _carried_note(self, n: int, head: str) -> str:
-        """What the pull request and its evidence comment say of a head that carries the certificate
-        of another (`certificate_carried`): the head the examiner certified. Empty for a head the
-        examiner certified itself."""
-        certified = self._examiner_certified(n, head)
-        if not head or certified == head:
+    def _carried_note(self, st: IssueState, head: str) -> str:
+        """What the pull request and its evidence comment say of a head that carries the
+        certificate of another (`_carried`): the head the examiner examined, and who certified it,
+        the examiner or the engine's examiner bound. Empty for a head that was itself examined.
+        Read from the issue's state, which a run that adopts the issue keeps."""
+        examined = st.examined_sha
+        if not head or not examined or examined == head:
             return ""
-        return (f"{self.other} certified `{certified}`. This head `{head}` merges main into it without a conflict, "
-                f"so it carries that certificate (ADR 0001, amendment 14): it was verified again on this exact head, "
-                f"and the `required` check runs on it before the merge.")
+        bound = any(str(d.get("id", "")).startswith("examiner-bound-") and f"`{examined[:12]}`" in str(d.get("choice", ""))
+                    for d in st.decisions)
+        by = (f"the engine certified it under the examiner bound, {self.other} having withheld its certificate"
+              if bound else f"{self.other} certified it")
+        return (f"{self.other} examined `{examined}` and {by}. This head `{head}` was not examined: it merges main "
+                f"into that head without a conflict, so it carries its certificate (ADR 0001, amendment 14). It "
+                f"was verified again on this exact head, and the `required` check runs on it before the merge.")
+
+    def _pr_body(self, n: int, st: IssueState, head: str) -> str:
+        """The pull request's body for `head`, whose examination section names the head the
+        examiner examined when `head` carries its certificate."""
+        carried = self._carried_note(st, head)
+        return report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other,
+                                     examination=f"Built by {self.op}. {carried}" if carried else None)
 
     def _render_evidence(self, n: int, records: list[dict], head: str, verdicts: dict) -> str:
-        """The evidence comment of issue `n` for `head`, naming the head the examiner certified
+        """The evidence comment of issue `n` for `head`, naming the head the examiner examined
         when `head` carries its certificate."""
-        text, carried = report.render_evidence(n, records, head, verdicts), self._carried_note(n, head)
+        text, carried = report.render_evidence(n, records, head, verdicts), self._carried_note(self.store.issue(n), head)
         return f"{text}\n\n{carried}" if carried else text
 
     def _close_findings(self, n: int, st: IssueState, wt: Path, evidence: list[dict]) -> list[str]:
@@ -2394,9 +2403,7 @@ class Engine:
         pushed (`_owner_lands`)."""
         assert st.branch is not None
         issue = self.plan.issues[n]
-        body = report.render_pr_body(n, issue.title, st, self.op, self.other)
-        carried = self._carried_note(n, head)
-        body += f"\n\n{carried}" if carried else ""
+        body = self._pr_body(n, st, head)
         pr = self.gh.find_pr(st.branch)
         if pr is None or pr.get("state") != "open":
             pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
@@ -2813,7 +2820,7 @@ class Engine:
         # and not updated, comes last of the two and is recorded at once; and the comment that says
         # how the issue ends is written before anything that cannot be taken back.
         if discharged and st.pr:   # the pull request listed them as left for later
-            self._safe(self.gh.update_pr, st.pr, report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other))
+            self._safe(self.gh.update_pr, st.pr, self._pr_body(n, st, head))
         self._publish_deferred(n, st)
         self._file_followup(n, st)
         self.store.put(st)

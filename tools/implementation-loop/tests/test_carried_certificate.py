@@ -61,7 +61,8 @@ class MovingWorkspace(Workspace):
 
 
 class Loop:
-    def __init__(self, script):
+    def __init__(self, script, caps):
+        self.caps = caps
         self.repo = TempRepo()
         self.fake = FakeGitHub(on_merge=self.repo.merge)
         body = issue_body(f"feat/issue-{ISSUE}", [f"`docs/f{ISSUE}.txt` contains `text {ISSUE}`."], ["The test passes."])
@@ -74,7 +75,7 @@ class Loop:
 
     def run(self):
         Engine(build_plan(self.fake, EPIC, self.repo.work), self.store, self.fake, self.ws, self.agents,
-               Config(repo="test/test", caps=Caps(ci_poll_s=0, queue_poll_s=0)), repo_root=self.repo.work,
+               Config(repo="test/test", caps=Caps(ci_poll_s=0, queue_poll_s=0, **self.caps)), repo_root=self.repo.work,
                log=lambda m: None, sleep=lambda s: None, policy={"lacks": []}).run()
 
     def main_moves(self, path, text):
@@ -103,8 +104,8 @@ class Loop:
 
 
 @contextmanager
-def loop(script=None):
-    run = Loop(script or Script(files={f"docs/f{ISSUE}.txt": f"text {ISSUE}"}))
+def loop(script=None, **caps):
+    run = Loop(script or Script(files={f"docs/f{ISSUE}.txt": f"text {ISSUE}"}), caps)
     try:
         yield run
     finally:
@@ -167,3 +168,97 @@ def test_a_conflicting_update_goes_to_the_builder_and_its_resolution_is_examined
         assert git("merge-base", "--is-ancestor", main_moved, resolved, cwd=run.repo.work) == ""
         assert resolved != certified and run.merged() == [resolved]
         assert run.store.issue(ISSUE).phase == Phase.DONE
+
+
+def test_a_clean_merge_shipping_makes_at_the_push_carries_the_certificate(monkeypatch):
+    with loop() as run:
+        run.then_main_moves(("docs/first.txt", "first\n"))
+        push = run.ws.push
+
+        def move_and_push(path):   # main moves again between the land step's update and its push
+            monkeypatch.setattr(run.ws, "push", push)
+            run.main_moves("docs/second.txt", "second\n")
+            return push(path)
+
+        monkeypatch.setattr(run.ws, "push", move_and_push)
+        run.run()
+
+        [merged] = run.merged()
+        certified, shipped_main = run.parents(merged)
+        assert any(v["ok"] and v["head"] == merged for v in run.events("verified"))
+        assert len(run.agents.examined) == 1
+        assert [(e["certified"], e["main"]) for e in run.events("certificate_carried") if e["head"] == merged] == [
+            (certified, shipped_main)]
+
+
+def test_a_run_resumed_after_the_merged_head_passed_verification_carries_the_certificate(monkeypatch):
+    with loop() as run:
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        record = run.store.event
+
+        def interrupt(kind, **fields):
+            record(kind, **fields)
+            if kind == "verified" and fields["ok"] and run.events("updated_from_main"):
+                (run.store.dir / "STOP").touch()
+                raise L.agents.AgentStopped("interrupted after verification")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(run.store, "event", interrupt)
+            run.run()
+        run.run()
+
+        assert run.store.issue(ISSUE).phase == Phase.DONE
+        assert len(run.agents.examined) == 1 and len(run.events("certificate_carried")) == 1
+
+
+def test_the_pull_request_attributes_the_examination_to_the_head_examined():
+    with loop() as run:
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        run.run()
+
+        [pr] = run.fake.prs.values()
+        [examined] = run.agents.examined
+        assert pr["head"]["sha"] != examined and examined in pr["body"]
+        assert "certified on this exact head" not in pr["body"]
+
+
+def test_a_certificate_of_the_examiner_bound_is_not_attributed_to_the_examiner():
+    # past the bound, the engine certifies the first examination although the examiner withholds
+    with loop(Script(files={f"docs/f{ISSUE}.txt": f"text {ISSUE}"}, no_certify=1), examiner_bound=1) as run:
+        run.then_main_moves(("docs/later.txt", "later\n"))
+        run.run()
+
+        [record] = run.events("certified_by_bound")
+        [pr] = run.fake.prs
+        [evidence] = [c["body"] for c in run.fake.comments[pr] if L.report.EVIDENCE_MARKER in c["body"]]
+        assert record["head"] in evidence and run.events("certificate_carried")
+        assert "codex certified it" not in evidence.lower() and "examiner bound" in evidence
+
+
+def test_a_run_that_adopts_the_delivery_keeps_the_examined_head_in_the_evidence(monkeypatch):
+    from test_deploying import DEPLOYED, SIGNS_IN, SMOKE, VERIFIED
+    from test_deploying import Agents as DeployingAgents
+    from test_deploying import loop as deploying_loop
+    from test_discharge import RHI, push_main
+
+    with deploying_loop(contexts=(), verified=VERIFIED, lacks=(DEPLOYED,), unverified=()) as run:
+        run.deploy = replace(run.deploy, discharge_contexts=(RHI,))
+        run.add_work(2, owner=((SIGNS_IN, DEPLOYED),), files=(SMOKE,))
+        examine = DeployingAgents.examine
+
+        def move_main(*args, **kwargs):   # main moves once the examiner has certified
+            result = examine(*args, **kwargs)
+            push_main(run)
+            return result
+
+        monkeypatch.setattr(DeployingAgents, "examine", move_main)
+        run.run()
+        [examination] = run.events("examined", 2)
+        head, pr = examination["head"], run.issue(2).pr
+        assert run.events("certificate_carried", 2) and head in run.comment(pr, L.report.EVIDENCE_MARKER)
+        [merge] = run.fake.commits[2]
+        run.fake.set_status(merge, RHI, "success", VERIFIED)
+        run.run(root=2)   # another run, rooted at the issue, discharges the owner's item
+
+        assert run.issue(2, root=2).phase == Phase.DONE
+        assert head in run.comment(pr, L.report.EVIDENCE_MARKER)

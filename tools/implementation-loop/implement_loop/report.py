@@ -137,7 +137,9 @@ def render_evidence(n: int, evidence: list[dict], head_sha: str, verdicts: dict 
     return "\n".join(lines)
 
 
-def render_pr_body(n: int, title: str, st, operator: str, other: str) -> str:
+def render_pr_body(n: int, title: str, st, operator: str, other: str, examination: str | None = None) -> str:
+    """`examination` says who built, examined and certified what, where the head is not the one
+    examined (a head that carries the certificate of the head it merged)."""
     lines = [f"Refs #{n}", "", f"Implements **{title}** through the implement loop.", ""]
     if st.decisions:
         lines += ["## Decisions", "",
@@ -158,7 +160,7 @@ def render_pr_body(n: int, title: str, st, operator: str, other: str) -> str:
     follow = [f for f in st.findings if f.get("status") == "follow_up"]
     advisory = [f for f in st.findings if f.get("status") in ("advisory", "rejected")]
     lines += ["## Examination",
-              (f"- Built by {operator}; examined, probed and certified on this exact head by {other}. "
+              (f"- {examination or f'Built by {operator}; examined, probed and certified on this exact head by {other}.'} "
                f"No blocking finding remains.")]
     if follow:
         lines += [("- Reproduced but not blocking (no ledger item or safety invariant requires them; filed as a "

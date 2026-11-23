@@ -239,12 +239,14 @@ commits), at two points:
   its own issue, and the `required` check still runs on the merged head before the merge. The
   engine journals one `certificate_carried` event per carry (`issue`, `certified`: the head
   merged, `head`: the merged head, `main`: the commit of main merged), and the pull request's
-  evidence comment names the head the examiner certified. Only this merge carries: a head a
-  build round makes, a merge of main included, is examined, and a merged head whose
-  verification fails is a failed round for the builder that lands nothing. A conflict, there or
-  in `scripts/ship.sh`, is aborted and sends the issue back to build (`conflict`); the head that
-  resolves it is examined. A head the owner lands is not brought up to date (as before). A head
-  that `scripts/ship.sh` makes by merging main at the push is still examined.
+  evidence comment and the pull request name the head the examiner examined, and who certified
+  it. Only such a merge carries, read from git: two parents, the certified head and a commit of
+  main, and the tree git's own merge of the two makes; the same holds for the merge
+  `scripts/ship.sh` makes when main moves again before the push. A rebase, a head that resolves a
+  conflict, or any other change is examined, and a merged head whose verification fails is a
+  failed round for the builder that lands nothing. A conflict, there or in `scripts/ship.sh`, is
+  aborted and sends the issue back to build (`conflict`). A head the owner lands is not brought
+  up to date (as before).
 
 A conflict is work for the builder, never an engine fault, and costs no round: main moving is
 nobody's design fault (ADR 0012). No worktree keeps an unfinished rebase or merge between steps, and when a
