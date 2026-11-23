@@ -391,7 +391,8 @@ are recorded here as proposed and are part of what the owner approves.
     head the examiner certified. Only a head that is exactly `main` merged into the certified
     head carries, which the engine reads from git (its two parents, and the tree git's own merge
     of them makes), so the merge `scripts/ship.sh` makes at the push carries too. A merged head
-    whose verification fails goes back to the builder as a failed round and does not land. A
+    whose verification fails goes back to the builder as a failed round and does not land, and
+    it has lost its carry: should the builder change only its commands, the examiner sees it. A
     merge with a conflict is the builder's work, and the head that resolves it is examined, as is
     a rebased head or any other change. Landing a head the owner lands is unchanged.
 

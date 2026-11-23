@@ -1894,10 +1894,16 @@ class Engine:
         whoever made the merge (the land step, or `scripts/ship.sh` at the push). That is two
         parents, the certified head first and a commit of `main` second, and the tree git's own
         merge of the two makes. A head that resolves a conflict is no such merge, nor is a rebase
-        or a head with any other change: those are examined. Read from git alone, so a run that
-        resumes, or another run, reaches the same answer."""
+        or a head with any other change: those are examined. So is a merged head whose
+        verification has failed once (the journal's `verified` events). Read from git and the
+        journal, so a run that resumes reaches the same answer."""
         certified = st.certified_sha
         if not certified or head == certified:
+            return None
+        # A merged head that once failed its verification has lost the right to carry: whatever
+        # the builder changes next (a command, without a new commit), the examiner sees it.
+        if any(e.get("issue") == n and e.get("kind") == "verified" and e.get("head") == head and not e.get("ok")
+               for e in self.store.events()):
             return None
         parents = self.ws.git("rev-list", "--parents", "-n1", head, cwd=wt).split()[1:]
         if len(parents) != 2 or parents[0] != certified:
@@ -1916,17 +1922,19 @@ class Engine:
         """What the pull request and its evidence comment say of a head that carries the
         certificate of another (`_carried`): the head the examiner examined, and who certified it,
         the examiner or the engine's examiner bound. Empty for a head that was itself examined.
-        Read from the issue's state, which a run that adopts the issue keeps."""
+        Read from the issue's state, which a run that adopts the issue keeps. The examiner is named
+        by its role: the run that writes this may not be the run whose examiner certified."""
         examined = st.examined_sha
         if not head or not examined or examined == head:
             return ""
         bound = any(str(d.get("id", "")).startswith("examiner-bound-") and f"`{examined[:12]}`" in str(d.get("choice", ""))
                     for d in st.decisions)
-        by = (f"the engine certified it under the examiner bound, {self.other} having withheld its certificate"
-              if bound else f"{self.other} certified it")
-        return (f"{self.other} examined `{examined}` and {by}. This head `{head}` was not examined: it merges main "
-                f"into that head without a conflict, so it carries its certificate (ADR 0001, amendment 14). It "
-                f"was verified again on this exact head, and the `required` check runs on it before the merge.")
+        by = ("the engine certified it under the examiner bound, the examiner having withheld its certificate"
+              if bound else "the examiner certified it")
+        return (f"The examiner examined `{examined}` and {by}. This head `{head}` was not examined: it merges "
+                f"main into that head without a conflict, so it carries its certificate (ADR 0001, amendment "
+                f"14). It was verified again on this exact head, and the `required` check runs on it before "
+                f"the merge.")
 
     def _pr_body(self, n: int, st: IssueState, head: str) -> str:
         """The pull request's body for `head`, whose examination section names the head the
@@ -1934,7 +1942,7 @@ class Engine:
         carried = self._carried_note(st, head)
         # `examination` is passed only for a carried certificate: a head the examiner examined
         # renders the body exactly as before, through the same call as before.
-        extra = {"examination": f"Built by {self.op}. {carried}"} if carried else {}
+        extra = {"examination": carried} if carried else {}
         return report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other, **extra)
 
     def _render_evidence(self, n: int, records: list[dict], head: str, verdicts: dict) -> str:

@@ -154,6 +154,24 @@ def test_a_merged_head_that_fails_verification_goes_back_to_the_builder():
         assert len(run.agents.examined) == 2 and run.merged() == [run.agents.examined[1]] != [merged_head]
 
 
+def test_a_merged_head_that_failed_verification_does_not_carry_after_its_command_is_repaired():
+    with loop() as run:
+        path = "docs/format.txt"
+        run.main_moves(path, "first")
+        run.then_main_moves((path, "second"))
+        run.agents.extra_check = " && grep -qx first docs/format.txt"   # true of the certified head only
+
+        def use_current_format(worktree):   # the builder repairs its command, not the commit
+            if (worktree / path).read_text() == "second":
+                run.agents.extra_check = " && grep -qx second docs/format.txt"
+        run.agents.fix = use_current_format
+        run.run()
+
+        [failed] = [e for e in run.events("verified") if not e["ok"]]
+        assert run.events("round_failed") and not run.events("certificate_carried")
+        assert failed["head"] not in run.merged() or failed["head"] in run.agents.examined
+
+
 def test_a_conflicting_update_goes_to_the_builder_and_its_resolution_is_examined():
     shared = "shared/suites.txt"
     with loop(Script(files={f"docs/f{ISSUE}.txt": f"text {ISSUE}"}, lines={shared: f"suite-for-{ISSUE}"})) as run:
@@ -258,7 +276,16 @@ def test_a_run_that_adopts_the_delivery_keeps_the_examined_head_in_the_evidence(
         assert run.events("certificate_carried", 2) and head in run.comment(pr, L.report.EVIDENCE_MARKER)
         [merge] = run.fake.commits[2]
         run.fake.set_status(merge, RHI, "success", VERIFIED)
+        init = DeployingAgents.__init__
+
+        def other_operator(self, *args, **kwargs):   # the adopting run's operator is the other vendor
+            init(self, *args, **kwargs)
+            self.operator, self.other = "codex", "claude"
+
+        monkeypatch.setattr(DeployingAgents, "__init__", other_operator)
         run.run(root=2)   # another run, rooted at the issue, discharges the owner's item
 
         assert run.issue(2, root=2).phase == Phase.DONE
-        assert head in run.comment(pr, L.report.EVIDENCE_MARKER)
+        evidence = run.comment(pr, L.report.EVIDENCE_MARKER)
+        assert head in evidence
+        assert "claude examined" not in evidence.lower() and "claude certified" not in evidence.lower()
