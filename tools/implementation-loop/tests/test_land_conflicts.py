@@ -10,17 +10,23 @@ import subprocess
 import threading
 import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest import mock
 
 from helpers import SHIP, TempRepo, git, issue_body
-from implement_loop import workspace
-from implement_loop.agents import FakeAgents, Script
-from implement_loop.config import CEILINGS, Caps, Config
-from implement_loop.engine import MERGE_QUEUE, Engine
-from implement_loop.github import FakeGitHub
-from implement_loop.graph import build_plan
-from implement_loop.model import Phase
-from implement_loop.state import RunStore
+from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
+
+if TYPE_CHECKING:   # the type of `L.engine.Engine`, for the annotations
+    from implement_loop.engine import Engine as EngineType
+
+workspace = L.workspace
+FakeAgents, Script = L.agents.FakeAgents, L.agents.Script
+CEILINGS, Caps, Config = L.config.CEILINGS, L.config.Caps, L.config.Config
+MERGE_QUEUE, Engine = L.engine.MERGE_QUEUE, L.engine.Engine
+FakeGitHub = L.github.FakeGitHub
+build_plan = L.graph.build_plan
+Phase = L.model.Phase
+RunStore = L.state.RunStore
 
 # The unresolved-conflict tests run to the call ceiling: a low one keeps them short.
 LOW_CEILING = {"M": 10}
@@ -105,12 +111,12 @@ class LandConflictTests(unittest.TestCase):
         self.scripts = {}
         self.shared_paths = ["shared/suites.txt"]
         self.seed_main({self.shared_paths[0]: "base-suite\n"})
-        self._engine: Engine | None = None
-        self.peer: Engine | None = None
+        self._engine: EngineType | None = None
+        self.peer: EngineType | None = None
         self.boundary_errors = []
 
     @property
-    def engine(self) -> Engine:
+    def engine(self) -> "EngineType":
         assert self._engine is not None, "run_engine() has not run in this fixture"
         return self._engine
 
@@ -230,8 +236,10 @@ class LandConflictTests(unittest.TestCase):
             self.assert_exact_gates(self.peer)
 
     def assert_exact_gates(self, engine):
-        """No merge without a certificate for the exact head: after the last update from main, the
-        head was verified, then examined and certified, then verified again as it lands."""
+        """No merge without a certificate for the exact head: after the last conflict or update from
+        main that carried no certificate, the head was verified, then examined and certified, then
+        verified again as it lands. A head the land step merged main into without a conflict carries
+        the certificate of the head it merged (ADR 0001, amendment 14), once verified itself."""
         events = engine.store.events()
         merged = [e for e in events if e["kind"] == "merged"]
         self.assertTrue(merged, events)
@@ -241,13 +249,21 @@ class LandConflictTests(unittest.TestCase):
             self.assertIn((event["pr"], head), calls)
             self.assertEqual(self.gh.prs[event["pr"]]["head"]["sha"], head)
             mine = [e for e in events if e.get("issue") == n and e["seq"] < event["seq"]]
-            barrier = max((e["seq"] for e in mine if e["kind"] in ("conflict", "updated_from_main")), default=0)
+            carried = {e["head"]: e for e in mine if e["kind"] == "certificate_carried"}
+            certified = head
+            while certified in carried:   # back to the head the examiner certified, each carried head verified
+                carry = carried[certified]
+                self.assertTrue([e for e in mine if e["kind"] == "verified" and e["ok"] is True
+                                 and e["head"] == certified and e["seq"] < carry["seq"]], events)
+                certified = carry["certified"]
+            barrier = max((e["seq"] for e in mine if e["kind"] == "conflict" or (
+                e["kind"] == "updated_from_main" and e.get("to") not in carried)), default=0)
             exams = [e for e in mine if e["kind"] == "examined" and e["seq"] > barrier]
             self.assertTrue(exams, f"no examination after the last update from main: {events}")
             exam = exams[-1]
             self.assertTrue(exam["certify"])
             examined = exam["head"]
-            self.assertEqual(examined, head, "the examined head is the head that lands")
+            self.assertEqual(examined, certified, "the examined head is the head that lands, or carries its certificate")
             verified = [e for e in mine if e["kind"] == "verified" and e["ok"] is True and e["seq"] > barrier]
             self.assertTrue([e for e in verified if e["head"] == examined and e["seq"] < exam["seq"]],
                             f"{examined} was examined before it was verified: {events}")
@@ -309,7 +325,8 @@ class LandConflictTests(unittest.TestCase):
         self.assertEqual(len(land_conflicts(self.events())), 1)
         updates = self.events("updated_from_main")
         self.assertTrue(any(e.get("phase") == "land" for e in updates))
-        self.assertGreaterEqual(len(self.events("examined")), 3)
+        self.assertGreaterEqual(len(self.events("examined")), 2)
+        self.assertTrue(self.events("certificate_carried"), "the clean update before land kept the certificate")
         self.assertFalse(self.events("round_failed"))
         # No operation is left in any worktree of either run.
         assert self.peer is not None
@@ -558,7 +575,7 @@ class LandConflictTests(unittest.TestCase):
             finally:
                 engine.claims.release(MERGE_QUEUE, engine.owner)
 
-        with mock.patch("implement_loop.engine.VERSION", "0.2.0"), \
+        with mock.patch.object(L.engine, "VERSION", "0.2.0"), \
                 mock.patch.object(workspace.Workspace, "push", old_push), \
                 mock.patch.object(Engine, "_step_land", old_land):
             self.run_engine(agents)

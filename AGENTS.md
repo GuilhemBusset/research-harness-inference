@@ -223,7 +223,10 @@ do not depend on one. In the order a change meets them:
 - the implement loop's verifier, in the sandbox, on the exact head: the hygiene scan, the issue's
   commands, the adopted probes and protected paths; then the examiner's certificate for that head,
   which reviews every change to a test, and which from an issue's fourth examination on only an
-  unmet item or a finding that names a safety invariant withholds;
+  unmet item or a finding that names a safety invariant withholds. When the land step brings a
+  certified head up to date with `main` without a conflict, the merged head keeps that
+  certificate: it is verified again on its exact head and `required` runs on it before the merge,
+  but it is not examined again. A head that resolves a conflict is examined;
 - CI (`.github/workflows/ci.yml`), with no AWS credentials and no secrets: `scripts/check.sh` and
   the history scan, ending in one job, `required`;
 - the GitHub ruleset (`setup/pr-only-main.json`): a pull request for every change to `main`,

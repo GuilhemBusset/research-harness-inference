@@ -1867,13 +1867,31 @@ class Engine:
         # surface in a fault-repair run, is a problem here.
         problems += gate.protected_problems(self.ws.changed_files(wt, base), st.grants, self.repair)
         problems += [f"open finding {f['id']} still reproduces: {f['title']}" for f in still]
-        self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
+        env = environment_problem(evidence) if problems else ""
+        # A carried certificate (`_carried`) stands on the engine's verification of the merged head:
+        # once that fails, it is revoked, for landing and for any further carry, and only a new
+        # examination that certifies can let a head of this issue land. So is the certificate a
+        # failing merged head would have carried, on its first verification. The revocation is saved
+        # with the failed evidence, before the failure is journaled, so a run that stops after
+        # either resumes without it.
+        revoked = st.certified_sha if problems and not env and st.certified_sha and (
+            st.certified_sha != st.examined_sha or self._carried(n, st, wt, head) is not None) else None
+        if revoked:
+            st.certified_sha = None
         st.evidence, st.base_sha = evidence, base
         self.store.put(st)
+        self.store.event("verified", issue=n, head=head, ok=ok and not problems, problems=problems, closed=closed)
+        if revoked:
+            self.store.event("certificate_revoked", issue=n, head=head, certified=revoked)
         if not problems:
+            carried = self._carried(n, st, wt, head)
+            if carried is not None:
+                if not any(e.get("issue") == n and e.get("kind") == "certificate_carried" and e.get("head") == head
+                           for e in self.store.events()):   # one event per carry, a resumed one included
+                    self.store.event("certificate_carried", issue=n, head=head, **carried)
+                return self._set_phase(n, Phase.LAND, certified_sha=head, verified_sha=head, head_sha=head)
             nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
-        env = environment_problem(evidence)
         if env:
             return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}", resume=Phase.VERIFY)
         # The feedback here is what the build left for its builder: the decisions on its requests
@@ -1881,6 +1899,69 @@ class Engine:
         # learnt that its restated commands were refused, nor why, and restated them nine times.
         self._round_failed(n, problems, [f["id"] for f in still], notes=notes,
                            told=[f for f in st.feedback if f not in notes] + failed_output(evidence))
+
+    def _carried(self, n: int, st: IssueState, wt: Path, head: str) -> dict | None:
+        """{certified, main} when `head` may carry the certificate of the head it merged (ADR 0001,
+        amendment 14): `head` is exactly `main` merged into the certified head without a conflict,
+        whoever made the merge (the land step, or `scripts/ship.sh` at the push). That is two
+        parents, the certified head first and a commit of `main` second, and the tree git's own
+        merge of the two makes. A head that resolves a conflict is no such merge, nor is a rebase
+        or a head with any other change: those are examined. So is a merged head whose
+        verification has failed once (the journal's `verified` events). Read from git and the
+        journal, so a run that resumes reaches the same answer."""
+        certified = st.certified_sha
+        if not certified or head == certified:
+            return None
+        # A merged head that once failed its verification has lost the right to carry: whatever
+        # the builder changes next (a command, without a new commit), the examiner sees it.
+        if any(e.get("issue") == n and e.get("kind") == "verified" and e.get("head") == head and not e.get("ok")
+               for e in self.store.events()):
+            return None
+        parents = self.ws.git("rev-list", "--parents", "-n1", head, cwd=wt).split()[1:]
+        if len(parents) != 2 or parents[0] != certified:
+            return None
+        main = parents[1]
+        if not self.ws.is_ancestor(wt, main, self.ws.base_ref()):
+            return None
+        merge = subprocess.run(["git", "merge-tree", "--write-tree", certified, main], cwd=wt,
+                               capture_output=True, text=True, check=False)
+        tree = merge.stdout.split("\n", 1)[0].strip() if merge.returncode == 0 else ""
+        if not tree or tree != self.ws.git("rev-parse", f"{head}^{{tree}}", cwd=wt):
+            return None
+        return {"certified": certified, "main": main}
+
+    def _carried_note(self, st: IssueState, head: str) -> str:
+        """What the pull request and its evidence comment say of a head that carries the
+        certificate of another (`_carried`): the head the examiner examined, and who certified it,
+        the examiner or the engine's examiner bound. Empty for a head that was itself examined.
+        Read from the issue's state, which a run that adopts the issue keeps. The examiner is named
+        by its role: the run that writes this may not be the run whose examiner certified."""
+        examined = st.examined_sha
+        if not head or not examined or examined == head:
+            return ""
+        bound = any(str(d.get("id", "")).startswith("examiner-bound-") and f"`{examined[:12]}`" in str(d.get("choice", ""))
+                    for d in st.decisions)
+        by = ("the engine certified it under the examiner bound, the examiner having withheld its certificate"
+              if bound else "the examiner certified it")
+        return (f"The examiner examined `{examined}` and {by}. This head `{head}` was not examined: it merges "
+                f"main into that head without a conflict, so it carries its certificate (ADR 0001, amendment "
+                f"14). It was verified again on this exact head, and the `required` check runs on it before "
+                f"the merge.")
+
+    def _pr_body(self, n: int, st: IssueState, head: str) -> str:
+        """The pull request's body for `head`, whose examination section names the head the
+        examiner examined when `head` carries its certificate."""
+        carried = self._carried_note(st, head)
+        # `examination` is passed only for a carried certificate: a head the examiner examined
+        # renders the body exactly as before, through the same call as before.
+        extra = {"examination": carried} if carried else {}
+        return report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other, **extra)
+
+    def _render_evidence(self, n: int, records: list[dict], head: str, verdicts: dict) -> str:
+        """The evidence comment of issue `n` for `head`, naming the head the examiner examined
+        when `head` carries its certificate."""
+        text, carried = report.render_evidence(n, records, head, verdicts), self._carried_note(self.store.issue(n), head)
+        return f"{text}\n\n{carried}" if carried else text
 
     def _close_findings(self, n: int, st: IssueState, wt: Path, evidence: list[dict]) -> list[str]:
         """An open finding closes only when its reproduction passes on the new head (a probe's
@@ -2198,7 +2279,10 @@ class Engine:
                 if st.probes or any(c.get("author") == "examiner" for c in st.commands):
                     return self._set_phase(n, Phase.VERIFY)   # an earlier engine's probes leave the branch first
                 # Main may have moved since the certificate. Merging it makes a new head, which is
-                # verified and certified again (a focused delta examination) before it may land.
+                # verified again on its exact head before it may land. Merged without a conflict, it
+                # keeps the certificate of the head it merged (`_carried`; ADR 0001, amendment 14):
+                # main's change was certified in its own issue, and CI's `required` still runs on
+                # it. A conflict is the builder's work, and the head that resolves it is examined.
                 sync = self.ws.update(wt)
                 if sync.status == "conflict":
                     self.ws.abort_in_progress(wt)
@@ -2341,7 +2425,7 @@ class Engine:
         pushed (`_owner_lands`)."""
         assert st.branch is not None
         issue = self.plan.issues[n]
-        body = report.render_pr_body(n, issue.title, st, self.op, self.other)
+        body = self._pr_body(n, st, head)
         pr = self.gh.find_pr(st.branch)
         if pr is None or pr.get("state") != "open":
             pr = self.gh.create_pr(st.branch, self.cfg.base_branch, issue.title, body)
@@ -2349,7 +2433,7 @@ class Engine:
             self.gh.update_pr(pr["number"], body)
         st.pr = pr["number"]
         self.store.put(st)
-        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, report.render_evidence(n, st.evidence, head, st.verdicts))
+        self._upsert_comment(st.pr, report.EVIDENCE_MARKER, self._render_evidence(n, st.evidence, head, st.verdicts))
         return pr
 
     # ------------------------------------------------------------------ landed by the owner
@@ -2732,7 +2816,7 @@ class Engine:
         discharged = checked | verified
         records = evidence + deployed + list(discharged.values())
         evidence_comment = (self._upsert_comment(st.pr, report.EVIDENCE_MARKER,
-                                                 report.render_evidence(n, records, head, verdicts))
+                                                 self._render_evidence(n, records, head, verdicts))
                             if st.pr else None)
         link = (evidence_comment or {}).get("html_url", "")
         proven = {e["criterion"] for e in evidence if e["passed"]} | set(verdicts) | set(discharged)
@@ -2758,7 +2842,7 @@ class Engine:
         # and not updated, comes last of the two and is recorded at once; and the comment that says
         # how the issue ends is written before anything that cannot be taken back.
         if discharged and st.pr:   # the pull request listed them as left for later
-            self._safe(self.gh.update_pr, st.pr, report.render_pr_body(n, self.plan.issues[n].title, st, self.op, self.other))
+            self._safe(self.gh.update_pr, st.pr, self._pr_body(n, st, head))
         self._publish_deferred(n, st)
         self._file_followup(n, st)
         self.store.put(st)
@@ -3121,7 +3205,7 @@ class Engine:
         verdicts = {i: v for i, v in st.verdicts.items() if v.get("verdict") == "met"}
         adopted = elsewhere(self.gh.get_issue(n).get("body") or "", before.get("html_url") or "")
         for _ in range(DISCHARGE_WRITES):
-            comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, report.render_evidence(
+            comment = self._upsert_comment_answered(st.pr or 0, report.EVIDENCE_MARKER, self._render_evidence(
                 n, [*base, *adopted.values()], evidence_head, verdicts))
             link = (comment or {}).get("html_url", "")
             body = self.gh.get_issue(n).get("body") or ""
