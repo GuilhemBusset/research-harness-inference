@@ -35,5 +35,6 @@ SMOKE_TEST_IDS: tuple[str, ...] = (
     # tests/smoke/test_smoke.py: the tests of the smoke tests themselves, which reach no stack.
     "ids-listed",
     "deployed-need-endpoint",
+    "first-stream-settles",
     "environment",
 )
