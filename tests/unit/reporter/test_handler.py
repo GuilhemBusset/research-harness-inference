@@ -22,6 +22,8 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
+from rhi_lifecycle import serving
+from rhi_lifecycle.stages import Stage
 from rhi_reporter import handler, measure
 from rhi_reporter.github import SECRET_VARIABLE, RefusedError
 from rhi_reporter.status import VERIFIED_DESCRIPTION, CommitStatus, Description, State
@@ -395,6 +397,22 @@ def test_a_failed_verification_names_the_last_stage_an_instance_reached(
     assert MARKER not in str(client.posted) and MARKER not in caplog.text
     # The mark was read from the folder of the event's own execution.
     assert stub.objects_read == [(BUCKET, f"verification/{stub.execution}/last-stages")]
+
+
+def test_a_failed_verification_names_an_instance_in_service_by_the_stage_serving(stub: Stub, commit: str) -> None:
+    # One instance in service and one that stopped at a stage of a start, under the function's
+    # allow-list: the stages of a start and the stage serving (`src/rhi/pipeline/reporter.py`).
+    stub.mark("last-stages", f"{serving.STAGE}\nweights\n")
+    client = Client()
+    run(
+        verification(stub.execution, "FAILED"),
+        stub,
+        client,
+        lifecycle_stages=(*(stage.value for stage in Stage), serving.STAGE),
+    )
+    named = {description for _, _, context, description in client.posted if "/lifecycle/" in context}
+    assert named == {serving.STAGE, "weights"}
+    assert not [context for _, _, context, _ in client.posted if context.endswith("/dropped")]
 
 
 @pytest.mark.parametrize("left", ["nothing", "another execution's", "marks that cannot be listed"])
