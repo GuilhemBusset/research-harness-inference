@@ -246,8 +246,9 @@ commits), at two points:
   conflict, or any other change is examined, and a merged head whose verification fails is a
   failed round for the builder that lands nothing; that head never carries afterwards, so a
   repaired command on it is examined. The same holds when the failure comes after the carry (a
-  merge GitHub refused sends the head to be verified again): the carry is lost and the head is
-  examined before it lands. The examiner is named by its role, so a run that adopts the
+  merge GitHub refused sends the head to be verified again): the carried certificate is revoked
+  (`certificate_revoked`), for landing and for any further carry, and only a new examination
+  that certifies lets a head of the issue land. The examiner is named by its role, so a run that adopts the
   issue does not credit its own examiner. A conflict, there or in `scripts/ship.sh`, is
   aborted and sends the issue back to build (`conflict`). A head the owner lands is not brought
   up to date (as before).

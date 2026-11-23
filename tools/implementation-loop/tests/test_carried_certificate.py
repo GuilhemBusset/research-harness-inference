@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from dataclasses import replace
 from shlex import quote
 
+import pytest
+
 from helpers import SHIP, TempRepo, git, issue_body
 from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
 
@@ -173,30 +175,45 @@ def test_a_merged_head_that_failed_verification_does_not_carry_after_its_command
         assert failed["head"] not in run.merged() or failed["head"] in run.agents.examined
 
 
-def test_a_carried_head_that_fails_a_later_verification_is_examined_before_it_lands(tmp_path, monkeypatch):
+@pytest.mark.parametrize("case", ["certified", "withheld", "main moves"])
+def test_a_carried_head_that_fails_a_later_verification_lands_only_on_a_new_certificate(case, tmp_path, monkeypatch):
     with loop() as run:
         run.then_main_moves(("docs/later.txt", "later\n"))
         outside = tmp_path / "format"   # what the check reads changes; the head does not
         outside.write_text("first\n")
         run.agents.extra_check = f" && grep -qx first {quote(str(outside))}"
-        merge = run.fake.merge_pr
+        merge, examine = run.fake.merge_pr, run.agents.examine
 
         def refuse_once(*args):   # GitHub refuses the carried head's merge once: it is verified again
             monkeypatch.setattr(run.fake, "merge_pr", merge)
             outside.write_text("second\n")
+            if case == "main moves":   # and main moves while the builder repairs
+                run.main_moves("docs/second.txt", "second\n")
             raise L.github.GitHubError("merge refused")
 
         def repair_command(worktree):   # the builder repairs its command, not the commit
             if outside.read_text() == "second\n":
                 run.agents.extra_check = f" && grep -qx second {quote(str(outside))}"
+
+        def withhold_once(*args):   # the examination after the failure withholds its certificate
+            result = examine(*args)
+            if case == "withheld" and len(run.agents.examined) == 2:
+                result.certify = False
+            return result
         monkeypatch.setattr(run.fake, "merge_pr", refuse_once)
+        monkeypatch.setattr(run.agents, "examine", withhold_once)
         run.agents.fix = repair_command
         run.run()
 
-        [carry] = run.events("certificate_carried")
-        assert [v["ok"] for v in run.events("verified") if v["head"] == carry["head"]][:2] == [True, False]
-        assert run.merged() == [carry["head"]] and run.agents.examined[-1] == carry["head"]
-        assert run.store.issue(ISSUE).phase == Phase.DONE
+        [carry, *_] = run.events("certificate_carried")
+        [failed] = [v for v in run.events("verified") if not v["ok"]]
+        assert failed["head"] == carry["head"] and run.store.issue(ISSUE).phase == Phase.DONE
+        later = [e for e in run.store.events() if e.get("issue") == ISSUE and e["seq"] > failed["seq"]]
+        certified = [e["head"] for e in later if e["kind"] == "examined" and e["certify"]]
+        [merged] = run.merged()   # the one merge request that reached GitHub after the refusal
+        assert certified, "a new examination certified after the failure"
+        assert merged == certified[-1] or any(
+            e["kind"] == "certificate_carried" and e["head"] == merged and e["certified"] == certified[-1] for e in later)
 
 
 def test_a_conflicting_update_goes_to_the_builder_and_its_resolution_is_examined():

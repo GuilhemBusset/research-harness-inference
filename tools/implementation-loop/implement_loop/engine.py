@@ -1877,11 +1877,18 @@ class Engine:
                            for e in self.store.events()):   # one event per carry, a resumed one included
                     self.store.event("certificate_carried", issue=n, head=head, **carried)
                 return self._set_phase(n, Phase.LAND, certified_sha=head, verified_sha=head, head_sha=head)
-            nxt = Phase.LAND if head == st.certified_sha and not self._carry_lost(n, st, head) else Phase.EXAMINE
+            nxt = Phase.LAND if head == st.certified_sha else Phase.EXAMINE
             return self._set_phase(n, nxt, verified_sha=head, head_sha=head)
         env = environment_problem(evidence)
         if env:
             return self._wait(n, WAIT_ENVIRONMENT, f"the host cannot run this issue's checks: {env}", resume=Phase.VERIFY)
+        if st.certified_sha and st.certified_sha != st.examined_sha:
+            # A carried certificate (`_carried`) stands on the engine's verification of the merged
+            # head: once that fails, it is revoked, for landing and for any further carry, and only
+            # a new examination that certifies can let a head of this issue land.
+            self.store.event("certificate_revoked", issue=n, head=head, certified=st.certified_sha)
+            st.certified_sha = None
+            self.store.put(st)
         # The feedback here is what the build left for its builder: the decisions on its requests
         # (and the notes above). A failed verification used to replace it, so #32's builder never
         # learnt that its restated commands were refused, nor why, and restated them nine times.
@@ -1917,19 +1924,6 @@ class Engine:
         if not tree or tree != self.ws.git("rev-parse", f"{head}^{{tree}}", cwd=wt):
             return None
         return {"certified": certified, "main": main}
-
-    def _carry_lost(self, n: int, st: IssueState, head: str) -> bool:
-        """True when `head` holds a carried certificate (a `certificate_carried` event names it) and
-        a verification of it has failed since: its certificate no longer stands on the examiner's
-        and the engine's word, since what the builder repaired next (a command, without a new
-        commit) was never examined. Such a head goes to the examiner, as `_carried` refuses a
-        carry to a head that failed before it. A head the examiner examined itself keeps its own
-        certificate. Read from the journal, so a run that resumes reaches the same answer."""
-        if st.examined_sha == head:
-            return False
-        events = [e for e in self.store.events() if e.get("issue") == n and e.get("head") == head]
-        carried = [i for i, e in enumerate(events) if e.get("kind") == "certificate_carried"]
-        return bool(carried) and any(e.get("kind") == "verified" and not e.get("ok") for e in events[carried[0]:])
 
     def _carried_note(self, st: IssueState, head: str) -> str:
         """What the pull request and its evidence comment say of a head that carries the

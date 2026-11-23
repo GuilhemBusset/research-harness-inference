@@ -393,6 +393,8 @@ are recorded here as proposed and are part of what the owner approves.
     of them makes), so the merge `scripts/ship.sh` makes at the push carries too. A merged head
     whose verification fails goes back to the builder as a failed round and does not land, and
     it has lost its carry: should the builder change only its commands, the examiner sees it. A
+    carried certificate whose head fails a later verification is revoked: only a new examination
+    that certifies lets the issue land, and nothing carries from the revoked head. A
     merge with a conflict is the builder's work, and the head that resolves it is examined, as is
     a rebased head or any other change. Landing a head the owner lands is unchanged.
 
