@@ -11,7 +11,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-from helpers import LOOP_TOML, REPO_ROOT
+from helpers import INVARIANTS, LOOP_TOML, REPO_ROOT
 from implement_loop.config import load_policy
 from test_engine import EngineCase
 
@@ -30,7 +30,7 @@ class InvariantNames(EngineCase):
 
     def test_an_engine_whose_loop_toml_gives_no_names_refuses_to_start(self):
         for text in ('[host]\nlacks = []\n', '[invariants]\nnames = []\n', '[invariants]\nnames = [""]\n',
-                     '[invariants]\nnames = ["secret exposure", " "]\n'):   # a blank name would match any
+                     f'[invariants]\nnames = ["{INVARIANTS[0]}", " "]\n'):   # a blank name would match any
             with tempfile.TemporaryDirectory() as tmp, self.subTest(text=text):
                 path = Path(tmp) / "loop.toml"
                 path.write_text(text)
@@ -52,7 +52,7 @@ class InvariantNames(EngineCase):
             (engine / "loop.toml").write_text(text)
             self.assertFalse(set(load_policy(engine / "loop.toml")["invariants"]) & set(load_policy(LOOP_TOML)["invariants"]))
             tests = ["test_review_fixes.FindingNew1OwnerFindings", "test_review_fixes.Finding02RevertFindings",
-                     "test_examiner_bound"]
+                     "test_examiner_bound", "test_live.LiveAdapterTests", "test_codex_escalation"]
             run = subprocess.run([sys.executable, "-m", "unittest", *tests], cwd=engine / "tests",
                                  capture_output=True, text=True, check=False)
             self.assertEqual(run.returncode, 0, run.stderr[-3000:])
