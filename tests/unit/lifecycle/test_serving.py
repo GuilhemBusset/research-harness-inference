@@ -467,7 +467,8 @@ def test_a_hung_engine_is_restarted() -> None:
                     assert world.restarts == 0
                     assert await world.tokens() == 0
                 await world.clock.advance(5)
-            await until(lambda: world.restarts > 0)
+            # The check counts a restart once the host has made it: its count ends the wait.
+            await until(lambda: registry.get_sample_value(RESTARTS) == 1)
 
         # The first check restarted it: the second is not due before the minute.
         assert world.clock.now < NOW + 60
@@ -486,7 +487,8 @@ def test_a_dead_engine_is_restarted() -> None:
         registry = CollectorRegistry()
 
         async with world.doing(world.agent(registry=registry).run()):
-            await until(lambda: world.restarts > 0)
+            # The check counts a restart once the host has made it: its count ends the wait.
+            await until(lambda: registry.get_sample_value(RESTARTS) == 1)
 
         # At its first check, with no wait: nothing was there to answer.
         assert world.clock.now == NOW
@@ -522,18 +524,23 @@ def test_a_busy_engine_that_answers_no_completion_in_time_is_not_restarted() -> 
 def test_an_engine_that_stopped_counting_tokens_is_restarted_a_minute_after_it_last_counted_one() -> None:
     async def scenario() -> None:
         world = World()
-        # The engine counts tokens for 15 seconds, then hangs: the heartbeat of the 15th second is
+        # The engine counts tokens for 5 seconds, then hangs: the heartbeat of the 5th second is
         # the last that reads more tokens than the one before it.
-        world.app = Busy(world.clock, stalls_at=NOW + 15).app
+        world.app = Busy(world.clock, stalls_at=NOW + 5).app
         registry = CollectorRegistry()
         agent = world.agent(registry=registry)
+        for _ in range(4):
+            await asyncio.to_thread(agent.beat)
+            await world.clock.advance(5)
 
-        # The first completion fails at 30 seconds, 15 seconds after the engine last counted a token.
+        # The first completion is sent at 20 seconds and fails at 50, which is 45 seconds after the
+        # engine last counted a token: longer than a completion may take, and within the minute.
+        assert serving.PROBE_SECONDS < 45 < serving.PROBE_INTERVAL_SECONDS
         assert not await minute(world, agent)
         assert world.restarts == 0
         assert registry.get_sample_value(RESTARTS) == 0
 
-        # The second fails at 90 seconds, 75 seconds after.
+        # The second fails at 110 seconds, 105 seconds after.
         assert await minute(world, agent)
         assert len(world.asked) == 2
         assert world.restarts == 1
