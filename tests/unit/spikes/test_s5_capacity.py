@@ -25,13 +25,19 @@ if TYPE_CHECKING:
 
 REPO = Path(__file__).resolve().parents[3]
 COMMIT = "c" * 40
-FLOORS = s5.Floors(5, 15, 10)
+FLOORS = s5.Floors(5, 15, 10, 0.5)
 
 
 def class_numbers(**changed: float) -> dict[str, float]:
     """Class-size numbers of both shapes that pass, with `changed` (by the several-agents name's
     quantity) for the several-agents run; a value of -1 leaves the number out."""
-    passing = {s5.Figure.TTFT_P95: 4, s5.Figure.STREAM_MEDIAN: 16, s5.Figure.STREAM_P10: 11, s5.Figure.PREEMPTIONS: 0}
+    passing = {
+        s5.Figure.TTFT_P95: 4,
+        s5.Figure.STREAM_MEDIAN: 16,
+        s5.Figure.STREAM_P10: 11,
+        s5.Figure.PREEMPTIONS: 0,
+        s5.Figure.FAILED_SHARE: 0,
+    }
     numbers: dict[str, float] = {"class_size": 20}
     for shape in s5.Shape:
         for figure, value in passing.items():
@@ -51,6 +57,10 @@ def test_a_missed_floor_fails_even_when_another_number_is_missing() -> None:
     assert spike.verdict(class_numbers(ttft_p95=-1)) is Verdict.NOT_MEASURED
     assert spike.verdict(class_numbers(ttft_p95=-1, preemptions=1)) is Verdict.FAIL
     assert spike.verdict(class_numbers(preemptions=-1, stream_median=14)) is Verdict.FAIL
+    # The failed share is one of those numbers: missing, no verdict; above its floor, a fail.
+    assert spike.verdict(class_numbers(failed_share=-1)) is Verdict.NOT_MEASURED
+    assert spike.verdict(class_numbers(failed_share=-1, preemptions=1)) is Verdict.FAIL
+    assert spike.verdict(class_numbers(ttft_p95=-1, failed_share=1)) is Verdict.FAIL
 
 
 def test_one_job_is_one_served_build(monkeypatch: pytest.MonkeyPatch) -> None:

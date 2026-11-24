@@ -157,6 +157,9 @@ class Config:
     target_stream_median_tokens_per_second: float
     target_stream_p10_tokens_per_second: float
     cached_share_flag_percent: float
+    # The failed requests, in percent of the requests sent, that a class-size run of spike S5 may
+    # have and still pass (`spikes/s5_capacity.py`). Only the spike's verdict reads it.
+    target_failed_requests_percent: float
     # The days the pipeline's log group keeps its state changes (`rhi.pipeline.events`), a period
     # CloudWatch Logs takes. Only synthesis of the pipeline stack reads it.
     pipeline_events_retention_days: int
@@ -435,6 +438,7 @@ KEYS: dict[str, Key] = {
     "target_stream_median_tokens_per_second": _NUMBER_ABOVE_ZERO,
     "target_stream_p10_tokens_per_second": _NUMBER_ABOVE_ZERO,
     "cached_share_flag_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
+    "target_failed_requests_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
     "pipeline_events_retention_days": Key(
         "a whole number of days that CloudWatch Logs takes as a retention period, such as 30, 90 or 365",
         _log_retention_days,
@@ -495,6 +499,10 @@ DEFAULTS: dict[str, object] = {
     "target_stream_median_tokens_per_second": 15,
     "target_stream_p10_tokens_per_second": 10,
     "cached_share_flag_percent": 85,
+    # The design gives no floor for spike S5's failed requests (issue E3-52): 0.5%, the share of
+    # failures that section 7.3's objective for the gateway's answers allows (99.5% answered),
+    # until the owner confirms it or names another.
+    "target_failed_requests_percent": 0.5,
     # The design gives no period for the pipeline's events, which hold no personal data (issue
     # E4-30): 90 days, the period of every log group of the stage (section 6.6).
     "pipeline_events_retention_days": 90,
