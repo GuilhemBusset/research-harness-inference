@@ -227,6 +227,8 @@ def test_optional_fields() -> None:
             pytest.param("coursework", {"zones": zones}, "zones", id=f"zones-{case}")
             for case, zones in (
                 ("not-a-list", "example-zone-a"),
+                # A list is read and a tuple is held: a tuple is not what a source gives.
+                ("a-tuple", ("example-zone-a",)),
                 ("empty", []),
                 ("not-text", ["example-zone-a", 2]),
                 ("a-zone-twice", ["example-zone-a", "example-zone-b", "example-zone-a"]),

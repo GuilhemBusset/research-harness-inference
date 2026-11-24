@@ -523,7 +523,8 @@ def _zones(pool: str, entry: Mapping[str, object]) -> tuple[str, ...] | None:
     if field not in entry:
         return None
     value = entry[field]
-    if not isinstance(value, (list, tuple)) or not value:
+    # A list, as every source of the configuration gives one: the tuple is how the pool holds it.
+    if not isinstance(value, list) or not value:
         raise PoolConfigError(pool, field, "must be a list of zone names that is not empty")
     if not all(isinstance(item, str) and ZONE_NAME.fullmatch(item) for item in value):
         raise PoolConfigError(

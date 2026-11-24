@@ -623,6 +623,13 @@ def test_a_refused_list_of_zones_is_named_by_its_key(tmp_path: Path, value: str)
         assert MARK not in message
 
 
+def test_the_key_zones_is_read_from_a_list_and_held_as_a_tuple() -> None:
+    key = config.KEYS["zones"]
+    assert key.parse(list(VPC_ZONES)) == VPC_ZONES
+    with pytest.raises(ValueError):  # a key's parser says only that it refuses: the loader words the refusal
+        key.parse(VPC_ZONES)
+
+
 def test_a_pools_zones_are_read_against_the_key(tmp_path: Path) -> None:
     # A zone the key does not list: no subnet of the VPC is in it.
     message = refusal(tmp_path, with_zones(json.dumps(VPC_ZONES), f'["example-zone-a", "zone{MARK}-e"]'))

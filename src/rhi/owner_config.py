@@ -27,8 +27,9 @@ that key does not begin with the region's first three zones by name, or in which
 does not offer one of the pool's instance types, its fallbacks included. A pool's zones are its own
 list; without one, the first three of the key `zones`; without that key, the region's first three
 by name. A refusal names the pool, and the zone and the instance type by their positions in the
-configuration, never a zone's name, an instance type or a text of AWS; a call EC2 or the SDK
-refuses is named, and its error is not repeated. `check` asks nothing: it stays offline.
+configuration, never a zone's name, an instance type or a text of AWS. A call that fails is named,
+whatever the SDK raised, and so is one whose answer cannot be read: the error's text, which can
+hold EC2's answer, is not repeated. `check` asks nothing: it stays offline.
 
 `values` adds the value of each key of `config.PRIVATE_KEYS`, and each line of its standard
 input, to the list the scanner reports as `local-value` (tools/hygiene/README.md, "Values only
@@ -114,26 +115,62 @@ def _ordinal(index: int) -> str:
     return f"{position}{ending}"
 
 
-def _ec2(client: Any) -> tuple[Any, tuple[type[Exception], ...]]:
-    """The EC2 client, the caller's or one made with the caller's own credentials and region, and
-    the errors a call to it raises, as `config._ssm` gives them for SSM. Their messages are AWS's:
-    every caller replaces them."""
+def _ec2(client: Any) -> Any:
+    """The EC2 client: the caller's, or one made with the caller's own credentials and region, as
+    `config._ssm` makes the SSM client. The text of an error of the SDK is AWS's and is not repeated."""
+    if client is not None:
+        return client
     # Imported here: the check, the list of values and the module itself load without the SDK.
     import boto3
     import botocore.exceptions
 
-    errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
     try:
-        return (boto3.client("ec2") if client is None else client), errors
+        return boto3.client("ec2")
     except botocore.exceptions.NoRegionError:
         raise ZoneError("no EC2 client can be made: the caller's AWS configuration must give a region") from None
-    except errors as error:
+    except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError) as error:
         # The class names the cause; its text is the SDK's and is not repeated.
         raise ZoneError(f"no EC2 client can be made: the AWS SDK raised {type(error).__name__}") from None
 
 
 def _asked(call: str) -> ZoneError:
-    return ZoneError(f"the zones cannot be checked: EC2's {call} failed, with the caller's credentials and region")
+    return ZoneError(
+        f"the zones cannot be checked: EC2's {call} failed, or its answer cannot be read, "
+        "with the caller's credentials and region"
+    )
+
+
+def _region_zones(client: Any) -> list[str]:
+    """The region's zones of the type availability-zone, sorted by name."""
+    try:
+        described = client.describe_availability_zones(
+            Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}]
+        )
+        # The SDK leaves out of an answer a list that EC2 gave no item of.
+        return sorted(str(zone["ZoneName"]) for zone in described.get("AvailabilityZones", []))
+    except Exception:  # noqa: BLE001 - whatever the SDK raises, its text is AWS's: the call is named instead
+        raise _asked("DescribeAvailabilityZones") from None
+
+
+def _offered(client: Any, kinds: list[str]) -> set[tuple[str, str]]:
+    """Which zone offers which of the instance types `kinds`, as (zone, type) pairs, from every
+    page of the answer."""
+    offered: set[tuple[str, str]] = set()
+    request: dict[str, Any] = {
+        "LocationType": "availability-zone",
+        "Filters": [{"Name": "instance-type", "Values": kinds}],
+    }
+    try:
+        while True:
+            page = client.describe_instance_type_offerings(**request)
+            # The SDK leaves the list out of an answer that holds no offer: no zone offers the types.
+            offers = page.get("InstanceTypeOfferings", [])
+            offered |= {(str(offer["Location"]), str(offer["InstanceType"])) for offer in offers}
+            if not page.get("NextToken"):
+                return offered
+            request["NextToken"] = page["NextToken"]
+    except Exception:  # noqa: BLE001 - whatever the SDK raises, its text is AWS's: the call is named instead
+        raise _asked("DescribeInstanceTypeOfferings") from None
 
 
 def check_zones(loaded: config.Config, client: Any = None) -> None:
@@ -141,33 +178,12 @@ def check_zones(loaded: config.Config, client: Any = None) -> None:
     types (the module's docstring, "The zone check"), and raises `ZoneError` for the first that is
     not, or for a call that fails. `client` is an EC2 client of the AWS SDK; without one, the
     caller's credentials and region make it."""
-    client, errors = _ec2(client)
-    try:
-        described = client.describe_availability_zones(
-            Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}]
-        )
-    except errors:
-        raise _asked("DescribeAvailabilityZones") from None
-    region = sorted(zone["ZoneName"] for zone in described["AvailabilityZones"])
+    client = _ec2(client)
+    region = _region_zones(client)
     first = tuple(region[: config.FIRST_ZONES])
-
-    # Which zone offers which instance type, as (zone, type) pairs.
-    offered: set[tuple[str, str]] = set()
     kinds = sorted({kind for pool in loaded.pools for kind in pool.instance_types})
-    if kinds:
-        request: dict[str, Any] = {
-            "LocationType": "availability-zone",
-            "Filters": [{"Name": "instance-type", "Values": kinds}],
-        }
-        try:
-            while True:
-                page = client.describe_instance_type_offerings(**request)
-                offered |= {(offer["Location"], offer["InstanceType"]) for offer in page["InstanceTypeOfferings"]}
-                if not page.get("NextToken"):
-                    break
-                request["NextToken"] = page["NextToken"]
-        except errors:
-            raise _asked("DescribeInstanceTypeOfferings") from None
+    # EC2 refuses a filter with no value: pools that list no instance type have nothing to ask.
+    offered = _offered(client, kinds) if kinds else set()
 
     if loaded.zones is not None:
         for index, zone in enumerate(loaded.zones):

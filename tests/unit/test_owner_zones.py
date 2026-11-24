@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 import boto3
 import botocore.exceptions
+import botocore.parsers
+import botocore.session
 import pytest
 
 from rhi import config, owner_config
@@ -280,6 +282,57 @@ def test_a_call_ec2_refuses_is_named_and_its_text_is_not_repeated(write: Any) ->
         refused = write(EXAMPLE, Zones(failing=operation))
         assert not refused.accepted()  # which holds that nothing of the error's text is printed
         assert call in refused.printed
+
+
+def answering(operation: str, body: bytes) -> Any:
+    """What the SDK makes of an answer of EC2 to the operation that holds `body`: the answer as the
+    SDK's own parser reads it, or the error that parser raises."""
+    model = botocore.session.get_session().get_service_model("ec2")
+    shape = model.operation_model(operation).output_shape
+    parser = botocore.parsers.create_parser(model.protocol)
+    return lambda **_request: parser.parse({"body": body, "status_code": 200, "headers": {}}, shape)
+
+
+def test_an_answer_without_offers_refuses_the_first_pool_zone(write: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # EC2 offers none of the types asked for, and the SDK leaves the empty list out of its answer.
+    ec2 = Zones()
+    body = b"<DescribeInstanceTypeOfferingsResponse><requestId>example</requestId></DescribeInstanceTypeOfferingsResponse>"
+    monkeypatch.setattr(ec2, "describe_instance_type_offerings", answering("DescribeInstanceTypeOfferings", body))
+    assert "InstanceTypeOfferings" not in ec2.describe_instance_type_offerings()
+    refused = write(EXAMPLE, ec2)
+    assert not refused.accepted()
+    assert all(name in refused.printed for name in ("'coursework'", "first zone", "first instance type"))
+
+    # A region that answers with no zone at all: the first zone of the key is not one of its zones.
+    body = b"<DescribeAvailabilityZonesResponse><requestId>example</requestId></DescribeAvailabilityZonesResponse>"
+    monkeypatch.setattr(ec2, "describe_availability_zones", answering("DescribeAvailabilityZones", body))
+    refused = write(EXAMPLE, ec2)
+    assert not refused.accepted()
+    assert "first zone of the key 'zones'" in refused.printed
+
+
+def test_an_answer_the_sdk_cannot_read_is_named_by_its_call_and_not_repeated(
+    write: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SDK's parser raises an error of its own, outside the SDK's two families, and its text
+    # holds the answer. An answer that is read and lacks a name is not repeated either.
+    for operation, call, unreadable in (
+        ("describe_availability_zones", "DescribeAvailabilityZones", {"AvailabilityZones": [{"ZoneId": MARK}]}),
+        (
+            "describe_instance_type_offerings",
+            "DescribeInstanceTypeOfferings",
+            {"InstanceTypeOfferings": [{"InstanceType": GPU, "LocationType": MARK}]},
+        ),
+    ):
+        unparsed = answering(call, f"<example-answer-{MARK}>".encode())
+        with pytest.raises(botocore.parsers.ResponseParserError, match=MARK):
+            unparsed()
+        for answer in (unparsed, lambda unreadable=unreadable, **_request: unreadable):
+            ec2 = Zones()
+            monkeypatch.setattr(ec2, operation, answer)
+            refused = write(EXAMPLE, ec2)
+            assert not refused.accepted()  # which holds that nothing of the answer is printed
+            assert call in refused.printed
 
 
 def test_the_ec2_client_is_the_callers_own(

@@ -333,7 +333,8 @@ FIRST_ZONES = 3
 
 
 def _zones(value: object) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)) or len(value) < FIRST_ZONES:
+    # A list, as every source gives one and as a pool's own zones are read (`rhi_common.pool_config`).
+    if not isinstance(value, list) or len(value) < FIRST_ZONES:
         raise ValueError
     if not all(isinstance(item, str) and ZONE_NAME.fullmatch(item) for item in value):
         raise ValueError
