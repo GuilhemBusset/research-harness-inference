@@ -2,7 +2,10 @@
 system design, sections 4.1 and 4.3).
 
 The engine is the mock engine, in process: the agent's requests reach it through a stand-in for the
-network, which gives no answer once the request's time limit has passed on the test's clock. The
+network, which gives no answer once the request's time limit has passed on the test's clock. Three
+engines stand for what the check of liveness must tell apart: the mock that hangs, whose health
+route answers while it counts no token; `Busy`, slow but alive, whose token counts grow while it
+answers no completion in time; and `DEAD`, where nothing listens on the engine's port. The
 heartbeats table, the pool's secret and the host module are stand-ins too. The clock and the sleep
 are the test's, so no test waits for a heartbeat or for a minute; the one socket is the agent's own
 metrics endpoint, on a free port of the loopback interface.
@@ -14,6 +17,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import math
 import urllib.request
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -23,6 +27,9 @@ import pytest
 from botocore.exceptions import ClientError
 from prometheus_client import CollectorRegistry
 from prometheus_client.parser import text_string_to_metric_families
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
@@ -35,7 +42,7 @@ from rhi_mock_engine.app import create_app
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Coroutine
 
-    from starlette.applications import Starlette
+    from starlette.requests import Request
 
 NOW = 1_800_000_000
 # Made-up values, built here: none is an instance, a credential or a commit.
@@ -62,6 +69,12 @@ SETTINGS = Settings(
 CHAT = "/v1/chat/completions"
 RUNNING = metric_names(MOCK)[Quantity.RUNNING_REQUESTS]
 WAITING = metric_names(MOCK)[Quantity.WAITING_REQUESTS]
+# A counter's sample carries the family's name with `_total` after it.
+INPUT_TOKENS = metric_names(MOCK)[Quantity.INPUT_TOKENS] + "_total"
+OUTPUT_TOKENS = metric_names(MOCK)[Quantity.OUTPUT_TOKENS] + "_total"
+RESTARTS = serving.RESTARTS_METRIC + "_total"
+# A stand-in engine that is dead: nothing listens on the engine's port, so no route gives an answer.
+DEAD = None
 
 
 class Clock:
@@ -88,6 +101,48 @@ class Clock:
         await asyncio.sleep(0)
 
 
+class Busy:
+    """A stand-in engine that is slow but alive, as under long contexts with requests queued. Its
+    health route answers 200. Its `/metrics` gives requests running and waiting and the tokens it
+    has counted, under the mock's names: a thousand of input and fifty of output for every second
+    of the test's clock, until `stalls_at`, from when it counts none. A completion waits its turn
+    and gets no answer, unless `answers` says the engine answers it. While `metrics` is false the
+    metrics route gives no metrics."""
+
+    def __init__(self, clock: Clock, *, stalls_at: float = math.inf, answers: bool = False) -> None:
+        self._clock = clock
+        self._stalls_at = stalls_at
+        self._answers = answers
+        self.metrics = True
+        self.app = Starlette(
+            routes=[
+                Route("/health", self._health),
+                Route("/metrics", self._metrics),
+                Route(CHAT, self._complete, methods=["POST"]),
+            ]
+        )
+
+    async def _health(self, request: Request) -> Response:
+        return Response()
+
+    async def _metrics(self, request: Request) -> Response:
+        if not self.metrics:
+            return Response(status_code=503)
+        worked = min(self._clock.now, self._stalls_at) - NOW
+        lines = [
+            f"{RUNNING} 4.0",
+            f"{WAITING} 3.0",
+            f"{INPUT_TOKENS} {1000 * worked}",
+            f"{OUTPUT_TOKENS} {50 * worked}",
+        ]
+        return Response("\n".join(lines) + "\n")
+
+    async def _complete(self, request: Request) -> Response:
+        if not self._answers:
+            await asyncio.Event().wait()  # behind the queue until the agent hangs up
+        return JSONResponse({"choices": [{"message": {"role": "assistant", "content": "Hi"}}]})
+
+
 class World(Host):
     """An instance in service, and everything around its agent: the mock engine, the heartbeats
     table, Secrets Manager and the host. Made inside the test's event loop."""
@@ -99,7 +154,7 @@ class World(Host):
         # While the gate is closed, a request the mock runs is not answered: it stays in flight.
         self.gate = asyncio.Event()
         self.gate.set()
-        # The engine now (None: nothing listens), and the one a restart of the unit starts.
+        # The engine now (`DEAD`: nothing listens), and the one a restart of the unit starts.
         self.app: Starlette | None = self.mock(engine or MockSettings(secret=SECRET))
         self.restarted = restarted or MockSettings(secret=SECRET)
         self.restarts = 0
@@ -212,6 +267,10 @@ class World(Host):
         values = dict(line.rsplit(" ", 1) for line in lines if not line.startswith("#"))
         return float(values[RUNNING]), float(values[WAITING])
 
+    async def tokens(self) -> float | None:
+        """The tokens the engine has counted, as the agent reads them in the engine's `/metrics` now."""
+        return serving.read_tokens((await self.ask("GET", "/metrics")).content, MOCK)
+
 
 def run(scenario: Callable[[], Coroutine[Any, Any, None]]) -> None:
     # Bounded, so that a duty that stalls fails its test and does not stall the run.
@@ -226,6 +285,24 @@ async def until(condition: Callable[[], bool]) -> None:
             await asyncio.sleep(0.001)
 
     await asyncio.wait_for(polled(), timeout=10)
+
+
+async def minute(world: World, agent: serving.Serving) -> bool:
+    """One minute of the agent's duties, each made by the test when it is due, so that their order
+    is the test's: the check, a heartbeat every 5 seconds from the same moment, and whether the
+    check restarted the engine. A completion with no answer fails 30 seconds in, after the
+    heartbeat of the 25th second and before the one of the 30th."""
+    asked = len(world.asked)
+    check = asyncio.ensure_future(asyncio.to_thread(agent.check))
+    await until(lambda: check.done() or len(world.asked) > asked)  # the completion is sent, or none will be
+    for _ in range(6):
+        await asyncio.to_thread(agent.beat)
+        await world.clock.advance(5)
+    restarted = await asyncio.wait_for(check, timeout=10)
+    for _ in range(6):
+        await asyncio.to_thread(agent.beat)
+        await world.clock.advance(5)
+    return restarted
 
 
 def test_the_heartbeat_carries_the_engines_load_and_the_release_every_5_seconds() -> None:
@@ -313,7 +390,7 @@ def test_no_row_is_written_while_the_engine_gives_no_load() -> None:
     async def scenario() -> None:
         world = World()
         agent = world.agent()
-        engine, world.app = world.app, None  # nothing listens, as during the engine's restart
+        engine, world.app = world.app, DEAD  # nothing listens, as during the engine's restart
 
         assert not await asyncio.to_thread(agent.beat)
         assert world.items == []
@@ -353,6 +430,25 @@ def test_every_minute_the_engine_answers_a_completion_of_one_token() -> None:
     run(scenario)
 
 
+def test_the_tokens_are_read_under_the_engines_names_and_summed() -> None:
+    async def scenario() -> None:
+        world = World()
+        assert await world.tokens() == 0
+        body = {"model": SETTINGS.pool, "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 1}
+        answer = await world.ask("POST", CHAT, headers={"Authorization": f"Bearer {SECRET}"}, json=body)
+        # What the mock engine counted for one request, input and output, is what the agent reads.
+        usage = answer.json()["usage"]
+        assert usage["prompt_tokens"] > 0
+        assert usage["completion_tokens"] > 0
+        assert await world.tokens() == usage["prompt_tokens"] + usage["completion_tokens"]
+
+    run(scenario)
+    labelled = f'{INPUT_TOKENS}{{model_name="a"}} 7.0\n{INPUT_TOKENS}{{model_name="b"}} 2.0\n{OUTPUT_TOKENS} 4.0\n'
+    assert serving.read_tokens(labelled.encode(), MOCK) == 13
+    assert serving.read_tokens(f"{INPUT_TOKENS} 7.0\n".encode(), MOCK) is None  # no output tokens reported
+    assert serving.read_tokens(b"\xff not an exposition", MOCK) is None
+
+
 def test_a_hung_engine_is_restarted() -> None:
     async def scenario() -> None:
         # Inference hangs while health answers (evidence E23).
@@ -366,12 +462,128 @@ def test_a_hung_engine_is_restarted() -> None:
             # also while the completion is unanswered.
             for row in range(1, 12):
                 await until(lambda: len(world.rows) == row)  # noqa: B023 - called before the next turn
+                if world.clock.now < NOW + serving.PROBE_SECONDS:
+                    # Until its restart, the engine holds the completion and has counted no token.
+                    assert world.restarts == 0
+                    assert await world.tokens() == 0
                 await world.clock.advance(5)
-            await until(lambda: world.restarts > 0)
+            # The check counts a restart once the host has made it: its count ends the wait.
+            await until(lambda: registry.get_sample_value(RESTARTS) == 1)
 
+        # The first check restarted it: the second is not due before the minute.
         assert world.clock.now < NOW + 60
+        assert len(world.asked) == 1
         assert world.restarts == 1
-        assert registry.get_sample_value(serving.RESTARTS_METRIC + "_total") == 1
+        assert registry.get_sample_value(RESTARTS) == 1
+
+    run(scenario)
+
+
+def test_a_dead_engine_is_restarted() -> None:
+    async def scenario() -> None:
+        world = World()
+        world.app = DEAD
+        assert not await asyncio.to_thread(launch.Engine(world.fetch).healthy)
+        registry = CollectorRegistry()
+
+        async with world.doing(world.agent(registry=registry).run()):
+            # The check counts a restart once the host has made it: its count ends the wait.
+            await until(lambda: registry.get_sample_value(RESTARTS) == 1)
+
+        # At its first check, with no wait: nothing was there to answer.
+        assert world.clock.now == NOW
+        assert world.restarts == 1
+        assert registry.get_sample_value(RESTARTS) == 1
+
+    run(scenario)
+
+
+def test_a_busy_engine_that_answers_no_completion_in_time_is_not_restarted() -> None:
+    async def scenario() -> None:
+        world = World()
+        world.app = Busy(world.clock).app
+        registry = CollectorRegistry()
+
+        async with world.doing(world.agent(registry=registry).run()):
+            # Five minutes, 5 seconds at a time. Before each move of the clock the heartbeat that
+            # is due is written and the completion that is due is sent. None is answered: each
+            # fails 30 seconds after it was sent.
+            for beat in range(60):
+                await until(lambda: len(world.rows) == beat + 1 and len(world.asked) == beat // 12 + 1)  # noqa: B023 - called before the next turn
+                await world.clock.advance(5)
+            # The sixth completion is sent once the check that sent the fifth has ended.
+            await until(lambda: len(world.asked) == 6)
+
+        assert world.clock.now == NOW + 300
+        assert world.restarts == 0
+        assert registry.get_sample_value(RESTARTS) == 0
+
+    run(scenario)
+
+
+def test_an_engine_that_stopped_counting_tokens_is_restarted_a_minute_after_it_last_counted_one() -> None:
+    async def scenario() -> None:
+        world = World()
+        # The engine counts tokens for 5 seconds, then hangs: the heartbeat of the 5th second is
+        # the last that reads more tokens than the one before it.
+        world.app = Busy(world.clock, stalls_at=NOW + 5).app
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        for _ in range(4):
+            await asyncio.to_thread(agent.beat)
+            await world.clock.advance(5)
+
+        # The first completion is sent at 20 seconds and fails at 50, which is 45 seconds after the
+        # engine last counted a token: longer than a completion may take, and within the minute.
+        assert serving.PROBE_SECONDS < 45 < serving.PROBE_INTERVAL_SECONDS
+        assert not await minute(world, agent)
+        assert world.restarts == 0
+        assert registry.get_sample_value(RESTARTS) == 0
+
+        # The second fails at 110 seconds, 105 seconds after.
+        assert await minute(world, agent)
+        assert len(world.asked) == 2
+        assert world.restarts == 1
+        assert registry.get_sample_value(RESTARTS) == 1
+
+    run(scenario)
+
+
+def test_more_tokens_after_a_heartbeat_that_read_none_do_not_show_the_engine_works() -> None:
+    async def scenario() -> None:
+        world = World()
+        # The engine hangs at 7 seconds. Its metrics give no answer at the heartbeat of the 5th
+        # second, so the one of the 10th reads more tokens than the last that read any, at 0, and
+        # has none of the heartbeat before it to compare them with.
+        busy = Busy(world.clock, stalls_at=NOW + 7)
+        world.app = busy.app
+        agent = world.agent()
+        for answered in (True, False, True):
+            busy.metrics = answered
+            await asyncio.to_thread(agent.beat)
+            await world.clock.advance(5)
+
+        assert await minute(world, agent)
+        assert len(world.asked) == 1
+        assert world.restarts == 1
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("tokens", ["grow", "stand still", "cannot be read"])
+def test_an_engine_that_answers_its_completion_is_not_restarted_whatever_its_tokens_do(tokens: str) -> None:
+    async def scenario() -> None:
+        world = World()
+        busy = Busy(world.clock, stalls_at=NOW if tokens == "stand still" else math.inf, answers=True)
+        busy.metrics = tokens != "cannot be read"
+        world.app = busy.app
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+
+        assert [await minute(world, agent) for _ in range(5)] == [False] * 5
+        assert len(world.asked) == 5
+        assert world.restarts == 0
+        assert registry.get_sample_value(RESTARTS) == 0
 
     run(scenario)
 
