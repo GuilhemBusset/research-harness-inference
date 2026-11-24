@@ -9,8 +9,12 @@ names the engine's row of metric names (`rhi_common.engine_metrics`), under whic
 the check of liveness and the termination handling read the engine's `/metrics`. The boot program
 writes it from the setting `engine` of the release parameter. An instance whose boot program
 predates that setting has no such variable: the program then reads the engine from the instance's
-tag `rhi-engine`, which the launch template gives every instance of the pool. Without either, the
-row is the mock engine's, and a vLLM engine read under the mock's names gives no load.
+tag `rhi-engine`, which the launch template gives every instance of the pool. Only when the
+instance metadata answers that the instance has no such tag is the row the mock engine's: a vLLM
+engine read under the mock's names gives no load. A metadata that does not answer is asked
+`TAG_ATTEMPTS` times, and then the program ends with a message that names the tag, as for a
+missing variable: its unit starts it again, and the next start asks again. It never takes an
+engine it could not read for the mock.
 
 **What it does.** It starts the metrics endpoint (`rhi_lifecycle.metrics`), then reads the
 instance's target lifecycle state from the instance metadata every `TICK_SECONDS`. The design gives
@@ -106,8 +110,11 @@ TICK_SECONDS = 5.0
 PARAMETER_VARIABLE = "RHI_RELEASE_PARAMETER"
 REGION_VARIABLE = "RHI_REGION"
 ENGINE_VARIABLE = "RHI_ENGINE"
-# The instance's tag that names its pool's engine (`rhi.pools.group`).
+# The instance's tag that names its pool's engine (`rhi.pools.group`), how many times the instance
+# metadata is asked for it before the program gives up, and the wait between two asks.
 ENGINE_TAG = "rhi-engine"
+TAG_ATTEMPTS = 3
+TAG_RETRY_SECONDS = 2.0
 
 # Set in the tasks of the serving duties, and so wherever one of them hands a call to a worker thread.
 _SERVING: contextvars.ContextVar[bool] = contextvars.ContextVar("serving", default=False)
@@ -133,7 +140,8 @@ class Environment:
     @classmethod
     def read(cls, environ: Mapping[str, str], engine_tag: Callable[[], str | None] = lambda: None) -> Self:
         """The settings in `environ`. Raises `SettingsError` when a variable is missing or empty.
-        `engine_tag` gives the instance's tag `rhi-engine`, asked only when `RHI_ENGINE` is missing."""
+        `engine_tag` gives the instance's tag `rhi-engine`, asked only when `RHI_ENGINE` is missing:
+        None when the instance has no such tag. It may raise `SettingsError` too."""
         setting_variables = {field.name: "RHI_" + field.name.upper() for field in fields(release.Settings)}
         missing = [
             variable
@@ -471,12 +479,19 @@ class Agent:
             asyncio.run_coroutine_threadsafe(self._stop_duties(), self._loop).result()
 
 
-def engine_tag(metadata: launch.Metadata) -> str | None:
-    """The instance's tag `rhi-engine`, or None when the metadata does not give it."""
-    try:
-        return metadata.tag(ENGINE_TAG)
-    except launch.MetadataError:
-        return None
+def engine_tag(metadata: launch.Metadata, wait: Callable[[float], object] = time.sleep) -> str | None:
+    """The instance's tag `rhi-engine`, or None when the instance metadata answers that the
+    instance has no such tag. A metadata that does not answer is asked again, `TAG_ATTEMPTS` times
+    in all, `TAG_RETRY_SECONDS` apart: then `SettingsError`, which names the tag."""
+    for attempt in range(1, TAG_ATTEMPTS + 1):
+        try:
+            return metadata.tag(ENGINE_TAG)
+        except launch.NoSuchItemError:
+            return None
+        except launch.MetadataError:
+            if attempt < TAG_ATTEMPTS:
+                wait(TAG_RETRY_SECONDS)
+    raise SettingsError(f"RHI_ENGINE is missing, and the instance metadata did not give the tag {ENGINE_TAG}")
 
 
 def main() -> None:

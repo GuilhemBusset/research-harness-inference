@@ -627,23 +627,55 @@ def test_without_rhi_engine_the_program_takes_the_engine_from_the_instances_tag(
     assert program.Environment.read(ENVIRON | {"RHI_ENGINE": "vllm"}, engine_tag=not_asked).engine == "vllm"
     # What a boot program older than the setting writes: no RHI_ENGINE, and the tag names the engine.
     assert program.Environment.read(ENVIRON, engine_tag=lambda: "vllm").engine == "vllm"
-    # Neither: the mock's names, as before.
+    # Neither, the instance having no such tag: the mock's names, as before.
     assert program.Environment.read(ENVIRON, engine_tag=lambda: None).engine == MOCK
     with pytest.raises(program.SettingsError, match="RHI_ENGINE"):
         program.Environment.read(ENVIRON, engine_tag=lambda: "an engine with no row")
 
-    # The tag, as the instance metadata gives it with a session token; None when the instance has no such tag.
-    def metadata(tags: dict[str, str]) -> launch.Metadata:
-        def fetch(request: urllib.request.Request, timeout: float | None) -> tuple[int, bytes] | None:
-            path = request.full_url.removeprefix(launch.METADATA_URL)
-            if path == "/api/token" and request.get_method() == "PUT":
-                return 200, b"a-session-token"
-            if request.get_header("X-aws-ec2-metadata-token") != "a-session-token":
-                return 401, b""
-            key = path.removeprefix("/meta-data/tags/instance/")
-            return (200, tags[key].encode()) if key in tags else (404, b"")
 
-        return launch.Metadata(fetch)
+class TagMetadata:
+    """The instance metadata, for the tags: a session token first, then reads that carry it. The
+    first `unanswered` reads of a tag get no answer, as when the service times out."""
 
-    assert program.engine_tag(metadata({program.ENGINE_TAG: "vllm"})) == "vllm"
-    assert program.engine_tag(metadata({})) is None
+    def __init__(self, tags: dict[str, str], unanswered: int = 0) -> None:
+        self.tags = tags
+        self.unanswered = unanswered
+        self.reads = 0
+        self.waits: list[float] = []
+
+    def fetch(self, request: urllib.request.Request, timeout: float | None) -> tuple[int, bytes] | None:
+        path = request.full_url.removeprefix(launch.METADATA_URL)
+        if path == "/api/token" and request.get_method() == "PUT":
+            return 200, b"a-session-token"
+        if request.get_header("X-aws-ec2-metadata-token") != "a-session-token":
+            return 401, b""
+        self.reads += 1
+        if self.reads <= self.unanswered:
+            return None
+        key = path.removeprefix("/meta-data/tags/instance/")
+        return (200, self.tags[key].encode()) if key in self.tags else (404, b"")
+
+    def engine_tag(self) -> str | None:
+        return program.engine_tag(launch.Metadata(self.fetch), wait=self.waits.append)
+
+
+def test_the_engines_tag_is_read_again_while_the_metadata_does_not_answer() -> None:
+    # Answered at once: the tag.
+    answered = TagMetadata({program.ENGINE_TAG: "vllm"})
+    assert (answered.engine_tag(), answered.reads, answered.waits) == ("vllm", 1, [])
+    # The metadata answers that the instance has no such tag: the mock's names, at the first answer.
+    absent = TagMetadata({})
+    assert (absent.engine_tag(), absent.reads, absent.waits) == (None, 1, [])
+    assert program.Environment.read(ENVIRON, engine_tag=absent.engine_tag).engine == MOCK
+
+    # Unanswered twice, then answered: the tag, after two waits.
+    late = TagMetadata({program.ENGINE_TAG: "vllm"}, unanswered=program.TAG_ATTEMPTS - 1)
+    assert program.Environment.read(ENVIRON, engine_tag=late.engine_tag).engine == "vllm"
+    assert (late.reads, late.waits) == (program.TAG_ATTEMPTS, [program.TAG_RETRY_SECONDS] * (program.TAG_ATTEMPTS - 1))
+
+    # Never answered: no engine is taken for the mock. The program ends by the tag's name, and the
+    # next start of its unit asks again.
+    silent = TagMetadata({program.ENGINE_TAG: "vllm"}, unanswered=program.TAG_ATTEMPTS)
+    with pytest.raises(program.SettingsError, match=program.ENGINE_TAG):
+        program.Environment.read(ENVIRON, engine_tag=silent.engine_tag)
+    assert silent.reads == program.TAG_ATTEMPTS

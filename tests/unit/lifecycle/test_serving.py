@@ -31,7 +31,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from rhi_common.engine_metrics import MOCK, VLLM, Kind, Quantity, metric_names
+from rhi_common.engine_metrics import MOCK, VLLM, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import launch, metrics, serving
 from rhi_lifecycle.host import Host
@@ -139,18 +139,20 @@ class Busy:
                 f"{OUTPUT_TOKENS} {50 * worked}",
             ]
             return Response("\n".join(lines) + "\n")
-        names = metric_names(self._engine)
-        values = {
-            Quantity.RUNNING_REQUESTS: 4.0,
-            Quantity.WAITING_REQUESTS: 3.0,
-            Quantity.INPUT_TOKENS: 1000 * worked,
-            Quantity.OUTPUT_TOKENS: 50 * worked,
-        }
-        lines = []
-        for quantity, value in values.items():
-            name = names[quantity]
-            sample = f"{name}_total" if name.kind is Kind.COUNTER else str(name)
-            lines += [f"# TYPE {name} {name.kind}", f'{sample}{{engine="0",model_name="{SETTINGS.pool}"}} {value}']
+        # vLLM's own names, written out rather than taken from the engine's row, so that a wrong
+        # name in the row fails the test. Its counters are typed under their samples' names.
+        assert self._engine == VLLM
+        labels = '{engine="0",model_name="coursework"}'
+        lines = [
+            "# TYPE vllm:num_requests_running gauge",
+            f"vllm:num_requests_running{labels} 4.0",
+            "# TYPE vllm:num_requests_waiting gauge",
+            f"vllm:num_requests_waiting{labels} 3.0",
+            "# TYPE vllm:prompt_tokens_total counter",
+            f"vllm:prompt_tokens_total{labels} {1000 * worked}",
+            "# TYPE vllm:generation_tokens_total counter",
+            f"vllm:generation_tokens_total{labels} {50 * worked}",
+        ]
         return Response("\n".join(lines) + "\n")
 
     async def _complete(self, request: Request) -> Response:
