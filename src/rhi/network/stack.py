@@ -1,9 +1,19 @@
 """The network stack: the VPC, the security groups, the public load balancer and its web ACL
 (system design, section 6.5), and the bucket of both load balancers' access logs (section 6.6).
 
-The stack is environment-agnostic, and the CDK gives such a stack two zones. This one has three:
-the first three that `Fn::GetAZs` lists for the deploying region, which CloudFormation resolves at
-deployment time. No zone is named in the repository and nothing is looked up.
+The stack is environment-agnostic, and the CDK gives such a stack two zones. This one has the
+zones the configuration lists (`zones`, at least three), in their order, and no template names one
+in full (`zones`, below): CloudFormation resolves each in the deploying region at deployment time.
+
+- The first three are the first three that `Fn::GetAZs` lists for the deploying region, whatever
+  the configuration calls them: the owner's tool holds the configured first three to those by name
+  before it writes the configuration (`rhi.owner_config`). A configuration that lists no zones has
+  these three, so listing them changes nothing of the template.
+- Each further zone is the deploying region followed by the last letter of the zone's name: a
+  zone's name is its region's followed by one letter, and the configuration refuses two zones that
+  end in the same letter (`rhi.config`).
+
+A zone is only ever appended (`rhi.network.vpc`). Nothing is looked up.
 
 **Parked** (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no public load
 balancer, listener, alias record or web ACL, and the VPC no NAT gateway (`rhi.network.vpc`). The
@@ -25,11 +35,22 @@ from rhi.network.security import SecurityGroups
 from rhi.network.vpc import ZONES, Network
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from aws_cdk import aws_ec2 as ec2
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
     from aws_cdk import aws_wafv2 as wafv2
 
     from rhi.config import Config
+
+
+def zones(names: Sequence[str] | None) -> list[str]:
+    """The zones of the VPC as the template writes them, in the order of the configuration's
+    `zones`: the first three as `Fn::Select` of positions 0 to 2 over `Fn::GetAZs`, and each
+    further one as `Fn::Join` of `AWS::Region` and the last letter of its name. With no names, the
+    first three alone."""
+    first = [cdk.Fn.select(index, cdk.Fn.get_azs()) for index in range(ZONES)]
+    return first + [cdk.Fn.join("", [cdk.Aws.REGION, name[-1]]) for name in (names or ())[ZONES:]]
 
 
 class NetworkStack(cdk.Stack):
@@ -41,6 +62,8 @@ class NetworkStack(cdk.Stack):
 
     def __init__(self, scope: Construct, construct_id: str, *, config: Config) -> None:
         super().__init__(scope, construct_id)
+        # The configuration's zones, by name, before the VPC reads `availability_zones`.
+        self._zone_names = config.zones
         network = Network(self, "Network", availability_zones=self.availability_zones, parked=config.parked)
         self.vpc: ec2.Vpc = network.vpc
         # The endpoint instances read weights through, which the model bucket's policy names.
@@ -86,5 +109,6 @@ class NetworkStack(cdk.Stack):
 
     @property
     def availability_zones(self) -> list[str]:
-        """The deploying region's first three zones, as CloudFormation selects them."""
-        return [cdk.Fn.select(index, cdk.Fn.get_azs()) for index in range(ZONES)]
+        """The zones the configuration lists, or the deploying region's first three, as
+        CloudFormation resolves them (`zones`)."""
+        return zones(self._zone_names)

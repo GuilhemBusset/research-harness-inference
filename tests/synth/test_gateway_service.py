@@ -216,9 +216,9 @@ def test_the_service_runs_on_fargate_in_private_subnets(gateway: Gateway) -> Non
     network = gateway.service["NetworkConfiguration"]["AwsvpcConfiguration"]
     assert network["AssignPublicIp"] == "DISABLED"
     # Every subnet of the tasks is one of the network's whose route table has no route to an
-    # internet gateway.
+    # internet gateway: one in each of the example's four zones.
     subnets = [gateway.origin(subnet) for subnet in network["Subnets"]]
-    assert len(subnets) == 3
+    assert len(subnets) == 4
     for path, subnet, _ in subnets:
         held_by = gateway.deployment.templates[path]
         assert held_by["Resources"][subnet]["Type"] == "AWS::EC2::Subnet"

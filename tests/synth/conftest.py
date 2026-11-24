@@ -5,6 +5,9 @@ temporary directory, as `cdk synth` would with the context of `cdk.json`, with t
 nothing is bundled, so no test needs the package index, and nothing comes from the environment
 the tests run in. A test asks for what it reads by a fixture's name: `templates`, `cloud_assembly`
 or `app`. pytest finds a fixture by its name, so a test file imports nothing from here.
+
+`without_zones` is a second synthesis, of the stage alone, from the example configuration with its
+zones left out: the network and the groups of a configuration that lists none.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -120,3 +124,26 @@ def templates(synthesized: Synthesized) -> dict[str, dict[str, Any]]:
 def written_to_the_tree(synthesized: Synthesized) -> list[str]:
     """The files of the repository that synthesis created, changed or removed."""
     return synthesized.written_to_the_tree
+
+
+@pytest.fixture(scope="session")
+def without_zones(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    """The templates of the stage's stacks, by the stack's ID (`Network`, `Pools`, ...), for the
+    example configuration with the key `zones` and every pool's own `zones` left out."""
+    import aws_cdk as cdk
+
+    from rhi.stage import EndpointStage
+
+    data = tomllib.loads((REPO / config.EXAMPLE_FILE).read_text(encoding="utf-8"))
+    del data["zones"]
+    for pool in data["pools"].values():
+        pool.pop("zones", None)
+    context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
+    app = cdk.App(outdir=str(tmp_path_factory.mktemp("without-zones")), context=context, analytics_reporting=False)
+    stage = EndpointStage(app, "Rhi", config=config.parse(data, "test"))
+    app.synth()
+    return {
+        stack.node.id: json.loads((Path(stage.outdir) / stack.template_file).read_text(encoding="utf-8"))
+        for stack in stage.node.children
+        if isinstance(stack, cdk.Stack)
+    }

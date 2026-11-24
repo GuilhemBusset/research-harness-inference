@@ -270,7 +270,7 @@ def standalone(
         stack,
         "Pool",
         pool=pool,
-        vpc=vpc,
+        subnets=vpc.private_subnets,
         security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
         target_group=elbv2.ApplicationTargetGroup(
             stack, "Targets", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE

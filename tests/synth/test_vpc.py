@@ -1,6 +1,10 @@
-"""The network (system design, sections 4.4, 5.4 and 6.5): three zones from the deploying region,
+"""The network (system design, sections 4.4, 5.4 and 6.5): the zones the configuration lists,
+resolved in the deploying region and named nowhere, or the region's first three when it lists none,
 public subnets for the load balancer, private subnets for tasks and instances, one NAT gateway,
 and an S3 gateway endpoint on the private route tables.
+
+The example configuration lists four zones. `without_zones` (conftest.py) is the example with no
+zones: a zone appended to the first three leaves the network of those three as it was.
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
 """
@@ -26,6 +30,18 @@ REPO = Path(__file__).resolve().parents[2]
 SOURCE = REPO / "src" / "rhi"
 ACKNOWLEDGED = REPO / "tests" / "policy" / "acknowledged"
 ZONE = {"Fn::GetAZs": ""}
+# The region's first three zones, as the template writes them, and the example's fourth: the
+# deploying region followed by the last letter of its name.
+FIRST_THREE = [{"Fn::Select": [index, ZONE]} for index in range(3)]
+FOURTH = {"Fn::Join": ["", [{"Ref": "AWS::Region"}, "d"]]}
+# What a zone appended must leave as it was, under its logical ID.
+KEPT = (
+    "AWS::EC2::Subnet",
+    "AWS::EC2::RouteTable",
+    "AWS::EC2::Route",
+    "AWS::EC2::SubnetRouteTableAssociation",
+    "AWS::EC2::NatGateway",
+)
 
 
 def of_type(template: dict[str, Any], kind: str) -> dict[str, dict[str, Any]]:
@@ -65,20 +81,62 @@ def network(app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, A
     return template
 
 
-def test_subnets_span_three_zones_of_the_deploying_region(network: dict[str, Any]) -> None:
-    subnets = of_type(network, "AWS::EC2::Subnet").values()
+def zones_by_type(template: dict[str, Any]) -> dict[str | None, list[Any]]:
+    """The zone of each subnet by the subnets' type, in the order of the subnets' positions: a
+    subnet's logical ID holds its group's name, then its position."""
     by_type: dict[str | None, list[Any]] = {}
-    for subnet in subnets:
+    for _, subnet in sorted(of_type(template, "AWS::EC2::Subnet").items()):
         by_type.setdefault(tag(subnet, "aws-cdk:subnet-type"), []).append(subnet["Properties"]["AvailabilityZone"])
-    assert set(by_type) == {"Public", "Private"}
-    zones = [{"Fn::Select": [index, ZONE]} for index in range(3)]
-    for kind, selected in by_type.items():
-        assert sorted(selected, key=json.dumps) == zones, kind
+    return by_type
+
+
+def test_subnets_span_the_configured_zones_in_their_order(network: dict[str, Any]) -> None:
+    assert len(config.load({"RHI_CONFIG": "example"}).zones or ()) == 4
+    # Four public and four private subnets: the first three of each in the region's first three
+    # zones, as with no zones configured, and the fourth in the region's zone `d`.
+    assert zones_by_type(network) == {"Public": [*FIRST_THREE, FOURTH], "Private": [*FIRST_THREE, FOURTH]}
+    # The fourth of each takes the next block of its kind, after those of the first three.
+    blocks = {name: s["Properties"]["CidrBlock"] for name, s in of_type(network, "AWS::EC2::Subnet").items()}
+    assert [block for name, block in blocks.items() if "PublicSubnet4" in name] == ["10.0.3.0/24"]
+    assert [block for name, block in blocks.items() if "PrivateSubnet4" in name] == ["10.0.64.0/20"]
+
+
+def test_the_network_names_no_zone(network: dict[str, Any]) -> None:
+    assert "example-zone" not in json.dumps(network)
+
+
+def test_without_zones_the_subnets_span_the_first_three_of_the_deploying_region(
+    without_zones: dict[str, dict[str, Any]],
+) -> None:
+    assert zones_by_type(without_zones["Network"]) == {"Public": FIRST_THREE, "Private": FIRST_THREE}
+
+
+def test_a_zone_appended_leaves_the_network_of_the_first_three_as_it_was(
+    network: dict[str, Any], without_zones: dict[str, dict[str, Any]]
+) -> None:
+    before = {name: r for name, r in without_zones["Network"]["Resources"].items() if r["Type"] in KEPT}
+    # Three subnets of each type, a route table, an association and a default route for each, and
+    # the one NAT gateway.
+    assert [sum(r["Type"] == kind for r in before.values()) for kind in KEPT] == [6, 6, 6, 6, 1]
+    after = network["Resources"]
+    for name, resource in before.items():
+        assert name in after, name
+        assert (after[name]["Type"], after[name]["Properties"]) == (resource["Type"], resource["Properties"]), name
+
+
+def test_the_vpc_refuses_fewer_than_three_zones(app_module: ModuleType) -> None:
+    from rhi.network.vpc import Network
+
+    cdk = app_module.cdk
+    stack = cdk.Stack(cdk.App(analytics_reporting=False), "Stack")
+    zones = [cdk.Fn.select(index, cdk.Fn.get_azs()) for index in range(2)]
+    with pytest.raises(ValueError, match="at least 3 zones"):
+        Network(stack, "Network", availability_zones=zones)
 
 
 def test_no_private_subnet_assigns_public_addresses(network: dict[str, Any]) -> None:
     private = [s for s in of_type(network, "AWS::EC2::Subnet").values() if tag(s, "aws-cdk:subnet-type") == "Private"]
-    assert len(private) == 3
+    assert len(private) == 4
     assert all(s["Properties"].get("MapPublicIpOnLaunch") is False for s in private)
 
 
