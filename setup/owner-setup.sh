@@ -501,6 +501,13 @@ pool, the `[pools.mock]` table of the example.
 
 The configuration loader checks the file before anything is written, and the configuration
 writer then writes one parameter per key under /rhi/config/, in the region of your credentials.
+
+Before it writes, the writer asks EC2 for the region's zones and for the zones that offer the
+pools' instance types. It refuses, with nothing written, a key `zones` that names a zone the
+region does not have or that does not begin with the region's first three zones by name, and a
+pool with a zone that does not offer one of its instance types: a pool's zones are its own
+`zones`, or else the first three of the key, or else the region's first three. The refusal gives
+the zone and the instance type by their positions in the file.
 EOF
   local file="$config_file" checked=1
   local tool=(env PYTHONPATH=src:services/common uv run --locked --no-dev python -m rhi.owner_config)

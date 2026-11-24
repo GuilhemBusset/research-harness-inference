@@ -564,6 +564,91 @@ def test_the_example_coursework_pool() -> None:
     assert loaded.default_pool == "coursework"
 
 
+# The example's two lists of zones: the VPC's, then the coursework pool's.
+VPC_ZONES = ("example-zone-a", "example-zone-b", "example-zone-c", "example-zone-d")
+COURSEWORK_ZONES = ("example-zone-a", "example-zone-b", "example-zone-d")
+
+
+def with_zones(key: str | None, coursework: str | None) -> str:
+    """The example's text with the value of the key `zones` and of the coursework pool's `zones`
+    replaced, or the line removed (None)."""
+    lines = iter("" if value is None else f"zones = {value}\n" for value in (key, coursework))
+    example = EXAMPLE.read_text(encoding="utf-8")
+    text, count = re.subn(r"^zones = .*\n", lambda _: next(lines), example, flags=re.MULTILINE)
+    assert count == 2  # the key, above the pools' tables, then the pool's field
+    return text
+
+
+def test_the_example_lists_four_zones_and_its_coursework_pool_three(tmp_path: Path) -> None:
+    loaded = config.load({"RHI_CONFIG": "example"})
+    assert loaded.zones == VPC_ZONES
+    # The coursework pool leaves out one of the first three zones and takes the fourth; the mock
+    # pool gives no list.
+    assert {pool.name: pool.zones for pool in loaded.pools} == {"coursework": COURSEWORK_ZONES, "mock": None}
+    assert load_text(tmp_path, with_zones(json.dumps(VPC_ZONES), json.dumps(COURSEWORK_ZONES))) == loaded
+
+    # A configuration written before the lists gives neither, and loads with both None: nothing
+    # fills the key from the pools, and it is no key the owner must give.
+    neither = load_text(tmp_path, with_zones(None, None))
+    assert neither.zones is None
+    assert [pool.zones for pool in neither.pools] == [None, None]
+    assert "zones" in config.OPTIONAL
+    assert neither == dataclasses.replace(
+        loaded, zones=None, pools=tuple(dataclasses.replace(pool, zones=None) for pool in loaded.pools)
+    )
+    # The key alone is a configuration too: every pool then spans the first three.
+    assert load_text(tmp_path, with_zones(json.dumps(VPC_ZONES), None)).zones == VPC_ZONES
+    # A pool may list any of the key's zones, in its own order, and the key more than four.
+    longer = load_text(tmp_path, with_zones(f'["z{MARK}-b", "z{MARK}-c", "z{MARK}-a", "y-d", "z-f"]', '["z-f", "y-d"]'))
+    assert (len(longer.zones or ()), longer.pools[0].zones) == (5, ("z-f", "y-d"))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(f'"zone{MARK}-a"', id="not-a-list"),
+        pytest.param(f'["zone{MARK}-a", "zone{MARK}-b"]', id="fewer-than-three"),
+        pytest.param(f'["zone{MARK}-a", "zone{MARK}-b", "zone{MARK}-c", "zone{MARK}-a"]', id="a-zone-twice"),
+        pytest.param(f'["zone{MARK}-a", "zone{MARK}-b", "other{MARK}-a"]', id="two-ending-in-one-letter"),
+        pytest.param(f'["zone-a", "zone-b", "zone-{MARK}"]', id="a-digit-last"),
+        pytest.param(f'["zone{MARK}-a", "zone{MARK}-b", "Zone{MARK}-C"]', id="upper-case"),
+        pytest.param(f'["zone{MARK}-a", "zone{MARK}-b", {MARK}]', id="not-text"),
+    ],
+)
+def test_a_refused_list_of_zones_is_named_by_its_key(tmp_path: Path, value: str) -> None:
+    for coursework in (None, json.dumps(COURSEWORK_ZONES)):
+        message = refusal(tmp_path, with_zones(value, coursework))
+        assert "'zones'" in message
+        assert "'file'" in message
+        assert MARK not in message
+
+
+def test_the_key_zones_is_read_from_a_list_and_held_as_a_tuple() -> None:
+    key = config.KEYS["zones"]
+    assert key.parse(list(VPC_ZONES)) == VPC_ZONES
+    with pytest.raises(ValueError):  # a key's parser says only that it refuses: the loader words the refusal
+        key.parse(VPC_ZONES)
+
+
+def test_a_pools_zones_are_read_against_the_key(tmp_path: Path) -> None:
+    # A zone the key does not list: no subnet of the VPC is in it.
+    message = refusal(tmp_path, with_zones(json.dumps(VPC_ZONES), f'["example-zone-a", "zone{MARK}-e"]'))
+    assert "'zones'" in message
+    assert "'coursework'" in message
+    assert MARK not in message
+    # The key left out: the pool's zones could not be matched to a subnet, whatever they are.
+    message = refusal(tmp_path, with_zones(None, f'["zone{MARK}-a"]'))
+    assert "'zones'" in message
+    assert "'coursework'" in message
+    assert MARK not in message
+    # A field the pool parser refuses reaches the loader's refusal with the pool and the field.
+    for value in ("[]", f'["zone{MARK}-a", "zone{MARK}-a"]', f'"zone{MARK}-a"'):
+        message = refusal(tmp_path, with_zones(json.dumps(VPC_ZONES), value))
+        assert "'pools'" in message
+        assert "pool 'coursework', field 'zones'" in message
+        assert MARK not in message
+
+
 def test_the_three_pool_keys_default_from_the_only_pool(tmp_path: Path) -> None:
     text = with_the_mock_pool_alone(allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
     loaded = load_text(tmp_path, text)

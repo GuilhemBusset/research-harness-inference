@@ -61,6 +61,16 @@ on_demand_price_limit = 5
 # pool (section 4.2).
 default_pool = "coursework"
 
+# The zones the VPC spans, by name, in the order of its subnets: at least three, none named twice
+# and no two ending in the same letter. The first three are the region's first three zones by name,
+# which are the zones the VPC spans when the key is left out. A zone is only ever appended: each
+# subnet is named after its zone's position in the list, so a zone moved or removed would replace
+# subnets of the deployed VPC. Left out, the VPC spans the region's first three zones, and no pool
+# may then list zones of its own. The owner's tool asks EC2 whether each is a zone of the region
+# before it writes the configuration to SSM. The four names here are placeholders: they name no
+# region.
+zones = ["example-zone-a", "example-zone-b", "example-zone-c", "example-zone-d"]
+
 # The key issuer's reserved concurrency, and the most keys a student may be issued over one UTC
 # day (sections 6.4 and 17). Left out, each is 5.
 issuer_reserved_concurrency = 5
@@ -233,6 +243,12 @@ parked = false
 # line of text. The effort mapping is section 17's: low and medium unchanged; high, xhigh and max
 # as xhigh. The upgrade pool of phase 4 shares the model's template and parsers, and so this
 # profile (section 6.1).
+#
+# Its zones are the zones its group launches in (section 5.4): each is one of the key `zones`
+# above, at least one, none named twice. A pool lists the zones that offer its instance types,
+# which the owner's tool asks EC2 before it writes the configuration to SSM. Left out, as the mock
+# pool leaves it, the group spans the first three zones of the VPC. Here the pool leaves out the
+# third zone and takes the fourth, as a pool does whose instance type the third zone does not offer.
 [pools.coursework]
 engine = "vllm"
 model = "Qwen/Qwen3.8-27B-FP8"
@@ -248,6 +264,7 @@ idle_minutes = 20
 drain_seconds = 300
 context_length = 262144
 largest_output = 32000
+zones = ["example-zone-a", "example-zone-b", "example-zone-d"]
 kv_cache_bits = 8
 prefix_caching = true
 step_budget_tokens = 8192
@@ -278,7 +295,8 @@ inter_token_latency = [
 
 # The mock pool, phase 1's pool: the mock engine on t4g.small, woken on demand. Its context length
 # is the coursework pool's, so that the mock exercises the same limits, and so is its largest
-# output. It gives no expected values and has no measured start.
+# output. It gives no expected values and has no measured start, and it lists no zones: its group
+# spans the first three zones of the VPC.
 [pools.mock]
 engine = "mock"
 instance_types = ["t4g.small"]

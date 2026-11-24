@@ -287,6 +287,28 @@ instance types the pools list), `on_demand_price_limit` (5 dollars an hour by de
 `default_pool` (by default the only pool; with two pools or more it must be given). Each pool is
 added later, by running this step again.
 
+Two lists of zones may be left out too, and say where the pools launch:
+
+- `zones`, a key of the file: the zones the VPC spans, by name, in the order of its subnets. At
+  least three, no two ending in the same letter. The first three are the region's first three
+  zones by name, which are the zones the VPC spans without the key, and a zone is only ever
+  appended to the list: a zone moved or removed would replace subnets of the deployed VPC.
+- `zones`, a field of a pool: the zones the pool's group launches in, each one of the key's. Left
+  out, the group spans the first three zones of the VPC. A pool may give it only when the file
+  gives the key.
+
+A pool whose instance type one of the first three zones does not offer lists its zones: the zones
+that offer the type, among them a fourth or a later zone of the key when one offers it. Until the
+change that builds the network and the groups from the lists is merged, a deployment reads
+neither. To see which zones the region has and which offer a type, on your terminal only:
+
+```sh
+aws ec2 describe-availability-zones --filters Name=zone-type,Values=availability-zone \
+  --query 'AvailabilityZones[].ZoneName' --output text
+aws ec2 describe-instance-type-offerings --location-type availability-zone \
+  --filters Name=instance-type,Values=<instance type> --query 'InstanceTypeOfferings[].Location' --output text
+```
+
 **Command.**
 
 ```sh
@@ -306,6 +328,21 @@ will read it: a file it refuses stops the step, with a message that names the ke
 value. The second is the configuration writer: one String parameter per key under `/rhi/config/`,
 over those that exist. It deletes none. A dry run runs the first command too, since it reads the
 file and calls nothing.
+
+Before it writes any parameter, the second command checks the zones with EC2, in the region of
+your credentials, which need `ec2:DescribeAvailabilityZones` and
+`ec2:DescribeInstanceTypeOfferings`. It refuses the file, and writes nothing, when:
+
+- a zone of the key `zones` is not one of the region's zones;
+- the key `zones` does not begin with the region's first three zones by name;
+- a zone of a pool does not offer one of the pool's instance types, its fallback types included.
+  A pool's zones are its own list; without one, the first three of the key `zones`; without the
+  key, the region's first three zones by name, and a region that gives the account fewer than
+  three refuses the pool.
+
+The refusal names the pool, and the zone and the instance type by their positions in the file
+(the pool's third zone, its second instance type), never by name. A pool whose instance type one
+of the first three zones does not offer is refused until it lists its zones.
 
 **To change the configuration later**, edit the file and run the same command again. Other
 runbooks and the owner's steps of later changes use this step for that.

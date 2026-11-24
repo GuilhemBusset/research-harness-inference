@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import boto3
 import botocore.exceptions
 import pytest
 
@@ -597,13 +598,36 @@ class Parameters:
         return {"Version": 1}
 
 
-def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) -> None:
+class Zones:
+    """An EC2 client, as far as the module's zone check uses one: a region of the example's four
+    zones, each of which offers every instance type asked for (tests/unit/test_owner_zones.py
+    holds what the check refuses)."""
+
+    NAMES = tuple(config.load({"RHI_CONFIG": "example"}).zones or ())
+
+    def describe_availability_zones(self, **_request: Any) -> dict[str, Any]:
+        return {"AvailabilityZones": [{"ZoneName": name} for name in self.NAMES]}
+
+    def describe_instance_type_offerings(self, **request: Any) -> dict[str, Any]:
+        (asked,) = request["Filters"]
+        offers = [{"InstanceType": kind, "Location": zone} for zone in self.NAMES for kind in asked["Values"]]
+        return {"InstanceTypeOfferings": offers}
+
+
+def test_the_module_writes_what_the_configuration_writer_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The zone check's client is a stand-in in every call, and the SDK is asked for none.
+    def refuse(*_arguments: object, **_options: object) -> None:
+        raise AssertionError("a test asked the SDK for a real client")
+
+    monkeypatch.setattr(boto3, "client", refuse)
     file = tmp_path / "owner.toml"
     file.write_text(EXAMPLE.replace("example.com", "example.org"), encoding="utf-8")
     expected, written, untouched = Parameters(), Parameters(), Parameters()
     config.write_ssm(config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(file)}), expected)
 
-    assert owner_config.main(["write", str(file)], written) == 0
+    assert owner_config.main(["write", str(file)], written, Zones()) == 0
     assert written.put == expected.put
     assert {"Name": "/rhi/config/domain", "Value": "example.org", "Type": "String", "Overwrite": True} in written.put
 
@@ -611,7 +635,7 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
     # nothing in the setup writes or asks for them.
     file.write_text("session_windows = []\n" + EXAMPLE.replace("example.com", "example.org"), encoding="utf-8")
     retired = Parameters()
-    assert owner_config.main(["write", str(file)], retired) == 0
+    assert owner_config.main(["write", str(file)], retired, Zones()) == 0
     assert retired.put == expected.put
     assert not any("session_windows" in request["Name"] for request in retired.put)
     assert "session_windows" not in (REPO / "setup/owner-setup.sh").read_text(encoding="utf-8")
@@ -619,7 +643,7 @@ def test_the_module_writes_what_the_configuration_writer_writes(tmp_path: Path) 
     # A check writes nothing, and a file the loader refuses is refused before anything is written.
     assert owner_config.main(["check", str(file)], untouched) == 0
     file.write_text(REFUSED, encoding="utf-8")
-    assert owner_config.main(["write", str(file)], untouched) == 1
+    assert owner_config.main(["write", str(file)], untouched, Zones()) == 1
     assert untouched.put == []
 
 
