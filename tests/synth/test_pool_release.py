@@ -948,23 +948,26 @@ class MetadataRequest(BaseHTTPRequestHandler):
         """Nothing is written to the test's output."""
 
 
-def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> None:
-    root, state, programs = tmp_path / "root", tmp_path / "state", tmp_path / "bin"
-    for folder in (root, state, programs):
-        folder.mkdir()
+def boot(release: Release, folder: Path) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """The boot program, run as an instance runs it with the release's parameter and archive, in a
+    root under `folder`: its run, the root, and the folder where the stand-ins keep their state."""
+    root, state, programs = folder / "root", folder / "state", folder / "bin"
+    for made in (root, state, programs):
+        made.mkdir(parents=True)
     for name, text in (("aws", AWS), ("systemctl", SYSTEMCTL)):
         (programs / name).write_text(text, encoding="utf-8")
         (programs / name).chmod(0o755)
-    value = sample(mock.parameter["Value"])
+    parameter = release.parameter["Name"]
+    value = sample(release.parameter["Value"])
     files = json.loads(value)["files"]
     cloud = {
         "region": REGION,
-        "parameters": {PARAMETER: value},
-        "objects": {f"s3://{files['bucket']}/{files['key']}": str(mock.archive)},
+        "parameters": {parameter: value},
+        "objects": {f"s3://{files['bucket']}/{files['key']}": str(release.archive)},
     }
     (state / "cloud.json").write_text(json.dumps(cloud), encoding="utf-8")
 
-    metadata = Metadata({"tags/instance/rhi-release-parameter": PARAMETER, "placement/region": REGION})
+    metadata = Metadata({"tags/instance/rhi-release-parameter": parameter, "placement/region": REGION})
     threading.Thread(target=metadata.serve_forever, daemon=True).start()
     try:
         ran = subprocess.run(
@@ -983,6 +986,18 @@ def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> 
     finally:
         metadata.shutdown()
         metadata.server_close()
+    return ran, root, state
+
+
+def settings_written(root: Path) -> dict[str, str]:
+    """The settings the boot program wrote for the units, by variable."""
+    lines = (root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    return dict(line.split("=", 1) for line in lines)
+
+
+def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> None:
+    ran, root, state = boot(mock, tmp_path)
+    value = sample(mock.parameter["Value"])
 
     # The digest the parameter names is the archive's: the program went on to unpack and start it.
     assert (ran.returncode, ran.stderr) == (0, "")
@@ -998,8 +1013,64 @@ def test_the_boot_program_accepts_the_archive(mock: Release, tmp_path: Path) -> 
         "start --no-block rhi-collector.service rhi-lifecycle.service",
     ]
     # The settings the units read are the parameter's.
-    settings = dict(
-        line.split("=", 1) for line in (root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
-    )
+    settings = settings_written(root)
     assert settings["RHI_ENGINE_IMAGE"] == json.loads(value)["engine_image"]
     assert (settings["RHI_LAUNCH_HOOK"], settings["RHI_TERMINATION_HOOK"]) == ("rhi-launch", "rhi-termination")
+    assert settings["RHI_ENGINE"] == "mock"
+
+
+def test_a_vllm_pools_instance_heartbeats_its_load_while_it_serves(app_module: ModuleType, tmp_path: Path) -> None:
+    from prometheus_client import CollectorRegistry
+
+    from rhi_common.engine_metrics import VLLM, Quantity, metric_names
+    from rhi_common.records import InstanceHeartbeat
+    from rhi_lifecycle import __main__ as agent
+    from rhi_lifecycle import serving
+    from rhi_lifecycle.host import Host
+
+    # A vllm pool's release, as synthesis writes it, on an instance the boot program starts with it.
+    release = standalone(app_module, tmp_path / "synthesis", GPU)
+    assert release.value["settings"]["engine"] == "vllm"
+    ran, root, _ = boot(release, tmp_path / "instance")
+    assert (ran.returncode, ran.stderr) == (0, "")
+    # The agent's program, given what the boot program wrote, reads the engine under vLLM's names.
+    environment = agent.Environment.read(settings_written(root))
+    assert environment.engine == VLLM
+    held = agent_release.read_held(root / "var/lib/rhi/release.json")
+    assert held is not None
+
+    # In service, a heartbeat reads vLLM's `/metrics` and writes the instance's row, which the
+    # scaler and the smoke test `release-heartbeat` read: the stage `serving` and the engine's load.
+    # Read under the mock's names, the same answer gives no load and no row is written.
+    names = metric_names(VLLM)
+    running, waiting = names[Quantity.RUNNING_REQUESTS], names[Quantity.WAITING_REQUESTS]
+    exposition = "".join(
+        f'# TYPE {name} gauge\n{name}{{engine="0",model_name="coursework"}} {count}\n'
+        for name, count in ((running, 2.0), (waiting, 1.0))
+    ).encode()
+    tables: list[str] = []
+    written: list[dict[str, Any]] = []
+
+    def table(name: str) -> types.SimpleNamespace:
+        tables.append(name)
+        return types.SimpleNamespace(put_item=lambda Item: written.append(Item))
+
+    def fetch(request: Any, timeout: float | None) -> tuple[int, bytes] | None:
+        return (200, exposition) if request.full_url.endswith("/metrics") else None
+
+    duties = serving.Serving(
+        held,
+        environment.settings,
+        "the-instance",
+        environment.engine,
+        dynamodb=types.SimpleNamespace(Table=table),
+        secrets=None,
+        host=Host(),
+        fetch=fetch,
+        registry=CollectorRegistry(),
+        clock=lambda: 1_800_000_000.0,
+    )
+    assert duties.beat()
+    assert tables == [environment.settings.heartbeat_table]
+    (row,) = [InstanceHeartbeat.from_item(item) for item in written]
+    assert (row.pool, row.stage, row.running, row.waiting) == ("coursework", serving.STAGE, 2, 1)

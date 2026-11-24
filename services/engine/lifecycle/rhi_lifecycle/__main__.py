@@ -5,8 +5,11 @@ instance (system design, section 4.3). The agent's unit runs it as `python -m rh
 `/run/rhi/release.env`, as the boot program writes it: `RHI_RELEASE_PARAMETER`, `RHI_REGION` and
 one variable for each setting of `rhi_lifecycle.release.Settings`, `RHI_POOL` to `RHI_SECRET_ID`.
 A variable that is missing ends the program at once, with a message that names it. `RHI_ENGINE`
-names the engine's row of metric names (`rhi_common.engine_metrics`); the boot program does not
-write it, and without it the row is the mock engine's.
+names the engine's row of metric names (`rhi_common.engine_metrics`), under which the heartbeat,
+the check of liveness and the termination handling read the engine's `/metrics`. The boot program
+writes it from the setting `engine` of the release parameter. Without it the row is the mock
+engine's, as on an instance whose boot program predates that setting: a vLLM engine read under
+the mock's names gives no load, so such an instance writes no heartbeat while it serves.
 
 **What it does.** It starts the metrics endpoint (`rhi_lifecycle.metrics`), then reads the
 instance's target lifecycle state from the instance metadata every `TICK_SECONDS`. The design gives

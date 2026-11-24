@@ -16,7 +16,8 @@ also reads, so its keys are fixed:
   files and this agent) and the digest it checks them against;
 - `measured_start_seconds`: the pool's measured start, absent (or null) until one is measured;
 - `settings`: `pool`, `group`, `launch_hook`, `termination_hook`, `log_group`, `workspace_url`,
-  `heartbeat_table` and `secret_id`.
+  `heartbeat_table`, `secret_id` and `engine`. `engine` is not a field of `Settings`: the boot
+  program gives it to the agent's program as `RHI_ENGINE` (`rhi_lifecycle.__main__`).
 
 A release is the first three and `files.sha256`: what the instance serves. The measured start and
 the settings change how the instance runs, not what it serves, so they are read and left out of

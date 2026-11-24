@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from rhi_lifecycle import __main__ as agent
 from rhi_lifecycle import release
 
 if TYPE_CHECKING:
@@ -157,6 +158,7 @@ def parameter_value(files: bytes) -> dict[str, Any]:
             "workspace_url": "https://aps-workspaces.example.com/api/v1/remote_write",
             "heartbeat_table": "rhi-heartbeats",
             "secret_id": "rhi/coursework/engine",
+            "engine": "vllm",
         },
     }
 
@@ -321,12 +323,16 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
         "RHI_REGION": REGION,
         "RHI_RELEASE_PARAMETER": PARAMETER,
         "RHI_ENGINE_IMAGE": current.release.engine_image,
+        "RHI_ENGINE": "vllm",
     }
     if measured is not None:
         expected["RHI_MEASURED_START"] = str(measured)
     lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
     assert dict(line.split("=", 1) for line in lines) == expected
     assert len(lines) == len(expected)
+    # The agent's program, given those settings, reads the engine under the names of the pool's engine.
+    environment = agent.Environment.read(dict(line.split("=", 1) for line in lines))
+    assert (environment.engine, environment.settings) == ("vllm", current.settings)
     # The archive is all there is under /opt/rhi, and only the top of units/ is installed.
     assert instance.files_under("opt/rhi") == {f"release/{name}" for name in MEMBERS}
     for name, content in MEMBERS.items():
@@ -416,6 +422,11 @@ def no_secret_id(instance: Instance) -> None:
     instance.publish(json.dumps(instance.value), instance.files)
 
 
+def no_engine(instance: Instance) -> None:
+    del instance.value["settings"]["engine"]
+    instance.publish(json.dumps(instance.value), instance.files)
+
+
 def a_setting_of_two_lines(instance: Instance) -> None:
     instance.value["settings"]["log_group"] = "/rhi/coursework\nRHI_SECRET_ID=another"
     instance.publish(json.dumps(instance.value), instance.files)
@@ -444,8 +455,8 @@ def one_byte_changed(instance: Instance) -> None:
 
 
 FAILURES = [
-    no_tag, no_metadata, no_parameter, not_json, no_secret_id, a_setting_of_two_lines, a_flag_of_two_lines,
-    flags_that_are_no_list, no_archive, one_byte_changed,
+    no_tag, no_metadata, no_parameter, not_json, no_secret_id, no_engine, a_setting_of_two_lines,
+    a_flag_of_two_lines, flags_that_are_no_list, no_archive, one_byte_changed,
 ]  # fmt: skip
 
 

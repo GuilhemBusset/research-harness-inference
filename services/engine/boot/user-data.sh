@@ -111,8 +111,10 @@ import os
 import sys
 
 work, region, parameter, record = sys.argv[1:]
+# `engine` is RHI_ENGINE, the engine's row of metric names the lifecycle agent reads the engine under.
 SETTINGS = (
     "group", "launch_hook", "termination_hook", "log_group", "workspace_url", "heartbeat_table", "secret_id",
+    "engine",
 )
 
 
