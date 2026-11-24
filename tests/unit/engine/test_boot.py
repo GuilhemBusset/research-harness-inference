@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from rhi_lifecycle import __main__ as agent
 from rhi_lifecycle import release
 
 if TYPE_CHECKING:
@@ -50,6 +51,8 @@ ENGINE_UNIT = BOOT.parent / "units/rhi-engine.service"
 REGION = "eu-west-3"
 PARAMETER = "/rhi/pools/coursework/release"
 TAG, PLACEMENT = "tags/instance/rhi-release-parameter", "placement/region"
+# The pool's engine, which the launch template also gives each instance as a tag.
+ENGINE_TAG = "tags/instance/rhi-engine"
 OBJECT = "s3://artifacts/releases/coursework.tar"
 # The archive of a release: units/, collector/config.yaml and agent/ at its root.
 MEMBERS = {
@@ -157,6 +160,7 @@ def parameter_value(files: bytes) -> dict[str, Any]:
             "workspace_url": "https://aps-workspaces.example.com/api/v1/remote_write",
             "heartbeat_table": "rhi-heartbeats",
             "secret_id": "rhi/coursework/engine",
+            "engine": "vllm",
         },
     }
 
@@ -321,12 +325,16 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
         "RHI_REGION": REGION,
         "RHI_RELEASE_PARAMETER": PARAMETER,
         "RHI_ENGINE_IMAGE": current.release.engine_image,
+        "RHI_ENGINE": "vllm",
     }
     if measured is not None:
         expected["RHI_MEASURED_START"] = str(measured)
     lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
     assert dict(line.split("=", 1) for line in lines) == expected
     assert len(lines) == len(expected)
+    # The agent's program, given those settings, reads the engine under the names of the pool's engine.
+    environment = agent.Environment.read(dict(line.split("=", 1) for line in lines))
+    assert (environment.engine, environment.settings) == ("vllm", current.settings)
     # The archive is all there is under /opt/rhi, and only the top of units/ is installed.
     assert instance.files_under("opt/rhi") == {f"release/{name}" for name in MEMBERS}
     for name, content in MEMBERS.items():
@@ -339,6 +347,31 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
     assert commands.index("daemon-reload") < commands.index("start")
     at_start = set((instance.state / "at-start").read_text(encoding="utf-8").split())
     assert {*TOP_UNITS, "release.env", "engine-flags", "release.json"} <= at_start
+
+
+def test_a_release_written_before_the_engine_setting_takes_the_engine_from_the_instances_tag(
+    instance: Instance,
+) -> None:
+    # A release of a parameter written before its settings named the engine, on an instance whose
+    # launch template, newer, gives the new boot program: the instance's tag names the engine.
+    del instance.value["settings"]["engine"]
+    instance.publish(json.dumps(instance.value), instance.files)
+    instance.metadata.values[ENGINE_TAG] = "vllm"
+
+    result = instance.run(PROGRAM)
+
+    assert result.returncode == 0, result.stderr
+    assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
+    lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    assert agent.Environment.read(dict(line.split("=", 1) for line in lines)).engine == "vllm"
+
+    # A release that names the engine is followed, whatever the tag says.
+    instance.stop()
+    instance.value["settings"]["engine"] = "mock"
+    instance.publish(json.dumps(instance.value), instance.files)
+    assert instance.run(PROGRAM).returncode == 0
+    lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    assert dict(line.split("=", 1) for line in lines)["RHI_ENGINE"] == "mock"
 
 
 def test_the_mock_pool_gets_no_gpu_unit(instance: Instance) -> None:
@@ -387,7 +420,7 @@ def test_the_tag_and_the_region_are_read_with_a_session_token(instance: Instance
     assert instance.metadata.reads == []
 
     assert instance.run(PROGRAM).returncode == 0
-    assert set(instance.metadata.reads) == {TAG, PLACEMENT}
+    assert set(instance.metadata.reads) == {TAG, PLACEMENT, ENGINE_TAG}
     # The parameter the tag names, and no other: with another name in the tag, nothing is read.
     instance.metadata.values[TAG] = "/rhi/pools/another/release"
     assert instance.run(PROGRAM).returncode != 0
@@ -413,6 +446,12 @@ def not_json(instance: Instance) -> None:
 
 def no_secret_id(instance: Instance) -> None:
     del instance.value["settings"]["secret_id"]
+    instance.publish(json.dumps(instance.value), instance.files)
+
+
+def no_engine(instance: Instance) -> None:
+    # Neither the release nor a tag of the instance names the engine.
+    del instance.value["settings"]["engine"]
     instance.publish(json.dumps(instance.value), instance.files)
 
 
@@ -444,8 +483,8 @@ def one_byte_changed(instance: Instance) -> None:
 
 
 FAILURES = [
-    no_tag, no_metadata, no_parameter, not_json, no_secret_id, a_setting_of_two_lines, a_flag_of_two_lines,
-    flags_that_are_no_list, no_archive, one_byte_changed,
+    no_tag, no_metadata, no_parameter, not_json, no_secret_id, no_engine, a_setting_of_two_lines,
+    a_flag_of_two_lines, flags_that_are_no_list, no_archive, one_byte_changed,
 ]  # fmt: skip
 
 

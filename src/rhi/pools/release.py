@@ -38,7 +38,9 @@ everything but the libraries and nothing is downloaded.
 **The parameter.** `/rhi/pools/<pool>/release`, the name the launch template puts in the instance
 tag `rhi-release-parameter`. Its value is one JSON object: the compared release (`engine_image`,
 `model_revision`, `engine_flags` and `files`, with the archive's bucket, key and SHA-256), the
-measured start when the configuration gives one, and the instance's settings.
+measured start when the configuration gives one, and the instance's settings. Among the settings
+is the pool's engine, by its name in `rhi_common.engine_metrics`: the lifecycle agent reads the
+engine's `/metrics` under that engine's names, and an instance has no other way to know them.
 
 **The engine flags.** The arguments the engine's container receives. A vllm pool's are what
 `rhi.pools.vllm_command` builds from its configuration, with the model at the pool's prefix of the
@@ -433,6 +435,7 @@ class PoolRelease(Construct):
             "workspace_url": cdk.Fn.join("", [workspace.workspace.attr_prometheus_endpoint, REMOTE_WRITE_PATH]),
             "heartbeat_table": heartbeats.table_name,
             "secret_id": secret_name(pool.name),
+            "engine": pool.engine,
         }
         self.parameter = ssm.StringParameter(
             self,

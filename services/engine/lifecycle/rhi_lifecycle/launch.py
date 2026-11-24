@@ -149,6 +149,11 @@ class Metadata:
     def instance_id(self) -> str:
         return self._item("instance-id")
 
+    def tag(self, key: str) -> str:
+        """The value of the instance's tag `key`: the launch template lets the metadata give the
+        instance's tags. One the instance does not carry raises `NoSuchItemError`."""
+        return self._item(f"tags/instance/{key}")
+
     def _item(self, item: str) -> str:
         token = self._text(
             urllib.request.Request(
