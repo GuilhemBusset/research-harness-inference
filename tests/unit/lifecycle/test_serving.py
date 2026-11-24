@@ -31,7 +31,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from rhi_common.engine_metrics import MOCK, Quantity, metric_names
+from rhi_common.engine_metrics import MOCK, VLLM, Kind, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import launch, metrics, serving
 from rhi_lifecycle.host import Host
@@ -105,14 +105,16 @@ class Busy:
     """A stand-in engine that is slow but alive, as under long contexts with requests queued. Its
     health route answers 200. Its `/metrics` gives requests running and waiting and the tokens it
     has counted, under the mock's names: a thousand of input and fifty of output for every second
-    of the test's clock, until `stalls_at`, from when it counts none. A completion waits its turn
-    and gets no answer, unless `answers` says the engine answers it. While `metrics` is false the
-    metrics route gives no metrics."""
+    of the test's clock, until `stalls_at`, from when it counts none. With `engine` vLLM, it gives
+    them as vLLM does: under vLLM's names, each family typed and each series labelled by the model.
+    A completion waits its turn and gets no answer, unless `answers` says the engine answers it.
+    While `metrics` is false the metrics route gives no metrics."""
 
-    def __init__(self, clock: Clock, *, stalls_at: float = math.inf, answers: bool = False) -> None:
+    def __init__(self, clock: Clock, *, stalls_at: float = math.inf, answers: bool = False, engine: str = MOCK) -> None:
         self._clock = clock
         self._stalls_at = stalls_at
         self._answers = answers
+        self._engine = engine
         self.metrics = True
         self.app = Starlette(
             routes=[
@@ -129,12 +131,26 @@ class Busy:
         if not self.metrics:
             return Response(status_code=503)
         worked = min(self._clock.now, self._stalls_at) - NOW
-        lines = [
-            f"{RUNNING} 4.0",
-            f"{WAITING} 3.0",
-            f"{INPUT_TOKENS} {1000 * worked}",
-            f"{OUTPUT_TOKENS} {50 * worked}",
-        ]
+        if self._engine == MOCK:
+            lines = [
+                f"{RUNNING} 4.0",
+                f"{WAITING} 3.0",
+                f"{INPUT_TOKENS} {1000 * worked}",
+                f"{OUTPUT_TOKENS} {50 * worked}",
+            ]
+            return Response("\n".join(lines) + "\n")
+        names = metric_names(self._engine)
+        values = {
+            Quantity.RUNNING_REQUESTS: 4.0,
+            Quantity.WAITING_REQUESTS: 3.0,
+            Quantity.INPUT_TOKENS: 1000 * worked,
+            Quantity.OUTPUT_TOKENS: 50 * worked,
+        }
+        lines = []
+        for quantity, value in values.items():
+            name = names[quantity]
+            sample = f"{name}_total" if name.kind is Kind.COUNTER else str(name)
+            lines += [f"# TYPE {name} {name.kind}", f'{sample}{{engine="0",model_name="{SETTINGS.pool}"}} {value}']
         return Response("\n".join(lines) + "\n")
 
     async def _complete(self, request: Request) -> Response:
@@ -172,12 +188,14 @@ class World(Host):
 
         return create_app(settings, clock=self.clock.time, sleep=pace)
 
-    def agent(self, served: Release = SERVED, registry: CollectorRegistry | None = None) -> serving.Serving:
+    def agent(
+        self, served: Release = SERVED, registry: CollectorRegistry | None = None, engine: str = MOCK
+    ) -> serving.Serving:
         return serving.Serving(
             served,
             SETTINGS,
             INSTANCE,
-            MOCK,
+            engine,
             dynamodb=self,
             secrets=self,
             host=self,
@@ -498,13 +516,15 @@ def test_a_dead_engine_is_restarted() -> None:
     run(scenario)
 
 
-def test_a_busy_engine_that_answers_no_completion_in_time_is_not_restarted() -> None:
+@pytest.mark.parametrize("engine", [MOCK, VLLM])
+def test_a_busy_engine_that_answers_no_completion_in_time_is_not_restarted(engine: str) -> None:
+    # Under the names of each engine: the mock's, and those of vLLM, the coursework pool's engine.
     async def scenario() -> None:
         world = World()
-        world.app = Busy(world.clock).app
+        world.app = Busy(world.clock, engine=engine).app
         registry = CollectorRegistry()
 
-        async with world.doing(world.agent(registry=registry).run()):
+        async with world.doing(world.agent(registry=registry, engine=engine).run()):
             # Five minutes, 5 seconds at a time. Before each move of the clock the heartbeat that
             # is due is written and the completion that is due is sent. None is answered: each
             # fails 30 seconds after it was sent.
@@ -517,18 +537,21 @@ def test_a_busy_engine_that_answers_no_completion_in_time_is_not_restarted() -> 
         assert world.clock.now == NOW + 300
         assert world.restarts == 0
         assert registry.get_sample_value(RESTARTS) == 0
+        # Every heartbeat read the load under the engine's names, and wrote its row.
+        assert {(row.stage, row.running, row.waiting) for row in world.rows} == {(serving.STAGE, 4, 3)}
 
     run(scenario)
 
 
-def test_an_engine_that_stopped_counting_tokens_is_restarted_a_minute_after_it_last_counted_one() -> None:
+@pytest.mark.parametrize("engine", [MOCK, VLLM])
+def test_an_engine_that_stopped_counting_tokens_is_restarted_a_minute_after_it_last_counted_one(engine: str) -> None:
     async def scenario() -> None:
         world = World()
         # The engine counts tokens for 5 seconds, then hangs: the heartbeat of the 5th second is
         # the last that reads more tokens than the one before it.
-        world.app = Busy(world.clock, stalls_at=NOW + 5).app
+        world.app = Busy(world.clock, stalls_at=NOW + 5, engine=engine).app
         registry = CollectorRegistry()
-        agent = world.agent(registry=registry)
+        agent = world.agent(registry=registry, engine=engine)
         for _ in range(4):
             await asyncio.to_thread(agent.beat)
             await world.clock.advance(5)

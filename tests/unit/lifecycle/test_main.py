@@ -617,3 +617,33 @@ def test_the_program_names_a_setting_its_environment_lacks_and_does_nothing_else
     with pytest.raises(program.SettingsError, match="RHI_TERMINATION_HOOK"):
         program.Environment.read({name: value for name, value in ENVIRON.items() if name != "RHI_TERMINATION_HOOK"})
     assert program.Environment.read(ENVIRON).settings == release.Settings(**VALUE["settings"])
+
+
+def test_without_rhi_engine_the_program_takes_the_engine_from_the_instances_tag() -> None:
+    def not_asked() -> str | None:
+        raise AssertionError("the tag is read only when RHI_ENGINE is missing")
+
+    # What a boot program writes: the release's engine, which the tag does not override.
+    assert program.Environment.read(ENVIRON | {"RHI_ENGINE": "vllm"}, engine_tag=not_asked).engine == "vllm"
+    # What a boot program older than the setting writes: no RHI_ENGINE, and the tag names the engine.
+    assert program.Environment.read(ENVIRON, engine_tag=lambda: "vllm").engine == "vllm"
+    # Neither: the mock's names, as before.
+    assert program.Environment.read(ENVIRON, engine_tag=lambda: None).engine == MOCK
+    with pytest.raises(program.SettingsError, match="RHI_ENGINE"):
+        program.Environment.read(ENVIRON, engine_tag=lambda: "an engine with no row")
+
+    # The tag, as the instance metadata gives it with a session token; None when the instance has no such tag.
+    def metadata(tags: dict[str, str]) -> launch.Metadata:
+        def fetch(request: urllib.request.Request, timeout: float | None) -> tuple[int, bytes] | None:
+            path = request.full_url.removeprefix(launch.METADATA_URL)
+            if path == "/api/token" and request.get_method() == "PUT":
+                return 200, b"a-session-token"
+            if request.get_header("X-aws-ec2-metadata-token") != "a-session-token":
+                return 401, b""
+            key = path.removeprefix("/meta-data/tags/instance/")
+            return (200, tags[key].encode()) if key in tags else (404, b"")
+
+        return launch.Metadata(fetch)
+
+    assert program.engine_tag(metadata({program.ENGINE_TAG: "vllm"})) == "vllm"
+    assert program.engine_tag(metadata({})) is None

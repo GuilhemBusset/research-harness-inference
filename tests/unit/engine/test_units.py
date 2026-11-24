@@ -246,7 +246,11 @@ def test_the_engine_is_not_started_at_boot() -> None:
     assert "Install" not in read(TEXTS["rhi-engine"])
     for name in ("rhi-collector", "rhi-lifecycle"):
         assert "rhi-engine" not in json.dumps(read(TEXTS[name])["Unit"]), name
-    assert "rhi-engine" not in (ENGINE_FOLDER / "boot/rhi-boot.sh").read_text(encoding="utf-8")
+    # The boot program names the engine's unit nowhere. The one `rhi-engine` it reads is the
+    # instance's tag that names the pool's engine, from the instance metadata.
+    boot = (ENGINE_FOLDER / "boot/rhi-boot.sh").read_text(encoding="utf-8")
+    assert boot.count("/meta-data/tags/instance/rhi-engine") == 1
+    assert "rhi-engine" not in boot.replace("/meta-data/tags/instance/rhi-engine", "")
 
 
 def test_the_engine_listens_on_port_8000_and_every_other_listener_is_on_localhost() -> None:

@@ -60,6 +60,11 @@ parameter="$(fetch --header "X-aws-ec2-metadata-token: $token" \
   || fail "the tag rhi-release-parameter cannot be read"
 region="$(fetch --header "X-aws-ec2-metadata-token: $token" "$metadata/latest/meta-data/placement/region")" \
   || fail "the region cannot be read"
+# The pool's engine, for a release whose settings name none, as those written before the settings
+# had it: the launch template tags every instance of the pool with its engine (rhi.pools.group).
+# Without the tag, the release's setting is the only source.
+engine_tag="$(fetch --header "X-aws-ec2-metadata-token: $token" \
+  "$metadata/latest/meta-data/tags/instance/rhi-engine" 2>/dev/null)" || engine_tag=""
 
 aws ssm get-parameter --region "$region" --name "$parameter" --output json >"$work/parameter.json" \
   || fail "the release parameter cannot be read"
@@ -67,16 +72,14 @@ aws ssm get-parameter --region "$region" --name "$parameter" --output json >"$wo
 # The parameter's value is JSON (services/engine/lifecycle/rhi_lifecycle/release.py gives its
 # keys). This writes the settings, one NAME=value line each, the engine's flags, an argument on
 # each line, where the archive is, and the record for the lifecycle agent.
-python3 -I - "$work" "$region" "$parameter" "$record" <<'PY' || fail "the release parameter does not hold a release"
+python3 -I - "$work" "$region" "$parameter" "$record" "$engine_tag" <<'PY' || fail "the release parameter does not hold a release"
 import json
 import os
 import sys
 
-work, region, parameter, record = sys.argv[1:]
-# `engine` is RHI_ENGINE, the engine's row of metric names the lifecycle agent reads the engine under.
+work, region, parameter, record, engine_tag = sys.argv[1:]
 SETTINGS = (
     "group", "launch_hook", "termination_hook", "log_group", "workspace_url", "heartbeat_table", "secret_id",
-    "engine",
 )
 
 
@@ -100,6 +103,10 @@ try:
         ("RHI_ENGINE_IMAGE", image),
     ]
     variables += [("RHI_" + name.upper(), text(settings[name], "settings." + name)) for name in SETTINGS]
+    # RHI_ENGINE, the engine's row of metric names the lifecycle agent reads the engine under: the
+    # release's setting, or the instance's tag for a release that has none.
+    engine = settings["engine"] if "engine" in settings else engine_tag
+    variables.append(("RHI_ENGINE", text(engine, "settings.engine")))
     measured = release.get("measured_start_seconds")
     if measured is not None:
         if isinstance(measured, bool) or not isinstance(measured, int) or measured < 1:

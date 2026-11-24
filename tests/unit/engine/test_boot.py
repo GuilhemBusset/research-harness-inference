@@ -51,6 +51,8 @@ ENGINE_UNIT = BOOT.parent / "units/rhi-engine.service"
 REGION = "eu-west-3"
 PARAMETER = "/rhi/pools/coursework/release"
 TAG, PLACEMENT = "tags/instance/rhi-release-parameter", "placement/region"
+# The pool's engine, which the launch template also gives each instance as a tag.
+ENGINE_TAG = "tags/instance/rhi-engine"
 OBJECT = "s3://artifacts/releases/coursework.tar"
 # The archive of a release: units/, collector/config.yaml and agent/ at its root.
 MEMBERS = {
@@ -347,6 +349,31 @@ def test_a_release_with_the_parameters_digest_is_unpacked_installed_and_started(
     assert {*TOP_UNITS, "release.env", "engine-flags", "release.json"} <= at_start
 
 
+def test_a_release_written_before_the_engine_setting_takes_the_engine_from_the_instances_tag(
+    instance: Instance,
+) -> None:
+    # A release of a parameter written before its settings named the engine, on an instance whose
+    # launch template, newer, gives the new boot program: the instance's tag names the engine.
+    del instance.value["settings"]["engine"]
+    instance.publish(json.dumps(instance.value), instance.files)
+    instance.metadata.values[ENGINE_TAG] = "vllm"
+
+    result = instance.run(PROGRAM)
+
+    assert result.returncode == 0, result.stderr
+    assert instance.units("start") == {"rhi-collector", "rhi-lifecycle"}
+    lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    assert agent.Environment.read(dict(line.split("=", 1) for line in lines)).engine == "vllm"
+
+    # A release that names the engine is followed, whatever the tag says.
+    instance.stop()
+    instance.value["settings"]["engine"] = "mock"
+    instance.publish(json.dumps(instance.value), instance.files)
+    assert instance.run(PROGRAM).returncode == 0
+    lines = (instance.root / "run/rhi/release.env").read_text(encoding="utf-8").splitlines()
+    assert dict(line.split("=", 1) for line in lines)["RHI_ENGINE"] == "mock"
+
+
 def test_the_mock_pool_gets_no_gpu_unit(instance: Instance) -> None:
     # A mock pool's instance: its PCI bus lists a network adapter, and no device of NVIDIA's.
     instance.value["model_revision"] = None
@@ -393,7 +420,7 @@ def test_the_tag_and_the_region_are_read_with_a_session_token(instance: Instance
     assert instance.metadata.reads == []
 
     assert instance.run(PROGRAM).returncode == 0
-    assert set(instance.metadata.reads) == {TAG, PLACEMENT}
+    assert set(instance.metadata.reads) == {TAG, PLACEMENT, ENGINE_TAG}
     # The parameter the tag names, and no other: with another name in the tag, nothing is read.
     instance.metadata.values[TAG] = "/rhi/pools/another/release"
     assert instance.run(PROGRAM).returncode != 0
@@ -423,6 +450,7 @@ def no_secret_id(instance: Instance) -> None:
 
 
 def no_engine(instance: Instance) -> None:
+    # Neither the release nor a tag of the instance names the engine.
     del instance.value["settings"]["engine"]
     instance.publish(json.dumps(instance.value), instance.files)
 
