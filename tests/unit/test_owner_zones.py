@@ -274,6 +274,17 @@ def test_without_any_list_a_pool_is_held_to_the_regions_first_three_by_name(writ
         assert "first instance type" in refused.printed
 
 
+def test_without_any_list_a_region_of_fewer_than_three_zones_is_refused(write: Any) -> None:
+    # Some accounts reach only two zones of a region. Both offer every type, but the pools' groups
+    # span the region's first three by name, and there is no third to ask about.
+    for region in (REGION[:2], REGION[:1], ()):
+        refused = write(NEITHER, Zones(region=region))
+        assert not refused.accepted()
+        assert "'coursework'" in refused.printed
+        assert "fewer than three zones" in refused.printed
+    assert write(NEITHER, Zones(region=REGION[:3])).accepted()
+
+
 def test_a_call_ec2_refuses_is_named_and_its_text_is_not_repeated(write: Any) -> None:
     for operation, call in (
         ("describe_availability_zones", "DescribeAvailabilityZones"),

@@ -337,7 +337,8 @@ your credentials, which need `ec2:DescribeAvailabilityZones` and
 - the key `zones` does not begin with the region's first three zones by name;
 - a zone of a pool does not offer one of the pool's instance types, its fallback types included.
   A pool's zones are its own list; without one, the first three of the key `zones`; without the
-  key, the region's first three zones by name.
+  key, the region's first three zones by name, and a region that gives the account fewer than
+  three refuses the pool.
 
 The refusal names the pool, and the zone and the instance type by their positions in the file
 (the pool's third zone, its second instance type), never by name. A pool whose instance type one

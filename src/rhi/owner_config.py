@@ -26,7 +26,8 @@ It refuses a configuration in which a zone of the key `zones` is not one of the 
 that key does not begin with the region's first three zones by name, or in which a zone of a pool
 does not offer one of the pool's instance types, its fallbacks included. A pool's zones are its own
 list; without one, the first three of the key `zones`; without that key, the region's first three
-by name. A refusal names the pool, and the zone and the instance type by their positions in the
+by name, and a region that has fewer than three refuses the pool: a zone the region lacks offers
+nothing. A refusal names the pool, and the zone and the instance type by their positions in the
 configuration, never a zone's name, an instance type or a text of AWS. A call that fails is named,
 whatever the SDK raised, and so is one whose answer cannot be read: the error's text, which can
 hold EC2's answer, is not repeated. `check` asks nothing: it stays offline.
@@ -203,6 +204,12 @@ def check_zones(loaded: config.Config, client: Any = None) -> None:
         elif loaded.zones is not None:
             zones = loaded.zones[: config.FIRST_ZONES]
             which = "of the first three zones of the key 'zones', which it spans since it lists none,"
+        elif len(first) < config.FIRST_ZONES:
+            # A zone the region lacks offers nothing: the pool's group could not span three.
+            raise ZoneError(
+                f"the pool {pool.name!r}: the region has fewer than three zones, and the pool spans the region's "
+                "first three by name since no zones are listed"
+            )
         else:
             zones = first
             which = "of the region's first three zones by name, which it spans since no zones are listed,"
