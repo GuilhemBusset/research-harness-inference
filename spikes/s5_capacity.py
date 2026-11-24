@@ -98,6 +98,14 @@ per stream at the median and the slowest tenth; and the cost per million output 
 (`cost_per_million`): each instance's seconds in service at the configured price of its instance
 type, over the output tokens the records report.
 
+**The failed requests** (`failed`): every request whose record is not answered 200, or names one of
+the gateway's causes (`rhi_common.causes.Cause`). A stream answered 200 and then ended by the
+gateway's error event, as an engine restart ends one, is among them: the load generator records the
+event's cause. Each cause has one status, so the counts by cause, with the streams ended by an
+error event counted apart, are counts by status and cause. A failed request that named no cause of
+the gateway's, such as an answer of the edge, is counted without a cause, so the counts by cause and
+that one add up to the failed requests.
+
 **The label** of each run: the pool, the instance types that ran, the build, the lever, the shape,
 the number of streams, the students, and the class size when the run is at it.
 
@@ -140,7 +148,12 @@ streams or the class's size. A name is `<quantity>_<shape>_<streams>`, or `<quan
 at the class's size, with the shape `hands_on` or `several_agents`: `ttft_p95_hands_on_8`,
 `stream_median_several_agents_class`. The numbers of streams are those of `DECLARED_STREAMS`, and
 the job refuses any other before it sends anything. `class_size` is the class's size itself. A
-quantity with no sample behind it is left out of a run's numbers. The students' quantities come from
+quantity with no sample behind it is left out of a run's numbers. The failed requests are posted as
+their count, `failed_requests`, and as `failed_share`, their percentage of the requests sent, for
+every run that sent a request; then, each only when above zero, as one count for each cause of the
+gateway's, `failed_` followed by the cause's name (`failed_engine_error_several_agents_class`), as
+`failed_in_stream`, those answered 200 whose stream then carried the error event, which are also
+counted under their cause, and as `failed_without_cause`. The students' quantities come from
 the load generator's records; the engine's, from its instances: the output throughput, the prefill
 speed and the cached share are their means over the instances, the cache capacity the smallest any
 reported, the running requests the largest peak, and the preemptions their sum, given only when
@@ -149,12 +162,18 @@ every instance reported its count.
 **The verdict** (`spike_of`) reads the class-size runs of both shapes only. They pass when each
 has a 95th-percentile time to first token of later turns under `target_ttft_p95_seconds`, a median
 stream at `target_stream_median_tokens_per_second` or more, a slowest tenth at
-`target_stream_p10_tokens_per_second` or more, and no preemption. Those keys of the configuration
-(`rhi.config`, issue E4-31) default to section 17's 5 seconds, 15 and 10 tokens a second. A
-class-size number that misses its floor fails the job, a preemption among them, whatever else is
-missing. Short of that, a job whose class-size runs lack one of those numbers (an engine that does
-not count preemptions) has no verdict, and is posted as not measured. The numbers of a job are one
-build's: a run served by another build than the job's earlier runs stops the job, as not measured.
+`target_stream_p10_tokens_per_second` or more, no preemption, and a failed share at
+`target_failed_requests_percent` or less. The first three keys of the configuration (`rhi.config`,
+issue E4-31) default to section 17's 5 seconds, 15 and 10 tokens a second. The times and the speeds
+come from the requests that got an answer, so the failed share is read beside them: without it the
+survivors of a failing run could pass. The design gives no floor for it; the key's default, 0.5, is
+the share of failures that section 7.3's objective for the gateway's answers allows, until the
+owner confirms it or names another. A class-size number that misses its floor fails the job, a
+preemption or a failed share among them, whatever else is missing. Short of that, a job whose
+class-size runs lack one of those numbers (an engine that does not count preemptions, a run that
+sent no request and so has no failed share) has no verdict, and is posted as not measured. The
+numbers of a job are one build's: a run served by another build than the job's earlier runs stops
+the job, as not measured.
 
 **The record.** The run label is `<build>-<lever>-<instances>`. `record_statuses` writes a commit's
 runs of S5 into `docs/measurements/s5.md` (`tools/measurements/record.py`), and then gives each
@@ -194,6 +213,7 @@ import re
 import statistics
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -206,6 +226,7 @@ import common
 import loadgen
 import s4_weights
 from rhi import config
+from rhi_common.causes import Cause
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
 from rhi_lifecycle.serving import RELEASE_METRIC
@@ -450,6 +471,25 @@ class Experience:
     tokens_per_second_median: float | None
     tokens_per_second_slowest_tenth: float | None
     output_tokens: int
+    failed_by_cause: Mapping[str, int] = field(default_factory=dict)
+    """How many of the failed requests named each cause of the gateway's, by the cause's name; a
+    cause none named is not there. The failed requests they leave named no cause."""
+    failed_in_stream: int = 0
+    """How many of them were answered 200, their stream then carrying the gateway's error event."""
+
+
+CAUSES = frozenset(cause.value for cause in Cause)
+
+
+def named_cause(record: loadgen.Record) -> bool:
+    """Whether the record names one of the gateway's causes, in its answer or in an error event."""
+    return record.cause in CAUSES
+
+
+def failed(record: loadgen.Record) -> bool:
+    """Whether the request failed: not answered 200, or one of the gateway's causes named, as by the
+    error event that ends a stream answered 200."""
+    return record.status != 200 or named_cause(record)
 
 
 def _at(samples: Sequence[float], percent: float) -> float | None:
@@ -459,13 +499,14 @@ def _at(samples: Sequence[float], percent: float) -> float | None:
 def experience_of(records: Sequence[loadgen.Record]) -> Experience:
     """The time to first token at the median and the 95th percentile, later turns and first turns
     apart; the speed per stream at the median and the slowest tenth, its 10th percentile; the
-    output tokens the answers reported."""
+    output tokens the answers reported; and the failed requests (`failed`), by the cause they named."""
     later = [r.first_token_seconds for r in records if not r.first_turn and r.first_token_seconds is not None]
     first = [r.first_token_seconds for r in records if r.first_turn and r.first_token_seconds is not None]
     speeds = [r.output_tokens_per_second for r in records if r.output_tokens_per_second is not None]
+    named = Counter(record.cause for record in records if named_cause(record))
     return Experience(
         requests=len(records),
-        failed=sum(record.status != 200 for record in records),
+        failed=sum(failed(record) for record in records),
         later_turns=len(later),
         first_turns=len(first),
         first_token_seconds_median=_at(later, 50),
@@ -475,6 +516,8 @@ def experience_of(records: Sequence[loadgen.Record]) -> Experience:
         tokens_per_second_median=_at(speeds, 50),
         tokens_per_second_slowest_tenth=_at(speeds, 10),
         output_tokens=sum(record.output_tokens or 0 for record in records),
+        failed_by_cause={cause.value: named[cause.value] for cause in Cause if named[cause.value]},
+        failed_in_stream=sum(record.status == 200 and named_cause(record) for record in records),
     )
 
 
@@ -1104,6 +1147,24 @@ class Figure(StrEnum):
 
     REQUESTS = "requests"
     FAILED_REQUESTS = "failed_requests"
+    FAILED_SHARE = "failed_share"
+    """The failed requests in percent of the requests sent: what the verdict reads."""
+    FAILED_INVALID_KEY = "failed_invalid_key"
+    """The failed requests that named a cause of the gateway's: one quantity a cause (`FAILED_BY_CAUSE`)."""
+    FAILED_NOT_FOUND = "failed_not_found"
+    FAILED_REQUEST_REFUSED = "failed_request_refused"
+    FAILED_CONCURRENCY_LIMIT = "failed_concurrency_limit"
+    FAILED_WARMING = "failed_warming"
+    FAILED_CAPACITY_UNAVAILABLE = "failed_capacity_unavailable"
+    FAILED_POOL_SCHEDULED_ONLY = "failed_pool_scheduled_only"
+    FAILED_POOL_DISABLED = "failed_pool_disabled"
+    FAILED_NO_SESSION = "failed_no_session"
+    FAILED_ENGINE_ERROR = "failed_engine_error"
+    FAILED_TIME_LIMIT = "failed_time_limit"
+    FAILED_IN_STREAM = "failed_in_stream"
+    """Those answered 200 whose stream then carried the gateway's error event, also under their cause."""
+    FAILED_WITHOUT_CAUSE = "failed_without_cause"
+    """Those that named no cause of the gateway's, such as an answer of the edge."""
     INSTANCES = "instances"
     TTFT_MEDIAN = "ttft_median"
     """Later turns' time to first token: first turns are apart."""
@@ -1121,9 +1182,16 @@ class Figure(StrEnum):
     COST_PER_MILLION_OUTPUT_TOKENS = "cost_per_million_output_tokens"
 
 
+# The quantity of each cause of the gateway's vocabulary: a cause with none does not load.
+FAILED_BY_CAUSE = {cause: Figure(f"failed_{cause.value}") for cause in Cause}
+
 UNITS = {
     Figure.REQUESTS: "count",
     Figure.FAILED_REQUESTS: "count",
+    Figure.FAILED_SHARE: "percent",
+    **dict.fromkeys(FAILED_BY_CAUSE.values(), "count"),
+    Figure.FAILED_IN_STREAM: "count",
+    Figure.FAILED_WITHOUT_CAUSE: "count",
     Figure.INSTANCES: "count",
     Figure.TTFT_MEDIAN: "s",
     Figure.TTFT_P95: "s",
@@ -1176,7 +1244,9 @@ def _mean(values: Sequence[float | None]) -> float | None:
 
 
 def figures_of(measured: Measured) -> dict[Figure, int | float | None]:
-    """What one run measured, as the quantities it posts: None where it has nothing."""
+    """What one run measured, as the quantities it posts: None where it has nothing. A count of
+    failed requests by cause, in a stream or without a cause is None when it is zero, to keep
+    postings short; their count and their share are given for every run that sent a request."""
     seen, engines = measured.experience, [one.engine for one in measured.instances.values()]
     cached = _mean([one.cached_share for one in engines])
     capacity = _present([one.cache_capacity_tokens for one in engines])
@@ -1189,6 +1259,10 @@ def figures_of(measured: Measured) -> dict[Figure, int | float | None]:
     return {
         Figure.REQUESTS: seen.requests,
         Figure.FAILED_REQUESTS: seen.failed,
+        Figure.FAILED_SHARE: 100 * seen.failed / seen.requests if seen.requests else None,
+        **{figure: seen.failed_by_cause.get(cause.value) or None for cause, figure in FAILED_BY_CAUSE.items()},
+        Figure.FAILED_IN_STREAM: seen.failed_in_stream or None,
+        Figure.FAILED_WITHOUT_CAUSE: seen.failed - sum(seen.failed_by_cause.values()) or None,
         Figure.INSTANCES: len(measured.instances),
         Figure.TTFT_MEDIAN: seen.first_token_seconds_median,
         Figure.TTFT_P95: seen.first_token_seconds_p95,
@@ -1229,29 +1303,33 @@ def numbers_of(measured: Sequence[Measured], class_size: int) -> dict[str, int |
 class Floors:
     """The floors of section 7.3: the 95th percentile of the time to first token, in seconds, which
     a run stays under, and the median and the slowest tenth of a stream's speed, in tokens a
-    second, which it reaches."""
+    second, which it reaches. And one the design does not give yet: the failed requests, in percent
+    of the requests sent, which a run does not exceed."""
 
     ttft_p95_seconds: float
     stream_median_tokens_per_second: float
     stream_p10_tokens_per_second: float
+    failed_requests_percent: float
 
 
 def floors_of(settings: config.Config) -> Floors:
-    """The floors the configuration holds (issue E4-31), section 17's unless it gives others."""
+    """The floors the configuration holds (issue E4-31), section 17's unless it gives others, and
+    its floor on the failed requests, `target_failed_requests_percent`."""
     return Floors(
         ttft_p95_seconds=settings.target_ttft_p95_seconds,
         stream_median_tokens_per_second=settings.target_stream_median_tokens_per_second,
         stream_p10_tokens_per_second=settings.target_stream_p10_tokens_per_second,
+        failed_requests_percent=settings.target_failed_requests_percent,
     )
 
 
 # What the verdict reads, at the class's size in each shape.
-JUDGED = (Figure.TTFT_P95, Figure.STREAM_MEDIAN, Figure.STREAM_P10, Figure.PREEMPTIONS)
+JUDGED = (Figure.TTFT_P95, Figure.STREAM_MEDIAN, Figure.STREAM_P10, Figure.PREEMPTIONS, Figure.FAILED_SHARE)
 
 
 def meets(figure: Figure, value: float, floors: Floors) -> bool:
     """Whether one number the verdict reads meets its floor: the time to first token under its
-    floor, each speed at its floor or above, no preemption."""
+    floor, each speed at its floor or above, no preemption, the failed share at its floor or below."""
     if figure is Figure.TTFT_P95:
         return value < floors.ttft_p95_seconds
     if figure is Figure.STREAM_MEDIAN:
@@ -1260,19 +1338,23 @@ def meets(figure: Figure, value: float, floors: Floors) -> bool:
         return value >= floors.stream_p10_tokens_per_second
     if figure is Figure.PREEMPTIONS:
         return value == 0
+    if figure is Figure.FAILED_SHARE:
+        return value <= floors.failed_requests_percent
     raise ValueError("the verdict does not read that quantity")
 
 
 def passes(numbers: common.Numbers, floors: Floors) -> bool:
-    """Whether the class-size runs of both shapes meet the floors, with no preemption."""
+    """Whether the class-size runs of both shapes meet the floors, with no preemption and no more
+    failed requests than their floor allows."""
     return all(meets(figure, numbers[name_of(figure, shape, None)], floors) for shape in Shape for figure in JUDGED)
 
 
 @dataclass(frozen=True)
 class CapacitySpike(common.Spike):
-    """Spike S5 against `floors`: a class-size number that misses its floor fails the job, whatever
-    else is missing; with none missed, a class-size run that lacks a number the verdict reads leaves
-    the job with no verdict."""
+    """Spike S5 against `floors`: a class-size number that misses its floor fails the job, a failed
+    share above its floor among them, whatever else is missing; with none missed, a class-size run
+    that lacks a number the verdict reads, its failed share among them, leaves the job with no
+    verdict."""
 
     floors: Floors
 

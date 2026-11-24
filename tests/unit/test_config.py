@@ -49,12 +49,14 @@ GATEWAY_KEYS = {
     "retry_after_concurrency_limit_seconds": 5,
 }
 
-# The provisional targets of section 7.3, each at the default of section 17.
+# The provisional targets of section 7.3, each at the default of section 17, and spike S5's floor
+# on its failed requests, which the design does not name yet.
 TARGET_KEYS = {
     "target_ttft_p95_seconds": 5,
     "target_stream_median_tokens_per_second": 15,
     "target_stream_p10_tokens_per_second": 10,
     "cached_share_flag_percent": 85,
+    "target_failed_requests_percent": 0.5,
 }
 
 
@@ -225,6 +227,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ),
         *((key, value) for key in TARGET_KEYS for value in (f'"{MARK}"', "0", f"-{MARK}.5", "true", "nan")),
         ("cached_share_flag_percent", f"100.{MARK}"),
+        ("target_failed_requests_percent", f"100.{MARK}"),
         *(("pipeline_events_retention_days", value) for value in ("0", "91", f'"{MARK}"', "90.5", "true")),
         *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
@@ -370,6 +373,7 @@ def test_the_provisional_targets_read_the_defaults_of_section_17_when_left_out(t
         "target_stream_median_tokens_per_second": 20,
         "target_stream_p10_tokens_per_second": 12.5,
         "cached_share_flag_percent": 90,
+        "target_failed_requests_percent": 2.5,
     }
     given = load_text(tmp_path, example_with(**{key: str(value) for key, value in moved.items()}))
     assert {key: getattr(given, key) for key in TARGET_KEYS} == moved

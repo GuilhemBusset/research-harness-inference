@@ -97,6 +97,14 @@ target_stream_median_tokens_per_second = 15
 target_stream_p10_tokens_per_second = 10
 cached_share_flag_percent = 85
 
+# The failed requests, in percent of the requests sent, that a class-size run of spike S5 may have
+# and still pass: a run with more fails the job, whatever its times and speeds, which come only
+# from the requests that got an answer. A percentage above 0 and at most 100. Left out, it is 0.5.
+# The design names no floor for it yet: 0.5 is the share of failures that section 7.3's objective
+# for the gateway's answers allows (99.5% answered), and is provisional until the owner confirms it
+# or names another.
+target_failed_requests_percent = 0.5
+
 # The days the pipeline's log group keeps its state changes, which the deployments dashboard reads
 # (system design, sections 6.6 and 7.2). A period CloudWatch Logs takes (1, 3, 5, 7, 14, 30, 60,
 # 90, 120, 150, 180, 365 and longer ones). Left out, it is 90, the period of the stage's log groups.

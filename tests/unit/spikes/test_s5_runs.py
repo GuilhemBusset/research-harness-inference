@@ -1,7 +1,7 @@
 """Spike S5's runs (`spikes/s5_capacity.py`): which runs the job makes from its inputs, how recorded
 workspace answers read back as each instance's quantities, and what is computed from recorded
-load-generator records. No number here is a measurement; the instance names are made up, and the
-keys are generated.
+load-generator records, the failed requests among them. No number here is a measurement; the
+instance names are made up, and the keys are generated.
 """
 
 from __future__ import annotations
@@ -12,12 +12,15 @@ import urllib.error
 from email.message import Message
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 
 import common
 import loadgen
 import s5_capacity as s5
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
+from rhi_gateway import errors
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping, Sequence
@@ -191,6 +194,75 @@ class Workspace:
     def read_samples(self, query: str, *, at: float) -> list[common.Series]:
         refuse_anchored(query)
         return []
+
+
+def answered_as_the_gateway(request: httpx.Request) -> httpx.Response:
+    """The gateway's answer to the numbered request of a run: an error of its own for three of them,
+    rendered as it renders them (`rhi_gateway.errors`), and an answer for every other."""
+    number, stream = json.loads(request.content)["request"], {"content-type": "text/event-stream"}
+    if number in (10, 30):
+        cause = Cause.ENGINE_ERROR if number == 10 else Cause.CAPACITY_UNAVAILABLE
+        refused = errors.render_json(cause, errors.WireFormat.MESSAGES)
+        return httpx.Response(refused.status, headers=refused.headers, content=refused.body)
+    if number == 20:
+        # Answered 200, then ended by the error event, as an engine restart ends a stream.
+        ended = errors.render_stream_event(Cause.ENGINE_ERROR, errors.WireFormat.MESSAGES)
+        return httpx.Response(200, headers=stream, content=ended)
+    return httpx.Response(200, headers=stream, content=b"")
+
+
+def test_a_run_posts_its_failed_requests_by_cause() -> None:
+    clock = Clock()
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        # 100 requests, each a session of its own, read by the load generator itself.
+        clock.now += 600
+        sent = [
+            loadgen.Request("POST", loadgen.MESSAGES_PATH, {}, json.dumps({"request": n}).encode()) for n in range(100)
+        ]
+        sessions = tuple(loadgen.RecordedSession((loadgen.Exchange(0, request),)) for request in sent)
+        transport = httpx.MockTransport(answered_as_the_gateway)
+        return await loadgen.replay(
+            loadgen.Load(sessions, len(sessions)), keys, endpoint, at_once=4, transport=transport
+        )
+
+    job = s5.Job(
+        pool="coursework", engine="vllm", prices={"g7e.2xlarge": 3.36}, lever="baseline", streams=(1,),
+        class_size=1, duration=600, keys=[generate_key()], endpoint="https://gateway.example.com",
+        gateway=Gateway(), workspace=Workspace(), replay=replay, wall=clock, sleep=clock.sleep,
+    )  # fmt: skip
+    run = job.run(job.runs[0])
+    assert (run.experience.requests, run.experience.failed) == (100, 3)
+    numbers = s5.numbers_of([run], 1)
+    assert numbers["requests_hands_on_1"] == 100
+    assert {name: value for name, value in numbers.items() if name.startswith("failed_")} == {
+        "failed_requests_hands_on_1": 3,
+        "failed_share_hands_on_1": 3,
+        "failed_engine_error_hands_on_1": 2,
+        "failed_in_stream_hands_on_1": 1,
+        "failed_capacity_unavailable_hands_on_1": 1,
+    }
+
+
+def test_the_counts_by_cause_and_without_a_cause_add_up_to_the_failed_requests() -> None:
+    def failure(status: int | None, cause: str | None = None) -> loadgen.Record:
+        return loadgen.Record(0, 0, False, status, None, None, None, None, None, None, cause=cause)
+
+    # One refusal for each cause of the gateway's, each with its status; and three that name none:
+    # no answer at all, an answer of the edge, and a cause that is not of the vocabulary.
+    named = [failure(cause.status, cause.value) for cause in Cause]
+    unnamed = [failure(None), failure(403), failure(502, "another_cause")]
+    seen = s5.experience_of([record(True, 1.0), *named, *unnamed, record(False, 1.0)])
+    assert (seen.requests, seen.failed) == (16, 14)
+    label = s5.Label("coursework", ("g7e.2xlarge",), "8bit", "baseline", s5.Shape.HANDS_ON, 1, 1, None)
+    figures = s5.figures_of(s5.Measured(label, 600.0, seen, None))
+    by_cause = {cause.value: figures[s5.Figure(f"failed_{cause.value}")] for cause in Cause}
+    assert by_cause == dict.fromkeys(by_cause, 1) and len(by_cause) == 11
+    assert figures[s5.Figure.FAILED_WITHOUT_CAUSE] == 3
+    assert figures[s5.Figure.FAILED_REQUESTS] == 11 + 3
+    # None was answered 200, and a run with no request has no share to post.
+    assert figures[s5.Figure.FAILED_IN_STREAM] is None
+    assert s5.figures_of(s5.Measured(label, 600.0, s5.experience_of([]), None))[s5.Figure.FAILED_SHARE] is None
 
 
 def test_the_runs_follow_the_inputs() -> None:
