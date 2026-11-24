@@ -30,7 +30,12 @@ if TYPE_CHECKING:
 
 REPO = Path(__file__).resolve().parents[3]
 EXAMPLE = tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8"))
-FLOORS = ("target_ttft_p95_seconds", "target_stream_median_tokens_per_second", "target_stream_p10_tokens_per_second")
+FLOORS = (
+    "target_ttft_p95_seconds",
+    "target_stream_median_tokens_per_second",
+    "target_stream_p10_tokens_per_second",
+    "target_failed_requests_percent",
+)
 COMMIT = "c" * 40
 
 
@@ -59,10 +64,13 @@ def run(
     p10: float = 11.0,
     preemptions: float | None = 0,
     build: str = "8bit",
+    requests: int = 400,
+    failed: int = 0,
 ) -> s5.Measured:
-    """A recorded run: its students' times and speeds, and one instance's engine."""
+    """A recorded run: its students' times and speeds, how many of its requests failed, and one
+    instance's engine."""
     label = s5.Label("coursework", ("g7e.2xlarge",), build, "baseline", shape, streams, streams, class_size)
-    seen = s5.Experience(400, 0, 360, 40, 1.2, p95, 3.0, 4.5, median, p10, 200_000)
+    seen = s5.Experience(requests, failed, 360, 40, 1.2, p95, 3.0, 4.5, median, p10, 200_000)
     engine = s5.EngineQuantities(
         output_tokens_per_second=150.0,
         prefill_tokens_per_second=5_000.0,
@@ -98,6 +106,12 @@ def verdict(measured: list[s5.Measured], configuration: config.Config | None = N
         ({"preemptions": 1}, Verdict.FAIL),
         # An engine that does not count preemptions cannot show there were none.
         ({"preemptions": None}, Verdict.NOT_MEASURED),
+        # 4 failed requests of 400 are above the floor, whatever else is missing.
+        ({"failed": 4}, Verdict.FAIL),
+        ({"failed": 4, "preemptions": None}, Verdict.FAIL),
+        # A run that sent no request has no failed share; a floor it misses still fails the job.
+        ({"requests": 0}, Verdict.NOT_MEASURED),
+        ({"requests": 0, "p95": 6.0}, Verdict.FAIL),
     ],
 )
 def test_the_class_size_runs_are_judged_against_the_floors(at_class: dict[str, Any], expected: Verdict) -> None:
@@ -109,9 +123,31 @@ def test_the_class_size_runs_are_judged_against_the_floors(at_class: dict[str, A
         assert verdict(one_shape) is Verdict.FAIL
 
 
+def test_a_class_size_failed_share_above_its_floor_fails_the_job() -> None:
+    def shares(hands_on: int, several_agents: int, configuration: config.Config | None = None) -> Verdict:
+        """The verdict of a job whose class-size runs, of 400 requests each, had that many failed,
+        and meet every other floor."""
+        failed = {s5.Shape.HANDS_ON: hands_on, s5.Shape.SEVERAL_AGENTS: several_agents}
+        runs = job()[:-2] + [run(shape, 20, class_size=20, failed=failed[shape]) for shape in s5.Shape]
+        numbers = s5.numbers_of(runs, 20)
+        assert numbers["failed_share_hands_on_class"] == 100 * hands_on / 400
+        assert numbers["failed_share_several_agents_class"] == 100 * several_agents / 400
+        return verdict(runs, configuration)
+
+    # 2 of 400 are a share of 0.5, the default floor, which both shapes may reach; 4 are a share of 1.
+    assert shares(2, 2) is Verdict.PASS
+    assert shares(4, 2) is Verdict.FAIL
+    assert shares(2, 4) is Verdict.FAIL
+    # 6 are a share of 1.5, which a configuration whose floor is 2 passes.
+    assert shares(6, 6) is Verdict.FAIL
+    assert shares(6, 6, settings(target_failed_requests_percent=2)) is Verdict.PASS
+    # The runs at a number of streams do not enter the verdict, whatever failed in them.
+    assert verdict([*job(), run(s5.Shape.HANDS_ON, 8, failed=200)]) is Verdict.PASS
+
+
 def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Left out, the keys take section 17's values.
-    assert s5.floors_of(settings(**dict.fromkeys(FLOORS))) == s5.Floors(5, 15, 10)
+    # Left out, the keys take section 17's values, and the failed share its own default.
+    assert s5.floors_of(settings(**dict.fromkeys(FLOORS))) == s5.Floors(5, 15, 10, 0.5)
     stricter = settings(target_stream_median_tokens_per_second=17.5)
     assert verdict(job(median=16.0)) is Verdict.PASS
     assert verdict(job(median=16.0), stricter) is Verdict.FAIL
@@ -237,8 +273,10 @@ def test_the_record_holds_the_matrix(tmp_path: Path) -> None:
         for streams in ("1", "8", "class")
     } | {("8bit", "hands-on", "16"), ("4bit", "hands-on", "16")}
     assert {labels["lever"] for labels in medians} == {"baseline"}
+    # Every quantity but the counts that are posted only above zero: these runs had no failed request.
+    unposted = {*s5.FAILED_BY_CAUSE.values(), s5.Figure.FAILED_IN_STREAM, s5.Figure.FAILED_WITHOUT_CAUSE}
     assert {row["name"] for row in held["rows"]} == {
-        *(figure.value for figure in s5.Figure),
+        *(figure.value for figure in s5.Figure if figure not in unposted),
         "class_size",
         "numbers_posted",
     }
