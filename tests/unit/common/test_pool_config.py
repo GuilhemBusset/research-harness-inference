@@ -222,6 +222,19 @@ def test_optional_fields() -> None:
             pytest.param("coursework", {"start_delay_seconds": delay}, "start_delay_seconds", id=f"vllm-delay-{delay}")
             for delay in (400, 0)
         ),
+        # A pool's zones are at least one zone name, each named once.
+        *(
+            pytest.param("coursework", {"zones": zones}, "zones", id=f"zones-{case}")
+            for case, zones in (
+                ("not-a-list", "example-zone-a"),
+                ("empty", []),
+                ("not-text", ["example-zone-a", 2]),
+                ("a-zone-twice", ["example-zone-a", "example-zone-b", "example-zone-a"]),
+                ("a-digit-last", ["example-zone-1"]),
+                ("upper-case", ["Example-Zone-A"]),
+                ("an-empty-name", [""]),
+            )
+        ),
     ],
 )
 def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
@@ -462,6 +475,25 @@ def test_a_mock_pools_start_delay_is_0_unless_it_gives_one() -> None:
         refusal = refused("mock", changed(MOCK, {"start_delay_seconds": delay}))
         assert refusal.field == "start_delay_seconds"
         assert repr("start_delay_seconds") in str(refusal)
+
+
+def test_a_pools_zones_are_none_unless_it_lists_them() -> None:
+    # Left out, as in every entry written before the field: the group spans the VPC's first three.
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
+        (pool,) = parse_pools({name: entry})
+        assert pool.zones is None
+        assert "zones" not in pool_entry(pool)
+
+    # Given, they are held in the order written, which no rule here sorts. The module knows no
+    # other key: whether a zone is one the VPC spans is the configuration loader's to say.
+    for zones in (["example-zone-d", "example-zone-a"], ["example-zone-b"]):
+        (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"zones": zones})})
+        assert pool.zones == tuple(zones)
+        # The entry the deployment writes for the gateway and the scaler reads back the same.
+        assert pool_entry(pool)["zones"] == zones
+        assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+    # A list that is empty, or names a zone twice, is refused by the pool's name and the field:
+    # `test_refusals`.
 
 
 # The mock pool's entry as `config.example.toml` gave it when the owner first wrote it to SSM. A

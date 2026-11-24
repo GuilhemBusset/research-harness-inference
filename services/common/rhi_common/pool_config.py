@@ -102,6 +102,12 @@ health route answers 503 after the engine starts, so that the gateway holds a re
 0, the mock ready at once. Its release passes it to the mock as the flag `--start-delay-seconds`
 (`rhi.pools.release`). Only a pool whose engine is mock may give it, even at 0.
 
+A pool may give `zones`, the zones its Auto Scaling group spans (section 5.4): a list of at least
+one zone name, none named twice. A zone name holds lower-case letters, digits and hyphens, and ends
+in a lower-case letter. Left out, it is None, and the group spans the first three zones of the VPC.
+Which zones the VPC spans is another key of the configuration, of which this module knows nothing:
+the configuration loader reads a pool's zones against it (`rhi.config`).
+
 A refusal is a `PoolConfigError` that names the pool and the field, never a value: build logs
 show it.
 
@@ -170,6 +176,8 @@ _COMMIT = re.compile(r"[0-9a-f]{40}", re.ASCII)
 _PARSER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 # An entry of a request profile, which the gateway looks up as a module of its profile package.
 _PROFILE_ENTRY = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
+# A zone's name: its region's, followed by one lower-case letter.
+ZONE_NAME = re.compile(r"[a-z0-9-]*[a-z]", re.ASCII)
 
 
 def group_name(pool: str) -> str:
@@ -283,6 +291,8 @@ class Pool:
     # Seconds after its start during which a mock engine's health route answers 503 (section 4.1).
     # 0 for every pool that does not give it, and only a mock pool may give it.
     start_delay_seconds: int
+    # The zones the pool's group spans, by name, or None for the first three zones of the VPC.
+    zones: tuple[str, ...] | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
@@ -507,6 +517,23 @@ def _start_delay_seconds(pool: str, entry: Mapping[str, object], engine: str) ->
     return _whole(pool, entry, field, least=0, default=DEFAULT_START_DELAY_SECONDS)
 
 
+def _zones(pool: str, entry: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The zones the pool's group spans, in the order written, or None when the pool lists none."""
+    field = "zones"
+    if field not in entry:
+        return None
+    value = entry[field]
+    if not isinstance(value, (list, tuple)) or not value:
+        raise PoolConfigError(pool, field, "must be a list of zone names that is not empty")
+    if not all(isinstance(item, str) and ZONE_NAME.fullmatch(item) for item in value):
+        raise PoolConfigError(
+            pool, field, "must hold zone names: lower-case letters, digits and hyphens, with a letter last"
+        )
+    if len(set(value)) != len(value):
+        raise PoolConfigError(pool, field, "names a zone twice")
+    return tuple(value)
+
+
 def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
@@ -587,6 +614,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
             else DEFAULT_CACHE_SALT_SCOPE
         ),
         start_delay_seconds=_start_delay_seconds(name, entry, engine),
+        zones=_zones(name, entry),
     )
 
 

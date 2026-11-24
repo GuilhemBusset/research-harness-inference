@@ -36,6 +36,20 @@ a value the deployed configuration lacks; given, a pool that lists another type 
 out, is the only pool when there is one and none when there is none; with two pools or more it
 must be given, and given, it must name a pool.
 
+**The zones.** `zones` lists the zones the VPC spans, by name, in the order of its subnets: at
+least three, none named twice, and no two ending in the same letter. A zone's name is its region's
+followed by one letter, and the synthesis writes a zone beyond the third as the deploying region
+followed by that letter, so that no template names a region. The first three are the zones the VPC
+spans without the key, the region's first three by name, and a zone is only ever appended: the CDK
+names each subnet after its position, so a zone moved or removed would replace subnets of the
+deployed VPC. Left out, the key is None, and nothing fills it: the VPC spans the region's first
+three zones. The pools are read against it. A pool's own `zones` are the zones its group spans,
+each one of the key's: a pool that names another zone is refused, and so is a pool that gives
+zones when the key is left out, since no name could then be matched to a subnet. A pool that gives
+none spans the first three. Whether a zone is one of the region's, and offers a pool's instance
+types, only EC2 can say: the owner's tool asks it before the configuration enters SSM
+(`rhi.owner_config`), and this module does not.
+
 The region and the account are not configuration. They come from the deploying credentials
 (assumption A4), so no key holds either.
 
@@ -59,7 +73,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from rhi_common.pool_config import DEFAULT_ON_DEMAND_PRICE_LIMIT, Pool, PoolConfigError, parse_pools
+from rhi_common.pool_config import DEFAULT_ON_DEMAND_PRICE_LIMIT, ZONE_NAME, Pool, PoolConfigError, parse_pools
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -122,6 +136,9 @@ class Config:
     on_demand_price_limit: float
     # The pool of the `claude-*` model names, or None when no pool is configured (5.4, 6.2).
     default_pool: str | None
+    # The zones the VPC spans, by name, in the order of its subnets, or None for the region's first
+    # three by name. A pool's own zones are among them.
+    zones: tuple[str, ...] | None
     # Whether the public load balancer has its certificate, its HTTPS listener and the domain's
     # alias record. Off until the owner's domain resolves through the hosted zone: before that,
     # the certificate's DNS validation never completes and the deployment fails.
@@ -310,6 +327,23 @@ def _instance_types(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+# The zones the VPC spans when the configuration lists none, and the fewest it may list: the first
+# three of the list are those zones (`ZONES` in `rhi.network.vpc`).
+FIRST_ZONES = 3
+
+
+def _zones(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) < FIRST_ZONES:
+        raise ValueError
+    if not all(isinstance(item, str) and ZONE_NAME.fullmatch(item) for item in value):
+        raise ValueError
+    # A zone beyond the third is written as the deploying region and the zone's last letter: two
+    # zones that end in the same letter would be one. A zone named twice is such a pair.
+    if len({item[-1] for item in value}) != len(value):
+        raise ValueError
+    return tuple(value)
+
+
 def _dollars_an_hour(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError
@@ -419,6 +453,12 @@ KEYS: dict[str, Key] = {
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
     "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
     "default_pool": _STRING,
+    "zones": Key(
+        "a list of at least three zone names, each of lower-case letters, digits and hyphens with a letter last, "
+        "no two of them ending in the same letter",
+        _zones,
+        _json_from_text,
+    ),
     "issuer_reserved_concurrency": _WHOLE_NUMBER,
     "key_issuances_per_day": _WHOLE_NUMBER,
     "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
@@ -520,9 +560,10 @@ DEFAULTS: dict[str, object] = {
     "parked": False,
 }
 
-# Keys a source may leave out without a default: the field is then None. `parse` fills the two
-# below from the pools (the module's docstring, "The pools").
-OPTIONAL: frozenset[str] = frozenset({"allowed_instance_types", "default_pool"})
+# Keys a source may leave out without a default: the field is then None. `parse` fills
+# `allowed_instance_types` and `default_pool` from the pools (the module's docstring, "The pools"),
+# and leaves `zones` None ("The zones").
+OPTIONAL: frozenset[str] = frozenset({"allowed_instance_types", "default_pool", "zones"})
 
 # The keys whose values must never appear in the repository. The pipeline's leak check and the
 # owner's list of local values look for exactly these. Numbers and dates are not among them: no
@@ -582,8 +623,8 @@ def parse(data: Mapping[str, object], source: str) -> Config:
 def _read_against_the_pools(
     values: Mapping[str, Any], origins: Mapping[str, str], table: object, source: str
 ) -> dict[str, Any]:
-    """The pools parsed again with the configuration's price limit, and the two optional keys
-    that are read against them, checked or filled."""
+    """The pools parsed again with the configuration's price limit, and the optional keys that
+    are read against them: two checked or filled, and the zones, which each pool's own are held to."""
     try:
         pools = parse_pools(_pool_table(table), on_demand_price_limit=values["on_demand_price_limit"])
     except PoolConfigError as error:
@@ -599,6 +640,19 @@ def _read_against_the_pools(
             raise ConfigError(
                 f"the pool {pool.name!r} lists an instance type that the key 'allowed_instance_types' "
                 f"in {origins['allowed_instance_types']} does not allow"
+            )
+    zones = values["zones"]
+    for pool in pools:
+        if pool.zones is None:
+            continue
+        if zones is None:
+            raise ConfigError(
+                f"the pool {pool.name!r} gives zones, and the configuration source {source!r} lacks the key "
+                "'zones', which lists the zones a pool may name"
+            )
+        if any(zone not in zones for zone in pool.zones):
+            raise ConfigError(
+                f"the pool {pool.name!r} names a zone that the key 'zones' in {origins['zones']} does not list"
             )
     names = [pool.name for pool in pools]
     default = values["default_pool"]

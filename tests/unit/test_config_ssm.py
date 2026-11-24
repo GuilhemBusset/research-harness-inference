@@ -180,6 +180,45 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         assert from_file == written
 
 
+def test_the_two_lists_of_zones_are_written_and_read_back(tmp_path: Path) -> None:
+    # The example gives both lists: the key is one parameter, a JSON array, and the pool's list is
+    # in the pool's entry.
+    assert EXAMPLE.zones is not None
+    coursework = next(pool for pool in EXAMPLE.pools if pool.name == "coursework")
+    assert coursework.zones is not None
+    assert coursework.zones != EXAMPLE.zones[: len(coursework.zones)]
+    # A configuration written before the lists gives neither, and one may give the key alone.
+    key_alone = dataclasses.replace(
+        EXAMPLE, pools=tuple(dataclasses.replace(pool, zones=None) for pool in EXAMPLE.pools)
+    )
+    neither = dataclasses.replace(key_alone, zones=None)
+
+    for written in (EXAMPLE, key_alone, neither):
+        stand_in = StandIn()
+        config.write_ssm(written, stand_in)
+        values = {name: value for name, (_, value) in stand_in.parameters.items()}
+        if written.zones is None:
+            assert "/rhi/config/zones" not in values  # left out, as the owner's source leaves it out
+        else:
+            assert json.loads(values["/rhi/config/zones"]) == list(written.zones)
+        entry = json.loads(values["/rhi/config/pools/coursework"])
+        expected = next(pool for pool in written.pools if pool.name == "coursework").zones
+        assert entry.get("zones") == (None if expected is None else list(expected))
+        from_ssm = config.read_ssm(stand_in)
+        assert from_ssm == written
+        assert (from_ssm.zones, [pool.zones for pool in from_ssm.pools]) == (
+            written.zones,
+            [pool.zones for pool in written.pools],
+        )
+
+        config.write_file(written, tmp_path / "written.toml")
+        from_file = config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": str(tmp_path / "written.toml")})
+        assert from_file == written
+        assert ("zones" in tomllib.loads((tmp_path / "written.toml").read_text(encoding="utf-8"))) == (
+            written.zones is not None
+        )
+
+
 @pytest.mark.parametrize(
     ("named", "changes"),
     [
@@ -210,6 +249,11 @@ def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -
         ("'pools'", {"/rhi/config/pools/mock": f'{{"engine": "mock{MARK}"}}'}),
         ("'allowed_instance_types'", {"/rhi/config/allowed_instance_types": f"t{MARK}.small"}),
         ("'default_pool'", {"/rhi/config/default_pool": f"pool{MARK}"}),
+        # The zones: a list the loader refuses, and a pool whose zone the list does not hold.
+        ("'zones'", {"/rhi/config/zones": f'["zone{MARK}-a", "zone{MARK}-b"]'}),
+        ("'zones'", {"/rhi/config/zones": f"zone{MARK}-a"}),
+        ("'zones'", {"/rhi/config/zones": f'["zone{MARK}-a", "zone{MARK}-b", "zone{MARK}-c"]'}),
+        ("'zones'", {"/rhi/config/zones": None}),
     ],
 )
 def test_a_missing_an_unknown_or_a_wrongly_typed_parameter_raises(

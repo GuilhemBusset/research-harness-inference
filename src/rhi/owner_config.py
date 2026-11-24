@@ -3,7 +3,7 @@ checked by the configuration loader and written to SSM by the configuration writ
 half writes the file's private values to the hygiene scanner's list of local values.
 
     python -m rhi.owner_config check <file>   # the loader reads the file; nothing is written
-    python -m rhi.owner_config write <file>   # the same check, then one parameter per key in SSM
+    python -m rhi.owner_config write <file>   # the same check, the zone check, then one parameter per key in SSM
     python -m rhi.owner_config values <file> --list <list>   # the private values, onto the list
 
 The file goes through the loader's own `file` source and to SSM through `write_ssm`
@@ -11,12 +11,33 @@ The file goes through the loader's own `file` source and to SSM through `write_s
 the loader refuses is refused here, before anything is written, in the loader's words: they name
 a key or a source and never a value. Nothing this module prints holds a value of the file.
 
+**The zone check.** Whether a zone is one of the region's, and whether it offers an instance type,
+only EC2 can say, and synthesis has no AWS access. So `write` asks EC2 before it writes any
+parameter, with the caller's credentials and region:
+
+- DescribeAvailabilityZones, filtered to the zone type availability-zone: the region's zones,
+  sorted by name. Its first three are the zones the VPC spans when the configuration lists none
+  (`rhi.network.stack`);
+- DescribeInstanceTypeOfferings, with the location type availability-zone, filtered to the
+  instance types the pools list, every page: which zone offers which type. A configuration whose
+  pools list no instance type has nothing to ask, and the call is not made.
+
+It refuses a configuration in which a zone of the key `zones` is not one of the region's, in which
+that key does not begin with the region's first three zones by name, or in which a zone of a pool
+does not offer one of the pool's instance types, its fallbacks included. A pool's zones are its own
+list; without one, the first three of the key `zones`; without that key, the region's first three
+by name. A refusal names the pool, and the zone and the instance type by their positions in the
+configuration, never a zone's name, an instance type or a text of AWS; a call EC2 or the SDK
+refuses is named, and its error is not repeated. `check` asks nothing: it stays offline.
+
 `values` adds the value of each key of `config.PRIVATE_KEYS`, and each line of its standard
 input, to the list the scanner reports as `local-value` (tools/hygiene/README.md, "Values only
 the owner knows"): one value per line, in a file only its owner can read.
 
 That the file and the list lie outside the working tree is the walkthrough's check, made before
-it starts this module. Only `write` reaches AWS, with the caller's credentials and region.
+it starts this module. Only `write` reaches AWS, with the caller's credentials and region: it
+needs `ec2:DescribeAvailabilityZones` and `ec2:DescribeInstanceTypeOfferings` for the zone check,
+and `ssm:PutParameter` on the configuration's parameters.
 """
 
 from __future__ import annotations
@@ -76,9 +97,112 @@ def write_values(loaded: config.Config, further: Iterable[str], path: Path) -> i
     return len(set(listed)) + len(new)
 
 
-def main(arguments: Sequence[str] | None = None, client: Any = None) -> int:
+class ZoneError(Exception):
+    """The zone check refused the configuration, or could not ask EC2. The message holds no zone's
+    name, no instance type and no text of AWS."""
+
+
+_ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+
+
+def _ordinal(index: int) -> str:
+    """The position of the item at `index` of a list, in words as far as the tenth: `third`, `11th`."""
+    if index < len(_ORDINALS):
+        return _ORDINALS[index]
+    position = index + 1
+    ending = "th" if position % 100 in (11, 12, 13) else {1: "st", 2: "nd", 3: "rd"}.get(position % 10, "th")
+    return f"{position}{ending}"
+
+
+def _ec2(client: Any) -> tuple[Any, tuple[type[Exception], ...]]:
+    """The EC2 client, the caller's or one made with the caller's own credentials and region, and
+    the errors a call to it raises, as `config._ssm` gives them for SSM. Their messages are AWS's:
+    every caller replaces them."""
+    # Imported here: the check, the list of values and the module itself load without the SDK.
+    import boto3
+    import botocore.exceptions
+
+    errors = (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError)
+    try:
+        return (boto3.client("ec2") if client is None else client), errors
+    except botocore.exceptions.NoRegionError:
+        raise ZoneError("no EC2 client can be made: the caller's AWS configuration must give a region") from None
+    except errors as error:
+        # The class names the cause; its text is the SDK's and is not repeated.
+        raise ZoneError(f"no EC2 client can be made: the AWS SDK raised {type(error).__name__}") from None
+
+
+def _asked(call: str) -> ZoneError:
+    return ZoneError(f"the zones cannot be checked: EC2's {call} failed, with the caller's credentials and region")
+
+
+def check_zones(loaded: config.Config, client: Any = None) -> None:
+    """Asks EC2 whether the configuration's zones are the region's and offer the pools' instance
+    types (the module's docstring, "The zone check"), and raises `ZoneError` for the first that is
+    not, or for a call that fails. `client` is an EC2 client of the AWS SDK; without one, the
+    caller's credentials and region make it."""
+    client, errors = _ec2(client)
+    try:
+        described = client.describe_availability_zones(
+            Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}]
+        )
+    except errors:
+        raise _asked("DescribeAvailabilityZones") from None
+    region = sorted(zone["ZoneName"] for zone in described["AvailabilityZones"])
+    first = tuple(region[: config.FIRST_ZONES])
+
+    # Which zone offers which instance type, as (zone, type) pairs.
+    offered: set[tuple[str, str]] = set()
+    kinds = sorted({kind for pool in loaded.pools for kind in pool.instance_types})
+    if kinds:
+        request: dict[str, Any] = {
+            "LocationType": "availability-zone",
+            "Filters": [{"Name": "instance-type", "Values": kinds}],
+        }
+        try:
+            while True:
+                page = client.describe_instance_type_offerings(**request)
+                offered |= {(offer["Location"], offer["InstanceType"]) for offer in page["InstanceTypeOfferings"]}
+                if not page.get("NextToken"):
+                    break
+                request["NextToken"] = page["NextToken"]
+        except errors:
+            raise _asked("DescribeInstanceTypeOfferings") from None
+
+    if loaded.zones is not None:
+        for index, zone in enumerate(loaded.zones):
+            if zone not in region:
+                raise ZoneError(f"the {_ordinal(index)} zone of the key 'zones' is not a zone of the region")
+        for index, zone in enumerate(loaded.zones[: config.FIRST_ZONES]):
+            if first[index : index + 1] != (zone,):
+                raise ZoneError(
+                    f"the {_ordinal(index)} zone of the key 'zones' is not the region's {_ordinal(index)} zone by "
+                    "name: the key must begin with the region's first three zones by name, which are the zones "
+                    "the deployed VPC spans"
+                )
+    for pool in loaded.pools:
+        # The zones the pool's group spans, and what a refusal calls one of them.
+        if pool.zones is not None:
+            zones, which = pool.zones, "zone it lists"
+        elif loaded.zones is not None:
+            zones = loaded.zones[: config.FIRST_ZONES]
+            which = "of the first three zones of the key 'zones', which it spans since it lists none,"
+        else:
+            zones = first
+            which = "of the region's first three zones by name, which it spans since no zones are listed,"
+        for zone_index, zone in enumerate(zones):
+            for kind_index, kind in enumerate(pool.instance_types):
+                if (zone, kind) not in offered:
+                    raise ZoneError(
+                        f"the pool {pool.name!r}: the {_ordinal(zone_index)} {which} "
+                        f"does not offer its {_ordinal(kind_index)} instance type"
+                    )
+
+
+def main(arguments: Sequence[str] | None = None, client: Any = None, ec2: Any = None) -> int:
     """Checks the file, and writes it to SSM, or its private values to the list, when asked to.
-    `client` is as for `config.write_ssm`. Returns the exit status: 0, or 1 on a refusal."""
+    `client` is as for `config.write_ssm`, and `ec2` as the client of `check_zones`. Returns the
+    exit status: 0, or 1 on a refusal."""
     parser = argparse.ArgumentParser(prog="python -m rhi.owner_config", description=__doc__.partition("\n\n")[0])
     parser.add_argument(
         "action",
@@ -94,11 +218,13 @@ def main(arguments: Sequence[str] | None = None, client: Any = None) -> int:
     try:
         loaded = config.load({"RHI_CONFIG": "file", "RHI_CONFIG_FILE": options.file})
         if options.action == "write":
+            # Before any parameter: a configuration the zone check refuses writes nothing.
+            check_zones(loaded, ec2)
             config.write_ssm(loaded, client)
         elif options.action == "values":
             # Further values, one per line: the walkthrough passes on what the owner entered.
             held = write_values(loaded, sys.stdin, options.list)
-    except (config.ConfigError, ListError) as error:
+    except (config.ConfigError, ListError, ZoneError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 1
     if options.action == "check":
