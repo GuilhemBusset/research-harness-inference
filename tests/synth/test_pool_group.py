@@ -163,7 +163,7 @@ def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00
         stack,
         "Pool",
         pool=pool,
-        vpc=vpc,
+        subnets=vpc.private_subnets,
         security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
         target_group=target_group,
         role=role,

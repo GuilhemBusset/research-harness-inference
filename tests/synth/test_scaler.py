@@ -5,6 +5,7 @@ settings in the shape `rhi_scaler.settings` reads and a role that may do what a 
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -164,7 +165,8 @@ def test_the_settings_name_every_pool_s_group_and_target_group_and_read(
     _, function = scaler_function(pools)
     settings = parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
 
-    assert [pool.config for pool in settings.pools] == list(EXAMPLE.pools)
+    # Every pool as the example gives it, but for the zones of its group, which the scaler is not told.
+    assert [pool.config for pool in settings.pools] == [dataclasses.replace(pool, zones=None) for pool in EXAMPLE.pools]
     assert [pool.config.name for pool in settings.pools] == ["coursework", "mock"]
     groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
     for pool in settings.pools:

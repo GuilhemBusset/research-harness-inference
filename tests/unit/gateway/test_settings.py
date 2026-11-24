@@ -137,7 +137,7 @@ def test_a_full_environment_gives_the_settings() -> None:
 
 
 def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
-    # What the deployment writes: each pool's entry as the configuration gives it back (`rhi.config.pool_entry`).
+    # What the deployment writes: each pool's entry as the configuration gives it back (`rhi.config.deployed_entry`).
     vllm = {
         **MOCK,
         "engine": "vllm",
@@ -156,7 +156,7 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
         "cache_salt_scope": "class",
     }
     loaded = parse_pools({"mock": MOCK, "coursework": vllm}, on_demand_price_limit=10)
-    written = json.dumps({pool.name: config.pool_entry(pool) for pool in loaded})
+    written = json.dumps({pool.name: config.deployed_entry(pool) for pool in loaded})
 
     names = [pool.name for pool in loaded]
     by_pool = {

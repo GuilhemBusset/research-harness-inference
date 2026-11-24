@@ -35,7 +35,7 @@ import aws_cdk as cdk
 from aws_cdk import custom_resources as cr
 from constructs import Construct
 
-from rhi.network.vpc import PRIVATE
+from rhi.network.vpc import PRIVATE, ZONES, private_subnets
 from rhi.pools import image
 from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from rhi.config import Config
     from rhi.network.stack import NetworkStack
     from rhi.observability.stack import ObservabilityStack
+    from rhi_common.pool_config import Pool
 
 # What separates two pools in the output of the release parameters, and a pool's name from its
 # parameter's. Neither is a character of a pool's name or of a parameter's.
@@ -66,6 +67,19 @@ def release_parameters_text(parameters: Mapping[str, str]) -> str:
     """Each pool's name and the name of its release parameter, as one text:
     `mock=/rhi/pools/mock/release` for one pool, a comma between two, and `NO_POOL` for no pool."""
     return POOL_SEPARATOR.join(f"{pool}{NAME_SEPARATOR}{name}" for pool, name in parameters.items()) or NO_POOL
+
+
+def zone_positions(pool: Pool, zones: tuple[str, ...] | None) -> list[int]:
+    """The positions, among the VPC's zones, of the zones the pool's group spans: those of the
+    pool's own zones in the configuration's `zones`, which names the VPC's zones in the order of its
+    subnets, or the first three for a pool that lists none. The configuration loader holds a pool's
+    zones to that list, and refuses a pool that gives zones where the list is left out
+    (`rhi.config`)."""
+    if pool.zones is None:
+        return list(range(ZONES))
+    if zones is None:
+        raise ValueError(f"the pool {pool.name!r} gives zones, and the configuration lists none")
+    return [zones.index(zone) for zone in pool.zones]
 
 
 class PoolsStack(cdk.Stack):
@@ -177,12 +191,15 @@ class PoolsStack(cdk.Stack):
             pools=config.pools,
         )
         # One launch template and group per pool, by the pool's name; none with the table empty.
+        # A group spans the private subnets of its pool's zones alone, where the load balancer
+        # above spans every private subnet: a target in a zone the load balancer does not span
+        # receives no traffic from it.
         self.groups = {
             pool.name: PoolGroup(
                 self,
                 f"Pool-{pool.name}",
                 pool=pool,
-                vpc=network.vpc,
+                subnets=private_subnets(network.vpc, zone_positions(pool, config.zones)),
                 security_group=network.security_groups.instances,
                 target_group=self.routing.target_groups[pool.name],
                 role=self.roles[pool.name].role,

@@ -46,9 +46,11 @@ deployed VPC. Left out, the key is None, and nothing fills it: the VPC spans the
 three zones. The pools are read against it. A pool's own `zones` are the zones its group spans,
 each one of the key's: a pool that names another zone is refused, and so is a pool that gives
 zones when the key is left out, since no name could then be matched to a subnet. A pool that gives
-none spans the first three. Whether a zone is one of the region's, and offers a pool's instance
-types, only EC2 can say: the owner's tool asks it before the configuration enters SSM
-(`rhi.owner_config`), and this module does not.
+none spans the first three. The names stay in the configuration: the stacks turn them into
+positions among the VPC's zones, and the entry a deployed program is given leaves them out
+(`deployed_entry`). Whether a zone is one of the region's, and offers a pool's instance types, only
+EC2 can say: the owner's tool asks it before the configuration enters SSM (`rhi.owner_config`), and
+this module does not.
 
 The region and the account are not configuration. They come from the deploying credentials
 (assumption A4), so no key holds either.
@@ -777,6 +779,18 @@ def pool_entry(pool: Pool) -> dict[str, object]:
             value = {key: list(bounds) for key, bounds in dataclasses.asdict(value).items() if bounds is not None}
         entry[field.name] = list(value) if isinstance(value, tuple) else value
     return entry
+
+
+def deployed_entry(pool: Pool) -> dict[str, object]:
+    """A pool's entry as a deployed program is given it, the gateway and the scaler: `pool_entry`
+    without the pool's zones.
+
+    The zones say where the pool's group launches, which the stacks decide (`rhi.pools.stack`) and
+    no program reads. An entry that held them would write zone names in full into a template, and
+    a change of placement would replace the gateway's task definition and the scaler's settings
+    ("The zones").
+    """
+    return pool_entry(dataclasses.replace(pool, zones=None))
 
 
 def _pool_entries(value: object) -> dict[str, dict[str, object]] | None:

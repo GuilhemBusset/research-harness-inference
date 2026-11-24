@@ -7,7 +7,9 @@ The group holds to the fleet cap (`tests/policy/test_fleet_cap.py`): a minimum o
 scaler is the one writer of the desired capacity, and the group protects every new instance from
 scale-in, so that only the scaler, which lifts the protection, chooses which instance leaves.
 
-The group spans the private subnets of the VPC's three zones, and launches the pool's instance types
+The group spans the private subnets it is given and no other, those of its pool's zones
+(`rhi.pools.stack`): an instance type is not offered in every zone, and a group that spans a zone
+without its type fails the launches Auto Scaling places there. It launches the pool's instance types
 in the order the configuration lists them: the first, then each fallback when a zone has none of
 the one before. They are On-Demand only and carry no weights, which a warm pool requires of a group
 with several types (evidence E10).
@@ -87,6 +89,8 @@ from rhi.pools import image
 from rhi_common import pool_config
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 
     from rhi_common.pool_config import Pool
@@ -153,7 +157,8 @@ def machine_image(pool: Pool) -> tuple[ec2.IMachineImage, str]:
 
 
 class PoolGroup(Construct):
-    """One pool's launch template, as `launch_template`, and Auto Scaling group, as `group`."""
+    """One pool's launch template, as `launch_template`, and Auto Scaling group, as `group`, which
+    launches in `subnets`, the private subnets of the pool's zones."""
 
     def __init__(
         self,
@@ -161,7 +166,7 @@ class PoolGroup(Construct):
         construct_id: str,
         *,
         pool: Pool,
-        vpc: ec2.IVpc,
+        subnets: Sequence[ec2.ISubnet],
         security_group: ec2.ISecurityGroup,
         target_group: elbv2.IApplicationTargetGroup,
         role: iam.Role,
@@ -208,7 +213,8 @@ class PoolGroup(Construct):
             auto_scaling_group_name=pool_config.group_name(pool.name),
             min_size="0",
             max_size=str(pool.max_instances),
-            vpc_zone_identifier=vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnet_ids,
+            # The private subnets of the pool's zones, and of no other zone.
+            vpc_zone_identifier=[subnet.subnet_id for subnet in subnets],
             new_instances_protected_from_scale_in=True,
             target_group_arns=[target_group.target_group_arn],
             mixed_instances_policy=autoscaling.CfnAutoScalingGroup.MixedInstancesPolicyProperty(

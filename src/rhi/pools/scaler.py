@@ -12,9 +12,9 @@ minute's run reads everything again.
 without a reference to this stack.
 
 **Its settings** are one JSON object in `RHI_SCALER_SETTINGS`, in the shape `rhi_scaler.settings`
-reads: every pool's entry as the stage loaded it, the name of the pool's group and the ARN of its
-target group, the names of the heartbeat and pool-state tables, and the workspace's remote-write
-address.
+reads: every pool's entry as the stage loaded it, without the zones of its group
+(`rhi.config.deployed_entry`), the name of the pool's group and the ARN of its target group, the
+names of the heartbeat and pool-state tables, and the workspace's remote-write address.
 
 **Its role** is the only one of the stage that may set a group's capacity
 (`tests/policy/test_single_writer.py`). It has no AWS managed policy. What it may do, each with its
@@ -52,7 +52,7 @@ from constructs import Construct
 
 from rhi import packaging
 from rhi.access.issuer import READ_ACTIONS, WRITE_ACTIONS
-from rhi.config import pool_entry
+from rhi.config import deployed_entry
 from rhi.observability import prometheus
 from rhi.pools.group import POOL_TAG
 from rhi_scaler.cloudwatch import NAMESPACE as METRICS_NAMESPACE
@@ -188,7 +188,7 @@ class Scaler(Construct):
         settings = {
             "pools": {
                 pool.name: {
-                    "entry": pool_entry(pool),
+                    "entry": deployed_entry(pool),
                     "group": groups[pool.name].group.ref,
                     "target_group": target_groups[pool.name].target_group_arn,
                 }

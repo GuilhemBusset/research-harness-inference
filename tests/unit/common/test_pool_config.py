@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 import pytest
 
-from rhi.config import pool_entry
+from rhi.config import deployed_entry, pool_entry
 from rhi_common.pool_config import HistogramBuckets, PoolConfigError, parse_pools
 from rhi_common.records import SESSION_PARTITION
 
@@ -491,9 +491,12 @@ def test_a_pools_zones_are_none_unless_it_lists_them() -> None:
     for zones in (["example-zone-d", "example-zone-a"], ["example-zone-b"]):
         (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"zones": zones})})
         assert pool.zones == tuple(zones)
-        # The entry the deployment writes for the gateway and the scaler reads back the same.
+        # The entry the owner's tool writes holds them, and reads back the same.
         assert pool_entry(pool)["zones"] == zones
         assert parse_pools({"coursework": pool_entry(pool)}) == (pool,)
+        # The entry the deployment writes for the gateway and the scaler leaves them out, and
+        # nothing else: no template then names a zone, and neither program reads where a group launches.
+        assert deployed_entry(pool) == {key: value for key, value in pool_entry(pool).items() if key != "zones"}
     # A list that is empty, or names a zone twice, is refused by the pool's name and the field:
     # `test_refusals`.
 
