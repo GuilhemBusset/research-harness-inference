@@ -1,7 +1,7 @@
 """The coursework pool of `config.example.toml`, through the gateway as its entry point builds it.
 
 The pools are those the example loads, written into `RHI_POOLS` as the deployment writes them
-(`rhi.config.pool_entry`), and the gateway is built from its settings (`rhi_gateway.settings`) by
+(`rhi.config.deployed_entry`), and the gateway is built from its settings (`rhi_gateway.settings`) by
 `rhi_gateway.main.build`. moto stands in for the tables and the secrets, a small double for the
 target groups' health, and an `httpx.MockTransport` for the engine. The student's key is drawn when
 the test runs.
@@ -146,7 +146,7 @@ def example_settings() -> Settings:
         for name in names
     }
     environ = {
-        "RHI_POOLS": json.dumps({pool.name: config.pool_entry(pool) for pool in example.pools}),
+        "RHI_POOLS": json.dumps({pool.name: config.deployed_entry(pool) for pool in example.pools}),
         "RHI_DEFAULT_POOL": str(example.default_pool),
         "RHI_UPSTREAM_URL": UPSTREAM,
         "RHI_TARGET_GROUPS": json.dumps({name: target_group(name) for name in names}),

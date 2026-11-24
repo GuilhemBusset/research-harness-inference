@@ -33,7 +33,8 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 
 **What the gateway is told**, as the environment variables `rhi_gateway.settings` reads:
 
-- `RHI_POOLS`: the pools as the stage loaded them, `{}` with none;
+- `RHI_POOLS`: the pools as the stage loaded them, without the zones of their groups
+  (`rhi.config.deployed_entry`), `{}` with none;
 - `RHI_DEFAULT_POOL`: the configuration's default pool, left out when it has none;
 - `RHI_UPSTREAM_URL`: the internal load balancer's listener, by the load balancer's DNS name;
 - `RHI_TARGET_GROUPS` and `RHI_POOL_SECRETS`: each pool's target group and each pool's secret, by
@@ -111,7 +112,7 @@ from constructs import Construct
 
 from rhi import packaging
 from rhi.access.issuer import READ_ACTIONS, WRITE_ACTIONS
-from rhi.config import pool_entry
+from rhi.config import deployed_entry
 from rhi.network.security import GATEWAY_PORT, INTERNAL_LOAD_BALANCER_PORT
 from rhi.observability import prometheus
 from rhi.pools.scaler import REMOTE_WRITE_PATH
@@ -281,7 +282,7 @@ class GatewayService(Construct):
         )
 
         environment = {
-            POOLS_VARIABLE: json.dumps({pool.name: pool_entry(pool) for pool in config.pools}),
+            POOLS_VARIABLE: json.dumps({pool.name: deployed_entry(pool) for pool in config.pools}),
             UPSTREAM_URL_VARIABLE: f"http://{upstream.load_balancer_dns_name}:{INTERNAL_LOAD_BALANCER_PORT}",
             TARGET_GROUPS_VARIABLE: stack.to_json_string(
                 {name: target_groups[name].target_group_arn for name in names}

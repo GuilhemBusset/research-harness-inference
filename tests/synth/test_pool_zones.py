@@ -1,7 +1,8 @@
 """The zones each pool's group launches in (system design, section 5.4): the private subnets of
 the pool's own zones and no other, or those of the VPC's first three zones for a pool that lists
 none, while the internal load balancer spans every private subnet of the VPC, so that it reaches a
-target in whichever zone a group launches it.
+target in whichever zone a group launches it. The zones place the groups and nothing else: no
+template holds a zone's name, and the gateway and the scaler are told nothing of them.
 
 The example configuration lists four zones; its coursework pool lists the first, the second and the
 fourth, and its mock pool none. `without_zones` (conftest.py) is the example with no zones.
@@ -11,6 +12,7 @@ The CDK is imported inside the fixtures, after `app_module` has started jsii (se
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -110,3 +112,23 @@ def test_without_zones_every_group_spans_the_first_three(
 
     # A zone appended to the VPC changes nothing of the group of a pool that lists none.
     assert groups(example["Pools"])["mock"] == groups(pools)["mock"]
+
+
+def test_no_template_names_a_zone(templates: dict[str, dict[str, Any]]) -> None:
+    # The owner's configuration holds the names, and a template only positions and a last letter:
+    # a stack that held one in full would name its region.
+    zones = EXAMPLE.zones or ()
+    assert [path for path, template in templates.items() if any(zone in json.dumps(template) for zone in zones)] == []
+
+
+def test_the_zones_change_nothing_the_gateway_and_the_scaler_are_given(
+    app: cdk.App, cloud_assembly: Path, templates: dict[str, dict[str, Any]], without_zones: dict[str, dict[str, Any]]
+) -> None:
+    # A pool's zones say where its group launches, which neither program reads: giving them, or
+    # changing them, replaces neither the gateway's task definition nor the scaler's function.
+    stage = app.node.find_child("Rhi")
+    for stack, kind in (("Gateway", "AWS::ECS::TaskDefinition"), ("Pools", "AWS::Lambda::Function")):
+        held_by = stage.node.find_child(stack)
+        path = (Path(stage.outdir) / held_by.template_file).relative_to(cloud_assembly).as_posix()  # ty: ignore[missing-attribute] - the app's stage and stack, typed as constructs
+        assert of_type(templates[path], kind)
+        assert of_type(templates[path], kind) == of_type(without_zones[stack], kind)

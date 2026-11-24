@@ -15,6 +15,7 @@ conftest.py).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -270,7 +271,8 @@ def test_the_environment_is_what_the_gateway_reads(gateway: Gateway) -> None:
     environment = gateway.environment(gateway.container)
     assert set(gateway_settings.REQUIRED) <= set(environment)
     read = gateway_settings.read_settings(environment)
-    assert read.pools == EXAMPLE.pools
+    # Every pool as the example gives it, but for the zones of its group, which the gateway is not told.
+    assert read.pools == tuple(dataclasses.replace(pool, zones=None) for pool in EXAMPLE.pools)
     # The pool `claude-*` model names reach (section 6.2, step 4).
     assert read.default_pool is not None and read.default_pool.name == EXAMPLE.default_pool == "coursework"
     # The course end the usage rows expire by (section 6.6), as the configuration gives it.
