@@ -16,7 +16,7 @@ from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
-from rhi_common.records import GatewayHeartbeat, Session, SessionSwitch
+from rhi_common.records import Session, SessionSwitch
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
 from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
@@ -52,9 +52,9 @@ ENVIRON = {
 SETTINGS = read_settings(ENVIRON)
 
 
-def held_request(now: int) -> dict[str, Any]:
-    """A gateway task holding one request for the mock pool (a wake: also a request received)."""
-    return GatewayHeartbeat("task-1", "mock", 0, 1, NOW - 2, now - 1).to_item()
+def session_record() -> dict[str, Any]:
+    """The mock pool's session record: one instance, from an hour before `NOW` to an hour after."""
+    return Session("mock", 1, NOW - 3600, NOW + 3600, set_by="instructor", set_at=NOW - 7200).to_item()
 
 
 def note(asked: int, now: int = NOW, **supply: int) -> dict[str, Any]:
@@ -159,14 +159,14 @@ class Edge:
             self.cloudwatch.add_response("put_metric_data", {}, {"Namespace": "rhi/scaler", "MetricData": ANY})
 
     def queue_first_run(self, switch_error: str | None = None) -> None:
-        """A pool at zero, a request held: one instance asked for, and the memory stored. Nothing is
-        published when the switch's read fails with `switch_error`."""
-        self.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)], switch_error=switch_error)
+        """A pool at zero whose session asks for one instance: it is asked for, and the memory
+        stored. Nothing is published when the switch's read fails with `switch_error`."""
+        self.queue_read(desired=0, instances=[], records=[session_record()], heartbeats=[], switch_error=switch_error)
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
         # The instance asked for has not come: it waits, from this run on.
-        self.expect_writes(note(1, waiting=1, waiting_since=NOW), published=switch_error is None)
+        self.expect_writes(note(1, requested=1, waiting=1, waiting_since=NOW), published=switch_error is None)
 
 
 @pytest.fixture
@@ -189,17 +189,14 @@ def series(body: bytes) -> dict[tuple[str, tuple[tuple[str, str], ...]], list[fl
     return out
 
 
-def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(edge: Edge) -> None:
+def test_a_session_raises_the_pool_stores_the_memory_and_emits_its_metrics(edge: Edge) -> None:
     edge.queue_first_run()
     decision = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
-    assert [(pool.desired, pool.reason) for pool in decision.pools] == [(1, Reason.WAKE)]
-    # The memory stored: the request received, the run that saw it held, the gateway's heartbeat.
+    assert [(pool.desired, pool.reason) for pool in decision.pools] == [(1, Reason.PROVISION)]
     (update,) = edge.updates
     assert update["Key"] == {"pool": {"S": "mock"}, "record": {"S": "memory"}}
-    # And the run from which the pool waits for the instance it asked for.
-    assert stored_memory(update) == Memory(
-        last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1, short_since=NOW
-    )
+    # The memory stored: the run from which the pool waits for the instance it asked for.
+    assert stored_memory(update) == Memory(short_since=NOW)
 
     ((url, headers, body),) = edge.pushes
     assert url == WORKSPACE
@@ -211,7 +208,7 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
         "rhi_scaler_desired_capacity": 1.0,
         "rhi_scaler_instances_in_service": 0.0,
     }
-    assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
+    assert sent[(DECISIONS, (("pool", "mock"), ("reason", "provision")))][-1] == 1.0
     # The session switch has no record: the session gauge reads 0.
     assert sent[(SESSION_ON, ())] == [0.0]
     # What the note holds goes out too: one instance asked of AWS that has not come.
@@ -240,8 +237,8 @@ def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_setting
     assert [(pool.desired, pool.requested) for pool in decision.pools] == [(0, 0)]
 
 
-def test_a_switch_that_cannot_be_read_still_lets_demand_wake_the_pool_then_fails_the_run(edge: Edge) -> None:
-    # The wake, the note and the memory are queued, and no publication: the fixture checks all.
+def test_a_switch_that_cannot_be_read_still_lets_the_session_raise_the_pool_then_fails_the_run(edge: Edge) -> None:
+    # The capacity, the note and the memory are queued, and no publication: the fixture checks all.
     edge.queue_first_run(switch_error="ProvisionedThroughputExceededException")
     with pytest.raises(ClientError):
         scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
@@ -265,8 +262,8 @@ def test_a_run_that_cannot_read_the_pools_still_sends_the_switch_it_reads(edge: 
 
 
 def test_a_run_whose_pool_write_fails_still_sends_the_switch_it_read(edge: Edge) -> None:
-    # The wake goes, then DynamoDB refuses the pool's note; the switch has no record: off.
-    edge.queue_read(desired=0, instances=[], records=[], heartbeats=[held_request(NOW)])
+    # The capacity is set, then DynamoDB refuses the pool's note; the switch has no record: off.
+    edge.queue_read(desired=0, instances=[], records=[session_record()], heartbeats=[])
     edge.autoscaling.add_response(
         "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
     )
@@ -282,17 +279,17 @@ def test_a_second_run_is_harmless(edge: Edge) -> None:
     edge.queue_first_run()
     counts = DecisionCounts()
     first = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, counts)
-    # The same request still held, read a minute later from the world the first run left: the
-    # group at the capacity it set, its instance starting, and the memory it stored.
+    # The same session, read a minute later from the world the first run left: the group at the
+    # capacity it set, its instance starting, and the memory it stored.
     later = NOW + 60
     edge.queue_read(
         desired=1,
         instances=[{"InstanceId": "instance-a", "LifecycleState": "Pending:Wait"}],
-        records=[memory_to_item("mock", first.pools[0].memory)],
-        heartbeats=[held_request(later)],
+        records=[memory_to_item("mock", first.pools[0].memory), session_record()],
+        heartbeats=[],
     )
     # No Auto Scaling call is queued: one would fail the test. Only the note and the memory.
-    edge.expect_writes(note(1, later, starting=1))
+    edge.expect_writes(note(1, later, requested=1, starting=1))
     second = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, later, counts)
     assert [pool.desired for pool in second.pools] == [pool.desired for pool in first.pools] == [1]
 
@@ -313,12 +310,12 @@ def test_the_caller_changes_nothing_and_nothing_from_the_request_is_logged(
         for event in events:
             edge.queue_first_run()
             answers.append(scaler.handler(event, None, environ=ENVIRON))
-    assert answers == [{"pools": [{"pool": "mock", "desired": 1, "reason": "wake"}]}] * 3
+    assert answers == [{"pools": [{"pool": "mock", "desired": 1, "reason": "provision"}]}] * 3
 
     assert marker not in caplog.text
     records = [json.loads(record.getMessage()) for record in caplog.records if record.name == "rhi_scaler"]
     decisions = [record for record in records if record["event"] == "decision"]
-    assert [(record["pool"], record["reason"]) for record in decisions] == [("mock", "wake")] * 3
+    assert [(record["pool"], record["reason"]) for record in decisions] == [("mock", "provision")] * 3
     # The supply a record gives is the group's own: the instances in service and those starting.
     counts = {"desired_before": 0, "desired": 1, "in_service": 0, "starting": 0, "launches_suspended": False}
     assert [{key: record[key] for key in record if key not in ("event", "pool", "reason")} for record in decisions] == [counts] * 3
