@@ -12,7 +12,21 @@ which an instance refresh of a GPU pool's group that began after the execution s
 when it did not end well; its answer is a file, `RHI_VERIFY_GPU_POOLS_FILE`, that names
 `coursework` or nothing. Its command ends before the verification's begins, so the smoke tests
 then run on the mock pool and, when the file names it, on the coursework pool, after the refresh.
-The step's `TIMEOUT` covers a refresh and two runs of the tests, each with a cold wake.
+
+**The session on the mock pool.** The script books the mock pool before its run of the tests on it,
+one instance under the name `pipeline/verify` for twice the configuration's `check_wait_minutes`,
+waits until the gateway's status reads the pool ready or `check_wait_minutes` have passed, and
+stops the session it booked after the run, whatever its result (`scripts/pipeline/booking.py`).
+It books only a pool that has no session booked or active, and stops only the session it booked.
+So the deployed verification does not depend on a wake. The session is an item of the stage's
+pool-state table, which the script finds as the deployment hold does (`rhi.pipeline.hold`), by
+the table's logical ID in the pools stack.
+
+**How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, a refresh
+and two runs of the tests, each with a cold wake, and `check_wait_minutes` more, the longest the
+script waits for the session's instance. So the build is not cut before the wait is over, the tests
+have run and the session is stopped. A wait that would take the timeout beyond CodeBuild's limit for
+one build is refused at synthesis.
 
 **The action is named `ACTION`.** The reporter maps an action of that name to the context
 `verify/<stage>`, so the step's name is its contract: `tests/policy/test_pipeline.py` lists it.
@@ -27,6 +41,16 @@ reference to each output, never its value:
 - `RHI_VERIFY_RELEASE_PARAMETERS`: each pool's name and the name of its release parameter, the
   pools stack's. The script hands it to the smoke tests as the JSON they read.
 - `RHI_VERIFY_HEARTBEATS_TABLE`: the name of the stage's heartbeats table, the pools stack's too.
+
+of the stage itself, read at synthesis as text, as the hold's step reads them:
+
+- `RHI_VERIFY_POOLS_STACK`: the pools stack's name;
+- `RHI_VERIFY_POOL_STATE_LOGICAL_ID`: the pool-state table's logical ID in that stack;
+- `RHI_VERIFY_CHECK_WAIT_MINUTES`: the configuration's `check_wait_minutes`;
+- `RHI_VERIFY_SESSION_MAX_HOURS`: the configuration's `session_max_hours`, the bound a session is
+  written and read under (`rhi_common.sessions`);
+- `PYTHONPATH`: the folders of pytest's import path, as in the hold's step: the booking imports
+  `rhi_common`.
 
 and of the execution:
 
@@ -88,7 +112,13 @@ text. A logical ID holds no hyphen, so the pattern matches that one table
 verifies, which it names by the workspace's tag, since the workspace has no ID when the role is
 written (`rhi.observability.stack`); read the release parameter of each pool the stage deploys, by
 its name; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
-action on it; and write under `verification/` of the artifact bucket. Beside that it holds what CDK
+action on it; read the one stack resource that names the stage's pool-state table,
+`cloudformation:DescribeStackResource` on the pools stack; read and write, `dynamodb:GetItem` and
+`dynamodb:PutItem`, the items of that table whose partition key is the mock pool's name, and no
+other pool's: the condition is on `dynamodb:LeadingKeys`, in the form the canary's role has for
+the heartbeats table (`rhi.pipeline.canary`). That covers every record of the mock pool's
+partition, its session among them, and neither the coursework pool's records nor the session
+switch; and write under `verification/` of the artifact bucket. Beside that it holds what CDK
 Pipelines gives every project of the pipeline: its own logs, its own test reports and a read of
 its input in the artifact bucket. For the decision, it may also describe Auto Scaling groups and
 their instance refreshes, which AWS grants on every resource only, and list the executions of this
@@ -110,7 +140,9 @@ from aws_cdk import pipelines
 
 from rhi.gateway.stack import NO_ENDPOINT
 from rhi.observability.stack import STAGE_TAG
-from rhi.pipeline.synth import UV_VERSION
+from rhi.pipeline.hold import pool_state_logical_id
+from rhi.pipeline.spikes import MAX_TIMEOUT_HOURS, pool_state_table_arn
+from rhi.pipeline.synth import UV_VERSION, import_path
 from rhi.stage import EndpointStage
 
 if TYPE_CHECKING:
@@ -148,6 +180,16 @@ REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
 FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
 GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
+# What the script books the mock pool with: the pools stack's name and the pool-state table's
+# logical ID in it, and the configuration's `check_wait_minutes` and `session_max_hours`.
+POOLS_STACK_VARIABLE = "RHI_VERIFY_POOLS_STACK"
+POOL_STATE_LOGICAL_ID_VARIABLE = "RHI_VERIFY_POOL_STATE_LOGICAL_ID"
+CHECK_WAIT_MINUTES_VARIABLE = "RHI_VERIFY_CHECK_WAIT_MINUTES"
+SESSION_MAX_HOURS_VARIABLE = "RHI_VERIFY_SESSION_MAX_HOURS"
+# The pool the script books, by its name: the partition key of the only items of the pool-state
+# table the role may read and write, with these two actions.
+MOCK_POOL = "mock"
+POOL_STATE_ITEMS = ["dynamodb:GetItem", "dynamodb:PutItem"]
 # CodePipeline's variable for the ID of the execution an action runs in.
 EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
 
@@ -155,9 +197,23 @@ INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
 COMMANDS = ["uv sync --locked", f"uv run --locked python {DECISION}", f"uv run --locked python {SCRIPT}"]
 # What the decision reads of Auto Scaling, which grants it on every resource only.
 DESCRIBES_REFRESHES = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeInstanceRefreshes"]
-# The longest the step runs: the decision's wait for a refresh, an hour at most, and the smoke tests
-# on the mock pool and on the coursework pool, each with a cold wake and the workspace's lag.
+# The longest the step runs beside its wait for the instance of the session it booked: the set-up,
+# the decision's wait for a refresh, an hour at most, and the smoke tests on the mock pool and on
+# the coursework pool, each with a cold wake and the workspace's lag.
 TIMEOUT = cdk.Duration.hours(3)
+
+
+def timeout(check_wait_minutes: int) -> cdk.Duration:
+    """The step's timeout: `TIMEOUT` and the wait for the session's instance, `check_wait_minutes`,
+    so that the build outlasts the wait, the tests and the stop of the session. A `ValueError` when
+    that is longer than CodeBuild lets one build run."""
+    minutes = TIMEOUT.to_minutes() + check_wait_minutes
+    if minutes > MAX_TIMEOUT_HOURS * 60:
+        raise ValueError(
+            f"check_wait_minutes is {check_wait_minutes}: with the {TIMEOUT.to_minutes()} minutes of the "
+            f"verification's other work, the step would run longer than CodeBuild's {MAX_TIMEOUT_HOURS} hours"
+        )
+    return cdk.Duration.minutes(minutes)
 
 
 def _copy(file_variable: str, key: str) -> str:
@@ -252,9 +308,36 @@ def verify_step(
         statements.append(
             iam.PolicyStatement(actions=["dynamodb:Query"], resources=[heartbeats_table_arn(scope, stage)])
         )
+        # The session on the mock pool: where the pool-state table is, as text, and the two
+        # numbers of the configuration the booking is made with.
+        environment |= {
+            POOLS_STACK_VARIABLE: stage.pools.stack_name,
+            POOL_STATE_LOGICAL_ID_VARIABLE: pool_state_logical_id(stage),
+            CHECK_WAIT_MINUTES_VARIABLE: str(stage.config.check_wait_minutes),
+            SESSION_MAX_HOURS_VARIABLE: str(stage.config.session_max_hours),
+            "PYTHONPATH": ":".join(import_path()),
+        }
+        wait_minutes = stage.config.check_wait_minutes
+        # The table's name, by its logical ID in the pools stack: that one stack's resources.
+        pools_stack = scope.format_arn(
+            service="cloudformation", resource="stack", resource_name=f"{stage.pools.stack_name}/*"
+        )
+        statements.append(
+            iam.PolicyStatement(actions=["cloudformation:DescribeStackResource"], resources=[pools_stack])
+        )
+        # The mock pool's items of the pool-state table, its session among them, read and written:
+        # the partition key may only be that pool's name.
+        statements.append(
+            iam.PolicyStatement(
+                actions=POOL_STATE_ITEMS,
+                resources=[pool_state_table_arn(scope, stage)],
+                conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}},
+            )
+        )
     else:
         # A stage that is not the endpoint's has no endpoint to verify: the step says so, as not run.
         environment[ENDPOINT_VARIABLE] = NO_ENDPOINT
+        wait_minutes = 0
     return pipelines.CodeBuildStep(
         ACTION,
         input=source,
@@ -266,7 +349,7 @@ def verify_step(
         env=environment,
         env_from_cfn_outputs=outputs,
         role_policy_statements=statements,
-        timeout=TIMEOUT,
+        timeout=timeout(wait_minutes),
     )
 
 

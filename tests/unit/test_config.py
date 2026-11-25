@@ -219,6 +219,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         *(("parked", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(("outside_sessions_alarm_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(("session_max_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
+        *(("check_wait_minutes", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(("gateway_error_alarm_minutes", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(("gateway_error_alarm_percent", value) for value in (f'"{MARK}"', "0", f"100.{MARK}", f"-{MARK}", "true")),
         *(
@@ -333,6 +334,15 @@ def test_session_max_hours_reads_12_when_left_out(tmp_path: Path) -> None:
     # A whole number of at least 1.
     assert load_text(tmp_path, example_with(session_max_hours="1")).session_max_hours == 1
     assert load_text(tmp_path, example_with(session_max_hours="6")).session_max_hours == 6
+
+
+def test_check_wait_minutes_reads_45_when_left_out(tmp_path: Path) -> None:
+    # Section 17: 45 minutes, so that a configuration written before the key loads unchanged.
+    assert load_text(tmp_path, example_with(check_wait_minutes=None)).check_wait_minutes == 45
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["check_wait_minutes"] == 45
+    # A whole number of at least 1.
+    assert load_text(tmp_path, example_with(check_wait_minutes="1")).check_wait_minutes == 1
+    assert load_text(tmp_path, example_with(check_wait_minutes="90")).check_wait_minutes == 90
 
 
 def test_the_gateway_error_alarm_reads_5_percent_over_5_minutes_when_left_out(tmp_path: Path) -> None:

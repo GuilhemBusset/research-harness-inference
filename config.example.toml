@@ -132,6 +132,12 @@ outside_sessions_alarm_hours = 1
 # written and when it is read. Left out, it is 12.
 session_max_hours = 12
 
+# How long a check that booked a session waits for the session's instance, in whole minutes: the
+# pipeline's verification books the mock pool for twice this long, the wait and as long again for
+# its tests, so twice this must fit in `session_max_hours` (system design, sections 8.2 and 17).
+# Left out, it is 45.
+check_wait_minutes = 45
+
 # The share of the gateway's requests, in percent, that may fail for the gateway's own fault, and
 # the whole minutes of the period it is measured over, before an alarm says so on the alerts topic
 # (system design, sections 7.3 and 17). Left out, they are 5 and 5.
