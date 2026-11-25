@@ -104,8 +104,12 @@ def test_every_gpu_row_has_one_panel_for_each_of_the_seven_quantities(example: r
         assert [panel["title"] for panel in row] == [on[name][0]["title"] for name in SEVEN]
 
         for panel in row:
-            # Each reads "asleep" while the pool has no instance in service.
-            assert rules.asleep(pool) in queries(panel)
+            # Each reads the pool's state, "no session" or "waiting for capacity", while the pool
+            # does not serve, and shows a GPU's series only while it does.
+            states = rules.state_queries(pool)
+            assert [one for one in queries(panel) if one in states.values()] == list(states.values())
+            shown = [one for one in queries(panel) if one not in states.values()]
+            assert shown and all(one.endswith(rules.serving(pool, "")[len("(") :]) for one in shown)
         # The energy is the published counter's rate on each series, summed per instance.
         assert rules.rate(series[ENERGY], {rules.POOL: pool}, by=("instance",)) in queries(on[ENERGY][0])[0]
         # A gauge, and an Xid code above all, stays one series for each GPU of each instance.

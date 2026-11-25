@@ -7,8 +7,8 @@ without the helpers is held to the same rules as one made with them. It reports:
 | --- | --- |
 | `data-source` | A query, or anything else in the dashboard, that names none of the two fixed data sources, nor one of Grafana's own two: its server-side expressions, or the mixed source of a panel whose queries each name their own; a query that names the mixed source itself |
 | `rate` | `rate`, `irate` or `increase` of anything but a plain selector: a sum, a subquery |
-| `asleep` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.awake`, no `rules.asleep` query, shown, whose zero reads "asleep", or, in a panel of one value, a query over the range. An engine counter, or a histogram's buckets or count, read as what each of its samples added in a session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again. An engine gauge always does: it falls as well as rises, and what its samples "added" is no count |
-| `session` | In a panel of one value, a query, shown, that reads the session gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
+| `pool-state` | A panel that queries an engine metric and does not take the pool's state from the scaler: a query not kept by `rules.serving`; a state of `rules.STATES` with no query of `rules.state_queries`, shown, whose zero reads the state's text; or, in a panel of one value, a query over the range. An engine counter, or a histogram's buckets or count, read as what each of its samples added in its pool's session (`rules.session_increment`, which `rules.over_sessions` sums) needs neither: a series no instance updates any more adds nothing, so nothing an instance last reported is counted again. An engine gauge always does: it falls as well as rises, and what its samples "added" is no count |
+| `session` | In a panel of one value, a query, shown, that reads a session's gauge and asks for the range: each of its points looks back over a range of its own, and the panel's last one can show a session before the dashboard's range. Such a query is an instant one, read at the range's end over the range |
 | `engine-row` | An engine metric queried for no pool, for a pool the configuration does not hold, or for a pool whose engine names it otherwise or leaves its quantity out. An engine metric is any name of the per-engine table, its further quantities included |
 | `percentile` | A `histogram_quantile` whose panel does not show the count behind it: a query, shown, that is the summed increase of the same histogram's count, for the same series over the same window, and nothing else |
 | `undeclared` | A metric name no declaration covers: neither a declared family nor that family's name followed by a sample's suffix |
@@ -45,7 +45,7 @@ BUILT_IN = {str(one.uid): str(one.type_val) for one in (rules.EXPRESSIONS, rules
 # The functions that read a counter, which restarts from zero with its instance.
 COUNTER_FUNCTIONS = frozenset({"rate", "irate", "increase"})
 # The panels that show one value for each series, not its course over the range.
-ONE_VALUE_PANELS = frozenset({"stat", "gauge", "bargauge"})
+ONE_VALUE_PANELS = frozenset({"stat", "gauge", "bargauge", "table"})
 SAMPLES = (rules.COUNTER_SAMPLE, *rules.HISTOGRAM_SAMPLES)
 # One version, in full: no range, no "or later".
 EXACT_VERSION = re.compile(r"\d+(\.\d+)+([.+-][0-9A-Za-z.+-]+)?")
@@ -203,27 +203,27 @@ def _read(expression: str) -> _Expression:
 _PLACEHOLDER = "x"
 
 
-def _increment_spans(tokens: Sequence[str], series: Sequence[str]) -> Iterator[tuple[int, int]]:
-    """Every span of the tokens that is `rules.session_increment` of the series' tokens."""
+def _increment_spans(tokens: Sequence[str], series: Sequence[str], session: rules.Session) -> Iterator[tuple[int, int]]:
+    """Every span of the tokens that is `rules.session_increment` of the series' tokens, in the session."""
     for previous in rules.PREVIOUS:
         pattern: list[str] = []
-        for token in _tokens(rules.session_increment(_PLACEHOLDER, previous))[0]:
+        for token in _tokens(rules.session_increment(_PLACEHOLDER, previous, session))[0]:
             pattern.extend(series if token == _PLACEHOLDER else (token,))
         for index in range(len(tokens) - len(pattern) + 1):
             if list(tokens[index : index + len(pattern)]) == pattern:
                 yield index, index + len(pattern)
 
 
-def _counted_per_sample(expression: _Expression, selector: _Selector) -> bool:
-    """Whether the selector is read as what each of its samples added, taken in a session
-    (`rules.session_increment`): a series no instance updates any more adds nothing, so nothing an
-    instance last reported is counted again."""
+def _counted_per_sample(expression: _Expression, selector: _Selector, session: rules.Session) -> bool:
+    """Whether the selector is read as what each of its samples added, taken in the session: a
+    pool's, by its name, or any pool's (`rules.session_increment`). A series no instance updates
+    any more adds nothing, so nothing an instance last reported is counted again."""
     tokens = expression.tokens
     own = list(tokens[selector.start : selector.end])
     if selector.window is not None:
         own = own[: own.index("[")]
     return any(
-        start <= selector.start and selector.end <= end for start, end in _increment_spans(tokens, own)
+        start <= selector.start and selector.end <= end for start, end in _increment_spans(tokens, own, session)
     )
 
 
@@ -309,9 +309,9 @@ def _declaration_problems(declared: Iterable[rules.Declared], root: Path) -> Ite
             yield Violation("declaration", one.name, "the exporter is not named with one exact version")
 
 
-def _keeps_awake(expression: _Expression, pool: str) -> bool:
-    """Whether the whole expression is what `rules.awake` writes for the pool."""
-    gate = _tokens(rules.awake(pool, "x"))[0][3:]
+def _kept_while_serving(expression: _Expression, pool: str) -> bool:
+    """Whether the whole expression is what `rules.serving` writes for the pool."""
+    gate = _tokens(rules.serving(pool, _PLACEHOLDER))[0][3:]
     tokens = list(expression.tokens)
     if tokens[-len(gate) :] != gate or tokens[0] != "(":
         return False
@@ -334,18 +334,18 @@ def _is_prometheus(target: Mapping[str, Any]) -> bool:
 def _counted(expression: _Expression) -> _Selector | None:
     """The series whose increase, summed, is all the expression returns; None when it returns anything else.
 
-    What `rules.awake` adds for the series' own pool is not counted against it. A mean, a ratio or
-    a comparison that holds the same increase is not a count.
+    What `rules.serving` adds for the series' own pool, the scaler's two gauges of it, is not
+    counted against it. A mean, a ratio or a comparison that holds the same increase is not a count.
     """
     tokens = expression.tokens
     start, end = 0, len(tokens)
-    if len(expression.selectors) == 2:
+    if len(expression.selectors) == 3:
         pools = [
             value
             for label, operator, value in expression.selectors[0].matchers
             if (label, operator) == (rules.POOL, "=")
         ]
-        if len(pools) != 1 or not _keeps_awake(expression, pools[0]):
+        if len(pools) != 1 or not _kept_while_serving(expression, pools[0]):
             return None
         start, end = 1, _closing(tokens, 0)
     elif len(expression.selectors) != 1:
@@ -367,22 +367,26 @@ def _counted(expression: _Expression) -> _Selector | None:
     return selector
 
 
-def _reads_asleep(panel: Mapping[str, Any], pool: str) -> bool:
-    """Whether the panel holds `rules.asleep` for the pool, as a query, shown, whose zero reads "asleep"."""
-    state = _tokens(rules.asleep(pool))[0]
+def _reads_state(panel: Mapping[str, Any], pool: str, state: rules.State) -> bool:
+    """Whether the panel holds the state's query for the pool (`rules.state_queries`), shown, whose
+    zero reads the state's text. The value is matched by its query, or, in a table, by the name
+    Grafana gives it (`rules.table_value`)."""
+    expression = _tokens(rules.state_queries(pool)[state])[0]
     references = {
         target.get("refId")
         for target in panel.get("targets") or ()
-        if _is_shown(target) and _is_prometheus(target) and _tokens(target.get("expr") or "")[0] == state
+        if _is_shown(target) and _is_prometheus(target) and _tokens(target.get("expr") or "")[0] == expression
     }
+    matchers = [("byFrameRefID", reference) for reference in references]
+    matchers += [("byName", rules.table_value(reference)) for reference in references if isinstance(reference, str)]
     for override in (panel.get("fieldConfig") or {}).get("overrides") or ():
         matcher = override.get("matcher") or {}
-        if matcher.get("id") != "byFrameRefID" or matcher.get("options") not in references:
+        if (matcher.get("id"), matcher.get("options")) not in matchers:
             continue
         for value in override.get("properties") or ():
             for mapping in (value.get("value") or ()) if value.get("id") == "mappings" else ():
                 zero = (mapping.get("options") or {}).get("0") if mapping.get("type") == "value" else None
-                if isinstance(zero, dict) and zero.get("text") == rules.ASLEEP:
+                if isinstance(zero, dict) and zero.get("text") == state.text:
                     return True
     return False
 
@@ -399,7 +403,7 @@ def _panel_problems(
     targets = panel.get("targets") or ()
     read: list[tuple[Mapping[str, Any], _Expression]] = []
     counts: set[tuple[str, frozenset[tuple[str, str, str]], str | None]] = set()
-    asleep_for: set[str] = set()
+    state_for: set[str] = set()
     for target in targets:
         source = target.get("datasource")
         if source is None:
@@ -440,19 +444,22 @@ def _panel_problems(
                 yield Violation("engine-row", where, f"{selector.name} is not queried for one configured pool")
             elif all(engine != pool.engine for engine, _ in rows):
                 yield Violation("engine-row", where, f"{selector.name} is not in the row of the pool's engine")
-            elif (pool.engine, selector.name) not in rising or not _counted_per_sample(expression, selector):
-                asleep_for.add(pool.name)
-                if not _keeps_awake(expression, pool.name):
-                    yield Violation("asleep", where, f"a query of {selector.name} is not kept to the pool in service")
+            elif (pool.engine, selector.name) not in rising or not _counted_per_sample(
+                expression, selector, pool.name
+            ):
+                state_for.add(pool.name)
+                if not _kept_while_serving(expression, pool.name):
+                    yield Violation("pool-state", where, f"a query of {selector.name} is not kept to the pool while it serves")
 
-    for pool in sorted(asleep_for):
-        if not _reads_asleep(panel, pool):
-            yield Violation("asleep", where, f"no query of the in-service count of {pool!r} reads asleep at zero")
+    for pool in sorted(state_for):
+        for state in rules.STATES:
+            if not _reads_state(panel, pool, state):
+                yield Violation("pool-state", where, f"no query of the state of {pool!r} reads {state.text!r}")
     one_value = panel.get("type") in ONE_VALUE_PANELS
-    if asleep_for and one_value and not all(target.get("instant") for target in targets):
-        yield Violation("asleep", where, "a panel of one value asks for the range, and would keep an old value")
+    if state_for and one_value and not all(target.get("instant") for target in targets):
+        yield Violation("pool-state", where, "a panel of one value asks for the range, and would keep an old value")
     for target, expression in read:
-        reads_session = any(one.name == rules.SESSION_ON for one in expression.selectors)
+        reads_session = any(one.name == rules.SESSION_ACTIVE for one in expression.selectors)
         if one_value and reads_session and _is_shown(target) and not target.get("instant"):
             yield Violation("session", where, f"query {target.get('refId')!r} is read over the session and asks for the range")
 
