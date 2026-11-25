@@ -3,7 +3,7 @@
 Over a term, a student will probably leak a key: pushed in a homework branch, pasted in a chat,
 left in a harness's settings file (system design, section 13). A leaked key gives inference in
 that student's name, and nothing else: a key carries no other privilege. Once the gateway enforces
-the session switch (issue E4-41, see the runbook `session-on-and-off.md`), it serves a key only
+the session switch (issue E4-41, see the runbook `sessions.md`), it serves a key only
 while a session is on; until that gateway is deployed, it serves the key at any hour. Either way
 the key keeps working until it is revoked, or until it expires at the course end, so revoke it at
 once, whether a session is on or not. Revoking it is the fix. A revoked key stops working within

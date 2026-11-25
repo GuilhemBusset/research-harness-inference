@@ -7,6 +7,7 @@ resources by logical ID, the second gives the scaler's settings and counts the r
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import io
@@ -24,7 +25,7 @@ from rhi_admin import main
 from rhi_admin import session as admin_session
 from rhi_admin.roster import AdminError
 from rhi_common import sessions as rules
-from rhi_common.records import LaunchFailure, ScalerNote, Session
+from rhi_common.records import LaunchFailure, ScalerNote, Session, SessionSwitch
 
 # 2027-01-15T08:00 UTC, which the clock of `ZONE` shows as 09:00.
 NOW = 1_800_000_000
@@ -412,16 +413,22 @@ def test_a_stop_of_every_pool_that_fails_on_one_still_asks_for_a_run_of_what_it_
     assert deployed.functions.runs == runs + 1
 
 
-def test_a_parked_stage_has_the_switch_and_no_pool(deployed: Deployed) -> None:
+@pytest.mark.parametrize("command", ["on", "off"])
+def test_no_switch_stands_beside_the_sessions(command: str) -> None:
+    # A session is the one operating state, and `stop` ends it: the command line knows no switch.
+    with pytest.raises(SystemExit) as refused, contextlib.redirect_stderr(io.StringIO()):
+        main.parser().parse_args(["session", command])
+    assert refused.value.code == 2
+
+
+def test_a_parked_stage_has_no_pool(deployed: Deployed) -> None:
     # Parked, the stack keeps the pool-state table and holds no scaler.
     deployed.stack.parked = True
 
     status, out, err = deployed.run("status")
     assert (status, err) == (0, "")
-    lines = [line.split("\t") for line in out.splitlines()]
-    assert lines[:2] == [["session", "set_by", "set_at"], ["off", "-", "-"]]
-    # No pool is deployed: after the switch's line, the pools' header and no line.
-    assert len(lines) == 3
+    # No pool is deployed: the header and no line.
+    assert [line.split("\t")[0] for line in out.splitlines()] == ["pool"]
 
     # A booking is refused, and there is nothing to stop.
     status, _, err = deployed.run("start", "1", "--for", "1h")
@@ -433,6 +440,8 @@ def test_a_parked_stage_has_the_switch_and_no_pool(deployed: Deployed) -> None:
 
 def test_status_prints_the_supply(deployed: Deployed) -> None:
     deployed.run("start", "3", "--for", "6h")
+    # A switch that an earlier `session on` left in the table has no line: nothing reads it.
+    deployed.table.put_item(Item=SessionSwitch(on=True, set_by="user/earlier", set_at=NOW - HOUR).to_item())
     note = ScalerNote(
         pool="coursework",
         capacity_asked=3,
@@ -450,9 +459,8 @@ def test_status_prints_the_supply(deployed: Deployed) -> None:
 
     assert (status, err) == (0, "")
     lines = [line.split("\t") for line in out.splitlines()]
-    # The switch's header and its line come first, as before.
-    assert lines[:2] == [["session", "set_by", "set_at"], ["off", "-", "-"]]
-    coursework, mock = (dict(zip(lines[2], line, strict=True)) for line in lines[3:])
+    # The header, then one line for each deployed pool, and nothing else.
+    coursework, mock = (dict(zip(lines[0], line, strict=True)) for line in lines[1:])
     assert (coursework["pool"], mock["pool"]) == ("coursework", "mock")
 
     # The session, its start and its end in the configured zone, who set it and when.
@@ -485,4 +493,4 @@ def test_status_prints_the_supply(deployed: Deployed) -> None:
     # A session whose end has come is no session.
     deployed.run("stop", now=NOW + 700)
     lines = [line.split("\t") for line in deployed.run("status", now=NOW + 701)[1].splitlines()]
-    assert lines[3][:2] == ["coursework", "none"]
+    assert lines[1][:2] == ["coursework", "none"]

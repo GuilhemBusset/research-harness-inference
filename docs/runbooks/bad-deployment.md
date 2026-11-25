@@ -238,7 +238,7 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    rhi_admin session status
    ```
 
-   Once the deployment hold is deployed (issue E4-42, see the runbook `session-on-and-off.md`), the
+   Once the deployment hold is deployed (issue E4-42, see the runbook `sessions.md`), the
    pipeline waits before each stage's deployment while the switch reads on, so a repair merged
    during a class waits for the session to be switched off; a deployment that passed the hold
    before the session was switched on still runs to its end. Until that hold is deployed, nothing
