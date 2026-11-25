@@ -12,6 +12,7 @@ import json
 import math
 import re
 import secrets
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -393,6 +394,39 @@ def test_the_session_is_stopped_after_a_step_that_raised(stored: Any, monkeypatc
     ]
 
 
+def test_a_booking_written_while_the_job_is_cancelled_is_stopped(stored: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = a_rig(stored, PROMPT, PROMPT)
+    rig.run.offload = s7._off_loop
+    book = rig.run.booking.book
+    started, finish = threading.Event(), threading.Event()
+
+    def slow_book(minutes: int, now: int) -> bool:
+        # The write is on its way to the table as the job is cancelled, and reaches it after.
+        started.set()
+        assert finish.wait(5)
+        return book(minutes, now)
+
+    monkeypatch.setattr(rig.run.booking, "book", slow_book)
+
+    async def cancelled() -> None:
+        job = asyncio.create_task(rig.run.in_session())
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            job.cancel()
+            await asyncio.sleep(0)
+        finally:
+            finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await job
+
+    asyncio.run(cancelled())
+    # The booking was written, and the job stopped it before it ended.
+    assert [session.instances for _, session in rig.scaler.written] == [2, 2]
+    ended = session_of(stored)
+    assert ended is not None and ended.ends_at <= rig.clock.now()
+    assert rig.gateway.received == []
+
+
 # The departures, and the stream across a release.
 
 
@@ -486,6 +520,74 @@ def test_the_stream_across_a_release_keeps_its_last_byte_when_no_note_asks_for_f
     ]
 
 
+def test_the_session_is_lowered_only_once_the_stream_is_held_open_at_the_gateway(
+    stored: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = a_rig(stored, PROMPT, PROMPT)
+    lower = rig.run.lower
+    order: list[str] = []
+
+    class Connecting(httpx.AsyncBaseTransport):
+        """A gateway whose connection takes a turn of the event loop to make, before any byte."""
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0)
+            assert isinstance(request.stream, httpx.AsyncByteStream)
+            async for _ in request.stream:
+                order.append("part")
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Events(Reply()))
+
+    async def lowering() -> bool:
+        order.append("lowered")
+        return await lower()
+
+    rig.run.transport = Connecting()
+    monkeypatch.setattr(rig.run, "lower", lowering)
+    rig.booked(rig.run.departures)
+
+    # The stream's first part had reached the gateway when the job lowered its session.
+    assert order.index("part") < order.index("lowered")
+    (stream,) = of(parsed(rig.out), "stream")
+    assert (stream["stream"], stream["decision"], stream["ended"]) == ("release", 1, "closing_event")
+
+
+def test_the_last_byte_leaves_as_the_release_is_set_not_at_the_next_padding() -> None:
+    clock = FakeClock()
+    gateway = Gateway(clock)
+
+    async def released_while_waiting() -> s7.Read:
+        release, waiting, never = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class Waiting:
+            """A clock on which the wait for the next byte of padding never ends."""
+
+            now = clock.now
+
+            async def sleep(self, seconds: float) -> None:
+                waiting.set()
+                await never.wait()
+
+        stream = asyncio.create_task(
+            s7.slow_stream(
+                "http://gateway.example.com",
+                "key",
+                s7._request("mock"),
+                clock=Waiting(),
+                release=release,
+                transport=httpx.MockTransport(gateway.handle),
+            )
+        )
+        await asyncio.wait_for(waiting.wait(), 5)
+        assert gateway.received == []
+        release.set()
+        return await asyncio.wait_for(stream, 5)
+
+    read = asyncio.run(released_while_waiting())
+    # The gateway read the body whole, with no byte of padding in between, and answered.
+    assert len(gateway.received) == 1
+    assert (read.ended, read.body_sent_at) == ("closing_event", clock.now())
+
+
 @pytest.mark.parametrize("gap", ["collectors", "in_service"])
 def test_a_gap_in_the_workspace_loses_no_observation_it_can_still_read(stored: Any, gap: str) -> None:
     rig = a_rig(stored, PROMPT, PROMPT)
@@ -515,20 +617,30 @@ def test_a_gap_in_the_workspace_loses_no_observation_it_can_still_read(stored: A
     assert all(line["out_of_service_read_at"] and line["gone_read_at"] for line in departures)
 
 
-def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be(stored: Any) -> None:
+@pytest.mark.parametrize(
+    ("shown_until", "late_for"),
+    [("the_lowering", 52), ("the_lowering", 95), ("the_decision", 150)],
+    ids=["withdrawn_before_the_count_drops", "withdrawn_after_the_count_dropped", "a_stop_after_the_decision"],
+)
+def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be_and_gives_no_departure(
+    stored: Any, shown_until: str, late_for: float
+) -> None:
     rig = a_rig(stored, PROMPT, PROMPT)
     read = rig.scaler.read_series
     seemed: list[float] = []
 
     def delayed(query: str, **window: float) -> list[common.Series]:
-        # From the job's lowering until some fifty seconds after the scaler first asked for fewer,
-        # the workspace shows the writes of the instance that stays only up to the lowering: it
-        # seems to have stopped.
+        # For a while, until `late_for` seconds after the scaler first asked for fewer, the
+        # workspace shows the writes of the instance that stays only up to the job's lowering, or
+        # up to some seconds after that decision: it seems to have stopped, before the decision or
+        # after it.
         lowered = [at for at, session in rig.scaler.written if session.instances == 1]
-        asked = [note.written_at for note in rig.scaler.notes if note.capacity_asked == 1]
-        if query.startswith("max by (instance)") and lowered and not (asked and rig.clock.now() >= asked[0] + 52):
+        asked = [note.written_at + 20.0 for note in rig.scaler.notes if note.capacity_asked == 1]
+        hidden = (lowered if shown_until == "the_lowering" else asked)[:1]
+        over = bool(asked) and rig.clock.now() >= asked[0] - 20 + late_for
+        if query.startswith("max by (instance)") and hidden and rig.clock.now() >= hidden[0] and not over:
             staying = rig.scaler.machines[1]
-            staying.gone_at = lowered[0]
+            staying.gone_at = hidden[0]
             seemed[:] = [staying.last_write() or 0.0]
             try:
                 return read(query, **window)
@@ -542,8 +654,14 @@ def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be(stored:
     lines = parsed(rig.out, *identifiers(rig))
     (withdrawn,) = of(lines, "gone_withdrawn")
     assert withdrawn["last_write_at"] == s7.utc(seemed[0])
-    departures = [(line["decision"], line["last_write_at"]) for line in of(lines, "scale_in")]
-    assert departures == [(n + 1, s7.utc(machine.last_write())) for n, machine in enumerate(rig.scaler.machines)]
+    # A stop from before the decision is none of its departures.
+    (seeming,) = [line for line in of(lines, "gone") if line["last_write_at"] == withdrawn["last_write_at"]]
+    assert seeming["decision"] == (None if shown_until == "the_lowering" else 1)
+    # Each instance that left has its summary, once, and the one that stayed has none.
+    departures = [(line["decision"], line["instance"], line["last_write_at"]) for line in of(lines, "scale_in")]
+    assert departures == [
+        (n + 1, rig.run.names(machine.name), s7.utc(machine.last_write())) for n, machine in enumerate(rig.scaler.machines)
+    ]
 
 
 # The starting instance.
@@ -551,12 +669,17 @@ def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be(stored:
 
 @pytest.mark.parametrize(
     ("left", "slow_collector"),
-    [("starting", None), ("starting", 100.0), ("starting", 200.0), ("in_service", None)],
-    ids=["the_starting_one_that_never_wrote", "the_starting_one", "the_starting_one_told_twice", "the_one_in_service"],
+    [("starting", None), ("starting", 200.0), ("in_service", None), ("in_service", 100.0)],
+    ids=[
+        "the_starting_one_that_never_wrote",
+        "the_starting_one",
+        "the_one_in_service",
+        "the_one_in_service_told_by_the_notes_alone",
+    ],
 )
 def test_the_starting_instance(stored: Any, left: str, slow_collector: float | None) -> None:
     # One instance is in service a minute after its launch; the other is still starting then, and
-    # its collector has not written, has written, or writes only after the note read the state.
+    # its collector has not written, writes only after the note read the state, or has written.
     # The group holds the instance it released for a hundred seconds more.
     rig = a_rig(stored, PROMPT, (slow_collector, 400.0), leaves=s7.Left(left), drain=100.0)
     asyncio.run(rig.run.starting_instance())
@@ -575,24 +698,55 @@ def test_the_starting_instance(stored: Any, left: str, slow_collector: float | N
 
     # Which of the two left, and when: the note that first read it gone, and the one that read it
     # out of the group.
-    assert (line["left"], line["reason"], line["left_by_notes"]) == (left, None, left)
+    assert (line["left"], line["reason"]) == (left, None)
     after = [note for note in rig.scaler.notes if note.written_at > lowered_at and note.in_service + note.starting < 2]
     assert (line["in_service_after"], line["starting_after"]) == ((1, 0) if left == "starting" else (0, 1))
     assert line["lowered_at"] < line["left_written_at"] == s7.utc(after[0].written_at) <= line["left_read_at"]
     out_of_the_group = next(note for note in after if note.draining == 0)
     assert line["left_written_at"] < line["gone_written_at"] == s7.utc(out_of_the_group.written_at) <= line["at"]
+    # The notes tell it when the other is starting still; the collectors when the one in service
+    # alone had written as the state was read.
+    alone = slow_collector is None or slow_collector > 120
+    assert line["left_by_notes"] == (left if left == "in_service" else None)
+    assert line["left_by_collectors"] == (left if alone else None)
+    assert line["written_at_state"] == (["instance-1"] if alone else ["instance-1", "instance-2"])
     # The instance that left is named, with its collector's last write, when it ever wrote.
     serving, starting = rig.scaler.machines
     gone = starting if left == "starting" else serving
     if gone.last_write() is None:
-        assert (line["instance"], line["last_write_at"], line["left_by_collectors"]) == (None, None, None)
+        assert (line["instance"], line["last_write_at"]) == (None, None)
     else:
         assert (line["instance"], line["last_write_at"]) == (rig.run.names(gone.name), s7.utc(gone.last_write()))
         assert line["lowered_at"] < line["last_write_at"] < line["at"]
-        # The collectors tell it too when the one in service alone had written as the state was read.
-        alone = slow_collector is None or slow_collector > 120
-        assert line["left_by_collectors"] == (left if alone else None)
-        assert line["written_at_state"] == (["instance-1"] if alone else ["instance-1", "instance-2"])
+
+
+@pytest.mark.parametrize(
+    ("launch", "leaves", "left"),
+    [
+        ((100.0, 400.0), "starting", None),
+        ((65.0, 195.0), "in_service", None),
+        ((130.0, 195.0), "in_service", "in_service"),
+    ],
+    ids=["the_starting_one_left", "the_one_in_service_left", "the_one_in_service_left_and_alone_had_written"],
+)
+def test_the_line_of_the_starting_instance_tells_no_role_the_readings_do_not_tell(
+    stored: Any, launch: tuple[float, float], leaves: str, left: str | None
+) -> None:
+    # In each run the note after the lowering reads one instance in service and none starting: the
+    # starting one left, or it entered service between two notes and the one in service left. The
+    # notes read the same. The collectors tell the two apart only when one instance alone had
+    # written as the state was read.
+    rig = a_rig(stored, PROMPT, launch, leaves=s7.Left(leaves))
+    asyncio.run(rig.run.starting_instance())
+
+    (line,) = of(parsed(rig.out, *identifiers(rig)), "starting_instance")
+    assert (line["in_service_after"], line["starting_after"], line["left_by_notes"]) == (1, 0, None)
+    assert (line["left"], line["reason"]) == (left, None if left else "role_not_told")
+    # Whatever the role, the line names the instance that left, and when.
+    serving, starting = rig.scaler.machines
+    gone = starting if leaves == "starting" else serving
+    assert (line["instance"], line["last_write_at"]) == (rig.run.names(gone.name), s7.utc(gone.last_write()))
+    assert line["lowered_at"] < line["left_written_at"] <= line["gone_written_at"]
 
 
 def test_the_line_of_the_starting_instance_says_why_it_tells_neither(stored: Any) -> None:
@@ -605,8 +759,8 @@ def test_the_line_of_the_starting_instance_says_why_it_tells_neither(stored: Any
 
     # The notes and the collectors disagree: neither is believed. A single reading stands alone.
     starting, in_service = s7.Left.STARTING, s7.Left.IN_SERVICE
-    assert s7.which_left((starting, None), in_service) == (None, s7.Untold.READINGS_DISAGREE)
-    assert s7.which_left((None, s7.Untold.BOTH_IN_SERVICE), in_service) == (in_service, None)
+    assert s7.which_left((in_service, None), starting) == (None, s7.Untold.READINGS_DISAGREE)
+    assert s7.which_left((None, s7.Untold.ROLE_NOT_TOLD), starting) == (starting, None)
     assert s7.which_left((None, s7.Untold.NOTHING_LEFT), None) == (None, s7.Untold.NOTHING_LEFT)
 
     def notes(*counts: tuple[int, int]) -> list[ScalerNote]:
