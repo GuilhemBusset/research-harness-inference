@@ -160,6 +160,45 @@ def test_the_retired_session_windows_parameter_loads_only_as_an_empty_list() -> 
     assert not any("session_windows" in name for name in written.parameters)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "wrong"),
+    [("on_demand_price_limit", "4.5", f"five{MARK}"), ("keepalive_seconds", "10", f"{MARK}.5")],
+)
+def test_a_retired_parameter_of_scaling_by_load_loads_only_as_its_type(key: str, value: str, wrong: str) -> None:
+    # The deployed prefix still holds the parameter, which the writer never deletes: its old type
+    # loads as if it were not there, any other text is refused by the key, and no writing puts it.
+    stand_in = StandIn(example_parameters())
+    assert f"/rhi/config/{key}" not in stand_in.parameters
+    stand_in.parameters[f"/rhi/config/{key}"] = ("String", value)
+    assert config.read_ssm(stand_in) == EXAMPLE
+    stand_in.parameters[f"/rhi/config/{key}"] = ("String", wrong)
+    with pytest.raises(config.ConfigError) as raised:
+        config.read_ssm(stand_in)
+    assert repr(key) in str(raised.value)
+    assert MARK not in as_logged(raised.value)
+
+    written = StandIn()
+    config.write_ssm(EXAMPLE, written)
+    assert not any(key in name for name in written.parameters)
+
+
+def test_a_pools_parameter_that_still_gives_every_retired_field_loads() -> None:
+    # A pool's entry as the deployed prefix holds it: a JSON object with the six fields.
+    stand_in = StandIn(example_parameters())
+    retired = {
+        "wake": "on-demand",
+        "warm_instances": 1,
+        "hold_seconds": 420,
+        "hold_seconds_non_streaming": 240,
+        "idle_minutes": 20,
+        "start_delay_seconds": 0,
+    }
+    for pool in ("coursework", "mock"):
+        _, entry = stand_in.parameters[f"/rhi/config/pools/{pool}"]
+        stand_in.parameters[f"/rhi/config/pools/{pool}"] = ("String", json.dumps(json.loads(entry) | retired))
+    assert config.read_ssm(stand_in) == EXAMPLE
+
+
 def test_the_retired_nightly_stop_parameter_loads_only_as_a_time_of_day() -> None:
     # The deployed prefix still holds the parameter, which the writer never deletes: a time of day
     # loads as if it were not there, any other text is refused, and no writing puts it.

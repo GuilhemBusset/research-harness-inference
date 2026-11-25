@@ -39,7 +39,7 @@ numbers upward from 1 and is far below 10^18: the canary of the pipeline's verif
 (`CANARY_GITHUB_ID`, `rhi_admin.canary`) and the spikes' students, from `SPIKE_GITHUB_ID_BASE` on
 (`rhi_admin.spikes`). The gateway serves them as it serves every key, on a pool whose session is
 active (section 5.6): the verification, the weekly canary and the spikes book a session, or run
-inside one. `is_owner_entry` says whether a GitHub ID is one of them.
+inside one.
 """
 
 from __future__ import annotations
@@ -61,11 +61,6 @@ SPIKE_GITHUB_ID_BASE = 10**18
 
 _KEY_HASH = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
-
-
-def is_owner_entry(github_id: int) -> bool:
-    """Whether a GitHub ID is one of the owner's own entries: the canary, or one of the spikes' students."""
-    return github_id == CANARY_GITHUB_ID or github_id >= SPIKE_GITHUB_ID_BASE
 
 
 def utc_day(at: int) -> str:

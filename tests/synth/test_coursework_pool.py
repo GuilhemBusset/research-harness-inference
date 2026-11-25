@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from rhi import config
-
 if TYPE_CHECKING:
     import aws_cdk as cdk
 
@@ -48,9 +46,7 @@ def test_the_coursework_group(pools: dict[str, Any]) -> None:
     assert overrides == [{"InstanceType": "g7e.2xlarge"}]
 
 
-def test_the_pools_stack_holds_no_warm_pool_though_the_coursework_entry_gives_two(pools: dict[str, Any]) -> None:
-    (coursework,) = [pool for pool in config.load({"RHI_CONFIG": "example"}).pools if pool.name == "coursework"]
-    assert coursework.warm_instances == 2
+def test_the_pools_stack_holds_no_warm_pool(pools: dict[str, Any]) -> None:
     assert [r for r in pools["Resources"].values() if r["Type"] == "AWS::AutoScaling::WarmPool"] == []
 
 

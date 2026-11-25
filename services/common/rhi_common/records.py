@@ -7,14 +7,13 @@ holds a table reads and writes it.
 
 | Table | Partition key | Sort key | Items |
 | --- | --- | --- | --- |
-| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote`. `session`, the pool's booking: `Session` |
-| pool-state | `_session` | `switch` | The session switch, the admin's: `SessionSwitch` |
-| heartbeats | `pool` | `source` | `gateway#<task ID>`: `GatewayHeartbeat`. `instance#<instance ID>`: `InstanceHeartbeat` |
+| pool-state | `pool` | `record` | `note`, the scaler's: `ScalerNote`. `session`, the pool's booking: `Session` |
+| heartbeats | `pool` | `source` | `instance#<instance ID>`: `InstanceHeartbeat` |
 
 An item is in the form boto3's table resource takes and returns: attribute names to plain values,
 strings and whole numbers. `to_item` writes every number as an `int`; `from_item` also takes the
 `Decimal` that boto3 gives back for a number. A time is a whole number of seconds since the epoch.
-A time that may be unknown (no request received yet, no launch that found no capacity) is `None`
+A time that may be unknown (no launch that found no capacity yet) is `None`
 in the record and absent from the item. A pool's rebalance number is absent from the scaler's note
 while it is 0, and a note stored without one reads as 0. The note's counts of the pool's supply are
 always written, and a note stored before the scaler wrote them reads as zeros, with no time and no
@@ -22,18 +21,16 @@ cause.
 
 A heartbeat is rewritten every 5 seconds and ignored once it is older than 20 seconds (section
 17): `is_fresh` is that rule. Its item also carries `expires_at`, the table's expiry attribute, one
-hour after it was written, which only clears the rows of tasks and instances that are gone. The
-pool-state items carry no expiry: they survive deployments (section 11.3).
+hour after it was written, which only clears the rows of instances that are gone. The pool-state
+items carry no expiry: they survive deployments (section 11.3).
 
 `from_item` refuses, with a `RecordError`, an item that is not the record asked for: another key,
-a missing or mistyped attribute, a mode outside the four, a switch that is neither on nor off.
+a missing or mistyped attribute.
 
-The session switch (section 5.6) is one item of the pool-state table that no pool can be: a pool's
-name is lower-case letters, digits and hyphens, so none is `_session`. Only the admin writes it,
-`on` as a boolean, true or false. A missing item reads as off: `session_is_on` is that rule.
-`set_by` and `set_at` say who last changed the switch and when: setting it to what it already
-reads writes nothing (`switched` is that rule), so the time an off switch was set is
-the time the last session ended, which the scaler's count outside sessions reads.
+The tables can still hold items of kinds an earlier release wrote and this module no longer
+defines: in pool-state a pool's record `mode` and the item `switch` under `_session`, in heartbeats
+the rows `gateway#<task ID>`. Nothing reads them and nothing deletes them; the heartbeat rows
+expire by themselves.
 
 A pool's session (section 5.6) is the record `session` under the pool's name: a booking of the
 pool, with a number of instances, a start and an end. A pool has one at a time, and a pool with no
@@ -51,14 +48,9 @@ from enum import StrEnum
 from typing import Self
 
 # The sort keys of the pool-state table that this module owns.
-MODE_RECORD = "mode"
 NOTE_RECORD = "note"
 SESSION_RECORD = "session"
-# The keys of the session switch's item in the pool-state table.
-SESSION_PARTITION = "_session"
-SWITCH_RECORD = "switch"
-# What comes before the task's or the instance's ID in the sort key of the heartbeats table.
-GATEWAY_SOURCE = "gateway#"
+# What comes before the instance's ID in the sort key of the heartbeats table.
 INSTANCE_SOURCE = "instance#"
 
 # Readers ignore a heartbeat older than this (section 17).
@@ -73,14 +65,6 @@ class RecordError(ValueError):
     """An item is not the record it was read as."""
 
 
-class Mode(StrEnum):
-    """A pool's operating state (section 11.3). `parked` is a deployment flag, not a mode."""
-
-    ENABLED = "enabled"
-    SCHEDULED_ONLY = "scheduled-only"
-    DISABLED = "disabled"
-
-
 class LaunchFailure(StrEnum):
     """Why a pool's group last failed to launch, while the pool waits (section 5.4). The scaler's
     note and its metrics carry one of these four words, never text from AWS."""
@@ -93,11 +77,6 @@ class LaunchFailure(StrEnum):
     LAUNCHES_SUSPENDED = "launches-suspended"
     # The launch failed for any other reason.
     LAUNCH_FAILED = "launch-failed"
-
-
-# The mode of a pool that has no mode record, by the `wake` of its configuration (section 11.3):
-# what the scaler reads, and what the admin CLI re-enables a pool to.
-CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 
 
 def _text(item: Mapping[str, object], name: str) -> str:
@@ -132,51 +111,11 @@ def _record(item: Mapping[str, object], record: str) -> None:
 
 
 def _source_id(item: Mapping[str, object], prefix: str) -> str:
-    """The task's or the instance's ID, from a sort key that starts with the prefix."""
+    """The instance's ID, from a sort key that starts with the prefix."""
     source = _text(item, "source")
     if not source.startswith(prefix) or source == prefix:
         raise RecordError(f"`source` is not `{prefix}` followed by an ID")
     return source.removeprefix(prefix)
-
-
-@dataclass(frozen=True)
-class GatewayHeartbeat:
-    """One gateway task's demand for one pool, rewritten every 5 seconds.
-
-    An explicit wake counts as a held request until the pool is ready, and as a request received
-    at that moment. The rule that takes a pool to zero counts from `last_request_at`.
-    """
-
-    task: str
-    pool: str
-    in_flight: int
-    held: int
-    last_request_at: int | None
-    written_at: int
-
-    def to_item(self) -> Item:
-        item: Item = {
-            "pool": self.pool,
-            "source": GATEWAY_SOURCE + self.task,
-            "in_flight": self.in_flight,
-            "held": self.held,
-            "written_at": self.written_at,
-            "expires_at": self.written_at + EXPIRY_SECONDS,
-        }
-        if self.last_request_at is not None:
-            item["last_request_at"] = self.last_request_at
-        return item
-
-    @classmethod
-    def from_item(cls, item: Mapping[str, object]) -> Self:
-        return cls(
-            task=_source_id(item, GATEWAY_SOURCE),
-            pool=_text(item, "pool"),
-            in_flight=_whole(item, "in_flight"),
-            held=_whole(item, "held"),
-            last_request_at=_optional_time(item, "last_request_at"),
-            written_at=_whole(item, "written_at"),
-        )
 
 
 @dataclass(frozen=True)
@@ -221,34 +160,6 @@ class InstanceHeartbeat:
             stage=_text(item, "stage"),
             written_at=_whole(item, "written_at"),
         )
-
-
-@dataclass(frozen=True)
-class PoolState:
-    """A pool's mode, and who set it and when. Only the admin changes it."""
-
-    pool: str
-    mode: Mode
-    set_by: str
-    set_at: int
-
-    def to_item(self) -> Item:
-        return {
-            "pool": self.pool,
-            "record": MODE_RECORD,
-            "mode": self.mode.value,
-            "set_by": self.set_by,
-            "set_at": self.set_at,
-        }
-
-    @classmethod
-    def from_item(cls, item: Mapping[str, object]) -> Self:
-        _record(item, MODE_RECORD)
-        try:
-            mode = Mode(item.get("mode"))
-        except ValueError:
-            raise RecordError("`mode` is not one of the four modes") from None
-        return cls(pool=_text(item, "pool"), mode=mode, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
 
 
 @dataclass(frozen=True)
@@ -337,34 +248,6 @@ class ScalerNote:
 
 
 @dataclass(frozen=True)
-class SessionSwitch:
-    """Whether a session is on, and who last changed the switch and when (section 5.6). Only the admin sets it."""
-
-    on: bool
-    set_by: str
-    set_at: int
-
-    def to_item(self) -> Item:
-        return {
-            "pool": SESSION_PARTITION,
-            "record": SWITCH_RECORD,
-            "on": self.on,
-            "set_by": self.set_by,
-            "set_at": self.set_at,
-        }
-
-    @classmethod
-    def from_item(cls, item: Mapping[str, object]) -> Self:
-        if item.get("pool") != SESSION_PARTITION:
-            raise RecordError(f"the item is not under the partition key `{SESSION_PARTITION}`")
-        _record(item, SWITCH_RECORD)
-        on = item.get("on")
-        if not isinstance(on, bool):
-            raise RecordError("`on` is not true or false")
-        return cls(on=on, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
-
-
-@dataclass(frozen=True)
 class Session:
     """A pool's session: a booking of the pool, and who last wrote it and when (section 5.6).
 
@@ -404,19 +287,6 @@ class Session:
         )
 
 
-def switched(current: SessionSwitch | None, on: bool, set_by: str, now: int) -> SessionSwitch | None:
-    """The switch to write when `set_by` sets it `on` at the time `now`, or `None` when there is
-    nothing to write because it already reads so (a missing record reads as off)."""
-    if session_is_on(current) == on:
-        return None
-    return SessionSwitch(on=on, set_by=set_by, set_at=now)
-
-
-def session_is_on(switch: SessionSwitch | None) -> bool:
-    """Whether a session is on: not while the switch reads off, nor while it has no record."""
-    return switch is not None and switch.on
-
-
-def is_fresh(heartbeat: GatewayHeartbeat | InstanceHeartbeat, now: int) -> bool:
+def is_fresh(heartbeat: InstanceHeartbeat, now: int) -> bool:
     """Whether a reader at the time `now` still counts the heartbeat: not once it is older than 20 seconds."""
     return now - heartbeat.written_at <= FRESH_SECONDS

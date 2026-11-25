@@ -6,26 +6,24 @@ from decimal import Decimal
 
 import pytest
 
-from rhi_common.records import (
-    GatewayHeartbeat,
-    InstanceHeartbeat,
-    LaunchFailure,
-    Mode,
-    PoolState,
-    RecordError,
-    ScalerNote,
-    Session,
-    SessionSwitch,
-    is_fresh,
-    session_is_on,
-    switched,
-)
+from rhi_common import records
+from rhi_common.records import InstanceHeartbeat, LaunchFailure, RecordError, ScalerNote, Session, is_fresh
 
 NOW = 1_800_000_000
 
-GATEWAY = GatewayHeartbeat(
-    task="0f3a9c", pool="coursework", in_flight=3, held=1, last_request_at=NOW - 7, written_at=NOW
-)
+# Items of the kinds an earlier release wrote, which the tables may still hold: a gateway task's
+# heartbeat, a pool's mode and the session switch. No record reads them.
+GATEWAY_ROW = {
+    "pool": "coursework",
+    "source": "gateway#0f3a9c",
+    "in_flight": 3,
+    "held": 1,
+    "written_at": NOW,
+    "expires_at": NOW + 3600,
+}
+MODE_ITEM = {"pool": "coursework", "record": "mode", "mode": "scheduled-only", "set_by": "admin", "set_at": NOW - 500}
+SWITCH_ITEM = {"pool": "_session", "record": "switch", "on": True, "set_by": "admin", "set_at": NOW}
+
 INSTANCE = InstanceHeartbeat(
     instance="instance-1",
     pool="coursework",
@@ -36,7 +34,6 @@ INSTANCE = InstanceHeartbeat(
     stage="serving",
     written_at=NOW,
 )
-STATE = PoolState(pool="coursework", mode=Mode.SCHEDULED_ONLY, set_by="admin", set_at=NOW - 500)
 NOTE = ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=NOW - 90, written_at=NOW)
 # A pool that waits: three asked, one in service, one starting, one leaving.
 SHORT = ScalerNote(
@@ -57,11 +54,7 @@ SESSION = Session(
 )
 
 RECORDS = [
-    GATEWAY,
-    GatewayHeartbeat(task="0f3a9c", pool="mock", in_flight=0, held=0, last_request_at=None, written_at=NOW),
     INSTANCE,
-    STATE,
-    *(PoolState(pool="mock", mode=mode, set_by="admin", set_at=NOW) for mode in Mode),
     NOTE,
     ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=NOW),
     ScalerNote(pool="mock", capacity_asked=2, no_capacity_at=None, written_at=NOW, rebalance_number=7),
@@ -71,9 +64,7 @@ RECORDS = [
 
 
 @pytest.mark.parametrize("record", RECORDS)
-def test_each_record_survives_a_round_trip(
-    record: GatewayHeartbeat | InstanceHeartbeat | PoolState | ScalerNote | Session,
-) -> None:
+def test_each_record_survives_a_round_trip(record: InstanceHeartbeat | ScalerNote | Session) -> None:
     item = record.to_item()
     # A time that is unknown is absent from the item; every other value is a string or a whole number.
     assert all(type(value) in (str, int) for value in item.values())
@@ -86,26 +77,24 @@ def test_each_record_survives_a_round_trip(
 def test_item_keys() -> None:
     note = NOTE.to_item()
     assert (note["pool"], note["record"]) == ("mock", "note")
-    state = STATE.to_item()
-    assert (state["pool"], state["record"]) == ("coursework", "mode")
     session = SESSION.to_item()
     assert (session["pool"], session["record"]) == ("coursework", "session")
     # The pool-state items must survive: they carry no expiry.
     assert "expires_at" not in note
-    assert "expires_at" not in state
     assert "expires_at" not in session
 
-    gateway = GATEWAY.to_item()
-    assert (gateway["pool"], gateway["source"]) == ("coursework", "gateway#0f3a9c")
-    assert gateway["written_at"] == GATEWAY.written_at
-    assert gateway["expires_at"] == GATEWAY.written_at + 3600
     instance = INSTANCE.to_item()
     assert (instance["pool"], instance["source"]) == ("coursework", "instance#instance-1")
     assert instance["expires_at"] == NOW + 3600
 
 
-def test_the_modes_are_the_three_of_the_design() -> None:
-    assert {mode.value for mode in Mode} == {"enabled", "scheduled-only", "disabled"}
+def test_the_records_are_the_instances_heartbeat_the_scalers_note_and_the_session() -> None:
+    # The pool mode and its record, the session switch and the gateway's heartbeat are defined no more.
+    classes = {name for name, value in vars(records).items() if isinstance(value, type) and hasattr(value, "to_item")}
+    assert classes == {"InstanceHeartbeat", "ScalerNote", "Session"}
+    for name in ("Mode", "MODE_RECORD", "CONFIGURED_MODE", "SESSION_PARTITION", "SWITCH_RECORD", "GATEWAY_SOURCE"):
+        assert not hasattr(records, name)
+    assert not hasattr(records, "switched") and not hasattr(records, "session_is_on")
 
 
 def test_a_note_without_a_rebalance_number_reads_as_0() -> None:
@@ -165,33 +154,22 @@ def test_the_cause_of_a_failed_launch_is_one_of_four_words() -> None:
         ScalerNote.from_item({**SHORT.to_item(), "waiting": Decimal("1.5")})
 
 
-@pytest.mark.parametrize("mode", ["parked", "ENABLED", "scheduled_only", "", 1, None])
-def test_a_mode_outside_the_four_is_refused(mode: object) -> None:
-    item: dict[str, object] = {**STATE.to_item(), "mode": mode}
-    with pytest.raises(RecordError):
-        PoolState.from_item(item)
-    del item["mode"]
-    with pytest.raises(RecordError):
-        PoolState.from_item(item)
-
-
-@pytest.mark.parametrize("heartbeat", [GATEWAY, INSTANCE])
-def test_a_heartbeat_is_fresh_at_20_seconds_and_stale_after(heartbeat: GatewayHeartbeat | InstanceHeartbeat) -> None:
-    assert is_fresh(heartbeat, NOW)
-    assert is_fresh(heartbeat, NOW + 20)
-    assert not is_fresh(heartbeat, NOW + 21)
+def test_a_heartbeat_is_fresh_at_20_seconds_and_stale_after() -> None:
+    assert is_fresh(INSTANCE, NOW)
+    assert is_fresh(INSTANCE, NOW + 20)
+    assert not is_fresh(INSTANCE, NOW + 21)
 
 
 def test_an_item_of_another_record_is_refused() -> None:
+    # Among them the items an earlier release left in the tables: none reads as a record of today.
     for read, item in [
-        (PoolState.from_item, NOTE.to_item()),
-        (ScalerNote.from_item, STATE.to_item()),
+        (ScalerNote.from_item, SESSION.to_item()),
+        (ScalerNote.from_item, MODE_ITEM),
         (Session.from_item, NOTE.to_item()),
-        (Session.from_item, SessionSwitch(on=True, set_by="admin", set_at=NOW).to_item()),
-        (PoolState.from_item, SESSION.to_item()),
-        (GatewayHeartbeat.from_item, INSTANCE.to_item()),
-        (InstanceHeartbeat.from_item, GATEWAY.to_item()),
-        (GatewayHeartbeat.from_item, {**GATEWAY.to_item(), "source": "gateway#"}),
+        (Session.from_item, MODE_ITEM),
+        (Session.from_item, SWITCH_ITEM),
+        (InstanceHeartbeat.from_item, GATEWAY_ROW),
+        (InstanceHeartbeat.from_item, {**INSTANCE.to_item(), "source": "instance#"}),
     ]:
         with pytest.raises(RecordError):
             read(item)
@@ -200,14 +178,13 @@ def test_an_item_of_another_record_is_refused() -> None:
 @pytest.mark.parametrize("written_at", [Decimal("1800000000.5"), 1800000000.0, "1800000000", True, -1, None])
 def test_a_time_that_is_not_a_whole_number_of_seconds_is_refused(written_at: object) -> None:
     for read, item in [
-        (GatewayHeartbeat.from_item, GATEWAY.to_item()),
         (InstanceHeartbeat.from_item, INSTANCE.to_item()),
         (ScalerNote.from_item, NOTE.to_item()),
     ]:
         with pytest.raises(RecordError):
             read({**item, "written_at": written_at})
     with pytest.raises(RecordError):
-        PoolState.from_item({**STATE.to_item(), "set_at": written_at})
+        Session.from_item({**SESSION.to_item(), "set_at": written_at})
 
 
 @pytest.mark.parametrize("name", ["pool", "instances", "starts_at", "ends_at", "set_by", "set_at"])
@@ -220,27 +197,3 @@ def test_a_session_with_a_missing_or_mistyped_attribute_is_refused(name: str) ->
     del item[name]
     with pytest.raises(RecordError):
         Session.from_item(item)
-
-
-@pytest.mark.parametrize("on", [True, False])
-def test_the_session_switch_reads_back_and_reads_off_when_it_has_no_record(on: bool) -> None:
-    switch = SessionSwitch(on=on, set_by="admin", set_at=NOW)
-    item = switch.to_item()
-    assert (item["pool"], item["record"]) == ("_session", "switch")
-    assert SessionSwitch.from_item({**item, "set_at": Decimal(NOW)}) == switch
-    assert session_is_on(switch) is on
-    assert session_is_on(None) is False
-
-
-def test_setting_the_switch_to_what_it_reads_writes_nothing() -> None:
-    off = SessionSwitch(on=False, set_by="admin", set_at=NOW)
-    assert switched(off, False, "admin", NOW + 60) is None
-    assert switched(None, False, "admin", NOW + 60) is None
-    assert switched(off, True, "admin", NOW + 60) == SessionSwitch(on=True, set_by="admin", set_at=NOW + 60)
-    assert switched(None, True, "admin", NOW + 60) == SessionSwitch(on=True, set_by="admin", set_at=NOW + 60)
-
-
-@pytest.mark.parametrize("on", ["on", 1, None])
-def test_a_switch_that_is_neither_true_nor_false_is_refused(on: object) -> None:
-    with pytest.raises(RecordError):
-        SessionSwitch.from_item({**SessionSwitch(on=True, set_by="admin", set_at=NOW).to_item(), "on": on})

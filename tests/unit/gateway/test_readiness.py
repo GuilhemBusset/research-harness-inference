@@ -11,7 +11,7 @@ import asyncio
 from typing import Any
 
 from rhi_common.causes import Cause
-from rhi_common.records import Mode, PoolState, ScalerNote, Session
+from rhi_common.records import ScalerNote, Session
 from rhi_gateway.readiness import Readiness
 
 POOLS = {"coursework": "group-coursework", "upgrade": "group-upgrade", "mock": "group-mock"}
@@ -51,7 +51,7 @@ class PoolStateTable:
         self.failing = False
         self.reads: list[tuple[str, str]] = []
 
-    def put(self, record: PoolState | ScalerNote | Session) -> None:
+    def put(self, record: ScalerNote | Session) -> None:
         item = record.to_item()
         self.items[str(item["pool"]), str(item["record"])] = item
 
@@ -171,9 +171,10 @@ def test_whether_a_pool_can_serve_is_its_session_its_health_and_the_note_s_count
     # Once the session has ended the pool serves no one, healthy or not.
     assert refusal("coursework", at=now + 3600) is Cause.NO_SESSION
 
-    # The admin's mode record is not read: whatever it holds, the pool serves by the rule above.
-    for mode in (Mode.DISABLED, Mode.SCHEDULED_ONLY):
-        table.put(PoolState("coursework", mode, set_by="admin", set_at=now))
+    # A mode record an earlier release left is not read: whatever it holds, the pool serves by the rule above.
+    for mode in ("disabled", "scheduled-only"):
+        left = {"pool": "coursework", "record": "mode", "mode": mode, "set_by": "admin", "set_at": now}
+        table.items["coursework", "mode"] = left
         assert refusal("coursework") is None
     assert ("coursework", "mode") not in table.reads
 

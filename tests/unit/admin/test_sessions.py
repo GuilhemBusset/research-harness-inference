@@ -25,7 +25,7 @@ from rhi_admin import main
 from rhi_admin import session as admin_session
 from rhi_admin.roster import AdminError
 from rhi_common import sessions as rules
-from rhi_common.records import LaunchFailure, ScalerNote, Session, SessionSwitch
+from rhi_common.records import LaunchFailure, ScalerNote, Session
 
 # 2027-01-15T08:00 UTC, which the clock of `ZONE` shows as 09:00.
 NOW = 1_800_000_000
@@ -441,7 +441,8 @@ def test_a_parked_stage_has_no_pool(deployed: Deployed) -> None:
 def test_status_prints_the_supply(deployed: Deployed) -> None:
     deployed.run("start", "3", "--for", "6h")
     # A switch that an earlier `session on` left in the table has no line: nothing reads it.
-    deployed.table.put_item(Item=SessionSwitch(on=True, set_by="user/earlier", set_at=NOW - HOUR).to_item())
+    switch = {"pool": "_session", "record": "switch", "on": True, "set_by": "user/earlier", "set_at": NOW - HOUR}
+    deployed.table.put_item(Item=switch)
     note = ScalerNote(
         pool="coursework",
         capacity_asked=3,

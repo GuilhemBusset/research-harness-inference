@@ -126,13 +126,13 @@ deployment, with the same import path:
 
 - `deploy_hold.py` finds the pool-state table by its logical ID, `RHI_HOLD_TABLE_LOGICAL_ID`, in
   the pools stack, `RHI_HOLD_POOLS_STACK`, and reads from it the session of each pool that
-  `RHI_HOLD_POOLS` names, separated by commas, and the session switch. A session holds the
-  deployment while it is active, with `RHI_HOLD_SESSION_MAX_HOURS` as the longest a session lasts.
-  It exits 0 at once when no session is active and the switch reads off, which is how a missing
-  item reads, or when the stack or the table does not exist yet; otherwise it reads them all again
-  every 60 seconds until that is so. An empty `RHI_HOLD_POOLS` is a stage with no pool: only the
-  switch is read. Any other failed read, an item that is not a session or a switch that does not
-  read, fails the step, and the deployment waits for the next execution.
+  `RHI_HOLD_POOLS` names, separated by commas, and no other item. A session holds the deployment
+  while it is active, with `RHI_HOLD_SESSION_MAX_HOURS` as the longest a session lasts. It exits 0
+  at once when no session is active, which is how a missing item reads, or when the stack or the
+  table does not exist yet; otherwise it reads them all again every 60 seconds until that is so.
+  An empty `RHI_HOLD_POOLS` is a stage with no pool: no item is read, and the step passes. Any
+  other failed read, or an item that is not a session, fails the step, and the deployment waits
+  for the next execution.
 
 The script of the image promotion job (`src/rhi/pipeline/image_promotion.py`), a CodeBuild project
 beside the pipeline, `rhi-promote-image`, which the owner starts by hand and nothing else starts:

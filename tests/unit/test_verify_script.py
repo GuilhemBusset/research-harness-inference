@@ -44,7 +44,7 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 import verify
-from rhi_common.records import EXPIRY_SECONDS, SESSION_RECORD, GatewayHeartbeat, InstanceHeartbeat, Session
+from rhi_common.records import EXPIRY_SECONDS, SESSION_RECORD, InstanceHeartbeat, Session
 from rhi_common.tables import HEARTBEATS, POOL_STATE
 
 if TYPE_CHECKING:
@@ -705,6 +705,18 @@ def instance_row(pool: str, stage: str, written_at: int = 1) -> tuple[str, dict[
     return instance, row.to_item()
 
 
+def gateway_row(pool: str, written_at: int) -> dict[str, Any]:
+    """A gateway task's heartbeat as an earlier release wrote it, which the table may still hold."""
+    return {
+        "pool": pool,
+        "source": "gateway#task-1",
+        "in_flight": 0,
+        "held": 0,
+        "written_at": written_at,
+        "expires_at": written_at + EXPIRY_SECONDS,
+    }
+
+
 def failed_run(tmp_path: Path, dynamodb: Any, exit_code: int = 1) -> tuple[int, str | None]:
     """The script's exit after a run of the tests of the pools `mock` and `gpu` that ends in
     `exit_code`, and what it left as the instances' last stages, None for no file."""
@@ -729,8 +741,7 @@ def test_a_failed_run_leaves_the_last_stage_of_each_instance_of_the_tested_pools
     untested = instance_row("other", "boot")
     for _, item in [*rows, untested]:
         table.put_item(Item=item)
-    task = GatewayHeartbeat(task="task-1", pool="mock", in_flight=1, held=0, last_request_at=None, written_at=1)
-    table.put_item(Item=task.to_item())
+    table.put_item(Item=gateway_row("mock", written_at=1))
 
     exit_code, left = failed_run(tmp_path, heartbeats)
 
@@ -864,8 +875,7 @@ def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capa
     before = [instance_row("coursework", "serving", NOW - 1) for _ in range(verify.ROW_PAGES + 1)]
     for _, item in (*before, instance_row("coursework", "weights", NOW - 3600), instance_row("mock", "boot", NOW + 60)):
         table.put_item(Item=item)
-    task = GatewayHeartbeat(task="task-1", pool="coursework", in_flight=0, held=0, last_request_at=None, written_at=NOW)
-    table.put_item(Item=task.to_item())
+    table.put_item(Item=gateway_row("coursework", written_at=NOW))
     run = PoolRuns(mock=on_mock)
 
     exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, OneRowAPage(heartbeats) if paged else heartbeats)

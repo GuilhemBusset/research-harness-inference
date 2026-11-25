@@ -194,7 +194,6 @@ def engine_process() -> Iterator[EngineProcess]:
             SECRET_VARIABLE: secret,
             "RHI_MOCK_FIRST_BYTE_SECONDS": "0",
             "RHI_MOCK_TOKENS_PER_SECOND": str(PROCESS_TOKENS_PER_SECOND),
-            "RHI_MOCK_START_SECONDS": "0",
             "RHI_MOCK_HANG": "0",
         }
         with log_path.open("wb") as log:

@@ -46,9 +46,8 @@ engine's `/metrics` under that engine's names, and an instance has no other way 
 
 **The engine flags.** The arguments the engine's container receives. A vllm pool's are what
 `rhi.pools.vllm_command` builds from its configuration, with the model at the pool's prefix of the
-model bucket of the stack's account and region. A mock pool's are `--start-delay-seconds` and its
-start delay when the pool gives one above 0, and none at 0, so that a configuration that leaves
-the field out keeps the mock's release as it was. They never hold the pool's secret.
+model bucket of the stack's account and region. A mock pool has none: the mock engine takes no
+argument. They never hold the pool's secret.
 
 **The grants.** The pool's instance role may read that parameter and no other, read the archive's
 object and no other object of the bucket, and pull the pool's engine image. ECR's authorization
@@ -96,9 +95,6 @@ if TYPE_CHECKING:
 # the hooks by the issue that creates them.
 LAUNCH_HOOK = "rhi-launch"
 TERMINATION_HOOK = "rhi-termination"
-
-# The mock's argument for its start delay (`rhi_mock_engine.app`).
-START_DELAY_FLAG = "--start-delay-seconds"
 
 ARM64 = "arm64"
 AMD64 = "amd64"
@@ -272,15 +268,12 @@ class PoolRelease(Construct):
         )
         engine_image = f"{repository.repository_uri}@{self.digest.get_response_field('imageDetails.0.imageDigest')}"
 
-        # The arguments of the engine's container. The model bucket's name holds the account and
-        # the region, which deployment resolves in the parameter.
+        # The arguments of the engine's container: a mock pool's engine takes none. The model
+        # bucket's name holds the account and the region, which deployment resolves in the parameter.
         stack = cdk.Stack.of(self)
+        engine_flags: list[str] = []
         if pool.engine == "vllm":
             engine_flags = vllm_command.arguments(pool, bucket=model_store.bucket_name(stack.account, stack.region))
-        elif pool.start_delay_seconds > 0:
-            engine_flags = [START_DELAY_FLAG, str(pool.start_delay_seconds)]
-        else:
-            engine_flags = []
 
         # What an instance must hold, compared by the agent.
         document: dict[str, object] = {

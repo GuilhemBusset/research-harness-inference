@@ -165,16 +165,20 @@ class World(Host):
     """An instance in service, and everything around its agent: the mock engine, the heartbeats
     table, Secrets Manager and the host. Made inside the test's event loop."""
 
-    def __init__(self, engine: MockSettings | None = None, *, restarted: MockSettings | None = None) -> None:
+    def __init__(self, engine: MockSettings | None = None, *, restart_loads_for: float = 0) -> None:
         super().__init__(ecr=object())
         self.loop = asyncio.get_running_loop()
         self.clock = Clock()
+        # A restarted engine loads for this long, as a model does: its health route answers 503
+        # until `healthy_at`. The mock is healthy at once, so the world answers in its place.
+        self.restart_loads_for = restart_loads_for
+        self.healthy_at = self.clock.now
         # While the gate is closed, a request the mock runs is not answered: it stays in flight.
         self.gate = asyncio.Event()
         self.gate.set()
         # The engine now (`DEAD`: nothing listens), and the one a restart of the unit starts.
         self.app: Starlette | None = self.mock(engine or MockSettings(secret=SECRET))
-        self.restarted = restarted or MockSettings(secret=SECRET)
+        self.restarted = MockSettings(secret=SECRET)
         self.restarts = 0
         self.secret_readable = True
         self.tables: list[str] = []
@@ -248,6 +252,7 @@ class World(Host):
     def restart_engine(self) -> None:
         self.restarts += 1
         self.app = self.mock(self.restarted)
+        self.healthy_at = self.clock.now + self.restart_loads_for
 
     # The engine, where the agent opens a URL. The agent calls from a worker thread.
 
@@ -278,6 +283,8 @@ class World(Host):
     async def ask(self, method: str, path: str, **request: Any) -> httpx.Response:
         """One request to the engine, from the instance itself."""
         assert self.app is not None
+        if path == "/health" and self.clock.now < self.healthy_at:
+            return httpx.Response(503)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url=launch.ENGINE_URL) as http:
             return await http.request(method, path, **request)
 
@@ -616,7 +623,7 @@ def test_an_engine_that_answers_its_completion_is_not_restarted_whatever_its_tok
 def test_a_restarted_engine_is_checked_again_only_once_it_is_healthy() -> None:
     async def scenario() -> None:
         # After its restart the engine takes 100 seconds to load, as a model does.
-        world = World(MockSettings(secret=SECRET, hang=True), restarted=MockSettings(secret=SECRET, start_seconds=100))
+        world = World(MockSettings(secret=SECRET, hang=True), restart_loads_for=100)
         async with world.doing(world.agent().watch()):
             await until(lambda: len(world.asked) == 1)
             await world.clock.advance(60)

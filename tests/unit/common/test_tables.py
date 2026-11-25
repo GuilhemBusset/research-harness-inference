@@ -8,31 +8,13 @@ from collections.abc import Mapping
 import pytest
 
 from rhi_common import records, students, tables
-from rhi_common.records import (
-    GatewayHeartbeat,
-    InstanceHeartbeat,
-    Mode,
-    PoolState,
-    ScalerNote,
-    Session,
-    SessionSwitch,
-)
+from rhi_common.records import InstanceHeartbeat, ScalerNote, Session
 from rhi_common.students import Lease, RosterEntry, StudentKey, UsageDay
 from rhi_common.tables import HEARTBEATS, KEYS, POOL_STATE, ROSTER, USAGE, AttributeType, KeyAttribute, Table
 
 NOW = 1_800_000_000
 
-type Record = (
-    StudentKey
-    | RosterEntry
-    | UsageDay
-    | PoolState
-    | ScalerNote
-    | Session
-    | SessionSwitch
-    | GatewayHeartbeat
-    | InstanceHeartbeat
-)
+type Record = StudentKey | RosterEntry | UsageDay | ScalerNote | Session | InstanceHeartbeat
 
 # One of every item of `rhi_common.students` and `rhi_common.records`, with the table it goes to.
 ITEMS: list[tuple[Table, Record]] = [
@@ -69,16 +51,10 @@ ITEMS: list[tuple[Table, Record]] = [
             leases={"req-1": Lease(expires=NOW + 1800)},
         ),
     ),
-    (POOL_STATE, PoolState(pool="mock", mode=Mode.ENABLED, set_by="admin", set_at=NOW)),
     (POOL_STATE, ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=NOW)),
     (
         POOL_STATE,
         Session(pool="mock", instances=1, starts_at=NOW, ends_at=NOW + 3600, set_by="instructor", set_at=NOW),
-    ),
-    (POOL_STATE, SessionSwitch(on=True, set_by="admin", set_at=NOW)),
-    (
-        HEARTBEATS,
-        GatewayHeartbeat(task="0f3a9c", pool="mock", in_flight=1, held=0, last_request_at=None, written_at=NOW),
     ),
     (
         HEARTBEATS,
@@ -136,7 +112,9 @@ def test_the_tables_are_the_five_of_the_design() -> None:
 
 
 def test_the_pool_state_records_and_the_mark_of_the_memory() -> None:
-    assert set(tables.POOL_STATE_RECORDS) == {"mode", "note", "memory", "session"}
+    assert set(tables.POOL_STATE_RECORDS) == {"note", "memory", "session"}
+    # The session switch has no key any more.
+    assert not hasattr(tables, "SESSION_SWITCH_KEY")
     assert tables.MEMORY_RECORD == "memory"
     assert tables.LAUNCH_SUSPENDED == "launch_suspended"
 
@@ -165,10 +143,7 @@ def test_every_item_carries_its_tables_keys(table: Table, record: Record) -> Non
 def test_the_pool_state_items_are_records_of_the_table() -> None:
     for table, record in ITEMS:
         if table is POOL_STATE:
-            item = record.to_item()
-            # A pool's own records, or the session switch under the key no pool can take.
-            is_switch = {name: item[name] for name in tables.SESSION_SWITCH_KEY} == tables.SESSION_SWITCH_KEY
-            assert is_switch or item["record"] in tables.POOL_STATE_RECORDS
+            assert record.to_item()["record"] in tables.POOL_STATE_RECORDS
 
 
 def test_the_key_item_carries_the_keys_of_by_student() -> None:

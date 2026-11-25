@@ -180,7 +180,7 @@ def test_the_pools_are_the_running_scalers_whatever_their_prices(deployed: Deplo
     # The configuration in SSM may name other pools before the next deployment: the running ones count.
     ssm = boto3.client("ssm")
     ssm.put_parameter(Name="/rhi/config/pools/other", Value=json.dumps(entry("on-demand")), Type="String")
-    # The deployment checked the prices against the configuration's limit, which may be above the default.
+    # No rule holds a pool's prices to a limit: a pool priced above what was once the limit is read.
     settings = json.loads(SETTINGS)
     settings["pools"]["mock"]["entry"]["prices"] = {"g6e.xlarge": 6.0}
     status, out, err = deployed.run("status", settings=json.dumps(settings))

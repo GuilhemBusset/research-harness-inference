@@ -374,6 +374,10 @@ def test_the_mock_serves_on_port_8000_with_the_secret_of_its_environment(monkeyp
     served: list[tuple[Any, dict[str, Any]]] = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: served.append((app, kwargs)))
     monkeypatch.setenv("RHI_POOL_SECRET", SECRET)
+    # It takes no argument, for a start delay or anything else.
+    with pytest.raises(TypeError):
+        mock.main(["--start-delay-seconds", "30"])  # ty: ignore[too-many-positional-arguments]
+    assert served == []
 
     mock.main()
 
@@ -384,36 +388,14 @@ def test_the_mock_serves_on_port_8000_with_the_secret_of_its_environment(monkeyp
     assert engine.post(CHAT, json=REQUESTS[CHAT], headers={"Authorization": "Bearer another"}).status_code == 401
 
 
-def test_health_answers_503_before_the_start_delay_and_200_after() -> None:
-    now = 100.0
-    engine = Engine(create_app(Settings(secret=SECRET, start_seconds=30), clock=lambda: now))
-
-    assert engine.get("/health").status_code == 503
-    now = 129.9
-    assert engine.get("/health").status_code == 503
-    now = 130.0
+def test_health_answers_200_from_the_start_whatever_the_environment_says() -> None:
+    # The mock has no start delay: the variable that once set one is read into nothing.
+    settings = Settings.from_env({"RHI_POOL_SECRET": SECRET, "RHI_MOCK_START_SECONDS": "30"})
+    assert settings == Settings(secret=SECRET)
+    assert not hasattr(settings, "start_seconds")
+    # The application's clock stands still at the moment it was created.
+    engine = Engine(create_app(settings, clock=lambda: 100.0))
     # No secret: the load balancer's health check carries none.
-    assert engine.get("/health").status_code == 200
-
-
-def test_the_start_delay_argument(monkeypatch: pytest.MonkeyPatch) -> None:
-    served: list[Any] = []
-    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: served.append(app))
-    # The application's clock, moved by the test: nothing waits.
-    now = 100.0
-    monkeypatch.setattr(mock, "create_app", lambda settings: create_app(settings, clock=lambda: now))
-    monkeypatch.setenv("RHI_POOL_SECRET", SECRET)
-    # The argument wins over the environment's start delay.
-    monkeypatch.setenv("RHI_MOCK_START_SECONDS", "30")
-
-    mock.main(["--start-delay-seconds", "2"])
-
-    [app] = served
-    engine = Engine(app)
-    assert engine.get("/health").status_code == 503
-    now = 101.9
-    assert engine.get("/health").status_code == 503
-    now = 102.0
     assert engine.get("/health").status_code == 200
 
 
@@ -423,13 +405,10 @@ def test_the_settings_come_from_the_environment() -> None:
         "RHI_POOL_SECRET": SECRET,
         "RHI_MOCK_FIRST_BYTE_SECONDS": "1.5",
         "RHI_MOCK_TOKENS_PER_SECOND": "20",
-        "RHI_MOCK_START_SECONDS": "45",
         "RHI_MOCK_HANG": "1",
     }
 
-    assert Settings.from_env(environ) == Settings(
-        secret=SECRET, first_byte_seconds=1.5, tokens_per_second=20, start_seconds=45, hang=True
-    )
+    assert Settings.from_env(environ) == Settings(secret=SECRET, first_byte_seconds=1.5, tokens_per_second=20, hang=True)
     with pytest.raises(SettingsError):
         Settings.from_env({**environ, "RHI_MOCK_TOKENS_PER_SECOND": "0"})
     with pytest.raises(SettingsError):

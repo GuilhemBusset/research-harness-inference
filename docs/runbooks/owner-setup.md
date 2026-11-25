@@ -282,8 +282,8 @@ repository and nothing else is part of the trust boundary (section 8.4; ADR 0001
 The loader requires every one of these keys. Sessions have no schedule in the configuration: the
 instructor switches them on and off ([a session booked, changed and stopped](sessions.md)). A pool is a
 `[pools.<name>]` table, which the loader checks with the pool parser; the mock pool of
-`config.example.toml` is the first one added. Three keys go with the pools and may be left out: `allowed_instance_types` (by default the
-instance types the pools list), `on_demand_price_limit` (5 dollars an hour by default) and
+`config.example.toml` is the first one added. Two keys go with the pools and may be left out: `allowed_instance_types` (by default the
+instance types the pools list) and
 `default_pool` (by default the only pool; with two pools or more it must be given). Each pool is
 added later, by running this step again.
 

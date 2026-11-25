@@ -7,7 +7,7 @@ the pipeline (`rhi.packaging.image_context`), for the runner's own architecture:
 is published for arm64 and x86_64.
 
 The mock needs nothing outside itself but the pool's secret, so the image is started as it is
-deployed, with a short start delay and a secret made here, and the running engine is asked.
+deployed, with a secret made here and no argument, and the running engine is asked.
 
 It needs a container runtime, so CI's job `container-tests` runs it and the local gate does not
 (tests/container/README.md). Nothing here skips: without a runtime the fixture fails.
@@ -29,25 +29,21 @@ import pytest
 DOCKERFILE = Path(__file__).resolve().parents[2] / "services" / "engine" / "mock" / "Dockerfile"
 # The port every engine listens on (system design, section 4.1).
 PORT = 8000
-# What the mock is started with: how long `/health` answers 503 after its start, in seconds.
-START_DELAY = 3
 # One of the inference routes, and a request it answers when the secret comes with it.
 INFERENCE_ROUTE = "/v1/chat/completions"
 REQUEST = {"model": "mock", "messages": [{"role": "user", "content": "Say something."}]}
 
 BUILD_SECONDS = 900
 LISTEN_SECONDS = 60
-HEALTHY_SECONDS = START_DELAY + 60
 
 
 @dataclass(frozen=True)
 class Engine:
-    """A running container of the image: where it answers, its secret, and when its start was asked for."""
+    """A running container of the image: where it answers, and its secret."""
 
     base: str
     # Not in what a failing test prints of its arguments.
     secret: str = field(repr=False)
-    asked: float
 
 
 def docker(*arguments: str, timeout: float = 60) -> str:
@@ -112,31 +108,25 @@ def image() -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def engine(image: str) -> Iterator[Engine]:
-    """A running container of the image, with a start delay and a secret; the container ends here."""
+    """A running container of the image, with a secret; the container ends here."""
     # Named before it exists, so that it is removed even when `docker run` does not return.
     container = f"rhi-mock-engine-build-{uuid4().hex}"
     # Made at each run, and given to the engine as the deployment gives it: in RHI_POOL_SECRET.
     secret = secrets.token_urlsafe(32)
-    settings = [f"--env=RHI_MOCK_START_SECONDS={START_DELAY}", f"--env=RHI_POOL_SECRET={secret}"]
-    asked = time.monotonic()
     try:
-        # Published on a free port of the loopback interface only.
-        docker("run", "--detach", f"--name={container}", f"--publish=127.0.0.1::{PORT}", *settings, image)
-        yield Engine(base=address(container), secret=secret, asked=asked)
+        # Published on a free port of the loopback interface only. No argument after the image: a
+        # mock pool's release gives its engine none.
+        published = f"--publish=127.0.0.1::{PORT}"
+        docker("run", "--detach", f"--name={container}", published, f"--env=RHI_POOL_SECRET={secret}", image)
+        yield Engine(base=address(container), secret=secret)
     finally:
         # Stops and removes the container, whether it never answered, a test failed or all passed.
         remove("rm", "--force", "--volumes", container)
 
 
-def test_health_answers_200_once_the_start_delay_has_passed(engine: Engine) -> None:
-    deadline = time.monotonic() + HEALTHY_SECONDS
-    while (status := health(engine.base)) != 200:
-        # Until then the engine says that it is starting, and nothing else.
-        assert status == 503
-        assert time.monotonic() < deadline, f"/health did not answer 200 in {HEALTHY_SECONDS} seconds"
-        time.sleep(0.2)
-    # The engine started after its container was asked for, so its delay cannot have ended sooner.
-    assert time.monotonic() - engine.asked >= START_DELAY
+def test_health_answers_200_once_the_engine_listens(engine: Engine) -> None:
+    # The fixture waited until the engine listened: it has no start delay, so it is healthy at once.
+    assert health(engine.base) == 200
 
 
 def test_an_inference_route_refuses_a_request_without_the_secret(engine: Engine) -> None:

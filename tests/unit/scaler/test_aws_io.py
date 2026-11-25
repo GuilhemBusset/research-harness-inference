@@ -14,7 +14,7 @@ from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, PoolState, ScalerNote, Session, SessionSwitch
+from rhi_common.records import InstanceHeartbeat, ScalerNote, Session
 from rhi_scaler.aws_io import (
     FORMER_MEMORY_ATTRIBUTES,
     RECORD_READS,
@@ -278,17 +278,26 @@ def test_a_run_takes_from_the_tables_only_the_memory_the_session_and_the_instanc
     with mock_aws():
         aws = Aws()
         create_tables(aws.clients.dynamodb)
-        # What the tables may hold beside: the pool's mode record and its note, the session
-        # switch, and a gateway's heartbeat row.
+        # What the tables may hold beside: the pool's note, and what an earlier release left, the
+        # pool's mode record, the session switch and a gateway's heartbeat row.
         for item in (
             memory_to_item("coursework", memory),
             session.to_item(),
-            PoolState("coursework", Mode.DISABLED, "admin", NOW - 5).to_item(),
+            {"pool": "coursework", "record": "mode", "mode": "disabled", "set_by": "admin", "set_at": NOW - 5},
             ScalerNote(pool="coursework", capacity_asked=2, no_capacity_at=None, written_at=NOW - 60).to_item(),
-            SessionSwitch(on=True, set_by="admin", set_at=NOW - 5).to_item(),
+            {"pool": "_session", "record": "switch", "on": True, "set_by": "admin", "set_at": NOW - 5},
         ):
             aws.clients.dynamodb.put_item(TableName=TABLES.pool_state, Item=serialize(item))
-        for item in (heartbeat.to_item(), GatewayHeartbeat("task-1", "coursework", 2, 1, NOW - 3, NOW - 2).to_item()):
+        gateway_row = {
+            "pool": "coursework",
+            "source": "gateway#task-1",
+            "in_flight": 2,
+            "held": 1,
+            "last_request_at": NOW - 3,
+            "written_at": NOW - 2,
+            "expires_at": NOW - 2 + 3600,
+        }
+        for item in (heartbeat.to_item(), gateway_row):
             aws.clients.dynamodb.put_item(TableName=TABLES.heartbeats, Item=serialize(item))
         # Every item DynamoDB returns to the run, whatever the call that asked for it.
         returned: list[dict[str, Any]] = []
