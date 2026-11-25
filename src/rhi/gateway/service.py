@@ -45,7 +45,9 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 - `RHI_SCALER_FUNCTION`: the scaler function's name;
 - `RHI_COURSE_END`: the configuration's course end date, YYYY-MM-DD, by which every usage row
   the gateway writes expires (section 6.6);
-- the six numeric variables, each from its configuration key (`NUMERIC`).
+- the seven numeric variables, each from its configuration key (`NUMERIC`): the last,
+  `RHI_SESSION_MAX_HOURS`, is the longest a session may last, under which the gateway reads every
+  pool's session (section 5.6);
 - the three floors of the objectives, each from its configuration key (`FLOORS`), which the
   gateway's histograms take among their boundaries.
 
@@ -170,6 +172,7 @@ NUMERIC = {
     "RHI_RETRY_AFTER_WARMING": "retry_after_warming_seconds",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "retry_after_capacity_unavailable_seconds",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "retry_after_concurrency_limit_seconds",
+    "RHI_SESSION_MAX_HOURS": "session_max_hours",
 }
 # Each floor of the objectives, and the configuration key it is written from: the gateway takes
 # it among its histograms' boundaries (`rhi_gateway.settings`).

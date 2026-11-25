@@ -50,6 +50,7 @@ import datetime
 import itertools
 import json
 import random
+import time
 import tomllib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ from starlette.types import Message, Receive, Scope
 import scrub
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import profile, proxy, routes
 from rhi_gateway.affinity import Affinity
@@ -104,6 +106,13 @@ NOW = 1_800_000_000
 COURSE_END_DATE = datetime.date(2027, 6, 30)
 # No replay may wait this long, in seconds: one that does has hung, and fails.
 GUARD_SECONDS = 30.0
+
+
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
 
 
 class ForwardedBodyDiffers(AssertionError):
@@ -511,7 +520,7 @@ async def _replay(
         filters=filters(capture.profile),
         proxy=gateway_proxy,
         # Every pool is ready: the request is forwarded at once, with no hold.
-        holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
+        holding=Holding(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}, wake=lambda pool: None),
     )
     app = build_app(forwarding_handlers(forwarding))
     await asyncio.wait_for(app(client.scope, client.receive, client.send), timeout=GUARD_SECONDS)

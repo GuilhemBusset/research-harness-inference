@@ -54,12 +54,17 @@ cause that carries the header, or those `Forwarding.retry_after` gives. Token co
 call (section 5.3): it is never held and never asks for a wake, and on a pool that is not ready it
 is answered `warming` at once, before any reservation.
 
-**The session** (section 5.6): while no session is on, a student's request ends at once with the
-cause `no_session`, in its wire format, as the handler's first step: before its body is read, so
-nothing is reserved, held or woken and the scaler sees no demand from it. Whether a session is on is
-the switch as the gateway last read it (`rhi_gateway.readiness.Readiness.session_is_on`), given as
-`Holding.session`. The owner's own entries, the canary and the spikes' students
-(`rhi_common.students.is_owner_entry`), are served whatever the switch says (`in_session`).
+**The session** (sections 5.6 and 6.2, step 5): a pool is served while its session is active, and at
+no other time, for every key, whoever booked the session. A request names its pool in its body, so
+the check is made twice. As the handler's first step, while no pool's session is active, the
+request ends with the cause `no_session`, in its wire format, before its body is read. Then, as
+soon as the body filter has named the pool (`rhi_gateway.body.Admit`), a request for a pool whose
+session is not active ends with `no_session`: before the filter judges any other field, before the
+hold's first step and before the reservation, so no slot is taken, nothing is held or woken and
+the scaler sees no demand from it. Whether a session is active is the shared
+rule (`rhi_common.sessions.is_active`) on the session the gateway last read for the pool
+(`rhi_gateway.readiness.PoolView.session`), at the time of the task's own clock (`Holding.clock`)
+and under the longest session of the configuration (`Holding.session_max_hours`).
 
 **The demand** (section 5.1): with a heartbeat (`rhi_gateway.heartbeat`), a request counts as
 held while it is held and as in flight from its forwarding to its end, which the settlement marks;
@@ -124,10 +129,9 @@ from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 from rhi_common.causes import Cause
 from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
-from rhi_common.students import is_owner_entry
 from rhi_gateway import routes, telemetry
 from rhi_gateway.affinity import Affinity
-from rhi_gateway.body import BodySource, Forwarded
+from rhi_gateway.body import Admit, BodySource, Forwarded
 from rhi_gateway.budget import Ledger, Reservation
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.experience import Experience
@@ -135,6 +139,7 @@ from rhi_gateway.hold import DEFAULT_KEEPALIVE_SECONDS, HELD_HEADER, Action, End
 from rhi_gateway.proxy import CLIENT_LEFT_STATUS, Observed, Proxy, _to_the_end
 from rhi_gateway.readiness import PoolView, Readiness
 from rhi_gateway.routes import TABLE, Route, match
+from rhi_gateway.settings import NUMERIC_DEFAULTS, SESSION_MAX_HOURS
 
 if TYPE_CHECKING:
     from rhi_gateway.auth import Authenticator
@@ -302,9 +307,15 @@ class RequestBody:
 
 
 class Filter(Protocol):
-    """The body filter of one route: `rhi_gateway.body.BodyFilter` or a format's own."""
+    """The body filter of one route: `rhi_gateway.body.BodyFilter` or a format's own.
 
-    async def read(self, source: BodySource, *, student: str, request_id: str) -> Forwarded: ...
+    It calls `admit` with the pool as soon as the body has named it, before it judges any other
+    field, and what `admit` raises ends the read.
+    """
+
+    async def read(
+        self, source: BodySource, *, student: str, request_id: str, admit: Admit | None = None
+    ) -> Forwarded: ...
 
 
 # How often a held request reads the kept view of its pool, in seconds, besides the moments the
@@ -316,11 +327,6 @@ HOLD_READ_SECONDS = 1.0
 _CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
 
 
-def in_session(session: Callable[[], bool], student: KeyRecord) -> bool:
-    """Whether the student is served now: while a session is on, and always for the owner's own entries (section 5.6)."""
-    return is_owner_entry(student.github_id) or session()
-
-
 @dataclass(frozen=True)
 class Holding:
     """What the hold reads and asks (section 5.3): the kept views of the pools, and the wake.
@@ -328,9 +334,9 @@ class Holding:
     `views` gives the kept view of every pool (`rhi_gateway.readiness.Readiness.views`); a pool it
     does not hold reads as not ready with no records. `wake` asks the scaler to run for a pool and
     returns at once (`rhi_gateway.waker.Waker.ask`). `clock` gives the seconds since the epoch, the
-    clock of the scaler's note, and `sleep` waits on it: a test gives its own. `session` gives
-    whether a session is on (`rhi_gateway.readiness.Readiness.session_is_on`), which the gateway's
-    builder gives; left out, a session is always on.
+    clock of the scaler's note and of a session's start and end, and `sleep` waits on it: a test
+    gives its own. `session_max_hours` is the longest a session may last, the configuration's,
+    under which each pool's session is read (`rhi_common.sessions`).
     """
 
     views: Callable[[], Mapping[str, PoolView]]
@@ -338,11 +344,20 @@ class Holding:
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     keepalive_seconds: float = DEFAULT_KEEPALIVE_SECONDS
-    session: Callable[[], bool] = lambda: True
+    session_max_hours: int = NUMERIC_DEFAULTS[SESSION_MAX_HOURS]
 
     def view(self, pool: Pool) -> PoolView:
         """The kept view of one pool. Reads nothing."""
         return self.views().get(pool.name, PoolView())
+
+    def in_session(self, pool: Pool) -> bool:
+        """Whether the pool's session, as last read, is active now (section 5.6). Reads nothing."""
+        return self.view(pool).in_session(self.clock(), session_max_hours=self.session_max_hours)
+
+    def any_session(self) -> bool:
+        """Whether any pool's session, as last read, is active now. Reads nothing."""
+        now = self.clock()
+        return any(view.in_session(now, session_max_hours=self.session_max_hours) for view in self.views().values())
 
 
 @dataclass(frozen=True)
@@ -580,14 +595,21 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         request_id = uuid.uuid4().hex
         holding = forwarding.holding
         held: _Held | None = None
+
+        def admit(pool: Pool) -> None:
+            # The body has named the pool: a request for one with no active session ends here, whatever
+            # else its body holds, and nothing is reserved, held or woken for it (section 6.2, step 5).
+            telemetry.note_pool(pool.name)
+            if not holding.in_session(pool):
+                raise GatewayError(Cause.NO_SESSION)
+
         try:
-            if not in_session(holding.session, student):
-                # Before the body is read: nothing is reserved, held or woken (section 5.6).
+            if not holding.any_session():
+                # No pool is served: the request is refused before its body is read (section 6.2, step 5).
                 raise GatewayError(Cause.NO_SESSION)
             forwarded = await body_filter.read(
-                RequestBody(request.receive), student=str(student.github_id), request_id=request_id
+                RequestBody(request.receive), student=str(student.github_id), request_id=request_id, admit=admit
             )
-            telemetry.note_pool(forwarded.pool.name)
             if entry == routes.COUNT_TOKENS:
                 # A cheap call: never held, never a wake, never demand (section 5.3).
                 if not holding.view(forwarded.pool).ready:

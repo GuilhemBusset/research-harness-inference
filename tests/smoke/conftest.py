@@ -14,7 +14,9 @@ and in CI with no account. The environment says which:
 - the gateway, as `rhi_gateway.main.build` builds it from an environment, served by uvicorn on a
   loopback port the system picks, so that the tests reach either stack the same way, by address;
 - its tables and the pool's secret in moto, with the canary's key and the secret drawn when the
-  tests run;
+  tests run, and a session booked on the pool under test for the hour that starts when the stack
+  is built: the gateway serves a pool only in its session, the canary's key like any other
+  (section 5.6), so the stack is given to the tests once its gateway has read that session;
 - the mock engine (`rhi_mock_engine.app`) as the transport of the gateway's hop to its pool;
 - `Targets` for the target group's health, and `Scaler` for the scaler function: the pool has no
   target until the gateway asks for a wake, and its target is healthy `START_SECONDS` later. So
@@ -52,11 +54,12 @@ import uvicorn
 from botocore.client import BaseClient
 from moto import mock_aws
 
-from rhi_common import tables
+from rhi_common import sessions, tables
 from rhi_common.keys import generate_key, key_hash
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway.main import aws_clients, build
-from rhi_gateway.settings import read_settings
+from rhi_gateway.settings import Settings, read_settings
 from rhi_gateway.sse import SseEvent, SseReader
 from rhi_mock_engine.app import Settings as MockSettings
 from rhi_mock_engine.app import create_app
@@ -253,6 +256,25 @@ def _gateway_environment(pool: str) -> dict[str, str]:
     }
 
 
+def book(pool: str, settings: Settings) -> Session:
+    """A session of one instance booked on the pool for the hour that starts now, written to the
+    pool-state table as every writer writes one (`rhi_common.sessions.started`)."""
+    now = int(time.time())
+    session = sessions.started(
+        None,
+        pool=pool,
+        instances=1,
+        starts_at=now,
+        ends_at=now + sessions.HOUR_SECONDS,
+        set_by="smoke",
+        now=now,
+        max_instances=next(configured for configured in settings.pools if configured.name == pool).max_instances,
+        session_max_hours=settings.session_max_hours,
+    )
+    boto3.resource("dynamodb").Table(settings.pool_state_table).put_item(Item=session.to_item())
+    return session
+
+
 def enrol(github_id: int = 0, alias: str = "canary") -> str:
     """A key drawn now for one student, its item written to the keys table as the issuer writes the
     canary's. While the local stack is served, a test that needs more students than the canary
@@ -279,6 +301,7 @@ def local_stack(pool: str) -> Generator[tuple[str, str]]:
         environ = _gateway_environment(pool)
         key = enrol()
         settings = read_settings(environ)
+        session = book(pool, settings)
         clients = aws_clients()
         pool_secret = clients.secretsmanager.get_secret_value(SecretId=settings.pool_secrets[pool])["SecretString"]
         targets = Targets()
@@ -296,7 +319,8 @@ def local_stack(pool: str) -> Generator[tuple[str, str]]:
             serving.start()
             try:
                 deadline = time.monotonic() + 30
-                while not server.started:
+                # Started, and its first read of the pool's records done: the session is the one booked above.
+                while not (server.started and gateway.readiness.pool(pool).session == session):
                     assert serving.is_alive() and time.monotonic() < deadline, "the local gateway did not start"
                     time.sleep(0.01)
                 yield address, key

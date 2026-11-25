@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import json
 import secrets
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,6 +26,7 @@ from starlette.applications import Starlette
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import metrics, proxy, routes
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
@@ -61,6 +63,13 @@ POOLS = parse_pools(
 TURNS = {entry.wire_format: entry for entry in (routes.MESSAGES, routes.RESPONSES, routes.CHAT_COMPLETIONS)}
 
 MESSAGES, RESPONSES, CHAT = WireFormat.MESSAGES, WireFormat.RESPONSES, WireFormat.CHAT_COMPLETIONS
+
+
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
 
 
 def sse(name: str | None, data: dict[str, Any] | str) -> bytes:
@@ -203,7 +212,7 @@ def gateway(*students: tuple[str, int]) -> Gateway:
             "http://pools.example.com:8080",
             {POOL: "secret"},
         ),
-        holding=Holding(views=lambda: {POOL: PoolView(ready=made.ready)}, wake=lambda pool: None, sleep=sleep),
+        holding=Holding(views=lambda: {POOL: in_session(POOL, ready=made.ready)}, wake=lambda pool: None, sleep=sleep),
     )
     made.app = build_app(forwarding_handlers(forwarding), metrics=made.metrics)
     # The series are the application's own, on the metrics' registry; only their clock is the test's.

@@ -19,7 +19,8 @@ names the pool and the entry.
 scaler function is the `Waker`'s, and the heartbeats table is the `Heartbeat`'s. The body filters
 are the three formats', with the body limit of the settings and, on each forwarded route, every
 pool's request profile, which is built first; the proxy has the upstream address,
-the pools' secrets and the longest request; the hold has the keep-alive interval; the refusals
+the pools' secrets and the longest request; the hold has the keep-alive interval, and with the
+local routes the longest session, under which each pool's session is read; the refusals
 have the three `Retry-After`. With no pool, every one of these is built the same, over no pool.
 
 **The secrets.** A pool's bearer secret is in no variable and no template: the settings hold its
@@ -237,8 +238,8 @@ def build(
         holding=Holding(
             views=readiness.views,
             wake=waker.ask,
-            session=readiness.session_is_on,
             keepalive_seconds=settings.keepalive_seconds,
+            session_max_hours=settings.session_max_hours,
         ),
         heartbeat=heartbeat,
         retry_after=settings.retry_after,
@@ -249,7 +250,7 @@ def build(
         views=readiness.views,
         default_pool=default_pool,
         waker=waker,
-        session=readiness.session_is_on,
+        session_max_hours=settings.session_max_hours,
     )
     app = build_app(
         forwarding_handlers(forwarding),
