@@ -32,6 +32,10 @@ then adds a project and nothing else: no statement and no finding.
 - read the configuration's parameters, under `/rhi/config/`, by path, as the synth step does;
 - read the pool-state records, `dynamodb:GetItem` and `dynamodb:Query` on the stage's pool-state
   table, named as the verification names the heartbeats table (`rhi.pipeline.verify`);
+- write, with `dynamodb:PutItem` and no other action, the items of that table whose partition key
+  is the mock pool's name, and no other pool's: the condition is on `dynamodb:LeadingKeys`, in the
+  form the verification's role has. A job that runs on the mock pool books that pool itself
+  (section 12, `scripts/pipeline/booking.py`), and its session is one of those items;
 - read the spikes' secret, `rhi/spike-keys` (`rhi_common.spike_keys`), and no other;
 - query the stage's Prometheus workspace, by the tag that names its stage;
 - put the measurement event on the measurement bus, through `rhi.pipeline.reporter.measuring_job`;
@@ -40,7 +44,8 @@ then adds a project and nothing else: no statement and no finding.
 - write to the shared log group, and use the shared key.
 
 No action of Auto Scaling, EC2 or IAM: a spike reaches a pool through the gateway, as a canary
-student, and never changes one.
+student, and changes nothing of one but the mock pool's session. No job can book a GPU pool: the
+session of any other pool, and the session switch, are under another partition key.
 """
 
 from __future__ import annotations
@@ -84,6 +89,10 @@ CONNECTION_ACTIONS = ["codeconnections:GetConnection", "codeconnections:GetConne
 # What CodeBuild does with a project's key: encrypt and decrypt what it stores of a build.
 KEY_ACTIONS = ["kms:Decrypt", "kms:DescribeKey", "kms:Encrypt", "kms:GenerateDataKey"]
 POOL_STATE_READS = ["dynamodb:GetItem", "dynamodb:Query"]
+# The pool a job may book, by its name: the partition key of the only items of the pool-state table
+# the role may write, with this one action.
+MOCK_POOL = "mock"
+POOL_STATE_WRITES = ["dynamodb:PutItem"]
 
 
 @dataclass(frozen=True)
@@ -254,7 +263,15 @@ class SpikeJobs(Construct):
             statements.append(
                 iam.PolicyStatement(actions=["aps:QueryMetrics"], resources=[workspaces], conditions=tagged)
             )
+            pool_state = pool_state_table_arn(stack, stage)
+            statements.append(iam.PolicyStatement(actions=POOL_STATE_READS, resources=[pool_state]))
+            # The mock pool's items of that table, its session among them: the partition key of a
+            # write may only be that pool's name.
             statements.append(
-                iam.PolicyStatement(actions=POOL_STATE_READS, resources=[pool_state_table_arn(stack, stage)])
+                iam.PolicyStatement(
+                    actions=POOL_STATE_WRITES,
+                    resources=[pool_state],
+                    conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}},
+                )
             )
         return statements

@@ -2,8 +2,9 @@
 
 A spike is a short experiment with a pass condition. One that needs AWS runs as a pipeline job,
 and each job is one module of this folder, which is on the import path: a spike imports this
-module as `common`. Nothing here changes a pool: a spike reaches a pool through the gateway only,
-as a canary student, and reads what it measures from the Prometheus workspace.
+module as `common`. Nothing here changes a pool: a spike reaches a pool through the gateway, as a
+canary student, and reads what it measures from the Prometheus workspace. A job that runs on the
+mock pool books that pool itself, through `scripts/pipeline/booking.py` (system design, section 12).
 
 **Timing.** `Stopwatch` and `timed` count seconds on the monotonic clock.
 
