@@ -11,7 +11,8 @@ and `session_max_hours`.
 
 **Reading.** A session ends at its `ends_at`, or `session_max_hours` after the later of its
 `starts_at` and its `set_at` when that comes first: a record that gives a later end is read as
-ending there. `is_active` is true from `starts_at` until that end, the end itself excluded.
+ending there, and `end` gives that time. `is_active` is true from `starts_at` until that end, the
+end itself excluded.
 `requested` is the number of instances the pool is to hold: the session's `instances`, at most
 `max_instances`, while it is active, and 0 before, after, and for a pool with no session.
 
@@ -71,6 +72,12 @@ def _bounded(session: Session, now: int, max_instances: int, session_max_hours: 
             "the end is more than `session_max_hours` after the later of the start and the present moment"
         )
     return session
+
+
+def end(session: Session, *, session_max_hours: int) -> int:
+    """When the session ends, as every reader takes it: its `ends_at`, or `session_max_hours` after
+    the later of its start and the moment it was written when that comes first."""
+    return _end(session, session_max_hours)
 
 
 def is_active(session: Session | None, now: int, *, session_max_hours: int) -> bool:

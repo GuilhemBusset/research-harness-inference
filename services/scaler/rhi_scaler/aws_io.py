@@ -11,7 +11,7 @@ What is read, for each pool:
 | Desired capacity, instances by lifecycle state and their scale-in protection, suspended processes | `DescribeAutoScalingGroups` |
 | The warm pool's instances | `DescribeWarmPool` |
 | Which instances serve | `DescribeTargetHealth` on the pool's target group |
-| Launches abandoned in a row, the last launch that found no capacity | `DescribeScalingActivities` |
+| Launches abandoned in a row, the last launch that found no capacity, the last launch that failed and its cause | `DescribeScalingActivities` |
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
 | Mode (the configured mode when no record exists), the scaler's memory, and the pool's session (none when no record exists) | the pool-state table, by pool |
 
@@ -46,6 +46,12 @@ the abandons that set the mark the admin cleared. A launch that failed for any o
 counts nor ends the row. The time of the last launch that found no capacity is read from the whole
 history too, whatever came after it.
 
+The last launch that failed (section 5.4) is the launch activity, into service or into the warm
+pool, that failed or was cancelled and completed last. Its cause is one of three words
+(`rhi_common.records.LaunchFailure`), told from the error code its message carries and from
+nothing else of it: `insufficient-capacity` for a launch that found no capacity, `quota` for one
+the account's vCPU quota refused, and `launch-failed` for any other, an abandoned launch included.
+
 `apply` makes, for each pool, these calls and only those that change something, in this order:
 
 1. protect from scale-in every instance `InService` that is unprotected and that the decision does
@@ -61,10 +67,28 @@ run, whether or not a call was made. The note carries the decision's rebalance n
 not, which is how the number reaches the gateway (section 5.5). The note is put whole; the memory
 record is updated (`memory_update`), so that what the admin CLI writes in it survives: the mark
 `launch_suspended` once cleared, and who cleared it and when.
+
+The note also says what the pool was asked and what waits (section 5.4), and `supply_note` is that
+rule:
+
+| In the note | From |
+| --- | --- |
+| `requested` | The decision: what the pool's session asks for now |
+| `capacity_asked` | The decision's desired capacity, the "asked of AWS" |
+| `starting`, `in_service`, `draining` | The supply the run read |
+| `waiting` | `capacity_asked` less the instances starting and in service, never below zero |
+| `waiting_since` | The time of the first of the runs in a row that saw `waiting` above zero; absent while nothing waits |
+| `launch_failure` | Absent while nothing waits. Otherwise `launches-suspended` when the decision suspends the pool's launches, or else the cause of the last launch that failed, if it failed since `waiting_since` |
+
+The time the wait began is kept from one run to the next in the pool's memory record, under the
+attribute `short_since`: the name `waiting_since` is taken there by the instances whose requests
+wait. `apply` stores it with the decision's memory, and removes it once nothing waits. It returns
+the notes it wrote, by pool, so that the metrics send the same numbers (`rhi_scaler.metrics`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -83,6 +107,7 @@ from rhi_common.records import (
     SESSION_RECORD,
     GatewayHeartbeat,
     InstanceHeartbeat,
+    LaunchFailure,
     Mode,
     PoolState,
     RecordError,
@@ -92,12 +117,16 @@ from rhi_common.records import (
     is_fresh,
 )
 from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD, SESSION_SWITCH_KEY
-from rhi_scaler.model import SESSION_MAX_HOURS, Decision, Inputs, Memory, PoolInputs, Supply
+from rhi_scaler.model import SESSION_MAX_HOURS, Decision, Inputs, Memory, PoolDecision, PoolInputs, Supply
 
 # The process a launch loop suspends, and the only one this module ever names.
 LAUNCH_PROCESS = "Launch"
 # The EC2 error code of a launch that found no capacity, as the group's activity carries it.
 NO_CAPACITY = "InsufficientInstanceCapacity"
+# The EC2 error code of a launch the account's vCPU quota refused, and the words EC2's own message
+# has for it when the activity carries no code: they are compared in lower case.
+QUOTA = "VcpuLimitExceeded"
+QUOTA_WORDS = "vcpu limit"
 # How many instances one SetInstanceProtection call may name.
 PROTECTION_BATCH = 50
 
@@ -125,12 +154,21 @@ class TableNames:
 
 
 @dataclass(frozen=True)
+class FailedLaunch:
+    """A launch that failed: when it completed, and why, in one of the three words a launch gives."""
+
+    at: int
+    cause: LaunchFailure
+
+
+@dataclass(frozen=True)
 class GroupState:
     """What `apply` compares a decision with: the group as the run read it.
 
     `in_service` lists the instances whose lifecycle state is `InService`, `protected` those of the
     group's own list that are protected from scale-in. `no_capacity_at` is the time of the last
-    launch that found no capacity, `None` when the history read holds none.
+    launch that found no capacity, `None` when the history read holds none. `last_failed_launch` is
+    the last launch that failed, `None` when the history read holds none.
     """
 
     group: str
@@ -139,6 +177,7 @@ class GroupState:
     protected: frozenset[str]
     launch_suspended: bool
     no_capacity_at: int | None
+    last_failed_launch: FailedLaunch | None = None
 
 
 @dataclass(frozen=True)
@@ -241,13 +280,24 @@ def _into_warm_pool(description: str) -> bool:
     return "into warm pool" in description or "to warm pool" in description
 
 
+def _failure_cause(message: str) -> LaunchFailure:
+    """Why a launch failed, from the error code its status message carries: one of three words."""
+    if NO_CAPACITY in message:
+        return LaunchFailure.INSUFFICIENT_CAPACITY
+    if QUOTA in message or QUOTA_WORDS in message.lower():
+        return LaunchFailure.QUOTA
+    return LaunchFailure.LAUNCH_FAILED
+
+
 @dataclass(frozen=True)
 class LaunchHistory:
-    """What the group's activity history says: the launches abandoned in a row, and the time of the
-    last launch that found no capacity (`None` when the history read holds none)."""
+    """What the group's activity history says: the launches abandoned in a row, the time of the
+    last launch that found no capacity, and the last launch that failed, whatever its cause (each
+    `None` when the history read holds none)."""
 
     abandoned_in_a_row: int
     no_capacity_at: int | None
+    last_failed: FailedLaunch | None = None
 
 
 def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | None) -> LaunchHistory:
@@ -255,6 +305,7 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
     reached_service: int | None = counted_from
     abandons: list[int] = []
     no_capacity_at: int | None = None
+    last_failed: FailedLaunch | None = None
     for activity in activities:
         description = str(activity.get("Description", "")).lower()
         if not _is_launch(description):
@@ -268,13 +319,15 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
             continue
         if status not in ("Failed", "Cancelled"):
             continue
+        if last_failed is None or moment >= last_failed.at:
+            last_failed = FailedLaunch(moment, _failure_cause(message))
         if NO_CAPACITY in message:
             no_capacity_at = moment if no_capacity_at is None else max(no_capacity_at, moment)
         elif "abandon" in message.lower():
             abandons.append(moment)
     # The row starts at the later of the last launch that reached service and the memory's start.
     abandoned = sum(1 for moment in abandons if reached_service is None or moment > reached_service)
-    return LaunchHistory(abandoned, no_capacity_at)
+    return LaunchHistory(abandoned, no_capacity_at, last_failed)
 
 
 def _heartbeats(
@@ -321,6 +374,7 @@ _MEMORY_TIMES = (
     "abandons_counted_from",
     "last_rebalance_at",
     "outside_sessions_since",
+    "short_since",
 )
 # The attributes of the memory record that the scaler alone writes: all of them but the keys and
 # `launch_suspended`, which the admin clears.
@@ -356,6 +410,7 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
         rebalance_number=_time(item, "rebalance_number") or 0,
         last_rebalance_at=_time(item, "last_rebalance_at"),
         outside_sessions_since=_time(item, "outside_sessions_since"),
+        short_since=_time(item, "short_since"),
     )
 
 
@@ -418,6 +473,7 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
         protected=frozenset(i["InstanceId"] for i in own if i.get("ProtectedFromScaleIn")),
         launch_suspended=any(p.get("ProcessName") == LAUNCH_PROCESS for p in group.get("SuspendedProcesses", [])),
         no_capacity_at=history.no_capacity_at,
+        last_failed_launch=history.last_failed,
     )
     return inputs, state
 
@@ -509,9 +565,42 @@ def memory_update(table: str, pool: str, before: Memory, after: Memory) -> dict[
     }
 
 
-def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) -> None:
+def supply_note(pool: PoolDecision, read: PoolInputs, state: GroupState, now: int) -> ScalerNote:
+    """The pool's note for a run at the time `now`: what its decision asks, what the run read of
+    its supply and of its group, and what waits, since when and why (section 5.4)."""
+    supply = read.supply
+    waiting = max(0, pool.desired - len(supply.starting) - len(supply.in_service))
+    waiting_since: int | None = None
+    launch_failure: LaunchFailure | None = None
+    if waiting > 0:
+        # The first of the runs in a row that saw the pool wait: this one, unless the memory holds one.
+        waiting_since = now if read.memory.short_since is None else read.memory.short_since
+        failed = state.last_failed_launch
+        if pool.suspend_launches:
+            launch_failure = LaunchFailure.LAUNCHES_SUSPENDED
+        elif failed is not None and failed.at >= waiting_since:
+            launch_failure = failed.cause
+    return ScalerNote(
+        pool=pool.pool,
+        capacity_asked=pool.desired,
+        no_capacity_at=state.no_capacity_at,
+        written_at=now,
+        rebalance_number=pool.rebalance_number,
+        requested=pool.requested,
+        starting=len(supply.starting),
+        in_service=len(supply.in_service),
+        draining=len(supply.draining),
+        waiting=waiting,
+        waiting_since=waiting_since,
+        launch_failure=launch_failure,
+    )
+
+
+def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) -> dict[str, ScalerNote]:
     """Makes each pool's decision true, calling Auto Scaling only for what differs, then writes the
-    pool's note and memory."""
+    pool's note and memory. Returns the notes it wrote, by pool."""
+    read_pools = {read.config.name: read for read in run.inputs.pools}
+    notes: dict[str, ScalerNote] = {}
     for pool in decision.pools:
         state = run.groups[pool.pool]
         named = set(pool.lift_protection)
@@ -530,13 +619,11 @@ def apply(clients: Clients, tables: TableNames, run: Run, decision: Decision) ->
         elif not pool.suspend_launches and state.launch_suspended:
             clients.autoscaling.resume_processes(AutoScalingGroupName=state.group, ScalingProcesses=[LAUNCH_PROCESS])
 
-        note = ScalerNote(
-            pool=pool.pool,
-            capacity_asked=pool.desired,
-            no_capacity_at=state.no_capacity_at,
-            written_at=run.inputs.now,
-            rebalance_number=pool.rebalance_number,
-        )
+        before = read_pools[pool.pool]
+        note = supply_note(pool, before, state, run.inputs.now)
         _put(clients, tables.pool_state, note.to_item())
-        before = next(read.memory for read in run.inputs.pools if read.config.name == pool.pool)
-        clients.dynamodb.update_item(**memory_update(tables.pool_state, pool.pool, before, pool.memory))
+        # The time the wait began goes on in the memory, and leaves it once nothing waits.
+        memory = dataclasses.replace(pool.memory, short_since=note.waiting_since)
+        clients.dynamodb.update_item(**memory_update(tables.pool_state, pool.pool, before.memory, memory))
+        notes[pool.pool] = note
+    return notes

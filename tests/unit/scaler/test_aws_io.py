@@ -285,6 +285,8 @@ def test_a_decision_becomes_calls_in_order_and_the_note_carries_no_capacity(aws:
     aws.expect("set_desired_capacity", DesiredCapacity=1, HonorCooldown=False)
     aws.expect("suspend_processes", ScalingProcesses=["Launch"])
     note = {"pool": "coursework", "record": "note", "capacity_asked": 1, "no_capacity_at": NOW - 120, "written_at": NOW}
+    # The three instances the run read in service, and nothing waits: one is asked for.
+    note |= {"requested": 0, "starting": 0, "in_service": 3, "draining": 0, "waiting": 0}
     aws.expect_writes(note, (EMPTY, memory))
     apply(aws.clients, TABLES, run, decision(1, ("instance-b", "instance-c"), suspend=True, memory=memory))
 
@@ -299,7 +301,9 @@ def test_no_change_no_call(aws: Aws) -> None:
     run = read_one(aws)
     memory = Memory(launch_suspended=True, suspended_at=NOW - 60)
     # Nothing queued on Auto Scaling: any call there fails the test.
-    aws.expect_writes({"pool": "coursework", "record": "note", "capacity_asked": 1, "written_at": NOW}, (EMPTY, memory))
+    note = {"pool": "coursework", "record": "note", "capacity_asked": 1, "written_at": NOW}
+    note |= {"requested": 0, "starting": 0, "in_service": 1, "draining": 0, "waiting": 0}
+    aws.expect_writes(note, (EMPTY, memory))
     apply(aws.clients, TABLES, run, decision(1, suspend=True, memory=memory))
 
 
@@ -381,6 +385,7 @@ def test_the_memory_update_leaves_the_admins_clear_and_what_is_not_the_scalers(m
             rebalance_number=3,
             last_rebalance_at=NOW - 10,
             outside_sessions_since=NOW - 11,
+            short_since=NOW - 12,
         )
         assert all(value not in (None, (), 0, False) for value in dataclasses.astuple(full))
         client.update_item(**memory_update(TABLES.pool_state, "coursework", stored, full))

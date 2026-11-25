@@ -9,6 +9,7 @@ import pytest
 from rhi_common.records import (
     GatewayHeartbeat,
     InstanceHeartbeat,
+    LaunchFailure,
     Mode,
     PoolState,
     RecordError,
@@ -37,6 +38,20 @@ INSTANCE = InstanceHeartbeat(
 )
 STATE = PoolState(pool="coursework", mode=Mode.SCHEDULED_ONLY, set_by="admin", set_at=NOW - 500)
 NOTE = ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=NOW - 90, written_at=NOW)
+# A pool that waits: three asked, one in service, one starting, one leaving.
+SHORT = ScalerNote(
+    pool="mock",
+    capacity_asked=3,
+    no_capacity_at=None,
+    written_at=NOW,
+    requested=3,
+    starting=1,
+    in_service=1,
+    draining=1,
+    waiting=1,
+    waiting_since=NOW - 600,
+    launch_failure=LaunchFailure.QUOTA,
+)
 SESSION = Session(
     pool="coursework", instances=2, starts_at=NOW + 3600, ends_at=NOW + 18000, set_by="instructor", set_at=NOW
 )
@@ -50,6 +65,7 @@ RECORDS = [
     NOTE,
     ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=NOW),
     ScalerNote(pool="mock", capacity_asked=2, no_capacity_at=None, written_at=NOW, rebalance_number=7),
+    SHORT,
     SESSION,
 ]
 
@@ -108,6 +124,45 @@ def test_a_note_without_a_rebalance_number_reads_as_0() -> None:
 def test_a_rebalance_number_that_is_not_a_whole_number_is_refused(number: object) -> None:
     with pytest.raises(RecordError):
         ScalerNote.from_item({**NOTE.to_item(), "rebalance_number": number})
+
+
+def test_a_note_stored_without_what_waits_reads_as_zeros_no_time_and_no_cause() -> None:
+    # The note as the scaler wrote it before it said what waits.
+    stored = {"pool": "mock", "record": "note", "capacity_asked": 2, "no_capacity_at": NOW - 90, "written_at": NOW}
+    note = ScalerNote.from_item(stored)
+    assert (note.capacity_asked, note.no_capacity_at) == (2, NOW - 90)
+    assert (note.requested, note.starting, note.in_service, note.draining, note.waiting) == (0, 0, 0, 0, 0)
+    assert (note.waiting_since, note.launch_failure) == (None, None)
+
+
+def test_a_note_says_what_waits_and_drops_the_time_and_the_cause_while_nothing_does() -> None:
+    stored = SHORT.to_item()
+    held = {"requested": 3, "starting": 1, "in_service": 1, "draining": 1, "waiting": 1}
+    assert {name: stored[name] for name in held} == held
+    assert (stored["waiting_since"], stored["launch_failure"]) == (NOW - 600, "quota")
+    # The counts are written at zero too; a time and a cause that are not set are left out.
+    nothing = NOTE.to_item()
+    assert {name: nothing[name] for name in held} == dict.fromkeys(held, 0)
+    assert "waiting_since" not in nothing and "launch_failure" not in nothing
+
+
+def test_a_note_with_an_attribute_its_reader_does_not_know_still_reads() -> None:
+    assert ScalerNote.from_item({**SHORT.to_item(), "written_by_a_later_scaler": "anything"}) == SHORT
+
+
+def test_the_cause_of_a_failed_launch_is_one_of_four_words() -> None:
+    assert {cause.value for cause in LaunchFailure} == {
+        "insufficient-capacity",
+        "quota",
+        "launches-suspended",
+        "launch-failed",
+    }
+    # Anything else, text from AWS included, is not a note.
+    for cause in ("InsufficientInstanceCapacity", "", 3):
+        with pytest.raises(RecordError):
+            ScalerNote.from_item({**SHORT.to_item(), "launch_failure": cause})
+    with pytest.raises(RecordError):
+        ScalerNote.from_item({**SHORT.to_item(), "waiting": Decimal("1.5")})
 
 
 @pytest.mark.parametrize("mode", ["parked", "ENABLED", "scheduled_only", "", 1, None])
