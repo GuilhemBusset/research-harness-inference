@@ -546,6 +546,39 @@ def test_a_success_is_not_posted_while_the_marks_cannot_be_read(stub: Stub, capl
     assert MARKER not in caplog.text
 
 
+def test_a_verification_whose_gpu_tests_did_not_run_for_lack_of_capacity_says_so(
+    stub: Stub, commit: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    def posted(by: Stub) -> list[tuple[str, str, str, str]]:
+        client = Client()
+        run(verification(by.execution, "SUCCEEDED")[1:], by, client)
+        return client.posted
+
+    # The step booked the coursework pool, no instance was launched, and the mock pool's tests passed.
+    stub.mark("gpu-not-run", "no-capacity\n")
+    assert posted(stub) == [(commit, "success", VERIFY, Description.VERIFIED_WITHOUT_GPU)]
+    # Not the description the implement loop discharges a smoke test's item on.
+    assert Description.VERIFIED_WITHOUT_GPU != VERIFIED_DESCRIPTION
+    # The mark of another execution says nothing of this one.
+    stub.marks.clear()
+    stub.mark("gpu-not-run", "no-capacity\n", execution=str(uuid.uuid4()))
+    assert posted(stub) == [(commit, "success", VERIFY, VERIFIED_DESCRIPTION)]
+
+    class RefusesTheMark(Stub):
+        """The artifact bucket, which lists the mark `not-run` and refuses to list `gpu-not-run`."""
+
+        def list_objects_v2(self, Bucket: str, Prefix: str) -> dict[str, Any]:
+            if Prefix.endswith("/gpu-not-run"):
+                raise ClientError({"Error": {"Code": "AccessDenied", "Message": MARKER}}, "ListObjectsV2")
+            return super().list_objects_v2(Bucket, Prefix)
+
+    # While that mark cannot be read, no success is posted: the GPU tests may not have run.
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClientError):
+        posted(RefusesTheMark(stub.execution, commit))
+    assert [record.getMessage() for record in caplog.records] == [handler.NO_NOT_RUN]
+    assert MARKER not in caplog.text
+
+
 def test_a_superseded_commit_is_not_verified_by_a_verification_that_ran_nothing(stub: Stub, commit: str) -> None:
     earlier, superseded_commit = str(uuid.uuid4()), secrets.token_hex(20)
 

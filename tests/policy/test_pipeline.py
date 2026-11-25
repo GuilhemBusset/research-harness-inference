@@ -66,14 +66,15 @@ Rules hold those two, and every action:
   of a stack that stage deploys whose name the action is given in `RHI_VERIFY_HEARTBEATS_TABLE`,
   as an output of that stack, named as CloudFormation names a table that has no name of its own,
   the stack's name, a hyphen, the table's logical ID, a hyphen and a wildcard for the suffix it
-  generates, in the deploying account and region (section 8.4); for the session it books on the
-  mock pool, read the one stack resource that names the stage's pool-state table,
-  `cloudformation:DescribeStackResource` on a stack that the stage deploys and whose template holds
-  the pool-state table, and read and write, with `dynamodb:GetItem` and `dynamodb:PutItem` and no
-  other action, the items of that table whose partition key is the mock pool's name, `mock`: the
-  table is named as the hold's role names it, and the statement's condition is
-  `ForAllValues:StringEquals` on `dynamodb:LeadingKeys` with that one name, alone, so the role
-  reaches no other pool's items, not every item, and no other table; write objects under
+  generates, in the deploying account and region (section 8.4); for the sessions it books, on the
+  mock pool and on the coursework pool, read the one stack resource that names the stage's
+  pool-state table, `cloudformation:DescribeStackResource` on a stack that the stage deploys and
+  whose template holds the pool-state table, and read and write, with `dynamodb:GetItem` and
+  `dynamodb:PutItem` and no other action, the items of that table whose partition key is the mock
+  pool's name, `mock`, or the coursework pool's, `coursework`: the table is named as the hold's role
+  names it, and the statement's condition is `ForAllValues:StringEquals` on `dynamodb:LeadingKeys`
+  with those names, one or both and no other, alone, so the role reaches no third pool's items,
+  not every item, and no other table; write objects under
   `verification/` of the pipeline's artifact bucket; and, for the decision whether the execution
   verifies on the coursework pool, describe Auto Scaling groups and their instance refreshes, which
   AWS grants on every resource only, and list the executions of the pipeline the action is in, by
@@ -303,10 +304,12 @@ STAGE_TAG = "rhi-stage"
 RELEASE_PARAMETER = re.compile(r"/rhi/pools/[a-z0-9-]+/release")
 HEARTBEATS_TABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
 STACK_OUTPUT = re.compile(r"#\{(\w+)\.(\w+)\}")
-# The pool the verification books, and the one condition under which its role may read and write
-# items of the pool-state table: every partition key of the request is that pool's name.
+# The pools the verification books, and the one condition under which its role may read and write
+# items of the pool-state table: every partition key of the request is one of those pools' names.
 MOCK_POOL = "mock"
-OF_THE_MOCK_POOL = {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}}
+COURSEWORK_POOL = "coursework"
+BOOKED_POOLS = [MOCK_POOL, COURSEWORK_POOL]
+OF_THE_BOOKED_POOLS = {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": BOOKED_POOLS}}
 VERIFICATION_MAY = {
     "secretsmanager:GetSecretValue": "secret",
     "aps:QueryMetrics": "workspaces",
@@ -1071,16 +1074,16 @@ def verification_resources(
 def verifies_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]) -> bool:
     """Whether an allowed statement of a verification's role reaches an action it is not given, a
     resource beyond those of the action's kind, where it reads or writes items of the pool-state
-    table, any item but the mock pool's: its condition must be `OF_THE_MOCK_POOL`, alone, or, where
-    it queries workspaces, any workspace but its stage's: its condition must be the one that admits
-    a workspace by the stage's tag, alone."""
+    table, any item but those of the pools the verification books: its condition must be the one
+    `of_the_booked_pools` admits, alone, or, where it queries workspaces, any workspace but its
+    stage's: its condition must be the one that admits a workspace by the stage's tag, alone."""
     if reports_more(statement, allowed, VERIFICATION_MAY):
         return True
     named = {action.lower() for action in as_list(statement.get("Action", [])) if isinstance(action, str)}
     items = {action.lower() for action, kind in VERIFICATION_MAY.items() if kind == "pool-state"}
     queries = {action.lower() for action, kind in VERIFICATION_MAY.items() if kind == "workspaces"}
     condition = statement.get("Condition")
-    if named & items and not of_the_mock_pool(condition):
+    if named & items and not of_the_booked_pools(condition):
         return True
     if not named & queries:
         return False
@@ -1093,17 +1096,17 @@ def verifies_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pa
     return not (isinstance(value, str) and value in tags)
 
 
-def of_the_mock_pool(condition: Any) -> bool:
-    """Whether a statement's condition is `OF_THE_MOCK_POOL` and nothing else: that one operator on
-    that one key, with the mock pool's name as its only value."""
-    if not isinstance(condition, dict) or list(condition) != list(OF_THE_MOCK_POOL):
+def of_the_booked_pools(condition: Any) -> bool:
+    """Whether a statement's condition admits items by the names of `BOOKED_POOLS` and nothing
+    else: the one operator of `OF_THE_BOOKED_POOLS` on its one key, with one of those names or both
+    as its only values, and no other name."""
+    if not isinstance(condition, dict) or list(condition) != list(OF_THE_BOOKED_POOLS):
         return False
     (keys,) = condition.values()
-    return (
-        isinstance(keys, dict)
-        and list(keys) == ["dynamodb:LeadingKeys"]
-        and as_list(keys["dynamodb:LeadingKeys"]) == [MOCK_POOL]
-    )
+    if not isinstance(keys, dict) or list(keys) != ["dynamodb:LeadingKeys"]:
+        return False
+    pools = as_list(keys["dynamodb:LeadingKeys"])
+    return bool(pools) and all(isinstance(pool, str) and pool in BOOKED_POOLS for pool in pools)
 
 
 def holds(template: Mapping[str, Any]) -> list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]]:
@@ -2270,13 +2273,14 @@ def test_the_verification_s_role_is_the_one_held(templates: dict[str, dict[str, 
     assert heartbeats.fullmatch(arn_text(query["Resource"]) or "")
     # And so is the stage's pool-state table, by the logical ID recorded for it: its role reads
     # that one stack's resources, and reads and writes that one table's items under the condition
-    # that names the mock pool's partition key, and nothing else of CloudFormation or DynamoDB.
+    # that names the partition keys of the two pools it books, the mock pool's and the coursework
+    # pool's, and nothing else of CloudFormation or DynamoDB.
     ((stack, logical_id),) = stage_pool_state(templates, actions)
     assert logical_id in recorded[stack]
     ((stacks,), (pool_state,)) = allowed["pools stack"], allowed["pool-state"]
     (items,) = [statement for statement in on_tables if statement is not query]
     assert sorted(items["Action"]) == ["dynamodb:GetItem", "dynamodb:PutItem"]
-    assert pool_state.fullmatch(arn_text(items["Resource"]) or "") and items["Condition"] == OF_THE_MOCK_POOL
+    assert pool_state.fullmatch(arn_text(items["Resource"]) or "") and items["Condition"] == OF_THE_BOOKED_POOLS
     (describe,) = [
         statement
         for statement in statements_of(template, role) or []
@@ -2360,7 +2364,8 @@ More = tuple[str, "Names", "dict[str, Any] | None"]
 # The heartbeats table of the stage of `built`, as CloudFormation names it: the stage deploys the
 # stack `Rhi-Endpoint`, which holds the table under the logical ID `Heartbeats`.
 HEARTBEATS = "Rhi-Endpoint-Heartbeats-*"
-# The narrow role: what the verification of the stage of `built` reads and writes.
+# The narrow role: what the verification of the stage of `built` reads and writes. Of the
+# pool-state table, the items of the pools it books: one statement names one of them, one both.
 VERIFIES: list[More] = [
     ("secretsmanager:GetSecretValue", the_secret(f"{CANARY_SECRET}-??????"), None),
     ("aps:QueryMetrics", the_workspaces, tagged("Rhi")),
@@ -2368,7 +2373,7 @@ VERIFIES: list[More] = [
     ("dynamodb:Query", the_table(HEARTBEATS), None),
     ("cloudformation:DescribeStackResource", the_stack("Rhi-Endpoint"), None),
     ("dynamodb:GetItem", the_pool_state(), of_pool(MOCK_POOL)),
-    ("dynamodb:PutItem", the_pool_state(), of_pool(MOCK_POOL)),
+    ("dynamodb:PutItem", the_pool_state(), of_pool(MOCK_POOL, COURSEWORK_POOL)),
     ("s3:PutObject", under(VERIFICATION_PREFIX), None),
     ("autoscaling:DescribeAutoScalingGroups", every_resource, None),
     ("autoscaling:DescribeInstanceRefreshes", every_resource, None),
@@ -2472,22 +2477,26 @@ ON_EVERY_RESOURCE = a_verification(("s3:PutObject", every_resource, None))
             id="the indexes of the heartbeats table",
         ),
         pytest.param(
-            a_verification(("dynamodb:PutItem", the_pool_state(), of_pool("coursework"))),
-            id="a write of the coursework pool's items",
+            a_verification(("dynamodb:PutItem", the_pool_state(), of_pool("other-1"))),
+            id="a write of a third pool's items",
         ),
         pytest.param(
             a_verification(("dynamodb:PutItem", the_pool_state(), None)), id="a write that names no partition key"
         ),
         pytest.param(
-            a_verification(("dynamodb:GetItem", the_pool_state(), of_pool("coursework"))),
-            id="a read of the coursework pool's items",
+            a_verification(("dynamodb:GetItem", the_pool_state(), of_pool("other-1"))),
+            id="a read of a third pool's items",
         ),
         pytest.param(
             a_verification(("dynamodb:GetItem", the_pool_state(), None)), id="a read that names no partition key"
         ),
         pytest.param(
-            a_verification(("dynamodb:PutItem", the_pool_state(), of_pool(MOCK_POOL, "coursework"))),
-            id="a write of the items of both pools",
+            a_verification(("dynamodb:PutItem", the_pool_state(), of_pool(MOCK_POOL, COURSEWORK_POOL, "other-1"))),
+            id="a write of the items of the two pools and of a third",
+        ),
+        pytest.param(
+            a_verification(("dynamodb:PutItem", the_pool_state(), of_pool())),
+            id="a write whose condition names no pool",
         ),
         pytest.param(
             a_verification(("dynamodb:PutItem", the_pool_state(), of_pool("*"))),

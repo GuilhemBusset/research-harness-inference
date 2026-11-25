@@ -2,8 +2,8 @@
 
 The status is the factory's only view of a deployment and it is public: these tests hold the
 contexts and states the implement loop waits on, the two descriptions it reads by value, that
-nothing of an event but five fields can reach GitHub, and that a verification that ran no test is
-described as one, never as verified.
+nothing of an event but five fields can reach GitHub, and that a verification that ran no test, or
+whose GPU tests did not run for lack of capacity, is described as one, never as verified.
 """
 
 import dataclasses
@@ -24,6 +24,7 @@ from rhi_reporter.status import (
     not_run_description,
     status_for,
     superseded_description,
+    without_gpu_tests,
 )
 
 SHA = "1a2b3c4d" * 5
@@ -168,6 +169,23 @@ def test_a_verification_that_ran_no_test_is_described_by_its_reason_and_never_as
     for kind, state in SWEEP:
         status = status_for(event(kind, state))
         assert status == verified or as_it_ran(status, "canary-missing") == status, (kind, state)
+
+
+def test_a_verification_whose_gpu_tests_did_not_run_is_described_so_and_never_as_verified() -> None:
+    # A member of its own, which no event gives and the loop does not read as verified, and which
+    # is not one of a verification that ran no test: the mock pool's tests ran and passed.
+    without_gpu = Description.VERIFIED_WITHOUT_GPU
+    assert without_gpu != VERIFIED_DESCRIPTION and given_by(without_gpu) == []
+    assert without_gpu not in {not_run_description(reason) for reason in ("canary-missing", "parked", "dormant")}
+
+    verified = status_for(event("verify", "SUCCEEDED"))
+    assert without_gpu_tests(verified) == CommitStatus(SHA, State.SUCCESS, "verify/Prod", without_gpu)
+    # Only a verification's success is told otherwise, and one that ran no test stays told so.
+    for kind, state in SWEEP:
+        status = status_for(event(kind, state))
+        assert status == verified or without_gpu_tests(status) == status, (kind, state)
+    not_run = as_it_ran(verified, "listener-off")
+    assert without_gpu_tests(not_run) == not_run
 
 
 def test_an_approval_has_descriptions_of_its_own() -> None:

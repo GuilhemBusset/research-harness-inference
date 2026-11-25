@@ -2,15 +2,16 @@
 6): the action named Verify, after the stage's deployment, which runs the decision whether the
 execution verifies on the coursework pool before the verification script, and builds no image; a post-build phase that copies the script's reason, when there is one, to the
 key verification/<execution ID>/not-run of the artifact bucket, the IDs of the smoke tests
-that failed to failed-smoke-tests beside it, and the last lifecycle stage each instance reached to
-last-stages; inputs that are outputs of the stage's stacks and the execution's ID; and a role that
+that failed to failed-smoke-tests beside it, the last lifecycle stage each instance reached to
+last-stages, and the reason the GPU tests did not run to gpu-not-run; inputs that are outputs of the
+stage's stacks and the execution's ID; and a role that
 reads the canary's secret, queries the stage's workspace, reads the stage's pools' release
 parameters, queries the stage's heartbeats table, and that one table, writes under
 verification/, describes groups and their refreshes, and lists its own pipeline's executions. For
-the session the script books on the mock pool, the step is given the pools stack's name, the
-pool-state table's logical ID and the configuration's two numbers, its role may describe that one
-stack's resources and read and write the mock pool's items of that one table, and its timeout
-grows with the wait.
+the sessions the script books, on the mock pool and on the coursework pool, the step is given the
+pools stack's name, the pool-state table's logical ID and the configuration's two numbers, its role
+may describe that one stack's resources and read and write the items of those two pools of that one
+table, and its timeout grows with the wait for each of them.
 
 The tests read the app's own pipeline, the one that is deployed. Two of them also build the app
 from a changed configuration, with no listener and with no pool.
@@ -192,24 +193,30 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
     (store,) = [verification.pipeline["ArtifactStore"]["Location"]]
     (bucket,) = [name for name, value in by_project.items() if value == store]
     reason_file, failed_file = script.REASON_FILE_VARIABLE, script.FAILED_TESTS_FILE_VARIABLE
-    stages_file = script.LAST_STAGES_FILE_VARIABLE
-    # The files the step names are three, outside the checkout, which CodeBuild places under its own folder.
-    assert len({by_project[reason_file], by_project[failed_file], by_project[stages_file]}) == 3
-    for file in (reason_file, failed_file, stages_file):
+    stages_file, gpu_file = script.LAST_STAGES_FILE_VARIABLE, script.GPU_REASON_FILE_VARIABLE
+    files = (reason_file, failed_file, stages_file, gpu_file)
+    # The files the step names are four, outside the checkout, which CodeBuild places under its own folder.
+    assert len({by_project[file] for file in files}) == 4
+    for file in files:
         assert Path(by_project[file]).is_absolute() and not by_project[file].startswith("/codebuild")
 
     tools, buckets = fake_aws(tmp_path), tmp_path / "buckets"
 
     def post_build(
-        reason: str | None, *, failed: str | None = None, stages: str | None = None, refuses: bool = False
+        reason: str | None,
+        *,
+        failed: str | None = None,
+        stages: str | None = None,
+        gpu: str | None = None,
+        refuses: bool = False,
     ) -> tuple[int, dict[str, str]]:
         """Runs the phase for the execution `an-execution`, after a script that left `reason`,
-        the failed tests `failed` and the instances' last stages `stages`: its exit, and the
-        objects of the buckets."""
+        the failed tests `failed`, the instances' last stages `stages` and `gpu` as the reason its
+        GPU tests did not run: its exit, and the objects of the buckets."""
         shutil.rmtree(buckets, ignore_errors=True)
         folder = tmp_path / "left"
         folder.mkdir(exist_ok=True)
-        for name, held in (("reason", reason), ("failed", failed), ("stages", stages)):
+        for name, held in (("reason", reason), ("failed", failed), ("stages", stages), ("gpu", gpu)):
             (folder / name).unlink(missing_ok=True)
             if held is not None:
                 (folder / name).write_text(held, encoding="utf-8")
@@ -220,6 +227,7 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
             reason_file: str(folder / "reason"),
             failed_file: str(folder / "failed"),
             stages_file: str(folder / "stages"),
+            gpu_file: str(folder / "gpu"),
             bucket: "artifacts",
             execution: "an-execution",
         }
@@ -253,6 +261,14 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
             "artifacts/verification/an-execution/last-stages": "weights\nboot\n",
         },
     )
+    # And the reason the GPU tests did not run, to the mark gpu-not-run, which is not the mark of a
+    # verification that ran no test. A copy of it that fails fails the build too: such a
+    # verification is not taken for one whose GPU tests ran.
+    assert post_build(None, gpu="no-capacity\n") == (
+        0,
+        {"artifacts/verification/an-execution/gpu-not-run": "no-capacity\n"},
+    )
+    assert post_build(None, gpu="no-capacity\n", refuses=True)[0] != 0
 
 
 def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(verification: Verification) -> None:
@@ -443,7 +459,7 @@ def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None
     assert {name for name, _ in tables} > {stack} and len([name for name, _ in tables if name == stack]) > 1
 
 
-def test_the_step_is_given_what_the_booking_of_the_mock_pool_needs(verification: Verification) -> None:
+def test_the_step_is_given_what_the_booking_of_its_two_pools_needs(verification: Verification) -> None:
     example, given = config.load({"RHI_CONFIG": "example"}), verification.given_by_the_project()
     # The pools stack and the pool-state table's logical ID in it, as text: the stack the pipeline
     # deploys under that name holds a table of that logical ID, keyed by pool and by record.
@@ -466,25 +482,28 @@ def test_the_step_is_given_what_the_booking_of_the_mock_pool_needs(verification:
     (describe,) = verification.allowed("cloudformation")
     assert describe["Action"] == "cloudformation:DescribeStackResource"
     assert text(describe["Resource"]) == f"arn:<>:cloudformation:<>:<>:stack/{stack}/*"
-    # It may read and write the items of that one table whose partition key is the mock pool's
-    # name, and nothing else of DynamoDB but its query of the heartbeats table.
+    # It may read and write the items of that one table whose partition key is the name of a pool
+    # the script books, the mock pool or the pool the decision names, and nothing else of DynamoDB
+    # but its query of the heartbeats table.
     (items,) = [s for s in verification.allowed("dynamodb") if "dynamodb:Query" not in as_list(s["Action"])]
     assert sorted(as_list(items["Action"])) == ["dynamodb:GetItem", "dynamodb:PutItem"]
     assert text(items["Resource"]) == f"arn:<>:dynamodb:<>:<>:table/{stack}-{logical_id}-*"
-    assert items["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [script.MOCK_POOL]}}
-    assert script.MOCK_POOL in {pool.name for pool in example.pools}
+    booked = [script.MOCK_POOL, decision.COURSEWORK_POOL]
+    assert items["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": booked}}
+    assert set(booked) <= {pool.name for pool in example.pools}
 
 
 def test_the_step_s_timeout_covers_the_wait_for_the_session_s_instance(
     verification: Verification, app_module: ModuleType, tmp_path: Path
 ) -> None:
-    # The build outlasts the wait, the tests and the stop of the session: a longer wait is a longer
-    # timeout, by as much, and beside the wait there are hours for the rest.
+    # The build outlasts the wait for each of the two pools the script books, the tests and the
+    # stop of each session: a longer wait is a longer timeout, by twice as much, and beside the
+    # waits there are hours for the rest.
     example = config.load({"RHI_CONFIG": "example"})
-    beside_the_wait = verification.project["TimeoutInMinutes"] - example.check_wait_minutes
-    assert beside_the_wait >= 120
+    beside_the_waits = verification.project["TimeoutInMinutes"] - 2 * example.check_wait_minutes
+    assert beside_the_waits >= 120
     longer = build(app_module, tmp_path / "longer", lambda data: data.update(check_wait_minutes=180))
-    assert longer.project["TimeoutInMinutes"] == 180 + beside_the_wait
+    assert longer.project["TimeoutInMinutes"] == 2 * 180 + beside_the_waits
     assert longer.given_by_the_project()[script.CHECK_WAIT_MINUTES_VARIABLE] == "180"
     # A wait CodeBuild's limit for one build cannot hold is refused when the app is built.
     with pytest.raises(ValueError, match="check_wait_minutes"):

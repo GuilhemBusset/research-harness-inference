@@ -13,20 +13,31 @@ when it did not end well; its answer is a file, `RHI_VERIFY_GPU_POOLS_FILE`, tha
 `coursework` or nothing. Its command ends before the verification's begins, so the smoke tests
 then run on the mock pool and, when the file names it, on the coursework pool, after the refresh.
 
-**The session on the mock pool.** The script books the mock pool before its run of the tests on it,
+**The session on each pool.** The script books the mock pool before its run of the tests on it,
 one instance under the name `pipeline/verify` for twice the configuration's `check_wait_minutes`,
 waits until the gateway's status reads the pool ready or `check_wait_minutes` have passed, and
 stops the session it booked after the run, whatever its result (`scripts/pipeline/booking.py`).
 It books only a pool that has no session booked or active, and stops only the session it booked.
 So the deployed verification does not depend on a wake. The session is an item of the stage's
 pool-state table, which the script finds as the deployment hold does (`rhi.pipeline.hold`), by
-the table's logical ID in the pools stack.
+the table's logical ID in the pools stack. When the decision's file names the coursework pool, the
+script then books that pool the same way, for its run of the tests on it. The pools the script may
+book are `BOOKED_POOLS`.
+
+**No capacity is not a failed release.** When the wait for the coursework pool ends with the pool
+not ready, the script reads the pool's rows of the heartbeats table: with no instance row written
+since the booking, no instance was launched. It then runs no test on that pool, stops its session,
+and leaves the one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names; its exit is
+that of the mock pool's run. The step's post-build phase copies the file, when there is one, to the
+object `verification/<execution ID>/gpu-not-run`, the mark by which the reporter gives the
+verification's success the description of one whose GPU tests did not run for lack of capacity
+(`rhi_reporter.status`). An instance that was launched and does not serve is a failed run, below.
 
 **How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, a refresh
-and two runs of the tests, each with a cold wake, and `check_wait_minutes` more, the longest the
-script waits for the session's instance. So the build is not cut before the wait is over, the tests
-have run and the session is stopped. A wait that would take the timeout beyond CodeBuild's limit for
-one build is refused at synthesis.
+and two runs of the tests, and `check_wait_minutes` more for each pool of `BOOKED_POOLS`, the
+longest the script waits for the instance of each session. So the build is not cut before the waits
+are over, the tests have run and the sessions are stopped. A wait that would take the timeout beyond
+CodeBuild's limit for one build is refused at synthesis.
 
 **The action is named `ACTION`.** The reporter maps an action of that name to the context
 `verify/<stage>`, so the step's name is its contract: `tests/policy/test_pipeline.py` lists it.
@@ -59,7 +70,8 @@ and of the execution:
 - `RHI_VERIFY_REASON_FILE`: where the script leaves its reason when it runs no test;
 - `RHI_VERIFY_FAILED_TESTS_FILE`: where the script leaves the IDs of the tests that fail;
 - `RHI_VERIFY_LAST_STAGES_FILE`: where the script leaves the last stage each instance reached;
-- `RHI_VERIFY_GPU_POOLS_FILE`: where the decision leaves the pools the smoke tests also run on.
+- `RHI_VERIFY_GPU_POOLS_FILE`: where the decision leaves the pools the smoke tests also run on;
+- `RHI_VERIFY_GPU_REASON_FILE`: where the script leaves the reason the GPU tests did not run.
 
 The decision learns the pipeline's name from CodeBuild's own `CODEBUILD_INITIATOR`: the pipeline
 refers to the step's project, so the project's environment may not refer to the pipeline.
@@ -114,13 +126,13 @@ written (`rhi.observability.stack`); read the release parameter of each pool the
 its name; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
 action on it; read the one stack resource that names the stage's pool-state table,
 `cloudformation:DescribeStackResource` on the pools stack; read and write, `dynamodb:GetItem` and
-`dynamodb:PutItem`, the items of that table whose partition key is the mock pool's name, and no
-other pool's: the condition is on `dynamodb:LeadingKeys`, in the form the canary's role has for
-the heartbeats table (`rhi.pipeline.canary`). That covers every record of the mock pool's
-partition, its session among them, and neither the coursework pool's records nor the session
-switch; and write under `verification/` of the artifact bucket. Beside that it holds what CDK
-Pipelines gives every project of the pipeline: its own logs, its own test reports and a read of
-its input in the artifact bucket. For the decision, it may also describe Auto Scaling groups and
+`dynamodb:PutItem`, the items of that table whose partition key is the mock pool's name or the
+coursework pool's, `BOOKED_POOLS`, and no other pool's: the condition is on `dynamodb:LeadingKeys`,
+in the form the canary's role has for the heartbeats table (`rhi.pipeline.canary`). That covers
+every record of those two partitions, their sessions among them, and neither a third pool's records
+nor the session switch; and write under `verification/` of the artifact bucket. Beside that it
+holds what CDK Pipelines gives every project of the pipeline: its own logs, its own test reports
+and a read of its input in the artifact bucket. For the decision, it may also describe Auto Scaling groups and
 their instance refreshes, which AWS grants on every resource only, and list the executions of this
 pipeline, by its ARN, and of no other. Nothing else: `tests/policy/test_pipeline.py` holds it to that.
 
@@ -163,12 +175,15 @@ NOT_RUN = "not-run"
 PARKED = "parked"
 FAILED_TESTS = "failed-smoke-tests"
 LAST_STAGES = "last-stages"
-# The files the script leaves its reason, the IDs of the failed tests and the instances' last
-# stages in, outside the checkout.
+# The mark of a verification whose GPU tests did not run, for the reason the mark holds.
+GPU_NOT_RUN = "gpu-not-run"
+# The files the script leaves its reason, the IDs of the failed tests, the instances' last stages
+# and the reason its GPU tests did not run in, outside the checkout.
 REASON_FILE = "/tmp/rhi-verification-not-run"
 FAILED_TESTS_FILE = "/tmp/rhi-verification-failed-smoke-tests"
 LAST_STAGES_FILE = "/tmp/rhi-verification-last-stages"
 GPU_POOLS_FILE = "/tmp/rhi-verification-gpu-pools"
+GPU_REASON_FILE = "/tmp/rhi-verification-gpu-not-run"
 
 ENDPOINT_VARIABLE = "RHI_SMOKE_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
@@ -180,15 +195,19 @@ REASON_FILE_VARIABLE = "RHI_VERIFY_REASON_FILE"
 FAILED_TESTS_FILE_VARIABLE = "RHI_VERIFY_FAILED_TESTS_FILE"
 LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
 GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
-# What the script books the mock pool with: the pools stack's name and the pool-state table's
+GPU_REASON_FILE_VARIABLE = "RHI_VERIFY_GPU_REASON_FILE"
+# What the script books a pool with: the pools stack's name and the pool-state table's
 # logical ID in it, and the configuration's `check_wait_minutes` and `session_max_hours`.
 POOLS_STACK_VARIABLE = "RHI_VERIFY_POOLS_STACK"
 POOL_STATE_LOGICAL_ID_VARIABLE = "RHI_VERIFY_POOL_STATE_LOGICAL_ID"
 CHECK_WAIT_MINUTES_VARIABLE = "RHI_VERIFY_CHECK_WAIT_MINUTES"
 SESSION_MAX_HOURS_VARIABLE = "RHI_VERIFY_SESSION_MAX_HOURS"
-# The pool the script books, by its name: the partition key of the only items of the pool-state
-# table the role may read and write, with these two actions.
+# The pools the script books, by their names: the mock pool, and the pool the decision names
+# (`COURSEWORK_POOL` of `scripts/pipeline/gpu_verification.py`). They are the partition keys of the
+# only items of the pool-state table the role may read and write, with these two actions.
 MOCK_POOL = "mock"
+COURSEWORK_POOL = "coursework"
+BOOKED_POOLS = [MOCK_POOL, COURSEWORK_POOL]
 POOL_STATE_ITEMS = ["dynamodb:GetItem", "dynamodb:PutItem"]
 # CodePipeline's variable for the ID of the execution an action runs in.
 EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
@@ -197,17 +216,17 @@ INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
 COMMANDS = ["uv sync --locked", f"uv run --locked python {DECISION}", f"uv run --locked python {SCRIPT}"]
 # What the decision reads of Auto Scaling, which grants it on every resource only.
 DESCRIBES_REFRESHES = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeInstanceRefreshes"]
-# The longest the step runs beside its wait for the instance of the session it booked: the set-up,
-# the decision's wait for a refresh, an hour at most, and the smoke tests on the mock pool and on
-# the coursework pool, each with a cold wake and the workspace's lag.
+# The longest the step runs beside its waits for the instances of the sessions it booked: the
+# set-up, the decision's wait for a refresh, an hour at most, and the smoke tests on the mock pool
+# and on the coursework pool, each with the workspace's lag.
 TIMEOUT = cdk.Duration.hours(3)
 
 
 def timeout(check_wait_minutes: int) -> cdk.Duration:
-    """The step's timeout: `TIMEOUT` and the wait for the session's instance, `check_wait_minutes`,
-    so that the build outlasts the wait, the tests and the stop of the session. A `ValueError` when
-    that is longer than CodeBuild lets one build run."""
-    minutes = TIMEOUT.to_minutes() + check_wait_minutes
+    """The step's timeout: `TIMEOUT` and the wait for a session's instance, `check_wait_minutes`,
+    once for each pool of `BOOKED_POOLS`, so that the build outlasts the waits, the tests and the
+    stop of each session. A `ValueError` when that is longer than CodeBuild lets one build run."""
+    minutes = TIMEOUT.to_minutes() + len(BOOKED_POOLS) * check_wait_minutes
     if minutes > MAX_TIMEOUT_HOURS * 60:
         raise ValueError(
             f"check_wait_minutes is {check_wait_minutes}: with the {TIMEOUT.to_minutes()} minutes of the "
@@ -223,12 +242,13 @@ def _copy(file_variable: str, key: str) -> str:
     return f'if [ -f "${file_variable}" ]; then aws s3 cp "${file_variable}" "{to}"; fi'
 
 
-# What the script left, as the objects the reporter reads: its reason, the tests that failed, and
-# the last stage each instance reached.
+# What the script left, as the objects the reporter reads: its reason, the tests that failed, the
+# last stage each instance reached, and the reason its GPU tests did not run.
 POST_BUILD_COMMANDS = [
     _copy(REASON_FILE_VARIABLE, NOT_RUN),
     _copy(FAILED_TESTS_FILE_VARIABLE, FAILED_TESTS),
     _copy(LAST_STAGES_FILE_VARIABLE, LAST_STAGES),
+    _copy(GPU_REASON_FILE_VARIABLE, GPU_NOT_RUN),
 ]
 
 
@@ -271,6 +291,7 @@ def verify_step(
         FAILED_TESTS_FILE_VARIABLE: FAILED_TESTS_FILE,
         LAST_STAGES_FILE_VARIABLE: LAST_STAGES_FILE,
         GPU_POOLS_FILE_VARIABLE: GPU_POOLS_FILE,
+        GPU_REASON_FILE_VARIABLE: GPU_REASON_FILE,
     }
     outputs: dict[str, cdk.CfnOutput] = {}
     # Secrets Manager adds six random characters to a secret's name in its ARN.
@@ -308,8 +329,8 @@ def verify_step(
         statements.append(
             iam.PolicyStatement(actions=["dynamodb:Query"], resources=[heartbeats_table_arn(scope, stage)])
         )
-        # The session on the mock pool: where the pool-state table is, as text, and the two
-        # numbers of the configuration the booking is made with.
+        # The session on each pool: where the pool-state table is, as text, and the two numbers
+        # of the configuration a booking is made with.
         environment |= {
             POOLS_STACK_VARIABLE: stage.pools.stack_name,
             POOL_STATE_LOGICAL_ID_VARIABLE: pool_state_logical_id(stage),
@@ -325,13 +346,13 @@ def verify_step(
         statements.append(
             iam.PolicyStatement(actions=["cloudformation:DescribeStackResource"], resources=[pools_stack])
         )
-        # The mock pool's items of the pool-state table, its session among them, read and written:
-        # the partition key may only be that pool's name.
+        # The items of the pool-state table of the pools the script books, their sessions among
+        # them, read and written: the partition key may only be one of those pools' names.
         statements.append(
             iam.PolicyStatement(
                 actions=POOL_STATE_ITEMS,
                 resources=[pool_state_table_arn(scope, stage)],
-                conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}},
+                conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": BOOKED_POOLS}},
             )
         )
     else:

@@ -17,6 +17,12 @@ in that order with `rhi_reporter.github`.
   state a superseded commit takes. When the marks cannot be read, the function fails after
   logging `NO_NOT_RUN` and posts no such success, so that the event is invoked again: a
   verification that may have run nothing is not reported as one that passed.
+- A verification that ended in success and ran its tests is then asked whether its GPU tests ran:
+  the step leaves the mark `gpu-not-run` when it booked the coursework pool and no instance was
+  launched during its wait. With the mark, the status is a success whose description says that the
+  mock pool's tests passed and that the GPU tests did not run for lack of capacity
+  (`status.without_gpu_tests`), never `VERIFIED_DESCRIPTION`. It is read with the mark `not-run`,
+  for the same statuses, and a mark that cannot be read posts no success in the same way.
 - An action of a step that runs before those stages (source, synthesis, self-update, assets)
   reports under each of them, as one of their actions, so that a failure there ends the stage's
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
@@ -92,7 +98,10 @@ an execution are the objects under `verification/<execution ID>/`, and the event
 - `last-stages`: the last lifecycle stage each instance of the tested pools reached, one per line,
   left when the tests failed;
 - `not-run`: one line, the reason no test ran: `canary-missing` or `listener-off`, which the
-  verification script leaves, or `parked`, which the step leaves while the system is parked.
+  verification script leaves, or `parked`, which the step leaves while the system is parked;
+- `gpu-not-run`: one line, the reason the GPU tests did not run, `no-capacity`, which the
+  verification script leaves when no instance of the coursework pool was launched during its wait.
+  The mark alone says so: its line is not read into a status.
 
 A mark is first looked for by listing its key, then read: the function's role may list that
 prefix, so a mark that is not there is told from one that cannot be read. At most `MARK_BYTES` of
@@ -149,6 +158,7 @@ from rhi_reporter.status import (
     State,
     as_it_ran,
     status_for,
+    without_gpu_tests,
 )
 
 if TYPE_CHECKING:
@@ -195,6 +205,7 @@ MARKS_PREFIX = "verification"
 FAILED_TESTS_MARK = "failed-smoke-tests"
 LAST_STAGES_MARK = "last-stages"
 NOT_RUN_MARK = "not-run"
+GPU_NOT_RUN_MARK = "gpu-not-run"
 # At most this much of a mark is read: every smoke test's ID fits in it many times over, and so
 # does a stage for each instance of a fleet at its cap.
 MARK_BYTES = 65536
@@ -533,15 +544,21 @@ def _as_they_ran(
 ) -> list[CommitStatus]:
     """`statuses` as the verification of `execution` ran. When one of them says that the
     verification's tests ran and passed, the mark `not-run` of that execution is read first, and
-    with it that status says instead that no test ran, and why. Raises, after logging `NO_NOT_RUN`,
-    when the marks cannot be read: no status then claims a verification that may have run nothing."""
+    with it that status says instead that no test ran, and why. Without it, the mark `gpu-not-run`
+    is read, and with it that status says instead that the mock pool's tests passed and that the
+    GPU tests did not run for lack of capacity. Raises, after logging `NO_NOT_RUN`, when the marks
+    cannot be read: no status then claims a verification that may have run less than its tests."""
     if not any(status.description == VERIFIED_DESCRIPTION for status in statuses):
         return list(statuses)
     try:
         lines = _mark(aws.s3, artifacts, execution, NOT_RUN_MARK)
+        gpu_not_run = lines is None and _mark(aws.s3, artifacts, execution, GPU_NOT_RUN_MARK) is not None
     except Exception:
         logger.warning(NO_NOT_RUN)
         raise
+    if gpu_not_run:
+        # The mark alone says that the GPU tests did not run, whatever it holds.
+        return [without_gpu_tests(status) for status in statuses]
     # The mark alone says that no test ran, whatever it holds: an empty one is a reason not known.
     reason = None if lines is None else next(iter(lines), "")
     return [as_it_ran(status, reason) for status in statuses]

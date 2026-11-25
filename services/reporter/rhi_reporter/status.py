@@ -39,6 +39,14 @@ the script (`src/rhi/pipeline/verify.py`). No event carries that reason, so `sta
 holds it passes the status through `as_it_ran`, which gives a verification's success the
 description of `not_run_description` in place of `VERIFIED_DESCRIPTION`: one member per known
 reason, `NOT_RUN_REASONS`, and one for any other. The reason is only compared, never written.
+
+**A verification whose GPU tests did not run says so.** When the step books the coursework pool and
+no instance is launched during its wait, it runs the mock pool's tests only, ends in success, and
+leaves a mark of its own (`scripts/pipeline/verify.py`): no capacity is not a failed release
+(section 8.2, step 6). Whoever holds that mark passes the status through `without_gpu_tests`, which
+gives a verification's success the member `VERIFIED_WITHOUT_GPU` in place of
+`VERIFIED_DESCRIPTION`. The implement loop discharges on `VERIFIED_DESCRIPTION` alone, so such a
+success discharges nothing.
 """
 
 import re
@@ -84,6 +92,7 @@ class Description(StrEnum):
     APPROVAL_REFUSED = "The approval was rejected, or it expired: the deployment did not continue."
     VERIFYING = "The verification is running."
     VERIFIED = "The verification's tests ran and passed."
+    VERIFIED_WITHOUT_GPU = "The mock pool's tests passed. The GPU tests did not run, for lack of capacity."
     VERIFICATION_FAILED = "The verification failed."
     NOT_RUN_CANARY_MISSING = "No test ran: the canary's key is missing. The deployment is not verified."
     NOT_RUN_LISTENER_OFF = "No test ran: the endpoint has no HTTPS listener. The deployment is not verified."
@@ -189,6 +198,15 @@ def as_it_ran(status: CommitStatus, reason: object) -> CommitStatus:
     if reason is None or status.description != VERIFIED_DESCRIPTION:
         return status
     return replace(status, description=not_run_description(reason))
+
+
+def without_gpu_tests(status: CommitStatus) -> CommitStatus:
+    """`status` of a verification that left the mark that its GPU tests did not run for lack of
+    capacity: when it says the verification's tests ran and passed, the same status with the
+    description `VERIFIED_WITHOUT_GPU`. Any other status is returned as it is."""
+    if status.description != VERIFIED_DESCRIPTION:
+        return status
+    return replace(status, description=Description.VERIFIED_WITHOUT_GPU)
 
 
 def superseded_description(covering_commit: str) -> str:
