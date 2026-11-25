@@ -1,13 +1,11 @@
 """The fleet's alarms, which work when Grafana is down: CloudWatch alarms that act on the alerts
 topic (system design, section 7.3).
 
-Three guard money from outside the scaler, so that a broken scaler cannot cost money (sections 5.1
-and 5.4). The first two read Auto Scaling's own group metrics (`rhi.pools.group` turns them on),
+Two guard money from outside the scaler, so that a broken scaler cannot cost money (sections 5.1
+and 5.4). The first reads Auto Scaling's own group metrics (`rhi.pools.group` turns them on),
 never what the scaler publishes, in the namespace `AWS/AutoScaling`, by the group's name, each
 statistic the most of its one-minute period:
 
-- **Wanted with nothing in service**, per pool: the group's `GroupDesiredCapacity` above 0 and its
-  `GroupInServiceInstances` at 0, in each of 10 one-minute periods.
 - **Running with nothing in service**, per pool: the group's `GroupTotalInstances` above 0 (the
   group keeps no stopped instance, so every instance it counts runs) and its
   `GroupInServiceInstances` at 0, in each of 20 one-minute periods.
@@ -15,25 +13,37 @@ statistic the most of its one-minute period:
   the scaler publishes after each completed run (`rhi_scaler.cloudwatch`). Missing data is what it
   alarms on, so it breaches.
 
-Each of the three is a metric math expression, or one metric, that is 1 in a period where its
+Each of the two is a metric math expression, or one metric, that is 1 in a period where its
 condition holds, and alarms when it is 1 in every period of its window. They evaluate a wall-clock
-window of whole minutes: the alarm reads exactly its 10, 20 or 5 periods, never an older data
+window of whole minutes: the alarm reads exactly its 20 or 5 periods, never an older data
 point that CloudWatch's default sliding window would reach back for when one is missing. A period
 the fleet's expression has no data for does not breach, so the condition must be seen in every
 period; a period with no completed run does.
 
-Two more come from the scaler's own rules, each per pool, from what the scaler publishes in the
-namespace `rhi/scaler` with the dimension `Pool`, over one one-minute period:
+Three more come from the scaler's own rules, each per pool, from what the scaler publishes in the
+namespace `rhi/scaler` with the dimension `Pool`, the first two reading the most of their one-minute
+period and the third the least:
 
-- **Launches suspended**: `LaunchesSuspended` at 1, after three abandoned launches (section 5.1).
+- **Launches suspended**: `LaunchesSuspended` at 1 in one period, after three abandoned launches
+  (section 5.1).
 - **In service while no session is on**: `MinutesInServiceOutsideSessions` above
-  outside_sessions_alarm_hours, 1 by default, in minutes (sections 11.3 and 17).
+  outside_sessions_alarm_hours, 1 by default, in minutes, in one period (sections 11.3 and 17).
+- **A session short of its instances**: `InstancesMissing` above 0 in each of
+  capacity_alarm_minutes one-minute periods, 30 by default (sections 5.4 and 17). It reads the
+  least of each period, so a minute in which one run saw the session filled is not a minute short,
+  whatever another run of that minute saw: a session filled within the window sends nothing. It
+  evaluates the same wall-clock window of whole minutes, so it reads exactly its periods: when one
+  of them has no data point, no older data point stands in for it, and the alarm keeps its state.
+  It clears when the session is filled, when it ends and when it is lowered to what is in service,
+  since `InstancesMissing` is then 0. The configuration refuses more minutes than the day
+  CloudWatch evaluates one-minute periods over (`rhi.config.MOST_CAPACITY_ALARM_MINUTES`).
 
-These two keep their state while the scaler publishes nothing: the scaler's own alarm says so.
+These three keep their state while the scaler publishes nothing: the scaler's own alarm says so.
 
 Every alarm acts on the alerts topic (`rhi.guardrails.alerts`, whose policy lets CloudWatch publish
-to it). The only dimensions their metrics carry are a group's name and a pool's name: nothing that
-identifies a student (section 6.6).
+to it) when it fires, and on nothing when it clears: `session status` and the fleet dashboard show
+when a session is filled. The only dimensions their metrics carry are a group's name and a pool's
+name: nothing that identifies a student (section 6.6).
 
 The construct creates alarms only, which hold no role and no IAM action.
 
@@ -51,7 +61,13 @@ from typing import TYPE_CHECKING
 from aws_cdk import aws_cloudwatch as cloudwatch
 from constructs import Construct
 
-from rhi_scaler.cloudwatch import LAUNCHES_SUSPENDED, MINUTES_OUTSIDE_SESSIONS, POOL_DIMENSION, RUN_COMPLETED
+from rhi_scaler.cloudwatch import (
+    INSTANCES_MISSING,
+    LAUNCHES_SUSPENDED,
+    MINUTES_OUTSIDE_SESSIONS,
+    POOL_DIMENSION,
+    RUN_COMPLETED,
+)
 from rhi_scaler.cloudwatch import NAMESPACE as SCALER_NAMESPACE
 
 if TYPE_CHECKING:
@@ -66,8 +82,8 @@ AUTO_SCALING_NAMESPACE = "AWS/AutoScaling"
 GROUP_DIMENSION = "AutoScalingGroupName"
 PERIOD_SECONDS = 60
 
-# The periods, of one minute, each condition must hold in.
-WANTED_PERIODS = 10
+# The periods, of one minute, each condition must hold in. How many a session may be short of its
+# instances is the configuration's `capacity_alarm_minutes`.
 RUNNING_PERIODS = 20
 SCALER_PERIODS = 5
 
@@ -96,8 +112,8 @@ def _metric(
 
 
 class AlarmsFleet(Construct):
-    """The scaler's alarm, as `scaler`, and each pool's four, by the pool's name, in `wanted`,
-    `running`, `launches_suspended` and `outside_sessions`."""
+    """The scaler's alarm, as `scaler`, and each pool's four, by the pool's name, in `running`,
+    `launches_suspended`, `outside_sessions` and `short`."""
 
     def __init__(
         self,
@@ -136,8 +152,17 @@ class AlarmsFleet(Construct):
             )
 
         def scaler_alarm(
-            alarm_id: str, description: str, pool: str, name: str, operator: str, threshold: float
+            alarm_id: str,
+            description: str,
+            pool: str,
+            name: str,
+            operator: str,
+            threshold: float,
+            periods: int | None = None,
+            statistic: str = "Maximum",
         ) -> cloudwatch.CfnAlarm:
+            """Over one period, or, when `periods` is given, over exactly that many whole minutes,
+            the condition in each. The statistic is what a period holding several runs reads."""
             return cloudwatch.CfnAlarm(
                 self,
                 alarm_id,
@@ -145,12 +170,14 @@ class AlarmsFleet(Construct):
                 namespace=SCALER_NAMESPACE,
                 metric_name=name,
                 dimensions=[cloudwatch.CfnAlarm.DimensionProperty(name=POOL_DIMENSION, value=pool)],
-                statistic="Maximum",
+                statistic=statistic,
                 period=PERIOD_SECONDS,
-                evaluation_periods=1,
+                evaluation_periods=periods or 1,
+                datapoints_to_alarm=periods,
                 comparison_operator=operator,
                 threshold=threshold,
                 treat_missing_data="ignore",
+                evaluation_window=WALL_CLOCK if periods else None,
                 alarm_actions=actions,
             )
 
@@ -170,20 +197,13 @@ class AlarmsFleet(Construct):
             evaluation_window=WALL_CLOCK,
             alarm_actions=actions,
         )
-        self.wanted: dict[str, cloudwatch.CfnAlarm] = {}
         self.running: dict[str, cloudwatch.CfnAlarm] = {}
         self.launches_suspended: dict[str, cloudwatch.CfnAlarm] = {}
         self.outside_sessions: dict[str, cloudwatch.CfnAlarm] = {}
+        self.short: dict[str, cloudwatch.CfnAlarm] = {}
         for pool, pool_group in groups.items():
             group = {GROUP_DIMENSION: pool_group.group.ref}
             in_service = _metric("in_service", AUTO_SCALING_NAMESPACE, "GroupInServiceInstances", group, "Maximum")
-            self.wanted[pool] = fleet_alarm(
-                f"Wanted-{pool}",
-                f"The pool {pool} has been wanted for 10 minutes with nothing in service.",
-                WANTED_PERIODS,
-                [_metric("desired", AUTO_SCALING_NAMESPACE, "GroupDesiredCapacity", group, "Maximum"), in_service],
-                "IF(desired > 0 AND in_service == 0, 1, 0)",
-            )
             self.running[pool] = fleet_alarm(
                 f"Running-{pool}",
                 f"The group of the pool {pool} has had instances running for 20 minutes with none in service.",
@@ -207,4 +227,17 @@ class AlarmsFleet(Construct):
                 MINUTES_OUTSIDE_SESSIONS,
                 "GreaterThanThreshold",
                 hours * 60,
+            )
+            short_minutes = config.capacity_alarm_minutes
+            self.short[pool] = scaler_alarm(
+                f"Short-{pool}",
+                f"The session of the pool {pool} has had fewer instances in service than it asks for"
+                f" {short_minutes} minutes.",
+                pool,
+                INSTANCES_MISSING,
+                "GreaterThanThreshold",
+                0,
+                short_minutes,
+                # A minute in which a run saw the session filled is not a minute short.
+                "Minimum",
             )
