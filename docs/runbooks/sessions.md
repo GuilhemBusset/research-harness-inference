@@ -261,8 +261,11 @@ Do these the day before the class.
    its start and after a stop. `asked` is what the scaler has asked of AWS for the pool, and the
    run sets it to `requested`, with one exception: a pool whose launches are suspended is not
    raised. Its `asked` goes down with the session and never up, so a session that asks for more
-   than the pool's group had been asked for leaves `asked` where it was, below `requested`: at
-   zero for a pool booked after its launches were suspended. No later run changes that. It is the
+   than the pool's group is asked for leaves `asked` where the run found it, below `requested`.
+   Where that is depends on what the group was asked for just before: zero when the pool had no
+   session and the scaler had already lowered its group, and the number of the earlier session
+   when the pool is booked again within the minute after that session ended, before a run has
+   lowered the group, or when a session under way is raised. No later run raises it. It is the
    runbook [a pool whose launches are suspended](suspended-launches.md).
 
    When the command said that a run was already under way, both may still read the numbers of

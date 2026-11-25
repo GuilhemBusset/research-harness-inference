@@ -125,25 +125,71 @@ pool, by its name in the configuration, which is also the model name `rhi status
          --query 'Activities[].{what:Description,status:StatusCode,why:StatusMessage,started:StartTime,ended:EndTime}'
      ```
 
-     A launch is an activity whose `Description` begins with the word launching. It was abandoned
-     when its `StatusCode` is `Failed` or `Cancelled` and its `StatusMessage` says that the launch's
-     lifecycle hook was abandoned. A launch that failed for lack of capacity, or that the quota
-     refused, says so there instead: it was not abandoned, and is the runbook
-     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service.
+     A launch is an activity whose `Description` begins with the word launching, or names the warm
+     pool as where the instance came from (below). It was abandoned when its `StatusCode` is
+     `Failed` or `Cancelled` and its `StatusMessage` says that the launch's lifecycle hook was
+     abandoned. A launch that failed for lack of capacity, or that the quota refused, says so
+     there instead: it was not abandoned, and is the runbook
+     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service,
+     unless it was a launch into the warm pool (below), and the scaler starts its count again at
+     the time it ended.
 
-     Read the activities against the time when the scaler suspended the launches, which is the
-     time of the run that counted the third abandoned launch. The alarm's e-mail gives the time
-     the alarm changed state, a minute or two after that run, and on the dashboard the pool's
-     panel of scale decisions by reason counts the reason `launch-suspended` from that run on.
-     The scaler counts by the time a launch ended, `EndTime`, and a launch that reaches service
-     starts its count again. So the launches that suspended the pool are the abandoned ones that
-     ended before that time, and after the later of two moments: the end of the last launch that
-     was successful before that time, and the last time a suspension was cleared.
+     Auto Scaling keeps a group's activities for weeks, so the list may still hold those of the
+     warm pool, the stopped instances that each group kept until section 4.5 dropped them. The
+     scaler reads them as it reads the others, with two differences, and so must you to find the
+     same three launches:
 
-     Set aside what ended after that time. A launch already under way when the scaler suspended
-     the launches still runs to its end. One that is abandoned then is one more after the three.
-     One that is successful then did not undo the suspension, which only the admin's command
-     clears, and it is not where the count started: counted from it, the history holds no
+     - an activity whose `Description` says that the instance came from the warm pool, or was
+       moved out of it, is a launch too, whatever word it begins with. `Successful`, the instance
+       reached service and the count starts again there; abandoned, it counts as one;
+     - a `Successful` activity whose `Description` says that the instance was launched into the
+       warm pool reached no service: it was launched to be stopped. It leaves the count as it is,
+       so the abandoned launches before it and after it are counted in one row.
+
+     Read the activities between two times that the scaler keeps in the pool's memory record, in
+     the stage's pool-state table. The table's name, on the line whose logical ID holds
+     `PoolState`:
+
+     ```sh
+     aws cloudformation list-stack-resources --stack-name Rhi-Pools \
+         --query "StackResourceSummaries[?ResourceType=='AWS::DynamoDB::Table'].[LogicalResourceId,PhysicalResourceId]" --output text
+     ```
+
+     and the two times, `<pool-state-table>` being that name:
+
+     ```sh
+     aws dynamodb get-item --table-name <pool-state-table> --consistent-read \
+         --key '{"pool": {"S": "coursework"}, "record": {"S": "memory"}}' \
+         --query 'Item.{suspended_at: suspended_at.N, abandons_counted_from: abandons_counted_from.N}'
+     ```
+
+     Each is a time in seconds, which `date -u -d @<seconds>` prints as a date, in UTC. Read both
+     before clearing anything: the run that finds the suspension cleared removes the first and
+     moves the second.
+
+     - `suspended_at` is the time of the run that counted the third abandoned launch and
+       suspended the launches. The alarm and the dashboard support it and do not replace it. The
+       alarm's e-mail gives the time the alarm changed state, a minute or two after that run. On
+       the dashboard, the pool's panel of scale decisions by reason counts `launch-suspended` for
+       the runs that kept a suspended pool from a raise, or that had nothing else to do on it. A
+       run that lowers the pool instead, as when its session has just ended, counts under
+       `release`, and one that only raises the rebalance number under `rebalance`. The run that
+       suspended the launches can be one of those, so the first `launch-suspended` on the panel
+       may be later than the suspension.
+     - `abandons_counted_from` is where the count last started again by the admin's doing: the
+       time of the run that found an earlier suspension cleared. That run comes up to a minute
+       after the command `pool clear-suspension`, and a launch abandoned between the two is not
+       counted. It reads `null` for a pool whose launches were never suspended before.
+
+     The scaler counts by the time a launch ended, `EndTime`. So the launches that suspended the
+     pool are the abandoned ones that ended by `suspended_at`, and after the later of two
+     moments: the end of the last launch that reached service by `suspended_at`, and
+     `abandons_counted_from` when the record holds one.
+
+     Set aside what ended after `suspended_at`. A launch already under way when the scaler
+     suspended the launches still runs to its end. One that is abandoned then is one more after
+     the three. One that is successful then did not undo the suspension, which only the admin's
+     command clears, and it is not where the count started: counted from it, the history holds no
      abandoned launch at all, while the three are before it. What it does say is that the fault
      does not fail every launch.
 
