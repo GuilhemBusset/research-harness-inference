@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from rhi_common.pool_config import Pool
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, Session
+from rhi_common.records import InstanceHeartbeat, Session
 
 # The longest session, in hours, for a run whose settings give none: the configuration's default.
 SESSION_MAX_HOURS = 12
@@ -63,30 +63,21 @@ class Memory:
     rebalance number, 0 until a run first raises it. `last_rebalance_at` is the time of the run
     that last raised it, and `None` when none has.
 
-    Seven are from the rules that sized a pool by its load, by its idleness and by what the gateway
-    reported: `last_request_at`, `last_in_flight_at`, `above_target_since`, `waiting_since`,
-    `last_scale_out_at`, `low_load_since` and `last_gateway_at`. No rule reads demand any more:
-    `decide` reads none of them and leaves each at its empty value, so a run removes what an
-    earlier one stored.
-
     `outside_sessions_since` only reports (`rhi_scaler.outside_sessions`, sections 11.3 and 17): it
-    is the time of the first of the runs in a row that saw an instance of the pool in service while
-    no session was on, and `None` when the last run did not. `decide` neither reads nor sets it.
+    is where the pool's stretch in service outside its session began, and `None` when the last run
+    saw no instance of the pool in service or saw its session active. `decide` neither reads nor
+    sets it.
 
     `short_since` only reports too (section 5.4): it is the time of the first of the runs in a row
     that saw the pool wait for capacity, with fewer instances starting and in service than were
     asked of AWS, and `None` when the last run did not. The edge sets it when it writes the pool's
-    note (`rhi_scaler.aws_io.apply`), and `decide` neither reads nor sets it. It is not
-    `waiting_since`.
+    note (`rhi_scaler.aws_io.apply`), and `decide` neither reads nor sets it.
+
+    The memory holds nothing of the pool's load, of its idleness or of the gateway: no rule reads
+    demand. What an earlier version stored of them is listed in
+    `rhi_scaler.aws_io.FORMER_MEMORY_ATTRIBUTES`, and the update of the record removes it.
     """
 
-    last_request_at: int | None = None
-    last_in_flight_at: int | None = None
-    above_target_since: int | None = None
-    waiting_since: tuple[tuple[str, int], ...] = ()
-    last_scale_out_at: int | None = None
-    low_load_since: int | None = None
-    last_gateway_at: int | None = None
     launch_suspended: bool = False
     suspended_at: int | None = None
     abandons_counted_from: int | None = None
@@ -101,21 +92,18 @@ class Memory:
 class PoolInputs:
     """One pool, as a run sees it.
 
-    `gateway_heartbeats` and `instance_heartbeats` are the pool's fresh rows of the heartbeats
-    table (`rhi_common.records.is_fresh`). The decision reads the instances' rows, to order a
-    release and for the rebalance, and counts no other. It reads neither `gateway_heartbeats` nor
-    `mode`: the edge still fills them, and no rule sizes a pool by them. `abandoned_launches` is
-    the number of launches abandoned in a row, counted by the edge from the group's activity
-    history from `Memory.abandons_counted_from`: a launch that reaches service ends a row, and one
-    that found no capacity is not abandoned. `session` is the pool's session as its record gives
-    it (`rhi_common.records.Session`), and `None` for a pool with no such record: whether it is
-    active at the time of the run is for `rhi_common.sessions` to say, not for the edge.
+    `instance_heartbeats` are the fresh rows the pool's instances wrote in the heartbeats table
+    (`rhi_common.records.is_fresh`), which the decision reads to order a release and for the
+    rebalance. `abandoned_launches` is the number of launches abandoned in a row, counted by the
+    edge from the group's activity history from `Memory.abandons_counted_from`: a launch that
+    reaches service ends a row, and one that found no capacity is not abandoned. `session` is the
+    pool's session as its record gives it (`rhi_common.records.Session`), and `None` for a pool
+    with no such record: whether it is active at the time of the run is for `rhi_common.sessions`
+    to say, not for the edge.
     """
 
     config: Pool
-    mode: Mode
     supply: Supply
-    gateway_heartbeats: tuple[GatewayHeartbeat, ...] = ()
     instance_heartbeats: tuple[InstanceHeartbeat, ...] = ()
     abandoned_launches: int = 0
     memory: Memory = Memory()

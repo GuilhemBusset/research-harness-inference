@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode
+from rhi_scaler.aws_io import PoolSettings
 from rhi_scaler.settings import SettingsError, read_settings
 
 # A configuration's pools table, with the mock pool.
@@ -55,9 +55,8 @@ def read(data: dict[str, Any]) -> Any:
 def test_the_mock_pool_reads_back() -> None:
     result = read(settings())
     (pool,) = result.pools
-    assert pool.config == parse_pools(CONFIGURATION["pools"])[0]
-    assert (pool.group, pool.target_group) == (GROUP, TARGET_GROUP)
-    assert pool.configured_mode is Mode.ENABLED
+    # The pool's configuration, its group and its target group, and nothing else: no mode.
+    assert pool == PoolSettings(config=parse_pools(CONFIGURATION["pools"])[0], group=GROUP, target_group=TARGET_GROUP)
     assert (result.tables.heartbeats, result.tables.pool_state) == ("heartbeats-table", "pool-state-table")
     assert result.workspace_url == WORKSPACE
     assert result.region == "us-east-1"

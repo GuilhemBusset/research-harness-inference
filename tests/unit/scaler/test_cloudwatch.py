@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 import boto3
@@ -11,7 +10,6 @@ from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode, RecordError
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, Run, TableNames
 from rhi_scaler.metrics import DecisionCounts
@@ -31,14 +29,14 @@ ENTRY = {
     "largest_output": 4_096,
 }
 COURSEWORK, MOCK = parse_pools({"coursework": ENTRY, "mock": ENTRY})
-# Coursework has been in service since an hour and a minute ago with no session on; mock has no
+# Coursework, which has no session, has been in service since an hour and a minute ago; mock has no
 # instance in service and its launches are suspended.
 RUN = Run(
     inputs=Inputs(
         now=NOW,
         pools=(
-            PoolInputs(COURSEWORK, Mode.ENABLED, Supply(1, in_service=("i-a",)), memory=Memory(outside_sessions_since=NOW - 3660)),
-            PoolInputs(MOCK, Mode.ENABLED, Supply(0), memory=Memory(outside_sessions_since=NOW - 600)),
+            PoolInputs(COURSEWORK, Supply(1, in_service=("i-a",)), memory=Memory(outside_sessions_since=NOW - 3660)),
+            PoolInputs(MOCK, Supply(0), memory=Memory(outside_sessions_since=NOW - 600)),
         ),
     ),
     groups={},
@@ -122,23 +120,6 @@ def test_no_published_metric_has_a_dimension_other_than_the_pool(monkeypatch: py
     for datum in call["MetricData"]:
         assert [dimension["Name"] for dimension in datum.get("Dimensions", [])] in ([], ["Pool"])
     assert {d["Dimensions"][0]["Value"] for d in call["MetricData"] if "Dimensions" in d} == {"coursework", "mock"}
-
-
-def test_a_switch_that_could_not_be_read_fails_the_run_after_its_decision_and_publishes_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    applied: list[Decision] = []
-    recorder = Recorder()
-    monkeypatch.setattr(scaler.aws_io, "read", lambda *_: replace(RUN, session_error=RecordError("unreadable")))
-    monkeypatch.setattr(scaler, "decide", lambda *_: DECISION)
-    monkeypatch.setattr(scaler.aws_io, "apply", lambda clients, tables, run, decision: applied.append(decision))
-    clients = Clients(autoscaling=None, elbv2=None, dynamodb=None, cloudwatch=recorder)
-    with pytest.raises(RecordError):
-        scaler.run_cycle(SETTINGS, clients, Recorder(), NOW, DecisionCounts())  # ty: ignore[invalid-argument-type] - a test double
-    assert recorder.calls == []
-    # The decision was applied: coursework, in service, kept its stretch; mock, with none in service, ended its own.
-    (decision,) = applied
-    assert [pool.memory.outside_sessions_since for pool in decision.pools] == [NOW - 3660, None]
 
 
 def test_a_publication_cloudwatch_refuses_fails_the_run(monkeypatch: pytest.MonkeyPatch) -> None:

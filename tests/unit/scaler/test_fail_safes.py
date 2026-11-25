@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode, Session
+from rhi_common.records import Session
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -39,7 +39,7 @@ def session(instances: int = 1) -> Session:
 
 def run(supply: Supply, now: int = NOW, **fields: object) -> PoolDecision:
     """One run at `now` of a pool whose session asks for one instance, unless `fields` give another."""
-    pool = replace(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=supply, session=session()), **fields)
+    pool = replace(PoolInputs(config=POOL, supply=supply, session=session()), **fields)
     return decide(Inputs(now=now, pools=(pool,))).pools[0]
 
 

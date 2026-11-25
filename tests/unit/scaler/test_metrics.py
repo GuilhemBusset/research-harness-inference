@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import LaunchFailure, Mode, ScalerNote, Session
+from rhi_common.records import LaunchFailure, ScalerNote, Session
 from rhi_scaler.metrics import DECISIONS, LAUNCH_FAILURE, SUPPLY_GAUGES, DecisionCounts, decode, encode, fleet_series
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -52,7 +52,7 @@ def run(
 ) -> dict[tuple[str, ...], list[tuple[float, int]]]:
     """The series of one run, by their label values in the order of the label names: the series'
     name, then the cause if it has one, the pool, and the reason if it has one."""
-    pool = PoolInputs(config=POOL, mode=Mode.ENABLED, supply=Supply(desired=1, in_service=("i-a",)), session=session)
+    pool = PoolInputs(config=POOL, supply=Supply(desired=1, in_service=("i-a",)), session=session)
     inputs = Inputs(now=now, pools=(pool,))
     decision = Decision(pools=(PoolDecision("mock", 1, (), False, Memory(), reason),))
     out = {}

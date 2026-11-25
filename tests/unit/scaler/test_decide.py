@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import itertools
 from pathlib import Path
 
 import pytest
 
 import rhi_scaler.decide
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import FRESH_SECONDS, GatewayHeartbeat, InstanceHeartbeat, Mode, Session
+from rhi_common.records import FRESH_SECONDS, InstanceHeartbeat, Session
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -43,14 +42,6 @@ def session(instances: int = 2, *, starts_at: int = NOW - HOUR, ends_at: int = N
     return Session(POOL.name, instances, starts_at, ends_at, set_by="instructor", set_at=starts_at - HOUR)
 
 
-def gateway(
-    task: str = "task-1", *, in_flight: int = 0, held: int = 0, last_request_at: int | None = None
-) -> GatewayHeartbeat:
-    return GatewayHeartbeat(
-        task=task, pool=POOL.name, in_flight=in_flight, held=held, last_request_at=last_request_at, written_at=NOW
-    )
-
-
 def instance(name: str, *, running: int = 0, waiting: int = 0, written_at: int = NOW) -> InstanceHeartbeat:
     return InstanceHeartbeat(
         instance=name,
@@ -66,7 +57,7 @@ def instance(name: str, *, running: int = 0, waiting: int = 0, written_at: int =
 
 def decide_one(supply: Supply, *, session_max_hours: int = 12, **fields: object) -> PoolDecision:
     """The decision of one run at `NOW` for the pool with that supply, and the inputs `fields` give."""
-    pool = dataclasses.replace(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=supply), **fields)
+    pool = dataclasses.replace(PoolInputs(config=POOL, supply=supply), **fields)
     (decision,) = decide(Inputs(now=NOW, pools=(pool,), session_max_hours=session_max_hours)).pools
     assert decision.pool == POOL.name
     assert isinstance(decision.reason, Reason)
@@ -206,27 +197,7 @@ def test_a_raise_keeps_its_reason_in_a_run_that_names_instances() -> None:
     assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.PROVISION)
 
 
-def test_no_rule_reads_demand() -> None:
-    long_ago = NOW - 6 * HOUR
-    gateways: tuple[tuple[GatewayHeartbeat, ...], ...] = (
-        (),
-        (gateway(held=12, last_request_at=NOW), gateway("task-2", held=8, last_request_at=NOW)),
-        (gateway(in_flight=40, last_request_at=NOW),),
-        (gateway(last_request_at=long_ago),),
-    )
-    memories = (
-        Memory(),
-        # What the rules of load, of idleness and of the silent gateway kept.
-        Memory(
-            last_request_at=long_ago,
-            last_in_flight_at=long_ago,
-            above_target_since=NOW - 10 * MINUTE,
-            waiting_since=(("instance-a", NOW - 10 * MINUTE),),
-            last_scale_out_at=long_ago,
-            low_load_since=long_ago,
-            last_gateway_at=NOW - HOUR,
-        ),
-    )
+def test_what_the_instances_report_sizes_no_pool() -> None:
     # Both instances run as many requests as the target, and more wait on each.
     full = (instance("instance-a", running=8, waiting=4), instance("instance-b", running=8, waiting=4))
     idle = (instance("instance-a"), instance("instance-b"))
@@ -240,32 +211,18 @@ def test_no_rule_reads_demand() -> None:
 
     decisions: dict[str, PoolDecision] = {}
     for name, (supply, record, reports) in pools.items():
-        # The same decision, whatever the gateways' heartbeats, the mode and the old memory say.
-        seen = {
-            decide_one(
-                supply,
-                session=record,
-                instance_heartbeats=reports,
-                gateway_heartbeats=heartbeats,
-                mode=mode,
-                memory=memory,
-            )
-            for heartbeats, mode, memory in itertools.product(gateways, Mode, memories)
-        }
-        assert len(seen) == 1, name
-        (decisions[name],) = seen
-        # And the memory's attributes of load, of idleness and of the gateway are left empty: it
-        # holds what the rebalance counts, and nothing else.
+        decisions[name] = decide_one(supply, session=record, instance_heartbeats=reports)
+        # The memory holds what the rebalance counts, and nothing else of the load.
         assert dataclasses.replace(decisions[name].memory, queuing_since=()) == Memory(), name
 
     def outcome(name: str) -> tuple[int, tuple[str, ...], Reason]:
         return decisions[name].desired, decisions[name].lift_protection, decisions[name].reason
 
-    # Held requests wake nothing.
+    # A pool with no session stays at zero.
     assert outcome("at zero, no session") == (0, (), Reason.UNCHANGED)
     # A full pool does not grow.
     assert outcome("full, at its session's number") == (2, (), Reason.UNCHANGED)
-    # An idle pool stays at its session's number, in any mode, and a silent gateway releases nothing.
+    # An idle pool stays at its session's number.
     assert outcome("idle, at its session's number") == (2, (), Reason.UNCHANGED)
     # What is released is what the session no longer asks for, and nothing else decides it.
     assert outcome("above its session's number") == (1, ("instance-a",), Reason.RELEASE)
@@ -292,16 +249,13 @@ def test_the_decision_is_a_function_of_its_inputs_alone() -> None:
         for alias in node.names
     }
     assert imported == {"__future__", "rhi_common.records", "rhi_common.sessions", "rhi_scaler.model"}
-    # It reads neither the gateways' heartbeats nor the pool's mode, which the inputs still carry.
-    read = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    assert not read & {"gateway_heartbeats", "mode"}
 
     # Every pool of the inputs gets its decision, in order, and the same inputs get the same one.
     inputs = Inputs(
         now=NOW,
         pools=(
-            PoolInputs(config=POOL, mode=Mode.ENABLED, supply=AT_ZERO, session=session(3)),
-            PoolInputs(config=POOL, mode=Mode.ENABLED, supply=TWO_IN_SERVICE),
+            PoolInputs(config=POOL, supply=AT_ZERO, session=session(3)),
+            PoolInputs(config=POOL, supply=TWO_IN_SERVICE),
         ),
     )
     decision = decide(inputs)

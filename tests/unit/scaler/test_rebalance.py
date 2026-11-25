@@ -10,7 +10,7 @@ from boto3.dynamodb.types import TypeSerializer
 from botocore.stub import ANY, Stubber
 
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, Session
+from rhi_common.records import InstanceHeartbeat, Session
 from rhi_scaler.aws_io import (
     Clients,
     PoolSettings,
@@ -60,7 +60,6 @@ def run(now: int, supply: Supply, *reports: Report, memory: Memory, instances: i
     (name, running, waiting), written at `now`."""
     inputs = PoolInputs(
         config=pool,
-        mode=Mode.ENABLED,
         supply=supply,
         instance_heartbeats=tuple(instance_heartbeat(report, now) for report in reports),
         memory=memory,
@@ -146,7 +145,7 @@ def serialize(item: dict[str, Any]) -> dict[str, Any]:
 
 def test_the_number_reaches_the_note() -> None:
     tables = TableNames(heartbeats="heartbeats-table", pool_state="pool-state-table")
-    settings = PoolSettings(config=POOL, group="group", target_group="targets", configured_mode=Mode.ENABLED)
+    settings = PoolSettings(config=POOL, group="group", target_group="targets")
     options = {"region_name": "us-east-1", "aws_access_key_id": "stub", "aws_secret_access_key": "stub"}
     clients = Clients(*(boto3.client(name, **options) for name in ("autoscaling", "elbv2", "dynamodb", "cloudwatch")))
     autoscaling, elbv2, dynamodb = Stubber(clients.autoscaling), Stubber(clients.elbv2), Stubber(clients.dynamodb)
@@ -173,18 +172,15 @@ def test_the_number_reaches_the_note() -> None:
     with autoscaling, elbv2, dynamodb:
         for seconds, (neighbour, number) in steps.items():
             now = T + seconds
-            heartbeats = [
-                GatewayHeartbeat("task-0", POOL.name, 13, 0, now, now).to_item(),
-                *(instance_heartbeat(report, now).to_item() for report in (WAITS, neighbour)),
-            ]
+            heartbeats = [instance_heartbeat(report, now).to_item() for report in (WAITS, neighbour)]
             autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": ["group"]})
             autoscaling.add_response("describe_scaling_activities", {"Activities": []}, name)
             elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": health}, {"TargetGroupArn": "targets"})
-            # The pool-state table holds what the run before stored, and the pool's session of two.
-            for table, items in ((tables.pool_state, [*stored, session().to_item()]), (tables.heartbeats, heartbeats)):
-                dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, {"TableName": table, **query})
-            # No session switch.
-            dynamodb.add_response("get_item", {}, {"TableName": tables.pool_state, "Key": ANY, "ConsistentRead": True})
+            # The memory the run before stored, and the pool's session of two.
+            records = [serialize(item) for item in (*stored[1:], session().to_item())]
+            dynamodb.add_response("batch_get_item", {"Responses": {tables.pool_state: records}}, {"RequestItems": ANY})
+            rows = [serialize(item) for item in heartbeats]
+            dynamodb.add_response("query", {"Items": rows}, {"TableName": tables.heartbeats, **query})
             read_run = read(clients, tables, [settings], now)
             decision = decide(read_run.inputs)
             # The two items the table must receive, exactly. No Auto Scaling call is queued: one would fail.
