@@ -11,9 +11,10 @@ listed, because every stack and every asset a later change adds to the stage bri
   with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
   an arm64 emulator and the buildx plugin, each a download from its project's releases on GitHub
   by its exact version, checked against a checksum before it is extracted or run: the commands of
-  `INSTALLS_THE_IMAGE_BUILDER`, all of them and in their order, and no other. It runs, pulls and
-  creates no image, an emulator's or a builder's. It is left out in the asset stage, and
-  so is that stage while it holds nothing else: CDK Pipelines creates it with the first asset;
+  `INSTALLS_THE_IMAGE_BUILDER`, all of them and in their order, in the `commands` of one phase,
+  and no other. It runs, pulls and creates no image, an emulator's or a builder's. It is left out
+  in the asset stage, and so is that stage while it holds nothing else: CDK Pipelines creates it
+  with the first asset;
 - a stack's deployment action: a CloudFormation action that prepares or executes a change set, or
   creates and updates a stack.
 
@@ -214,10 +215,11 @@ INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
 # binfmt project, the tool and the emulators of the QEMU version the release is named after: each
 # downloaded, checked and extracted in one folder, then registered by the tool. Nothing here runs
 # an image or creates a builder: the build is the Docker daemon's own builder's.
-# The commands are allowed as one sequence, whole and in this order, and not one by one: a file is
-# extracted, and a tool run, only under the check of its checksum. `INSTALLS_THE_IMAGE_BUILDER`
-# matches them joined by a line feed, so that the release and the QEMU version of one line are
-# those of the others.
+# The commands are allowed as one sequence, whole and in this order, in the `commands` of one
+# phase, and not one by one: a file is extracted, and a tool run, only under the check of its
+# checksum, and a check that fails ends the `commands` of its phase and nothing else.
+# `INSTALLS_THE_IMAGE_BUILDER` matches them joined by a line feed, so that the release and the
+# QEMU version of one line are those of the others.
 EMULATOR = r"/opt/binfmt"
 EMULATOR_TOOL = r"binfmt_linux-amd64\.tar\.gz"
 EMULATORS = r"qemu_v(?P=qemu)_linux-amd64\.tar\.gz"
@@ -493,33 +495,48 @@ def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any
     return resource.get("Properties", {}).get("Source", {}).get("BuildSpec")
 
 
-def commands_of(build_spec: Any) -> list[str] | None:
-    """The commands of a build specification written as text, of every phase, in the order
-    CodeBuild runs the phases whatever the order they are written in, a phase it does not know
-    last. None when it is not such a build specification."""
+def blocks_of(build_spec: Any) -> list[list[str]] | None:
+    """The commands of a build specification written as text, as the blocks CodeBuild runs: the
+    `commands` of each phase, then its `finally`, in the order CodeBuild runs the phases whatever
+    the order they are written in, a phase it does not know last. A command that fails ends its
+    `commands` block, and nothing else: the `finally` of its phase runs after it, and a later
+    phase may. A phase's `commands` block is first of its two, at an even place. None when it is
+    not such a build specification."""
     try:
         phases = json.loads(build_spec)["phases"]
         ordered = sorted(phases, key=lambda phase: PHASES.index(phase) if phase in PHASES else len(PHASES))
-        commands = [
-            command for phase in ordered for key in ("commands", "finally") for command in phases[phase].get(key, [])
-        ]
+        blocks = [list(phases[phase].get(key, [])) for phase in ordered for key in ("commands", "finally")]
     except (TypeError, ValueError, KeyError, AttributeError):  # Not such a build specification.
         return None
-    return commands if all(isinstance(command, str) for command in commands) else None
+    return blocks if all(isinstance(command, str) for block in blocks for command in block) else None
+
+
+def commands_of(build_spec: Any) -> list[str] | None:
+    """The commands of a build specification written as text, of every block, in the order
+    CodeBuild runs them. None when it is not such a build specification."""
+    blocks = blocks_of(build_spec)
+    return None if blocks is None else [command for block in blocks for command in block]
 
 
 def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
     """Whether an action is a CodeBuild action whose project does nothing but publish assets:
     its build specification installs `cdk-assets` and publishes with it, and runs nothing else,
     or nothing else than the whole sequence that installs the pinned emulator and buildx plugin an
-    image is built with, in its order."""
-    commands = commands_of(build_spec_of(action, template))
-    if commands is None:
+    image is built with, in its order and in the `commands` of one phase: there, and only there,
+    a checksum that does not match ends the sequence before the file is extracted or run."""
+    blocks = blocks_of(build_spec_of(action, template))
+    if blocks is None:
         return False
-    publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
-    others = [command for command in commands if command not in publishing]
-    others = [command for command in others if not INSTALLS_THE_PUBLISHER.fullmatch(command)]
-    return bool(publishing) and (not others or INSTALLS_THE_IMAGE_BUILDER.fullmatch("\n".join(others)) is not None)
+    publishes = any(PUBLISHES_ASSETS.fullmatch(command) for block in blocks for command in block)
+    others = [
+        (place, command)
+        for place, block in enumerate(blocks)
+        for command in block
+        if not PUBLISHES_ASSETS.fullmatch(command) and not INSTALLS_THE_PUBLISHER.fullmatch(command)
+    ]
+    in_one_commands_block = len({place for place, _ in others}) == 1 and others[0][0] % 2 == 0
+    installs = INSTALLS_THE_IMAGE_BUILDER.fullmatch("\n".join(command for _, command in others)) is not None
+    return publishes and (not others or (in_one_commands_block and installs))
 
 
 def deploys_a_stack(action: Mapping[str, Any]) -> bool:
@@ -1769,13 +1786,15 @@ def a_publisher_that_installs(installs: list[str]) -> Change:
     return a_publisher_with({"install": [INSTALLS_CDK_ASSETS, *installs], "build": [PUBLISH]})
 
 
-def a_publisher_with(commands: dict[str, list[str]]) -> Change:
+def a_publisher_with(commands: dict[str, list[str]], last: dict[str, list[str]] | None = None) -> Change:
     """Adds to the asset stage a project whose build specification writes these phases, in this
-    order, each with its commands."""
+    order, each with its commands, and with those of `last` in its `finally` block."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         codebuild = cdk.aws_codebuild
-        phases = {phase: {"commands": commands[phase]} for phase in commands}
+        phases: dict[str, dict[str, list[str]]] = {phase: {"commands": commands[phase]} for phase in commands}
+        for phase, run_last in (last or {}).items():
+            phases[phase]["finally"] = run_last
         spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
         project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
         synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
@@ -1833,6 +1852,24 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that writes the check first, in a phase that runs after the extraction",
+        ),
+        pytest.param(
+            a_publisher_with(
+                {"install": [INSTALLS_CDK_ASSETS, DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL], "build": [PUBLISH]},
+                last={"install": IMAGE_BUILDER[2:]},
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that extracts the emulator's tool in a block a failed check does not end",
+        ),
+        pytest.param(
+            a_publisher_with(
+                {
+                    "build": [INSTALLS_CDK_ASSETS, DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL],
+                    "post_build": [*IMAGE_BUILDER[2:], PUBLISH],
+                }
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that extracts the emulator's tool in a phase a failed check does not end",
         ),
         pytest.param(
             a_publisher_that_installs(

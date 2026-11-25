@@ -71,8 +71,16 @@ TAKES_AN_IMAGE = {
     ("manifest", "inspect"): INSPECTS_A_MANIFEST,
     ("buildx", "imagetools", "inspect"): INSPECTS_AN_IMAGE,
 }
-# The options of `docker` itself, before its command, that take no value.
+# The options of `docker` itself and of a management command, before its command, that take no
+# value.
 DOCKER_TAKES_NO_VALUE = frozenset({"-D", "--debug", "--help", "--tls", "--tlsverify"})
+# Another name of a management command.
+ALIASES = {"builder": "buildx"}
+# The options of a Docker command whose value is an image, as a build's cache is, and the keys by
+# which the value of an option names one (`--driver-opt image=`, `--cache-from type=registry,ref=`,
+# `--attest type=sbom,generator=`), in a word of their own or after the option's `=`.
+NAMES_AN_IMAGE = ("--cache-from", "--cache-to")
+IMAGE_KEY = re.compile(r"(?:^|[=,])(?:image|ref|generator)=([^,]+)")
 # What ends a command in a line of shell: an operator, a parenthesis, a redirection, a backquote.
 ENDS_A_COMMAND = re.compile(r"[();<>|&`]+")
 
@@ -197,19 +205,39 @@ def after_options(words: list[str], take_no_value: frozenset[str]) -> list[str]:
     return words[index:]
 
 
+def under(call: list[str], names: tuple[str, ...]) -> list[str] | None:
+    """What follows, in a call of `docker`, the command of these names, each written after the
+    options of the one before it. None when the call is of another command."""
+    words = call
+    for name in names:
+        words = after_options(words, DOCKER_TAKES_NO_VALUE)
+        if not words or ALIASES.get(words[0], words[0]) != name:
+            return None
+        words = words[1:]
+    return words
+
+
 def images_of(command: str) -> list[str]:
     """The container images a command names: the first operand of each Docker command that takes
-    an image, after its options and their values, each `image=` option, and each image a build is
-    given as a context (`docker-image://`). A call that names its image nowhere this can read is
-    given whole: it is no reference to another registry, and no image by its digest."""
-    words = [word for line in command_lines(command) for word in line if len(word.split()) == 1]
-    found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
-    found += [word.split("docker-image://", 1)[1] for word in words if "docker-image://" in word]
+    an image, after its options and their values, the value of each option or key that names an
+    image, and each image a build is given as a context (`docker-image://`). A call that names its
+    image nowhere this can read is given whole: it is no reference to another registry, and no
+    image by its digest."""
+    found = []
+    for line in command_lines(command):
+        for index, word in enumerate(line):
+            if len(word.split()) != 1:  # A command line itself, read as its own line.
+                continue
+            found += IMAGE_KEY.findall(word)
+            found += [word.split("docker-image://", 1)[1]] if "docker-image://" in word else []
+            option, joined, value = word.partition("=")
+            value = value if joined else next(iter(line[index + 1 :]), "")
+            if option in NAMES_AN_IMAGE and "=" not in value:  # With keys, `ref=` names the image.
+                found.append(value or word)
     for call in docker_calls(command):
-        words = after_options(call, DOCKER_TAKES_NO_VALUE)
-        for subcommand, take_no_value in TAKES_AN_IMAGE.items():
-            if tuple(words[: len(subcommand)]) == subcommand:
-                operands = after_options(words[len(subcommand) :], take_no_value)
+        for names, take_no_value in TAKES_AN_IMAGE.items():
+            if (words := under(call, names)) is not None:
+                operands = after_options(words, take_no_value)
                 found.append(operands[0] if operands else " ".join(["docker", *call]))
     return found
 
@@ -241,10 +269,10 @@ def selects_a_builder(commands: list[str]) -> list[str]:
     or by `BUILDX_BUILDER`."""
     found = []
     for command in commands:
-        calls = [after_options(call, DOCKER_TAKES_NO_VALUE) for call in docker_calls(command)]
+        calls = docker_calls(command)
         words = [word for line in command_lines(command) for word in line]
         if (
-            any(call[:2] in (["buildx", "create"], ["buildx", "use"]) for call in calls)
+            any(under(call, ("buildx", name)) is not None for call in calls for name in ("create", "use"))
             or any(word == "--builder" or word.startswith("--builder=") for word in words)
             or "BUILDX_BUILDER" in command
         ):
@@ -459,6 +487,22 @@ SHA = "@sha256:" + "0" * 64
             id="a build with an image as a context",
         ),
         pytest.param(
+            "docker buildx --debug create --use --driver docker-container --driver-opt=image=moby/buildkit:v0.34.2",
+            ["moby/buildkit:v0.34.2"],
+            id="a builder's image, after the option's =",
+        ),
+        pytest.param(
+            f"docker --debug buildx -D imagetools inspect moby/buildkit{SHA}",
+            [f"moby/buildkit{SHA}"],
+            id="a read of a manifest, with options before each command",
+        ),
+        pytest.param("docker build --cache-from python:3.13 .", ["python:3.13"], id="a build with an image as a cache"),
+        pytest.param(
+            f"docker buildx build --cache-from=type=registry,ref=docker.io/library/python{SHA} .",
+            [f"docker.io/library/python{SHA}"],
+            id="a build with an image as a cache, named by a key",
+        ),
+        pytest.param(
             "curl -fsSL https://registry-1.docker.io/v2/library/python/manifests/3.13",
             ["https://registry-1.docker.io/v2/library/python/manifests/3.13"],
             id="a word that names a host of Docker Hub",
@@ -482,6 +526,10 @@ def test_an_image_on_docker_hub_is_refused(command: str, expected: list[str]) ->
             id="a run from another registry, with words like images among its options and arguments",
         ),
         pytest.param(f"docker run --rm localhost:5000/tool{SHA} --install arm64", id="a run from a local registry"),
+        pytest.param(
+            "docker build --cache-from type=registry,ref=public.ecr.aws/example/cache --cache-to type=inline .",
+            id="a build with a cache from another registry",
+        ),
         pytest.param("docker buildx version", id="a Docker command that takes no image"),
         pytest.param("curl -fsSL -o tool https://example.com/docker.io.tar.gz", id="a file named like the host"),
     ],
@@ -499,6 +547,11 @@ def test_what_names_no_image_on_docker_hub_is_accepted(command: str) -> None:
         pytest.param(
             '"$HOME/.docker/cli-plugins/docker-buildx" create --use', id="a builder created by the plugin's file"
         ),
+        pytest.param(
+            "docker buildx --debug create --use --driver docker-container --driver-opt=image=moby/buildkit:v0.34.2",
+            id="a builder created after an option of buildx",
+        ),
+        pytest.param("docker builder create --use", id="a builder created under buildx's other name"),
         pytest.param("docker buildx build --builder=rhi-assets .", id="a builder given to one build"),
         pytest.param("export BUILDX_BUILDER=rhi-assets", id="a builder selected by the variable"),
     ],

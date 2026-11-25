@@ -11,8 +11,9 @@ The Dockerfiles are those git lists, tracked or untracked but not ignored: the p
 step runs the tests in a work tree with no commit, where every file is untracked. A file is read
 the way BuildKit's parser reads it (`frontend/dockerfile/parser`), as far as FROM lines and the
 directive go: what a comment, a continued line or a byte-order mark does there, it does here. A
-here-document is not read as one: a line of its body that starts with FROM is taken for an
-instruction, which can only refuse more.
+here-document is not read as one. Under the first instruction that may open one, a line that
+starts with FROM is taken for an instruction, and no FROM line there names a stage a later one
+may take: both can only refuse more.
 """
 
 from __future__ import annotations
@@ -106,44 +107,61 @@ def syntax_image(dockerfile: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def instructions(dockerfile: str) -> list[str]:
-    """A Dockerfile's instructions, each as one line. A line that ends with the escape character,
-    `\\` unless the `escape` directive names the other, continues on the next, past the comments
-    and the blank lines between them. A comment is no instruction and never continues."""
+def instruction_at(lines: list[str], start: int, continues: re.Pattern[str]) -> tuple[str, int]:
+    """The instruction a line starts, as one line, and the place of the line under its last. A
+    line that ends with the escape character continues on the next, past the comments and the
+    blank lines between them."""
+    instruction, at = "", start
+    piece = lines[start].lstrip()
+    while True:
+        continued = continues.search(piece)
+        instruction += piece[: continued.start()] if continued else piece
+        at += 1
+        while continued and at < len(lines) and (not lines[at].strip() or lines[at].lstrip().startswith("#")):
+            at += 1
+        if not continued or at == len(lines):
+            return instruction, at
+        piece = lines[at]
+
+
+def instructions(dockerfile: str) -> list[tuple[str, bool]]:
+    """A Dockerfile's instructions, each as one line, and whether it is one for sure. The escape
+    character is `\\` unless the `escape` directive names the other. A comment is no instruction
+    and never continues. Under an instruction that may open a here-document, one written with
+    `<<`, a line may be the document's and no instruction, and where the document ends is not
+    read: there, every line is read as the start of an instruction, and none is one for sure."""
     lines = lines_of(dockerfile)
     escape = directives([line.lstrip() for line in lines]).get("escape", "\\")
     escape = re.escape(escape if escape == "`" else "\\")
     continues = re.compile(rf"(?<!{escape}){escape}[ \t]*$")
     found = []
-    rest = iter(lines)
-    for line in rest:
-        if line.lstrip().startswith("#"):
+    sure, at = True, 0
+    while at < len(lines):
+        if lines[at].lstrip().startswith("#"):
+            at += 1
             continue
-        instruction = ""
-        piece: str | None = line.lstrip()
-        while piece is not None:
-            continued = continues.search(piece)
-            instruction += piece[: continued.start()] if continued else piece
-            following = (other for other in rest if other.strip() and not other.lstrip().startswith("#"))
-            piece = next(following, None) if continued else None
+        instruction, after = instruction_at(lines, at, continues)
         if instruction.strip():
-            found.append(instruction)
+            found.append((instruction, sure))
+        sure = sure and "<<" not in instruction
+        at = after if sure else at + 1
     return found
 
 
 def bases(dockerfile: str) -> list[str]:
     """The images a Dockerfile's FROM lines make the builder pull. `FROM scratch` pulls nothing,
-    and neither does a FROM that names an earlier stage of the same file."""
+    and neither does a FROM that names an earlier stage of the same file, one that a FROM line
+    which is an instruction for sure names."""
     found = []
     stages: set[str] = set()
-    for instruction in instructions(dockerfile):
+    for instruction, sure in instructions(dockerfile):
         words = instruction.split()
         if words[0].upper() != "FROM":
             continue
         arguments = list(dropwhile(lambda word: word.startswith("--"), words[1:]))
         if arguments and arguments[0] != "scratch" and arguments[0].lower() not in stages:
             found.append(arguments[0])
-        if len(arguments) == 3 and arguments[1].upper() == "AS":
+        if sure and len(arguments) == 3 and arguments[1].upper() == "AS":
             stages.add(arguments[2].lower())
     return found
 
@@ -273,6 +291,16 @@ ECR_PUBLIC = f"public.ecr.aws/docker/library/python:3.13{SHA}"
             id="a FROM under a line that ends with a backslash, when the escape character is another",
         ),
         pytest.param(
+            "FROM scratch AS files\nCOPY <<EOF /Dockerfile\nFROM scratch AS python\nEOF\nFROM python\n",
+            [("python", ON_DOCKER_HUB), ("python", NO_DIGEST)],
+            id="a FROM that names a stage only a here-document's FROM line names",
+        ),
+        pytest.param(
+            f"FROM scratch\nRUN <<#EOF\necho \\\n#EOF\nFROM python{SHA}\n",
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under a here-document whose last line ends with the escape character",
+        ),
+        pytest.param(
             f'ARG BASE=python\nFROM "docker.io"/library/python{SHA}\nFROM ${{BASE}}{SHA}\n',
             [(f'"docker.io"/library/python{SHA}', NOT_READ), (f"${{BASE}}{SHA}", NOT_READ)],
             id="an image written with a quote, and one with a variable",
@@ -297,6 +325,10 @@ def test_an_image_on_docker_hub_or_without_its_digest_is_refused(
         pytest.param(
             f"FROM --platform=$BUILDPLATFORM {ECR_PUBLIC} AS build\nFROM build AS test\nFROM scratch\n",
             id="an earlier stage",
+        ),
+        pytest.param(
+            f"FROM {ECR_PUBLIC} AS build\nRUN <<EOF\necho built\nEOF\nFROM build\n",
+            id="a stage named above a here-document",
         ),
         pytest.param(f"# syntax=ghcr.io/example/dockerfile:1{SHA}\nFROM localhost/base{SHA}\n", id="other hosts"),
         pytest.param("FROM scratch\n# syntax=docker/dockerfile:1\n", id="a comment like the directive, under a FROM"),
