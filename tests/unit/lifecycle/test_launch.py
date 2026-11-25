@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 
 from rhi_lifecycle import release
 from rhi_lifecycle.host import Host, HostError
-from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, Engine, Launch, Metadata, Outcome, fetch
+from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, NO_ACTION, Engine, Launch, Metadata, Outcome, fetch
 from rhi_mock_engine.app import Settings, create_app
 
 if TYPE_CHECKING:
@@ -86,11 +86,15 @@ class World(Host):
         self.pull_fails = False
         self.pull_limits: list[float | None] = []
         self.start_fails = False
-        # The record of a launch under way: whether the host keeps one, whether it can be written,
-        # and what it was at each of the steps named.
+        # The record of a launch under way: whether the host keeps one, and one that its steps
+        # passed, whether each can be written, and what the two were at each of the steps named.
         self.on_record = False
+        self.passed = False
         self.record_fails = False
-        self.recorded: list[tuple[str, bool]] = []
+        self.pass_fails = False
+        self.recorded: list[tuple[str, bool, bool]] = []
+        # The error code of Auto Scaling's answer to a completion, when it takes none.
+        self.refuses: str | None = None
         # The engine: healthy this long after its start (None: never), and its answer to the
         # warm-up request (None: none, the request stays unanswered).
         self.started_at: float | None = None
@@ -136,7 +140,7 @@ class World(Host):
 
     def start_engine(self, timeout: float | None = None) -> None:
         self.calls.append("start")
-        self.recorded.append(("start", self.on_record))
+        self.recorded.append(("start", self.on_record, self.passed))
         if self.start_fails:
             raise HostError("start", 1)
         self.started_at = self.now
@@ -146,8 +150,13 @@ class World(Host):
             raise HostError("record", 1)
         self.on_record = True
 
+    def pass_launch(self) -> None:
+        if self.pass_fails:
+            raise HostError("record", 1)
+        self.passed = True
+
     def end_launch(self) -> None:
-        self.on_record = False
+        self.on_record = self.passed = False
 
     # The SDK's clients.
 
@@ -163,7 +172,9 @@ class World(Host):
 
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         self.calls.append("complete")
-        self.recorded.append(("complete", self.on_record))
+        self.recorded.append(("complete", self.on_record, self.passed))
+        if self.refuses is not None:
+            raise ClientError({"Error": {"Code": self.refuses}}, "CompleteLifecycleAction")
         self.completions.append(request)
         return {}
 
@@ -341,8 +352,10 @@ def test_a_launch_is_on_record_until_auto_scaling_has_taken_its_completion(tmp_p
 
     # On record when the engine's unit was started and still when the hook was completed: an
     # agent restarted in between finds a launch whose hook waits, not an instance that serves.
-    assert world.recorded == [("start", True), ("complete", True)]
+    # Its steps are on record as passed only once they have, and before the completion is sent.
+    assert world.recorded == [("start", True, False), ("complete", True, True)]
     assert not world.on_record
+    assert not world.passed
 
 
 def test_an_abandoned_launch_stays_on_record(tmp_path: Path) -> None:
@@ -351,8 +364,9 @@ def test_an_abandoned_launch_stays_on_record(tmp_path: Path) -> None:
 
     assert world.launch().run() is Outcome.ABANDONED
 
-    # Its engine was started, and the instance never served.
+    # Its engine was started, and the instance never served: no record says its steps passed.
     assert world.on_record
+    assert not world.passed
 
 
 def test_a_launch_that_cannot_be_put_on_record_is_abandoned_before_the_engine_starts(tmp_path: Path) -> None:
@@ -363,6 +377,41 @@ def test_a_launch_that_cannot_be_put_on_record_is_abandoned_before_the_engine_st
 
     assert world.calls == ["complete"]
     assert world.completions == [completion("ABANDON")]
+
+
+def test_a_launch_that_cannot_put_its_steps_on_record_as_passed_is_abandoned(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
+    world.pass_fails = True
+
+    assert world.launch().run() is Outcome.ABANDONED
+
+    assert world.calls == ["check", "start", "health", "warm-up", "complete"]
+    assert world.completions == [completion("ABANDON")]
+
+
+@pytest.mark.parametrize(
+    ("refuses", "outcome"),
+    [
+        pytest.param(None, Outcome.CONTINUED, id="the-hook-still-waits"),
+        pytest.param(NO_ACTION, Outcome.CONTINUED, id="no-action-waits"),
+        pytest.param("Throttling", Outcome.NOT_COMPLETED, id="the-call-fails"),
+    ],
+)
+def test_a_launch_whose_steps_passed_is_resumed_by_its_completion_alone(
+    refuses: str | None, outcome: Outcome, tmp_path: Path
+) -> None:
+    # The agent stopped after the launch's last step: only the answer to its completion is missing.
+    world = World(tmp_path, on_disk=True)
+    world.on_record = world.passed = True
+    world.refuses = refuses
+
+    assert world.launch().resume() is outcome
+
+    # No step is repeated. The hook that still waits is completed; when none waits, the instance
+    # was let in before. Both leave no launch on record, and a call that failed leaves it there.
+    assert world.calls == ["complete"]
+    assert world.completions == ([completion("CONTINUE")] if refuses is None else [])
+    assert world.on_record is world.passed is (outcome is Outcome.NOT_COMPLETED)
 
 
 @pytest.mark.parametrize("target", ["Terminated", "Warmed:Stopped", None])

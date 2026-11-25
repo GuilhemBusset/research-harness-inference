@@ -23,7 +23,7 @@ one. What a reading calls for:
 
 | The instance | Target state | What the program does |
 | --- | --- | --- |
-| not in service | `InService`, and no launch run yet | runs the launch (`rhi_lifecycle.launch`), once |
+| not in service | `InService`, and no launch run yet | runs the launch (`rhi_lifecycle.launch`), once, or resumes one whose steps passed |
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
 | in service, or one that may have served | `Terminated` | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
 | not in service | none: the metadata says the instance has no such item | runs the canary (`rhi_lifecycle.canary`), once |
@@ -65,31 +65,40 @@ termination handling stops the engine's unit through a host that first brings th
 worker thread is waited for. Only then is the unit stopped, and nothing of the duties runs after.
 
 **A restart of its unit.** The program keeps what it knows of the instance in memory, and its unit
-starts it again when it has failed. So a program that starts asks the host two things, once:
-whether the engine's unit has been started and not stopped since (`Host.engine_started`), and
-whether a launch is on record there (`Host.launch_begun`). Only the agent starts the unit, in a
-launch or in a canary's run, and only the termination handling stops it, once the instance has
-drained. A launch is on record from its first step until Auto Scaling has taken the completion that
-lets the instance into service, and a canary's run from its first step on (`rhi_lifecycle.launch`,
-`rhi_lifecycle.canary`). A host that cannot be asked ends the program, and the next start of its
-unit asks again.
+starts it again when it has failed. So a program that starts asks the host three things, once:
+whether the engine's unit has been started and not stopped since (`Host.engine_started`), whether
+a launch is on record there (`Host.launch_begun`), and whether that launch has on record that its
+steps all passed (`Host.launch_passed`). Only the agent starts the unit, in a launch or in a
+canary's run, and only the termination handling stops it, once the instance has drained. A launch
+is on record from its first step until Auto Scaling has taken the completion that lets the instance
+into service, and a canary's run from its first step on (`rhi_lifecycle.launch`,
+`rhi_lifecycle.canary`). A launch has its steps on record as passed from the engine's answer to the
+warm-up request on, before it sends its completion. A host that cannot be asked ends the program,
+and the next start of its unit asks again.
 
 - The unit is started and no launch is on record: the program was restarted on an instance that
   serves, or that is leaving service with its engine still to drain. It runs no launch there, and
   takes the instance as in service: with the target state `InService` the serving duties resume,
   and with `Terminated` the instance is handed to the termination handling.
-- A launch is on record: the program was restarted during a launch, whose hook still waits, or
-  after one that was abandoned, or after one whose record stayed when Auto Scaling had taken its
-  completion: the record is removed after that answer, and the removal can fail, or the program
-  stop before it. The host cannot tell these apart, so the instance may have served. It is not
-  taken as in service: no serving duty runs and no serving heartbeat is written. With the target
-  state `InService` the launch is run again, by all its steps, and only its completion of the hook
-  lets the instance into service. The hook's timeout still bounds it, counted from the instance's
-  start. With `Terminated` the instance is handed to the termination handling, whatever a launch
-  run again came to: an instance that served may hold a request, and one that never served loses
-  nothing by a drain, because nothing runs on its engine and its termination hook, if one waits,
-  is completed at once. On an instance in no group the canary's run is made again, and writes its
-  line.
+- A launch is on record, and not its steps as passed: the program was restarted during a launch,
+  whose hook still waits, or after one that was abandoned. The instance is not taken as in
+  service: no serving duty runs and no serving heartbeat is written. With the target state
+  `InService` the launch is run again, by all its steps, and only its completion of the hook lets
+  the instance into service. The hook's timeout still bounds it, counted from the instance's start.
+  On an instance in no group the canary's run is made again, and writes its line.
+- A launch is on record with its steps as passed: the program was restarted while the launch's
+  completion was sent, or after Auto Scaling had taken it: the records are removed after that
+  answer, and the removal can fail, or the program stop before it. The instance is not taken as
+  in service yet, and no step of the launch is run again. With the target state `InService` the
+  program resumes the launch (`Launch.resume`): it sends the completion again, and writes no row
+  of a launch's stage. When Auto Scaling takes it, or answers that no lifecycle action waits, the
+  instance is in service: the serving duties resume, and their heartbeats with them. A completion
+  that got no such answer is sent again after the next reading.
+
+In both cases the instance may have served. So with the target state `Terminated` it is handed to
+the termination handling, whatever a launch run again or resumed came to: an instance that served
+may hold a request, and one that never served loses nothing by a drain, because nothing runs on
+its engine and its termination hook, if one waits, is completed at once.
 
 The serving duties end only by failing, and the program then ends with them, so that its unit
 restarts it and they resume.
@@ -237,11 +246,17 @@ class _Host(Host):
     def begin_launch(self) -> None:
         self._host.begin_launch()
 
+    def pass_launch(self) -> None:
+        self._host.pass_launch()
+
     def end_launch(self) -> None:
         self._host.end_launch()
 
     def launch_begun(self) -> bool:
         return self._host.launch_begun()
+
+    def launch_passed(self) -> bool:
+        return self._host.launch_passed()
 
     def stop_engine(self) -> None:
         self._rest()
@@ -343,6 +358,8 @@ class Agent:
         # Whether the program started on an instance whose engine's unit was started with a launch
         # on record, and has not drained it: it cannot tell whether the instance entered service.
         self._may_have_served = False
+        # Whether the launch found on record had passed all its steps: it is resumed, not run.
+        self._passed = False
         # Whether the instance's launch was run, or is over because the instance serves or has
         # served: it is run once.
         self._launched = False
@@ -369,9 +386,10 @@ class Agent:
             # A unit restarted on an instance whose engine was started. With no launch on record
             # the instance was let into service, and no launch is run on it. With one, it may have
             # been.
-            started, begun = await asyncio.to_thread(self._found)
+            started, begun, passed = await asyncio.to_thread(self._found)
             self._in_service = self._launched = started and not begun
             self._may_have_served = started and begun
+            self._passed = started and begun and passed
             next_at = self._clock()
             while True:
                 await self.tick()
@@ -465,15 +483,22 @@ class Agent:
             _LOG.warning("the instance metadata did not give %s", error)  # the item's name
             return None
 
-    def _found(self) -> tuple[bool, bool]:
-        """Whether the program starts on an instance whose engine's unit is started, and whether a
-        launch is on record there. The record is asked for only beside a started engine."""
+    def _found(self) -> tuple[bool, bool, bool]:
+        """Whether the program starts on an instance whose engine's unit is started, whether a
+        launch is on record there, and whether its steps are on record as passed. A record is
+        asked for only beside a started engine, and the second only beside the first."""
         started = self._host.engine_started()
-        return started, started and self._host.launch_begun()
+        begun = started and self._host.launch_begun()
+        return started, begun, begun and self._host.launch_passed()
 
     async def _enter(self, instance: str) -> None:
         self._launched = True
-        outcome = await asyncio.to_thread(self._launch.run)
+        if self._passed:
+            outcome = await asyncio.to_thread(self._launch.resume)
+            # A completion that got no answer is sent again after the next reading.
+            self._launched = outcome is not Outcome.NOT_COMPLETED
+        else:
+            outcome = await asyncio.to_thread(self._launch.run)
         _LOG.info("the launch ended: %s", outcome.value)
         if outcome is Outcome.CONTINUED:
             self._in_service = True

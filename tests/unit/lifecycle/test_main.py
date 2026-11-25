@@ -139,8 +139,9 @@ class World(Host):
         # The engine: nothing listens until the host module starts its unit. While the gate is
         # closed, a request the engine runs is not answered: it stays in flight.
         self.app: Starlette | None = None
-        # Whether a launch is on record on the host.
+        # Whether a launch is on record on the host, and its steps as passed.
         self.launching = False
+        self.passed = False
         self.gate = asyncio.Event()
         self.gate.set()
         self.closed = False
@@ -253,11 +254,17 @@ class World(Host):
     def begin_launch(self) -> None:
         self.launching = True
 
+    def pass_launch(self) -> None:
+        self.passed = True
+
     def end_launch(self) -> None:
-        self.launching = False
+        self.launching = self.passed = False
 
     def launch_begun(self) -> bool:
         return self.launching
+
+    def launch_passed(self) -> bool:
+        return self.passed
 
     def stop_engine(self) -> None:
         self.calls.append("stop")
@@ -563,23 +570,29 @@ def test_a_restarted_agent_runs_an_interrupted_launch_again_before_it_serves(tmp
 
 class RecordStays(World):
     """An instance whose host removes no record of a launch. Auto Scaling takes one completion of
-    the launch hook: after it no launch hook waits, and another completion is `refused`."""
+    the launch hook: after it no launch hook waits, and another completion is `refused`, once the
+    `throttled` ones before it have failed without saying so."""
 
     refused = 0
+    throttled = 0
 
     def end_launch(self) -> None:
         raise HostError("record", 1)
 
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         if request["LifecycleHookName"] == "launch" and self.completions:
+            if self.throttled:
+                self.throttled -= 1
+                raise ClientError({"Error": {"Code": "Throttling"}}, "CompleteLifecycleAction")
             self.refused += 1
-            raise ClientError({}, "CompleteLifecycleAction")
+            raise ClientError({"Error": {"Code": launch.NO_ACTION}}, "CompleteLifecycleAction")
         return super().complete_lifecycle_action(**request)
 
     async def served(self) -> None:
         """The launch of an agent that ran before the program let the instance into service."""
         assert await asyncio.to_thread(self.earlier_launch().run) is launch.Outcome.CONTINUED
         assert self.launching
+        assert self.passed
         self.readings.clear()
 
     async def drains(self, student: asyncio.Future[httpx.Response]) -> None:
@@ -614,16 +627,28 @@ def test_an_agent_restarted_on_a_terminated_instance_drains_it_though_its_launch
     run(scenario)
 
 
-def test_an_agent_restarted_in_service_with_its_launch_still_on_record_drains_the_instance_later(
+def test_an_agent_restarted_in_service_with_its_launch_still_on_record_resumes_serving_and_drains_later(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         world = RecordStays(tmp_path, IN_SERVICE)
         await world.served()
+        launched, rows = len(world.calls), len(world.items)
+        world.throttled = 1
         async with world.running():
-            # The launch is run again, and Auto Scaling takes no second completion.
-            await until(lambda: world.refused == 1)
+            # The completion is sent again. A call that fails says nothing of the hook: no duty
+            # runs yet, and the next reading sends it once more.
+            await until(lambda: world.throttled == 0)
+            assert (world.refused, world.beats) == (0, [])
+            # Auto Scaling answers that no launch hook waits: the instance serves, as it did.
             await world.ticks(1)
+            await until(lambda: len(world.beats) == 1)
+            assert world.refused == 1
+
+            # No step of the launch was run again, and no row names a launch's stage after the
+            # ones of the launch itself: the rows since are the serving duties'.
+            assert world.calls[launched:] == ["completion"]
+            assert len(world.items) == rows + 1
 
             student = await world.student()
             world.target = TERMINATED

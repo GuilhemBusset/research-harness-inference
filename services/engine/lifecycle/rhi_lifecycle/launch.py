@@ -41,10 +41,29 @@ serves: Auto Scaling has let it in. So a record that is there says a launch may 
 service, never that it did not: an agent that starts and finds one drains the instance when its
 group terminates it, as it drains one that served (`rhi_lifecycle.__main__`).
 
-**A launch may be run again.** The agent that finds a launch on record runs the launch again
-(`rhi_lifecycle.__main__`), and every step can be repeated: the image is on disk, the release is
-checked again, a unit that is started stays so, and the engine answers one more warm-up request.
-The hook's timeout is counted from the instance's start, not from the second run.
+**Its last step is on record too.** A record that stayed cannot tell a launch that was interrupted
+from one that Auto Scaling let into service. So once the engine has answered the warm-up request,
+and before the completion is sent, the launch puts on record that its steps have all passed
+(`Host.pass_launch`); one that cannot is abandoned. `CONTINUE` is therefore sent only for a launch
+with that record, and the record is removed with the launch's own.
+
+**An interrupted launch is run again.** The agent that finds a launch on record, and no record
+that its steps passed, runs the launch again (`rhi_lifecycle.__main__`): its hook still waits. Every
+step can be repeated: the image is on disk, the release is checked again, a unit that is started
+stays so, and the engine answers one more warm-up request. The hook's timeout is counted from the
+instance's start, not from the second run.
+
+**A launch whose steps passed is resumed, not run again** (`Launch.resume`). Only the answer to
+its completion is missing, so the agent sends the completion again, with `CONTINUE`, and does
+nothing else: no step is repeated, and no row of a launch's stage is written over the row of an
+instance that serves. Auto Scaling takes that completion when the launch hook still waits. When it
+answers that no lifecycle action waits for the instance (`NO_ACTION`), the hook is over: by the
+completion sent before, and the instance serves; or by its timeout, and the group terminates the
+instance, whose target state then says so. Either way the records are removed and the instance is
+taken as let into service. Any other failure of the call says nothing: the launch stays on record,
+and the completion is sent again later. Auto Scaling gives the same answer for a hook or a group
+it does not know, so settings that misname one are read as a hook that is over; a launch with such
+settings completes no hook at all, and its hook's timeout abandons the instance.
 
 **The stages.** A launch marks where each stage of the start begins and ends
 (`rhi_lifecycle.stages`, which says what each stage covers), so the agent's metrics give the
@@ -91,6 +110,10 @@ ABANDON = "ABANDON"
 
 # The target lifecycle state of a launch. The others (`Terminated`, ...) are not launches.
 IN_SERVICE = "InService"
+
+# The error code of Auto Scaling's answer to the completion of a lifecycle action that does not
+# wait: the hook was completed before, or its timeout has passed.
+NO_ACTION = "ValidationError"
 
 # The model revision of a pool that serves no model: the heartbeat's row takes no empty value.
 NO_MODEL = "none"
@@ -212,7 +235,8 @@ class Engine:
 class Outcome(enum.Enum):
     """How `Launch.run`, or `Termination.run`, ended."""
 
-    # The launch hook was completed with `CONTINUE`.
+    # The launch hook was completed with `CONTINUE`: by this call or, for a launch resumed, by
+    # the one sent before it.
     CONTINUED = "continued"
     # The launch hook was completed with `ABANDON`.
     ABANDONED = "abandoned"
@@ -359,16 +383,10 @@ class Launch:
         started = self.clock()
         # The boot ends where the launch starts: both are read now, before anything takes time.
         booted = self.uptime()
-        try:
-            target = self.metadata.target_state()
-            instance = self.metadata.instance_id()
-        except MetadataError:
-            return Outcome.NOT_COMPLETED
-        if target != IN_SERVICE:
-            return Outcome.NOT_A_LAUNCH
-        current = release.read_current(self.ssm, self.parameter)
-        if current is None:
-            return Outcome.NOT_COMPLETED
+        launching = self._launching()
+        if isinstance(launching, Outcome):
+            return launching
+        current, instance = launching
         start = self._start(current, instance)
         if booted is not None:
             start.timings.start(Stage.BOOT, at=started - booted)
@@ -382,12 +400,7 @@ class Launch:
         else:
             result = CONTINUE
         try:
-            self.autoscaling.complete_lifecycle_action(
-                AutoScalingGroupName=current.settings.group,
-                LifecycleHookName=current.settings.launch_hook,
-                InstanceId=instance,
-                LifecycleActionResult=result,
-            )
+            self._complete(current.settings, instance, result)
         except (BotoCoreError, ClientError):
             return Outcome.NOT_COMPLETED
         finally:
@@ -397,11 +410,58 @@ class Launch:
             return Outcome.ABANDONED
         # Auto Scaling took the completion: the launch is one completed, and no longer under way.
         start.timings.completed()
+        self._off_record()
+        return Outcome.CONTINUED
+
+    def resume(self) -> Outcome:
+        """Send again the completion of a launch whose steps have all passed, as the host has on
+        record, and do nothing else: `CONTINUED` when Auto Scaling takes it, or answers that no
+        lifecycle action waits for the instance."""
+        launching = self._launching()
+        if isinstance(launching, Outcome):
+            return launching
+        current, instance = launching
+        try:
+            self._complete(current.settings, instance, CONTINUE)
+        except ClientError as refusal:
+            if refusal.response.get("Error", {}).get("Code") != NO_ACTION:
+                return Outcome.NOT_COMPLETED
+            # The launch hook is over. The stages of this launch were timed by the agent that ran
+            # it, so no metric counts it a second time.
+        except BotoCoreError:
+            return Outcome.NOT_COMPLETED
+        self._off_record()
+        return Outcome.CONTINUED
+
+    def _launching(self) -> tuple[release.Current, str] | Outcome:
+        """The pool's current release, whose settings name the launch hook, and the instance; or
+        how the call ends when the instance is not being launched or one of them is unknown."""
+        try:
+            target = self.metadata.target_state()
+            instance = self.metadata.instance_id()
+        except MetadataError:
+            return Outcome.NOT_COMPLETED
+        if target != IN_SERVICE:
+            return Outcome.NOT_A_LAUNCH
+        current = release.read_current(self.ssm, self.parameter)
+        if current is None:
+            return Outcome.NOT_COMPLETED
+        return current, instance
+
+    def _complete(self, settings: release.Settings, instance: str, result: str) -> None:
+        self.autoscaling.complete_lifecycle_action(
+            AutoScalingGroupName=settings.group,
+            LifecycleHookName=settings.launch_hook,
+            InstanceId=instance,
+            LifecycleActionResult=result,
+        )
+
+    def _off_record(self) -> None:
+        """Remove the launch's records from the host: Auto Scaling has let the instance in."""
         try:
             self.host.end_launch()
         except HostError as error:
             _LOG.error("the record of the launch was not removed (%s)", error)
-        return Outcome.CONTINUED
 
     def _start(self, current: release.Current, instance: str) -> _Start:
         digest, revision = identity(current.release)
@@ -431,4 +491,10 @@ class Launch:
         if not on_disk:
             steps.pull(current, None)
         steps.serve(current, None, start.reach)
+        try:
+            # On record before the completion is sent: an agent that starts and finds this record
+            # sends the completion again, and repeats no step.
+            self.host.pass_launch()
+        except HostError:
+            raise Abandon from None
         start.reach(Stage.HOOK)

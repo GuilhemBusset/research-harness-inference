@@ -18,17 +18,19 @@ on its standard input: reading it back needs no permission of the instance role.
 
 The host also keeps the record of a launch under way: an empty file, `LAUNCH_RECORD`, that is
 there from the start of a launch until Auto Scaling has taken the completion that lets the instance
-into service. The agent's program reads it when it starts: beside a started engine, no record
-says the instance serves, and a record that it may not (`rhi_lifecycle.__main__`). It is under
-`/run`, which is empty at every start of the instance, beside the settings the boot program writes
-there.
+into service. A second empty file, `PASSED_RECORD`, joins it once every step of the launch has
+passed, before the completion is sent. The agent's program reads both when it starts: beside a
+started engine, no record says the instance serves, the first alone that its launch hook still
+waits, and the two that only the completion's answer is missing (`rhi_lifecycle.__main__`). They
+are under `/run`, which is empty at every start of the instance, beside the settings the boot
+program writes there.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
 caller gave it has passed: it is stopped, because the run of a canary has a deadline
 (`rhi_lifecycle.canary`). Two answers are read, compared and never repeated: the state systemd
 gives the engine's unit, a word of systemd's own vocabulary, and the names of the files beside the
-record.
+records.
 """
 
 from __future__ import annotations
@@ -49,9 +51,11 @@ ENGINE_UNIT = "rhi-engine"
 CONSOLE = "/dev/console"
 
 # The record of a launch under way: an empty file of this name in this folder of the host, where
-# the boot program writes the release's settings.
+# the boot program writes the release's settings. The record that its steps have all passed is
+# another, beside it.
 RUN_FOLDER = "/run/rhi"
 LAUNCH_RECORD = "launching"
+PASSED_RECORD = "launch-passed"
 
 # The host's first process, and the namespaces of it a command enters.
 HOST_NAMESPACES = ("--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid")
@@ -130,19 +134,34 @@ class Host:
         """Put on record that a launch is under way on the host."""
         self._run("record", ("touch", f"{RUN_FOLDER}/{LAUNCH_RECORD}"))
 
+    def pass_launch(self) -> None:
+        """Put on record that every step of the launch under way has passed: its completion of the
+        launch hook is sent next."""
+        self._run("record", ("touch", f"{RUN_FOLDER}/{PASSED_RECORD}"))
+
     def end_launch(self) -> None:
-        """Remove the record of the launch: Auto Scaling has let the instance into service."""
-        self._run("record", ("rm", "-f", f"{RUN_FOLDER}/{LAUNCH_RECORD}"))
+        """Remove the records of the launch: Auto Scaling has let the instance into service."""
+        # The launch's own record first: a removal that stops between the two leaves no launch on
+        # record, which is what an instance in service has.
+        self._run("record", ("rm", "-f", f"{RUN_FOLDER}/{LAUNCH_RECORD}", f"{RUN_FOLDER}/{PASSED_RECORD}"))
 
     def launch_begun(self) -> bool:
         """Whether a launch is on record on the host: one was begun, and its record was not
         removed. A host that did not list its folder has not said no: `HostError`."""
+        return LAUNCH_RECORD in self._records()
+
+    def launch_passed(self) -> bool:
+        """Whether the host has on record that every step of a launch passed. A host that did not
+        list its folder has not said no: `HostError`."""
+        return PASSED_RECORD in self._records()
+
+    def _records(self) -> list[str]:
         # The names in the folder, one on each line. The exit status of a command that looks for
         # one file would not tell a file that is absent from a host that could not be entered.
         returncode, names = self._read("record", ("ls", RUN_FOLDER))
         if returncode != 0:
             raise HostError("record", returncode)
-        return LAUNCH_RECORD in names.splitlines()
+        return names.splitlines()
 
     def stop_engine(self) -> None:
         self._run("stop", ("systemctl", "stop", ENGINE_UNIT))

@@ -119,6 +119,9 @@ class World(Host):
     def begin_launch(self) -> None:
         pass
 
+    def pass_launch(self) -> None:
+        pass
+
     def end_launch(self) -> None:
         pass
 
