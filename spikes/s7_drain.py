@@ -45,9 +45,13 @@ session, and nothing else: the scaler alone moves the instances. The steps, in o
    replaces that task. Then one `stream` line, `gateway_deployment`.
 2. **The departures** (`Run.departures`). It waits until the scaler's note asks for two instances
    and reads two in service, as does its in-service gauge (`instances`, the two that write). It
-   lowers its session to one, and watches the instance that leaves; once that departure is whole
-   and the note reads the instance out of the group (`Watch.left`), or its wait ran out, it stops
-   its session and watches the last one leave. Each reading is kept apart and read again at every
+   lowers its session to one, and watches the instance that leaves; once that departure is whole,
+   a note reads the instance out of the group and the instance that note still counts was read
+   writing a minute after it (`Watch.left`, `read_staying`), or its wait ran out, it stops its
+   session and watches the last one leave. A note counts instances without naming them, so a
+   collector read silent is the one of the instance that left only once the other is read
+   writing still: until then it may be the one that stays, at a time the workspace shows no write
+   for, and the session is not stopped on it. Each reading is kept apart and read again at every
    poll, so that a gap in the workspace loses nothing it shows later:
    - `scale_in_asked`: each note that asks for fewer than the last (a decision), with its
      `written_at`, when it was read and how many fewer;
@@ -93,7 +97,12 @@ session, and nothing else: the scaler alone moves the instances. The steps, in o
    polls the note: at the first one that reads one instance in service and one starting it lowers
    its session to one, at once. Then it watches which of the two leaves, and writes one line,
    `starting_instance` (`Starting.fields`): `left`, `starting` or `in_service`, or null with the
-   `reason`; and when, the note's times and the collector's. The first note written after the
+   `reason`; and when, the note's times and the collector's. It watches until a note reads one of
+   the two out of the group and the other was read writing a minute after that note
+   (`Starting.settled`, `read_staying`): a collector read stopped before that may be the one of
+   the instance that stays, at a time the workspace shows no write for, and names no instance.
+   When the wait runs out first, the line names none and the launches tell nothing: it holds
+   what the notes told. The first note written after the
    lowering that reads fewer than two starting or in service gives `left_written_at`, and the
    first such note that reads none draining either gives `gone_written_at`: the scaler counts an
    instance as starting before its collector writes, so one that leaves then has no other time.
@@ -549,17 +558,32 @@ def stopped_at(writes: set[float], *, since: float, now: float) -> float | None:
     return last if last >= since and now - last >= QUIET_SECONDS else None
 
 
+def read_staying(writes: Mapping[str, set[float]], note: ScalerNote) -> bool:
+    """Whether the instances `note` counts in the group, draining ones included, were read staying:
+    at least as many instances were read writing more than a minute after the note was written. An
+    instance writes until it shuts down and is in the group until then, and the scaler's run, which
+    stamps its note with its start, lasts less than a minute: an instance that writes a minute
+    after the note was in the group as the run read it. Once those the note counts are all read so,
+    any other instance is out of the group, and a collector read stopped is an instance that left.
+    Until then it may be an instance that stays, at a time the workspace shows no write for: the
+    note counts instances without naming them."""
+    after = note.written_at + MINUTE_SECONDS
+    staying = sum(1 for times in writes.values() if times and max(times) > after)
+    return staying >= note.starting + note.in_service + note.draining
+
+
 @dataclass
 class Watch:
     """What the departures step reads from the time the job lowered its session, `start`: the number
     the scaler asks for and the in-service count last read, the note last read, the times of each
     instance's writes read so far (by AWS identifier, never written), the decisions, and the
-    departures read and not withdrawn, by instance and last write."""
+    departures read and not withdrawn, by instance and last write; and every note read, in order."""
 
     start: float
     asked: int
     in_service: int
     note: ScalerNote | None = None
+    notes: list[ScalerNote] = field(default_factory=list)
     writes: dict[str, set[float]] = field(default_factory=dict)
     decisions: list[Decision] = field(default_factory=list)
     departures: dict[tuple[str, float], Departure] = field(default_factory=dict)
@@ -590,16 +614,20 @@ class Watch:
 
     def left(self, decision: Decision) -> bool:
         """Whether the instances `decision` asked fewer have left for good: each was read out of
-        service and gone, and the scaler's note, written since the last of them stopped, reads no
-        more instances in the group, draining ones included, than the decision asked for. While
-        the note still counts an instance more, a collector that seems to have stopped is not
-        taken for the departure: a later read may withdraw it."""
-        note = self.note
-        return (
-            decision.whole
-            and note is not None
-            and note.written_at >= max(one.last_write for one in decision.departures)
+        service and gone, a note of the scaler written since the last of them stopped reads no
+        more instances in the group, draining ones included, than the decision asked for, and the
+        instances that note counts were read staying (`read_staying`). While the notes still count
+        an instance more, or an instance they count is not read writing after them, a collector
+        that seems to have stopped is not taken for the departure: it may be the one of the
+        instance that stays, and a later read may withdraw it."""
+        if not decision.whole:
+            return False
+        stopped = max(one.last_write for one in decision.departures)
+        return any(
+            note.written_at >= stopped
             and note.starting + note.in_service + note.draining <= decision.asked
+            and read_staying(self.writes, note)
+            for note in self.notes
         )
 
     def waiting_for(self) -> str:
@@ -608,7 +636,7 @@ class Watch:
         if any(len(one.drops) < one.fewer for one in self.decisions):
             return "out_of_service"
         if not all(self.left(one) for one in self.decisions):
-            return "out_of_the_group"
+            return "departure_confirmed"
         return "scale_in_asked"
 
 
@@ -748,6 +776,13 @@ class Starting:
             if any(self.lowered_at <= at < min(self.launched.get(instance, (math.inf,))) for at in scrapes)
         }
 
+    def _other_stays(self) -> bool:
+        """Whether a note read one of the two out of the group and the instances that note counts
+        were read staying (`read_staying`): only then is a collector read stopped the one of the
+        instance that left, and not the other's at a time the workspace shows no write for."""
+        gone = self._first(drained=True)
+        return gone is not None and read_staying(self.writes, gone[0])
+
     def _waited(self, now: float) -> bool:
         """Whether a note read one of the two out of the group long enough ago for its collector,
         if it ever wrote, to be read stopped."""
@@ -755,18 +790,22 @@ class Starting:
         return gone is not None and now >= gone[1] + QUIET_SECONDS + INGEST_SECONDS
 
     def settled(self, now: float) -> bool:
-        """Whether one of the two has left for good: a note reads it out of the group, and its
-        collector was read stopped, or has had the time to be if it ever wrote."""
-        return self._first(drained=True) is not None and (bool(self.stopped(now)) or self._waited(now))
+        """Whether one of the two has left for good: a note reads it out of the group, the other
+        was read staying, and its collector was read stopped, or has had the time to be if it ever
+        wrote."""
+        return self._other_stays() and (bool(self.stopped(now)) or self._waited(now))
 
     def fields(self, names: Names, why: Untold | None, now: float) -> dict[str, object]:
-        """The line: which of the two left, or `why` it was not looked for, and when."""
+        """The line: which of the two left, or `why` it was not looked for, and when. The collectors
+        tell which instance left, and so do the launches, only once the other was read staying
+        (`_other_stays`): the line names no instance before."""
         starting = self.still_starting()
-        stopped = self.stopped(now)
+        told = self._other_stays()
+        stopped = self.stopped(now) if told else []
         out, gone = self._first(drained=False), self._first(drained=True)
         by_notes = left_by_notes([note for note, _ in self.after])
         by_launches = left_by_launches(
-            starting, self.writes, [instance for _, instance in stopped], waited=self._waited(now)
+            starting, self.writes, [instance for _, instance in stopped], waited=told and self._waited(now)
         )
         left, reason = (None, why) if why is not None else which_left(by_notes, by_launches)
         # When the hook of the instance that stopped was first read completed, if it ever was: an
@@ -1197,6 +1236,8 @@ class Run:
         if note is None:
             return
         now = self.clock.now()
+        if watch.note is None or note.written_at > watch.note.written_at:
+            watch.notes.append(note)
         watch.note = note
         if note.capacity_asked < watch.asked:
             decision = Decision(
@@ -1367,8 +1408,9 @@ class Run:
         asks for one instance (`_watched`). When the wait for that decision runs out, the first
         decision asks for another number or the session was not lowered, the stream is given up
         before the session is stopped: a note that asks for fewer after the stop does not send
-        it. A departure is waited for until it is whole and the note reads the instance out of
-        the group (`Watch.left`). The session is stopped whatever was read."""
+        it. A departure is waited for until it is whole, a note reads the instance out of the
+        group and the instance that stays was read writing after that note (`Watch.left`). The
+        session is stopped whatever was read."""
         if not await self.two_in_service():
             self.recorder.line("timeout", waiting_for="two_in_service")
             await self.stop()

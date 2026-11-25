@@ -711,6 +711,58 @@ def test_a_time_with_no_write_of_an_instance_that_goes_on_writing_is_no_departur
     assert withdrawn["at"] < first["gone_read_at"] <= stopped["at"] <= second["asked_at"]
 
 
+def unshown(rig: Rig, staying: int, since: float, until: float) -> None:
+    """The workspace shows nothing the collector of the instance that stays, the one launched at
+    place `staying` of the two, wrote from `since` to `until` seconds after the run began."""
+    read = rig.scaler.read_series
+
+    def gapped(query: str, **window: float) -> list[common.Series]:
+        series = read(query, **window)
+        if not query.startswith("max by (instance)") or len(rig.scaler.machines) != s7.INSTANCES:
+            return series
+        name = rig.scaler.machines[staying].name
+        return [
+            common.Series(one.labels, tuple((at, write) for at, write in one.samples if not since <= write - T0 <= until))
+            if one.labels["instance"] == name
+            else one
+            for one in series
+        ]
+
+    rig.scaler.read_series = gapped
+
+
+@pytest.mark.parametrize("shown_again", [True, False])
+def test_the_session_is_not_stopped_on_the_silence_of_the_instance_that_stays(stored: Any, shown_again: bool) -> None:
+    # As the scaler releases one instance, the workspace stops showing the writes of the other for
+    # two minutes, or for good: the one that stays seems to stop first, and the note reads one
+    # instance out of the group.
+    rig = a_rig(stored, PROMPT, (20.0, 70.0))
+    unshown(rig, 1, 160.0, 275.0 if shown_again else math.inf)
+    rig.booked(rig.run.departures)
+
+    lines = parsed(rig.out, *identifiers(rig))
+    leaving, staying = rig.scaler.machines
+    (stopped,) = [line for line in of(lines, "session") if line["action"] == "stopped"]
+    seemed = next(line for line in of(lines, "gone") if line["instance"] == rig.run.names(staying.name))
+    assert seemed["decision"] == 1 and seemed["at"] < stopped["at"]
+    if not shown_again:
+        # The departure was never told from the silence: the wait ran out, and the line says so.
+        timeout = of(lines, "timeout")[0]
+        assert timeout["waiting_for"] == "departure_confirmed"
+        assert seemed["at"] < timeout["at"] <= stopped["at"]
+        return
+    # The session was stopped once the instance that left was read gone and the other writing, and
+    # each departure names its instance.
+    assert not of(lines, "timeout")
+    assert [line["instance"] for line in of(lines, "gone_withdrawn")] == [rig.run.names(staying.name)]
+    first, second = of(lines, "scale_in")
+    assert [(line["decision"], line["instance"], line["last_write_at"]) for line in (first, second)] == [
+        (1, rig.run.names(leaving.name), s7.utc(leaving.last_write())),
+        (2, rig.run.names(staying.name), s7.utc(staying.last_write())),
+    ]
+    assert first["gone_read_at"] <= stopped["at"] <= second["asked_at"]
+
+
 def test_a_reading_that_shows_the_drops_of_two_decisions_gives_each_its_line(stored: Any) -> None:
     rig = a_rig(stored, PROMPT, PROMPT)
     read = rig.scaler.read_series
@@ -760,15 +812,16 @@ def test_a_session_that_ends_before_the_scaler_acts_on_the_lowering_does_not_sen
 
 
 @pytest.mark.parametrize(
-    ("left", "slow_collector", "by_launches"),
-    [("starting", 200.0, True), ("in_service", 100.0, True), ("in_service", None, False)],
+    ("left", "slow", "by_launches"),
+    [("starting", (200.0, 400.0), True), ("in_service", (100.0, 400.0), True), ("in_service", (330.0, 400.0, 300.0), False)],
     ids=["the_starting_one", "the_one_in_service", "the_one_in_service_told_by_the_notes_alone"],
 )
-def test_the_starting_instance(stored: Any, left: str, slow_collector: float | None, by_launches: bool) -> None:
-    # One instance is in service a minute after its launch; the other is still starting then, its
-    # hook not completed, and its collector writes only after the note read the state, has written
-    # by then, or never writes. The group holds the instance it released for a hundred seconds more.
-    rig = a_rig(stored, PROMPT, (slow_collector, 400.0), leaves=s7.Left(left), drain=100.0)
+def test_the_starting_instance(stored: Any, left: str, slow: tuple[float, ...], by_launches: bool) -> None:
+    # One instance is in service a minute after its launch; the other is still starting then, and
+    # its collector writes only after the note read the state, its hook not completed; has written
+    # by then; or writes only once its hook is completed, so that no scrape reads it starting. The
+    # group holds the instance it released for a hundred seconds more.
+    rig = a_rig(stored, PROMPT, slow, leaves=s7.Left(left), drain=100.0)
     asyncio.run(rig.run.starting_instance())
 
     lines = parsed(rig.out, *identifiers(rig))
@@ -806,6 +859,33 @@ def test_the_starting_instance(stored: Any, left: str, slow_collector: float | N
         assert line["hook_completed_at"] is None
     else:
         assert s7.utc(gone.hooked_at) <= line["hook_completed_at"] < line["state_written_at"]
+
+
+@pytest.mark.parametrize("shown_again", [True, False])
+def test_the_silence_of_the_instance_that_stays_is_not_taken_for_the_one_that_left(
+    stored: Any, shown_again: bool
+) -> None:
+    # The starting instance leaves, and the workspace stops showing the writes of the one in
+    # service for two minutes, or for good: it seems to stop first, as a note reads one instance
+    # out of the group.
+    rig = a_rig(stored, PROMPT, (20.0, 400.0))
+    unshown(rig, 0, 208.0, 328.0 if shown_again else math.inf)
+    asyncio.run(rig.run.starting_instance())
+
+    lines = parsed(rig.out, *identifiers(rig))
+    (line,) = of(lines, "starting_instance")
+    serving, starting = rig.scaler.machines
+    assert serving.gone_at == math.inf and starting.gone_at < math.inf
+    assert line["gone_written_at"] is not None
+    if shown_again:
+        # The job read on until the instance in service was read writing again, then named the other.
+        assert not of(lines, "timeout")
+        assert (line["left"], line["instance"]) == ("starting", rig.run.names(starting.name))
+        assert line["last_write_at"] == s7.utc(starting.last_write())
+    else:
+        # The wait ran out with the instance in service never read writing again: no instance is named.
+        assert [timeout["waiting_for"] for timeout in of(lines, "timeout")] == ["starting_instance_gone"]
+        assert (line["left"], line["reason"], line["instance"]) == (None, "role_not_told", None)
 
 
 def test_the_role_of_an_instance_is_not_told_by_which_collector_wrote_first(stored: Any) -> None:
