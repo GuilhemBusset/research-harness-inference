@@ -138,6 +138,8 @@ class World(Host):
         # The engine: nothing listens until the host module starts its unit. While the gate is
         # closed, a request the engine runs is not answered: it stays in flight.
         self.app: Starlette | None = None
+        # Whether a launch is on record on the host.
+        self.launching = False
         self.gate = asyncio.Event()
         self.gate.set()
         self.closed = False
@@ -145,6 +147,23 @@ class World(Host):
     def serves_already(self) -> None:
         """The instance was launched by an agent that ran before this one: its engine was started, and runs."""
         self.app = self.mock()
+
+    def earlier_launch(self) -> launch.Launch:
+        """The launch of an agent that ran before the program, on the same instance."""
+        return launch.Launch(
+            NAME,
+            metadata=launch.Metadata(self.fetch),
+            autoscaling=self,
+            ssm=self,
+            secrets=self,
+            dynamodb=self,
+            host=self,
+            engine=launch.Engine(self.fetch),
+            held=self.held,
+            clock=self.clock.time,
+            sleep=self.wait,
+            wall=self.clock.time,
+        )
 
     def mock(self) -> Starlette:
         async def pace(seconds: float) -> None:
@@ -229,6 +248,15 @@ class World(Host):
 
     def engine_started(self) -> bool:
         return self.app is not None
+
+    def begin_launch(self) -> None:
+        self.launching = True
+
+    def end_launch(self) -> None:
+        self.launching = False
+
+    def launch_begun(self) -> bool:
+        return self.launching
 
     def stop_engine(self) -> None:
         self.calls.append("stop")
@@ -485,6 +513,104 @@ def test_a_restarted_agent_hands_an_instance_that_left_service_to_the_terminatio
         assert world.calls == ["termination hook", "stop"]
         assert world.completions == [completion("termination")]
         assert world.beats == []
+
+    run(scenario)
+
+
+class AgentStopped(Exception):
+    """The agent that ran before the program stopped where it was."""
+
+
+class StopsInWarmUp(World):
+    """An instance whose agent stops while its launch waits for the warm-up request's answer,
+    until `stops` is cleared."""
+
+    stops = True
+
+    async def _answer(self, request: urllib.request.Request, timeout: float | None) -> tuple[int, bytes] | None:
+        if self.stops and request.full_url == f"{launch.ENGINE_URL}{CHAT}":
+            raise AgentStopped
+        return await super()._answer(request, timeout)
+
+
+def test_a_restarted_agent_runs_an_interrupted_launch_again_before_it_serves(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = StopsInWarmUp(tmp_path, IN_SERVICE)
+        with pytest.raises(AgentStopped):
+            await asyncio.to_thread(world.earlier_launch().run)
+        # The engine's unit is started, and the launch hook still waits.
+        assert world.calls == ["pull", "check", "start", "health"]
+        assert world.completions == []
+
+        world.stops = False
+        async with world.running():
+            await until(lambda: len(world.beats) == 1)
+            await world.ticks(2)
+
+        # The launch again, by its steps, with the image on disk by now; the hook is completed once.
+        assert world.calls[4:9] == ["check", "start", "health", "completion", "launch hook"]
+        assert world.completions == [completion("launch")]
+        # No row said the instance serves before Auto Scaling took that completion: the rows of
+        # the two runs name a launch's stages, up to the hook.
+        stages = [InstanceHeartbeat.from_item(item).stage for item in world.items]
+        before = stages[: stages.index(serving.STAGE)]
+        assert before[-1] == "hook"
+        assert len(before) == 5 + 6
+
+    run(scenario)
+
+
+def test_a_restarted_agent_leaves_an_abandoned_launch_alone_once_the_group_terminates_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        # The engine was started, the launch was abandoned at its warm-up request, and the agent's
+        # unit was restarted: the launch is on record still.
+        world = World(tmp_path, TERMINATED)
+        world.serves_already()
+        world.launching = True
+        async with world.running():
+            await until(lambda: world.readings != [])
+            await world.ticks(3)
+
+        assert world.calls == []
+        assert world.completions == []
+        assert world.items == []
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("target", ["Warmed:Stopped", "Standby", "Detached"])
+def test_only_the_target_state_terminated_starts_a_drain(target: str, tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = World(tmp_path, IN_SERVICE)
+        async with world.running():
+            await until(lambda: len(world.beats) == 1)
+
+            world.target = target
+            await world.ticks(4)
+
+            # No termination hook was completed and the engine runs: the serving duties go on.
+            assert world.completions == [completion("launch")]
+            assert "stop" not in world.calls
+            assert len(world.beats) == 5
+
+    run(scenario)
+
+
+def test_a_restarted_agent_makes_an_interrupted_canarys_run_again(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        # The canary's run started the engine and went on record, and the agent stopped before
+        # it wrote its line.
+        world = World(tmp_path, NO_STATE)
+        world.serves_already()
+        world.launching = True
+        async with world.running():
+            await until(lambda: world.console != [])
+            await world.ticks(2)
+
+        assert world.calls == ["pull", "check", "start", "health", "completion", "console"]
+        assert world.console == [f"rhi-canary served image_digest=sha256:{'a' * 64} model_revision=none"]
+        assert world.completions == []
+        assert world.items == []
 
     run(scenario)
 

@@ -86,6 +86,11 @@ class World(Host):
         self.pull_fails = False
         self.pull_limits: list[float | None] = []
         self.start_fails = False
+        # The record of a launch under way: whether the host keeps one, whether it can be written,
+        # and what it was at each of the steps named.
+        self.on_record = False
+        self.record_fails = False
+        self.recorded: list[tuple[str, bool]] = []
         # The engine: healthy this long after its start (None: never), and its answer to the
         # warm-up request (None: none, the request stays unanswered).
         self.started_at: float | None = None
@@ -131,9 +136,18 @@ class World(Host):
 
     def start_engine(self, timeout: float | None = None) -> None:
         self.calls.append("start")
+        self.recorded.append(("start", self.on_record))
         if self.start_fails:
             raise HostError("start", 1)
         self.started_at = self.now
+
+    def begin_launch(self) -> None:
+        if self.record_fails:
+            raise HostError("record", 1)
+        self.on_record = True
+
+    def end_launch(self) -> None:
+        self.on_record = False
 
     # The SDK's clients.
 
@@ -149,6 +163,7 @@ class World(Host):
 
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         self.calls.append("complete")
+        self.recorded.append(("complete", self.on_record))
         self.completions.append(request)
         return {}
 
@@ -316,6 +331,37 @@ def test_failures_abandon(on_disk: bool, failure: Callable[[World], None], steps
 
     # The steps up to the one that failed, then one completion.
     assert world.calls == [*steps, "complete"]
+    assert world.completions == [completion("ABANDON")]
+
+
+def test_a_launch_is_on_record_until_auto_scaling_has_taken_its_completion(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
+
+    assert world.launch().run() is Outcome.CONTINUED
+
+    # On record when the engine's unit was started and still when the hook was completed: an
+    # agent restarted in between finds a launch whose hook waits, not an instance that serves.
+    assert world.recorded == [("start", True), ("complete", True)]
+    assert not world.on_record
+
+
+def test_an_abandoned_launch_stays_on_record(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
+    failed_warm_up(world)
+
+    assert world.launch().run() is Outcome.ABANDONED
+
+    # Its engine was started, and the instance never served.
+    assert world.on_record
+
+
+def test_a_launch_that_cannot_be_put_on_record_is_abandoned_before_the_engine_starts(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
+    world.record_fails = True
+
+    assert world.launch().run() is Outcome.ABANDONED
+
+    assert world.calls == ["complete"]
     assert world.completions == [completion("ABANDON")]
 
 

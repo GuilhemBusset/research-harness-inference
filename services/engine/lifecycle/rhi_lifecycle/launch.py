@@ -29,6 +29,21 @@ hook's timeout passes, and Auto Scaling abandons the instance as it does when th
 instance by its metadata. Without one of them there is nothing to call: `run` returns
 `NOT_COMPLETED`, and the hook's own timeout abandons the instance.
 
+**A launch under way is on record.** The agent's unit starts the agent again when it has failed,
+and the agent that starts then finds the engine's unit started: by a launch that was interrupted,
+or by one that let the instance into service. So a launch puts itself on record on the host before
+its first step (`Host.begin_launch`), and removes the record once Auto Scaling has taken the
+completion with `CONTINUE` (`Host.end_launch`), not before: an instance whose launch hook still
+waits is never taken for one that serves. A launch that is abandoned stays on record, and so does
+one whose completion did not reach Auto Scaling. A launch that cannot be put on record is
+abandoned before the engine starts. A record that cannot be removed is logged, and the instance
+serves: Auto Scaling has let it in.
+
+**A launch may be run again.** The agent that finds a launch on record runs the launch again
+(`rhi_lifecycle.__main__`), and every step can be repeated: the image is on disk, the release is
+checked again, a unit that is started stays so, and the engine answers one more warm-up request.
+The hook's timeout is counted from the instance's start, not from the second run.
+
 **The stages.** A launch marks where each stage of the start begins and ends
 (`rhi_lifecycle.stages`, which says what each stage covers), so the agent's metrics give the
 seconds each took. At the start of each stage the launch also rewrites the instance's row in the
@@ -378,8 +393,12 @@ class Launch:
             start.timings.end()
         if result != CONTINUE:
             return Outcome.ABANDONED
-        # Auto Scaling took the completion: the launch is one completed.
+        # Auto Scaling took the completion: the launch is one completed, and no longer under way.
         start.timings.completed()
+        try:
+            self.host.end_launch()
+        except HostError as error:
+            _LOG.error("the record of the launch was not removed (%s)", error)
         return Outcome.CONTINUED
 
     def _start(self, current: release.Current, instance: str) -> _Start:
@@ -401,6 +420,9 @@ class Launch:
         """The steps before the hook's completion, none with a time limit."""
         steps = Steps(self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep)
         try:
+            # On record before the engine's unit can be started: an agent that starts and finds the
+            # unit started knows by the record that the launch hook still waits.
+            self.host.begin_launch()
             on_disk = self.host.holds(current.release.engine_image)
         except HostError:
             raise Abandon from None

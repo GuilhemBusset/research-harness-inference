@@ -224,6 +224,8 @@ def test_a_command_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
         Host(Ecr(), nsenter=str(tmp_path / "missing")).holds(IMAGE)
     with pytest.raises(HostError):
         Host(Ecr(), nsenter=str(tmp_path / "missing")).engine_started()
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).launch_begun()
 
 
 def test_a_systemd_that_gives_the_engines_unit_no_state_has_not_said_that_it_is_stopped(nsenter: Nsenter) -> None:
@@ -231,3 +233,32 @@ def test_a_systemd_that_gives_the_engines_unit_no_state_has_not_said_that_it_is_
         host(nsenter).engine_started()
 
     assert raised.value.action == "state"
+
+
+def test_a_launch_is_put_on_record_in_the_hosts_run_folder_and_removed_from_it(nsenter: Nsenter) -> None:
+    host(nsenter).begin_launch()
+    host(nsenter).end_launch()
+
+    assert nsenter.calls() == [
+        [*IN_THE_HOST, "touch", "/run/rhi/launching"],
+        [*IN_THE_HOST, "rm", "-f", "/run/rhi/launching"],
+    ]
+
+
+@pytest.mark.parametrize(("names", "begun"), [("engine-flags\nlaunching\nrelease.env", True), ("release.env", False)])
+def test_a_launch_is_on_record_when_the_hosts_run_folder_lists_its_file(
+    names: str, begun: bool, nsenter: Nsenter
+) -> None:
+    nsenter.say(names)
+
+    assert host(nsenter).launch_begun() is begun
+    assert nsenter.calls() == [[*IN_THE_HOST, "ls", "/run/rhi"]]
+
+
+def test_a_host_that_does_not_list_its_run_folder_has_not_said_that_no_launch_is_on_record(nsenter: Nsenter) -> None:
+    nsenter.fail_on("ls")
+
+    with pytest.raises(HostError) as raised:
+        host(nsenter).launch_begun()
+
+    assert (raised.value.action, raised.value.returncode) == ("record", 3)

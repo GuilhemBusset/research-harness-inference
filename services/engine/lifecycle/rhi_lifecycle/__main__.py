@@ -25,15 +25,17 @@ one. What a reading calls for:
 | --- | --- | --- |
 | not in service | `InService`, and no launch run yet | runs the launch (`rhi_lifecycle.launch`), once |
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
-| in service | any other | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
+| in service | `Terminated` | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
 | not in service | none: the metadata says the instance has no such item | runs the canary (`rhi_lifecycle.canary`), once |
 
 Any other reading calls for nothing. An instance that is not in service and whose target state is
 `Terminated` is among them: its launch was abandoned, or it has drained, and the program leaves it
-alone.
+alone. So is an instance in service whose target state is neither `InService` nor `Terminated`: the
+group's instances leave service one way, terminated, and no other state starts a drain or stops the
+serving duties.
 
 The instance is in service once its launch has completed the launch hook: the serving duties start
-then. They run until the target state leaves service, and on while the termination handling waits
+then. They run until the target state is `Terminated`, and on while the termination handling waits
 for the engine to drain. A hook that could not be completed leaves the instance in service, and the
 next reading hands it over again. An instance that has drained is out of service for good: the
 program runs no launch on it again.
@@ -63,21 +65,28 @@ termination handling stops the engine's unit through a host that first brings th
 worker thread is waited for. Only then is the unit stopped, and nothing of the duties runs after.
 
 **A restart of its unit.** The program keeps what it knows of the instance in memory, and its unit
-starts it again when it has failed. So a program that starts asks the host, once, whether the
-engine's unit has been started and not stopped since (`Host.engine_started`). Only the agent starts
-that unit, in a launch, and only the termination handling stops it, once the instance has drained.
-So a program that finds the unit started was restarted on an instance that serves, or that is
-leaving service with its engine still to drain. It runs no launch there, and takes the instance as
-in service: with the target state `InService` the serving duties resume, and with any other the
-instance is handed to the termination handling. A host that cannot be asked ends the program, and
-the next start of its unit asks again. The serving duties end only by failing, and the program then
-ends with them, so that its unit restarts it and they resume.
+starts it again when it has failed. So a program that starts asks the host two things, once:
+whether the engine's unit has been started and not stopped since (`Host.engine_started`), and
+whether a launch is on record there (`Host.launch_begun`). Only the agent starts the unit, in a
+launch or in a canary's run, and only the termination handling stops it, once the instance has
+drained. A launch is on record from its first step until Auto Scaling has taken the completion that
+lets the instance into service, and a canary's run from its first step on (`rhi_lifecycle.launch`,
+`rhi_lifecycle.canary`). A host that cannot be asked ends the program, and the next start of its
+unit asks again.
 
-A program that failed in the middle of a launch, once the engine's unit was started, also finds the
-unit started when it starts again. It takes the instance as in service and completes no launch
-hook: the hook's timeout abandons that instance, and the termination handling then drains it. The
-same holds for a canary, whose run also starts the unit: the program does not make the run again,
-and the promotion job, which reads no line, fails the candidate at its own time limit.
+- The unit is started and no launch is on record: the program was restarted on an instance that
+  serves, or that is leaving service with its engine still to drain. It runs no launch there, and
+  takes the instance as in service: with the target state `InService` the serving duties resume,
+  and with `Terminated` the instance is handed to the termination handling.
+- A launch is on record: the program was restarted during a launch, whose hook still waits, or
+  after one that was abandoned. A started engine says nothing more there. The instance is not in
+  service: no serving duty runs and no serving heartbeat is written. With the target state
+  `InService` the launch is run again, by all its steps, and only its completion of the hook lets
+  the instance into service. The hook's timeout still bounds it, counted from the instance's start.
+  On an instance in no group the canary's run is made again, and writes its line.
+
+The serving duties end only by failing, and the program then ends with them, so that its unit
+restarts it and they resume.
 
 Every call that waits (the instance metadata, a transition) runs in a worker thread, so the
 readings and the serving duties keep their own cadence beside it.
@@ -104,7 +113,7 @@ from rhi_lifecycle.canary import Canary
 from rhi_lifecycle.host import Host
 from rhi_lifecycle.launch import Launch, Outcome
 from rhi_lifecycle.serving import Serving
-from rhi_lifecycle.termination import Termination
+from rhi_lifecycle.termination import TERMINATED, Termination
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Mapping
@@ -218,6 +227,15 @@ class _Host(Host):
 
     def engine_started(self) -> bool:
         return self._host.engine_started()
+
+    def begin_launch(self) -> None:
+        self._host.begin_launch()
+
+    def end_launch(self) -> None:
+        self._host.end_launch()
+
+    def launch_begun(self) -> bool:
+        return self._host.launch_begun()
 
     def stop_engine(self) -> None:
         self._rest()
@@ -339,8 +357,9 @@ class Agent:
         self._loop.set_default_executor(self._workers)
         self.server = server = metrics.serve(self._registry, port=self._port)
         try:
-            # A unit restarted on an instance whose engine was started: no launch is run on it.
-            self._in_service = self._launched = await asyncio.to_thread(self._host.engine_started)
+            # A unit restarted on an instance whose engine was started, with no launch on record:
+            # the instance was let into service, and no launch is run on it.
+            self._in_service = self._launched = await asyncio.to_thread(self._found_in_service)
             next_at = self._clock()
             while True:
                 await self.tick()
@@ -380,7 +399,7 @@ class Agent:
             return
         target, instance = reading
         if target is None:
-            # The instance belongs to no group: a canary, unless its engine was started before the program.
+            # The instance belongs to no group: a canary, unless the program found it in service.
             if not self._in_service and not self._tried:
                 self._tried = True
                 self._begin(self._try())
@@ -388,7 +407,7 @@ class Agent:
             if target == launch.IN_SERVICE:
                 if self._duties is None:
                     self._serve(instance)
-            else:
+            elif target == TERMINATED:
                 self._begin(self._leave(instance))
         elif target == launch.IN_SERVICE and not self._launched:
             self._begin(self._enter(instance))
@@ -431,6 +450,10 @@ class Agent:
         except launch.MetadataError as error:
             _LOG.warning("the instance metadata did not give %s", error)  # the item's name
             return None
+
+    def _found_in_service(self) -> bool:
+        """Whether the program starts on an instance that a launch before it let into service."""
+        return self._host.engine_started() and not self._host.launch_begun()
 
     async def _enter(self, instance: str) -> None:
         self._launched = True

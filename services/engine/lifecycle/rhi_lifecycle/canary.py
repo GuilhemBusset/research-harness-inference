@@ -16,6 +16,12 @@ is given no Auto Scaling client. It is given no heartbeats table either, and kee
 reached in memory only: a row there would be read as one of the pool's instances. The program
 starts no serving duty after it.
 
+**On record, like a launch.** The run puts itself on record on the host before its first step
+(`Host.begin_launch`), and nothing removes the record: the instance never enters service. So an
+agent whose unit was restarted during the run, or after it, does not take the started engine for
+one that serves: it makes the run again, and the line is written by that run. A run that cannot be
+put on record fails in the image stage.
+
 **The outcome** is one line on the instance's serial console, which the promotion job reads with
 EC2's console output. Writing it needs no permission of the instance role and leaves the stage's
 tables untouched. The line is one of two, its words separated by one space:
@@ -111,6 +117,10 @@ class Canary:
                 raise launch.Abandon
             measured = current.measured_start_seconds
             deadline = started + max(DEADLINE_SECONDS, DEADLINE_STARTS * (measured or 0))
+            try:
+                self.host.begin_launch()
+            except HostError:
+                raise launch.Abandon from None
             steps.pull(current, deadline)
             steps.serve(current, deadline, reached.append)
         except launch.Abandon:

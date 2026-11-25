@@ -116,6 +116,12 @@ class World(Host):
         self.now += UNIT
         self.healthy_at = self.now + LOAD
 
+    def begin_launch(self) -> None:
+        pass
+
+    def end_launch(self) -> None:
+        pass
+
     # The SDK's clients, and the heartbeats table of its DynamoDB resource.
 
     def get_parameter(self, **request: Any) -> dict[str, Any]:
