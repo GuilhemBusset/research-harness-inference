@@ -18,34 +18,71 @@ instance serves is compared with the deployed one both through the workspace (`r
 the canary's role may query for the coursework pool alone (`src/rhi/pipeline/canary.py`). The run
 records its results as JUnit XML, which the script reads back.
 
-**The wake.** While the tests run, a thread of this process reads the coursework pool's state from
-`GET /status` every `POLL_SECONDS` (a status read is not demand: it wakes nothing). The wake is the
-time from the last reading of `cold` before the pool turned `warming` or `ready` to the first
-reading of `ready`: the hold of the first stream through the pool's readiness, without the stream's
-generation. A pool that reads `ready` at the first reading was not woken, and its wake is 0 seconds.
-A pool that never reads `ready` has no wake measured, and the number is left out.
+**The session.** With sessions, no instance of the coursework pool runs unless someone booked
+one, so the canary books for itself, as the verification does and with its routine
+(`verify.run_in_a_session`, over `booking.py`): one instance, under the name `BOOKED_BY`, for twice
+`RHI_VERIFY_CHECK_WAIT_MINUTES`, the wait and as long again for the tests, so that a job that dies
+leaves a session that ends by itself. It finds the stage's pool-state table by its logical ID in
+the pools stack, as the deployment hold does, reads the gateway's `GET /status` with the canary's
+key until the pool reads `ready` or `RHI_VERIFY_CHECK_WAIT_MINUTES` have passed since the booking,
+runs the tests, and stops the session it booked, whatever became of the run and only while the
+session still reads as its booking. A pool that already has a session, booked or active, is
+neither booked nor stopped: the tests run at once, on the instances that are there.
+
+**No capacity.** When the wait ends and the pool does not read ready, the canary asks, as the
+verification does (`verify.Launches`), whether an instance was launched at all: the heartbeat rows
+of the coursework pool's instances written since the booking, in the table the release parameter
+names, which the canary's role may query for that pool alone. No instance launched is a lack of
+capacity (`docs/design/evidence.md`, E32): no test runs, and the run did not measure. An instance
+that was launched and did not serve by the end of the wait is a failed canary; the tests still
+run, for what they show in the log. When the table cannot tell, the tests run and their result
+stands: a launched instance is never reported as a lack of capacity.
 
 **The measurement.** One run of `gpu-canary`, on the commit the job ran from,
 `CODEBUILD_RESOLVED_SOURCE_VERSION`, with the UTC date the run began, YYYY-MM-DD, as its run label:
-a record keeps one run per label, so each week's run keeps its own. Its verdict is
+a record keeps one run per label, so each week's run keeps its own. A measurement carries a verdict
+and named numbers, never text, so each of the canary's three results is a verdict, and a number
+says why a run did not measure:
 
-- fail when a smoke test failed, in its set-up, its call or its teardown;
-- error, not measured, when no test ran: the endpoint has no HTTPS listener (`RHI_SMOKE_ENDPOINT`
-  reads `none`), the canary's secret is missing or holds no key, or the run left no result; and
-  when the run did not end (pytest was interrupted, or ended with an exit code other than its two
-  of a finished run, `FINISHED`), or no wake was measured;
-- pass otherwise: the run ended, at least one smoke test passed, none failed, and the wake was
-  measured.
+- pass: the wait did not end on a launched instance that did not serve, the run of the tests
+  ended, at least one smoke test passed and none failed;
+- fail: a smoke test failed, in its set-up, its call or its teardown, or an instance was launched
+  and the pool did not read ready by the end of the wait, whatever the tests then gave, and also
+  when their run left no record or one that cannot be read;
+- error, not measured, with `no_capacity` 1: no instance was launched during the wait.
 
-and its numbers, `Number`, are the seconds the wake took and the numbers of smoke tests passed and
-failed. Only the tests that ended count: a case the JUnit XML records without its name is one
-pytest did not finish. It is sent through the measurement event (`rhi_reporter.measure.measurement_event`) on the
-bus `RHI_MEASUREMENT_BUS` names. An event the bus does not take fails the script: EventBridge
-answers a refused entry with a count of failed entries, not with an error.
+A run that could not measure for another reason is an error too, with `no_capacity` 0: the endpoint
+has no HTTPS listener (`RHI_SMOKE_ENDPOINT` reads `none`), the canary's secret is missing or holds
+no key, the pool could not be booked, the run left no result or one that cannot be read, or it
+did not end (pytest was interrupted, or ended with an exit code other than its two of a finished
+run, `FINISHED`).
 
-The script exits with the tests' exit code once the event is sent, and with 1 when that code is 0
-and the verdict still is not pass, so a canary that is not green after a run is a failed build as
-well.
+Its numbers, `Number`, those the run has:
+
+- `wait_seconds`: the seconds from the booking to the pool's first reading of `ready`, or to the
+  end of the wait when none came; 0 on a pool that read ready when the job began, before any
+  booking, and on a pool that already had a session, for which the canary does not wait. Left out
+  when the pool was never reached or could not be booked;
+- `smoke_tests_passed` and `smoke_tests_failed`: only the tests that ended count, since a case the
+  JUnit XML records without its name is one pytest did not finish. A failed canary always has
+  both: 0 and 0 when an instance was launched, did not serve, and the run of the tests left no
+  record of a test. Left out of a run that did not measure and has no record of a test;
+- `no_capacity`: 1 when no instance was launched during the wait, 0 otherwise.
+
+It is sent through the measurement event (`rhi_reporter.measure.measurement_event`) on the bus
+`RHI_MEASUREMENT_BUS` names. An event the bus does not take fails the script: EventBridge answers
+a refused entry with a count of failed entries, not with an error.
+
+**The exit.** Once the event is sent: the tests' exit code, and 1 when that code is 0 and a run
+that made tests still is not a pass, so a canary that is not green after a run is a failed build
+as well. A week without capacity ran no test and is not a failed canary: its exit is 0. A session
+the script booked and could not stop, or a pool it could not book, makes the exit 1; such a
+session ends by itself.
+
+What the job gives, in the environment, beside the commit and the bus: `RHI_SMOKE_ENDPOINT`,
+`RHI_SMOKE_RELEASE_PARAMETERS`, and the four variables of the verification's session,
+`RHI_VERIFY_POOLS_STACK`, `RHI_VERIFY_POOL_STATE_LOGICAL_ID`, `RHI_VERIFY_CHECK_WAIT_MINUTES` and
+`RHI_VERIFY_SESSION_MAX_HOURS` (`scripts/pipeline/verify.py`).
 
 Run by the canary's job, from the checkout:
 
@@ -58,16 +95,14 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree
 
-import httpx
 from botocore.exceptions import BotoCoreError, ClientError
 
 import verify
@@ -79,6 +114,8 @@ if TYPE_CHECKING:
 NAME = "canary_result"
 MEASUREMENT = "gpu-canary"
 POOL = "coursework"
+# The name the canary's session is booked under.
+BOOKED_BY = "pipeline/canary"
 
 COMMIT_VARIABLE = "CODEBUILD_RESOLVED_SOURCE_VERSION"
 WORKSPACE_URL_VARIABLE = "RHI_SMOKE_WORKSPACE_URL"
@@ -88,12 +125,6 @@ REMOTE_WRITE_PATH = "api/v1/remote_write"
 # The exit codes of a run of pytest that ended: every test passed, or some failed.
 FINISHED = (0, 1)
 
-# The pool's states as `GET /status` gives them (section 5.3).
-COLD = "cold"
-READY = "ready"
-# Between two readings of the pool's state, and the longest one may take.
-POLL_SECONDS = 2.0
-READ_SECONDS = 10.0
 # The format of the run label: the UTC date.
 LABEL_FORMAT = "%Y-%m-%d"
 
@@ -101,12 +132,28 @@ LABEL_FORMAT = "%Y-%m-%d"
 class Number(StrEnum):
     """The names of the canary's numbers."""
 
-    WAKE_SECONDS = "wake_seconds"
+    WAIT_SECONDS = "wait_seconds"
     SMOKE_TESTS_PASSED = "smoke_tests_passed"
     SMOKE_TESTS_FAILED = "smoke_tests_failed"
+    NO_CAPACITY = "no_capacity"
 
 
 NAMES: tuple[str, ...] = tuple(Number)
+
+
+@dataclass(frozen=True)
+class Wait:
+    """What the wait for the session's instance gave: its seconds, `None` when none were measured;
+    whether no instance was launched in it; and whether one was launched and the pool still did
+    not read ready when it ended."""
+
+    seconds: float | None = None
+    no_capacity: bool = False
+    unserved: bool = False
+
+
+# A run that never reached the pool.
+NOT_WAITED = Wait()
 
 
 @dataclass(frozen=True)
@@ -137,6 +184,19 @@ def read_results(junit_xml: str) -> Results:
     return Results(passed=len(outcomes) - failed, failed=failed, finished=finished)
 
 
+def read_report(report: Path) -> Results | None:
+    """The results in the file a run of the tests was to record them in. None when the run left no
+    file, or one that is not XML, as a run that was killed while it wrote leaves: such a run has no
+    result, and the canary still reports."""
+    if not report.is_file():
+        return None
+    try:
+        return read_results(report.read_text(encoding="utf-8"))
+    except (ElementTree.ParseError, UnicodeDecodeError):
+        print(f"{NAME}: the record of the tests' run cannot be read", file=sys.stderr)
+        return None
+
+
 def ended(results: Results | None, exit_code: int) -> Results | None:
     """The results of a run whose pytest exited with `exit_code`: one that did not exit as a
     finished run does, `FINISHED`, did not end, whatever its XML holds."""
@@ -145,42 +205,51 @@ def ended(results: Results | None, exit_code: int) -> Results | None:
     return replace(results, finished=False)
 
 
-def wake_seconds(readings: Sequence[tuple[float, str | None]]) -> float | None:
-    """The seconds the wake took, from the pool's states read at the given monotonic times, a
-    reading that failed as None: from the last `cold` before the pool turned `warming` or `ready`,
-    or from the first reading when it was already warming, to the first `ready`. 0 when the first
-    reading is `ready`, and None when no reading is."""
-    began: float | None = None
-    for at, state in readings:
-        if state is None:
-            continue
-        if state == READY:
-            return 0.0 if began is None else round(at - began, 1)
-        if state == COLD or began is None:
-            began = at
-    return None
+def wait_of(outcome: verify.Outcome, *, ready_at_first: bool) -> Wait:
+    """What the wait gave, from what became of the run in its session and from whether the pool
+    read ready when the job began, before any booking. Its seconds are 0 on a pool that was ready
+    then, also when the canary went on to book it; the seconds the session's routine waited, to a
+    tenth, on a pool the canary booked; 0 on a pool that already had a session, for which nothing
+    waits; and not measured on a pool that could not be booked."""
+    if ready_at_first:
+        seconds: float | None = 0.0
+    elif outcome.waited is not None:
+        seconds = round(outcome.waited, 1)
+    else:
+        seconds = None if outcome.exit_code is None else 0.0
+    return Wait(seconds=seconds, no_capacity=outcome.no_capacity, unserved=outcome.unserved)
 
 
-def verdict_of(results: Results | None, wake: float | None) -> Verdict:
-    """The run's verdict: fail when a test failed; not measured when no test ended, when the run
-    did not end or when no wake was measured; pass otherwise."""
+def verdict_of(results: Results | None, wait: Wait) -> Verdict:
+    """The run's verdict: not measured when no instance was launched during the wait; fail when one
+    was launched and did not serve by the wait's end, whatever the tests then gave, or when a test
+    failed; not measured when no test ended or the run did not end; pass otherwise."""
+    if wait.no_capacity:
+        return Verdict.NOT_MEASURED
+    if wait.unserved:
+        return Verdict.FAIL
     if results is None or results.passed + results.failed == 0:
         return Verdict.NOT_MEASURED
     if results.failed:
         return Verdict.FAIL
-    if not results.finished or wake is None:
+    if not results.finished:
         return Verdict.NOT_MEASURED
     return Verdict.PASS
 
 
-def numbers_of(results: Results | None, wake: float | None) -> dict[str, int | float]:
-    """The run's numbers, those it measured."""
+def numbers_of(results: Results | None, wait: Wait) -> dict[str, int | float]:
+    """The run's numbers: the wait's seconds and the tests' counts when the run has them, and
+    always whether it was a lack of capacity that kept it from measuring. A launched instance that
+    did not serve is a failed canary with or without a record of the tests, and a failed canary
+    has its counts: no test is known to have passed or failed when the run left no record."""
     numbers: dict[str, int | float] = {}
-    if wake is not None:
-        numbers[Number.WAKE_SECONDS] = wake
-    if results is not None:
-        numbers[Number.SMOKE_TESTS_PASSED] = results.passed
-        numbers[Number.SMOKE_TESTS_FAILED] = results.failed
+    if wait.seconds is not None:
+        numbers[Number.WAIT_SECONDS] = wait.seconds
+    counted = Results(passed=0, failed=0, finished=False) if results is None and wait.unserved else results
+    if counted is not None and not wait.no_capacity:
+        numbers[Number.SMOKE_TESTS_PASSED] = counted.passed
+        numbers[Number.SMOKE_TESTS_FAILED] = counted.failed
+    numbers[Number.NO_CAPACITY] = int(wait.no_capacity)
     return numbers
 
 
@@ -192,13 +261,13 @@ def run_label(now: datetime) -> str:
     return now.astimezone(UTC).strftime(LABEL_FORMAT)
 
 
-def measurement(results: Results | None, wake: float | None, *, commit: str, bus: str, now: datetime) -> dict[str, str]:
+def measurement(results: Results | None, wait: Wait, *, commit: str, bus: str, now: datetime) -> dict[str, str]:
     """The entry of PutEvents that hands the run to the reporter."""
     return measurement_event(
         MEASUREMENT,
         run_label(now),
-        verdict_of(results, wake),
-        numbers_of(results, wake),
+        verdict_of(results, wait),
+        numbers_of(results, wait),
         names=NAMES,
         commit=commit,
         bus=bus,
@@ -236,51 +305,6 @@ def stage_settings(client: Any, env: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-def status_reader(endpoint: str, key: str, transport: httpx.BaseTransport | None = None) -> Callable[[], str | None]:
-    """What reads the coursework pool's state from `GET /status` of `endpoint`, with the canary's
-    key, through `transport` when one is given: None for a reading that failed. Nothing of the
-    machine's own configuration, a proxy among it, takes part in a reading."""
-    address = (endpoint if "://" in endpoint else f"https://{endpoint}").rstrip("/")
-
-    def read() -> str | None:
-        try:
-            with httpx.Client(timeout=READ_SECONDS, trust_env=False, transport=transport) as http:
-                answer = http.get(f"{address}/status", headers={"Authorization": f"Bearer {key}"})
-            states = {record["model"]: record["state"] for record in answer.json()["pools"]}
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            return None
-        state = states.get(POOL) if answer.status_code == 200 else None
-        return state if isinstance(state, str) else None
-
-    return read
-
-
-class WakeWatch:
-    """Reads the pool's state with `read` every `seconds`, on a thread of its own, from when the
-    context begins until it ends or the wake is measured: `readings`, each with its monotonic time."""
-
-    def __init__(self, read: Callable[[], str | None], *, seconds: float = POLL_SECONDS) -> None:
-        self.readings: list[tuple[float, str | None]] = []
-        self._read, self._seconds = read, seconds
-        self._done = threading.Event()
-        self._thread = threading.Thread(target=self._watch, name="canary-wake", daemon=True)
-
-    def _watch(self) -> None:
-        while not self._done.is_set():
-            self.readings.append((time.monotonic(), self._read()))
-            if wake_seconds(self.readings) is not None:
-                return
-            self._done.wait(self._seconds)
-
-    def __enter__(self) -> Self:
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_exception: object) -> None:
-        self._done.set()
-        self._thread.join(timeout=READ_SECONDS + self._seconds)
-
-
 def _client(service: str) -> Any:
     import boto3
 
@@ -292,68 +316,125 @@ def run_canary(
     *,
     secrets: Any,
     ssm: Any,
+    dynamodb: Any,
+    cloudformation: Any,
+    resource: Any,
+    status: Callable[[str, float], str | None] | None,
     run: Callable[[Mapping[str, str], Sequence[str]], int],
-    watch: Callable[[str, str], WakeWatch],
-) -> tuple[Results | None, float | None, int]:
-    """Runs the smoke tests on the coursework pool: their results, the wake's seconds and the run's
-    exit code. No result when no test could run. A client that is None is made, from the build's
-    own credentials and region, only once it is needed."""
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> tuple[Results | None, Wait, int]:
+    """Runs the smoke tests on the coursework pool, in a session the canary books on it when it has
+    none: their results, what the wait gave and the run's exit code. No result when no test could
+    run or none was run. A client that is None is made, from the build's own credentials and
+    region, only once it is needed."""
     endpoint = env.get(verify.ENDPOINT_VARIABLE)
     if not endpoint:
         print(f"{NAME}: {verify.ENDPOINT_VARIABLE} is not set: no test was run", file=sys.stderr)
-        return None, None, 1
+        return None, NOT_WAITED, 1
     if endpoint == verify.NO_ENDPOINT:
         print(f"{NAME}: no test was run: {verify.LISTENER_OFF}")
-        return None, None, 0
+        return None, NOT_WAITED, 0
     key = verify.canary_key(_client("secretsmanager") if secrets is None else secrets)
     if key is None:
         print(f"{NAME}: no test was run: {verify.CANARY_MISSING}")
-        return None, None, 0
+        return None, NOT_WAITED, 0
+    check = verify.check_of(env)
+    if check is None:
+        print(
+            f"{NAME}: {verify.POOLS_STACK_VARIABLE} and {verify.POOL_STATE_LOGICAL_ID_VARIABLE} name the pool-state "
+            f"table, and {verify.CHECK_WAIT_MINUTES_VARIABLE} and {verify.SESSION_MAX_HOURS_VARIABLE} are whole "
+            "numbers above zero: no test was run",
+            file=sys.stderr,
+        )
+        return None, NOT_WAITED, 1
     stage = stage_settings(_client("ssm") if ssm is None else ssm, env)
     given = {**env, **stage, verify.KEY_VARIABLE: key, verify.POOL_VARIABLE: POOL}
+    read = status or verify.status_reader(endpoint, key)
+    if cloudformation is None or resource is None:
+        import boto3
+
+        cloudformation = cloudformation or boto3.client("cloudformation")
+        resource = resource or boto3.resource("dynamodb")
+    # The pool's state as the job begins, before any booking: a pool that is ready then is not waited for.
+    ready_at_first = read(POOL, verify.READ_SECONDS) == verify.READY
     with tempfile.TemporaryDirectory() as folder:
         report = Path(folder) / "results.xml"
-        with watch(endpoint, key) as watching:
-            exit_code = run(given, (f"--junitxml={report}", verify.SMOKE_TESTS))
-        results = read_results(report.read_text(encoding="utf-8")) if report.is_file() else None
-    return results, wake_seconds(watching.readings), exit_code
-
-
-def _watch(endpoint: str, key: str) -> WakeWatch:
-    return WakeWatch(status_reader(endpoint, key))
+        outcome = verify.run_in_a_session(
+            check,
+            POOL,
+            lambda: run(given, (f"--junitxml={report}", verify.SMOKE_TESTS)),
+            cloudformation=cloudformation,
+            resource=resource,
+            status=lambda within: read(POOL, within),
+            sleep=sleep,
+            clock=clock,
+            launched=lambda since: verify.launched_rows(given, POOL, since, dynamodb),
+            set_by=BOOKED_BY,
+        )
+        results = read_report(report)
+    if outcome.exit_code is None:
+        # No run was made: for lack of capacity, which fails nothing, or because the pool was not booked.
+        results, exit_code = None, 0 if outcome.no_capacity else 1
+    else:
+        results, exit_code = ended(results, outcome.exit_code), outcome.exit_code
+        if results is None:
+            # A run of the tests that left no result is not a green one, whatever its exit.
+            exit_code = exit_code or 1
+    if not outcome.in_order:
+        # A session the canary booked and could not stop, or could not book: it ends by itself.
+        exit_code = exit_code or 1
+    return results, wait_of(outcome, ready_at_first=ready_at_first), exit_code
 
 
 def main(
     environ: Mapping[str, str] | None = None,
     *,
-    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
     secrets: Any = None,
     ssm: Any = None,
     events: Any = None,
+    dynamodb: Any = None,
+    cloudformation: Any = None,
+    resource: Any = None,
+    status: Callable[[str, float], str | None] | None = None,
     run: Callable[[Mapping[str, str], Sequence[str]], int] = verify.run_tests,
-    watch: Callable[[str, str], WakeWatch] = _watch,
 ) -> int:
-    """Runs the canary and sends its measurement; the tests' exit code once it is sent, or 1 for a
-    run that exited 0 and is not green. Without a client, the build's own credentials and region
-    make it, when it is needed."""
+    """Runs the canary and sends its measurement; the run's exit code once it is sent, or 1 for a
+    run of the tests that exited 0 and is not green. `clock` gives the time, in seconds since the
+    epoch, and `sleep` waits that many seconds; `status` reads the state of the pool it is given in
+    the seconds it is given, from the endpoint's `GET /status` when left out. `secrets`, `ssm`,
+    `events`, `dynamodb` and `cloudformation` are clients of the AWS SDK and `resource` a DynamoDB
+    resource: without one, the build's own credentials and region make it, when it is needed."""
     env = os.environ if environ is None else environ
-    began = clock()
+    began = datetime.fromtimestamp(clock(), UTC)
     commit, bus = env.get(COMMIT_VARIABLE), env.get(BUS_VARIABLE)
     if not commit or not bus:
         print(f"{NAME}: {COMMIT_VARIABLE} and {BUS_VARIABLE} name the commit and the bus", file=sys.stderr)
         return 1
     try:
-        results, wake, exit_code = run_canary(env, secrets=secrets, ssm=ssm, run=run, watch=watch)
+        results, wait, exit_code = run_canary(
+            env,
+            secrets=secrets,
+            ssm=ssm,
+            dynamodb=dynamodb,
+            cloudformation=cloudformation,
+            resource=resource,
+            status=status,
+            run=run,
+            sleep=sleep,
+            clock=clock,
+        )
     except (BotoCoreError, ClientError) as error:
         # The canary could not measure: it says so, as not measured, rather than sending nothing.
         print(f"{NAME}: the canary did not run ({type(error).__name__})", file=sys.stderr)
-        results, wake, exit_code = None, None, 1
-    results = ended(results, exit_code)
-    entry = measurement(results, wake, commit=commit, bus=bus, now=began)
+        results, wait, exit_code = None, NOT_WAITED, 1
+    entry = measurement(results, wait, commit=commit, bus=bus, now=began)
     send(entry, _client("events") if events is None else events)
-    verdict = verdict_of(results, wake)
+    verdict = verdict_of(results, wait)
     print(f"{NAME}: {MEASUREMENT} {verdict.name.lower()} sent for {run_label(began)}")
-    if results is None or verdict is Verdict.PASS:
+    if verdict is Verdict.PASS or (results is None and verdict is not Verdict.FAIL):
         return exit_code
     return exit_code or 1
 

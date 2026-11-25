@@ -444,7 +444,7 @@ the next run uses the new key.
    - The verification: after a **Release change**, its `verify/<stage>` status reads "The
      verification's tests ran and passed.", not one that begins "No test ran", and the end of
      its Verify action's CodeBuild log reports tests `passed` and none `failed` or `error`.
-   - Or the weekly canary, started now; it wakes the coursework pool, one GPU start:
+   - Or the weekly canary, started now; it books one instance of the coursework pool, one GPU start:
 
      ```sh
      aws codebuild start-build --project-name rhi-gpu-canary --query build.id --output text
