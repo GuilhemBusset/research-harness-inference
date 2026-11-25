@@ -1,5 +1,5 @@
-"""The fleet cap: a pool's group has a minimum of zero, no desired capacity and its pool's maximum
-(system design, sections 4.2, 5.1 and 8.4).
+"""The fleet cap: a pool's group has a minimum of zero, no desired capacity, its pool's maximum and
+no scheduled action (system design, sections 4.2, 5.1 and 8.4).
 
 A pool becomes one Auto Scaling group, and the group's maximum size is the first thing that stays
 outside the scaler, so that a broken scaler cannot cost money. Schedules, ceilings and stops all
@@ -13,8 +13,9 @@ the configuration the policy tests synthesize. Every group is a pool's: one with
 whose tag names no configured pool, is refused. A size counts only when the template writes it as
 a number: one built from a parameter or another resource could be anything at deployment.
 
-A scheduled action that sets only a desired capacity is not refused: the nightly action that sets
-it to zero is one of the guards outside the scaler (section 5.1).
+Every scheduled action is refused, whatever it sets, a desired capacity alone included: it would be
+a second writer of the pool's size, at an hour that knows nothing of the sessions. There is no
+nightly stop (section 5.1): what ends a forgotten session is its own end.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ MAXIMUM = "its maximum is not the max_instances of its pool"
 UNTAGGED = f"it does not carry one tag {POOL_TAG}"
 UNKNOWN_POOL = f"its tag {POOL_TAG} names no configured pool"
 SCALING_POLICY = "a scaling policy"
-SCHEDULED_SIZE = "a scheduled action that sets a minimum or a maximum"
+SCHEDULED = "a scheduled action"
 
 GROUP = "AWS::AutoScaling::AutoScalingGroup"
 SCHEDULED_ACTION = "AWS::AutoScaling::ScheduledAction"
@@ -83,8 +84,8 @@ def violations(templates: Mapping[str, Mapping[str, Any]], caps: Mapping[str, in
                 found += [(path, logical_id, what) for what in group_violations(properties, caps)]
             if kind in SCALES_A_GROUP:
                 found.append((path, logical_id, SCALING_POLICY))
-            if kind == SCHEDULED_ACTION and ("MinSize" in properties or "MaxSize" in properties):
-                found.append((path, logical_id, SCHEDULED_SIZE))
+            if kind == SCHEDULED_ACTION:
+                found.append((path, logical_id, SCHEDULED))
     return found
 
 
@@ -131,7 +132,7 @@ def test_detects_a_desired_capacity(cdk: ModuleType) -> None:
     assert found(cdk, group(cdk, desired_capacity="1")) == [("Group", DESIRED_CAPACITY)]
 
 
-def test_detects_a_scheduled_minimum(cdk: ModuleType) -> None:
+def test_detects_a_scheduled_action(cdk: ModuleType) -> None:
     def scheduled(**sets: int) -> Any:
         """A group with a scheduled action that sets what is given."""
         pool = group(cdk)
@@ -139,9 +140,10 @@ def test_detects_a_scheduled_minimum(cdk: ModuleType) -> None:
         action(pool.stack, "Action", auto_scaling_group_name=pool.ref, recurrence="0 3 * * *", **sets)
         return pool
 
-    # The nightly action of section 5.1 sets a desired capacity and no bound.
-    assert found(cdk, scheduled(desired_capacity=0)) == []
-    assert found(cdk, scheduled(min_size=1)) == [("Action", SCHEDULED_SIZE)]
+    assert found(cdk, group(cdk)) == []
+    # Even one that sets only a desired capacity, and that to zero, as the nightly stop did.
+    assert found(cdk, scheduled(desired_capacity=0)) == [("Action", SCHEDULED)]
+    assert found(cdk, scheduled(min_size=1)) == [("Action", SCHEDULED)]
 
 
 def test_detects_an_untagged_group(cdk: ModuleType) -> None:
@@ -191,8 +193,18 @@ def by_hand(**changes: Any) -> dict[str, Any]:
         ),
         pytest.param(
             {"Group": by_hand(), "Action": {"Type": SCHEDULED_ACTION, "Properties": {"MaxSize": 8}}},
-            [("Action", SCHEDULED_SIZE)],
+            [("Action", SCHEDULED)],
             id="a scheduled maximum",
+        ),
+        pytest.param(
+            {"Group": by_hand(), "Action": {"Type": SCHEDULED_ACTION, "Properties": {"DesiredCapacity": 0}}},
+            [("Action", SCHEDULED)],
+            id="a scheduled desired capacity",
+        ),
+        pytest.param(
+            {"Group": by_hand(), "Action": {"Type": SCHEDULED_ACTION}},
+            [("Action", SCHEDULED)],
+            id="a scheduled action that sets nothing",
         ),
         pytest.param(
             {"Group": by_hand(MinSize="1", MaxSize="3", DesiredCapacity="1")},

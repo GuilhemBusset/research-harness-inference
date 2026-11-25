@@ -203,8 +203,6 @@ class PoolsStack(cdk.Stack):
                 security_group=network.security_groups.instances,
                 target_group=self.routing.target_groups[pool.name],
                 role=self.roles[pool.name].role,
-                nightly_stop=config.nightly_stop,
-                time_zone=config.time_zone,
             )
             for pool in config.pools
         }
