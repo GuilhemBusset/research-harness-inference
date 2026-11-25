@@ -4,8 +4,9 @@ A launch that fails every time (a bad image, a wrong prefix, a rotated secret) w
 whole session: launch, wait, abandon, relaunch, each attempt billed (system design, section 5.4).
 So the scaler counts the launches abandoned in a row, and after three it suspends the launches of
 the pool's group, sets the mark `launch_suspended` in the pool's record, and waits for the admin
-(section 5.1). While the mark stands the pool is not raised: a session asks for instances and gets
-none. Nothing clears the mark but the admin's command, and the scaler never sets it back by itself.
+(section 5.1). While the mark stands the group launches nothing and the pool is not raised: what a
+session asks beyond what the group had already been asked for is not passed on to AWS. Nothing
+clears the mark but the admin's command, and the scaler never sets it back by itself.
 
 A launch is **abandoned** when the instance started and did not become ready to serve: a step of
 its start failed, the release on the instance was not the pool's, or the start's deadline passed.
@@ -33,8 +34,8 @@ pool, by its name in the configuration, which is also the model name `rhi status
   has suspended the pool's launches after three abandoned launches. It is sent once, when the
   scaler suspends them, and nothing is sent when the alarm clears.
 - **`rhi_admin pool status`** reads `true` under `launch_suspended` for the pool.
-- **`rhi_admin session status`** reads the cause `launches-suspended` for the pool, or a session
-  that stays short with `requested` above `asked`.
+- **`rhi_admin session status`** reads the cause `launches-suspended` for the pool, or `requested`
+  above `asked`.
 - **Students** see a pool that does not come up during its session, or stays short of its
   instances. With none in service or starting, `rhi status` lists it as `unavailable` with
   `capacity_unavailable`: the students' side does not tell suspended launches from missing
@@ -57,11 +58,20 @@ pool, by its name in the configuration, which is also the model name `rhi status
    rhi_admin session status
    ```
 
-   A suspended pool shows in one of two ways. While instances that were asked of AWS before the
-   suspension have not arrived, `waiting` is above zero and `cause` reads `launches-suspended`. A
-   session booked, or raised, after the suspension is not passed on to AWS at all: `requested`
-   stays above `asked`, with nothing waiting and no cause. In both, the instances already in
-   service stay and keep serving, and a session that is lowered or stopped still releases them.
+   The numbers from `requested` on are what the scaler wrote at its last run, within the last
+   minute. The scaler does not raise a suspended pool: `asked`, what the pool's group is asked for,
+   stays where the suspension found it, or goes down with the session. Two things show it, one of
+   them or both:
+
+   - `waiting` above zero, with the cause `launches-suspended`: instances the group was asked for
+     before the suspension and has not got. `waiting` is `asked` less the instances starting and in
+     service, and a cause is shown only while `waiting` is above zero;
+   - `requested` above `asked`: a session booked, or raised, since the suspension. What it asks
+     beyond `asked` is not asked of AWS at all, so it is not counted under `waiting`, and by itself
+     it shows no cause.
+
+   The instances in service stay and keep serving, and a session that is lowered or stopped still
+   releases them.
 
 3. **Why three launches were abandoned.** Find it before clearing anything: launches that resume
    on the same fault are abandoned again, each one billed.
@@ -74,8 +84,9 @@ pool, by its name in the configuration, which is also the model name `rhi status
    - **Where the starts stopped.** In Grafana, on the dashboard "Fleet and scaling", in the pool's
      row, the panel "Cold launch: seconds per stage, per launch" has one series for each stage of
      each launch, with the time range set over the launches. An abandoned launch keeps the stages
-     it went through, as far as the instance reported them before it left, and has none after the
-     one it stopped in. The stages, in order, and what to suspect of a launch that stops in each:
+     it went through, the one it was abandoned in included, as far as the instance reported them
+     before it left, and has none after that one. The stages after the boot, in order, and what to
+     suspect of a launch whose last stage is each:
 
      | Stage | What the instance does | What to suspect |
      | --- | --- | --- |
@@ -85,32 +96,57 @@ pool, by its name in the configuration, which is also the model name `rhi status
      | `weights` | Waits for the engine's health route, while the engine loads the weights | The weights are not where the release says, a wrong prefix, or the engine does not start with them |
      | `warm-up` | Sends the engine one request | The engine started and does not answer |
 
-     Three launches that stop in the same stage point to one cause. The pool's log group,
+     A launch that completes has the stage `hook` last; an abandoned one never has it. Three
+     launches that stop in the same stage point to one cause. The pool's log group,
      `/rhi/pools/coursework` with the pool's name, holds what its instances logged around the time
      of each launch.
-   - **When the launches ran.** The group of a pool is named `rhi-pool-` followed by the pool's
-     name. Its last activities, with when each started and ended and how it ended:
+   - **Which launches were abandoned, and when.** The scaler counts them in the activities of the
+     pool's group, which is named `rhi-pool-` followed by the pool's name. Its last activities, the
+     newest first, each with what it was, how it ended and why:
 
      ```sh
      aws autoscaling describe-scaling-activities --auto-scaling-group-name rhi-pool-coursework \
-         --max-items 10 --query 'Activities[].[StartTime,EndTime,StatusCode]' --output text
+         --max-items 20 --output json \
+         --query 'Activities[].{what:Description,status:StatusCode,why:StatusMessage,started:StartTime,ended:EndTime}'
      ```
 
-4. **Whether a session is active on the pool** (step 2). While one is, the pool is raised as soon
-   as the suspension is cleared. And a fix that is a deployment waits while a session is active on
-   any pool (section 5.6): stop the sessions first, with the runbook
-   [a session booked, changed and stopped](sessions.md), and tell the students to work with their
-   own subscriptions meanwhile.
+     A launch is an activity whose `Description` begins with the word launching. It was abandoned
+     when its `StatusCode` is `Failed` or `Cancelled` and its `StatusMessage` says that the launch's
+     lifecycle hook was abandoned. A launch that failed for lack of capacity, or that the quota
+     refused, says so there instead: it was not abandoned, and is the runbook
+     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service, and
+     the scaler's count starts again after it: the launches that suspended the pool are the
+     abandoned ones that ended, `EndTime`, after the last successful one, and after the last time
+     the suspension was cleared. Their times, against those of the deployments and the rotations
+     above, say which change they followed, and are the times to read the dashboard and the pool's
+     log group at.
+
+4. **Whether a session is active,** on the pool and on any other (step 2). On the pool: the scaler
+   raises it at its first run after the suspension is cleared, so a suspension cleared during a
+   session launches within a minute. On any pool: a fix that is a deployment waits while a session is
+   active (section 5.6). For such a fix, stop the sessions first, with the runbook
+   [a session booked, changed and stopped](sessions.md), let their instances leave (its Verify,
+   step 3), and tell the students to work with their own subscriptions meanwhile.
 
 ## Act
 
-1. **Fix the cause,** with the runbook that Check, step 3, pointed to. Until it is fixed, leave
-   the suspension as it is: a suspended pool launches nothing, so the fault costs nothing more.
+1. **Fix the cause,** with the runbook that Check, step 3, pointed to, and leave the suspension
+   as it is until the cause is fixed: a suspended pool launches nothing, so the fault costs nothing
+   more, and launches that resume on the same fault are abandoned again.
 
-   A fix that is a deployment is the one case where the suspension is cleared first (step 2), once
-   every session is stopped and just before the fix is merged or its execution started: with no
-   session on the pool, clearing launches nothing, and the pipeline's verification, which books the
-   pool it tests, needs the launches (runbook [bad deployment](bad-deployment.md), Act, step 1).
+   When the fix is a deployment, the suspension stays through it too. With every session stopped
+   (Check, step 4) the scaler holds the pool at zero, suspended or not, so the deployment has no
+   instance of the pool to replace and needs no launch. Merge the fix, or start its execution, and
+   follow that execution on the pipeline's page in the CodePipeline console. The cause is fixed
+   once every deployment action of the stage has succeeded in it: from then on the pool's group
+   launches the corrected release. Go to step 2 then, and not before.
+
+   Do not wait longer either. The execution's verification follows its deployment: it books the
+   pools it tests and waits `check_wait_minutes` (45 by default) for an instance of each, and an
+   instance of a suspended pool does not come. A verification whose wait for the pool ended before
+   the suspension was cleared has not tested the fix on that pool, and may have failed for it: read
+   the execution with the runbook [bad deployment](bad-deployment.md), and take Verify, below, as
+   the test of the fix.
 
 2. **Clear the suspension,** once the cause is fixed. The command sets the mark back to false and
    writes who cleared it and when; it is refused for a pool whose launches are not suspended.
@@ -125,10 +161,19 @@ pool, by its name in the configuration, which is also the model name `rhi status
    rhi_admin pool run
    ```
 
-   It prints each pool's decision: the pool, the instances asked of AWS and the reason. A pool
-   with an active session that was short reads `provision`; `launch-suspended` means the mark still
-   stands. When the command answers that the scaler is already running, that run or the next one,
-   within a minute, resumes the launches.
+   It prints one line for each pool: the pool, the instances its group is asked for, and the reason
+   of the run's decision. For the pool just cleared, while a session is active on it:
+
+   - `provision`: the session asks for more than the group had been asked for, and the run now asks
+     AWS for the session's number;
+   - `unchanged`: the group had been asked for the session's number before the suspension. The run
+     changes no number, and resumes the group's launches all the same;
+   - `launch-suspended`: the run still found the mark set. Read `rhi_admin pool status` again.
+
+   `release` and `rebalance` are the run's other work on the pool, and say nothing of the
+   suspension: Verify, step 1, does. With no session active on the pool, its line reads zero instances, and the launches wait for a
+   booking (step 3). When the command answers that the scaler is already running, the launches
+   resume at the next run, within a minute.
 
 3. **Book the pool again,** if its session was stopped or has ended, with the runbook
    [a session booked, changed and stopped](sessions.md).
@@ -152,7 +197,8 @@ pool, by its name in the configuration, which is also the model name `rhi status
    reads `true` again was suspended by three more: the fix did not fix the launch. Go back to
    Check, step 3.
 
-3. Students see the pool `warming`, then `ready`:
+3. Students see the pool `ready` once an instance is in service, and `warming` before that, from
+   the moment one is starting:
 
    ```sh
    rhi status

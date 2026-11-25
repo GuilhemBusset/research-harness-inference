@@ -37,11 +37,12 @@ rhi login --endpoint https://inference.example.com
 ```
 
 A pool is named by its name in the configuration, which is also the model name `rhi status` prints.
-Each command `session` takes `--pool`, and acts on the configuration's `default_pool` without it:
-`coursework` in the example, and below. A time is `HH:MM`, the next time the clock of the
-configuration's `time_zone` shows it, or a date and time, `YYYY-MM-DDTHH:MM`, in that zone. A
-length is a whole number followed by `m` or `h`, as `90m` or `6h`. The times and the numbers below
-are examples.
+`session start`, `session set` and `session stop` take `--pool`, and act on the configuration's
+`default_pool` without it: `coursework` in the example, and below. `session status` takes no pool:
+it lists every deployed pool. A time is `HH:MM`, the next time the clock of the configuration's
+`time_zone` shows it, or a date and time, `YYYY-MM-DDTHH:MM`, in that zone. A length is a whole
+number followed by `m` or `h`, as `90m` or `6h`. The times and the numbers below are examples, for
+the example's coursework pool, whose `max_instances` is 2.
 
 ## When
 
@@ -85,7 +86,8 @@ Do these the day before the class.
    waited for like any other, and `session status` then reads the cause `quota` (Act, step 2).
 
 2. **A pool's maximum, if the class needs more instances.** A session books from 1 to the pool's
-   `max_instances`, as the running scaler holds it, and `session start` refuses more. To raise it,
+   `max_instances`, as the running scaler holds it, and `session start` and `session set` refuse
+   more. To raise it,
    edit `max_instances` of the pool in your configuration file, kept outside the working tree, then
    validate and write it to SSM:
 
@@ -177,32 +179,39 @@ Do these the day before the class.
    | `in_service` | Healthy behind the load balancer: these serve students |
    | `cause` | While instances are waited for, why the last launch failed, if one did |
 
+   The columns up to `set_at` are the session's record, read as the command runs. Those from
+   `requested` on are what the scaler wrote at its last run: it runs every minute, and once more
+   when a command `session` asks it to, so they follow a command at once when the command said that
+   the scaler has run, and within a minute when it said that a run was already under way.
+
    The session is filled when `in_service` reads the session's `instances`. While it is not:
 
    - `waiting` above zero, with no cause or the cause `insufficient-capacity`: AWS has no instance
      yet. Nothing gives up, and Auto Scaling keeps asking by itself: wait. If the class starts
      before the instances, it is the runbook [capacity failure](capacity-failure.md);
    - the cause `quota`: the account's quota refuses the launches (Check, step 1);
-   - the cause `launches-suspended`, or `requested` above `asked` for more than a minute: the
-     scaler has suspended the pool's launches, the runbook
-     [a pool whose launches are suspended](suspended-launches.md);
+   - the cause `launches-suspended`, or `requested` above `asked`: the scaler has suspended the
+     pool's launches, the runbook [a pool whose launches are suspended](suspended-launches.md);
    - the cause `launch-failed`: a launch failed for another reason. If it goes on, three launches
      abandoned in a row suspend the pool's launches, and it is the same runbook.
 
    The dashboard "Fleet and scaling" in Grafana shows the same numbers over time, in the pool's
    row.
 
-3. **Change the session.** `session set` changes what it is given and keeps the rest. More
-   instances, or fewer:
+3. **Change the session.** `session set` changes what it is given and keeps the rest. The
+   instances are any number from 1 to the pool's `max_instances`: fewer than the session has, here
+   one of the two booked in step 1, or more, here the two again.
 
    ```sh
-   rhi_admin session set --instances 3
+   rhi_admin session set --instances 1
+   rhi_admin session set --instances 2
    ```
 
-   More are asked of AWS at once and arrive as the first ones did. Fewer: what leaves is, in this
-   order, capacity that has not arrived, an instance still starting, an instance in service that
-   has nothing running and nothing waiting, then the one with the fewest requests, which drains
-   (section 5.1).
+   Fewer: what leaves is, in this order, capacity that has not arrived, an instance still starting,
+   an instance in service that has nothing running and nothing waiting, then the one with the
+   fewest requests, which drains (section 5.1). More: they are asked of AWS at once and arrive as
+   the first ones did, which may take as long. A number above the pool's `max_instances` is
+   refused, and the session stays as it was (Check, step 2, raises the maximum).
 
    A later end, or a sooner one, as a time or as a length counted from the later of the session's
    start and now:
@@ -240,12 +249,17 @@ Do these the day before the class.
 ## Verify
 
 1. **The session reads as you wrote it,** after each command: `booked` or `active` with its
-   instances, its start and its end after a booking or a change, and `none` after a stop, with
-   `requested` at zero.
+   instances, its start and its end after a booking or a change, and `none` after a stop. That
+   much is the record, and reads so at once.
 
    ```sh
    rhi_admin session status
    ```
+
+   `requested` and `asked` follow once the scaler has run on the record (Act, step 2): the
+   session's instances while it is active, zero before its start and after a stop. When the command
+   said that a run was already under way, they may still read the numbers of before: read the
+   status again a minute later.
 
 2. **What students see at each moment.** The gateway reads the sessions every 5 seconds, so a
    command shows here within seconds. `rhi status` lists each pool with a state and, when it is
@@ -277,12 +291,25 @@ Do these the day before the class.
    starts with none, students work with their own subscriptions to hosted models; nothing here
    stands in for a pool.
 
-3. **After a stop, or after the end,** the instances are gone within about eleven minutes (section
-   5.1): `session status` reads zero under `asked`, `starting` and `in_service` for the pool, and
-   the dashboard "Fleet and scaling" shows the same in the pool's row.
+3. **After a stop, or after the end,** the scaler's next run, within a minute, asks AWS for
+   none: `session status` then reads zero under `requested` and `asked` for the pool, and zero
+   under `in_service` once its instances have left the load balancer.
 
    ```sh
    rhi_admin session status
    ```
+
+   That line does not count an instance that drains: one that still has requests running leaves
+   once they have finished, and the instances are gone within about eleven minutes of the run that
+   released them (section 5.1). The pool's group, which is named `rhi-pool-` followed by the pool's
+   name, then lists no instance, and the command prints nothing:
+
+   ```sh
+   aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names rhi-pool-coursework \
+       --query 'AutoScalingGroups[].Instances[].[InstanceId,LifecycleState]' --output text
+   ```
+
+   A group that still lists an instance after twenty minutes, with none in service, raises the
+   alarm on instances running with nothing in service (section 5.1).
 
 Walked through on the deployed system: not yet.
