@@ -9,10 +9,11 @@ pool's session changes nothing for it.
 The count is in whole minutes, from where the pool's stretch began. A stretch begins at the first
 of the runs in a row that saw the pool with at least one instance in service while its session was
 not active, and no earlier than that session's end: when runs were missed while a session came and
-went, the stretch counts from the end of that session, not from before it. A run that sees none in
-service, or that finds the session active, ends the stretch: the next one counts from zero. Where
-the stretch began is kept in the pool's memory (`Memory.outside_sessions_since`), so it runs on
-from one run to the next.
+went, the stretch counts from the end of that session, not from before it. A session stopped
+before its start was never active, so it moves no stretch. A run that sees none in service, or
+that finds the session active, ends the stretch: the next one counts from zero. Where the stretch
+began is kept in the pool's memory (`Memory.outside_sessions_since`), so it runs on from one run
+to the next.
 
 The stretch only reports: `decide` neither reads nor sets it.
 """
@@ -39,7 +40,7 @@ def stretch_since(
         return now
     if session is not None:
         ended = sessions.end(session, session_max_hours=session_max_hours)
-        if ended <= now:
+        if session.starts_at < ended <= now:
             # The session was active until its end: no stretch began before it.
             return max(previous, ended)
     return previous

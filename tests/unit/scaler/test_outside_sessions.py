@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from rhi_common import sessions
 from rhi_common.pool_config import parse_pools
 from rhi_common.records import Session
 from rhi_scaler.decide import decide
@@ -71,6 +72,17 @@ def test_a_stretch_starts_at_the_end_of_the_pool_s_session_not_before_it() -> No
     # session allows ended there.
     long = Session("coursework", 1, T0 + 60, T0 + 9 * HOUR, set_by="instructor", set_at=T0)
     assert counts([(T0, 1, long), (T0 + HOUR + 120, 1, long)], session_max_hours=1) == [0, 1]
+
+
+def test_a_booking_stopped_before_its_start_leaves_the_stretch_running() -> None:
+    # In service for an hour with a session booked for later, which is then stopped: it was never
+    # active, so the stretch runs on from where it began.
+    stop = T0 + HOUR
+    booking = Session("coursework", 1, stop + HOUR, stop + 2 * HOUR, set_by="instructor", set_at=T0)
+    stopped = sessions.stopped(booking, set_by="instructor", now=stop, session_max_hours=12)
+    assert stopped is not None
+    runs = [(T0 + 60 * n, 1, booking) for n in range(60)] + [(stop, 1, stopped), (stop + 60, 1, stopped)]
+    assert counts(runs)[-3:] == [59, 60, 61]
 
 
 def test_a_session_active_on_another_pool_does_not_end_a_pool_s_stretch() -> None:
