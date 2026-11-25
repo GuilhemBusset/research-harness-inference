@@ -15,8 +15,8 @@ by the configuration step of `setup/owner-setup.sh`. Anything else (the AWS cons
 
 `OWNER/REPOSITORY` below stands for this repository on GitHub, `<sha>` for the full SHA of the
 merge commit, `<stage>` for the name of the stage the pipeline deploys, `<pipeline>` for the
-pipeline's name, `<stack>` for the name of a stack of the stage as the CloudFormation console
-lists it, and `<group>` for a pool's Auto Scaling group. The admin CLI is run from the repository's
+pipeline's name, and `<stack>` for the name of a stack of the stage as the CloudFormation console
+lists it. The admin CLI is run from the repository's
 root, with your own AWS credentials; define its name once in your shell:
 
 ```sh
@@ -201,9 +201,7 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
        same execution had already updated successfully before the failure stays on the new one.
      - `UPDATE_ROLLBACK_FAILED`: the rollback stopped half way, and no further update of the
        stack can start, the pipeline's included, until it is resumed. Read the stack's events for
-       the resource that could not roll back and why. A pool's instance refresh that could not run
-       (its group's launches suspended, Act, step 1) is fixed by resuming the launches first. Then
-       resume the rollback:
+       the resource that could not roll back and why. Then resume the rollback:
 
        ```sh
        aws cloudformation continue-update-rollback --stack-name <stack>
@@ -213,73 +211,57 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
        succeed at all: the skipped resource stays as the failed update left it, and the next
        deployment must bring it right. Read the state again until it is `UPDATE_ROLLBACK_COMPLETE`.
 
-     A pool's instance refresh is part of its stack's update (section 4.3), so the rollback of a
-     Pools stack whose refresh trigger had changed (Act, step 5) puts the earlier release back in
-     the pool's parameter and starts a refresh back to it. Do not assume it ran: read the pool's
-     refreshes, the newest first, and the release its instances serve. The group of a pool
-     carries the tag `rhi-pool` with the pool's name:
+     The rollback of a Pools stack puts the earlier release back in each pool's parameter, and
+     the earlier launch template in place. Like the deployment, it replaces no instance (section
+     4.3): it changes what the next instance launches with, and nothing that runs.
 
-     ```sh
-     aws autoscaling describe-auto-scaling-groups --filters Name=tag:rhi-pool,Values=coursework \
-         --query 'AutoScalingGroups[].AutoScalingGroupName'
-     aws autoscaling describe-instance-refreshes --auto-scaling-group-name <group> --max-records 3 \
-         --query 'InstanceRefreshes[].[Status,StartTime,EndTime,PercentageComplete]'
-     ```
+   **What the instances serve.** A deployment waits while a session is active, so a bad release
+   normally found no instance, and the first to launch on it are the instances that the
+   verification, or the next session, asks for. An instance that launched while the bad release
+   was deployed keeps it until it leaves, whatever was deployed since. On the Grafana dashboard
+   "Deployments and releases", the panel "Release each instance serves: image digest and model
+   revision" shows the release each running instance of a pool serves. A pool with no instance
+   serves no release until its next session, whose instances start with what its parameter names
+   then.
 
-   On the Grafana dashboard "Deployments and releases", the panel "Release each instance serves:
-   image digest and model revision" shows the release each running instance of a pool holds. A
-   pool with no instance holds no release until it next starts, and starts with what its
-   parameter names then.
-
-4. **Whether a session is on.** A repair is deployed outside a session: its refresh replaces
-   instances and its gateway deployment drains tasks, in the middle of a class otherwise.
+4. **Whether a session is booked or active,** on any pool:
 
    ```sh
    rhi_admin session status
    ```
 
-   Once the deployment hold is deployed (issue E4-42, see the runbook `sessions.md`), the
-   pipeline waits before each stage's deployment while the switch reads on, so a repair merged
-   during a class waits for the session to be switched off; a deployment that passed the hold
-   before the session was switched on still runs to its end. Until that hold is deployed, nothing
-   holds a deployment: merge the repair only while no session is on, and switch no session on
-   until its execution has ended.
+   The pipeline waits before each stage's deployment while a session is active on any pool
+   (section 8.2, step 5), so a repair merged during a class is deployed after the session's end,
+   and nothing changes under the class meanwhile. If the repair cannot wait, stop the sessions
+   (runbook [a session booked, changed and stopped](sessions.md)) and tell the students to work
+   with their own subscriptions. A deployment that passed the wait before a session started still
+   runs to its end: its gateway deployment drains tasks during the session, and an instance that
+   launches meanwhile may start on either release. So book no session until the repair's
+   execution has ended.
 
 ## Act
 
 1. **A pool whose launches are suspended.** When `rhi_admin pool status` reads `launch_suspended`
-   `true` for a pool, its group's `Launch` process is suspended: no instance refresh can launch a
-   replacement, the scaler does not wake it, and the verification cannot start an instance on it.
-   The fix or revert of step 2, 3 or 4 would then fail on that pool, or hang until its refresh
-   times out. The launches must be running again before the repair's refresh starts, so resume
-   them just before you merge the repair, or start its execution, with no session on.
-
-   The admin command clears only the mark; the scaler resumes the group's `Launch` process at its
-   next run, every minute. Clear the mark, then ask for one run of the scaler now:
+   `true` for a pool, its group launches nothing: the scaler does not raise the pool, and the
+   verification's instance on it never comes. A suspended pool costs nothing more, so leave the
+   suspension in place while the repair is deployed: with no session active the pool is at zero,
+   and the deployment has no instance to replace and needs no launch. Clear it only once every
+   deployment action of the repair's execution has succeeded, so that the next launch starts the
+   repaired release; cleared sooner, launches resume on the bad one and are abandoned again, each
+   one billed. The runbook [a pool whose launches are suspended](suspended-launches.md) has the
+   whole of it. The admin command clears the mark, and the scaler resumes the group's launches at
+   its next run, which the second command asks for now:
 
    ```sh
    rhi_admin pool clear-suspension coursework
    rhi_admin pool run
    ```
 
-   with the pool's name in place of `coursework`. Then confirm that the group no longer lists
-   `Launch` among its suspended processes (Check, step 3, finds `<group>` from the pool's tag); an
-   empty list, or one without `Launch`, is what you want:
-
-   ```sh
-   aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <group> \
-       --query 'AutoScalingGroups[0].SuspendedProcesses[].ProcessName'
-   ```
-
-   Only then merge the repair or start its execution. Until the refresh has replaced them, the
-   pool's launches still start the bad release: once the gateway enforces the session switch
-   (issue E4-41), nothing wakes the pool with no session on; until then, a student's request can.
-   Should three launches fail again before the refresh starts, the scaler suspends the pool again,
-   and the refresh then fails (Check, step 3). So, before the execution reaches the Pools stack's
-   `Deploy` action (its actions, Check, step 1), read `rhi_admin pool status` once more; if it
-   reads `true` again, clear the mark, run the scaler and confirm as above before that action
-   starts. Should a launch of the corrected release fail three times, the fix did not fix the
-   launch.
+   with the pool's name in place of `coursework`. The repair's own verification may have waited
+   for an instance of the suspended pool in vain: once the suspension is cleared, the test of the
+   repair on that pool is the pool's next session, or the weekly canary for the coursework pool.
+   Should a launch of the repaired release be abandoned three times, the scaler suspends the pool
+   again: the repair did not fix the launch.
 
 2. **Choose: fix forward or revert.**
 
@@ -291,8 +273,8 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      forward has failed too. A revert brings back a state that was deployed and verified.
    - **Never by hand.** Changing a stack, a parameter or a group in the console does not fix a bad
      deployment: the next run of the pipeline deploys `main` and the configuration over it again.
-     Resuming a rollback (Check, step 3) and resuming a pool's launches (step 1) only let the
-     pipeline run.
+     Resuming a rollback (Check, step 3) only lets the pipeline run, and clearing a pool's
+     suspension (step 1) only lets the pool launch what the pipeline deployed.
 
    **What to revert: the code, the configuration, or a machine image.** A deployment deploys three
    inputs, and only the first is in git. Revert the one that changed:
@@ -301,8 +283,8 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    - **the configuration in SSM**, which the pipeline's synthesis reads on every execution
      (section 8.2, step 2): a pool's model, model revision, engine flags or instance types, and
      every other setting of the configuration file. A git revert does not touch it: an execution
-     started by a git revert synthesizes the same release from the same configuration, so it
-     refreshes no pool back, and leaves the bad instances in service. Put the previous values back in your
+     started by a git revert synthesizes the same release from the same configuration, so the
+     pools keep the bad release, and their next instances launch on it. Put the previous values back in your
      configuration file and run the configuration step, which writes it to SSM; then start an
      execution of the pipeline in its console (**Release change**) so that it deploys:
 
@@ -343,22 +325,18 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    or file it as an issue for the implement loop. A fix of the configuration or of a machine image
    goes the way of step 2.
 
-5. **What a revert does to instances already refreshed.** A deployment does not change an instance
-   that is running. A pool's instance refresh starts when its refresh trigger changes
-   (`src/rhi/pools/release.py`), which holds the pool's release (its engine image, model revision,
-   engine flags and files), its machine image, and the version of its launch template: any change
-   to the launch template, its user data, which carries the boot program, among others, makes a
-   new launch template version. The refresh replaces the instances in service first and then
-   those in the warm pool (section 4.3). A revert that changes one of these back is such a change,
-   and a launch template that is put back is still a new version: its deployment starts a new
-   refresh, which replaces again every instance the bad deployment had already refreshed, now
-   with the earlier release and launch template. Nothing goes back in place: the instances are
-   replaced, the refresh takes about as long as the bad one did, and on a GPU pool each
-   replacement is one more GPU start (the mock pool's instances are CPU instances, and cost a CPU
-   start). A pool with no instance in service or in the warm pool has nothing to replace. A revert
-   that changes no pool's release, machine image or launch template version refreshes no
-   instance. A gateway that the bad deployment changed is replaced by a new deployment of its
-   service, which drains each old task for up to 30 minutes (section 8.5).
+5. **What a revert does to instances.** Nothing: like every deployment, a revert replaces no
+   instance (section 4.3). It puts the earlier release back in each pool's parameter and the
+   earlier launch template in place, and the instances of each pool's next session launch on
+   them. With no session active, which is when the revert is deployed, no pool has an instance,
+   and the revert costs no GPU start of its own; its verification books one when the revert
+   changes a GPU pool's engine image, model revision or engine flags (Verify, step 1). An
+   instance that launched on the bad release, in a session booked while the bad deployment was
+   in place, keeps the bad release until it leaves: stop that session, let its instances go, and
+   book it again once the revert is deployed (runbook
+   [a session booked, changed and stopped](sessions.md)). A gateway that the bad deployment
+   changed is replaced by a new deployment of its service, which drains each old task for up to
+   30 minutes (section 8.5).
 
 ## Verify
 
@@ -378,15 +356,19 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    action ended `Succeeded`, `Verify` included, with `list-action-executions` as in Check, step 1,
    and that the Verify build's log shows its tests ran.
 
-   The smoke tests run on the mock pool every time. They run on the coursework
-   pool as well, and check there the image digest and model revision its instances report
-   against the deployed release, only when an instance refresh of a GPU pool started during that
-   execution and ended `Successful` (`scripts/pipeline/gpu_verification.py`). A revert that
-   refreshed only another GPU pool (`upgrade`, `xl`) is tested on coursework, not on that pool:
-   read that pool's served release on the dashboard "Deployments and releases" at its next start.
-   A deployment that refreshed no GPU pool says nothing about any GPU pool's release.
+   The smoke tests run on the mock pool every time, on an instance the verification books. They
+   run on the coursework pool as well, on an instance the verification books there, and check the
+   image digest and model revision that instance reports against the deployed release, only when
+   the execution changed a GPU pool's engine image, model revision or engine flags
+   (`scripts/pipeline/gpu_verification.py`). When AWS gave no instance within
+   `check_wait_minutes` (45 by default), the GPU tests did not run: the `verify/<stage>` status
+   then reads "The mock pool's tests passed. The GPU tests did not run, for lack of capacity.",
+   which is not a failed release, and the next weekly canary covers it. Whichever GPU pool's
+   release changed, the tests read the coursework pool: read another pool's served release
+   (`upgrade`, `xl`) on the dashboard "Deployments and releases" at its next session. A deployment
+   that changed no GPU pool's release says nothing about any GPU pool's release.
 
-2. **No pool's launches are suspended,** and each pool reads its configured mode:
+2. **No pool's launches are suspended:**
 
    ```sh
    rhi_admin pool status

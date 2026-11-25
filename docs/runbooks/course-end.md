@@ -53,13 +53,13 @@ that `rhi_admin roster list` prints.
 
 ## Check
 
-1. **No session is on,** and none will be:
+1. **No session is booked or active,** and none will be:
 
    ```sh
    rhi_admin session status
    ```
 
-   If it reads `on`, switch it off:
+   Every pool must read `none`. If one reads `booked` or `active`, stop every session:
 
    ```sh
    rhi_admin session stop --all

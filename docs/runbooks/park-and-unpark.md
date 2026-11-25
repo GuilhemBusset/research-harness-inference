@@ -6,21 +6,22 @@ stage drops what costs money at idle, about 170 dollars a month, and keeps its d
 pipeline, which then cost a few dollars a month. Unparked, the same deployment brings everything
 back. While the endpoint is parked nothing answers students, and they use their own subscriptions.
 
-Parking is not the session switch, and not a pool's mode. The session switch (runbook
-[a session booked, changed and stopped](sessions.md)) is a record that says whether students are
-served; it removes nothing and deploys nothing. A pool's mode (runbook
-[a pool whose launches are suspended](suspended-launches.md)) stops one pool. Both are records in the pool-state table, and
-parking keeps them as they are.
+Parking is not how a class ends: that is the stop of its session. A session (runbook
+[a session booked, changed and stopped](sessions.md)) is a record that says when a pool serves
+students and with how many instances; booking or stopping one removes nothing and deploys nothing.
+The sessions are records in the pool-state table, and parking keeps the table. A session cannot be
+booked or stopped while the endpoint is parked, since no pool is deployed, and a deployment that
+parks waits while one is active (Check, step 1).
 
 **What parking removes.** The public load balancer with its certificate, its HTTPS listener, its
 alias record and its web ACL; the NAT gateway, so the private subnets have no way out; the internal
 load balancer; the three Fargate services (the gateway, the key issuer and Grafana); each pool's
-group, its warm pool, its lifecycle hooks and its release; the scaler and its schedule; the fleet's
-alarms; and, beside the pipeline, the weekly GPU canary job and its schedule. The pools' instances,
-warm ones included, are terminated with their groups.
+group, its lifecycle hooks and its release; the scaler and its schedule; the fleet's
+alarms; and, beside the pipeline, the weekly GPU canary job and its schedule. A pool has no
+instance outside a session, so the groups are empty when they go.
 
 **What parking keeps.** Every table, with what it holds: the roster, the keys, the usage rows, the
-pools' modes and the session switch, the heartbeats. The model bucket, the bucket of the load
+pools' sessions and the scaler's records, the heartbeats. The model bucket, the bucket of the load
 balancers' access logs, the Prometheus workspace, and the log groups with fixed names (`/rhi/gateway`,
 `/rhi/scaler`, `/rhi/issuer`, `/rhi/pools/<pool>`, the web ACL's): every record and sample there still
 expires 90 days after it was written. The VPC, its subnets, its security groups and its S3 endpoint;
@@ -38,11 +39,11 @@ job, which refuses a pool that has no group (`no-group`). And the verification: 
 the pipeline, a merge to `main` included, deploys the parked stage and runs no test, so what a merge
 changes in the endpoint is first tested by the execution that unparks.
 
-**What this runbook rests on.** The deployment hold lands with issue E4-42: a check before each
-stage's deployment that waits while the session switch reads on (section 8.2). Once it is deployed,
-an execution that parks or unparks during a class waits for the session to be switched off. Until
-it is deployed, nothing holds a deployment: confirm that no session is on before you start the
-execution (Check, step 1), and switch none on until it has ended.
+**What this runbook rests on.** The deployment hold: a step before each stage's deployment that
+waits while a session is active on any pool (section 8.2, step 5). An execution that parks during
+a class waits for the session's end. It is a check before the deployment, not a pause of one: a
+deployment that has passed it runs to its end, so book no session until the execution has ended
+(Check, step 1).
 
 **How the steps are written.** A command of this repository (`rhi`, `rhi_admin`, or a script of
 the repository) is in a code block and is checked by `tests/unit/test_runbooks.py`. A change to the
@@ -63,25 +64,27 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 - **Park between cohorts:** once the course has ended and the runbook [course end](course-end.md)
   has been followed, or for any break of weeks.
 - **Park between sessions** only when you accept a deployment to unpark before each class (section
-  11.2). An unpark is a whole pipeline execution, a new certificate validated through the hosted
-  zone, and a GPU start for each warm instance as the warm pools fill again: start it the day before
-  the class, not shortly before.
+  11.2). An unpark is a whole pipeline execution and a new certificate validated through the
+  hosted zone, and the session is booked only after it, hours ahead of the class: start the unpark
+  the day before the class, not shortly before. The deployment starts no instance; its
+  verification books one for its tests (Verify, step 3).
 - **Unpark** before the next session or the next cohort, with that much time ahead.
 
 ## Check
 
-1. **No session is on.** A deployment that parks removes the gateway and the pools under a class;
-   one that unparks fills the warm pools. Read the switch:
+1. **No session is booked or active.** A deployment that parks removes the gateway and the pools
+   under a class. Read the sessions:
 
    ```sh
    rhi_admin session status
    ```
 
-   It must read `off`. Until the deployment hold of issue E4-42 is deployed, this check is the only
-   thing that keeps the execution away from a class: start the execution only while the switch
-   reads off, and switch no session on until it has ended (Verify). Once the hold is deployed, an
-   execution started while the switch reads on waits before the stage's deployment until it reads
-   off.
+   Before parking, every pool must read `none`: stop a session that is still booked or active
+   (runbook [a session booked, changed and stopped](sessions.md)). An execution started while a
+   session is active waits before the stage's deployment until the session has ended, and one that
+   has passed that check parks under a session booked after it: book none until the execution has
+   ended (Verify). Before unparking, a parked stage has no pool deployed, and the command prints
+   no pool's line.
 
 2. **No execution of the pipeline is in progress,** on the pipeline's page in the CodePipeline
    console. The pipeline runs its executions one after the other: an execution in progress deploys
@@ -96,8 +99,8 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      canary's key, and the old one expired with the old course.
 
    - **The GPU quota covers each pool's `max_instances` plus one** (runbook
-     [a session booked, changed and stopped](sessions.md), Check, step 1). Unparking launches
-     each pool's warm instances at once.
+     [a session booked, changed and stopped](sessions.md), Check, step 1). The unpark's
+     verification may book one coursework instance, and the first session after it books its own.
    - **A machine image change waits for the unpark.** The promotion job refuses a parked pool;
      promote the image after the unpark (runbook
      [machine image and engine upgrade](image-and-engine-upgrade.md)).
@@ -182,9 +185,8 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    bootstrap's boundary.
 
    The deployment creates the load balancers, the certificate (validated through the hosted
-   zone), the NAT gateway, the services, and each pool's group, whose warm pool fills at once: each
-   warm instance runs for the minutes it takes to pull the engine's image and check its release,
-   billed at its GPU price, then stops.
+   zone), the NAT gateway, the services, the scaler and each pool's group, at zero instances: a
+   pool has none until a session is booked on it.
 
 ## Verify
 
@@ -247,10 +249,15 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      read its log again. If its tests fail too, the runbook [a bad deployment](bad-deployment.md)
      applies.
 
-   The unpark creates each pool's group anew, and an instance refresh is what tells the
-   verification that a GPU pool's release changed, so the log also reads
-   `gpu-verification: the smoke tests run on no GPU pool`: this execution tested the mock pool,
-   not the coursework pool. The coursework pool is first tested at its next start (step 5).
+   The verification books one instance of the mock pool for its tests, and stops that session. It
+   books the coursework pool as well only when the execution changed what only a GPU instance can
+   test (section 8.2, step 6), which it reads from each GPU pool's release parameter. Parking
+   removed each pool's release and the unpark writes it anew, which the decision reads as a
+   change. The log says which it was. After `gpu-verification: the smoke tests run on coursework`,
+   the tests ran on a booked coursework instance too, or were recorded as not run for lack of
+   capacity. After `gpu-verification: the smoke tests run on no GPU pool`, this execution tested
+   the mock pool only, and the coursework pool is first tested by the next weekly canary, or at
+   its first session (step 5).
 
 4. **A student's key still works.** For the cohort that was parked: with a key issued to your own
    roster entry before parking, the status of the pools is answered, which the gateway does only
@@ -275,9 +282,10 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    the status once more.
 
 5. **The pools are back.** In Grafana, on the dashboard "Fleet and scaling", in each pool's row,
-   the panel "Instances: desired, in service" has data again, zero for both until a session asks
-   for the pool: the scaler reads the pool's group. At the pool's first start, the dashboard
-   "Deployments and releases", panel "Release each instance serves: image digest and model
-   revision", shows the release it serves.
+   the panel "Instances: requested, asked of AWS, waiting for capacity, starting, in service" has
+   data again, zero for each until a session is booked on the pool: the scaler runs and reads the
+   pool's group. At the pool's first session, the dashboard "Deployments and releases", panel
+   "Release each instance serves: image digest and model revision", shows the release its
+   instances serve.
 
 Walked through on the deployed system: not yet.

@@ -4,43 +4,75 @@ Two things under a GPU pool are pinned, and each changes only on purpose (system
 4.3):
 
 - **The machine image,** AWS's base GPU image with the open-source NVIDIA driver on Ubuntu 22.04.
-  The pool's launch template names it by the ID in the SSM parameter `/rhi/images/<pool>`, and only
-  the image promotion job writes that parameter, after a canary start on the new image passes. A
+  The pool's launch template names it by the ID in an SSM parameter of the pool, and only the
+  image promotion job writes that parameter, after a canary start on the new image passes. A
   merge never changes the driver under the engine.
 - **The engine,** the upstream vLLM image that `services/engine/vllm/Dockerfile` pins by the digest
   of its multi-architecture index, with the upstream version it is in `services/engine/vllm/VERSION`.
   Raising it is a change of those two lines, through a pull request.
 
-A deployment does not reach an existing instance by itself. A new machine image, or a new engine
-image in a pool's release, starts an instance refresh of the pool's group, which replaces the
-instances in service first and then those in the warm pool, and the pipeline's verification then
-asserts that the coursework pool serves the deployed release. Each such deployment costs one GPU
-start per warm instance (Act, "What the refresh costs").
+**A deployment replaces no instance, and needs none replaced** (section 4.3). A pool has no
+instance outside a session, and a deployment waits while a session is active (section 8.2), so a
+release normally finds nothing to reach: the instances of the next session launch from the new
+launch template, and each reads the pool's release at its start. There is no instance refresh to
+start or to wait for. An instance that is in service when a release changes, because a session
+was booked while a deployment was under way, keeps what it started with until it leaves. What
+checks a release is the pipeline's verification, which books an instance: after a deployment that
+changes a GPU pool's engine image, model revision or engine flags, it books one instance of the
+coursework pool and asserts that the instance serves the release deployed (Verify, step 2).
 
 **What this runbook rests on.**
 
-- **The promotion job** is in place: the CodeBuild project `rhi-promote-image`, which the owner
-  starts by hand and nothing else starts (`scripts/pipeline/README.md`).
-- **The scheduled advisory check** lands with issue E4-25: a GitHub Actions workflow that opens an
-  issue when the pinned vLLM version has a high or critical advisory (section 9). Until it is in
-  `.github/workflows/`, nobody is told: read the advisories by hand (Check, step 4), weekly while a
-  course runs.
-- **The deployment hold** lands with issue E4-42: a check before each stage's deployment that waits
-  while the session switch reads on (section 8.2). Until it is deployed, nothing holds a
-  deployment: start a promotion or merge an engine change only while no session is on, and switch
-  none on until its execution has ended.
+- **The promotion job,** a CodeBuild project beside the pipeline, which the owner starts by hand
+  and nothing else starts (`scripts/pipeline/README.md`). Its canary start is the one GPU instance
+  that runs outside a session: the job launches one instance from the pool's launch template, with
+  the candidate image, outside the pool's group, and terminates it whatever came of it.
+- **The scheduled advisory check,** `.github/workflows/advisories.yml`: once a day it opens an
+  issue when the pinned vLLM version has a high or critical advisory (section 9).
+- **The deployment hold:** a step before each stage's deployment that waits while a session is
+  active on any pool (section 8.2, step 5). It is a check before the deployment, not a pause of
+  one: a deployment that has passed it runs to its end.
 
 **How the steps are written.** A command of this repository (`rhi`, `rhi_admin`, or a script of
 the repository) is in a code block and is checked by `tests/unit/test_runbooks.py`. A change to the
 configuration in SSM is an edit of your configuration file, kept outside the working tree, followed
-by the configuration step of `setup/owner-setup.sh`; this runbook needs none. Anything else (the
-AWS console, GitHub, `aws`, `gh`, `git`, `curl`) is written out in full and is tested only by
-walking through the runbook.
+by the configuration step of `setup/owner-setup.sh`; this runbook needs none. A step that needs the
+account is the `aws` command you run with your own credentials, in the region of the endpoint; it
+and the commands `gh`, `git` and `curl` are tested only by walking through the runbook.
 
-`OWNER/REPOSITORY` below stands for this repository on GitHub, `<pipeline>` for the pipeline's
-name, `<execution>` for the ID of one of its executions, `<sha>` for a full commit SHA, `<group>`
-for a pool's Auto Scaling group and `coursework` for the pool you upgrade. The admin CLI is run
-from the repository's root, with your own AWS credentials; define its name once in your shell:
+A name or an ID the account gives is a placeholder below, never the name itself:
+
+| Placeholder | What it stands for | Where it comes from |
+| --- | --- | --- |
+| `OWNER/REPOSITORY` | This repository on GitHub | |
+| `<sha>` | A full commit SHA | |
+| `<pipeline>` | The pipeline | The first command below prints it |
+| `<execution>` | The ID of one execution of the pipeline | The step that starts or finds it |
+| `<promotion-project>` | The CodeBuild project of the image promotion job | `PROJECT_NAME` in `src/rhi/pipeline/image_promotion.py` |
+| `<canary-project>` | The CodeBuild project of the weekly GPU canary | `NAME` in `src/rhi/pipeline/canary.py` |
+| `<image-parameter>` | The SSM parameter that holds the pool's machine image | `image_parameter` in `src/rhi/pools/image.py`, with the pool's name |
+| `<release-parameter>` | The SSM parameter that holds the pool's release | `release_parameter` in `src/rhi/pools/group.py`, with the pool's name |
+| `<build>` | The ID of a CodeBuild build | The command that started it, or step 2 of Verify |
+| `<log-group>`, `<log-stream>` | Where a build's log is | The command below that reads a build |
+
+`coursework` stands for the pool you upgrade. The pipeline's name:
+
+```sh
+aws codepipeline list-pipelines --query 'pipelines[].name' --output text
+```
+
+A build's state and where its log is, then the end of that log, which is how this runbook reads
+what a job or the verification printed:
+
+```sh
+aws codebuild batch-get-builds --ids <build> \
+    --query 'builds[0].[buildStatus,logs.groupName,logs.streamName]' --output text
+aws logs get-log-events --log-group-name <log-group> --log-stream-name <log-stream> \
+    --query 'events[].message' --output text
+```
+
+The admin CLI is run from the repository's root, with your own AWS credentials; define its name
+once in your shell:
 
 ```sh
 alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main'
@@ -54,29 +86,35 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
   pinned version, or the advisories you read by hand show one (Check, step 4): adopt the fixed
   version at once. Any other new vLLM release waits 7 days after its publication before it is
   adopted (section 17): a compromised release is usually caught within hours (section 9).
-- **Not during a session, and not while parked.** A refresh replaces the instances a class would
-  use, and the promotion job refuses a pool that has no group, as a parked stage has none (runbook
+- **Between sessions, and not while parked.** A deployment waits while a session is active, so a
+  promotion or a merge made during a class is deployed after it. The canary start of a promotion
+  asks AWS for one GPU instance beside those of a session, against the same quota. And the
+  promotion job refuses a pool that has no group, as a parked stage has none (runbook
   [park and unpark](park-and-unpark.md)).
 
 ## Check
 
-1. **No session is on,** and none will be until the execution has ended:
+1. **No session is active, and none starts before the execution has ended.** One line for each
+   pool, with its session, `none`, `booked` or `active`, and its times:
 
    ```sh
    rhi_admin session status
    ```
 
-   It must read `off`. Until the deployment hold of issue E4-42 is deployed, nothing else keeps the
-   refresh out of a class.
+   While a session is active on any pool, the deployment waits for its end, and so does the
+   verification of the upgrade. A session that is booked and has not started holds nothing: if it
+   starts while the deployment is under way, its instances may start on either release, and each
+   keeps what it started with. So upgrade when the next session's start is hours away, or move
+   that start (runbook [a session booked, changed and stopped](sessions.md)).
 
-2. **No pool's launches are suspended,** and the pool reads its configured mode:
+2. **No pool's launches are suspended:**
 
    ```sh
    rhi_admin pool status
    ```
 
-   A pool that reads `launch_suspended` `true` cannot launch the refresh's replacements: clear it
-   first (runbook [a bad deployment](bad-deployment.md), Act, step 1).
+   A pool that reads `launch_suspended` `true` launches nothing, so the verification's instance
+   never comes: clear it first (runbook [a pool whose launches are suspended](suspended-launches.md)).
 
 3. **For a machine image: the candidate, and the image it replaces.** Take the candidate's ID, in
    the endpoint's region, and the instance families it lists, from the release notes of AWS's base
@@ -85,7 +123,7 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    promotion of it puts back should the new one go wrong:
 
    ```sh
-   aws ssm get-parameter --name /rhi/images/coursework --query Parameter.Value --output text
+   aws ssm get-parameter --name <image-parameter> --query Parameter.Value --output text
    ```
 
 4. **For the engine: the advisory, and the version that fixes it.** The pinned version:
@@ -113,40 +151,46 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 ### A machine image
 
 1. **Start the promotion job,** with the pool, the candidate's ID and the families its release
-   notes list, comma-separated:
+   notes list, comma-separated. The command prints the build's ID, `<build>` below:
 
    ```sh
-   aws codebuild start-build --project-name rhi-promote-image \
+   aws codebuild start-build --project-name <promotion-project> --query build.id --output text \
        --environment-variables-override '[{"name": "RHI_PROMOTE_POOL", "value": "coursework"}, {"name": "RHI_PROMOTE_IMAGE", "value": "ami-<candidate>"}, {"name": "RHI_PROMOTE_FAMILIES", "value": "G6e,G7e,P5,P5en"}]'
    ```
 
-   In the console, the same is CodeBuild, the project `rhi-promote-image`, **Start build with
-   overrides**, and the three environment variables above.
+   The job starts its canary: one GPU instance, from the pool's launch template with the
+   candidate in place of the template's image, outside the pool's group and outside any session.
+   It is the one GPU instance of this system that no session asked for. It is billed at one
+   instance's price for its minutes, and the job terminates it whatever came of it. It changes no
+   group's capacity and books nothing.
 
-2. **Read the job's end** in its build log (the build's page in the CodeBuild console). It prints
-   `promote_image: pool coursework, candidate ...`, one line for each step it took, and ends with
-   one of:
+2. **Read the job's end** in the build's log, with the two commands of the introduction: the build
+   has ended once its state reads other than `IN_PROGRESS`. The log has the line
+   `promote_image: pool coursework, candidate ...`, one line for each step the job took, and ends
+   with one of:
 
    - `promote_image: promoted`, after `promote_image: pipeline started`: the canary served, the
      parameter holds the candidate, and the job started an execution of the pipeline;
    - `promote_image: not promoted:` and any other cause (`family-not-listed`, `image-unavailable`,
-     `canary-failed`, `canary-timed-out`, ...): nothing was written, the pool keeps its image, and
-     no execution started. Fix the cause, or choose another candidate, and start again.
+     `canary-not-started`, `canary-failed`, `canary-timed-out`, ...): nothing was written, the
+     pool keeps its image, and no execution started. Fix the cause, or choose another candidate,
+     and start again. A canary that did not start, or timed out, may only have found no capacity:
+     start the job again later;
    - `promote_image: not promoted: pipeline-not-started`: the parameter **was** written, but the
-     job started no execution. Start one yourself with **Release change** on the pipeline's page
-     in the CodePipeline console, and note the execution ID the console shows for it once started
-     as `<execution>`. Skip the search by the build's times in step 3: that execution was started
-     after the build, by you, and step 3's last paragraph still applies to it.
+     job started no execution. Start one yourself; the command prints its ID, `<execution>`:
 
-   The canary start is one GPU start, at one instance's price for its minutes; the job terminates
-   the canary whatever came of it.
+     ```sh
+     aws codepipeline start-pipeline-execution --name <pipeline> --query pipelineExecutionId --output text
+     ```
+
+     Skip the search by the build's times in step 3: that execution was started after the build,
+     by you, and step 3's last paragraph still applies to it.
 
 3. **Find the execution the job started,** when it ended with `promote_image: promoted`, and note
    its ID as `<execution>`. The job prints no
    ID. Its execution started while the job's build ran, between the build's start and end times,
    with the trigger `StartPipelineExecution` and, as the trigger's detail, the job's own role
-   rather than your identity. The build's times, `<build>` being the build's ID, which
-   `start-build` printed as `build.id` and the build's page shows:
+   rather than your identity. The build's times:
 
    ```sh
    aws codebuild batch-get-builds --ids <build> --query 'builds[0].[startTime,endTime]' --output text
@@ -169,10 +213,11 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    The pipeline is not set to restart an execution when its self-update (the stage
    `UpdatePipeline`, its action `SelfMutate`) changes it. Read the actions of `<execution>`,
    whichever way it was started (Verify, step 1): when it ended without any action of the stage
-   `Rhi`, and no newer execution is in progress, start one with **Release change** on the
-   pipeline's page in the CodePipeline console; from then on `<execution>` is that new execution,
-   whose ID the console shows once it is started (the newest in the listing above, with your
-   identity as its trigger's detail).
+   `Rhi`, and no newer execution is in progress, start one with the command of step 2; from then
+   on `<execution>` is that new execution, whose ID the command printed.
+
+   The deployment writes the candidate into the pool's launch template. It replaces no instance:
+   the instances of the pool's next session launch on the new image.
 
 ### The engine
 
@@ -234,8 +279,8 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
    with the two lines edited between the branch and the check.
 
-3. **Merge it with no session on** (Check, step 1), once the check `required` is green. Note the
-   merge commit's SHA as `<sha>`, then the execution that deploys it, `<execution>`:
+3. **Merge it,** once the check `required` is green. Note the merge commit's SHA as `<sha>`, then
+   the execution that deploys it, `<execution>`:
 
    ```sh
    aws codepipeline list-pipeline-executions --pipeline-name <pipeline> \
@@ -246,25 +291,35 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    stage `UpdatePipeline`, its action `SelfMutate`) updates the pipeline, and the pipeline is not
    set to restart an execution when it is updated: the execution can end there without any action
    of the stage `Rhi` (Verify, step 1, lists them), and no other execution starts on its own. Then,
-   when no newer execution is in progress, start one with **Release change** on the pipeline's
-   page in the CodePipeline console; it deploys the head of `main`, which is `<sha>` while nothing
-   was merged after it, and the query above lists it too. `<execution>` is the execution of
-   `<sha>` whose actions of the stage `Rhi` ran.
-   The pipeline builds the new engine image into ECR, and every pool served by vLLM gets a new
-   release, which starts a refresh of each one that has instances.
+   when no newer execution is in progress, start one; the command prints its ID:
 
-### What the refresh costs
+   ```sh
+   aws codepipeline start-pipeline-execution --name <pipeline> --query pipelineExecutionId --output text
+   ```
 
-The refresh replaces each instance of the pool, in service and in the warm pool. A replaced warm
-instance is one GPU start: the new instance launches, pulls the engine's image, checks its release,
-completes its launch hook and stops. With the example's coursework pool, `warm_instances = 2` on
-`g7e.2xlarge`, that is two starts at 3.36 dollars an hour each for the minutes they run, and one
-more for each instance in service, which is why the refresh runs with no session on and nothing in
-service. The verification then wakes the coursework pool once to run its smoke tests on it, which
-costs about what a run of the weekly GPU canary costs, about 1.50 dollars with the idle tail
-(section 11.2). A promotion adds its canary start (Act, step 2). A pool with no instance in service
-or warm has nothing to replace, and an engine change refreshes every pool served by vLLM, the
-larger pools included, while a machine image refreshes only the promoted pool.
+   It deploys the head of `main`, which is `<sha>` while nothing was merged after it, and the
+   query above lists it too. `<execution>` is the execution of `<sha>` whose actions of the stage
+   `Rhi` ran. The pipeline builds the new engine image into ECR, and every pool served by vLLM
+   gets a new release. No instance is replaced: the release is what the instances of each pool's
+   next session read at their start.
+
+### What a release reaches, and what it costs
+
+A release reaches an instance at its launch, and only then. With no session active, which is when
+a deployment runs, no pool has an instance: the deployment has nothing to replace and waits for
+nothing, and the upgrade costs no GPU start of its own. Two things do start a GPU instance, each
+one instance for its minutes, at the pool's price (3.36 dollars an hour for the example's
+`g7e.2xlarge`):
+
+- **the canary start of a promotion** (Act, "A machine image", step 1), outside any session;
+- **the verification of an engine upgrade,** which books one instance of the coursework pool,
+  waits for it for `check_wait_minutes` (45 by default), runs its tests and stops the session it
+  booked (Verify, step 2). When AWS gives no instance in that time, it books nothing more and
+  costs nothing: the GPU tests are recorded as not run, for lack of capacity.
+
+A promotion's own execution books no GPU instance: a machine image is no part of a pool's release,
+and its test was the canary start. An engine upgrade gives every pool served by vLLM a new
+release, the larger pools included, and the verification reads it on the coursework pool only.
 
 ## Verify
 
@@ -277,76 +332,97 @@ larger pools included, while a machine image refreshes only the promoted pool.
        --query 'actionExecutionDetails[].[stageName,actionName,status,startTime]' --output text
    ```
 
-   Every action reads `Succeeded`, `Verify` included. A failed one is the runbook
+   Every action reads `Succeeded`, `Verify` included. `Hold` reads `InProgress` for as long as a
+   session is active: the deployment waits for its end. A failed action is the runbook
    [a bad deployment](bad-deployment.md); for a machine image, its Act, step 2 promotes the image of
    Check, step 3 back.
 
-2. **The refreshes ended, and the release assertion ran on the coursework pool and passed.** A
-   Verify that succeeded does not say it: Verify also succeeds when it ran no test, and the
-   commit's `verify/<stage>` status can describe another execution of the same commit. In the
-   detail page of `<execution>`, open the details of the action Verify, which link to its
-   CodeBuild log, and read it:
+2. **For the engine: the verification booked an instance of the coursework pool, and the release
+   assertion passed on it.** A Verify that succeeded does not say it: Verify also succeeds when it
+   ran no GPU test, and the commit's `verify/<stage>` status can describe another execution of the
+   same commit. Read the log of this execution's Verify. The ID of its build, `<build>`:
 
-   - `gpu-verification: the instance refresh of the pool <pool> ended Successful`, one such line
-     for each GPU pool this execution refreshed: the promoted pool for a machine image, each pool
-     served by vLLM that has instances for the engine. Then `gpu-verification: the smoke tests run
-     on coursework`: the decision found the refreshes this execution started and waited for them,
-     and the smoke tests run on the coursework pool whichever pool was refreshed;
-   - then two of pytest's summaries that each report tests `passed` and none `failed` or `error`:
-     the run on the mock pool, and the run on the coursework pool, whose tests
-     `gpu-release-served` and `release-heartbeat` (`tests/smoke/ids.py`) compare the image digest
-     and model revision the coursework pool's instances serve with its deployed release. When the
-     coursework pool was one of the refreshed pools, it serves the new release. A refreshed pool
-     other than coursework, a promoted `upgrade` or `xl` pool included, is not what these tests
-     read: its refresh line above says its instances were replaced, and step 3 checks what it
-     serves.
+   ```sh
+   aws codepipeline list-action-executions --pipeline-name <pipeline> \
+       --filter pipelineExecutionId=<execution> \
+       --query "actionExecutionDetails[?actionName=='Verify'].output.executionResult.externalExecutionId" --output text
+   ```
 
-   Any other end means the release is not verified by the pipeline:
+   then its log, with the two commands of the introduction. A release that is verified reads, in
+   this order:
 
-   - `gpu-verification: the smoke tests run on no GPU pool`: no refresh of a GPU pool began during
-     this execution, because the affected pools had no instance in service or warm (the `upgrade`
-     and `xl` pools keep none, and an idle coursework pool with no warm instance has none), or
-     nothing of their release changed. Nothing tested what any affected pool serves: step 3
-     applies to every one of them, coursework included;
+   - `gpu-verification: the release of the pool coursework changed:` and the keys that differ,
+     `engine_image` among them, one such line for each pool served by vLLM; then
+     `gpu-verification: the smoke tests run on coursework`;
+   - `verify: booked the pool coursework for 90 minutes`, twice `check_wait_minutes`, then
+     `verify: the pool coursework reads ready`: the instance the verification booked launched on
+     the new release and came into service;
+   - pytest's summary of the run on the coursework pool, with tests `passed` and none `failed` or
+     `error`. Its tests `gpu-release-served` and `release-heartbeat` (`tests/smoke/ids.py`) compare
+     the image digest and model revision the pool's instances serve with the deployed release. The
+     summaries before it are those of the mock pool;
+   - `verify: stopped the session it booked on the pool coursework`.
+
+   Any other end means the pipeline has not verified the release on a GPU:
+
+   - `verify: no instance of the pool coursework was launched in 45 minutes: its tests are not
+     run, for lack of capacity`, then `verify: the GPU tests were not run: no-capacity`. No
+     capacity is not a failed release: the execution passes on the mock pool's tests, and the
+     commit's `verify/<stage>` status reads "The mock pool's tests passed. The GPU tests did not
+     run, for lack of capacity." The next weekly canary covers the release, the same way. To have
+     it now, start the canary, which books one instance of the coursework pool, and read its
+     build's log: it ends with `canary_result: gpu-canary pass sent for` and the day's date when
+     its tests ran and passed.
+
+     ```sh
+     aws codebuild start-build --project-name <canary-project> --query build.id --output text
+     ```
+
+   - `verify: the pool coursework already has a session: it is neither booked nor stopped`:
+     someone booked the pool meanwhile, and the tests ran on the instances that were there, which
+     may have started before the release. Read step 3 for the pool at its next session;
+   - `gpu-verification: the smoke tests run on no GPU pool`: this execution changed nothing of a
+     GPU pool's release that only a GPU instance can test. It is the expected line of a promotion's
+     execution, since a machine image is no part of a release, and step 4 applies. For the engine
+     it means that no pool's release changed in this execution: check that it is the execution
+     that deployed the change (Act, "The engine", step 3);
    - `verify: no test was run:` followed by `listener-off` or `canary-missing`: no test ran at all,
      and step 3 applies to every affected pool;
-   - a summary with a test `failed` or `error`, or a refresh that ended otherwise than
-     `Successful`: the verification failed, and the runbook [a bad deployment](bad-deployment.md)
+   - `verify: the pool coursework did not read ready in 45 minutes: the tests run`, or a summary
+     with a test `failed` or `error`: an instance was launched and did not serve, or did not serve
+     the release. The verification failed, and the runbook [a bad deployment](bad-deployment.md)
      applies.
 
 3. **Every affected pool whose release the smoke tests did not read.** The affected pools are the
    promoted pool for a machine image, and every pool served by vLLM for the engine. Of them, the
    smoke tests read only the coursework pool, and only when step 2 found its summary. Each other
-   affected pool is checked here: a pool that was refreshed but is not coursework, a pool that had
-   no instance to refresh (its next instance is the first to start on the new release), and the
-   coursework pool itself when step 2 ended otherwise. Write down which pools these are.
-   At each such pool's next start, in Grafana, on the dashboard "Deployments and releases", the
-   panel "Release each instance serves: image digest and model revision" shows its instances' image
-   digest and model revision; they equal what its release parameter holds (`upgrade` below, or the
-   pool's name in its place):
+   affected pool is checked here, at its next session, when its first instance launches on the new
+   release: a pool other than coursework, and the coursework pool itself when step 2 ended
+   otherwise. Write down which pools these are. In Grafana, on the dashboard "Deployments and
+   releases", the panel "Release each instance serves: image digest and model revision" shows its
+   instances' image digest and model revision; they equal what the pool's release parameter holds:
 
    ```sh
-   aws ssm get-parameter --name /rhi/pools/upgrade/release --query Parameter.Value --output text
+   aws ssm get-parameter --name <release-parameter> --query Parameter.Value --output text
    ```
 
    A pool whose first instance on the new release serves anything else is a bad deployment (runbook
-   [a bad deployment](bad-deployment.md)). Until each such pool has started once, its release is
+   [a bad deployment](bad-deployment.md)). Until each such pool has had a session, its release is
    deployed but not verified: say so wherever you report the upgrade.
 
-4. **For a machine image, the instances run it.** Every instance of the promoted pool
-   (`coursework` below, or the pool's name in its place), the stopped warm ones included, shows the
-   candidate's ID:
+4. **For a machine image, the instances of the pool's next session run it.** The promotion
+   replaced no instance, and outside a session the pool has none, so the command prints nothing
+   until then. Once the first instance of the next session runs, it shows the candidate's ID
+   (`coursework` below, or the pool's name in its place):
 
    ```sh
    aws ec2 describe-instances --filters Name=tag:rhi-pool,Values=coursework \
-       Name=instance-state-name,Values=running,stopped \
+       Name=instance-state-name,Values=running \
        --query 'Reservations[].Instances[].[ImageId,State.Name]' --output text
    ```
 
-   A pool with no instance prints nothing, and step 3's panel shows the engine's release, not the
-   machine image. Run the same command again at the pool's next start, once its first instance
-   runs: that instance must show the candidate's ID. Until it has, the image is promoted but not
-   verified on an instance: say so wherever you report the upgrade.
+   Until it has, the image is promoted and its canary start served, and no session has run on it:
+   say so wherever you report the upgrade.
 
 5. **No pool's launches are suspended:**
 

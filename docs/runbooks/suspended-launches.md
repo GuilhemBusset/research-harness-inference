@@ -12,7 +12,7 @@ A launch is **abandoned** when the instance started and did not enter service: a
 failed, the release on the instance was not the pool's, the start's deadline passed, or the
 instance's answer to the launch hook never reached Auto Scaling and the hook's timeout passed. A
 launch that found no capacity, or that the quota refused, is not abandoned: it is waited for, it
-suspends nothing, and it is the runbook [capacity failure](capacity-failure.md).
+suspends nothing, and it is the runbook [a session short of capacity](capacity-failure.md).
 
 **How the steps are written.** A command of this repository (`rhi`, `rhi_admin`, or a script of
 the repository) is in a code block and is checked by `tests/unit/test_runbooks.py`. Anything else
@@ -130,9 +130,9 @@ pool, by its name in the configuration, which is also the model name `rhi status
      `Failed` or `Cancelled` and its `StatusMessage` says that the launch's lifecycle hook was
      abandoned. A launch that failed for lack of capacity, or that the quota refused, says so
      there instead: it was not abandoned, and is the runbook
-     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service,
-     unless it was a launch into the warm pool (below), and the scaler starts its count again at
-     the time it ended.
+     [a session short of capacity](capacity-failure.md). A launch that reads `Successful` reached
+     service, unless it was a launch into the warm pool (below), and the scaler starts its count
+     again at the time it ended.
 
      Auto Scaling keeps a group's activities for weeks, so the list may still hold those of the
      warm pool, the stopped instances that each group kept until section 4.5 dropped them. The

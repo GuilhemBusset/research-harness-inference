@@ -4,7 +4,8 @@ What only the owner can do, once, in this order (system design, section 8.6).
 [`setup/owner-setup.sh`](../../setup/owner-setup.sh) walks through the nine steps. This page says,
 for each one, what it needs, the command, how to check it, and the decision of section 15 of the
 design that it rests on. Step 4 has a second half, 4b, which is not a step of section 8.6: it
-writes the list of real values that the hygiene scanner checks for on your machine.
+writes the list of real values that the hygiene scanner checks for on your machine. The page ends
+with the one task that recurs: booking each session ahead of its class, and stopping it after.
 
 **The owner runs the script, from a shell no agent runs in.** No agent runs it, and nothing here
 is claimed as done until the owner has seen the check.
@@ -276,16 +277,30 @@ repository and nothing else is part of the trust boundary (section 8.4; ADR 0001
 | `github_owner`, `github_repo` | The repository the pipeline deploys from |
 | `login_client_id` | The client ID of the student login App of step 3 |
 | `monthly_budget_usd` | The monthly budget, in whole US dollars |
-| `time_zone`, `course_end` | The IANA time zone of the schedule, and the day the course ends |
+| `time_zone`, `course_end` | The IANA time zone a session's times are read and shown in, and the day the course ends |
 | `pools` | An empty table for now: `pools = {}` |
 
 The loader requires every one of these keys. Sessions have no schedule in the configuration: the
-instructor switches them on and off ([a session booked, changed and stopped](sessions.md)). A pool is a
+instructor books each one ([a session booked, changed and stopped](sessions.md), and "Recurring"
+at the end of this page). A pool is a
 `[pools.<name>]` table, which the loader checks with the pool parser; the mock pool of
 `config.example.toml` is the first one added. Two keys go with the pools and may be left out: `allowed_instance_types` (by default the
 instance types the pools list) and
 `default_pool` (by default the only pool; with two pools or more it must be given). Each pool is
 added later, by running this step again.
+
+Three keys go with the sessions. Each is a whole number and may be left out, which reads its
+default (section 17):
+
+| Key | Default | What it sets |
+| --- | --- | --- |
+| `session_max_hours` | 12 | The longest a session may last, in hours: its end is at most this long after the later of its start and the moment it was booked or changed, so a session nobody remembers ends by itself (section 5.6) |
+| `capacity_alarm_minutes` | 30 | The minutes a session may have fewer instances in service than it asks for before an alarm says so on the alerts topic, from 1 to 1440 (section 5.4) |
+| `check_wait_minutes` | 45 | The minutes a check of the pipeline that booked a session, the verification or the weekly canary, waits for its instance. It books for twice as long, so twice this must fit in `session_max_hours` (section 8.2) |
+
+`config.example.toml` lists every other key the loader knows, each with its default. There is no
+key for a schedule or for a pool's behaviour between sessions: a pool has its session's instances
+while the session is active, and none otherwise (section 5.1).
 
 Two lists of zones may be left out too, and say where the pools launch:
 
@@ -568,3 +583,46 @@ aws secretsmanager describe-secret --secret-id rhi/canary-key --query Name --out
 ```
 
 **Decision.** None of section 15.
+
+## Recurring: book each session ahead of its class, and stop it after
+
+The nine steps are done once. One task comes back with every class (section 8.6): **book each
+session ahead of its class, and stop it when the class is over.** Nothing starts by itself: a pool
+has instances only while a session is active on it, and a request never starts one (section 5.6).
+
+**Needs.** Step 9 done, your AWS credentials and their region, and the pool's `max_instances`
+covered by the quota of step 1. The admin CLI, under the name the runbooks give it:
+
+```sh
+alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run --locked --no-dev python -m rhi_admin.main'
+```
+
+**Command.** Hours before the class, book the pool: a number of instances and an end, here two
+instances until 18:00 in the configuration's `time_zone`. The start of a session is when its
+instances are asked for, and AWS may take half an hour or more to give a GPU instance (section
+5.4), so the hours before the class are what booking ahead buys, and they are paid for:
+
+```sh
+rhi_admin session start 2 --until 18:00
+```
+
+When the class is over, stop the session. The end gives the GPUs back; a session that is not
+stopped ends by itself at its end, at most `session_max_hours` after it was booked:
+
+```sh
+rhi_admin session stop
+```
+
+**Check.** Before the class, the session reads `active` and `in_service` reads the number booked;
+after the stop, the session reads `none` and, within about eleven minutes, `in_service` reads zero:
+
+```sh
+rhi_admin session status
+```
+
+The runbook [a session booked, changed and stopped](sessions.md) has the whole of it: the checks of
+the day before, a session changed during a class, and what students see. A session that stays
+short of its instances is the runbook [a session short of capacity](capacity-failure.md).
+
+**Decision.** 13, capacity: the instructor books each session, and nothing scales by load. 5,
+class size, for the number of instances a class books.

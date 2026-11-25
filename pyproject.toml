@@ -4,7 +4,7 @@
 [project]
 name = "research-harness-inference"
 version = "0"
-description = "A scale-to-zero inference endpoint on AWS, written with Python CDK and built by a software factory"
+description = "An inference endpoint on AWS that the instructor provisions by session, written with Python CDK and built by a software factory"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

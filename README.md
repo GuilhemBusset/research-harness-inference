@@ -1,11 +1,13 @@
 # research-harness-inference
 
-A scale-to-zero inference endpoint on AWS for the students of the
-[coding-agent cursus](https://github.com/GuilhemBusset/coding-agent-cursus). Students point their
-harnesses (Claude Code, Codex CLI, their own SDK scripts) at one HTTPS endpoint; behind it, GPU
-machines start when someone needs them and stop when nobody does. The infrastructure is Python
-CDK, with uv and ty, deployed only by AWS CodePipeline, in a repository that is safe to make
-public.
+An inference endpoint on AWS for the students of the
+[coding-agent cursus](https://github.com/GuilhemBusset/coding-agent-cursus), which the instructor
+provisions by session. Students point their harnesses (Claude Code, Codex CLI, their own SDK
+scripts) at one HTTPS endpoint; behind it, GPU machines run only during a session. The instructor
+books each session ahead of its class, a number of instances with a start and an end, and stops
+it when the class is over: no request starts a machine, and outside a session none runs. The
+infrastructure is Python CDK, with uv and ty, deployed only by AWS CodePipeline, in a repository
+that is safe to make public.
 
 The repository is built and maintained by a software factory: a backlog of issues goes in,
 verified and merged changes come out, and nobody is in the loop during a run.
