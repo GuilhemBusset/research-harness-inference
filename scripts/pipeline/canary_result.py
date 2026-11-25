@@ -47,13 +47,15 @@ says why a run did not measure:
 - pass: the wait did not end on a launched instance that did not serve, the run of the tests
   ended, at least one smoke test passed and none failed;
 - fail: a smoke test failed, in its set-up, its call or its teardown, or an instance was launched
-  and the pool did not read ready by the end of the wait, whatever the tests then gave;
+  and the pool did not read ready by the end of the wait, whatever the tests then gave, and also
+  when their run left no record or one that cannot be read;
 - error, not measured, with `no_capacity` 1: no instance was launched during the wait.
 
 A run that could not measure for another reason is an error too, with `no_capacity` 0: the endpoint
 has no HTTPS listener (`RHI_SMOKE_ENDPOINT` reads `none`), the canary's secret is missing or holds
-no key, the pool could not be booked, the run left no result, or it did not end (pytest was
-interrupted, or ended with an exit code other than its two of a finished run, `FINISHED`).
+no key, the pool could not be booked, the run left no result or one that cannot be read, or it
+did not end (pytest was interrupted, or ended with an exit code other than its two of a finished
+run, `FINISHED`).
 
 Its numbers, `Number`, those the run has:
 
@@ -62,7 +64,9 @@ Its numbers, `Number`, those the run has:
   booking, and on a pool that already had a session, for which the canary does not wait. Left out
   when the pool was never reached or could not be booked;
 - `smoke_tests_passed` and `smoke_tests_failed`: only the tests that ended count, since a case the
-  JUnit XML records without its name is one pytest did not finish. Left out when no test ran;
+  JUnit XML records without its name is one pytest did not finish. A failed canary always has
+  both: 0 and 0 when an instance was launched, did not serve, and the run of the tests left no
+  record of a test. Left out of a run that did not measure and has no record of a test;
 - `no_capacity`: 1 when no instance was launched during the wait, 0 otherwise.
 
 It is sent through the measurement event (`rhi_reporter.measure.measurement_event`) on the bus
@@ -180,6 +184,19 @@ def read_results(junit_xml: str) -> Results:
     return Results(passed=len(outcomes) - failed, failed=failed, finished=finished)
 
 
+def read_report(report: Path) -> Results | None:
+    """The results in the file a run of the tests was to record them in. None when the run left no
+    file, or one that is not XML, as a run that was killed while it wrote leaves: such a run has no
+    result, and the canary still reports."""
+    if not report.is_file():
+        return None
+    try:
+        return read_results(report.read_text(encoding="utf-8"))
+    except (ElementTree.ParseError, UnicodeDecodeError):
+        print(f"{NAME}: the record of the tests' run cannot be read", file=sys.stderr)
+        return None
+
+
 def ended(results: Results | None, exit_code: int) -> Results | None:
     """The results of a run whose pytest exited with `exit_code`: one that did not exit as a
     finished run does, `FINISHED`, did not end, whatever its XML holds."""
@@ -222,13 +239,16 @@ def verdict_of(results: Results | None, wait: Wait) -> Verdict:
 
 def numbers_of(results: Results | None, wait: Wait) -> dict[str, int | float]:
     """The run's numbers: the wait's seconds and the tests' counts when the run has them, and
-    always whether it was a lack of capacity that kept it from measuring."""
+    always whether it was a lack of capacity that kept it from measuring. A launched instance that
+    did not serve is a failed canary with or without a record of the tests, and a failed canary
+    has its counts: no test is known to have passed or failed when the run left no record."""
     numbers: dict[str, int | float] = {}
     if wait.seconds is not None:
         numbers[Number.WAIT_SECONDS] = wait.seconds
-    if results is not None and not wait.no_capacity:
-        numbers[Number.SMOKE_TESTS_PASSED] = results.passed
-        numbers[Number.SMOKE_TESTS_FAILED] = results.failed
+    counted = Results(passed=0, failed=0, finished=False) if results is None and wait.unserved else results
+    if counted is not None and not wait.no_capacity:
+        numbers[Number.SMOKE_TESTS_PASSED] = counted.passed
+        numbers[Number.SMOKE_TESTS_FAILED] = counted.failed
     numbers[Number.NO_CAPACITY] = int(wait.no_capacity)
     return numbers
 
@@ -352,7 +372,7 @@ def run_canary(
             launched=lambda since: verify.launched_rows(given, POOL, since, dynamodb),
             set_by=BOOKED_BY,
         )
-        results = read_results(report.read_text(encoding="utf-8")) if report.is_file() else None
+        results = read_report(report)
     if outcome.exit_code is None:
         # No run was made: for lack of capacity, which fails nothing, or because the pool was not booked.
         results, exit_code = None, 0 if outcome.no_capacity else 1

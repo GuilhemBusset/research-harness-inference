@@ -369,7 +369,10 @@ def test_a_failed_test_gives_fail_and_the_session_is_stopped_all_the_same(pool_s
         # The verdict does not rest on the tests: a pool that served only after the wait still
         # did not serve in it.
         pytest.param(ALL_PASSED, 0, {"smoke_tests_passed": 3, "smoke_tests_failed": 0}, id="the tests passed"),
-        pytest.param(None, 3, {}, id="the tests left no result"),
+        # A failed canary has both counts, also when the run of the tests recorded none: it left
+        # no record, or was killed while it wrote one.
+        pytest.param(None, 3, {"smoke_tests_passed": 0, "smoke_tests_failed": 0}, id="the tests left no result"),
+        pytest.param("", -15, {"smoke_tests_passed": 0, "smoke_tests_failed": 0}, id="the record cannot be read"),
     ],
 )
 def test_an_instance_launched_that_never_served_gives_fail(
@@ -500,6 +503,17 @@ def test_a_run_of_the_tests_that_exits_0_and_is_not_green_fails_the_build(pool_s
     exit_code, found, _ = canary(clock, SmokeRun(pool_state, clock, None, exit_code=0), ready_after(clock, 0))
     assert (exit_code, found["verdict"]) == (1, "error")
     assert found["numbers"] == {"wait_seconds": 0.0, "no_capacity": 0}
+
+
+def test_a_record_of_the_tests_that_cannot_be_read_is_sent_as_not_measured(pool_state: Any) -> None:
+    # The run was killed while it wrote its record, on a pool that served: nothing is known of a test.
+    clock = Clock()
+    exit_code, found, _ = canary(clock, SmokeRun(pool_state, clock, "<testsuites>", exit_code=0), ready_after(clock, 0))
+    assert (exit_code, found["verdict"]) == (1, "error")
+    assert found["numbers"] == {"wait_seconds": 0.0, "no_capacity": 0}
+    # The session the canary booked is stopped all the same.
+    stopped = session_of(pool_state)
+    assert stopped is not None and stopped.ends_at == NOW + 300
 
 
 def test_an_event_the_bus_refuses_fails_the_script() -> None:
