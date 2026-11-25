@@ -37,6 +37,7 @@ SECRET = "rhi/reporter/github-app"
 BUCKET = "example-artifacts"
 SYNTH_KEY = "RhiPipeline-CodePi/Synth_Outp/assembly.zip"
 STARTED = datetime.datetime(2026, 11, 2, 9, 30, tzinfo=datetime.UTC)
+HOUR = datetime.timedelta(hours=1)
 # What a stub says in its own words, which no log may repeat.
 MARKER = "said-by-the-stub " + secrets.token_hex(8)
 
@@ -150,11 +151,16 @@ class Stub:
         # The verification's marks, by their key in the artifact bucket, and whether S3 refuses to
         # list them.
         self.marks: dict[str, bytes] = {}
+        self.written: dict[str, datetime.datetime] = {}
         self.refuses_to_list = False
+        # The runs of the stage's action `Verify` in this execution: their status and start.
+        self.verifications: list[tuple[str, datetime.datetime]] = []
 
-    def mark(self, name: str, held: str, execution: str | None = None) -> None:
-        """Leaves a mark, as the verification step of an execution does: this one's unless named."""
-        self.marks[f"verification/{execution or self.execution}/{name}"] = held.encode()
+    def mark(self, name: str, held: str, execution: str | None = None, written: datetime.datetime = STARTED) -> None:
+        """Leaves a mark at the time `written`, as the verification step of an execution does:
+        this one's unless named."""
+        key = f"verification/{execution or self.execution}/{name}"
+        self.marks[key], self.written[key] = held.encode(), written
 
     # Secrets Manager.
     def get_secret_value(self, SecretId: str) -> dict[str, str]:
@@ -233,7 +239,11 @@ class Stub:
             },
             "output": {},
         }
-        return {"actionExecutionDetails": [deploy, *approvals, synth]}
+        verifications = [
+            {"stageName": STAGE, "actionName": "Verify", "status": status, "startTime": started}
+            for status, started in self.verifications
+        ]
+        return {"actionExecutionDetails": [deploy, *approvals, *verifications, synth]}
 
     # S3: the artifact store. It lists under verification/ only, as the function's role may, and
     # answers a read of an object that is not there as it answers a role that may not list it.
@@ -241,7 +251,10 @@ class Stub:
         assert Bucket == BUCKET and Prefix.startswith("verification/")
         if self.refuses_to_list:
             raise ClientError({"Error": {"Code": "AccessDenied", "Message": MARKER}}, "ListObjectsV2")
-        return {"Contents": [{"Key": key} for key in sorted(self.marks) if key.startswith(Prefix)]}
+        listed = [
+            {"Key": key, "LastModified": self.written[key]} for key in sorted(self.marks) if key.startswith(Prefix)
+        ]
+        return {"Contents": listed}
 
     def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
         assert Bucket == BUCKET
@@ -546,6 +559,72 @@ def test_a_success_is_not_posted_while_the_marks_cannot_be_read(stub: Stub, capl
     assert MARKER not in caplog.text
 
 
+def test_a_verification_whose_gpu_tests_did_not_run_for_lack_of_capacity_says_so(
+    stub: Stub, commit: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    def posted(by: Stub) -> list[tuple[str, str, str, str]]:
+        client = Client()
+        run(verification(by.execution, "SUCCEEDED")[1:], by, client)
+        return client.posted
+
+    # The step booked the coursework pool, no instance was launched, and the mock pool's tests passed.
+    stub.mark("gpu-not-run", "no-capacity\n")
+    assert posted(stub) == [(commit, "success", VERIFY, Description.VERIFIED_WITHOUT_GPU)]
+    # Not the description the implement loop discharges a smoke test's item on.
+    assert Description.VERIFIED_WITHOUT_GPU != VERIFIED_DESCRIPTION
+    # The mark of another execution says nothing of this one.
+    stub.marks.clear()
+    stub.mark("gpu-not-run", "no-capacity\n", execution=str(uuid.uuid4()))
+    assert posted(stub) == [(commit, "success", VERIFY, VERIFIED_DESCRIPTION)]
+
+    class RefusesTheMark(Stub):
+        """The artifact bucket, which lists the mark `not-run` and refuses to list `gpu-not-run`."""
+
+        def list_objects_v2(self, Bucket: str, Prefix: str) -> dict[str, Any]:
+            if Prefix.endswith("/gpu-not-run"):
+                raise ClientError({"Error": {"Code": "AccessDenied", "Message": MARKER}}, "ListObjectsV2")
+            return super().list_objects_v2(Bucket, Prefix)
+
+    # While that mark cannot be read, no success is posted: the GPU tests may not have run.
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClientError):
+        posted(RefusesTheMark(stub.execution, commit))
+    assert [record.getMessage() for record in caplog.records] == [handler.NO_NOT_RUN]
+    assert MARKER not in caplog.text
+
+
+def test_the_gpu_mark_of_a_failed_attempt_says_nothing_of_the_retry_that_passes(
+    stub: Stub, commit: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def described() -> str:
+        client = Client()
+        run(verification(stub.execution, "SUCCEEDED")[1:], stub, client)
+        ((posted_on, state, context, description),) = client.posted
+        assert (posted_on, state, context) == (commit, "success", VERIFY)
+        return description
+
+    # The first attempt found no capacity and failed on the mock pool's tests: the step left its
+    # mark. The stage was retried, under the same execution ID, and the retry passed.
+    retried = STARTED + datetime.timedelta(hours=2)
+    stub.verifications = [("Failed", STARTED), ("Succeeded", retried)]
+    stub.mark("gpu-not-run", "no-capacity\n", written=STARTED + datetime.timedelta(hours=1))
+    # The retry left no mark: its GPU tests ran, and its success says so.
+    assert described() == VERIFIED_DESCRIPTION
+    # The retry found no capacity either, and wrote the mark again.
+    stub.mark("gpu-not-run", "no-capacity\n", written=retried + datetime.timedelta(hours=1))
+    assert described() == Description.VERIFIED_WITHOUT_GPU
+
+    # While the runs cannot be read, the mark cannot be dated, and no success is posted.
+    def throttled(**_: object) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": MARKER}}, "ListActionExecutions")
+
+    monkeypatch.setattr(stub, "list_action_executions", throttled)
+    client = Client()
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClientError):
+        run(verification(stub.execution, "SUCCEEDED")[1:], stub, client)
+    assert client.posted == [] and MARKER not in caplog.text
+    assert [record.getMessage() for record in caplog.records] == [handler.NO_NOT_RUN]
+
+
 def test_a_superseded_commit_is_not_verified_by_a_verification_that_ran_nothing(stub: Stub, commit: str) -> None:
     earlier, superseded_commit = str(uuid.uuid4()), secrets.token_hex(20)
 
@@ -564,8 +643,9 @@ def test_a_superseded_commit_is_not_verified_by_a_verification_that_ran_nothing(
 
         def list_action_executions(self, pipelineName: str, filter: dict[str, str]) -> dict[str, Any]:
             assert filter == {"pipelineExecutionId": self.execution}
+            failed = {"stageName": STAGE, "actionName": "Verify", "status": "Failed", "startTime": STARTED - HOUR}
             verify = {"stageName": STAGE, "actionName": "Verify", "status": "Succeeded", "startTime": STARTED}
-            return {"actionExecutionDetails": [verify]}
+            return {"actionExecutionDetails": [failed, verify]}
 
     def summary(execution: str, status: str, started: datetime.datetime, deploys: str) -> dict[str, Any]:
         revisions = [{"actionName": "GitHub", "revisionId": deploys}]
@@ -580,6 +660,20 @@ def test_a_superseded_commit_is_not_verified_by_a_verification_that_ran_nothing(
         (superseded_commit, "success", DEPLOY, Description.DEPLOYED),
         (superseded_commit, "success", VERIFY, Description.NOT_RUN_LISTENER_OFF),
     ]
+
+    def verified_as(written: datetime.datetime) -> str:
+        """The description of the superseded commit's verification when the covering execution
+        left, at that time, the mark that its GPU tests did not run."""
+        covering.marks.clear()
+        covering.mark("gpu-not-run", "no-capacity\n", written=written)
+        client = Client()
+        run([pipeline_event(covering.execution, "SUCCEEDED")], covering, client)
+        return client.posted[-1][3]
+
+    # So does the mark of GPU tests that did not run, when the run that succeeded left it, not the
+    # attempt that failed before it.
+    assert verified_as(STARTED + HOUR) == Description.VERIFIED_WITHOUT_GPU
+    assert verified_as(STARTED - HOUR / 2) == VERIFIED_DESCRIPTION
 
 
 def test_a_failed_step_before_the_stage_fails_its_deployment(stub: Stub, commit: str) -> None:

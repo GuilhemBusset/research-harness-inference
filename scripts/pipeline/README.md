@@ -41,11 +41,19 @@ deployment, with the folders of pytest's import path in `PYTHONPATH` for the boo
   any piece of it. When the decision's file names a pool, it then runs the same smoke tests once
   more with `RHI_SMOKE_POOL` naming that pool, `gpu-release-served` among them, which the mock
   pool's run leaves out, and `release-heartbeat`, which compares the release the pool's instances
-  write in their heartbeat rows with the deployed one. Around its run on the mock pool it books
-  that pool through `booking.py`, for twice the configuration's `check_wait_minutes`, waits until
+  write in their heartbeat rows with the deployed one. Around each run it books the run's pool
+  through `booking.py`, for twice the configuration's `check_wait_minutes`, waits until
   `GET /status` reads the pool ready or `check_wait_minutes` have passed, and stops the session it
   booked whatever the tests' result; a pool that already has a session is neither booked nor
-  stopped.
+  stopped. When the wait for a pool of the decision's file ends with the pool not ready and no
+  instance's heartbeat row written since the booking, which it looks for through the wait and at
+  its end, no instance was launched: it runs no test on that pool, stops its session, leaves the
+  one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names and exits with the result
+  of its other runs. The post-build phase copies that file as the mark `gpu-not-run`, from a build
+  that fails too; the reporter takes the mark for a success only when the run that succeeded wrote
+  it, so that a retry's success says only what the retry ran. With such a row, or
+  when the table's answers cannot tell, a read that failed among them, the tests run and their
+  failure is the script's.
 - `booking.py` is what a check books a pool through: `book` writes a session of one instance, for
   the minutes and under the name it is given, with the rules of `rhi_common.sessions`, only on a
   pool that has no session booked or active; `stop` ends that session only while the item still

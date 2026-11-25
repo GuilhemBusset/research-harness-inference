@@ -175,6 +175,7 @@ def test_a_discharge_context_that_is_no_verification_the_reporter_posts_fails(co
 def test_a_description_that_is_another_member_of_the_vocabulary_fails(key: str) -> None:
     others = [member for member in status.Description if member is not DESCRIPTIONS[key]]
     assert status.Description.NOT_RUN_CANARY_MISSING in others, "such as a verification that ran no test"
+    assert status.Description.VERIFIED_WITHOUT_GPU in others, "or one whose GPU tests did not run for lack of capacity"
     for member in others:
         [problem] = problems(owners_table(**{key: str(member)}))
         assert problem.startswith(key), member.name

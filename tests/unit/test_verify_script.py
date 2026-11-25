@@ -6,9 +6,14 @@ lifecycle stage each instance of the tested pools reached, and nothing else of a
 When the decision on the coursework pool left that pool, the smoke tests run again on it, with the
 tests of that run only.
 
-Around its run on the mock pool the script books that pool, waits until the gateway's status reads
-it ready or the wait is over, and stops the session it booked, also when the tests fail; a pool
-that already has a session is neither booked nor stopped.
+Around each run the script books the run's pool, waits until the gateway's status reads it ready
+or the wait is over, and stops the session it booked, also when the tests fail; a pool that already
+has a session is neither booked nor stopped. On a pool the decision left, a wait that ends with the
+pool not ready and no instance's heartbeat row written since the booking runs no test: the script
+stops its session, leaves `no-capacity` and exits with the result of its other runs; with such a
+row, also one that expired before the wait ended, or when the table's answers cannot tell, the
+tests run and their failure is the script's. A read of the table that failed is neither a launch
+nor the lack of one.
 
 A stand-in for the Secrets Manager client replaces AWS, and moto holds the heartbeats table and
 the pool-state table in process: no account, no credentials, no network. A clock the test controls
@@ -34,7 +39,7 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 import verify
-from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, InstanceHeartbeat, Session
+from rhi_common.records import EXPIRY_SECONDS, SESSION_RECORD, GatewayHeartbeat, InstanceHeartbeat, Session
 from rhi_common.tables import HEARTBEATS, POOL_STATE
 
 if TYPE_CHECKING:
@@ -136,15 +141,17 @@ class Clock:
 
 def verification(environ: Mapping[str, str], clock: Clock | None = None, **given: Any) -> int:
     """`verify.main` in `environ` and the booking's variables, with moto's pool-state table behind
-    the stand-in for CloudFormation, a status that reads the mock pool ready unless one is given,
+    the stand-in for CloudFormation, a status that reads every pool ready unless one is given,
     and a clock that only its `sleep` moves."""
     clock = clock or Clock()
     stand_ins: dict[str, Any] = {
-        "status": lambda within: "ready",
+        "status": lambda pool, within: "ready",
         "cloudformation": Stacks(),
         "resource": boto3.resource("dynamodb", region_name=REGION),
+        "sleep": clock.sleep,
+        "clock": clock.time,
     }
-    return verify.main({**BOOKING, **environ}, sleep=clock.sleep, clock=clock.time, **{**stand_ins, **given})
+    return verify.main({**BOOKING, **environ}, **{**stand_ins, **given})
 
 
 @pytest.mark.parametrize("held", [None, "", " \n"], ids=["no secret", "an empty secret", "a blank secret"])
@@ -271,9 +278,9 @@ def test_no_pool_is_no_release_parameter() -> None:
     assert verify.release_parameters("none") == {}
 
 
-def session_of(pool_state: Any) -> Session | None:
-    """The mock pool's session as the table holds it, None for no item."""
-    item = pool_state.get_item(Key={"pool": "mock", "record": SESSION_RECORD}, ConsistentRead=True).get("Item")
+def session_of(pool_state: Any, pool: str = "mock") -> Session | None:
+    """The session of a pool, the mock pool unless one is named, as the table holds it, None for no item."""
+    item = pool_state.get_item(Key={"pool": pool, "record": SESSION_RECORD}, ConsistentRead=True).get("Item")
     return None if item is None else Session.from_item(item)
 
 
@@ -313,33 +320,53 @@ def test_the_mock_pool_is_booked_before_the_tests_and_stopped_after_them(pool_st
     )
 
 
-def test_the_session_is_stopped_before_the_coursework_pool_s_run_and_when_the_run_breaks(
+def test_each_pool_is_booked_for_its_own_run_and_its_session_stopped_also_when_the_run_breaks(
     tmp_path: Path, pool_state: Any
 ) -> None:
     named = tmp_path / "gpu-pools"
     named.write_text("coursework\n", encoding="utf-8")
+    environ = {**ENVIRON, verify.GPU_POOLS_FILE_VARIABLE: str(named)}
     clock = Clock()
-    run = Booked(pool_state, clock)
+    held: list[tuple[Session | None, Session | None]] = []
 
-    assert (
-        verification({**ENVIRON, verify.GPU_POOLS_FILE_VARIABLE: str(named)}, clock, client=Secrets(a_key()), run=run)
-        == 0
+    def run(environ: Mapping[str, str]) -> int:
+        # The tests take five minutes, in the sessions the table holds then.
+        held.append((session_of(pool_state), session_of(pool_state, "coursework")))
+        clock.sleep(300)
+        return 0
+
+    assert verification(environ, clock, client=Secrets(a_key()), run=run) == 0
+
+    # The mock pool's run is in that pool's session alone. The coursework pool's comes after that
+    # session's end, in a session booked as the mock pool's was: one instance, for twice the wait.
+    (on_mock, not_yet), (stopped, on_coursework) = held
+    assert on_mock is not None and on_mock.ends_at == NOW + 5400 and not_yet is None
+    assert stopped is not None and stopped.ends_at == NOW + 300
+    assert on_coursework == Session(
+        pool="coursework",
+        instances=1,
+        starts_at=NOW + 300,
+        ends_at=NOW + 300 + 5400,
+        set_by="pipeline/verify",
+        set_at=NOW + 300,
     )
+    # And that session is stopped in its turn, when its tests end.
+    ended = session_of(pool_state, "coursework")
+    assert ended is not None and ended.starts_at == NOW + 300 and ended.ends_at == NOW + 600
 
-    # The mock pool's run is in the session; the coursework pool's comes after its end.
-    on_mock, on_coursework = run.sessions
-    assert on_mock is not None and on_coursework is not None
-    assert on_mock.ends_at == NOW + 5400 and on_coursework.ends_at == NOW + 300
+    for at, breaks_on in ((NOW + 3600, None), (NOW + 7200, "coursework")):
 
-    def broken(environ: Mapping[str, str]) -> int:
-        raise RuntimeError("the run of the tests broke")
+        def broken(environ: Mapping[str, str], breaks_on: str | None = breaks_on) -> int:
+            if environ.get(verify.POOL_VARIABLE) == breaks_on:
+                raise RuntimeError("the run of the tests broke")
+            return 0
 
-    later = Clock()
-    later.now = NOW + 3600
-    with pytest.raises(RuntimeError):
-        verification(ENVIRON, later, client=Secrets(a_key()), run=broken)
-    stopped = session_of(pool_state)
-    assert stopped is not None and stopped.starts_at == stopped.ends_at == NOW + 3600
+        later = Clock()
+        later.now = at
+        with pytest.raises(RuntimeError):
+            verification(environ, later, client=Secrets(a_key()), run=broken)
+        left = session_of(pool_state, breaks_on or "mock")
+        assert left is not None and left.starts_at == left.ends_at == at
 
 
 @pytest.mark.parametrize(
@@ -355,7 +382,7 @@ def test_a_pool_that_already_has_a_session_is_neither_booked_nor_stopped(
     clock = Clock()
     run = Booked(pool_state, clock)
 
-    def never_read(within: float) -> str:
+    def never_read(pool: str, within: float) -> str:
         raise AssertionError("the status is not waited for on a pool the step did not book")
 
     assert verification(ENVIRON, clock, client=Secrets(a_key()), run=run, status=never_read) == 0
@@ -378,10 +405,10 @@ def test_a_session_someone_else_booked_meanwhile_is_not_stopped(pool_state: Any)
     assert session_of(pool_state) == theirs
 
 
-def states(*read: str | None) -> Callable[[float], str | None]:
+def states(*read: str | None) -> Callable[[str, float], str | None]:
     """A status that reads each of `read` in turn, then the last of them for good."""
     left = list(read)
-    return lambda within: left.pop(0) if len(left) > 1 else left[0]
+    return lambda pool, within: left.pop(0) if len(left) > 1 else left[0]
 
 
 @pytest.mark.parametrize(
@@ -395,7 +422,7 @@ def states(*read: str | None) -> Callable[[float], str | None]:
     ids=["ready at once", "ready at the fourth reading", "never ready", "no reading"],
 )
 def test_the_tests_start_once_the_status_reads_ready_or_the_wait_is_over(
-    pool_state: Any, status: Callable[[float], str | None], waited: float
+    pool_state: Any, status: Callable[[str, float], str | None], waited: float
 ) -> None:
     clock = Clock()
     run = Booked(pool_state, clock)
@@ -417,7 +444,7 @@ def test_no_reading_of_the_status_goes_past_the_end_of_the_wait(pool_state: Any,
     run = Booked(pool_state, clock)
     read_at: list[float] = []
 
-    def warming(within: float) -> str | None:
+    def warming(pool: str, within: float) -> str | None:
         # A reading takes `takes` seconds to say the pool is warming, and gives nothing when it is
         # allowed less.
         read_at.append(clock.now)
@@ -445,6 +472,9 @@ def test_the_pool_s_state_is_read_from_the_gateway_s_status_with_the_canary_s_ke
             httpx.Response(200, json={"pools": [{"model": "coursework", "state": "ready"}]}),
             httpx.Response(503, json={"pools": [{"model": "mock", "state": "ready"}]}),
             httpx.Response(200, text="not a status"),
+            httpx.Response(
+                200, json={"pools": [{"model": "coursework", "state": "warming"}, {"model": "mock", "state": "ready"}]}
+            ),
         ]
     )
 
@@ -454,9 +484,10 @@ def test_the_pool_s_state_is_read_from_the_gateway_s_status_with_the_canary_s_ke
 
     read = verify.status_reader(ENDPOINT, "a-key", httpx.MockTransport(answer))
 
-    # The mock pool's own state; a status that does not give it, or does not answer, reads as none.
-    # A reading may take the seconds it is given, and no longer than the longest one may.
-    assert [read(within) for within in (2.5, 3600, 1, 1, 1)] == ["cold", "ready", None, None, None]
+    # The state of the pool that is asked for; a status that does not give it, or does not answer,
+    # reads as none. A reading may take the seconds it is given, and no longer than the longest one may.
+    assert [read("mock", within) for within in (2.5, 3600, 1, 1, 1)] == ["cold", "ready", None, None, None]
+    assert read("coursework", 1) == "warming"
     assert [request.extensions["timeout"]["read"] for request in asked[:2]] == [2.5, verify.READ_SECONDS]
     assert {str(request.url) for request in asked} == {f"https://{ENDPOINT}/status"}
     assert {request.headers["Authorization"] for request in asked} == {"Bearer a-key"}
@@ -474,7 +505,7 @@ def test_a_reading_of_the_status_that_has_no_answer_in_its_seconds_is_given_up()
 
     read = verify.status_reader(ENDPOINT, "a-key", httpx.MockTransport(held))
     try:
-        assert read(0.05) is None
+        assert read("mock", 0.05) is None
     finally:
         let_go.set()
 
@@ -552,12 +583,14 @@ def heartbeats() -> Iterator[Any]:
         yield boto3.client("dynamodb", region_name=REGION)
 
 
-def instance_row(pool: str, stage: str) -> tuple[str, dict[str, Any]]:
-    """An instance's heartbeat as its lifecycle agent writes it, with the stage it has reached: the
-    instance's ID, drawn now, and the row's item."""
+def instance_row(pool: str, stage: str, written_at: int = 1) -> tuple[str, dict[str, Any]]:
+    """An instance's heartbeat as its lifecycle agent writes it, at that time, with the stage it has
+    reached: the instance's ID, drawn now, and the row's item."""
     instance = f"instance-{secrets.token_hex(8)}"
     release = {"image_digest": f"sha256:{secrets.token_hex(32)}", "model_revision": secrets.token_hex(20)}
-    row = InstanceHeartbeat(instance=instance, pool=pool, running=0, waiting=0, stage=stage, written_at=1, **release)
+    row = InstanceHeartbeat(
+        instance=instance, pool=pool, running=0, waiting=0, stage=stage, written_at=written_at, **release
+    )
     return instance, row.to_item()
 
 
@@ -626,6 +659,261 @@ def test_a_table_that_cannot_be_read_leaves_the_tests_exit_as_it_is(
     assert failed_run(tmp_path, Refuses(), exit_code=2) == (2, None)
     printed = capsys.readouterr().err
     assert "last stages were not read" in printed and "said by AWS" not in printed
+
+
+class PoolRuns:
+    """In place of the run of the smoke tests: keeps the pool each run names, None for the mock
+    pool's, and ends the run on a pool in the exit it was given for it, 0 without one."""
+
+    def __init__(self, **exits: int) -> None:
+        self.exits, self.pools = exits, []
+
+    def __call__(self, environ: Mapping[str, str]) -> int:
+        self.pools.append(environ.get(verify.POOL_VARIABLE))
+        return self.exits.get(self.pools[-1] or "mock", 0)
+
+
+class Asked:
+    """A DynamoDB client that keeps each query it is asked before `client` answers it."""
+
+    def __init__(self, client: Any) -> None:
+        self.client, self.queries = client, []
+
+    def query(self, **request: Any) -> dict[str, Any]:
+        self.queries.append(request)
+        return self.client.query(**request)
+
+
+# When the coursework pool is booked, below: the mock pool reads ready at once and its run takes no
+# time, so the booking is made at `NOW`, and its wait of 45 minutes ends then.
+WAIT_ENDS = NOW + 45 * 60
+
+
+class Lifetimes(Clock):
+    """A clock whose `sleep` also puts each of `rows` in the heartbeats table when its `written_at`
+    comes, and removes it when its `expires_at` does: DynamoDB at its promptest."""
+
+    def __init__(self, *rows: dict[str, Any]) -> None:
+        super().__init__()
+        self.rows = rows
+
+    def sleep(self, seconds: float) -> None:
+        before = self.now
+        super().sleep(seconds)
+        table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+        for row in self.rows:
+            if before < row["written_at"] <= self.now:
+                table.put_item(Item=row)
+            if before < row["expires_at"] <= self.now:
+                table.delete_item(Key={"pool": row["pool"], "source": row["source"]})
+
+
+def on_a_pool_that_is_not_ready(
+    tmp_path: Path, run: PoolRuns, dynamodb: Any, clock: Clock | None = None, /, **changes: str
+) -> tuple[int, str | None, str | None]:
+    """The script's exit once the decision left the coursework pool, whose state never reads ready
+    while the mock pool's does, on `clock` when one is given; what it left as the reason its GPU
+    tests did not run, and as the instances' last stages, None for no file."""
+    named, reason, stages = tmp_path / "gpu-pools", tmp_path / "build" / "gpu-not-run", tmp_path / "last-stages"
+    named.write_text("coursework\n", encoding="utf-8")
+    for left in (reason, stages):
+        left.unlink(missing_ok=True)
+    environ = {
+        verify.ENDPOINT_VARIABLE: ENDPOINT,
+        verify.RELEASE_PARAMETERS_VARIABLE: "mock=/rhi/pools/mock/release,coursework=/rhi/pools/coursework/release",
+        verify.GPU_POOLS_FILE_VARIABLE: str(named),
+        verify.GPU_REASON_FILE_VARIABLE: str(reason),
+        verify.HEARTBEATS_TABLE_VARIABLE: TABLE,
+        verify.LAST_STAGES_FILE_VARIABLE: str(stages),
+        **changes,
+    }
+    exited = verification(
+        {name: value for name, value in environ.items() if value},
+        clock,
+        client=Secrets(a_key()),
+        run=run,
+        dynamodb=dynamodb,
+        status=lambda pool, within: "ready" if pool == "mock" else "warming",
+    )
+    left_as_reason, left_as_stages = (
+        left.read_text(encoding="utf-8") if left.exists() else None for left in (reason, stages)
+    )
+    return exited, left_as_reason, left_as_stages
+
+
+@pytest.mark.parametrize("on_mock", [0, 3], ids=["the mock run passed", "the mock run failed"])
+@pytest.mark.parametrize("paged", [False, True], ids=["one answer", "an answer in pages"])
+def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capacity(
+    tmp_path: Path, pool_state: Any, heartbeats: Any, on_mock: int, paged: bool
+) -> None:
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    # What says nothing of a launch on the coursework pool since the booking: the rows of instances
+    # it had before, however many pages they fill, an instance another pool launched, and a gateway
+    # task's own heartbeat.
+    before = [instance_row("coursework", "serving", NOW - 1) for _ in range(verify.ROW_PAGES + 1)]
+    for _, item in (*before, instance_row("coursework", "weights", NOW - 3600), instance_row("mock", "boot", NOW + 60)):
+        table.put_item(Item=item)
+    task = GatewayHeartbeat(task="task-1", pool="coursework", in_flight=0, held=0, last_request_at=None, written_at=NOW)
+    table.put_item(Item=task.to_item())
+    run = PoolRuns(mock=on_mock)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, OneRowAPage(heartbeats) if paged else heartbeats)
+
+    # No test on the pool, the one line of the reason, and the exit of the other run, the mock
+    # pool's, whatever it is: what a failed build's reason becomes is the step's affair.
+    assert (exited, reason) == (on_mock, "no-capacity\n")
+    assert run.pools == [None]
+    # The session the script booked on the pool is stopped when the wait ends.
+    stopped = session_of(pool_state, "coursework")
+    assert stopped is not None and (stopped.starts_at, stopped.ends_at) == (NOW, WAIT_ENDS)
+    assert stopped.set_by == "pipeline/verify"
+
+
+@pytest.mark.parametrize("written_at", [NOW, WAIT_ENDS], ids=["at the booking", "as the wait ends"])
+def test_with_a_row_written_since_the_booking_the_gpu_tests_run_and_their_failure_is_the_exit(
+    tmp_path: Path, pool_state: Any, heartbeats: Any, written_at: int
+) -> None:
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    row = instance_row("coursework", "weights", written_at)[1]
+    # The row is there from the time it is written at: at the booking, or not before the wait's last moment.
+    if written_at == NOW:
+        table.put_item(Item=row)
+    run, asked = PoolRuns(coursework=3), Asked(heartbeats)
+
+    exited, reason, stages = on_a_pool_that_is_not_ready(tmp_path, run, asked, Lifetimes(row))
+
+    # An instance was launched and does not serve: the tests run, fail, and say where it stopped.
+    assert (exited, reason, stages) == (3, None, "weights\n")
+    assert run.pools == [None, "coursework"]
+    # The read that could say no instance was launched is strongly consistent: it sees a row
+    # written a moment before.
+    assert asked.queries[0]["ConsistentRead"] is True
+    stopped = session_of(pool_state, "coursework")
+    assert stopped is not None and (stopped.starts_at, stopped.ends_at) == (NOW, WAIT_ENDS)
+
+
+def test_a_launch_is_not_forgotten_when_its_row_expires_before_the_wait_ends(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. An instance is launched a minute after the booking, writes its row once
+    # and never serves; the row expires an hour later, before the wait ends.
+    row = instance_row("coursework", "boot", NOW + 60)[1]
+    assert row["expires_at"] < NOW + 120 * 60
+    run, clock = PoolRuns(coursework=3), Lifetimes(row)
+
+    exited, reason, stages = on_a_pool_that_is_not_ready(
+        tmp_path, run, heartbeats, clock, **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"}
+    )
+
+    # The table holds no row of the pool when the wait ends, and the launch still counts: the
+    # tests run and fail, and the stage the instance was last seen at is the one that is left.
+    assert heartbeats.scan(TableName=TABLE)["Items"] == [] and clock.now >= NOW + 120 * 60
+    assert (exited, reason, stages) == (3, None, "boot\n")
+    assert run.pools == [None, "coursework"]
+
+
+def test_an_instance_that_was_replaced_keeps_the_stage_it_was_last_seen_at(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. The first instance stops at its boot and its row expires; the group
+    # launches another, which stops at its weights and whose row is there when the tests fail.
+    first = instance_row("coursework", "boot", NOW + 60)[1]
+    second = instance_row("coursework", "weights", first["expires_at"] + 240)[1]
+    assert second["written_at"] < NOW + 120 * 60 < second["expires_at"]
+
+    _, _, stages = on_a_pool_that_is_not_ready(
+        tmp_path,
+        PoolRuns(coursework=3),
+        heartbeats,
+        Lifetimes(first, second),
+        **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"},
+    )
+
+    # Each instance has its line, once: the one that is gone, and the one whose row is still read.
+    assert sorted((stages or "").splitlines()) == ["boot", "weights"]
+
+
+class UnreadableUntil:
+    """A DynamoDB client whose queries fail until the time `until` of `clock`, then are `client`'s."""
+
+    def __init__(self, client: Any, clock: Clock, until: int) -> None:
+        self.client, self.clock, self.until = client, clock, until
+
+    def query(self, **request: Any) -> dict[str, Any]:
+        if self.clock.time() < self.until:
+            raise ClientError({"Error": {"Code": "InternalServerError", "Message": "said by AWS"}}, "Query")
+        return self.client.query(**request)
+
+
+def test_a_read_that_failed_is_not_a_launch_when_a_later_answer_covers_the_whole_wait(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    assert verify.ROW_LASTS_SECONDS == EXPIRY_SECONDS
+    # A wait of 45 minutes, less than a row lasts: the table cannot be read until the wait's last
+    # minute, and then holds no row since the booking. A row written at any time of the wait would
+    # still be there, so no instance was launched.
+    run, clock = PoolRuns(coursework=4), Clock()
+    dynamodb = UnreadableUntil(heartbeats, clock, WAIT_ENDS - 60)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, dynamodb, clock)
+
+    assert (exited, reason) == (0, "no-capacity\n")
+    assert run.pools == [None]
+
+
+def test_answers_too_far_apart_do_not_say_that_no_instance_was_launched(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. The table cannot be read for longer than a row lasts, and an instance
+    # launched then wrote its row once: the row is gone when the table answers again, with no row.
+    row = instance_row("coursework", "boot", NOW + 60)[1]
+    run, clock = PoolRuns(coursework=4), Lifetimes(row)
+    dynamodb = UnreadableUntil(heartbeats, clock, row["expires_at"] + 60)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(
+        tmp_path, run, dynamodb, clock, **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"}
+    )
+
+    # Every answer the script had held no row, and none says what happened before: the tests run.
+    assert (exited, reason) == (4, None)
+    assert run.pools == [None, "coursework"]
+
+
+class RefusesQueries:
+    def query(self, **_request: Any) -> dict[str, Any]:
+        raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "said by AWS"}}, "Query")
+
+
+@pytest.mark.parametrize("cannot_tell", ["a table that cannot be read", "no table named"])
+def test_only_the_table_s_own_answer_says_that_no_instance_was_launched(
+    tmp_path: Path, pool_state: Any, heartbeats: Any, capsys: pytest.CaptureFixture[str], cannot_tell: str
+) -> None:
+    dynamodb, changes = heartbeats, {}
+    if cannot_tell == "a table that cannot be read":
+        dynamodb = RefusesQueries()
+    else:
+        changes = {verify.HEARTBEATS_TABLE_VARIABLE: ""}
+    run = PoolRuns(coursework=4)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, dynamodb, **changes)
+
+    # Not known is not a lack of capacity: the tests run, and their failure is the script's.
+    assert (exited, reason) == (4, None)
+    assert run.pools == [None, "coursework"]
+    # Whatever the read did, the session the script booked is stopped.
+    stopped = session_of(pool_state, "coursework")
+    assert stopped is not None and stopped.ends_at == WAIT_ENDS
+    assert "said by AWS" not in "".join(capsys.readouterr())
+
+
+def test_a_reason_that_cannot_be_left_fails_the_script(tmp_path: Path, pool_state: Any, heartbeats: Any) -> None:
+    # No instance was launched, and the step names no file for the reason: a passing exit would
+    # read as a verification whose GPU tests ran.
+    run = PoolRuns()
+    exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, heartbeats, **{verify.GPU_REASON_FILE_VARIABLE: ""})
+    assert exited != 0 and reason is None and run.pools == [None]
+    stopped = session_of(pool_state, "coursework")
+    assert stopped is not None and stopped.ends_at == WAIT_ENDS
 
 
 # A plugin of the collection below: it writes, as JSON, the IDs of the tests that were deselected
