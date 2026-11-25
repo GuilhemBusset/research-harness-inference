@@ -34,12 +34,11 @@ def by_metric(alarms: dict[str, dict[str, Any]], name: str) -> list[dict[str, An
     return [a for a in alarms.values() if name in {m["MetricName"] for m in metrics(a)}]
 
 
-def test_the_fleet_alarms_read_auto_scaling_over_10_and_20_whole_minutes(templates: Templates) -> None:
+def test_the_fleet_alarms_read_auto_scaling_over_20_whole_minutes(templates: Templates) -> None:
     alarms = of_type(template(templates, "RhiGuardrails"), "AWS::CloudWatch::Alarm")
     groups = of_type(template(templates, "RhiPools"), "AWS::AutoScaling::AutoScalingGroup")
     assert POOLS and len(groups) == len(POOLS)
     expected = {
-        "GroupDesiredCapacity": (10, {"desired": "GroupDesiredCapacity", "in_service": "GroupInServiceInstances"}),
         "GroupTotalInstances": (20, {"total": "GroupTotalInstances", "in_service": "GroupInServiceInstances"}),
     }
     for first, (periods, reads) in expected.items():
@@ -90,6 +89,40 @@ def test_each_pool_alarms_on_suspended_launches_and_an_hour_in_service_outside_s
             assert (alarm["Namespace"], alarm["Period"], alarm["EvaluationPeriods"]) == ("rhi/scaler", 60, 1)
             assert alarm["Dimensions"][0]["Name"] == "Pool"
             assert (alarm["ComparisonOperator"], alarm["Threshold"]) == (operator, threshold)
+
+
+def test_each_pool_alarms_on_a_session_short_of_its_instances_for_30_whole_minutes(templates: Templates) -> None:
+    guardrails = template(templates, "RhiGuardrails")
+    alarms = of_type(guardrails, "AWS::CloudWatch::Alarm")
+    (topic_id,) = of_type(guardrails, "AWS::SNS::Topic")
+    assert EXAMPLE.capacity_alarm_minutes == 30
+    found = by_metric(alarms, "InstancesMissing")
+    assert sorted(a["Dimensions"][0]["Value"] for a in found) == sorted(POOLS)
+    for alarm in found:
+        assert (alarm["Namespace"], alarm["Period"]) == ("rhi/scaler", 60)
+        assert [d["Name"] for d in alarm["Dimensions"]] == ["Pool"]
+        # A minute reads the least of its runs: one that saw the session filled breaks the shortage,
+        # so a session filled in the last of the 30 minutes sends nothing.
+        assert alarm["Statistic"] == "Minimum"
+        # Above zero in each of the 30 minutes, and in exactly those: no older data point stands in
+        # for a minute with none, which leaves the alarm in the state it has.
+        assert (alarm["ComparisonOperator"], alarm["Threshold"]) == ("GreaterThanThreshold", 0)
+        assert (alarm["EvaluationPeriods"], alarm["DatapointsToAlarm"]) == (30, 30)
+        assert alarm["EvaluationWindow"] == WALL_CLOCK
+        assert alarm["TreatMissingData"] == "ignore"
+        # It tells the instructor when it fires, and nothing when it clears.
+        assert {"Ref": topic_id} in alarm["AlarmActions"]
+        assert not alarm.get("OKActions")
+        assert not alarm.get("InsufficientDataActions")
+
+
+def test_no_alarm_reads_a_group_s_desired_capacity(templates: Templates) -> None:
+    # A pool whose launch waits for capacity has a desired capacity and nothing in service: under
+    # sessions that is its ordinary state, and the alarm on a session short of its instances covers it.
+    alarms = of_type(template(templates, "RhiGuardrails"), "AWS::CloudWatch::Alarm")
+    assert alarms
+    assert by_metric(alarms, "GroupDesiredCapacity") == []
+    assert "GroupDesiredCapacity" not in str(alarms)
 
 
 def test_every_alarm_acts_on_the_alerts_topic_which_cloudwatch_may_publish_to(templates: Templates) -> None:

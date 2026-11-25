@@ -121,6 +121,12 @@ cost_anomaly_detection = false
 # alerts topic (system design, sections 11.3 and 17). Left out, it is 1.
 outside_sessions_alarm_hours = 1
 
+# The whole minutes a session may have fewer instances in service than it asks before an alarm
+# says so on the alerts topic; nothing is sent when the session is filled or ends (system design,
+# sections 5.4 and 17). At least 1 and at most 1440, the day CloudWatch evaluates such an alarm
+# over. Left out, it is 30.
+capacity_alarm_minutes = 30
+
 # The longest a session may last, in whole hours: a session's end is at most this long after the
 # later of its start and the moment it was last booked or changed, so one nobody remembers ends by
 # itself (system design, sections 5.6 and 17). It bounds every session of every pool, when it is

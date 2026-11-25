@@ -184,6 +184,10 @@ class Config:
     # The whole hours a pool may be in service while no session is on before its alarm fires
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
+    # The whole minutes a session may have fewer instances in service than it asks before its alarm
+    # fires, at most MOST_CAPACITY_ALARM_MINUTES (`rhi.guardrails.alarms_fleet`; sections 5.4 and
+    # 17). Only synthesis reads it.
+    capacity_alarm_minutes: int
     # The longest a session may last, in whole hours after the later of its start and the moment it
     # was last written (`rhi_common.sessions`; sections 5.6 and 17). The scaler's settings carry it.
     session_max_hours: int
@@ -257,6 +261,19 @@ def _whole_number(value: object) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError
     return value
+
+
+# The longest window CloudWatch evaluates an alarm of one-minute periods over is one day (the
+# PutMetricAlarm API: the periods times their length are at most 86,400 seconds when a period is
+# shorter than an hour). More minutes would synthesize an alarm the deployment fails on.
+MOST_CAPACITY_ALARM_MINUTES = 24 * 60
+
+
+def _capacity_alarm_minutes(value: object) -> int:
+    minutes = _whole_number(value)
+    if minutes > MOST_CAPACITY_ALARM_MINUTES:
+        raise ValueError
+    return minutes
 
 
 # The retention periods, in days, that CloudWatch Logs takes for a log group.
@@ -485,6 +502,11 @@ KEYS: dict[str, Key] = {
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "outside_sessions_alarm_hours": _WHOLE_NUMBER,
+    "capacity_alarm_minutes": Key(
+        "a whole number of minutes from 1 to 1440, the day CloudWatch evaluates an alarm of one-minute periods over",
+        _capacity_alarm_minutes,
+        _number_from_text,
+    ),
     "session_max_hours": _WHOLE_NUMBER,
     "check_wait_minutes": _WHOLE_NUMBER,
     "gateway_error_alarm_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
@@ -553,6 +575,9 @@ DEFAULTS: dict[str, object] = {
     "cost_anomaly_detection": False,
     # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
     "outside_sessions_alarm_hours": 1,
+    # Sections 5.4 and 17: a session short of the instances it asks raises its alarm after 30
+    # minutes.
+    "capacity_alarm_minutes": 30,
     # Sections 5.6 and 17: a session ends at most 12 hours after the later of its start and the
     # last command.
     "session_max_hours": 12,
