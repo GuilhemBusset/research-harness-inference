@@ -21,12 +21,10 @@ What a pool's session asks for at the time of the run is `requested`, by
 every run is that number, whatever the group held: 0 to 3 is one decision, not three. Suspended
 launches are the one exception, below.
 
-No rule reads the students' demand. The decision reads neither the gateways' heartbeats nor the
-pool's mode, which the inputs still carry, and the instances' load never sizes a pool: a held
-request starts no instance, a full pool does not grow, a quiet one keeps its session's number, and
-a gateway that does not answer is an alarm, not a reason to give back instances that took long to
-get. The memory's attributes of load, of idleness and of the gateway are left at their empty
-values.
+No rule reads the students' demand, which the inputs do not carry, and the instances' load never
+sizes a pool: a held request starts no instance, a full pool does not grow, a quiet one keeps its
+session's number, and a gateway that does not answer is an alarm, not a reason to give back
+instances that took long to get.
 
 **Release.** When more instances are in service than `requested`, the decision names that many of
 them, the ones whose scale-in protection to lift, and its reason is `release`. In service, for
@@ -180,7 +178,6 @@ def _decide_pool(pool: PoolInputs, now: int, session_max_hours: int) -> PoolDeci
         desired=desired,
         lift_protection=lift,
         suspend_launches=suspended,
-        # The attributes of load, of idleness and of the gateway stay at their empty values.
         memory=Memory(
             launch_suspended=suspended,
             suspended_at=suspended_at,
