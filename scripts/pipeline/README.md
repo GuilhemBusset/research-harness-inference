@@ -45,7 +45,10 @@ deployment, with the folders of pytest's import path in `PYTHONPATH` for the boo
   through `booking.py`, for twice the configuration's `check_wait_minutes`, waits until
   `GET /status` reads the pool ready or `check_wait_minutes` have passed, and stops the session it
   booked whatever the tests' result; a pool that already has a session is neither booked nor
-  stopped. When the wait for a pool of the decision's file ends with the pool not ready and no
+  stopped. Before it books the mock pool, it runs the one test of a pool nobody has booked,
+  `no-session`, alone, and leaves it out of every other run. On a mock pool that already has a
+  session it cannot make that test: the other tests run, and it exits 1, because the verification
+  is not complete; retry the stage once the mock pool is free. When the wait for a pool of the decision's file ends with the pool not ready and no
   instance's heartbeat row written since the booking, which it looks for through the wait and at
   its end, no instance was launched: it runs no test on that pool, stops its session, leaves the
   one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names and exits with the result

@@ -33,6 +33,14 @@ deployed stack it does nothing, because the verification booked the pool before 
 (`scripts/pipeline/verify.py`). The one test of a pool nobody has booked takes `stack` alone, and
 runs before any test that takes `booked`.
 
+**A stream that is answered `warming`.** A deployed gateway is several tasks, and each reads its
+pools on its own, every 5 seconds (`rhi_gateway.readiness`). `GET /status` is one task's answer:
+when it first reads the pool ready, which is when whoever booked the pool starts the tests, another
+task may still answer a request 503 with `warming` until its next read. So `Stack.stream` makes a
+request again while the answer is that one, for `SETTLE_SECONDS` at most, three of those reads. It
+gives the answer it ends on: a stream test still needs a whole stream, and a pool that is still
+warming by then fails it. No other answer is asked again.
+
 The stack is one test file's: the fixture `stack` is built for a module and taken down after it,
 so moto and its placeholder credentials never outlive the smoke tests in a run of every test.
 
@@ -88,6 +96,12 @@ READY_SECONDS = 30.0
 # How long the client waits for the next bytes of an answer: an engine is silent while it computes
 # a long transcript.
 READ_SECONDS = 120.0
+# How long a stream is asked again while its answer is 503 with the cause `WARMING`, since the first
+# such answer, and between two requests: the gateway's tasks do not read a pool ready at the same
+# moment, and are at most one read of 5 seconds apart.
+SETTLE_SECONDS = 15.0
+AGAIN_SECONDS = 1.0
+WARMING = "warming"
 
 # Placeholders, which moto never checks.
 _ACCOUNT = "123456789012"
@@ -180,13 +194,33 @@ class Stack:
         return self.http.request(method, self.endpoint + path, headers=headers, **arguments)
 
     def stream(self, path: str, body: Mapping[str, Any]) -> Stream:
-        """A streamed request with the canary's key, read to the end of its answer."""
-        reader, events = SseReader(), []
+        """A streamed request with the canary's key, read to the end of its answer. While the
+        answer is 503 with the cause `warming`, the request is made again every `AGAIN_SECONDS`,
+        for `SETTLE_SECONDS` at most since the first such answer: the answer given is the last."""
+        until: float | None = None
+        while True:
+            answer, cause = self._streamed(path, body)
+            if answer.status != 503 or cause != WARMING:
+                return answer
+            until = time.monotonic() + SETTLE_SECONDS if until is None else until
+            if time.monotonic() + AGAIN_SECONDS > until:
+                return answer
+            time.sleep(AGAIN_SECONDS)
+
+    def _streamed(self, path: str, body: Mapping[str, Any]) -> tuple[Stream, str | None]:
+        """One streamed request, read to the end of its answer, and the cause the answer names when
+        it is an error and no stream: its `error.type`, in every wire format."""
+        reader, events, read = SseReader(), [], b""
         headers = {"Authorization": f"Bearer {self.key}"}
         with self.http.stream("POST", self.endpoint + path, headers=headers, json=body) as answer:
             for chunk in answer.iter_bytes():
                 events += reader.feed(chunk)
-        return Stream(status=answer.status_code, events=tuple(events))
+                read += b"" if answer.status_code == 200 else chunk
+        try:
+            cause = json.loads(read)["error"]["type"]
+        except (ValueError, KeyError, TypeError):
+            cause = None
+        return Stream(status=answer.status_code, events=tuple(events)), cause if isinstance(cause, str) else None
 
 
 class Targets:

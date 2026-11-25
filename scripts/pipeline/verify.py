@@ -30,10 +30,18 @@ that, and they can only be made on a pool that has no session. So the script run
 on the mock pool, when it finds that pool with no session booked or active and before it books it:
 a run of its own, which `RHI_VERIFY_UNBOOKED_RUN` marks for the plugin below, and whose exit counts
 like any other run's. Every other run, the mock pool's in its session and each pool's of the
-decision's file, leaves those tests out: its pool is booked. When the mock pool already has a
-session, someone else's, the script neither books nor stops it, as below, and cannot make the pool
-unbooked: that test is not run in this verification, the script says so in a line of its own, and
-the tests of the pool's session run on the instances that are there.
+decision's file, leaves those tests out: its pool is booked. Only the script marks that run: the
+variable is taken out of the environment the step gives before any run is made.
+
+**A verification without that test does not pass.** The script reads the mock pool's session once,
+and that reading decides: with no session, the test runs and the script then books the pool; with
+a session booked or active, someone else's, the script neither books nor stops it, as below, and
+cannot make the pool unbooked. It never books the mock pool without having run that test first,
+also when the session it read ends a moment later. On a mock pool that has a session, the tests of
+the pool's session run on the instances that are there, as do those of the decision's pools, the
+test of the pool nobody has booked is not run, the script says so in a line of its own, and it
+exits 1 whatever the other tests gave: the verification is not complete, and the stage is to be
+retried once the mock pool is free.
 
 **The session on a pool.** Before each of its runs of the tests, the script books the pool the run
 is on through `booking.py`: a session of one instance, under the name `BOOKED_BY`, for twice
@@ -46,7 +54,8 @@ either case; on a pool of the decision's file, see below. No reading starts once
 and each is given no longer than what is left of it. Whatever became of the run, the script then
 stops the session, only while the session still reads as the booking it made. A pool that already
 has a session booked or active is neither booked nor stopped: the tests run at once, on the
-instances that are there. A mock pool whose session cannot be read fails the script before any
+instances that are there, and on the mock pool the verification is then not complete, above. A
+mock pool whose session cannot be read fails the script before any
 test, and one that cannot be booked, or whose booking is longer than
 `RHI_VERIFY_SESSION_MAX_HOURS` allows, before any test of its session; a pool of the decision's file
 that cannot be booked gets no run and fails the script. A session that could not be stopped fails a
@@ -715,8 +724,10 @@ def run_in_a_session(
     read ready, and once more when the wait ends; when the pool does not read ready by then and its
     answers say that no instance was launched since the booking (`Launches`), no run is made, for
     lack of capacity. Without it, the run is made when the wait ends. With `unbooked`, the run of
-    what can only be tested on a pool nobody has booked: it is made first, before the booking, when
-    the pool has no session booked or active, and not at all on a pool that has one."""
+    what can only be tested on a pool nobody has booked: one reading of the pool's session decides.
+    When the pool has no session booked or active, that run is made first, and the pool is booked
+    after it. When it has one, that run is not made and the pool is not booked, also when that
+    session ends a moment later: `run` is made at once, and `Outcome.unbooked_exit` stays `None`."""
     # Here and not at the top: the script's paths that book nothing, and the run of the tests that
     # loads this file as its plugin, need no import path.
     import booking
@@ -727,23 +738,30 @@ def run_in_a_session(
     unbooked_exit = None
     try:
         table = resource.Table(booking.table_name(cloudformation, check.stack, check.logical_id))
-        free = unbooked is not None and not booking.booked(
+        # The one reading that decides whether the pool is tested as one nobody has booked.
+        occupied = unbooked is not None and booking.booked(
             table, pool, now=int(clock()), session_max_hours=check.session_max_hours
         )
     except (BotoCoreError, ClientError, KeyError, RecordError) as error:
         print(f"{NAME}: the pool {pool} was not booked ({type(error).__name__}): no test was run", file=sys.stderr)
         return Outcome(None, in_order=False)
-    if unbooked is not None and free:
+    if unbooked is not None and not occupied:
         print(f"{NAME}: the pool {pool} has no session: the test of a pool nobody has booked runs first", flush=True)
         unbooked_exit = unbooked()
     try:
-        session = booking.book(
-            table,
-            pool,
-            minutes=minutes,
-            set_by=set_by,
-            now=int(clock()),
-            session_max_hours=check.session_max_hours,
+        # A pool read as occupied is not booked, whatever became of its session since: the script
+        # books no pool it was to test unbooked without having run that test.
+        session = (
+            None
+            if occupied
+            else booking.book(
+                table,
+                pool,
+                minutes=minutes,
+                set_by=set_by,
+                now=int(clock()),
+                session_max_hours=check.session_max_hours,
+            )
         )
     except SessionError:
         problem = (
@@ -756,7 +774,7 @@ def run_in_a_session(
         return Outcome(None, in_order=False, unbooked_exit=unbooked_exit)
     if session is None:
         print(f"{NAME}: the pool {pool} already has a session: it is neither booked nor stopped")
-        if unbooked is not None and unbooked_exit is None:
+        if occupied:
             # Someone's session: it stays, and so the pool cannot be tested as one nobody has booked.
             print(f"{NAME}: the test of a pool nobody has booked is not run: the pool {pool} has a session")
         return Outcome(run(), in_order=True, unbooked_exit=unbooked_exit)
@@ -826,18 +844,20 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
-    """Verifies the deployment the environment names; 0 when every test that ran passed, or none
-    could run. `client` is a Secrets Manager client of the AWS SDK, `dynamodb` a DynamoDB one,
-    `cloudformation` a CloudFormation one and `resource` a DynamoDB resource; without one, the
-    build's own credentials and region make it. `run` runs the smoke tests in the environment it is
-    given: once on the mock pool before it is booked, marked by `UNBOOKED_VARIABLE`, when that pool
-    has no session; then once on the mock pool and once on each pool the decision left, each in a
-    session the script books and stops. A pool the decision left on which no instance was launched during the
-    wait gets no run, the reason is left for the step's post-build phase, and the exit is that of
-    the other runs. `status` reads the state of the pool it is given in the seconds it
-    is given, from the endpoint's `GET /status` when left out; `sleep` waits that many seconds and
-    `clock` gives the time, in seconds since the epoch. When a run fails, the last stage each
-    instance of the tested pools reached is left for the step's post-build phase."""
+    """Verifies the deployment the environment names; 0 when every test that ran passed and the
+    test of a pool nobody has booked was among them, or when none could run. `client` is a Secrets
+    Manager client of the AWS SDK, `dynamodb` a DynamoDB one, `cloudformation` a CloudFormation one
+    and `resource` a DynamoDB resource; without one, the build's own credentials and region make
+    it. `run` runs the smoke tests in the environment it is given: once on the mock pool before it
+    is booked, marked by `UNBOOKED_VARIABLE`, when that pool has no session; then once on the mock
+    pool and once on each pool the decision left, each in a session the script books and stops. On
+    a mock pool that has a session that first run is not made, and the exit is 1 whatever the
+    others gave. A pool the decision left on which no instance was launched during the wait gets no
+    run, the reason is left for the step's post-build phase, and the exit is that of the other
+    runs. `status` reads the state of the pool it is given in the seconds it is given, from the
+    endpoint's `GET /status` when left out; `sleep` waits that many seconds and `clock` gives the
+    time, in seconds since the epoch. When a run fails, the last stage each instance of the tested
+    pools reached is left for the step's post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
     if not endpoint:
@@ -867,7 +887,9 @@ def main(
         return 1
     pools = release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, ""))
     given = {**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)}
+    # The script alone says which pool a run is on, and which run is the unbooked pool's.
     given.pop(POOL_VARIABLE, None)
+    given.pop(UNBOOKED_VARIABLE, None)
     if cloudformation is None or resource is None:
         import boto3
 
@@ -911,10 +933,15 @@ def main(
             # A pool that could not be booked got no run: that fails the script.
             exits.append(1 if on_pool.exit_code is None else on_pool.exit_code)
     exit_code = next((code for code in exits if code != 0), 0)
+    if on_mock.unbooked_exit is None:
+        # The mock pool had a session: what a pool nobody has booked answers was not tested.
+        problem = "the test of a pool nobody has booked was not run"
+        print(f"{NAME}: the verification is not complete: {problem}", file=sys.stderr)
     if exit_code != 0:
         leave_last_stages(env, pools, dynamodb, seen)
-    elif not in_order:
-        # A session the script booked and could not stop fails a verification whose tests passed.
+    elif not in_order or on_mock.unbooked_exit is None:
+        # A session the script booked and could not stop fails a verification whose tests passed,
+        # and so does one that could not make the test of the unbooked pool.
         exit_code = 1
     if no_capacity:
         # Left whatever the exit: a reason that cannot be left fails a script that passed.
