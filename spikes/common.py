@@ -320,31 +320,33 @@ def pool_state_table(environ: Mapping[str, str]) -> Any:
 
 
 def require_session(
-    table: Any, pool: str, *, instances: int, run_minutes: int, session_max_hours: int, now: int
+    table: Any, pool: str, *, instances: int, run_minutes: int, session_max_hours: int, now: Callable[[], float]
 ) -> None:
-    """Passes when the pool's session carries a run of `run_minutes` on `instances` instances at
-    the time `now`, in whole seconds since the epoch; `SessionRefused` otherwise, with the first of
-    the reasons that holds:
+    """Passes when the pool's session carries a run of `run_minutes` on `instances` instances from
+    now on; `SessionRefused` otherwise, with the first of the reasons that holds:
 
     - `no-session`: the pool's session record is not active, or there is none;
     - `too-few-instances`: the scaler's note reads fewer than `instances` in service, or there is none;
-    - `session-too-short`: the session ends before `run_minutes` from `now`. Its end is the one
+    - `session-too-short`: the session ends before `run_minutes` from now. Its end is the one
       every reader takes (`rhi_common.sessions.end`), at most `session_max_hours` long.
 
     `table` is the pool-state table, a DynamoDB table of the AWS SDK; both items are read strongly
-    consistent, and nothing is written or sent."""
+    consistent, and nothing is written or sent. `now` is the clock, in seconds since the epoch: it
+    is read once both items have been, so that the time the reads took is not counted as the
+    session's."""
 
     def read(record: str) -> Any:
         return table.get_item(Key={"pool": pool, "record": record}, ConsistentRead=True).get("Item")
 
     held, noted = read(SESSION_RECORD), read(NOTE_RECORD)
+    at = now()
     session = None if held is None else Session.from_item(held)
-    if session is None or not sessions.is_active(session, now, session_max_hours=session_max_hours):
+    if session is None or not sessions.is_active(session, int(at), session_max_hours=session_max_hours):
         raise SessionRefused(Refusal.NO_SESSION)
     in_service = 0 if noted is None else ScalerNote.from_item(noted).in_service
     if in_service < instances:
         raise SessionRefused(Refusal.TOO_FEW_INSTANCES)
-    if sessions.end(session, session_max_hours=session_max_hours) < now + run_minutes * 60:
+    if sessions.end(session, session_max_hours=session_max_hours) < at + run_minutes * 60:
         raise SessionRefused(Refusal.SESSION_TOO_SHORT)
 
 

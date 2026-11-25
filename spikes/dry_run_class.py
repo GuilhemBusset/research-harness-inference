@@ -657,7 +657,7 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
                 instances=needs.instances,
                 run_minutes=needs.run_minutes,
                 session_max_hours=settings.session_max_hours,
-                now=int(clock.now()),
+                now=clock.now,
             )
         except common.SessionRefused as refused:
             recorder.line("refused", reason=refused.reason.value)

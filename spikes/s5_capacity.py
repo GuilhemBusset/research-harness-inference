@@ -142,9 +142,8 @@ number, which the session must have in service before the job sends anything, wh
 run, and which every run must be served by. The job
 refuses, as not measured, a run that any other number of instances served, or that one of them
 did not serve from its start to its end (`held_at`): the numbers of a job are always those many
-instances'. `RHI_S5_INSTANCES`, the variable's name before the job ran in a session, is refused
-before anything is sent: the job reads one number of instances, never two. What one instance
-serves is a job at one; the class's size
+instances'. `RHI_S5_INSTANCES`, the variable's name before the job ran in a session, is not read.
+What one instance serves is a job at one; the class's size
 over the session's instances is a job at the session's instances (`docs/measurements/s5.md` says
 how the owner holds the pool there).
 
@@ -258,8 +257,6 @@ CLASS_SIZE_VARIABLE = "RHI_S5_CLASS_SIZE"
 DURATION_VARIABLE = "RHI_S5_DURATION_SECONDS"
 LEVER_VARIABLE = "RHI_S5_LEVER"
 BUILD_VARIABLE = "RHI_S5_BUILD"
-# The name the job's instances had before it ran in a session: refused, never read.
-RETIRED_INSTANCES_VARIABLE = "RHI_S5_INSTANCES"
 WINDOW_VARIABLE = "RHI_S5_WINDOW_TOKENS"
 DEFAULT_POOL = "coursework"
 DEFAULT_STREAMS = (1, 4, 8, 16)
@@ -1717,8 +1714,6 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
     streams, lever, build = streams_of(environ), lever_of(environ), build_name_of(environ)
     class_size, duration = whole_of(environ, CLASS_SIZE_VARIABLE), whole_of(environ, DURATION_VARIABLE)
     window = window_of(environ)
-    if RETIRED_INSTANCES_VARIABLE in environ:
-        raise ValueError(f"{RETIRED_INSTANCES_VARIABLE} is not read: the instances are {common.INSTANCES_VARIABLE}")
     # One number of instances: the session's check, the run's label and each run's own check read it.
     needs = common.needs_of(environ)
     instances = needs.instances
@@ -1741,7 +1736,7 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
                 instances=instances,
                 run_minutes=needs.run_minutes,
                 session_max_hours=settings.session_max_hours,
-                now=int(time.time()),
+                now=time.time,
             )
         except common.SessionRefused as refused:
             print(f"refused: {refused.reason}")

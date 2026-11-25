@@ -682,7 +682,7 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
         instances=needs.instances,
         run_minutes=needs.run_minutes,
         session_max_hours=settings.session_max_hours,
-        now=int(time.time()),
+        now=time.time,
     )
     keys = common.canary_keys()
     key = keys.students[0]

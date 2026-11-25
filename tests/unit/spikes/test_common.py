@@ -381,7 +381,7 @@ def test_require_session(pool_state: Any) -> None:
             pool_state.hold(ScalerNote("coursework", 2, None, NOW - 30, in_service=in_service))
         try:
             common.require_session(
-                pool_state, "coursework", instances=instances, run_minutes=minutes, session_max_hours=12, now=NOW
+                pool_state, "coursework", instances=instances, run_minutes=minutes, session_max_hours=12, now=lambda: NOW
             )
         except common.SessionRefused as refused:
             assert str(refused) == refused.reason.value
@@ -411,6 +411,38 @@ def test_require_session(pool_state: Any) -> None:
     assert refusal(capped, 2, minutes=61) == "session-too-short"
     # Both items are read each time, and nothing else.
     assert set(pool_state.reads) == {("coursework", "session"), ("coursework", "note")}
+
+
+def test_the_session_is_judged_at_the_time_its_records_were_read(pool_state: Any) -> None:
+    class Slow:
+        """The table, each read of which takes a second of the clock `at`."""
+
+        at = float(NOW)
+
+        def get_item(self, **key: Any) -> dict[str, Any]:
+            self.at += 1
+            return pool_state.get_item(**key)
+
+    def refusal(minutes: int, *, left: int = 90 * 60) -> str | None:
+        """Why a run of `minutes` is refused in a session with `left` seconds left as the check begins."""
+        table = Slow()
+        pool_state.hold(
+            Session("coursework", 1, NOW - HOUR, NOW + left, "an-admin", NOW - HOUR),
+            ScalerNote("coursework", 1, None, NOW - 30, in_service=1),
+        )
+        try:
+            common.require_session(
+                table, "coursework", instances=1, run_minutes=minutes, session_max_hours=12, now=lambda: table.at
+            )
+        except common.SessionRefused as refused:
+            return refused.reason.value
+        return None
+
+    # The two reads took two seconds of the session: it no longer lasts the run it lasted before them.
+    assert refusal(90) == "session-too-short"
+    assert refusal(89) is None
+    # And a session that ended while they were read is no session.
+    assert refusal(1, left=1) == "no-session"
 
 
 def test_a_run_s_needs_are_the_owner_s_and_its_minutes_have_no_default() -> None:

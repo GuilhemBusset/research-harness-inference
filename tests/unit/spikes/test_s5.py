@@ -210,7 +210,9 @@ def test_the_job_admitted_to_its_session_waits_for_the_status_and_sends_no_wake(
     with pytest.raises(Reached):
         # One canary student's key carries one stream and a class of one.
         one_student = {"RHI_S5_STREAMS": "1", "RHI_S5_CLASS_SIZE": "1"}
-        s5.main(ENVIRON | pool_state.environ | one_student | {"RHI_SPIKE_INSTANCES": "2"})
+        # The name the instances had before the job ran in a session is not read, and stops nothing.
+        instances = {"RHI_SPIKE_INSTANCES": "2", "RHI_S5_INSTANCES": "1"}
+        s5.main(ENVIRON | pool_state.environ | one_student | instances)
     # The pool read cold, then ready: all the job asked the gateway before its first request.
     assert gateway_requests == [("GET", "https://example.com/status")] * 2
     # The instances the session was checked for are the run's own.
@@ -240,16 +242,13 @@ def test_the_job_refused_by_its_session_sends_nothing_and_is_not_measured(
     assert [(run.label, run.verdict, dict(run.numbers)) for run in posted] == [(label, Verdict.NOT_MEASURED, {})]
 
 
-def test_the_job_does_not_start_without_its_minutes_or_with_two_numbers_of_instances(
+def test_the_job_does_not_start_without_its_minutes(
     pool_state: Any, gateway_requests: list[tuple[str, str]], posted: list[Any]
 ) -> None:
     pool_state.book(in_service=2)
     without_minutes = {name: value for name, value in pool_state.environ.items() if name != "RHI_SPIKE_RUN_MINUTES"}
     with pytest.raises(ValueError, match="RHI_SPIKE_RUN_MINUTES"):
         s5.main(ENVIRON | without_minutes)
-    # The name the instances had before the job ran in a session is refused, never read beside the other.
-    with pytest.raises(ValueError, match="RHI_SPIKE_INSTANCES"):
-        s5.main(ENVIRON | pool_state.environ | {"RHI_S5_INSTANCES": "2"})
     assert (pool_state.reads, gateway_requests, posted) == ([], [], [])
 
 
