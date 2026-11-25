@@ -29,7 +29,7 @@ from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import Affinity
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter, Forwarded
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -60,7 +60,7 @@ POOLS = parse_pools({"coursework": MOCK})
 
 
 def in_session(pool: str, *, ready: bool = True) -> PoolView:
-    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
     now = int(time.time())
     booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
     return PoolView(ready=ready, session=booked)
@@ -222,8 +222,8 @@ def gateway(upstream: Upstream, clock: Clock) -> tuple[Starlette, str, Ledger]:
         ledger=ledger,
         filters=filters,
         proxy=Observing(ledger, client, "http://pools.example.com:8080", {"coursework": "secret"}, sleep=clock.sleep),
-        # Every pool is ready: these requests are forwarded at once, with no hold.
-        holding=Holding(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}, wake=lambda pool: None),
+        # Every pool is ready: these requests are forwarded.
+        pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
     )
     return build_app(forwarding_handlers(forwarding)), key, ledger
 

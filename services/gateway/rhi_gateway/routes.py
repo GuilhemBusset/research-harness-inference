@@ -2,7 +2,7 @@
 
 The engine's own request surface is too large to hand to students unfiltered, and vLLM answers
 routes such as `/invocations` and `/pause` without its key (section 4.1). The gateway therefore
-serves the eight routes written here and nothing else: four are forwarded to the engine, four are
+serves the seven routes written here and nothing else: four are forwarded to the engine, three are
 answered by the gateway itself, and any other method or path is the cause `not_found`.
 
 A request is in the table when its method and its path equal an entry's, the path being compared
@@ -59,10 +59,9 @@ RESPONSES = Route("POST", "/v1/responses", "/v1/responses", WireFormat.RESPONSES
 # Answered locally.
 MODELS = Route("GET", "/v1/models")
 STATUS = Route("GET", "/status")
-WAKE = Route("POST", "/wake")
 HELLO = Route("HEAD", "/api/hello")
 
-TABLE: tuple[Route, ...] = (MESSAGES, COUNT_TOKENS, CHAT_COMPLETIONS, RESPONSES, MODELS, STATUS, WAKE, HELLO)
+TABLE: tuple[Route, ...] = (MESSAGES, COUNT_TOKENS, CHAT_COMPLETIONS, RESPONSES, MODELS, STATUS, HELLO)
 
 _BY_REQUEST = {(route.method, route.path.encode("ascii")): route for route in TABLE}
 

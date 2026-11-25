@@ -22,7 +22,6 @@ from moto import mock_aws
 
 from rhi_common import retention
 from rhi_common.causes import Cause
-from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
 from rhi_common.tables import USAGE
 from rhi_gateway.budget import DynamoDBLedger, InMemoryLedger, Ledger, Reservation
@@ -108,7 +107,6 @@ def reserve(ledger: Ledger, who: StudentKey, request: str, *, pool: str | None =
     return ledger.reserve(
         who,
         request,
-        hold_seconds=DEFAULT_HOLD_SECONDS,
         longest_request_seconds=LONGEST_REQUEST_SECONDS,
         pool=pool,
     )
@@ -168,7 +166,7 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
     # The student's first request of the day writes the item whole: no tokens for the day, and a
     # lease of its expiry alone.
     first = reserve(ledger, who, "request-1")
-    lease = Lease(expires=NOON + 2280)
+    lease = Lease(expires=NOON + 1860)
     assert first == Reservation(github_id=7, day="2026-11-15", request_id="request-1", lease=lease)
     assert written() == UsageDay(
         github_id=7,
@@ -178,7 +176,7 @@ def test_the_item_of_a_day_and_the_two_writes_of_a_request(client: Calls) -> Non
         leases={"request-1": lease},
     )
     # Checked as stored, not through the reader, which ignores what it does not read.
-    stored_lease = {"expires": {"N": str(NOON + 2280)}}
+    stored_lease = {"expires": {"N": str(NOON + 1860)}}
     item = client.get_item(TableName=TABLE, Key=KEY)["Item"]
     assert "tokens" not in item
     assert item["leases"]["M"]["request-1"]["M"] == stored_lease
@@ -522,12 +520,12 @@ def test_an_expired_lease_frees_its_slot(client: Calls) -> None:
     clock.now = NOON + 1
     second = reserve(ledger, who, "request-2")
 
-    clock.now = NOON + 2279
+    clock.now = NOON + 1859
     assert refusal(ledger, who, "request-3") is Cause.CONCURRENCY_LIMIT
 
     # The first lease has expired and the second has not: the reservation that needs its slot
     # removes it in its own write.
-    clock.now = NOON + 2280
+    clock.now = NOON + 1860
     client.made.clear()
     third = reserve(ledger, who, "request-3")
     assert client.made == ["update_item", "update_item"]  # the one refused, then the one written
@@ -535,7 +533,7 @@ def test_an_expired_lease_frees_its_slot(client: Calls) -> None:
     assert ledger.settle(first) is False
 
     # A settlement that comes after the expiry removes the lease as any settlement does.
-    clock.now = NOON + 2281
+    clock.now = NOON + 1861
     assert ledger.settle(second) is True
     assert ledger.settle(third) is True
     assert written().leases == {}
@@ -562,7 +560,7 @@ def test_leases_the_release_before_wrote_are_settled_and_swept_and_the_day_s_tok
     reservation = reserve(ledger, student(limit=2), "request-1")
     record = written()
     assert (stored()["tokens"], set(record.leases)) == (2300, {"old-running", "request-1"})
-    assert stored()["leases"]["request-1"] == {"expires": NOON + 2280}
+    assert stored()["leases"]["request-1"] == {"expires": NOON + 1860}
 
     # The running one is settled like any other: its slot is freed and nothing is charged or given back.
     assert ledger.settle(Reservation(7, "2026-11-15", "old-running", running)) is True
@@ -633,7 +631,7 @@ def test_a_reservation_a_settlement_and_a_withdrawal_on_a_day_of_either_release(
     # The reservation counts the leases of either shape against the limit, and writes its expiry alone.
     reservation = reserve(ledger, student(limit=3), "request-1")
     assert refusal(ledger, student(limit=3), "request-2") is Cause.CONCURRENCY_LIMIT
-    assert stored()["leases"]["request-1"] == {"expires": NOON + 2280}
+    assert stored()["leases"]["request-1"] == {"expires": NOON + 1860}
 
     # The settlements remove the leases, and leave the day's tokens as they were.
     assert ledger.settle(Reservation(7, "2026-11-15", "in-flight", Lease(expires=NOON + 900))) is True

@@ -1,12 +1,12 @@
 """A pool is served while its session is active (`rhi_gateway.readiness`, `rhi_gateway.app`, `rhi_gateway.local`).
 
-A request, and a wake, for a pool whose session is not active end with `no_session`, for every
+A request for a pool whose session is not active ends with `no_session`, for every
 key, and the status lists that pool unavailable with it; while no pool's session is active, a
 request is refused before its body is read (system design, sections 5.3, 5.6 and 6.2, step 5).
 
 The gateway runs whole over a real readiness reader, whose load-balancing API and pool-state table
 are one double: the pools of `healthy` have a healthy target, and each pool's session is the item
-the test writes. The proxy, the ledger and the waker record what reaches them, and the application
+the test writes. The proxy and the ledger record what reaches them, and the application
 is reached through a `receive` that counts its calls: a body is read through nothing else. The
 clock is the test's. Every key is generated when the test runs.
 """
@@ -23,13 +23,14 @@ import pytest
 from starlette.responses import Response
 from starlette.types import Message, Receive, Scope, Send
 
+from rhi_common import sessions
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
 from rhi_common.records import Session
 from rhi_common.students import CANARY_GITHUB_ID, StudentKey
 from rhi_gateway import proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -38,7 +39,6 @@ from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import Readiness
-from rhi_gateway.waker import Waker
 
 NOW = 1_800_000_000
 HOUR = 3600
@@ -72,13 +72,12 @@ def session(pool: str, *, starts_at: int = NOW - 60, ends_at: int = NOW + HOUR, 
 
 
 class Aws:
-    """`describe_target_health`, the pool-state table's `get_item` and the scaler's `invoke`."""
+    """`describe_target_health` and the pool-state table's `get_item`."""
 
     def __init__(self, healthy: set[str]) -> None:
         self.healthy = healthy
         self.sessions: dict[str, dict[str, Any]] = {}
         self.failing = False
-        self.invocations: list[dict[str, Any]] = []
 
     def describe_target_health(self, *, TargetGroupArn: str) -> dict[str, Any]:
         state = "healthy" if TargetGroupArn in self.healthy else "unhealthy"
@@ -90,10 +89,6 @@ class Aws:
         if Key["record"] == "session" and Key["pool"] in self.sessions:
             return {"Item": self.sessions[Key["pool"]]}
         return {}
-
-    def invoke(self, **arguments: Any) -> dict[str, Any]:
-        self.invocations.append(arguments)
-        return {"StatusCode": 202}
 
 
 class Ledger(InMemoryLedger):
@@ -121,21 +116,6 @@ class Reached(proxy.Proxy):
         self.reached.append((route, forwarded.pool.name))
         await on_end(proxy.Observed(0, 0, ended_cleanly=True))
         return Response(status_code=200)
-
-
-class RecordingWaker(Waker):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.recorded: list[str] = []
-        self.asked: list[str] = []
-
-    def record(self, pool: str) -> None:
-        self.recorded.append(pool)
-        super().record(pool)
-
-    def ask(self, pool: str) -> Any:
-        self.asked.append(pool)
-        return super().ask(pool)
 
 
 class Gateway:
@@ -168,8 +148,6 @@ class Gateway:
         )
         self.ledger = Ledger()
         self.proxy = Reached()
-        self.hold_wakes: list[str] = []
-        self.waker = RecordingWaker(self.readiness, lambda_client=self.aws, function_name="scaler", clock=clock)
         forwarding = Forwarding(
             authenticator=authenticator,
             ledger=self.ledger,
@@ -180,12 +158,7 @@ class Gateway:
                 routes.RESPONSES: BodyFilter(responses.RESPONSES, POOLS),
             },
             proxy=self.proxy,
-            holding=Holding(
-                views=self.readiness.views,
-                wake=self.hold_wakes.append,
-                clock=clock,
-                session_max_hours=session_max_hours,
-            ),
+            pools=Pools(views=self.readiness.views, clock=clock, session_max_hours=session_max_hours),
         )
         local = LocalRoutes(
             authenticator,
@@ -193,7 +166,6 @@ class Gateway:
             self.readiness.views,
             default_pool=POOLS[0],
             clock=clock,
-            waker=self.waker,
             session_max_hours=session_max_hours,
         )
         self.app = build_app(forwarding_handlers(forwarding), local=local)
@@ -239,15 +211,8 @@ class Gateway:
         return self.call("POST", entry.path, github_id, body(entry, pool))
 
     def nothing_was_asked(self) -> bool:
-        """No slot was taken, no engine reached, and no wake recorded or asked of the scaler."""
-        return not (
-            self.ledger.reserved
-            or self.proxy.reached
-            or self.hold_wakes
-            or self.waker.recorded
-            or self.waker.asked
-            or self.aws.invocations
-        )
+        """No slot was taken and no engine reached."""
+        return not (self.ledger.reserved or self.proxy.reached)
 
 
 def no_session(answer: httpx.Response) -> bool:
@@ -264,7 +229,7 @@ def no_session(answer: httpx.Response) -> bool:
 def test_a_pool_is_served_in_its_session_and_a_pool_without_one_is_answered_no_session(
     entry: routes.Route, github_id: int
 ) -> None:
-    # The pool with no session has no healthy target: a request the gateway took for it would be held and wake it.
+    # The pool with no session has no healthy target either: the answer is `no_session`, and no other cause.
     gateway = Gateway(session("coursework"))
     assert no_session(gateway.forward(entry, "mock", github_id))
     assert gateway.nothing_was_asked()
@@ -331,7 +296,10 @@ def test_a_session_is_active_from_its_start_to_its_end_under_the_longest_session
     assert (answer.status_code == 200) if served else no_session(answer)
     states = {record["model"]: record for record in gateway.call("GET", "/status").json()["pools"]}
     assert (states["coursework"].get("cause") == "no_session") is not served
-    assert states["mock"] == {"model": "mock", "state": "ready"}
+    # The status gives the end of a session that is active, as every reader takes it, and of no other.
+    ends_at = sessions.end(booked, session_max_hours=session_max_hours) if served else None
+    assert states["coursework"].get("session_ends_at") == ends_at
+    assert states["mock"] == {"model": "mock", "state": "ready", "session_ends_at": NOW + HOUR}
 
 
 def test_a_session_ends_on_the_gateways_own_clock_with_no_new_read() -> None:
@@ -372,21 +340,9 @@ def test_the_status_lists_a_pool_unavailable_with_no_session_exactly_when_its_ow
     answer = gateway.call("GET", "/status", github_id)
     assert answer.status_code == 200
     assert answer.json()["pools"] == [
-        {"model": "coursework", "state": "ready"},
+        {"model": "coursework", "state": "ready", "session_ends_at": NOW + HOUR},
         {"model": "mock", "state": "unavailable", "cause": "no_session"},
     ]
     # The models and the hello answer as ever.
     assert [m["id"] for m in gateway.call("GET", "/v1/models", github_id).json()["data"]] == ["coursework", "mock"]
     assert gateway.call("HEAD", "/api/hello").status_code == 200
-
-
-@KEYS
-def test_a_wake_for_a_pool_without_a_session_is_answered_no_session_and_asks_for_nothing(github_id: int) -> None:
-    # Neither pool has a healthy target: a wake the gateway took would be recorded and asked of the scaler.
-    gateway = Gateway(session("coursework"), healthy=())
-    assert no_session(gateway.call("POST", "/wake", github_id, {"model": "mock"}))
-    assert gateway.nothing_was_asked()
-
-    answer = gateway.call("POST", "/wake", github_id, {"model": "coursework"})
-    assert (answer.status_code, answer.json()) == (200, {"model": "coursework", "state": "cold"})
-    assert gateway.waker.recorded == ["coursework"] and gateway.waker.asked == ["coursework"]

@@ -14,7 +14,8 @@ take the table as a boto3 table resource.
 `rhi_common.sessions.started`: one instance, from now, for the minutes it is given, under the name
 it is given. A caller that needs more instances gives their number and the pool's `max_instances`.
 It books only a pool that has no session booked or active: on any other it writes nothing and
-returns `None`, and its caller tests the instances that are there. The write holds only if the
+returns `None`, and its caller tests the instances that are there. `booked` says which of the two
+a pool is, by the same rule, for a caller that has something to do before it books. The write holds only if the
 item still is what was read, no item or the same ended session, so a session someone books between
 the read and the write is not written over: that too is `None`. A booking outside the bounds of a
 session, longer than `session_max_hours` or of more instances than `max_instances`, is a
@@ -88,6 +89,13 @@ def _written(table: Any, session: Session, current: Session | None) -> bool:
             raise
         return False
     return True
+
+
+def booked(table: Any, pool: str, *, now: int, session_max_hours: int) -> bool:
+    """Whether the pool has a session booked or active at the time `now`: one `book` would leave as it is."""
+    current = read(table, pool)
+    # `stopped` has something to write exactly when the pool has a session booked or active.
+    return sessions.stopped(current, set_by="", now=now, session_max_hours=session_max_hours) is not None
 
 
 def book(

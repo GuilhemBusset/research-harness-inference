@@ -35,7 +35,7 @@ next after `AFTER_REFUSAL_SECONDS`. A request that failed, or whose stream carri
 error event, ends its conversation as a refusal does: the next one opens with a first turn.
 
 **Whether a request was held** is the gateway's own decision, which its answer carries in the
-header `rhi_gateway.hold.HELD_HEADER` (`loadgen.Record.held`), whether or not the hold lasted long
+header `loadgen.HELD_HEADER` (`loadgen.Record.held`), whether or not the hold lasted long
 enough for a keep-alive. A keep-alive in the stream decides nothing: an engine may open its own
 stream with a comment or a `ping`, which a warm request then gets too.
 

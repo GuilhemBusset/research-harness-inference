@@ -55,10 +55,11 @@ sessions, run at once. Both draw their sizes from a seed, so a run can be repeat
 - the student, the session, whether the request was its session's first turn, and the status of
   the answer;
 - the time on the replay's clock the request was sent, and the seconds from then to its last token;
-- whether the gateway held the request, which its answer says with its header
-  (`rhi_gateway.hold.HELD_HEADER`), and only that: a keep-alive in the stream is no sign of it, since
-  a hold that ends before its first keep-alive is due leaves none, and an engine may open its own
-  stream with a comment or a `ping`;
+- whether the gateway held the request, which its answer says with the header `HELD_HEADER`, and
+  only that: a keep-alive in the stream is no sign of it, since an engine may open its own stream
+  with a comment or a `ping`. The gateway holds no request now (system design, section 5.3), so no
+  answer of it carries the header, and the field reads false on every request: it stays in the
+  records until the readings that take it are revised;
 - the gateway's cause, when the answer is one of its errors, a refusal or an error event, and the
   cause is one of its own (`rhi_common.causes.Cause`); nothing else of an error is kept.
 
@@ -85,7 +86,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from rhi_common.causes import Cause
-from rhi_gateway.hold import HELD_HEADER
 from rhi_gateway.sse import SseEvent, SseReader
 
 if TYPE_CHECKING:
@@ -111,6 +111,9 @@ PING_EVENT = "ping"
 _CAUSES = frozenset(cause.value for cause in Cause)
 # The headers of a capture that are not replayed: the recording's host and length, and a key.
 _NOT_REPLAYED = frozenset({"host", "content-length", "authorization", "x-api-key"})
+# The header, with the value `true`, that an answer to a request the gateway held carried. The
+# gateway holds none now and sends no such header: the name is this module's own.
+HELD_HEADER = "x-rhi-held"
 # What stands for the answer in a synthetic transcript when the answer held no text.
 _NO_TEXT = "(no text)"
 # One token each, with the space that follows: common words of three letters.
