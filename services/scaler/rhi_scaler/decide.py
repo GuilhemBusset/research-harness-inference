@@ -29,19 +29,28 @@ get. The memory's attributes of load, of idleness and of the gateway are left at
 values.
 
 **Release.** When more instances are in service than `requested`, the decision names that many of
-them, the ones whose scale-in protection to lift, and its reason is `release`. They are chosen
-among the instances in service, in this order:
+them, the ones whose scale-in protection to lift, and its reason is `release`. In service, for
+this rule, is what the group itself holds in service, since that is where scale-in protection
+starts: the instances that serve (`Supply.in_service`), and those whose target is not healthy
+(`Supply.not_serving`), which the supply lists as starting or as draining. They are chosen in this
+order:
 
-1. those whose fresh heartbeat reports nothing running and nothing waiting;
-2. those with the fewest requests running and waiting, by their fresh heartbeat;
-3. those with no fresh heartbeat, whose load is not known.
+1. those that do not serve, which the load balancer sends nothing;
+2. those that serve and whose fresh heartbeat reports nothing running and nothing waiting;
+3. those that serve, the fewest requests running and waiting first, by their fresh heartbeat;
+4. those that serve with no fresh heartbeat, whose load is not known.
 
-Within each, by name. An instance still starting is never named: scale-in protection starts when
-an instance enters service, so it has none to lift. Lowering the capacity is what stops asking for
-it. If the group keeps it all the same, it enters service and the run that then sees one instance
-too many releases whichever comes first in the order above. An instance already leaving is not
-named either. A run that lowers the capacity and has no instance to name, since what it gives up
-had not arrived, has the reason `release` too.
+Within each, by name. An instance still starting, one the group has not put in service, is never
+named: it has no protection to lift. Lowering the capacity is what stops asking for it. If the
+group keeps it all the same, it enters service and the run that then sees one instance too many
+releases whichever comes first in the order above. An instance the group is already terminating is
+not named either. A run that lowers the capacity and has no instance to name, since what it gives
+up had not arrived, has the reason `release` too.
+
+A raise comes first among the reasons. The capacity the run read can be below `requested` while
+more instances than `requested` are still in service, when an earlier run lowered it and the
+instances it named have not left yet. That run asks for `requested`, names the instances beyond it,
+and its reason is `provision`, or `launch-suspended` when the pool is not raised.
 
 **Rebalance.** The rule sets no size: it stands apart from the others. For each new number the
 gateway moves a share of the pool's students to the emptiest instance (section 5.5), a few at a
@@ -60,7 +69,7 @@ the input counts three launches abandoned in a row, the decision suspends the gr
 sets the mark `launch_suspended` in the memory. While it stands, every run keeps the launches
 suspended and the pool is not raised: a session that asks for more than the group was asked for
 leaves the capacity where the run read it, with the reason `launch-suspended`. A size that goes
-down still does. The admin clears the mark by setting it back to false. The run that finds it so
+down still does, and the instances beyond `requested` are named in either case. The admin clears the mark by setting it back to false. The run that finds it so
 resumes the launches and keeps its own time as the start of the count; it ignores the abandons it
 was given, which the group's history still holds, and decides as for any pool, so the session
 raises it. Only three abandons counted from that time suspend it again.
@@ -120,13 +129,18 @@ def _decide_pool(pool: PoolInputs, now: int, session_max_hours: int) -> PoolDeci
             desired, reason = supply.desired, Reason.LAUNCH_SUSPENDED
         else:
             reason = Reason.PROVISION
-    # The release: as many instances in service as there are beyond what the session asks for.
-    # Those that report nothing running and nothing waiting, then the fewest requests, then those
-    # that report nothing fresh; an instance still starting is not among them.
+    # The release: as many of the instances the group holds in service as there are beyond what
+    # the session asks for. Those that do not serve, then among those that serve the ones that
+    # report nothing running and nothing waiting, then the fewest requests, then those that report
+    # nothing fresh; an instance the group has not put in service is not among them.
     load = {heartbeat.instance: heartbeat.running + heartbeat.waiting for heartbeat in serving}
-    order = sorted(supply.in_service, key=lambda name: (name not in load, load.get(name, 0), name))
-    lift = tuple(sorted(order[: max(0, len(supply.in_service) - asked)]))
-    if lift or desired < supply.desired:
+    held = {*supply.in_service, *supply.not_serving}
+    order = sorted(
+        held, key=lambda name: (name in supply.in_service, name not in load, load.get(name, 0), name)
+    )
+    lift = tuple(sorted(order[: max(0, len(held) - asked)]))
+    # A raise, or a pool kept from one, keeps its reason.
+    if reason is Reason.UNCHANGED and (lift or desired < supply.desired):
         reason = Reason.RELEASE
 
     # The rebalance, whatever the size: it changes none. Its own count: an instance that waits,

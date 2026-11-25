@@ -27,6 +27,7 @@ from rhi_scaler.aws_io import (
     memory_update,
     read,
 )
+from rhi_scaler.decide import decide
 from rhi_scaler.model import Decision, Memory, PoolDecision, Reason, Supply
 
 NOW = 1_800_000_000
@@ -206,6 +207,8 @@ def test_a_group_becomes_the_supply_from_its_own_list_and_target_health(aws: Aws
         starting=("instance-c", "instance-d"),
         draining=("instance-b", "instance-e"),
         running=("instance-a", "instance-b", "instance-c", "instance-d", "instance-e"),
+        # In service for the group, their target not healthy: protected like the one that serves.
+        not_serving=("instance-b", "instance-c"),
     )
     # No mode record: the configured mode. Only the fresh, readable heartbeats.
     assert pool.mode is Mode.SCHEDULED_ONLY
@@ -215,6 +218,25 @@ def test_a_group_becomes_the_supply_from_its_own_list_and_target_health(aws: Aws
     group = run.groups["coursework"]
     assert group.desired == 4 and group.in_service == ("instance-a", "instance-b", "instance-c")
     assert not group.launch_suspended
+
+
+def test_a_session_that_ended_releases_a_protected_instance_whose_target_is_not_healthy(aws: Aws) -> None:
+    ended = Session("coursework", 2, NOW - 3600, NOW, set_by="instructor", set_at=NOW - 3600)
+    aws.queue_read(
+        desired=2,
+        instances=[instance("instance-a", "InService"), instance("instance-b", "Pending:Wait", protected=False)],
+        health={"instance-a": "unhealthy"},
+        records=[ended.to_item()],
+    )
+    run = read_one(aws)
+    assert run.inputs.pools[0].supply.starting == ("instance-a", "instance-b")
+    # The decision names the one the group protects, and not the one it still launches.
+    decided = decide(run.inputs)
+    assert [(pool.desired, pool.lift_protection) for pool in decided.pools] == [(0, ("instance-a",))]
+    aws.expect("set_instance_protection", InstanceIds=["instance-a"], ProtectedFromScaleIn=False)
+    aws.expect("set_desired_capacity", DesiredCapacity=0, HonorCooldown=False)
+    aws.expect_writes()
+    apply(aws.clients, TABLES, run, decided)
 
 
 def test_the_mode_record_and_the_memory_record_are_read(aws: Aws) -> None:

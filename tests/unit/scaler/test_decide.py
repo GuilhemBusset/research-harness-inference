@@ -154,6 +154,40 @@ def test_an_instance_still_in_service_after_the_capacity_was_lowered_is_named() 
     assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.RELEASE)
 
 
+def test_an_instance_the_group_holds_in_service_that_does_not_serve_is_released_first() -> None:
+    # Instance c is in service for the group, so it is protected, and its target is not healthy:
+    # the supply lists it as starting. Instance d is still being launched.
+    names = ("instance-a", "instance-b", "instance-c", "instance-d")
+    supply = Supply(
+        desired=4,
+        in_service=names[:2],
+        starting=names[2:],
+        running=names,
+        not_serving=("instance-c",),
+    )
+    reports = (instance("instance-a"), instance("instance-b", running=3))
+    # It counts against the session's number, and leaves before an instance that serves, even an idle one.
+    three = decide_one(supply, session=session(3), instance_heartbeats=reports)
+    assert (three.desired, three.lift_protection, three.reason) == (3, (), Reason.RELEASE)
+    two = decide_one(supply, session=session(2), instance_heartbeats=reports)
+    assert (two.desired, two.lift_protection, two.reason) == (2, ("instance-c",), Reason.RELEASE)
+    one = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert one.lift_protection == ("instance-a", "instance-c")
+    # The session is over: every instance the group protects, and never the one it still launches.
+    ended = decide_one(supply, session=session(2, ends_at=NOW), instance_heartbeats=reports)
+    assert (ended.desired, ended.lift_protection, ended.reason) == (0, names[:3], Reason.RELEASE)
+
+
+def test_a_raise_keeps_its_reason_in_a_run_that_names_instances() -> None:
+    # An earlier run lowered the capacity to one and the two instances it named have not left yet;
+    # the session now asks for two.
+    names = ("instance-a", "instance-b", "instance-c")
+    supply = Supply(desired=1, in_service=names, running=names)
+    reports = (instance("instance-a", running=2), instance("instance-b", running=1), instance("instance-c"))
+    decision = decide_one(supply, session=session(2), instance_heartbeats=reports)
+    assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.PROVISION)
+
+
 def test_no_rule_reads_demand() -> None:
     long_ago = NOW - 6 * HOUR
     gateways: tuple[tuple[GatewayHeartbeat, ...], ...] = (

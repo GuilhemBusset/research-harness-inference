@@ -28,6 +28,12 @@ class Supply:
     `desired` is the group's desired capacity. The three states each list their instances: in
     service, starting (launched and not yet in service) and draining (leaving service). `running`
     lists every running instance of the group in any state.
+
+    An instance is in service here when it serves: the group holds it in service and its target is
+    healthy. `not_serving` lists the instances the group holds in service that do not serve, since
+    their target is not healthy: each is also listed as starting or as draining. Scale-in
+    protection starts when the group puts an instance in service (`docs/design/evidence.md`, E32),
+    so these have one to lift, which an instance the group still launches has not.
     """
 
     desired: int
@@ -35,6 +41,7 @@ class Supply:
     starting: tuple[str, ...] = ()
     draining: tuple[str, ...] = ()
     running: tuple[str, ...] = ()
+    not_serving: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,13 +136,14 @@ class Reason(StrEnum):
     """Why a pool's decision is what it is. A decision names one."""
 
     # The pool's session asks for more instances than the group was asked for: the pool goes to
-    # the session's number, all at once.
+    # the session's number, all at once. A run that also names instances keeps this reason.
     PROVISION = "provision"
     # The pool's session asks for fewer instances than the pool holds, or for none: the capacity
     # goes down, and the instances in service beyond the session's number are named for release.
     RELEASE = "release"
     # Three launches abandoned in a row: the group's launches are suspended and the pool is not
-    # raised until the admin clears the mark.
+    # raised until the admin clears the mark. A run that does not raise the pool for it keeps this
+    # reason, even when it names instances.
     LAUNCH_SUSPENDED = "launch-suspended"
     # An instance has waited for 60 seconds while another runs below half of `target_concurrency`:
     # the pool's rebalance number goes up by one, in a run where no other rule acts.

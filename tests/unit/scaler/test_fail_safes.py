@@ -56,6 +56,12 @@ def test_two_abandoned_launches_change_nothing_and_the_third_suspends() -> None:
     assert (more.requested, more.desired, more.suspend_launches, more.reason) == (3, 1, True, Reason.LAUNCH_SUSPENDED)
     later = run(ONE, NOW + MINUTE, session=session(3), memory=third.memory)
     assert (later.desired, later.suspend_launches, later.reason) == (1, True, Reason.LAUNCH_SUSPENDED)
+    # Nor is it when more instances are in service than the session asks for: the one beyond its
+    # number is named (none reports its load, so the first by name), and the reason is still that
+    # the pool is not raised.
+    names = ("instance-a", "instance-b", "instance-c")
+    above = run(Supply(desired=1, in_service=names, running=names), NOW + MINUTE, session=session(2), memory=third.memory)
+    assert (above.desired, above.lift_protection, above.reason) == (1, ("instance-a",), Reason.LAUNCH_SUSPENDED)
 
 
 def test_a_suspended_pool_stays_suspended() -> None:
