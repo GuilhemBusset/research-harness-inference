@@ -10,7 +10,9 @@ rewrites a few fields and sends its own serialization of the result. The order i
    no number JSON cannot write (`NaN`, an infinity).
 3. **Find the pool** the `model` names. A configured pool's name selects that pool; a name that
    starts with `claude-` selects the default pool when the filter was given one; any other name,
-   and a `claude-` name with no default pool, is refused.
+   and a `claude-` name with no default pool, is refused. The caller is told the pool here
+   (`Admit`), before any other field is judged: a request for a pool that is not served ends
+   with the caller's cause, whatever else its body holds (step 5 of the request path).
 4. **Replace what the format cannot serve**: the replacement the caller gives for its wire
    format gets the parsed body and returns the body the next steps read. Messages gives one
    (`rhi_gateway.formats.messages.blocks_as_text`): a block no engine behind this gateway can
@@ -149,6 +151,10 @@ type Spec = Fields | Items | Shapes | Limit | _Keep
 # A pool's request profile on one route: it gets the filtered body and returns the body to serialize.
 # A format's replacement (step 4) has the same shape: it gets the parsed body and returns the body to filter.
 type Rewrite = Callable[[dict[str, Any]], dict[str, Any]]
+
+# What the caller is told once the body has named its pool (step 3): it returns for a pool it lets
+# in, and raises the refusal that ends the request otherwise.
+type Admit = Callable[[Pool], None]
 
 
 class BodySource(Protocol):
@@ -374,15 +380,19 @@ class BodyFilter:
     maximum: int = MAX_BODY_BYTES
     replacement: Rewrite | None = None
 
-    async def read(self, source: BodySource, *, student: str, request_id: str) -> Forwarded:
+    async def read(
+        self, source: BodySource, *, student: str, request_id: str, admit: Admit | None = None
+    ) -> Forwarded:
         """Read a request's body, never past the maximum, and give what to forward for it."""
-        return self.apply(await read_body(source, self.maximum), student=student, request_id=request_id)
+        raw = await read_body(source, self.maximum)
+        return self.apply(raw, student=student, request_id=request_id, admit=admit)
 
-    def apply(self, raw: bytes, *, student: str, request_id: str) -> Forwarded:
+    def apply(self, raw: bytes, *, student: str, request_id: str, admit: Admit | None = None) -> Forwarded:
         """What to forward for a body: the pool it names and the gateway's serialization.
 
         `student` identifies who sent the request, and `request_id` is the gateway's own ID for
-        it: neither comes from the body.
+        it: neither comes from the body. `admit`, when given, is called with the pool as soon as
+        the body has named it, before any other field is judged: what it raises ends the filter.
         """
         if not student or not request_id:
             raise ValueError("the filter needs the student and the gateway's request ID")
@@ -390,6 +400,8 @@ class BodyFilter:
             raise _refused("the body is above the maximum size")
         body = parse(raw)
         pool = pool_named(body.get(MODEL_FIELD), self.pools, self.default_pool)
+        if admit is not None:
+            admit(pool)
         try:
             if self.replacement is not None:
                 body = self.replacement(body)

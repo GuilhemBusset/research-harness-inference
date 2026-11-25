@@ -31,7 +31,7 @@ from starlette.types import Message
 from rhi_cli import login, main, revoke, store, wait
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import Mode, PoolState, ScalerNote
+from rhi_common.records import Mode, PoolState, ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway.app import build_app
 from rhi_gateway.auth import Authenticator
@@ -121,6 +121,10 @@ class Gateway:
 
     def get_item(self, *, Key: dict[str, str]) -> dict[str, Any]:
         name = Key["pool"]
+        if Key["record"] == "session":
+            # Every pool is in a session, for 6 hours from the moment the clock starts at.
+            booked = Session(name, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+            return {"Item": booked.to_item()}
         if Key["record"] == "mode":
             disabled = self.clock.now >= self.disabled_at.get(name, float("inf"))
             record = PoolState(pool=name, mode=Mode.DISABLED, set_by="admin", set_at=NOW)

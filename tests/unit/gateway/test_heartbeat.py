@@ -20,7 +20,7 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat
+from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import proxy, routes
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
@@ -105,7 +105,10 @@ class Table:
 
 
 class AWS:
-    """`describe_target_health` (healthy once `healthy`), the pool-state table (no records) and the scaler's `invoke`."""
+    """`describe_target_health` (healthy once `healthy`), the pool-state table and the scaler's `invoke`.
+
+    The table holds one record, the pool's session, active for 6 hours from the moment the test's clock starts at.
+    """
 
     def __init__(self) -> None:
         self.healthy = False
@@ -114,7 +117,10 @@ class AWS:
         return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy" if self.healthy else "initial"}}]}
 
     def get_item(self, Key: dict[str, str]) -> dict[str, Any]:
-        return {}
+        if Key["record"] != SESSION_RECORD:
+            return {}
+        session = Session(Key["pool"], instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+        return {"Item": session.to_item()}
 
     def invoke(self, **_: Any) -> None:
         return None

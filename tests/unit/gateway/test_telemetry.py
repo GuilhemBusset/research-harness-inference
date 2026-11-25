@@ -27,6 +27,7 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import app as gateway_app
 from rhi_gateway import proxy, routes
@@ -107,6 +108,11 @@ BODIES: dict[routes.Route, dict[str, Any]] = {
 }
 
 
+def booked(pool: str) -> Session:
+    """A session on the pool, active for 6 hours from the moment the gateway's clocks stand at."""
+    return Session(pool, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+
+
 class Aws:
     """The AWS clients the readiness and the waker are given; none is reached by these tests' assertions."""
 
@@ -144,7 +150,10 @@ def gateway(
     authenticator = Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW))
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     # The coursework pool is ready; the evening pool, scheduled only, is not.
-    ready = lambda: {"coursework": PoolView(ready=True)}
+    ready = lambda: {
+        "coursework": PoolView(ready=True, session=booked("coursework")),
+        "evening": PoolView(session=booked("evening")),
+    }
     if engine is None:
         engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))
     forwarding = Forwarding(
@@ -157,7 +166,7 @@ def gateway(
             routes.RESPONSES: BodyFilter(responses.RESPONSES, POOLS),
         },
         proxy=proxy.Proxy(proxy.upstream_client(engine), "http://pools.example.com:8080", {"coursework": "secret"}),
-        holding=Holding(views=ready, wake=lambda pool: None) if holding is None else holding,
+        holding=Holding(views=ready, wake=lambda pool: None, clock=lambda: float(NOW)) if holding is None else holding,
         clock=clock,
     )
     readiness = Readiness({"coursework": "tg-coursework"}, elbv2=Aws(), table=Aws(), clock=lambda: float(NOW))
@@ -344,7 +353,7 @@ def streaming(waits: Waits) -> tuple[Starlette, str]:
         await asyncio.sleep(0)
 
     holding = Holding(
-        views=lambda: {"coursework": PoolView(ready=waits.ready)},
+        views=lambda: {"coursework": PoolView(ready=waits.ready, session=booked("coursework"))},
         wake=lambda pool: None,
         clock=lambda: waits.hold_clock,
         sleep=sleep,

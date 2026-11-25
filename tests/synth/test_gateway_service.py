@@ -182,7 +182,7 @@ def gateway(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) ->
     return synthesize(app_module, tmp_path_factory.mktemp("example"))
 
 
-# Six numbers that are neither the configuration's defaults nor the settings reader's.
+# Seven numbers that are neither the configuration's defaults nor the settings reader's.
 OTHER_NUMBERS = {
     "request_body_limit_bytes": 1_048_576,
     "longest_request_seconds": 900,
@@ -190,6 +190,7 @@ OTHER_NUMBERS = {
     "retry_after_warming_seconds": 31,
     "retry_after_capacity_unavailable_seconds": 61,
     "retry_after_concurrency_limit_seconds": 6,
+    "session_max_hours": 13,
 }
 # Two floors of the objectives between the gateway's own boundaries, and one left at its default.
 OTHER_FLOORS = {
@@ -333,6 +334,8 @@ def test_the_numeric_settings_are_the_configuration_s(gateway: Gateway, one_task
         "retry_after_warming_seconds": read.retry_after_warming,
         "retry_after_capacity_unavailable_seconds": read.retry_after_capacity_unavailable,
         "retry_after_concurrency_limit_seconds": read.retry_after_concurrency_limit,
+        # The longest session, under which the gateway reads every pool's session (section 5.6).
+        "session_max_hours": read.session_max_hours,
     } == OTHER_NUMBERS
     # The floors are the configuration's, and boundaries of the histograms they are read in.
     assert set(gateway_settings.FLOOR_DEFAULTS) <= set(gateway.environment(gateway.container))

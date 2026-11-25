@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -20,6 +21,7 @@ from starlette.applications import Starlette
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import COOKIE_NAME, Affinity
@@ -49,6 +51,13 @@ MOCK = {
 }
 POOLS = parse_pools({"coursework": MOCK, "upgrade": MOCK})
 ATTRIBUTES = "; Expires=Fri, 15 Jan 2027 09:20:00 GMT; Path=/"
+
+
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
 
 
 def sse(*events: tuple[str | None, dict[str, Any] | str]) -> bytes:
@@ -165,7 +174,7 @@ class Gateway:
                 {pool.name: f"{pool.name}-secret" for pool in POOLS},
             ),
             holding=Holding(
-                views=views or (lambda: {pool.name: PoolView(ready=True) for pool in POOLS}),
+                views=views or (lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
                 wake=lambda pool: None,
                 sleep=lambda seconds: asyncio.sleep(0),
             ),
@@ -312,14 +321,16 @@ def test_parallel_requests_of_a_student_follow_the_same_cookie() -> None:
 
 
 def test_a_held_stream_carries_the_cookie_and_stores_the_one_its_answer_set() -> None:
-    views = [PoolView(ready=True), PoolView(ready=False), PoolView(ready=False)]
+    ready, cold = in_session("coursework"), in_session("coursework", ready=False)
+    views = [ready]
     gateway = Gateway(lambda: {"coursework": views.pop(0) if len(views) > 1 else views[0]})
     balancer = gateway.balancer
 
     async def scenario(ask: Ask) -> None:
         await ask()
         # The pool is not ready when the second request comes: it is answered at once, held, then forwarded.
-        views[:] = [PoolView(ready=False), PoolView(ready=False), PoolView(ready=True)]
+        # The first two views are read for the pool's session, the others by the hold.
+        views[:] = [cold, cold, cold, cold, ready]
         held = await ask()
         assert held.status_code == 200
         assert balancer.carried[1] == ("coursework", cookie(balancer.issued[0]))

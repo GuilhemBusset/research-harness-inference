@@ -24,7 +24,7 @@ from starlette.types import Message, Receive
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import MODE_RECORD, Mode, PoolState
+from rhi_common.records import MODE_RECORD, SESSION_RECORD, Mode, PoolState, Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import Affinity
@@ -154,12 +154,18 @@ class TargetGroup:
 
 
 class Records:
-    """The pool-state table: the admin's mode record when one is given, else none (the configured mode); no note."""
+    """The pool-state table: the admin's mode record when one is given, else none (the configured mode); no note.
+
+    The pool's session is active for 6 hours from the moment the test's clock starts at.
+    """
 
     def __init__(self, mode: Mode | None = None) -> None:
         self.mode = mode
 
     def get_item(self, Key: dict[str, str]) -> dict[str, Any]:
+        if Key["record"] == SESSION_RECORD:
+            booked = Session(Key["pool"], 1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+            return {"Item": booked.to_item()}
         if self.mode is None or Key["record"] != MODE_RECORD:
             return {}
         return {"Item": PoolState("coursework", self.mode, set_by="admin", set_at=NOW).to_item()}

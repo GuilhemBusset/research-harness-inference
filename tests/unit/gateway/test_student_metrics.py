@@ -31,6 +31,7 @@ from starlette.types import Message
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import metrics, proxy, routes
 from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
@@ -69,6 +70,11 @@ REQUESTS, INPUT, OUTPUT, ERRORS = (
     f"{name}_total" for name in (metrics.REQUESTS, metrics.INPUT_TOKENS, metrics.OUTPUT_TOKENS, metrics.ERRORS)
 )
 CACHED, COUNTED = (f"{name}_total" for name in (metrics.CACHED_INPUT_TOKENS, metrics.COUNTED_TOKENS))
+
+
+def booked(pool: str) -> Session:
+    """A session on the pool, active for 6 hours from the moment the gateway's clocks stand at."""
+    return Session(pool, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
 
 
 def body(entry: routes.Route, pool: str = "coursework") -> dict[str, Any] | None:
@@ -150,7 +156,7 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
         return httpx.Response(200, json={"type": "message", "input_tokens": used_in, "usage": usage})
 
     authenticator = Authenticator(store, wall_clock=lambda: float(NOW))
-    ready = lambda: {pool.name: PoolView(ready=True) for pool in POOLS}
+    ready = lambda: {pool.name: PoolView(ready=True, session=booked(pool.name)) for pool in POOLS}
     forwarding = Forwarding(
         authenticator=authenticator,
         ledger=ledger,
@@ -165,7 +171,7 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
             "http://pools.example.com:8080",
             {pool.name: "secret" for pool in POOLS},
         ),
-        holding=Holding(views=ready, wake=lambda pool: None),
+        holding=Holding(views=ready, wake=lambda pool: None, clock=lambda: float(NOW)),
     )
     readiness = Readiness(
         {pool.name: f"tg-{pool.name}" for pool in POOLS}, elbv2=made.aws, table=made.aws, clock=lambda: float(NOW)

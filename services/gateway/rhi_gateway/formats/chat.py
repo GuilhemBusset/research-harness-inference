@@ -65,6 +65,7 @@ from rhi_gateway.body import (
     KEEP,
     MAX_BODY_BYTES,
     MODEL_FIELD,
+    Admit,
     BodyFilter,
     BodySource,
     Fields,
@@ -229,11 +230,14 @@ class ChatBodyFilter:
     profiles: Mapping[str, Rewrite] = field(default_factory=dict)
     maximum: int = MAX_BODY_BYTES
 
-    async def read(self, source: BodySource, *, student: str, request_id: str) -> ChatForwarded:
+    async def read(
+        self, source: BodySource, *, student: str, request_id: str, admit: Admit | None = None
+    ) -> ChatForwarded:
         """Read a request's body, never past the maximum, and give what to forward for it."""
-        return self.apply(await read_body(source, self.maximum), student=student, request_id=request_id)
+        raw = await read_body(source, self.maximum)
+        return self.apply(raw, student=student, request_id=request_id, admit=admit)
 
-    def apply(self, raw: bytes, *, student: str, request_id: str) -> ChatForwarded:
+    def apply(self, raw: bytes, *, student: str, request_id: str, admit: Admit | None = None) -> ChatForwarded:
         """What to forward for a body, and whether the client asked for a stream's usage."""
         asked: list[bool] = []
 
@@ -248,5 +252,5 @@ class ChatBodyFilter:
         shared = BodyFilter(
             CHAT_COMPLETIONS, self.pools, self.default_pool, dict.fromkeys(names, rewrite), self.maximum
         )
-        forwarded = shared.apply(raw, student=student, request_id=request_id)
+        forwarded = shared.apply(raw, student=student, request_id=request_id, admit=admit)
         return ChatForwarded(forwarded.pool, forwarded.body, client_asked_for_usage=asked[0])

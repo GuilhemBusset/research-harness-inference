@@ -5,18 +5,19 @@ establishes that by checking each engine directly, and the gateway reads it thro
 The gateway never probes through the load balancer, which forwards the four inference routes and
 nothing else (section 5.3).
 
-On the same cycle it reads the pool's two records in the pool-state table: `mode`, the admin's
-(`rhi_common.records.PoolState`, section 11.3), and `note`, the scaler's (`ScalerNote`: whether
+On the same cycle it reads the pool's three records in the pool-state table: `mode`, the admin's
+(`rhi_common.records.PoolState`, section 11.3), `note`, the scaler's (`ScalerNote`: whether
 it asked for capacity, when a launch last found none, and the pool's rebalance number, which
-`PoolView.rebalance_number` gives: section 5.5). Once a cycle, with them, it reads the session
-switch (`rhi_common.records.SessionSwitch`, under `rhi_common.tables.SESSION_SWITCH_KEY`, section
-5.6), which `Readiness.session_is_on` gives: no item reads as off, a failed read, or an item that is
-not the switch's record, keeps the value last read, and the switch reads off until a first read
-succeeds. While it is off the gateway serves no student but the owner's own entries
-(`rhi_gateway.app`, `rhi_gateway.local`).
+`PoolView.rebalance_number` gives: section 5.5), and `session`, the pool's booking
+(`rhi_common.records.Session`, section 5.6). The session is read as the two others are: no item
+reads as no session, a failed read, or an item that is not a session, keeps the session last read,
+and a pool has no session until a first read succeeds. Whether the session kept is active is the
+shared rule (`rhi_common.sessions.is_active`), which `PoolView.in_session` applies at the time
+and under the longest session it is given: the gateway serves a pool while its session is active,
+and at no other time (`rhi_gateway.app`, `rhi_gateway.local`).
 
 `Readiness.run` repeats the cycle every 5 seconds for every pool, whether or not anyone asks, and
-keeps the last values. Callers read only the kept values (`Readiness.pool`, `Readiness.session_is_on`): no request causes a
+keeps the last values. Callers read only the kept values (`Readiness.pool`, `Readiness.views`): no request causes a
 read of the AWS API or of the table. A failed health read keeps the pool not ready; a failed read
 of a record keeps the value the previous cycle read. Nothing here sends a request through the
 load balancer: the only calls are `describe_target_health` and the table's `get_item`.
@@ -30,14 +31,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from rhi_common.records import MODE_RECORD, NOTE_RECORD, PoolState, ScalerNote, SessionSwitch, session_is_on
-from rhi_common.tables import POOL_STATE, SESSION_SWITCH_KEY
+from rhi_common import sessions
+from rhi_common.records import MODE_RECORD, NOTE_RECORD, SESSION_RECORD, PoolState, ScalerNote, Session
+from rhi_common.tables import POOL_STATE
 
 # How often every pool is read (section 5.3).
 INTERVAL_SECONDS = 5.0
@@ -50,14 +53,23 @@ class PoolView:
     """What the last cycle left for one pool.
 
     `ready` is whether the target group had a healthy target, and `observed_at` when that answer
-    came back (the moment the gateway learnt it), `None` before the first read. `mode` and `note`
-    are the last records read, `None` when the table holds none (or nothing was read yet).
+    came back (the moment the gateway learnt it), `None` before the first read. `mode`, `note` and
+    `session` are the last records read, `None` when the table holds none (or nothing was read yet).
     """
 
     ready: bool = False
     mode: PoolState | None = None
     note: ScalerNote | None = None
     observed_at: float | None = None
+    session: Session | None = None
+
+    def in_session(self, now: float, *, session_max_hours: int) -> bool:
+        """Whether the pool's session, as last read, is active at the time `now` (seconds since the epoch).
+
+        The rule is `rhi_common.sessions.is_active`, with the longest session of the configuration:
+        a pool with no session kept is in none.
+        """
+        return sessions.is_active(self.session, math.floor(now), session_max_hours=session_max_hours)
 
     @property
     def rebalance_number(self) -> int | None:
@@ -92,11 +104,7 @@ class Readiness:
         self._elbv2 = elbv2
         self._table = table
         self._clock = clock
-        # The views and the switch, kept together: one cycle replaces both in one assignment.
-        self._kept: tuple[Mapping[str, PoolView], bool] = (
-            MappingProxyType({pool: PoolView() for pool in self._target_groups}),
-            False,
-        )
+        self._kept: Mapping[str, PoolView] = MappingProxyType({pool: PoolView() for pool in self._target_groups})
         self._subscribers: list[Subscriber] = []
 
     @property
@@ -105,15 +113,11 @@ class Readiness:
 
     def pool(self, name: str) -> PoolView:
         """The kept view of one pool. Reads nothing; a pool the gateway was not given raises `KeyError`."""
-        return self._kept[0][name]
+        return self._kept[name]
 
     def views(self) -> Mapping[str, PoolView]:
         """The kept view of every pool, as one consistent snapshot."""
-        return self._kept[0]
-
-    def session_is_on(self) -> bool:
-        """Whether a session is on, as the switch last read says; off until a read succeeds. Reads nothing."""
-        return self._kept[1]
+        return self._kept
 
     def subscribe(self, subscriber: Subscriber) -> None:
         """Call `subscriber` after every cycle, with the new views."""
@@ -132,8 +136,8 @@ class Readiness:
             next_at = max(next_at + INTERVAL_SECONDS, self._clock())
             await sleep(next_at - self._clock())
 
-    def _read_all(self) -> tuple[dict[str, PoolView], bool]:
-        previous, session = self._kept
+    def _read_all(self) -> dict[str, PoolView]:
+        previous = self._kept
         views = {}
         for pool, target_group in self._target_groups.items():
             before = previous[pool]
@@ -144,16 +148,16 @@ class Readiness:
                 mode=self._read_record(pool, MODE_RECORD, PoolState.from_item, before.mode),
                 note=self._read_record(pool, NOTE_RECORD, ScalerNote.from_item, before.note),
                 observed_at=observed_at,
+                session=self._read_record(pool, SESSION_RECORD, Session.from_item, before.session),
             )
-        return views, self._read_switch(session)
+        return views
 
-    def _apply(self, cycle: tuple[dict[str, PoolView], bool]) -> None:
-        views, session = cycle
+    def _apply(self, views: dict[str, PoolView]) -> None:
         # One assignment: a caller sees either the previous cycle or this one, never a mix.
-        self._kept = (MappingProxyType(views), session)
+        self._kept = MappingProxyType(views)
         for subscriber in self._subscribers:
             try:
-                subscriber(self._kept[0])
+                subscriber(self._kept)
             except Exception:  # noqa: BLE001 - a failing subscriber must not stop the reads
                 _LOG.exception("a readiness subscriber failed")
 
@@ -179,13 +183,4 @@ class Readiness:
             return None if item is None else parse(item)
         except Exception as error:  # noqa: BLE001 - any failed read keeps the previous value
             _LOG.warning("read of record %s failed for pool %s (%s)", record, pool, type(error).__name__)
-            return kept
-
-    def _read_switch(self, kept: bool) -> bool:
-        try:
-            item = self._table.get_item(Key=SESSION_SWITCH_KEY).get("Item")
-            # No item is an answer: no session is on. An item that is not the switch's record is not.
-            return session_is_on(None if item is None else SessionSwitch.from_item(item))
-        except Exception as error:  # noqa: BLE001 - any failed read keeps the previous value
-            _LOG.warning("read of the session switch failed (%s)", type(error).__name__)
             return kept
