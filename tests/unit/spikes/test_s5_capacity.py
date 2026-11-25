@@ -5,7 +5,6 @@ a commit's runs reach the record. No number here is a measurement; the keys are 
 from __future__ import annotations
 
 import json
-import shutil
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +18,7 @@ from rhi_common.keys import generate_key
 from rhi_gateway import routes
 from rhi_gateway.profile.reasoning_effort import rewrite
 from rhi_reporter.measure import Verdict, encode
+from test_s5 import blank_record  # the record with none of its runs
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -119,9 +119,7 @@ def rows_of(path: Path) -> list[dict[str, Any]]:
 
 @pytest.fixture
 def record(tmp_path: Path) -> Path:
-    path = tmp_path / "s5.md"
-    shutil.copy(s5.RECORD, path)
-    return path
+    return blank_record(tmp_path / "s5.md")
 
 
 def test_the_record_reads_paginated_statuses_and_each_run_from_its_newest_posting(record: Path) -> None:
