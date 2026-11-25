@@ -7,9 +7,10 @@ A call whose repetition is harmless (GET, PUT, PATCH, DELETE, and the POSTs that
 set) is retried on any of them. Any other POST creates something, so it is retried only when
 GitHub certainly did not act on it: the host could not be reached, or a rate limit refused the
 request. After a 5xx, a broken connection or an answer `gh` could not read it may have taken
-effect, so it is not repeated; the engine looks up what it creates (a PR by its branch, an issue or a comment by its marker) before
-creating it again. A transient failure that outlasts the retries raises `GitHubUnavailable`, so
-the engine can tell an outage from a real error; any other failure raises `GitHubError` at once.
+effect, so it is not repeated; the engine looks up what it creates (a PR by its branch, an issue
+or a comment by its marker) before creating it again. A transient failure that outlasts the
+retries raises `GitHubUnavailable`, so the engine can tell an outage from a real error; any other
+failure raises `GitHubError` at once.
 
 `GhCli` runs `gh` with the login it has, unless it is given `env`: a function that answers the
 environment of one `gh` process, asked before each one. `cli.py` gives it `app_token.gh_env`,
