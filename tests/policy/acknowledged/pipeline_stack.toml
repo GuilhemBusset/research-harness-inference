@@ -12,9 +12,7 @@
 #   the smoke tests read the gateway's and the pool's metrics, and the release the pool's
 #   instances report.
 # - ssm:GetParameter on the release parameter of each pool the stage deploys, each by its name,
-#   /rhi/pools/<pool>/release: the release the pipeline deployed, which the served one must equal,
-#   and, before the smoke tests, the earlier version of it that the step's decision compares it
-#   with, read by its number with the same action.
+#   /rhi/pools/<pool>/release: the release the pipeline deployed, which the served one must equal.
 # - dynamodb:Query on the heartbeats table of the stage the step verifies, and on no other table:
 #   when its tests failed, the step reads the heartbeat rows of the pools it tested, by pool, for
 #   the last lifecycle stage each instance reached. The table is named by the pattern
@@ -24,9 +22,12 @@
 #   the objects verification/<execution ID>/not-run, when no test could run,
 #   verification/<execution ID>/failed-smoke-tests, the IDs of the smoke tests that failed, and
 #   verification/<execution ID>/last-stages, the last lifecycle stage each instance reached.
+# - autoscaling:DescribeAutoScalingGroups and autoscaling:DescribeInstanceRefreshes on every
+#   resource, the only resource AWS grants them on: before the smoke tests, the step's decision
+#   finds each GPU pool's group by its tags rhi-pool and rhi-engine and reads its instance
+#   refreshes, to learn whether this execution started one and to wait for it to end.
 # - codepipeline:ListPipelineExecutions on this pipeline, by its ARN, and on no other: the decision
-#   reads when this execution started, which the version it compares a release with was written
-#   before.
+#   reads when this execution started, which a refresh must have begun after.
 # - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
 #   CDK Pipelines' grant to a project that takes an input, here the source the step runs.
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
@@ -112,3 +113,5 @@
 "codebuild:BatchGetBuilds" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StartBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StopBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
+"autoscaling:DescribeAutoScalingGroups" = "The verification step's decision finds each GPU pool's group by its tags rhi-pool and rhi-engine, which it reads with the group; AWS grants describing groups on every resource only, and the action reads, never changes, a group."
+"autoscaling:DescribeInstanceRefreshes" = "The verification step's decision reads the instance refreshes of each GPU pool's group, to learn whether this execution started one and to wait for it to end; AWS grants describing refreshes on every resource only, and the action reads, never changes, a refresh."
