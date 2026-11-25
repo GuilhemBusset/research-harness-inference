@@ -1,4 +1,4 @@
-"""The admin's commands on the pools' operating state (`rhi_admin.pools`), through the CLI.
+"""The admin's commands on the pools' suspended launches and the scaler (`rhi_admin.pools`), through the CLI.
 
 The pool-state table, STS and SSM are moto's. CloudFormation and Lambda are stubbed: the stub
 answers for the deployed stack's resources by logical ID, and for the scaler's function, its
@@ -7,10 +7,11 @@ settings and its runs.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import io
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,9 +23,8 @@ from moto import mock_aws
 
 from rhi_admin import main
 from rhi_admin.pools import identity_name
-from rhi_common.records import CONFIGURED_MODE, Mode
 from rhi_scaler.aws_io import memory_from_item, memory_update
-from rhi_scaler.settings import SETTINGS_VARIABLE, parse_settings
+from rhi_scaler.settings import SETTINGS_VARIABLE
 
 NOW = 1_800_000_000
 SCALER = "deployed-scaler"
@@ -147,45 +147,46 @@ def deployed(monkeypatch: pytest.MonkeyPatch) -> Iterator[Deployed]:
             yield Deployed(admin, table, cloudformation_stub, functions_stub)
 
 
-def test_disabling_and_re_enabling_write_the_mode_with_who_and_when(deployed: Deployed) -> None:
-    assert deployed.run("disable", "mock")[0] == 0
-    assert deployed.item("mock", "mode") == {"pool": "mock", "record": "mode", "mode": "disabled", "set_by": WHO, "set_at": NOW}
-
-    status, out, _ = deployed.run("enable", "mock", now=NOW + 60)
-    assert status == 0 and "enabled" in out
-    assert deployed.item("mock", "mode") == {"pool": "mock", "record": "mode", "mode": "enabled", "set_by": WHO, "set_at": NOW + 60}
-
-    # Re-enabled to its configured mode: a scheduled-only pool is not woken on demand.
-    deployed.run("disable", "coursework")
-    deployed.run("enable", "coursework", now=NOW + 120)
-    assert deployed.item("coursework", "mode") == {
-        "pool": "coursework", "record": "mode", "mode": "scheduled-only", "set_by": WHO, "set_at": NOW + 120,
-    }
+@pytest.mark.parametrize("command", ["disable", "enable"])
+def test_a_pool_has_no_mode_to_set(command: str) -> None:
+    # A pool that should not run is a pool nobody books: the command line knows no mode.
+    with pytest.raises(SystemExit) as refused, contextlib.redirect_stderr(io.StringIO()):
+        main.parser().parse_args(["pool", command, "mock"])
+    assert refused.value.code == 2
 
 
-def test_a_pool_priced_above_the_default_limit_can_be_disabled(deployed: Deployed) -> None:
-    # The deployment checked its prices against the configuration's limit, which may be above the default.
+def test_status_names_no_mode(deployed: Deployed) -> None:
+    # The scaler suspended the launches of one pool; the other has no memory record yet.
+    deployed.table.put_item(Item={"pool": "coursework", "record": "memory", "launch_suspended": True, "waiting_since": {}})
+    # What an earlier `pool disable` left in the table is read by nothing.
+    left = {"pool": "mock", "record": "mode", "mode": "disabled", "set_by": WHO, "set_at": NOW - 60}
+    deployed.table.put_item(Item=left)
+
+    status, out, err = deployed.run("status")
+
+    assert (status, err) == (0, "")
+    header, *rows = (line.split("\t") for line in out.splitlines())
+    assert header == ["pool", "launch_suspended"]
+    assert rows == [["coursework", "true"], ["mock", "false"]]
+    assert not {"mode", "disabled", "enabled", "scheduled-only"} & set(out.split())
+    assert deployed.item("mock", "mode") == left
+
+    # Once the admin has cleared the mark, the pool reads as the other does.
+    assert deployed.run("clear-suspension", "coursework")[0] == 0
+    assert [line.split("\t") for line in deployed.run("status")[1].splitlines()[1:]] == [["coursework", "false"], ["mock", "false"]]
+
+
+def test_the_pools_are_the_running_scalers_whatever_their_prices(deployed: Deployed) -> None:
+    # The configuration in SSM may name other pools before the next deployment: the running ones count.
+    ssm = boto3.client("ssm")
+    ssm.put_parameter(Name="/rhi/config/pools/other", Value=json.dumps(entry("on-demand")), Type="String")
+    # The deployment checked the prices against the configuration's limit, which may be above the default.
     settings = json.loads(SETTINGS)
     settings["pools"]["mock"]["entry"]["prices"] = {"g6e.xlarge": 6.0}
-    status, _, err = deployed.run("disable", "mock", settings=json.dumps(settings))
+    status, out, err = deployed.run("status", settings=json.dumps(settings))
     assert (status, err) == (0, "")
-    assert deployed.item("mock", "mode") == {"pool": "mock", "record": "mode", "mode": "disabled", "set_by": WHO, "set_at": NOW}
-
-
-def test_status_shows_the_deployed_configured_mode_until_the_admin_sets_one(deployed: Deployed) -> None:
-    # The configuration in SSM may say otherwise before the next deployment: the running pools are what counts.
-    ssm = boto3.client("ssm")
-    ssm.put_parameter(Name="/rhi/config/pools/coursework", Value=json.dumps(entry("on-demand")), Type="String")
-    status, out, _ = deployed.run("status")
-    assert status == 0
-    rows = [line.split("\t") for line in out.splitlines()[1:]]
-    assert rows == [["coursework", "scheduled-only", "configured", "-", "false"], ["mock", "enabled", "configured", "-", "false"]]
+    assert [line.split("\t")[0] for line in out.splitlines()[1:]] == ["coursework", "mock"]
     assert deployed.items() == []
-
-    deployed.run("disable", "mock")
-    deployed.table.put_item(Item={"pool": "coursework", "record": "memory", "launch_suspended": True, "waiting_since": {}})
-    rows = [line.split("\t") for line in deployed.run("status")[1].splitlines()[1:]]
-    assert rows == [["coursework", "scheduled-only", "configured", "-", "true"], ["mock", "disabled", WHO, str(NOW), "false"]]
 
 
 def test_clearing_the_suspension_changes_the_mark_alone_and_survives_the_scaler(deployed: Deployed) -> None:
@@ -229,9 +230,8 @@ def test_asking_for_a_run_invokes_the_function_found_by_its_logical_id(deployed:
 
 
 def test_a_pool_that_is_not_deployed_is_refused(deployed: Deployed) -> None:
-    for command in ("disable", "enable", "clear-suspension"):
-        status, _, err = deployed.run(command, "other")
-        assert status == 1 and "no deployed pool" in err
+    status, _, err = deployed.run("clear-suspension", "other")
+    assert status == 1 and "no deployed pool" in err
     assert deployed.items() == []
 
 
@@ -239,31 +239,17 @@ def test_a_parked_stage_has_no_pool(deployed: Deployed) -> None:
     status, out, err = deployed.run("status", parked=True)
     assert (status, out.splitlines()[1:], err) == (0, [], "")
     # What needs a pool or the scaler is refused, and says that none is deployed.
-    for argv in (["run"], ["disable", "mock"], ["enable", "mock"], ["clear-suspension", "mock"]):
+    for argv in (["run"], ["clear-suspension", "mock"]):
         status, _, err = deployed.run(*argv, parked=True)
         assert status == 1 and "no pool is deployed" in err
     assert deployed.items() == []
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [["parked", "mock"], ["park", "mock"], ["disable", "mock", "--mode", "parked"], ["enable", "mock", "parked"]],
-)
-def test_no_command_parks_a_pool(deployed: Deployed, argv: Sequence[str]) -> None:
-    assert "parked" not in {mode.value for mode in Mode}
+@pytest.mark.parametrize("argv", [["parked", "mock"], ["park", "mock"], ["clear-suspension", "mock", "parked"]])
+def test_no_command_parks_a_pool(deployed: Deployed, argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         main.run(["pool", *argv], deployed.admin, now=NOW, out=io.StringIO(), err=io.StringIO())
-    # What every command writes is one of the admin's modes, never `parked`.
-    for argv_ok in (["disable", "mock"], ["enable", "mock"], ["disable", "coursework"], ["enable", "coursework"]):
-        deployed.run(*argv_ok)
-    assert {item["mode"] for item in deployed.items()} <= {Mode.ENABLED.value, Mode.SCHEDULED_ONLY.value, Mode.DISABLED.value}
-
-
-def test_the_settings_read_are_the_scalers_own() -> None:
-    # The scaler's settings give a pool no mode: the configured one follows the pool's `wake`.
-    pools = [pool.config for pool in parse_settings(SETTINGS, "us-east-1").pools]
-    modes = {pool.name: CONFIGURED_MODE[pool.wake] for pool in pools}
-    assert modes == {"coursework": Mode.SCHEDULED_ONLY, "mock": Mode.ENABLED}
+    assert deployed.items() == []
 
 
 def test_who_is_the_identity_without_its_account() -> None:

@@ -7,9 +7,9 @@ pipeline, which then cost a few dollars a month. Unparked, the same deployment b
 back. While the endpoint is parked nothing answers students, and they use their own subscriptions.
 
 Parking is not the session switch, and not a pool's mode. The session switch (runbook
-[a session switched on and off](session-on-and-off.md)) is a record that says whether students are
+[a session booked, changed and stopped](sessions.md)) is a record that says whether students are
 served; it removes nothing and deploys nothing. A pool's mode (runbook
-[a disabled pool](disabled-pool.md)) stops one pool. Both are records in the pool-state table, and
+[a pool whose launches are suspended](suspended-launches.md)) stops one pool. Both are records in the pool-state table, and
 parking keeps them as they are.
 
 **What parking removes.** The public load balancer with its certificate, its HTTPS listener, its
@@ -96,7 +96,7 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      canary's key, and the old one expired with the old course.
 
    - **The GPU quota covers each pool's `max_instances` plus one** (runbook
-     [a session switched on and off](session-on-and-off.md), Check, step 1). Unparking launches
+     [a session booked, changed and stopped](sessions.md), Check, step 1). Unparking launches
      each pool's warm instances at once.
    - **A machine image change waits for the unpark.** The promotion job refuses a parked pool;
      promote the image after the unpark (runbook

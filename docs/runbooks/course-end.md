@@ -62,7 +62,7 @@ that `rhi_admin roster list` prints.
    If it reads `on`, switch it off:
 
    ```sh
-   rhi_admin session off
+   rhi_admin session stop --all
    ```
 
 2. **The roster:** the GitHub ID and the alias of each entry.
