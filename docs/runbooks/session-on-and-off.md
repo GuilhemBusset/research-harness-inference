@@ -273,6 +273,6 @@ Do these the day before the class, while no session is on.
    data, for the pool. Only then allow the full `idle_minutes` (20 for the example's coursework),
    plus a few minutes for the scaler to act, before checking that each pool has no instance in
    service: in Grafana, on the dashboard "Fleet and scaling", in each pool's row, the panel
-   "Instances: desired, in service, warm" reads zero for desired and for in service.
+   "Instances: desired, in service" reads zero for desired and for in service.
 
 Walked through on the deployed system: not yet.

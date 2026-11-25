@@ -35,7 +35,6 @@ GROUP_WRITES = {
 DESCRIBES = {
     "autoscaling:DescribeAutoScalingGroups",
     "autoscaling:DescribeScalingActivities",
-    "autoscaling:DescribeWarmPool",
     "elasticloadbalancing:DescribeTargetHealth",
 }
 ITEMS = {

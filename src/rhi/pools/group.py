@@ -1,5 +1,5 @@
-"""A pool's Auto Scaling group, its launch template and its warm pool (system design, sections 4.2,
-4.3, 5.1 and 5.4).
+"""A pool's Auto Scaling group and its launch template (system design, sections 4.2, 4.3, 4.5, 5.1
+and 5.4).
 
 A pool becomes one group, whose instances register with the pool's target group (`rhi.pools.routing`).
 The group holds to the fleet cap (`tests/policy/test_fleet_cap.py`): a minimum of zero, the pool's
@@ -12,23 +12,20 @@ The group spans the private subnets it is given and no other, those of its pool'
 (`rhi.pools.stack`): an instance type is not offered in every zone, and a group that spans a zone
 without its type fails the launches Auto Scaling places there. It launches the pool's instance types
 in the order the configuration lists them: the first, then each fallback when a zone has none of
-the one before. They are On-Demand only and carry no weights, which a warm pool requires of a group
-with several types (evidence E10).
+the one before. They are On-Demand only and carry no weights.
 
-A pool whose `warm_instances` is above zero has a warm pool of stopped instances, which cost only
-their disk and keep the pulled image: its prepared capacity, the instances running or stopped that
-the group keeps, is `warm_instances`, and its minimum is zero, since a minimum above zero would
-launch a fresh instance to refill the pool on every wake (section 4.2; evidence E10). Instances
-return to it on scale-in. A pool whose `warm_instances` is zero has no warm pool.
+The group keeps no stopped instance, whatever the pool's entry says of instances to keep: a stopped
+instance holds no hardware, so it can start only in its own zone and as its own type, and fails when
+that has no capacity (section 4.5; evidence E32). Every start is the launch of a new instance, in
+any zone of the pool and of any type it lists.
 
 The group has no scheduled action, and so no nightly stop: a session may cross any hour, and a stop
 at a fixed hour would take from it the instances still starting (section 5.1; evidence E32). What
 ends a forgotten session is its own end, which the scaler applies.
 
-The group publishes its group metrics to CloudWatch every minute, the warm pool's among them,
-whether or not the pool has a warm pool: the alarms that guard money from outside the scaler read
-them (`rhi.guardrails.alarms_fleet`; sections 5.1 and 7.3). Auto Scaling publishes them at no
-charge.
+The group publishes its group metrics to CloudWatch every minute: the alarms that guard money from
+outside the scaler read them (`rhi.guardrails.alarms_fleet`; sections 5.1 and 7.3). Auto Scaling
+publishes them at no charge.
 
 The group has a fixed name, `rhi-pool-<pool>` (`rhi_common.pool_config.group_name`), so that its
 metrics keep one name whatever happens to the group: the cost dashboard counts a pool's hours over
@@ -54,8 +51,7 @@ instance with its pool, `rhi-pool`, and with the name of its pool's release para
 setting.
 
 A GPU pool's instance gets a volume of 150 GB: the engine's image, Docker's data and the engine's
-compile cache live on it (section 4.3), and a stopped warm instance costs only its disk, about $12 a
-month at that size (section 5.2). The mock pool's volume keeps the size of its image.
+compile cache live on it (section 4.3). The mock pool's volume keeps the size of its image.
 
 The group and the launch template themselves carry the pool's name under the tag `rhi-pool` and its
 engine under the tag `rhi-engine`. The pipeline's jobs that work on a pool (the promotion of a
@@ -119,11 +115,11 @@ MOCK_ROOT_DEVICE = "/dev/xvda"
 # The process that replaces instances in service to even out the zones.
 REBALANCING = "AZRebalance"
 
-# The size, in GiB, of a GPU pool's volume (sections 4.3 and 5.2).
+# The size, in GiB, of a GPU pool's volume (section 4.3).
 GPU_VOLUME_GIB = 150
 
-# The group metrics the group publishes, every minute: the group's and its warm pool's, every one
-# Auto Scaling has.
+# The group metrics the group publishes, every minute: every one Auto Scaling has for a group that
+# keeps no stopped instance.
 METRICS_GRANULARITY = "1Minute"
 GROUP_METRICS = (
     "GroupMinSize",
@@ -139,13 +135,6 @@ GROUP_METRICS = (
     "GroupStandbyCapacity",
     "GroupTerminatingCapacity",
     "GroupTotalCapacity",
-    "WarmPoolDesiredCapacity",
-    "WarmPoolWarmedCapacity",
-    "WarmPoolPendingCapacity",
-    "WarmPoolTerminatingCapacity",
-    "WarmPoolTotalCapacity",
-    "GroupAndWarmPoolDesiredCapacity",
-    "GroupAndWarmPoolTotalCapacity",
 )
 
 
@@ -245,19 +234,6 @@ class PoolGroup(Construct):
                 for key, value in ((POOL_TAG, pool.name), (ENGINE_TAG, pool.engine))
             ],
         )
-
-        if pool.warm_instances > 0:
-            self.warm_pool: autoscaling.CfnWarmPool | None = autoscaling.CfnWarmPool(
-                self,
-                "WarmPool",
-                auto_scaling_group_name=self.group.ref,
-                pool_state="Stopped",
-                max_group_prepared_capacity=pool.warm_instances,
-                min_size=0,
-                instance_reuse_policy=autoscaling.CfnWarmPool.InstanceReusePolicyProperty(reuse_on_scale_in=True),
-            )
-        else:
-            self.warm_pool = None
 
         stack = cdk.Stack.of(self)
         # Every group, by the pattern of its ARN, narrowed to the pool's by the group's tag.

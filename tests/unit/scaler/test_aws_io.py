@@ -21,6 +21,7 @@ from rhi_scaler.aws_io import (
     Run,
     TableNames,
     apply,
+    launch_history,
     memory_from_item,
     memory_to_item,
     memory_update,
@@ -70,7 +71,6 @@ class Aws:
         self,
         *,
         instances: Sequence[dict[str, Any]] = (),
-        warm: Sequence[dict[str, Any]] = (),
         health: Mapping[str, str] | None = None,
         desired: int = 0,
         suspended: tuple[str, ...] = ("AZRebalance",),
@@ -92,8 +92,6 @@ class Aws:
             "SuspendedProcesses": [{"ProcessName": name, "SuspensionReason": "by the stack"} for name in suspended],
         }
         self.autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": [GROUP]})
-        warm_instances = [{**instance, "AvailabilityZone": "us-east-1a", "HealthStatus": "Healthy", "ProtectedFromScaleIn": False} for instance in warm]
-        self.autoscaling.add_response("describe_warm_pool", {"Instances": warm_instances}, {"AutoScalingGroupName": GROUP})
         self.autoscaling.add_response(
             "describe_scaling_activities",
             {"Activities": [{"ActivityId": f"activity-{n}", "AutoScalingGroupName": GROUP, "Cause": "the scaler", **a} for n, a in enumerate(activities)]},
@@ -156,10 +154,9 @@ def at(seconds: int) -> datetime:
     return datetime.fromtimestamp(seconds, UTC)
 
 
-def launch(status: str, ended: int, message: str = "", warm_pool: bool = False) -> dict[str, Any]:
-    into = " into warm pool" if warm_pool else ""
+def launch(status: str, ended: int, message: str = "") -> dict[str, Any]:
     activity = {
-        "Description": f"Launching a new EC2 instance{into}: instance-x",
+        "Description": "Launching a new EC2 instance: instance-x",
         "StatusCode": status,
         "StartTime": at(ended - 30),
         "EndTime": at(ended),
@@ -179,7 +176,9 @@ def read_one(aws: Aws) -> Run:
     return read(aws.clients, TABLES, [SETTINGS], NOW)
 
 
-def test_a_group_with_a_warm_pool_becomes_the_supply(aws: Aws) -> None:
+def test_a_group_becomes_the_supply_from_its_own_list_and_target_health(aws: Aws) -> None:
+    # The Stubber refuses a call that is not queued: the read asks Auto Scaling for the group and its
+    # activities, and for no warm pool.
     aws.queue_read(
         desired=4,
         instances=[
@@ -188,8 +187,8 @@ def test_a_group_with_a_warm_pool_becomes_the_supply(aws: Aws) -> None:
             instance("instance-c", "InService"),
             instance("instance-d", "Pending:Wait"),
             instance("instance-e", "Terminating:Wait"),
+            instance("instance-f", "Terminated"),
         ],
-        warm=[instance("warm-a", "Warmed:Stopped"), instance("warm-b", "Warmed:Pending:Wait"), instance("warm-c", "Warmed:Terminating")],
         health={"instance-a": "healthy", "instance-b": "draining", "instance-c": "initial"},
         records=[{"pool": "coursework", "record": "memory", "launch_suspended": False, "last_request_at": NOW - 60, "waiting_since": {"instance-a": NOW - 5}}],
         heartbeats=[
@@ -206,8 +205,7 @@ def test_a_group_with_a_warm_pool_becomes_the_supply(aws: Aws) -> None:
         in_service=("instance-a",),
         starting=("instance-c", "instance-d"),
         draining=("instance-b", "instance-e"),
-        warm=("warm-a", "warm-b"),
-        running=("instance-a", "instance-b", "instance-c", "instance-d", "instance-e", "warm-b"),
+        running=("instance-a", "instance-b", "instance-c", "instance-d", "instance-e"),
     )
     # No mode record: the configured mode. Only the fresh, readable heartbeats.
     assert pool.mode is Mode.SCHEDULED_ONLY
@@ -313,12 +311,11 @@ def abandoned(aws: Aws, activities: list[dict[str, Any]], memory: Memory = EMPTY
 
 
 def test_what_counts_as_abandoned(aws: Aws) -> None:
-    # Three abandons since the last launch that reached service, one of them on the way into the
-    # warm pool; the abandon before that launch, and a launch into the warm pool, end nothing.
+    # Three abandons since the last launch that reached service; the abandon before that launch
+    # ends nothing.
     history = [
         launch("Cancelled", NOW - 100, ABANDONED),
-        launch("Successful", NOW - 150, warm_pool=True),
-        launch("Cancelled", NOW - 200, ABANDONED, warm_pool=True),
+        launch("Cancelled", NOW - 200, ABANDONED),
         launch("Failed", NOW - 300, ABANDONED),
         launch("Successful", NOW - 400),
         launch("Cancelled", NOW - 500, ABANDONED),
@@ -330,6 +327,23 @@ def test_what_counts_as_abandoned(aws: Aws) -> None:
     cleared = Memory(abandons_counted_from=NOW - 50)
     assert abandoned(aws, [launch("Cancelled", NOW - 100 * n, ABANDONED) for n in (1, 2, 3)], cleared) == 0
     assert abandoned(aws, [launch("Cancelled", NOW - 10, ABANDONED), *history], cleared) == 1
+
+
+def test_retained_activities_of_a_warm_pool_end_the_row_only_on_reaching_service() -> None:
+    # The group has no warm pool, but the history Auto Scaling retains still holds its activities:
+    # a launch that prepared a stopped instance reached no service, a move out of the pool did.
+    def activity(ended: int, description: str, status: str) -> dict[str, Any]:
+        return launch(status, ended, ABANDONED if status == "Cancelled" else "") | {"Description": description}
+
+    abandons = [launch("Cancelled", NOW - n, ABANDONED) for n in (300, 200, 100)]
+    prepared = activity(NOW - 150, "Launching a new EC2 instance into warm pool: instance-x", "Successful")
+    promoted = activity(NOW - 50, "Launching a new EC2 instance from warm pool: instance-x", "Successful")
+    moved = activity(NOW - 50, "Moving instance-x out of warm pool", "Successful")
+    abandoned_on_the_way = activity(NOW - 20, "Launching a new EC2 instance from warm pool: instance-x", "Cancelled")
+    assert launch_history([*abandons, prepared], None).abandoned_in_a_row == 3
+    assert launch_history([*abandons, promoted], None).abandoned_in_a_row == 0
+    assert launch_history([*abandons, moved], None).abandoned_in_a_row == 0
+    assert launch_history([*abandons, moved, abandoned_on_the_way], None).abandoned_in_a_row == 1
 
 
 def test_protection_and_resume(aws: Aws) -> None:

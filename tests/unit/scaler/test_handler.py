@@ -50,7 +50,6 @@ ENVIRON = {
     ),
 }
 SETTINGS = read_settings(ENVIRON)
-WARM = [{"InstanceId": "warm-a", "LifecycleState": "Warmed:Stopped"}]
 
 
 def held_request(now: int) -> dict[str, Any]:
@@ -131,9 +130,7 @@ class Edge:
             "Instances": [{**i, "AvailabilityZone": "us-east-1a", "HealthStatus": "Healthy", "ProtectedFromScaleIn": True} for i in instances],
             "SuspendedProcesses": [{"ProcessName": "AZRebalance", "SuspensionReason": "by the stack"}],
         }
-        warm = [{**i, "AvailabilityZone": "us-east-1a", "HealthStatus": "Healthy", "ProtectedFromScaleIn": False} for i in WARM]
         self.autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": [GROUP]})
-        self.autoscaling.add_response("describe_warm_pool", {"Instances": warm}, {"AutoScalingGroupName": GROUP})
         self.autoscaling.add_response("describe_scaling_activities", {"Activities": []}, {"AutoScalingGroupName": GROUP})
         self.elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": []}, {"TargetGroupArn": TARGET_GROUP})
         for table, items in (("pool-state-table", records), ("heartbeats-table", heartbeats)):
@@ -213,7 +210,6 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     assert {name: sent[(name, pool)][-1] for name in GAUGES} == {
         "rhi_scaler_desired_capacity": 1.0,
         "rhi_scaler_instances_in_service": 0.0,
-        "rhi_scaler_warm_instances": 1.0,
     }
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
     # The session switch has no record: the session gauge reads 0.
@@ -321,4 +317,8 @@ def test_the_caller_changes_nothing_and_nothing_from_the_request_is_logged(
 
     assert marker not in caplog.text
     records = [json.loads(record.getMessage()) for record in caplog.records if record.name == "rhi_scaler"]
-    assert [(record["pool"], record["reason"]) for record in records if record["event"] == "decision"] == [("mock", "wake")] * 3
+    decisions = [record for record in records if record["event"] == "decision"]
+    assert [(record["pool"], record["reason"]) for record in decisions] == [("mock", "wake")] * 3
+    # The supply a record gives is the group's own: the instances in service and those starting.
+    counts = {"desired_before": 0, "desired": 1, "in_service": 0, "starting": 0, "launches_suspended": False}
+    assert [{key: record[key] for key in record if key not in ("event", "pool", "reason")} for record in decisions] == [counts] * 3

@@ -275,9 +275,9 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    the status once more.
 
 5. **The pools are back.** In Grafana, on the dashboard "Fleet and scaling", in each pool's row,
-   the panel "Instances: desired, in service, warm" reads the pool's `warm_instances` for warm once
-   the warm pool has filled. At the pool's first start, the dashboard "Deployments and releases",
-   panel "Release each instance serves: image digest and model revision", shows the release it
-   serves.
+   the panel "Instances: desired, in service" has data again, zero for both until a session asks
+   for the pool: the scaler reads the pool's group. At the pool's first start, the dashboard
+   "Deployments and releases", panel "Release each instance serves: image digest and model
+   revision", shows the release it serves.
 
 Walked through on the deployed system: not yet.

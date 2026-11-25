@@ -173,7 +173,6 @@ def test_the_number_reaches_the_note() -> None:
                 *(instance_heartbeat(report, now).to_item() for report in (WAITS, neighbour)),
             ]
             autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": ["group"]})
-            autoscaling.add_response("describe_warm_pool", {"Instances": []}, name)
             autoscaling.add_response("describe_scaling_activities", {"Activities": []}, name)
             elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": health}, {"TargetGroupArn": "targets"})
             # The pool-state table holds what the run before stored.

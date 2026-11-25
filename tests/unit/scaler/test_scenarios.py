@@ -49,7 +49,7 @@ def test_two_first_requests_at_once() -> None:
 
 
 def test_a_request_during_scale_in() -> None:
-    pool = sim.Sim(POOL, start=T0, in_service=2, warm=0)
+    pool = sim.Sim(POOL, start=T0, in_service=2)
     long = pool.request("task-1", 60 * MINUTE)
     busy, idle = long.instance, ({"instance-1", "instance-2"} - {long.instance}).pop()
     while not pool.released:
@@ -65,28 +65,28 @@ def test_a_request_during_scale_in() -> None:
     pool.advance(5 * MINUTE)
     assert late.outcome == "served"
     assert pool.in_service() == [busy]
-    assert idle in pool.warm()
+    assert list(pool.instances) == [busy]
     assert [name for _, name in pool.released] == [idle]
 
 
 def test_a_wake_after_a_long_idle() -> None:
-    pool = sim.Sim(POOL, start=T0, in_service=1, warm=1)
+    pool = sim.Sim(POOL, start=T0, in_service=1)
     pool.request("task-1", MINUTE)
     pool.advance(30 * MINUTE)
     assert pool.desired == 0
     assert any(run.decision.reason is Reason.IDLE for run in pool.runs)
     pool.advance(6 * 60 * MINUTE)
-    assert pool.in_service() == pool.starting() == []
+    assert pool.instances == {}
 
     launched, ran = len(pool.launches), len(pool.runs)
     request = pool.request("task-1", MINUTE)
     pool.advance(15 * MINUTE)
     woken = pool.runs[ran:]
     assert woken[0].decision.reason is Reason.WAKE
-    # Many runs while it started (the wake repeats, the schedule), one instance, from the warm pool.
-    assert len([run for run in woken if run.now <= pool.launches[launched].now + pool.warm_start_seconds]) > 3
+    # Many runs while it started (the wake repeats, the schedule), one instance, a new one.
+    assert len([run for run in woken if run.now <= pool.launches[launched].now + pool.start_seconds]) > 3
     assert len(pool.launches) - launched == 1
-    assert pool.launches[launched].from_warm
+    assert pool.launches[launched].instance != "instance-1"
     assert max(run.decision.desired for run in woken) == 1
     assert request.outcome == "served"
 
@@ -115,7 +115,7 @@ def test_a_launch_that_never_becomes_healthy() -> None:
 
 
 def test_a_gateway_that_stops_reporting() -> None:
-    pool = sim.Sim(POOL, start=T0, in_service=1, warm=0)
+    pool = sim.Sim(POOL, start=T0, in_service=1)
     request = pool.request("task-1", 60 * MINUTE)
     pool.advance(2 * MINUTE)
     pool.stop_gateway("task-1")

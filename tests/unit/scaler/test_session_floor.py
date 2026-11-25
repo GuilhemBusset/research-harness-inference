@@ -179,7 +179,7 @@ def test_after_the_end_the_other_rules_apply() -> None:
     # minutes of low load.
     quick = parse_pools({"coursework": {**ENTRY, "idle_minutes": 3}})[0]
     end = NOW + 6 * MINUTE
-    pool = sim.Sim(quick, start=NOW, in_service=2, warm=0, session=session(2, ends_at=end))
+    pool = sim.Sim(quick, start=NOW, in_service=2, session=session(2, ends_at=end))
     pool.advance(4 * MINUTE)
     # No request yet: the idle rule would have taken the pool to zero, run after run.
     assert [(r.decision.desired, r.decision.requested) for r in pool.runs] == [(2, 2)] * 4

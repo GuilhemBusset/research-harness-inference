@@ -6,7 +6,6 @@ What the fleet dashboard shows of the scaler (section 7.2), per pool, on every r
 | --- | --- | --- | --- |
 | `rhi_scaler_desired_capacity` | gauge | `pool` | The desired capacity the run decided |
 | `rhi_scaler_instances_in_service` | gauge | `pool` | The instances in service the run read |
-| `rhi_scaler_warm_instances` | gauge | `pool` | The instances in the warm pool the run read |
 | `rhi_scaler_decisions_total` | counter | `pool`, `reason` | The decisions made with that reason |
 | `rhi_scaler_session_active` | gauge | `pool` | 1 while the pool's session is active; 0 otherwise |
 | `rhi_scaler_instances_requested` | gauge | `pool` | What the pool's session asks for now, 0 while none is active |
@@ -83,9 +82,8 @@ from rhi_scaler.model import Decision, Inputs, PoolInputs
 
 DESIRED_CAPACITY = "rhi_scaler_desired_capacity"
 INSTANCES_IN_SERVICE = "rhi_scaler_instances_in_service"
-WARM_INSTANCES = "rhi_scaler_warm_instances"
 DECISIONS = "rhi_scaler_decisions_total"
-GAUGES = (DESIRED_CAPACITY, INSTANCES_IN_SERVICE, WARM_INSTANCES)
+GAUGES = (DESIRED_CAPACITY, INSTANCES_IN_SERVICE)
 SESSION_ON = "rhi_scaler_session_on"
 SESSION_ACTIVE = "rhi_scaler_session_active"
 INSTANCES_REQUESTED = "rhi_scaler_instances_requested"
@@ -271,7 +269,6 @@ def fleet_series(
         gauges = {
             DESIRED_CAPACITY: pool.desired,
             INSTANCES_IN_SERVICE: len(read.supply.in_service),
-            WARM_INSTANCES: len(read.supply.warm),
             **supply_gauges(read, note, inputs.now, inputs.session_max_hours),
         }
         out.extend(

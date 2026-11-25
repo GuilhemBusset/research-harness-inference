@@ -9,9 +9,8 @@ and applies its `PoolDecision` to the group.
 
 What the group does, as section 5 describes it:
 
-- An instance taken from the warm pool comes into service `warm_start_seconds` after it was
-  started, a cold launch after `cold_start_seconds`. Every instance in service is protected from
-  scale-in.
+- Every start is the launch of a new instance, which comes into service `start_seconds` after it
+  was launched. Every instance in service is protected from scale-in.
 - An instance that never becomes healthy is abandoned by the launch hook after
   `launch_hook_seconds` (15 minutes) and terminated, which takes `TERMINATE_SECONDS`. The group
   launches its replacement once it is gone, while launches are not suspended. A minute's schedule
@@ -19,7 +18,7 @@ What the group does, as section 5 describes it:
 - When the desired capacity is below the instances counted (in service and starting), the group
   releases instances whose protection is lifted, and only those. A released instance is
   deregistered at once, so it takes no new request, and drains: once its engine reports nothing
-  running, the termination hook completes and it returns to the warm pool.
+  running, the termination hook completes and it is terminated.
 
 What a gateway task does: it rewrites its heartbeat row every 5 seconds, until it stops. A request
 it receives goes to the instance in service with the fewest requests; with none in service it is
@@ -63,7 +62,7 @@ class Request:
 @dataclass
 class Instance:
     name: str
-    state: str  # "warm", "starting", "in-service", "draining" or "terminating"
+    state: str  # "starting", "in-service", "draining" or "terminating"
     started_at: int = 0
     ready_at: int = 0
     gone_at: int = 0  # when a terminating instance is gone
@@ -94,7 +93,6 @@ class Run:
 class Launch:
     now: int
     instance: str
-    from_warm: bool
 
 
 class Sim:
@@ -106,17 +104,15 @@ class Sim:
         *,
         start: int,
         gateways: tuple[str, ...] = ("task-1",),
-        warm: int = 1,
         in_service: int = 0,
-        warm_start_seconds: int = 120,
-        cold_start_seconds: int = 300,
+        start_seconds: int = 300,
         healthy: bool = True,
         mode: Mode = Mode.ENABLED,
         session: Session | None = None,
     ) -> None:
         self.pool, self.mode, self.now = pool, mode, start
         self.session = session
-        self.warm_start_seconds, self.cold_start_seconds = warm_start_seconds, cold_start_seconds
+        self.start_seconds = start_seconds
         self.healthy = healthy  # whether a launch ever becomes healthy
         self.instances: dict[str, Instance] = {}
         self.desired = in_service
@@ -131,8 +127,6 @@ class Sim:
         # The group's activity history: (time, "abandoned" or "in-service").
         self.history: list[tuple[int, str]] = []
         self._count = 0
-        for _ in range(warm):
-            self._new("warm")
         for _ in range(in_service):
             self._new("in-service", protected=True)
         self._heartbeats()
@@ -168,9 +162,6 @@ class Sim:
     def starting(self) -> list[str]:
         return self._named("starting")
 
-    def warm(self) -> list[str]:
-        return self._named("warm")
-
     # The scaler.
 
     def run_scaler(self, caller: str = "schedule") -> PoolDecision:
@@ -180,8 +171,7 @@ class Sim:
             in_service=tuple(self.in_service()),
             starting=tuple(self.starting()),
             draining=tuple(self._named("draining")),
-            warm=tuple(self.warm()),
-            running=tuple(name for name, i in sorted(self.instances.items()) if i.state != "warm"),
+            running=tuple(sorted(self.instances)),
         )
         rows = [task.row for task in self.gateways.values() if task.row is not None]
         pool = PoolInputs(
@@ -242,12 +232,10 @@ class Sim:
         for _ in range(self.desired - len(counted) - len(self._named("terminating"))):
             if self.launches_suspended:
                 break
-            warm = self.warm()
-            instance = self.instances[warm[0]] if warm else self._new("starting")
-            delay = self.warm_start_seconds if warm else self.cold_start_seconds
-            instance.state, instance.started_at, instance.ready_at = "starting", self.now, self.now + delay
-            instance.healthy, instance.protected = self.healthy, True
-            self.launches.append(Launch(self.now, instance.name, bool(warm)))
+            instance = self._new("starting", protected=True)
+            instance.started_at, instance.ready_at = self.now, self.now + self.start_seconds
+            instance.healthy = self.healthy
+            self.launches.append(Launch(self.now, instance.name))
 
     def _forward(self, request: Request) -> bool:
         """Forward to the instance in service with the fewest requests, if there is one."""
@@ -294,8 +282,8 @@ class Sim:
             elif instance.state == "terminating" and now >= instance.gone_at:
                 del self.instances[instance.name]
             elif instance.state == "draining" and not self._on(instance.name):
-                # The termination hook completes: back to the warm pool.
-                instance.state, instance.protected = "warm", False
+                # The termination hook completes: the instance is terminated.
+                del self.instances[instance.name]
                 self.instance_rows.pop(instance.name, None)
         self._reconcile()
         for request in self.requests:
