@@ -270,8 +270,9 @@ and this runbook does not apply.
    A list with a gap in those minutes is a scaler that still does not run by itself, whatever the
    alarm reads now: go back to Check, step 2.
 
-3. **Every pool is asked for what its session asks for, or its launches are suspended.** The
-   columns from `requested` on follow a command again, and are those of a run of the last minute.
+3. **Every pool is asked for what its session asks for, and a suspended pool for no more than
+   before.** The columns from `requested` on follow a command again, and are those of a run of the
+   last minute.
 
    ```sh
    rhi_admin session status
@@ -279,11 +280,21 @@ and this runbook does not apply.
 
    `requested` reads the session's instances for a pool whose session is active, and zero for
    every other. `asked`, what the pool's group is asked for, reads the same number, with one
-   exception that is no fault of the scaler: a pool whose launches are suspended is not raised,
-   so its `asked` stays where the suspension found it, which can be below `requested`, at every
-   run until the admin clears the suspension (step 5). A scaler that runs keeps a suspension in
-   place: what shows that it is repaired is the completed runs of step 2, not these two numbers
-   being equal.
+   exception that is no fault of the scaler: a pool whose launches are suspended. A suspension
+   stops raises, and nothing else:
+
+   - **the scaler does not raise the pool.** A session booked or raised since the suspension
+     leaves `asked` below `requested`, for as long as the suspension lasts. The admin clears it
+     (step 5), and the first run after that raises the pool to what its session asks for;
+   - **the scaler still lowers it.** A session set to fewer instances takes `asked` down with it
+     at the next run, a session that ends or is stopped takes it to zero, and the instances
+     beyond `requested` are released, all with the suspension still in place. Capacity given up
+     this way does not come back while the pool is suspended.
+
+   So `asked` below `requested` on a suspended pool is the suspension at work, and `asked` going
+   down with a session is the scaler at work. Neither number shows by itself that the scaler is
+   repaired: the completed runs of step 2, one for each minute nobody asked for, are what shows
+   it.
 
    The scaler's first run sets each group to what its session asks for, whatever was done by hand:
    a group emptied in Act, step 2, stays at zero because its session was stopped, and a pool
@@ -308,12 +319,12 @@ and this runbook does not apply.
    ```
 
    `false` for every pool: nothing more to do. `true` for a pool is not a scaler that still
-   fails: the run that reports it completed, and every later run keeps the suspension until the
-   admin clears it. It can date from before the fault, or from the scaler's first run after it:
-   that run counts the launches the group abandoned while nothing watched it, and suspends the
-   group's launches when it finds three in a row. The scaler is repaired once steps 1 and 2 hold.
-   The suspension is the runbook
-   [a pool whose launches are suspended](suspended-launches.md), which finds why the launches
-   were abandoned before it clears anything.
+   fails: the run that reports it completed, and every later run keeps the launches suspended,
+   and still lowers the pool with its session (step 3), until the admin clears the suspension.
+   It can date from before the fault, or from the scaler's first run after it: that run counts
+   the launches the group abandoned while nothing watched it, and suspends the group's launches
+   when it finds three in a row. The scaler is repaired once steps 1 and 2 hold. The suspension
+   is the runbook [a pool whose launches are suspended](suspended-launches.md), which finds why
+   the launches were abandoned before it clears anything.
 
 Walked through on the deployed system: not yet.
