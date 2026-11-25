@@ -1,6 +1,6 @@
 """A pool's release (`rhi.pools.release`; system design, sections 4.3 and 8.2): the parameter its
-instances read, the archive and the engine image it names, what the instance role may fetch, and
-what starts an instance refresh.
+instances read, the archive and the engine image it names, and what the instance role may fetch.
+The stack starts no instance refresh: a deployment replaces no instance.
 
 The mock pool of the example configuration is read from the app the session synthesizes. What
 needs two syntheses to compare, or another pool, builds a stack that holds one pool and its
@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from botocore.exceptions import ClientError
 
 from rhi import config
 from rhi_common import pool_config
@@ -98,8 +97,6 @@ def sample(value: Any) -> str:
         return re.sub(r"\$\{([^}]+)\}", lambda match: PSEUDO[match[1]], argument)
     if function == "Fn::GetAtt" and argument[1] == "imageDetails.0.imageDigest":
         return IMAGE_DIGEST
-    if function == "Fn::GetAtt" and argument[1] == "LatestVersionNumber":
-        return f"sample-version-{argument[0]}"
     if (function, argument[1:]) == ("Fn::GetAtt", ["PrometheusEndpoint"]) or (
         function == "Fn::ImportValue" and "PrometheusEndpoint" in argument
     ):
@@ -152,28 +149,6 @@ class Release:
     def value(self) -> dict[str, Any]:
         """The parameter's value, with each reference replaced by a sample value."""
         return json.loads(sample(self.parameter["Value"]))
-
-    @property
-    def refresh(self) -> dict[str, Any]:
-        """The custom resource that refreshes the pool's group, whole."""
-        (found,) = [
-            resource
-            for resource in self.template["Resources"].values()
-            if resource["Type"] == REFRESH and self.parameter_of(resource) == [f"/rhi/pools/{self.pool}/release"]
-        ]
-        return found
-
-    def parameter_of(self, refresh: Mapping[str, Any]) -> list[str]:
-        """The names of the release parameters a refresh waits for."""
-        return [
-            self.template["Resources"][name]["Properties"]["Name"]
-            for name in as_list(refresh["DependsOn"])
-            if self.template["Resources"][name]["Type"] == "AWS::SSM::Parameter"
-        ]
-
-    @property
-    def trigger(self) -> Any:
-        return self.refresh["Properties"]["Trigger"]
 
     @property
     def archive(self) -> Path:
@@ -257,7 +232,7 @@ def standalone(
 
     from rhi.observability.prometheus import PrometheusWorkspace
     from rhi.pools.group import PoolGroup
-    from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
+    from rhi.pools.release import PoolRelease, ReleaseFiles
 
     cdk = app_module.cdk
     context = {"aws:cdk:bundling-stacks": ["**"] if bundled else []}
@@ -285,7 +260,6 @@ def standalone(
         "Release",
         pool=pool,
         files=ReleaseFiles(stack, "ReleaseFiles", repo=repo),
-        refresher=InstanceRefresher(stack, "InstanceRefresher", pools=[pool]),
         group=group,
         role=role,
         heartbeats=dynamodb.Table(stack, heartbeats, partition_key=key),
@@ -571,7 +545,7 @@ def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Rel
     release = standalone(app_module, tmp_path, pool)
 
     # The arguments the module builds, with the model bucket of the account and the region the
-    # stack is deployed to, in the parameter the agent reads and in what starts a refresh.
+    # stack is deployed to, in the parameter the agent reads.
     bucket = model_store.bucket_name(PSEUDO["AWS::AccountId"], REGION)
     flags = vllm_command.arguments(pool, bucket=bucket)
     assert flags[0] == f"s3://{bucket}/{model_store.pool_prefix('coursework')}{pool.revision}/"
@@ -579,7 +553,6 @@ def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Rel
     assert "--trust-remote-code" in flags
     assert release.value["engine_flags"] == flags
     assert agent_release.parse_current(sample(release.parameter["Value"])).release.engine_flags == tuple(flags)
-    assert json.loads(sample(release.trigger))["engine_flags"] == flags
 
     # The image: built from the vLLM image's folder, whole, and from nothing else.
     context = (release.outdir / release.image["directory"]).resolve()
@@ -593,7 +566,6 @@ def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Rel
 
     # The mock pool's release is as it was: no flag, and its image from its packaging's context.
     assert alone.value["engine_flags"] == []
-    assert json.loads(sample(alone.trigger))["engine_flags"] == []
     mock_context = (alone.outdir / alone.image["directory"]).resolve()
     assert {path.name for path in mock_context.iterdir()} == {
         "Dockerfile",
@@ -608,28 +580,23 @@ def test_the_mock_start_delay_is_a_flag(app_module: ModuleType, mock: Release, a
         (pool,) = pool_config.parse_pools({"mock": config.pool_entry(MOCK) | {"start_delay_seconds": delay}})
         return standalone(app_module, tmp_path / str(delay), pool)
 
-    # A mock pool that gives 400: the flag and its value, in the parameter the agent reads and in
-    # what starts a refresh, which therefore changes.
+    # A mock pool that gives 400: the flag and its value, in the parameter the agent reads.
     delayed = with_delay(400)
     flags = ["--start-delay-seconds", "400"]
     assert delayed.value["engine_flags"] == flags
     assert agent_release.parse_current(sample(delayed.parameter["Value"])).release.engine_flags == tuple(flags)
-    assert json.loads(sample(delayed.trigger))["engine_flags"] == flags
-    assert delayed.trigger != alone.trigger
     # Nothing else of the release changes, and no role or action comes with the flags.
     assert {**delayed.value, "engine_flags": []} == alone.value
     assert len(of_type(delayed.template, "AWS::IAM::Role")) == len(of_type(alone.template, "AWS::IAM::Role"))
     assert granted(delayed.template) == granted(alone.template)
 
     # The example configuration's mock pool leaves the field out: no flag. A pool that gives 0 has
-    # the same release and the same refresh as one that leaves it out.
+    # the same release as one that leaves it out.
     assert MOCK.start_delay_seconds == 0
     for release in (mock, alone):
         assert release.value["engine_flags"] == []
-        assert json.loads(sample(release.trigger))["engine_flags"] == []
     zero = with_delay(0)
     assert zero.parameter["Value"] == alone.parameter["Value"]
-    assert zero.refresh["Properties"] == alone.refresh["Properties"]
 
 
 # The grants.
@@ -677,7 +644,7 @@ def test_the_instance_role_may_fetch_its_release_and_nothing_else(mock: Release)
     assert (token["Action"], token["Resource"]) == ("ecr:GetAuthorizationToken", "*")
 
 
-# The refresh.
+# What changes a release, and what a deployment leaves alone.
 
 
 def changed(tmp_path: Path, file: str) -> Path:
@@ -689,11 +656,10 @@ def changed(tmp_path: Path, file: str) -> Path:
 
 
 @pytest.mark.parametrize("file", ["services/engine/mock/Dockerfile", "services/engine/units/rhi-collector.service"])
-def test_a_change_to_what_an_instance_holds_changes_the_release_and_the_trigger(
+def test_a_change_to_what_an_instance_holds_changes_the_release(
     app_module: ModuleType, alone: Release, tmp_path: Path, file: str
 ) -> None:
     other = standalone(app_module, tmp_path / "out", repo=changed(tmp_path, file))
-    assert other.trigger != alone.trigger
     # The image the release names is the one whose digest the lookup reads, in each.
     for release in (other, alone):
         parts = release.parameter["Value"]["Fn::Join"][1]
@@ -710,13 +676,14 @@ def test_a_change_to_what_an_instance_holds_changes_the_release_and_the_trigger(
         assert other.digest_lookup == alone.digest_lookup
 
 
-def test_what_is_outside_the_comparison_starts_no_refresh(
+def test_what_is_outside_the_comparison_leaves_the_compared_release_as_it_was(
     app_module: ModuleType, alone: Release, tmp_path: Path
 ) -> None:
-    """CloudFormation calls the refresh's resource only when one of its properties changes."""
+    """The measured start and a setting are in the parameter, and outside what an instance serves."""
     unrelated = standalone(app_module, tmp_path / "unrelated", unrelated=True)
     assert "AWS::SNS::Topic" in {r["Type"] for r in unrelated.template["Resources"].values()}
     assert "AWS::SNS::Topic" not in {r["Type"] for r in alone.template["Resources"].values()}
+    assert unrelated.parameter["Value"] == alone.parameter["Value"]
 
     measured = standalone(app_module, tmp_path / "measured", dataclasses.replace(MOCK, measured_start_seconds=120))
     assert measured.value["measured_start_seconds"] == 120
@@ -724,154 +691,50 @@ def test_what_is_outside_the_comparison_starts_no_refresh(
     setting = standalone(app_module, tmp_path / "setting", heartbeats="OtherHeartbeats")
     assert setting.value["settings"]["heartbeat_table"] != alone.value["settings"]["heartbeat_table"]
 
-    for other in (unrelated, measured, setting):
-        assert other.refresh["Properties"] == alone.refresh["Properties"]
+    compared = ("engine_image", "model_revision", "engine_flags", "files")
     for other in (measured, setting):
         assert other.parameter["Value"] != alone.parameter["Value"]
+        assert {key: other.value[key] for key in compared} == {key: alone.value[key] for key in compared}
 
 
-def test_the_trigger_holds_the_compared_release_and_the_launch_template(mock: Release) -> None:
-    trigger = json.loads(sample(mock.trigger))
-    value = mock.value
-    assert {key: trigger[key] for key in ("engine_image", "model_revision", "engine_flags")} == {
-        key: value[key] for key in ("engine_image", "model_revision", "engine_flags")
-    }
-    assert trigger["files_sha256"] == value["files"]["sha256"]
-    # The digest is read for the tag the asset step pushed the image under.
-    assert trigger["image_tag"] in mock.assets["dockerImages"]
-
-    # The machine image: the launch template's own reference, a parameter of the stack that
-    # CloudFormation resolves from the pool's image parameter when the stack is deployed.
-    group = of_type(mock.template, "AWS::AutoScaling::AutoScalingGroup")[mock.group]
-    specification = group["MixedInstancesPolicy"]["LaunchTemplate"]["LaunchTemplateSpecification"]
-    launch_template = mock.template["Resources"][specification["LaunchTemplateId"]["Ref"]]["Properties"]
-    image = launch_template["LaunchTemplateData"]["ImageId"]["Ref"]
-    assert image in references(mock.trigger)
-    assert trigger["machine_image"] == f"sample-{image}"
-    assert trigger["launch_template_version"] == sample(specification["Version"])
-    assert mock.template["Parameters"][image]["Type"] == "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
-    assert mock.template["Parameters"][image]["Default"].startswith("/aws/service/ecs/optimized-ami/")
-
-
-def test_the_stacks_deployment_waits_on_the_refresh(mock: Release) -> None:
-    resources = mock.template["Resources"]
-    refresh = mock.refresh
-    assert refresh["Properties"]["Group"] == {"Ref": mock.group}
-    # The release is written, and the instances may fetch it, before any instance is replaced.
-    depends_on = {resources[name]["Type"] for name in refresh["DependsOn"]}
-    assert mock.parameter_of(refresh) == [PARAMETER]
-    assert depends_on == {"AWS::SSM::Parameter", "AWS::IAM::Policy"}
-
-    # CloudFormation calls the provider's function, which starts the refresh with `on_event` and
-    # then runs a state machine that asks `is_complete` until the refresh has ended.
-    function = resources[refresh["Properties"]["ServiceToken"]["Fn::GetAtt"][0]]["Properties"]
-    variables = function["Environment"]["Variables"]
-    start = resources[variables["USER_ON_EVENT_FUNCTION_ARN"]["Fn::GetAtt"][0]]["Properties"]
-    query = resources[variables["USER_IS_COMPLETE_FUNCTION_ARN"]["Fn::GetAtt"][0]]["Properties"]
-    assert (start["Handler"], query["Handler"]) == ("index.on_event", "index.is_complete")
-    assert start["Code"] == query["Code"]
-    machine = resources[variables["WAITER_STATE_MACHINE_ARN"]["Ref"]]
-    assert machine["Type"] == "AWS::StepFunctions::StateMachine"
-    # It asks for as long as CloudFormation waits for a custom resource: an hour.
-    (retry,) = json.loads(sample_definition(machine))["States"]["framework-isComplete-task"]["Retry"]
-    assert retry["IntervalSeconds"] * retry["MaxAttempts"] == 3600
-
-
-def sample_definition(machine: Mapping[str, Any]) -> str:
-    definition = machine["Properties"]["DefinitionString"]
-    return "".join(part if isinstance(part, str) else "arn" for part in definition["Fn::Join"][1])
-
-
-class AutoScaling:
-    """Auto Scaling, for the three calls of the refresh's handlers: one group and its refreshes."""
-
-    def __init__(self, *, running: int = 0) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        # How many more starts find a refresh still running.
-        self.running = running
-        self.status = "Pending"
-
-    def start_instance_refresh(self, **arguments: Any) -> dict[str, Any]:
-        self.calls.append(("start", arguments))
-        if self.running:
-            self.running -= 1
-            raise ClientError({"Error": {"Code": "InstanceRefreshInProgress"}}, "StartInstanceRefresh")
-        return {"InstanceRefreshId": "refresh-1"}
-
-    def cancel_instance_refresh(self, **arguments: Any) -> dict[str, Any]:
-        self.calls.append(("cancel", arguments))
-        return {}
-
-    def describe_instance_refreshes(self, **arguments: Any) -> dict[str, Any]:
-        self.calls.append(("describe", arguments))
-        return {"InstanceRefreshes": [{"InstanceRefreshId": "refresh-1", "Status": self.status}]}
-
-
-@pytest.fixture
-def handlers(mock: Release) -> ModuleType:
-    """The code of the refresh's functions, as the template carries it."""
-    code = {
-        properties["Code"]["ZipFile"]
-        for properties in of_type(mock.template, "AWS::Lambda::Function").values()
-        if properties["Handler"] in ("index.on_event", "index.is_complete")
-    }
-    (source,) = code
-    module = types.ModuleType("index")
-    exec(compile(source, "index.py", "exec"), module.__dict__)  # noqa: S102 - the repository's own handler, read from its template
-    return module
-
-
-def test_the_refresh_replaces_instances_protected_from_scale_in(handlers: ModuleType) -> None:
-    autoscaling = AutoScaling()
-    event = {"RequestType": "Update", "ResourceProperties": {"Group": "the-group", "Trigger": "{}"}}
-    started = handlers.on_event(event, None, autoscaling=autoscaling)
-    assert autoscaling.calls == [
-        ("start", {"AutoScalingGroupName": "the-group", "Preferences": {"ScaleInProtectedInstances": "Refresh"}})
+def test_the_stack_starts_no_instance_refresh(mock: Release) -> None:
+    # A deployment replaces no instance: the pools stack holds no custom resource for a refresh,
+    # no state machine that would wait for one, and no role that may start, cancel or describe one.
+    kinds = {resource["Type"] for resource in mock.template["Resources"].values()}
+    assert REFRESH not in kinds and "AWS::StepFunctions::StateMachine" not in kinds
+    documents = [policy["PolicyDocument"] for policy in of_type(mock.template, "AWS::IAM::Policy").values()] + [
+        policy["PolicyDocument"]
+        for role in of_type(mock.template, "AWS::IAM::Role").values()
+        for policy in role.get("Policies", [])
     ]
-
-    # The deployment does not finish before the refresh does, and fails when the refresh does.
-    asked = event | started
-    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": False}
-    assert autoscaling.calls[-1] == (
-        "describe",
-        {"AutoScalingGroupName": "the-group", "InstanceRefreshIds": ["refresh-1"]},
-    )
-    autoscaling.status = "InProgress"
-    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": False}
-    autoscaling.status = "Successful"
-    assert handlers.is_complete(asked, None, autoscaling=autoscaling) == {"IsComplete": True}
-    for status in ("Failed", "Cancelled", "RollbackSuccessful"):
-        autoscaling.status = status
-        with pytest.raises(RuntimeError):
-            handlers.is_complete(asked, None, autoscaling=autoscaling)
+    actions = [
+        action
+        for document in documents
+        for statement in document["Statement"]
+        for action in as_list(statement.get("Action", []))
+    ]
+    assert actions and not [action for action in actions if "instancerefresh" in action.lower()]
 
 
-def test_a_new_stack_refreshes_too_and_a_removed_one_does_nothing(handlers: ModuleType) -> None:
-    autoscaling = AutoScaling()
-    created = handlers.on_event(
-        {"RequestType": "Create", "ResourceProperties": {"Group": "the-group"}}, None, autoscaling=autoscaling
-    )
-    assert created == {"Data": {"RefreshId": "refresh-1"}}
-    deleted = {"RequestType": "Delete", "ResourceProperties": {"Group": "the-group"}}
-    handlers.on_event(deleted, None, autoscaling=autoscaling)
-    assert handlers.is_complete(deleted, None, autoscaling=autoscaling) == {"IsComplete": True}
-    assert [call for call, _ in autoscaling.calls] == ["start"]
-
-
-def test_a_refresh_still_running_is_cancelled_for_one_that_starts_after_the_release_is_written(
-    handlers: ModuleType,
-) -> None:
-    autoscaling = AutoScaling(running=2)
-    pauses: list[int] = []
-    event = {"RequestType": "Update", "ResourceProperties": {"Group": "the-group"}}
-    started = handlers.on_event(event, None, autoscaling=autoscaling, sleep=pauses.append)
-    assert started == {"Data": {"RefreshId": "refresh-1"}}
-    assert [call for call, _ in autoscaling.calls] == ["start", "cancel", "start", "cancel", "start"]
-    assert len(pauses) == 2
-    # A group that never lets go of its refresh fails the deployment: the wait has an end.
-    stuck = AutoScaling(running=10**6)
-    with pytest.raises(ClientError):
-        handlers.on_event(event, None, autoscaling=stuck, sleep=pauses.append)
+def test_each_pool_keeps_its_release_parameter_and_the_grant_to_read_it(mock: Release) -> None:
+    # The mock pool's and the GPU pool's: one parameter each, which that pool's instance role reads.
+    assert len(EXAMPLE.pools) > 1
+    for pool in EXAMPLE.pools:
+        release = dataclasses.replace(mock, pool=pool.name)
+        (parameter_id,) = [
+            name
+            for name, p in of_type(mock.template, "AWS::SSM::Parameter").items()
+            if p["Name"] == release.parameter["Name"]
+        ]
+        role = release.tagged("AWS::IAM::Role")
+        reads = [
+            statement
+            for policy in of_type(mock.template, "AWS::IAM::Policy").values()
+            if {"Ref": role} in policy["Roles"]
+            for statement in policy["PolicyDocument"]["Statement"]
+            if statement["Action"] == "ssm:GetParameter" and parameter_id in references(statement["Resource"])
+        ]
+        assert len(reads) == 1
 
 
 # The boot program.

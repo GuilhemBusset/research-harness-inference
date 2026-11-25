@@ -40,7 +40,7 @@ from rhi.pools import image
 from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
 from rhi.pools.model_store import ModelStore
-from rhi.pools.release import InstanceRefresher, PoolRelease, ReleaseFiles
+from rhi.pools.release import PoolRelease, ReleaseFiles
 from rhi.pools.role import PoolRole
 from rhi.pools.routing import Routing
 from rhi.pools.scaler import Scaler, log_group
@@ -94,8 +94,8 @@ class PoolsStack(cdk.Stack):
     stage, the gateway's, allow its role to read it), each pool's launch template and Auto Scaling group, from
     `groups[name]`, the scaler, from
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke,
-    each pool's release, from `releases[name]`: its engine image, its release parameter and the
-    instance refresh that a change to the release starts, each pool's lifecycle hooks, from
+    each pool's release, from `releases[name]`: its engine image and its release parameter, which
+    the next session's instances read at their start, each pool's lifecycle hooks, from
     `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`), and the name of each pool's
     release parameter, from `release_parameters[name]` and, all of them, as the output
     `release_parameters_output`. The heartbeat table's name is the output `heartbeats_table_output`."""
@@ -218,19 +218,18 @@ class PoolsStack(cdk.Stack):
             workspace=observability.prometheus,
             session_max_hours=config.session_max_hours,
         )
-        # One release per pool, by the pool's name: its engine image, the parameter its instances
-        # read at every start, and the refresh of its group when the release changes. The pools
-        # share the release's files and what runs the refreshes; with the table empty there is none.
+        # One release per pool, by the pool's name: its engine image and the parameter its
+        # instances read at every start. A deployment replaces no instance: the next session's
+        # launch on the new release. The pools share the release's files; with the table empty
+        # there is none.
         if config.pools:
             files = ReleaseFiles(self, "ReleaseFiles")
-            refresher = InstanceRefresher(self, "InstanceRefresher", pools=config.pools)
             self.releases = {
                 pool.name: PoolRelease(
                     self,
                     f"Release-{pool.name}",
                     pool=pool,
                     files=files,
-                    refresher=refresher,
                     group=self.groups[pool.name],
                     role=self.roles[pool.name].role,
                     heartbeats=self.tables.heartbeats,
