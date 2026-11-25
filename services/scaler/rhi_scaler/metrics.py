@@ -8,6 +8,23 @@ What the fleet dashboard shows of the scaler (section 7.2), per pool, on every r
 | `rhi_scaler_instances_in_service` | gauge | `pool` | The instances in service the run read |
 | `rhi_scaler_warm_instances` | gauge | `pool` | The instances in the warm pool the run read |
 | `rhi_scaler_decisions_total` | counter | `pool`, `reason` | The decisions made with that reason |
+| `rhi_scaler_session_active` | gauge | `pool` | 1 while the pool's session is active; 0 otherwise |
+| `rhi_scaler_instances_requested` | gauge | `pool` | What the pool's session asks for now, 0 while none is active |
+| `rhi_scaler_instances_waiting` | gauge | `pool` | The instances asked of AWS that have not come: the desired capacity less those starting and in service |
+| `rhi_scaler_waiting_seconds` | gauge | `pool` | How long the pool has waited for them, 0 while nothing waits |
+| `rhi_scaler_instances_starting` | gauge | `pool` | The instances starting the run read |
+| `rhi_scaler_instances_draining` | gauge | `pool` | The instances draining the run read |
+| `rhi_scaler_session_starts_at_seconds` | gauge | `pool` | The start of the pool's session, in seconds since the epoch |
+| `rhi_scaler_session_ends_at_seconds` | gauge | `pool` | Its end (`rhi_common.sessions.end`), in seconds since the epoch |
+| `rhi_scaler_launch_failure` | gauge | `pool`, `cause` | 1 for the cause in force, 0 for the other three |
+
+What waits, since when and why (section 5.4) is the pool's note, as the run wrote it
+(`rhi_scaler.aws_io.supply_note`): the series and the note hold the same numbers. The two series
+of the session's window are sent while the pool's session has not ended, booked or active, and not
+for a pool whose session has ended or that has none. The cause has one series for each of the four
+words of `rhi_common.records.LaunchFailure`, on every run, so that a cause that ends reads 0
+rather than stays at its last 1: at most one of the four is 1, and none is while nothing waits or
+no launch has failed.
 
 And once for the whole system, on every run:
 
@@ -15,8 +32,9 @@ And once for the whole system, on every run:
 | --- | --- | --- | --- |
 | `rhi_scaler_session_on` | gauge | none | 1 while the session switch reads on; 0 while it reads off or has no record |
 
-The only labels are the pool's name and the decision's reason, a fixed vocabulary
-(`rhi_scaler.model.Reason`): no metric can carry a student.
+The only labels are the pool's name, the decision's reason and the cause of a failed launch, the
+last two from fixed vocabularies (`rhi_scaler.model.Reason`, `rhi_common.records.LaunchFailure`):
+no metric can carry a student, or text from AWS.
 
 **The session gauge** (system design, sections 5.6 and 7.3). PromQL knows nothing of the session
 switch, so the scaler, which runs every minute, says what it read: the objectives keep only the
@@ -59,8 +77,9 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
-from rhi_common.records import SessionSwitch, session_is_on
-from rhi_scaler.model import Decision, Inputs
+from rhi_common import sessions
+from rhi_common.records import LaunchFailure, ScalerNote, SessionSwitch, session_is_on
+from rhi_scaler.model import Decision, Inputs, PoolInputs
 
 DESIRED_CAPACITY = "rhi_scaler_desired_capacity"
 INSTANCES_IN_SERVICE = "rhi_scaler_instances_in_service"
@@ -68,6 +87,26 @@ WARM_INSTANCES = "rhi_scaler_warm_instances"
 DECISIONS = "rhi_scaler_decisions_total"
 GAUGES = (DESIRED_CAPACITY, INSTANCES_IN_SERVICE, WARM_INSTANCES)
 SESSION_ON = "rhi_scaler_session_on"
+SESSION_ACTIVE = "rhi_scaler_session_active"
+INSTANCES_REQUESTED = "rhi_scaler_instances_requested"
+INSTANCES_WAITING = "rhi_scaler_instances_waiting"
+WAITING_SECONDS = "rhi_scaler_waiting_seconds"
+INSTANCES_STARTING = "rhi_scaler_instances_starting"
+INSTANCES_DRAINING = "rhi_scaler_instances_draining"
+# What each pool's note gives on every run, with the pool's label.
+SUPPLY_GAUGES = (
+    SESSION_ACTIVE,
+    INSTANCES_REQUESTED,
+    INSTANCES_WAITING,
+    WAITING_SECONDS,
+    INSTANCES_STARTING,
+    INSTANCES_DRAINING,
+)
+# The window of a pool's session, sent while the session has not ended.
+SESSION_STARTS_AT = "rhi_scaler_session_starts_at_seconds"
+SESSION_ENDS_AT = "rhi_scaler_session_ends_at_seconds"
+# Why the pool's last launch failed: one series for each cause, with the labels pool and cause.
+LAUNCH_FAILURE = "rhi_scaler_launch_failure"
 
 SERVICE = "aps"
 # How long one push may take: the function's own timeout bounds the run.
@@ -184,38 +223,67 @@ def session_alone(
     return [series]
 
 
+def supply_gauges(pool: PoolInputs, note: ScalerNote, now: int, session_max_hours: int) -> dict[str, int]:
+    """What one pool's note and session give at the time `now`, by series: what the pool was asked
+    and what waits, and the session's window while the session has not ended."""
+    session = pool.session
+    gauges = {
+        SESSION_ACTIVE: int(sessions.is_active(session, now, session_max_hours=session_max_hours)),
+        INSTANCES_REQUESTED: note.requested,
+        INSTANCES_WAITING: note.waiting,
+        WAITING_SECONDS: 0 if note.waiting_since is None else max(0, now - note.waiting_since),
+        INSTANCES_STARTING: note.starting,
+        INSTANCES_DRAINING: note.draining,
+    }
+    if session is not None and now < sessions.end(session, session_max_hours=session_max_hours):
+        gauges[SESSION_STARTS_AT] = session.starts_at
+        gauges[SESSION_ENDS_AT] = sessions.end(session, session_max_hours=session_max_hours)
+    return gauges
+
+
 def fleet_series(
     inputs: Inputs,
     decision: Decision,
     counts: DecisionCounts,
     milliseconds: int | None = None,
     *,
+    notes: Mapping[str, ScalerNote],
     session: SessionSwitch | None | Unread = UNREAD,
     read_at: int | None = None,
 ) -> list[Series]:
     """Counts this run's decisions, and returns every series to send for it, pool by pool.
 
-    `milliseconds` is the run's time; without it, the decision clock's second. `session` is what
-    the run read of the session switch (`None` for no record), and gives the session gauge;
-    `UNREAD`, a switch the run could not read, gives no sample of it. `read_at` is when the read
-    of the switch returned (`session_series`).
+    `milliseconds` is the run's time; without it, the decision clock's second. `notes` holds each
+    pool's note as the run wrote it (`rhi_scaler.aws_io.apply`): what the pool was asked, what
+    waits and why. `session` is what the run read of the session switch (`None` for no record),
+    and gives the session gauge; `UNREAD`, a switch the run could not read, gives no sample of it.
+    `read_at` is when the read of the switch returned (`session_series`).
     """
     milliseconds = counts.stamp(inputs.now * 1000 if milliseconds is None else milliseconds)
-    supplies = {pool.config.name: pool.supply for pool in inputs.pools}
+    read_pools = {pool.config.name: pool for pool in inputs.pools}
     out: list[Series] = []
     if not isinstance(session, Unread):
         gauge = session_series(session, milliseconds, read_at)
         counts.passed(gauge.samples[-1][1])
         out.append(gauge)
     for pool in decision.pools:
-        supply = supplies[pool.pool]
+        read, note = read_pools[pool.pool], notes[pool.pool]
         gauges = {
             DESIRED_CAPACITY: pool.desired,
-            INSTANCES_IN_SERVICE: len(supply.in_service),
-            WARM_INSTANCES: len(supply.warm),
+            INSTANCES_IN_SERVICE: len(read.supply.in_service),
+            WARM_INSTANCES: len(read.supply.warm),
+            **supply_gauges(read, note, inputs.now, inputs.session_max_hours),
         }
         out.extend(
             Series(name, (("pool", pool.pool),), ((float(value), milliseconds),)) for name, value in gauges.items()
+        )
+        out.extend(
+            Series(
+                LAUNCH_FAILURE,
+                (("pool", pool.pool), ("cause", cause.value)),
+                ((1.0 if note.launch_failure is cause else 0.0, milliseconds),),
+            )
+            for cause in LaunchFailure
         )
         first = (pool.pool, pool.reason.value) not in counts.counts
         counts.add(pool.pool, pool.reason.value)

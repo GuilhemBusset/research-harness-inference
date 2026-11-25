@@ -83,6 +83,12 @@ class Memory:
     `outside_sessions_since` only reports (`rhi_scaler.outside_sessions`, sections 11.3 and 17): it
     is the time of the first of the runs in a row that saw an instance of the pool in service while
     no session was on, and `None` when the last run did not. `decide` neither reads nor sets it.
+
+    `short_since` only reports too (section 5.4): it is the time of the first of the runs in a row
+    that saw the pool wait for capacity, with fewer instances starting and in service than were
+    asked of AWS, and `None` when the last run did not. The edge sets it when it writes the pool's
+    note (`rhi_scaler.aws_io.apply`), and `decide` neither reads nor sets it. It is not
+    `waiting_since`, which times the instances whose requests wait.
     """
 
     last_request_at: int | None = None
@@ -99,6 +105,7 @@ class Memory:
     rebalance_number: int = 0
     last_rebalance_at: int | None = None
     outside_sessions_since: int | None = None
+    short_since: int | None = None
 
 
 @dataclass(frozen=True)

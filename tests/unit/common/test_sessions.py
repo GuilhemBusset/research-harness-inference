@@ -9,7 +9,7 @@ from collections.abc import Callable
 import pytest
 
 from rhi_common.records import Session
-from rhi_common.sessions import SessionError, changed, is_active, requested, started, stopped
+from rhi_common.sessions import SessionError, changed, end, is_active, requested, started, stopped
 
 NOW = 1_800_000_000
 HOUR = 3600
@@ -73,6 +73,9 @@ def test_a_session_ends_12_hours_after_the_later_of_its_start_and_its_last_write
     assert active(long, later + 12 * HOUR - 1)
     assert not active(long, later + 12 * HOUR)
     assert asked(long, later + 12 * HOUR) == 0
+    # That end is the one a reader is given, and a session within the bound ends where it says.
+    assert end(long, session_max_hours=HOURS) == later + 12 * HOUR
+    assert end(ACTIVE, session_max_hours=HOURS) == ACTIVE.ends_at
     # The bound is the configuration's: with another, the session ends elsewhere.
     assert is_active(long, later + 12 * HOUR, session_max_hours=20)
     assert not is_active(long, later + 6 * HOUR, session_max_hours=6)
