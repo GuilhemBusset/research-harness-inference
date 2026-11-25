@@ -6,7 +6,11 @@ that failed to failed-smoke-tests beside it, and the last lifecycle stage each i
 last-stages; inputs that are outputs of the stage's stacks and the execution's ID; and a role that
 reads the canary's secret, queries the stage's workspace, reads the stage's pools' release
 parameters, queries the stage's heartbeats table, and that one table, writes under
-verification/, describes groups and their refreshes, and lists its own pipeline's executions.
+verification/, describes groups and their refreshes, and lists its own pipeline's executions. For
+the session the script books on the mock pool, the step is given the pools stack's name, the
+pool-state table's logical ID and the configuration's two numbers, its role may describe that one
+stack's resources and read and write the mock pool's items of that one table, and its timeout
+grows with the wait.
 
 The tests read the app's own pipeline, the one that is deployed. Two of them also build the app
 from a changed configuration, with no listener and with no pool.
@@ -318,7 +322,7 @@ def test_the_role_reads_one_secret_and_writes_under_verification_only(verificati
     assert write["Action"] == "s3:PutObject"
     assert text(write["Resource"]) == f"<{store}.Arn>/verification/*"
 
-    # Beside the seven grants, only CodeBuild's own: the project's logs and test reports.
+    # Beside its grants, only CodeBuild's own: the project's logs and test reports.
     services = {action.partition(":")[0] for s in verification.statements for action in as_list(s["Action"])}
     assert services == {
         "secretsmanager",
@@ -326,6 +330,7 @@ def test_the_role_reads_one_secret_and_writes_under_verification_only(verificati
         "aps",
         "ssm",
         "dynamodb",
+        "cloudformation",
         "autoscaling",
         "codepipeline",
         "logs",
@@ -400,8 +405,8 @@ def test_the_decision_on_the_coursework_pool_ends_before_the_coursework_tests(
 
 
 def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None:
-    # One statement on DynamoDB: a query, which reads a table's items by their partition key, the pool.
-    (query,) = verification.allowed("dynamodb")
+    # One statement on DynamoDB that queries: it reads a table's items by their partition key, the pool.
+    (query,) = [s for s in verification.allowed("dynamodb") if "dynamodb:Query" in as_list(s["Action"])]
     assert query["Action"] == "dynamodb:Query"
     (resource,) = as_list(query["Resource"])
 
@@ -436,6 +441,54 @@ def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None
     assert all("-" not in logical_id for _, logical_id in tables)
     assert [table for table in tables if matches(*table)] == [(stack, heartbeats)]
     assert {name for name, _ in tables} > {stack} and len([name for name, _ in tables if name == stack]) > 1
+
+
+def test_the_step_is_given_what_the_booking_of_the_mock_pool_needs(verification: Verification) -> None:
+    example, given = config.load({"RHI_CONFIG": "example"}), verification.given_by_the_project()
+    # The pools stack and the pool-state table's logical ID in it, as text: the stack the pipeline
+    # deploys under that name holds a table of that logical ID, keyed by pool and by record.
+    stack, logical_id = given[script.POOLS_STACK_VARIABLE], given[script.POOL_STATE_LOGICAL_ID_VARIABLE]
+    assert stack == f"{STAGE}-Pools" and isinstance(logical_id, str)
+    table = verification.stacks()[stack]["Resources"][logical_id]
+    assert table["Type"] == "AWS::DynamoDB::Table" and "TableName" not in table["Properties"]
+    assert [key["AttributeName"] for key in table["Properties"]["KeySchema"]] == ["pool", "record"]
+    # The two numbers of the configuration, as the script reads them, and the import path the
+    # booking needs.
+    assert script.check_of(given) == script.Check(
+        stack=stack,
+        logical_id=logical_id,
+        wait_minutes=example.check_wait_minutes,
+        session_max_hours=example.session_max_hours,
+    )
+    assert {"services/common", "scripts/pipeline"} <= set(given["PYTHONPATH"].split(":"))
+
+    # The role may describe the resources of that one stack, and no other action of CloudFormation.
+    (describe,) = verification.allowed("cloudformation")
+    assert describe["Action"] == "cloudformation:DescribeStackResource"
+    assert text(describe["Resource"]) == f"arn:<>:cloudformation:<>:<>:stack/{stack}/*"
+    # It may read and write the items of that one table whose partition key is the mock pool's
+    # name, and nothing else of DynamoDB but its query of the heartbeats table.
+    (items,) = [s for s in verification.allowed("dynamodb") if "dynamodb:Query" not in as_list(s["Action"])]
+    assert sorted(as_list(items["Action"])) == ["dynamodb:GetItem", "dynamodb:PutItem"]
+    assert text(items["Resource"]) == f"arn:<>:dynamodb:<>:<>:table/{stack}-{logical_id}-*"
+    assert items["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [script.MOCK_POOL]}}
+    assert script.MOCK_POOL in {pool.name for pool in example.pools}
+
+
+def test_the_step_s_timeout_covers_the_wait_for_the_session_s_instance(
+    verification: Verification, app_module: ModuleType, tmp_path: Path
+) -> None:
+    # The build outlasts the wait, the tests and the stop of the session: a longer wait is a longer
+    # timeout, by as much, and beside the wait there are hours for the rest.
+    example = config.load({"RHI_CONFIG": "example"})
+    beside_the_wait = verification.project["TimeoutInMinutes"] - example.check_wait_minutes
+    assert beside_the_wait >= 120
+    longer = build(app_module, tmp_path / "longer", lambda data: data.update(check_wait_minutes=180))
+    assert longer.project["TimeoutInMinutes"] == 180 + beside_the_wait
+    assert longer.given_by_the_project()[script.CHECK_WAIT_MINUTES_VARIABLE] == "180"
+    # A wait CodeBuild's limit for one build cannot hold is refused when the app is built.
+    with pytest.raises(ValueError, match="check_wait_minutes"):
+        build(app_module, tmp_path / "too long", lambda data: data.update(check_wait_minutes=36 * 60))
 
 
 def build(app_module: ModuleType, outdir: Path, change: Callable[[dict[str, Any]], None]) -> Verification:
