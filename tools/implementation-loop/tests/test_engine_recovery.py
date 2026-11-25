@@ -18,7 +18,7 @@ from implement_loop import report
 from implement_loop.agents import AgentFailure, FakeAgents, Script
 from implement_loop.config import Caps
 from implement_loop.engine import Engine
-from implement_loop.github import GitHubError
+from implement_loop.github import GhCli, GitHubError
 from implement_loop.model import Phase
 from implement_loop.state import RunStore
 from implement_loop.workspace import GitError, Workspace
@@ -655,6 +655,28 @@ class CrossVendorRegressions(RecoveryCase):
         self.assertEqual((st.phase, st.wait["kind"], st.wait["resume"], st.merge_refusals),
                          (Phase.WAITING, "github", "land", 3))
         self.assertEqual(len(self.events("merge_refused", 2)), 3)
+
+    def test_a_pull_request_whose_answer_gh_could_not_read_waits_and_is_opened_once(self):
+        """`gh` printed only its JSON decoder's words for the answer to the POST that opens the pull
+        request: nothing says GitHub refused it, and nothing in the engine is at fault."""
+        self.add_work(2, "docs/a.txt", "alpha")
+        self.epic(2)
+        create = self.gh.create_pr
+
+        def answer_unread(head, base, title, body):
+            create(head, base, title, body)   # GitHub acted on it
+            unread = subprocess.CompletedProcess(["gh"], 1, "", "unexpected end of JSON input\n")
+            return GhCli("test/test", runner=lambda *args, **kwargs: unread).create_pr(head, base, title, body)
+        self.gh.create_pr = answer_unread
+        self.run_engine()
+        st = self.store.issue(2)
+        assert st.wait is not None
+        self.assertEqual((st.phase, st.wait["kind"], st.wait["resume"]), (Phase.WAITING, "github", "land"))
+        self.assertEqual((self.events("step_crashed"), self.faults()), ([], []))
+        self.gh.create_pr = create
+        self.run_engine(agents=FakeAgents(self.scripts))
+        self.assertEqual(self.phase(2), Phase.DONE)
+        self.assertEqual(len([pr for pr in self.gh.prs.values() if pr["head"]["ref"] == st.branch]), 1)
 
     def test_a_leftover_stop_request_does_not_stop_the_next_run(self):
         self.add_work(2, "docs/a.txt", "alpha")

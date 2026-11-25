@@ -174,7 +174,7 @@ def test_first_turns_apart_for_each_pool(example: rhi_config.Config) -> None:
         read = selectors(measure.expression)
         assert set(read) == {f"{experience.FIRST_TOKEN}_bucket", f"{experience.FIRST_TOKEN}_count", rules.SESSION_ACTIVE}
         matchers = read[f"{experience.FIRST_TOKEN}_bucket"][0]
-        # The pool's streamed requests, held for their pool or not, under the target's boundary...
+        # The pool's streamed requests under the target's boundary, whatever else the gateway says of them...
         assert re.fullmatch(matchers.pop("le"), "5")
         assert "start" not in matchers
         apart.append((matchers["pool"], matchers["turn"]))
@@ -184,12 +184,19 @@ def test_first_turns_apart_for_each_pool(example: rhi_config.Config) -> None:
     assert apart == [(pool.name, turn) for pool in example.pools for turn in ("first", "later")]
 
 
-def test_a_stream_held_for_its_pool_counts_in_the_pools_objectives(example: rhi_config.Config) -> None:
-    # The gateway records a first turn that waited for its pool: its first token after 6 seconds,
+def test_no_objective_selects_how_a_request_started(example: rhi_config.Config) -> None:
+    # The gateway's histograms no longer tell a held request from a warm one: a query that selected
+    # that label would read nothing.
+    read = [selectors(query) for objective in objectives.objectives(example) for query in objective.queries]
+    assert read and not [matchers for each in read for found in each.values() for matchers in found if "start" in matchers]
+
+
+def test_a_stream_the_gateway_records_counts_in_its_pools_objectives(example: rhi_config.Config) -> None:
+    # The gateway records a first turn as it records every stream: its first token after 6 seconds,
     # then 4 tokens a second.
     registry = CollectorRegistry()
     made = experience.Experience(registry, clock=iter((0.0, 6.0, 7.0)).__next__)
-    turn = made.request("coursework", WireFormat.MESSAGES, held=True, first_turn=True)
+    turn = made.request("coursework", WireFormat.MESSAGES, first_turn=True)
     turn.token_sent(answer=True)
     turn.token_sent(answer=True)
     turn.settled(input_tokens=20, output_tokens=5)
@@ -198,7 +205,7 @@ def test_a_stream_held_for_its_pool_counts_in_the_pools_objectives(example: rhi_
     # It is among the observations of its pool's first turns, and of both measures of the speed.
     for family, name, measured in ((experience.FIRST_TOKEN, "Time to first token", 1), (experience.SPEED, "Output speed per stream", 2)):
         sample = served[f"{family}_count"]
-        assert sample.value == 1 and sample.labels["start"] == "held"
+        assert sample.value == 1 and "start" not in sample.labels
         counting = [
             measure.pool
             for measure in found[name].measures
@@ -287,7 +294,7 @@ def test_a_revised_floor_is_read_exactly_at_a_boundary_the_gateway_counts(tmp_pa
     # The gateway counts its waits with the floor among its boundaries (`rhi_gateway.settings`): 95
     # of 100 first tokens under 6 seconds meet the objective, 90 do not, and both bounds agree.
     wait_buckets = with_floors(WAIT_BUCKETS, config.target_ttft_p95_seconds)
-    labels = {"pool": "coursework", "wire_format": "messages", "start": "warm", "turn": "first"}
+    labels = {"pool": "coursework", "wire_format": "messages", "turn": "first"}
     for waits, met in (([4.0] * 90 + [5.5] * 5 + [7.0] * 5, True), ([4.0] * 90 + [7.0] * 10, False)):
         registry = CollectorRegistry()
         histogram = experience.Experience(registry, wait_buckets=wait_buckets).first_token
@@ -365,8 +372,8 @@ def test_a_boundary_is_selected_as_the_collector_writes_it() -> None:
 def test_the_example_floors_are_boundaries_the_gateway_counts_strictly_under(example: rhi_config.Config) -> None:
     registry = CollectorRegistry()
     made = experience.Experience(registry)
-    made.speed.labels("coursework", "messages", "warm").observe(1)
-    made.first_token.labels("coursework", "messages", "warm", "first").observe(1)
+    made.speed.labels("coursework", "messages").observe(1)
+    made.first_token.labels("coursework", "messages", "first").observe(1)
     # The boundaries the shares read are the gateway's, in the workspace's spelling of them.
     served = {
         (sample.name, objectives.boundary(float(sample.labels["le"])))

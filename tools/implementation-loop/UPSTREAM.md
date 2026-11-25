@@ -10,7 +10,7 @@ subtree: fixes are carried between the two copies by hand
 | Commit | `a0dc6df7f9744dc91a57b81acda2102e3394bafa` (2026-11-08) |
 | Engine version at that commit | 1.0.7 |
 | Vendored on | 2026-11-11 |
-| Engine version here | 1.2.21 |
+| Engine version here | 1.2.22 |
 | Licence | MIT, Copyright (c) 2026 Guilhem Busset: the same licence and holder as this repository's `LICENSE` |
 
 Taken from that commit: `tools/implementation-loop/` whole, `scripts/implement.sh`,
@@ -24,6 +24,22 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 ```
 
 The reason for each local change is in the pull request that made it.
+
+## An answer `gh` could not read is not a refusal (2026-11-25)
+
+A local patch, not in upstream. When an error answer says it is JSON and its body is empty or cut
+short, `gh api` prints only what its JSON decoder said (`unexpected end of JSON input`), without
+the HTTP status. The client took that for a refusal and raised `GitHubError`. On the POST that
+opens a pull request, in `land`, that was an engine fault: the issue waited for a new engine
+version, and no version could have helped. The engine's version becomes 1.2.22, so the issues
+that wait for it resume.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/github.py` | `transient` answers `unknown` for that message when `gh` printed no HTTP status, as for a 5xx or a broken connection: the request was sent, and nothing says what GitHub did with it. A read or an idempotent write is retried. A creating POST is not repeated and raises `GitHubUnavailable`, so the issue waits for GitHub (`github`) and the next run resumes its step, which looks up what it creates before creating it again. An answer that carries a status is still judged by its status. |
+| `implement_loop/__init__.py` | `VERSION` is 1.2.22. |
+| `tests/test_github.py` | That answer is retried on a read, not repeated on a creating POST, and classed `unknown`. |
+| `tests/test_engine_recovery.py` | New test: a pull request opened with that answer leaves the issue waiting for GitHub with no engine fault, and the next run lands it with one pull request. |
 
 ## A later verification discharges a smoke-test item, with nothing held (2026-11-22)
 

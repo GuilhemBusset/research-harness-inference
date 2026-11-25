@@ -1,9 +1,10 @@
 """What students experience, per pool and wire format (`rhi_gateway.experience`; system design, section 7.2).
 
-The gateway runs whole over the in-memory key store and ledger, with a heartbeat and its metrics.
-The engine is an `httpx.MockTransport`: its streams move the test's clock as they send each event,
-and its other answers report the usage of one turn. Every series is read from the answer of the
-gateway's metrics endpoint, as the collector reads it. Every student is made when the tests run.
+The gateway runs whole over the in-memory key store and ledger, local routes included, with its
+metrics. The engine is an `httpx.MockTransport`: its streams move the test's clock as they send
+each event, and its other answers report the usage of one turn. Every series is read from the
+answer of the gateway's metrics endpoint, as the collector reads it. Every student is made when the
+tests run.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import secrets
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -23,6 +24,7 @@ from prometheus_client import CollectorRegistry
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from starlette.applications import Starlette
+from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
@@ -36,7 +38,6 @@ from rhi_gateway.budget import InMemoryLedger
 from rhi_gateway.errors import WireFormat
 from rhi_gateway.experience import (
     FIRST_TOKEN,
-    HELD,
     IN_FLIGHT,
     INPUT_TOKENS,
     OUTPUT_TOKENS,
@@ -47,8 +48,8 @@ from rhi_gateway.experience import (
 )
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
-from rhi_gateway.heartbeat import Heartbeat
 from rhi_gateway.keystore import InMemoryKeyStore
+from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
@@ -117,14 +118,17 @@ STREAMS = {
 
 @dataclass
 class Gateway:
-    """The gateway with its heartbeat and its metrics; the key of each student, by alias."""
+    """The gateway with its metrics; the key of each student, by alias."""
 
     app: Starlette
     metrics: metrics.Metrics
-    heartbeat: Heartbeat
     keys: dict[str, str]
     now: float = 0.0  # The clock the token times are read on: the engine's streams move it.
     broken: bool = False  # Whether the engine fails.
+    ready: bool = True  # Whether each pool has a healthy target.
+    release: asyncio.Event | None = None  # When a test gives one, the engine keeps a request until it is set.
+    # The coursework pool's requests in flight, as served each time the engine had a request or sent a part of a stream.
+    seen: list[float | None] = field(default_factory=list)
 
 
 def student() -> tuple[str, int]:
@@ -148,11 +152,13 @@ def gateway(*students: tuple[str, int]) -> Gateway:
         for alias, github_id in students
     ]
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
-    heartbeat = Heartbeat("task", [pool.name for pool in POOLS], clock=lambda: float(NOW))
-    made = Gateway(Starlette(), metrics.Metrics(), heartbeat, keys)
+    made = Gateway(Starlette(), metrics.Metrics(), keys)
 
     async def engine(request: httpx.Request) -> httpx.Response:
         body = json.loads(await request.aread())
+        made.seen.append(value(made, IN_FLIGHT, pool=POOL))
+        if made.release is not None:
+            await made.release.wait()
         if made.broken:
             return httpx.Response(500)
         if request.url.path == routes.COUNT_TOKENS.upstream_path:
@@ -170,12 +176,17 @@ def gateway(*students: tuple[str, int]) -> Gateway:
         async def chunks() -> AsyncIterator[bytes]:
             for at, part in STREAMS[request.url.path]:
                 made.now = at
+                made.seen.append(value(made, IN_FLIGHT, pool=POOL))
                 yield part
 
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())
 
+    def views() -> dict[str, PoolView]:
+        return {pool.name: in_session(pool.name, ready=made.ready) for pool in POOLS}
+
+    authenticator = Authenticator(InMemoryKeyStore(*items), wall_clock=lambda: float(NOW))
     forwarding = Forwarding(
-        authenticator=Authenticator(InMemoryKeyStore(*items), wall_clock=lambda: float(NOW)),
+        authenticator=authenticator,
         ledger=ledger,
         filters={
             routes.MESSAGES: BodyFilter(messages.MESSAGES, POOLS),
@@ -188,10 +199,14 @@ def gateway(*students: tuple[str, int]) -> Gateway:
             "http://pools.example.com:8080",
             {pool.name: "secret" for pool in POOLS},
         ),
-        pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
-        heartbeat=heartbeat,
+        pools=Pools(views=views),
     )
-    made.app = build_app(forwarding_handlers(forwarding), heartbeat=heartbeat, metrics=made.metrics)
+    made.app = build_app(
+        forwarding_handlers(forwarding),
+        local=LocalRoutes(authenticator=authenticator, pools=POOLS, views=views),
+        metrics=made.metrics,
+        pools=[pool.name for pool in POOLS],
+    )
     # The series are the application's own, on the metrics' registry; only their clock is the test's.
     made.app.state.experience.clock = lambda: made.now
     return made
@@ -245,13 +260,10 @@ def test_speed_per_request(wire_format: WireFormat) -> None:
     assert post(made, TURNS[wire_format], stream=True) == 200
 
     labels = {"pool": POOL, "wire_format": wire_format.value}
-    # No request waits for its pool: each is a warm one.
-    speed = {**labels, "start": "warm"}
     # 401 tokens, the first sent at 2 seconds and the last at 22: the 400 after the first, over 20
     # seconds, observed one step of the float above (`rhi_gateway.experience`).
-    assert value(made, SPEED + "_sum", **speed) == pytest.approx(20, rel=1e-12)
-    assert value(made, SPEED + "_count", **speed) == 1
-    assert value(made, SPEED + "_count", **labels, start="held") is None
+    assert value(made, SPEED + "_sum", **labels) == pytest.approx(20, rel=1e-12)
+    assert value(made, SPEED + "_count", **labels) == 1
     assert value(made, OUTPUT_TOKENS + "_sum", **labels) == STREAMED
 
 
@@ -262,14 +274,14 @@ def test_speed_per_request(wire_format: WireFormat) -> None:
 )
 def test_no_speed_without_two_tokens_sent_at_two_moments(sent_at: tuple[float, ...], output_tokens: int) -> None:
     registry, now = CollectorRegistry(), [0.0]
-    turn = Experience(registry, clock=lambda: now[0]).request(POOL, WireFormat.MESSAGES, held=False, first_turn=True)
+    turn = Experience(registry, clock=lambda: now[0]).request(POOL, WireFormat.MESSAGES, first_turn=True)
     for at in sent_at:
         now[0] = at
         turn.token_sent(True)
     turn.settled(INPUT, output_tokens)
 
     labels = {"pool": POOL, "wire_format": "messages"}
-    assert registry.get_sample_value(SPEED + "_count", {**labels, "start": "warm"}) is None
+    assert registry.get_sample_value(SPEED + "_count", labels) is None
     assert registry.get_sample_value(OUTPUT_TOKENS + "_sum", labels) == output_tokens
 
 
@@ -284,7 +296,7 @@ def test_tokens_per_turn(wire_format: WireFormat) -> None:
     assert value(made, INPUT_TOKENS + "_count", **labels) == value(made, OUTPUT_TOKENS + "_count", **labels) == 1
     # An answer that is not a stream has no speed, and no other pool or format has this turn.
     assert {sample.labels["wire_format"] for sample in served(made) if "wire_format" in sample.labels} == {wire_format}
-    assert value(made, SPEED + "_count", **labels, start="warm") is None
+    assert value(made, SPEED + "_count", **labels) is None
 
 
 def test_every_request_that_settles_is_observed_once() -> None:
@@ -301,24 +313,109 @@ def test_every_request_that_settles_is_observed_once() -> None:
     assert value(made, INPUT_TOKENS + "_sum", **labels) == INPUT
 
 
-def test_in_flight_and_held_match_the_heartbeat() -> None:
-    made = gateway(student())
-    first = made.heartbeat.received(POOL)
-    made.heartbeat.received(POOL)
+def in_flight(made: Gateway) -> dict[str, float | None]:
+    """The requests in flight the endpoint serves for each configured pool."""
+    return {pool.name: value(made, IN_FLIGHT, pool=pool.name) for pool in POOLS}
 
-    def reported() -> dict[str, tuple[float, float]]:
-        return {row.pool: (row.in_flight, row.held) for row in made.heartbeat.rows()}
 
-    def served_counts() -> dict[str, tuple[float | None, float | None]]:
-        return {
-            pool.name: (value(made, IN_FLIGHT, pool=pool.name), value(made, HELD, pool=pool.name)) for pool in POOLS
-        }
+def test_a_request_counts_in_flight_until_it_ends_once() -> None:
+    registry = CollectorRegistry()
+    made = Experience(registry, [POOL, "research"])
 
-    # No request is held, so that count is zero.
-    assert served_counts() == reported() == {POOL: (2, 0), "research": (0, 0)}
-    # They are read at each scrape: one in flight ends.
+    def counts() -> dict[str, float | None]:
+        return {name: registry.get_sample_value(IN_FLIGHT, {"pool": name}) for name in (POOL, "research")}
+
+    # Every configured pool has its series, zero for one with no request, read at each scrape.
+    first, second = made.forwarded(POOL), made.forwarded(POOL)
+    assert counts() == {POOL: 2, "research": 0}
     first.end()
-    assert served_counts() == reported() == {POOL: (1, 0), "research": (0, 0)}
+    first.end()
+    assert counts() == {POOL: 1, "research": 0}
+    second.end()
+    assert counts() == {POOL: 0, "research": 0}
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "not a stream"])
+def test_a_forwarded_request_is_in_flight_from_its_forwarding_to_its_end(stream: bool) -> None:
+    made = gateway(student())
+    assert in_flight(made) == {POOL: 0, "research": 0}
+    assert post(made, routes.MESSAGES, stream=stream) == 200
+    # In flight while the engine had it and, for a stream, as each part was sent; not once it has ended.
+    assert len(made.seen) == (1 + len(STREAMS[routes.MESSAGES.upstream_path]) if stream else 1)
+    assert set(made.seen) == {1}
+    assert in_flight(made) == {POOL: 0, "research": 0}
+
+
+def test_a_token_count_and_the_local_routes_are_not_in_flight() -> None:
+    made = gateway(student())
+    (key,) = made.keys.values()
+
+    async def local() -> list[int]:
+        transport = httpx.ASGITransport(app=made.app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example.com") as client:
+            entries = (routes.STATUS, routes.MODELS, routes.HELLO)
+            answers = [await client.request(entry.method, entry.path, headers={"x-api-key": key}) for entry in entries]
+            return [answer.status_code for answer in answers]
+
+    assert asyncio.run(local()) == [200, 200, 200]
+    assert post(made, routes.COUNT_TOKENS) == 200
+    # Only the token count reached the engine, and it was not in flight while it was there.
+    assert made.seen == [0]
+    assert in_flight(made) == {POOL: 0, "research": 0}
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "not a stream"])
+def test_a_request_the_pool_cannot_serve_is_never_in_flight(stream: bool) -> None:
+    made = gateway(student())
+    made.ready = False  # Its session is active, and no target is healthy.
+    assert post(made, routes.MESSAGES, stream=stream) == 503
+    assert (made.seen, in_flight(made)) == ([], {POOL: 0, "research": 0})
+
+
+def test_a_request_the_client_leaves_is_no_longer_in_flight() -> None:
+    made = gateway(student())
+    (key,) = made.keys.values()
+    body = json.dumps({"model": POOL, "max_tokens": 10, "messages": [{"role": "user", "content": "hello"}]}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": routes.MESSAGES.path,
+        "raw_path": routes.MESSAGES.path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"x-api-key", key.encode()), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("gateway.example.com", 443),
+    }
+
+    async def scenario() -> None:
+        made.release = asyncio.Event()  # Never set: the engine keeps the request.
+        request: list[Message] = [{"type": "http.request", "body": body, "more_body": False}]
+        left = asyncio.Event()
+
+        async def receive() -> Message:
+            if request:
+                return request.pop()
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            pass
+
+        call = asyncio.ensure_future(made.app(scope, receive, send))
+        # A guard, not the clock under test.
+        async with asyncio.timeout(10):
+            while not made.seen:
+                await asyncio.sleep(0.001)
+            assert in_flight(made)[POOL] == 1
+            left.set()
+            await call
+        assert in_flight(made) == {POOL: 0, "research": 0}
+
+    asyncio.run(scenario())
 
 
 def test_no_student_label() -> None:
@@ -331,9 +428,14 @@ def test_no_student_label() -> None:
 
     samples = served(made)
     # Every series of the module is there. Its labels are the pool, the wire format and a histogram's
-    # boundary, and for the two waits how the request started and which turn it is.
+    # boundary, and for the two waits which turn it is.
     assert all(any(sample.name.startswith(name) for sample in samples) for name in SERIES)
-    assert {label for sample in samples for label in sample.labels} == {"pool", "wire_format", "le", "start", "turn"}
+    assert {label for sample in samples for label in sample.labels} == {"pool", "wire_format", "le", "turn"}
+    # The gateway holds no request: nothing it serves says how a request started, and it has no
+    # gauge of requests held.
+    everything = list(text_string_to_metric_families(scrape(made)))
+    assert not [sample for family in everything for sample in family.samples if "start" in sample.labels]
+    assert not [family.name for family in everything if "held" in family.name]
     names = [str(name) for alias, github_id in students for name in (alias, github_id, made.keys[alias])]
     for sample in samples:
         written = " ".join([sample.name, *sample.labels, *sample.labels.values()])
@@ -357,14 +459,14 @@ def test_a_value_at_a_floor_is_not_in_the_floors_bucket() -> None:
     # A first token at exactly 5 seconds is not under 5; a stream at exactly 15 tokens per second is
     # at 15 or more. The bucket of each floor holds neither, the next one up holds each.
     registry, now = CollectorRegistry(), [0.0]
-    one = Turn(Experience(registry, clock=lambda: now[0]), POOL, WireFormat.MESSAGES, held=False, first_turn=True)
+    one = Turn(Experience(registry, clock=lambda: now[0]), POOL, WireFormat.MESSAGES, first_turn=True)
     now[0] = 5.0
     one.token_sent(answer=True)
     now[0] = 25.0
     one.token_sent(answer=True)
     one.settled(input_tokens=10, output_tokens=301)
-    wait = {"pool": POOL, "wire_format": "messages", "start": "warm", "turn": "first"}
-    speed = {"pool": POOL, "wire_format": "messages", "start": "warm"}
+    wait = {"pool": POOL, "wire_format": "messages", "turn": "first"}
+    speed = {"pool": POOL, "wire_format": "messages"}
     for name, labels, floor, above in ((FIRST_TOKEN, wait, "5.0", "7.5"), (SPEED, speed, "15.0", "17.5")):
         assert registry.get_sample_value(f"{name}_bucket", {**labels, "le": floor}) == 0
         assert registry.get_sample_value(f"{name}_bucket", {**labels, "le": above}) == 1

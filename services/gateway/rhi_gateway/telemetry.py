@@ -14,7 +14,6 @@ configuration sends that output to the gateway's log group. A record holds exact
 | `input_tokens`, `output_tokens` | what the request's settlement observed; 0 when nothing was forwarded |
 | `cached_input_tokens` | the part of `input_tokens` the engine reported read from its cache, as the usage parsers give it; 0 when it reported none |
 | `time_to_first_token_ms` | from the request accepted to its first token sent, in milliseconds, as the time-to-first-token histogram counts it (`rhi_gateway.experience`); `null` when no token was sent |
-| `held_ms` | how long the request was held while its pool started, in milliseconds: 0 on every request, since the gateway holds none (system design, section 5.3) |
 | `latency_ms` | from the request's arrival to its end, in milliseconds |
 | `status` | the HTTP status sent; `null` if none was |
 | `cause` | the cause the gateway gave (`rhi_common.causes`), `none` for its own fault, else `null` |
@@ -94,7 +93,6 @@ class RequestRecord:
     cached_input_tokens: int = 0
     token_count: bool = False
     time_to_first_token_ms: int | None = None
-    held_ms: int = 0
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -107,7 +105,6 @@ class RequestRecord:
             "output_tokens": self.output_tokens,
             "cached_input_tokens": self.cached_input_tokens,
             "time_to_first_token_ms": self.time_to_first_token_ms,
-            "held_ms": self.held_ms,
             "latency_ms": self.latency_ms,
             "status": self.status,
             "cause": self.cause,
@@ -145,13 +142,6 @@ def note_first_token(seconds: float) -> None:
     record = _CURRENT.get()
     if record is not None and record.time_to_first_token_ms is None:
         record.time_to_first_token_ms = _milliseconds(seconds)
-
-
-def note_held(seconds: float) -> None:
-    """The seconds the request was held while its pool started."""
-    record = _CURRENT.get()
-    if record is not None:
-        record.held_ms = _milliseconds(seconds)
 
 
 def _milliseconds(seconds: float) -> int:

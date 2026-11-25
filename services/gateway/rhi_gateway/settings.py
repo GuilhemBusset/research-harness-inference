@@ -9,18 +9,16 @@ The deployment fills these variables in, and nothing else configures the gateway
 | `RHI_UPSTREAM_URL` | The address of the internal load balancer's listener, an `http` or `https` URL | required |
 | `RHI_TARGET_GROUPS` | Each pool's target group, as JSON from the pool's name to the group's ARN; `{}` with no pool | required |
 | `RHI_POOL_SECRETS` | Each pool's secret, as JSON from the pool's name to the secret's ARN; `{}` with no pool | required |
-| `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_HEARTBEAT_TABLE`, `RHI_POOL_STATE_TABLE` | The deployed tables' names | required |
-| `RHI_SCALER_FUNCTION` | The scaler function's name | required |
+| `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_POOL_STATE_TABLE` | The deployed tables' names | required |
 | `RHI_COURSE_END` | The configuration's course end date, `YYYY-MM-DD`: every usage row the gateway writes expires 90 days after it (section 6.6) | required |
 | `RHI_BODY_LIMIT_BYTES` | The largest request body the filter reads, in bytes | 8388608 |
 | `RHI_LONGEST_REQUEST_SECONDS` | The longest a request may run | 1800 |
-| `RHI_KEEPALIVE_SECONDS` | The interval between the keep-alives of a held request | 10 |
 | `RHI_RETRY_AFTER_WARMING`, `RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE`, `RHI_RETRY_AFTER_CONCURRENCY_LIMIT` | The seconds of `Retry-After` for the three causes that carry one | 30, 60, 5 |
 | `RHI_SESSION_MAX_HOURS` | The longest a session may last, in hours: the bound every pool's session is read under (`rhi_common.sessions`, section 5.6) | 12 |
 | `RHI_TARGET_TTFT_P95_SECONDS`, `RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND`, `RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND` | The floors of the objectives of section 7.3 (seconds to a first token, tokens a second of a stream), which the gateway's histograms take among their boundaries | 5, 15, 10 |
 
 The defaults are section 17's, and the configuration's (`src/rhi/config.py`) for the keys the
-deployment writes into the seven numeric variables and the three floors. A numeric variable is a
+deployment writes into the six numeric variables and the three floors. A numeric variable is a
 whole number above zero, in digits; a floor is a number above zero, in digits with at most one
 decimal point.
 
@@ -30,11 +28,10 @@ at a boundary. So the waits are counted in `WAIT_BUCKETS` with the floor of the 
 among them, and the speed in `SPEED_BUCKETS` with the two floors of a stream
 (`rhi_common.boundaries`): a floor the owner revises is read exactly, wherever it falls.
 
-A table's name is one DynamoDB can hold (3 to 255 letters, digits, `_`, `-` and `.`), and the
-function's name one Lambda can (1 to 64 letters, digits, `_` and `-`). A target group's ARN is an
-ARN of a load balancing target group, and a secret's ARN an ARN of a Secrets Manager secret: one
-given for the other is refused, like any text that is no ARN. A value of another form would only
-fail later, at the first call that used it.
+A table's name is one DynamoDB can hold (3 to 255 letters, digits, `_`, `-` and `.`). A target
+group's ARN is an ARN of a load balancing target group, and a secret's ARN an ARN of a Secrets
+Manager secret: one given for the other is refused, like any text that is no ARN. A value of
+another form would only fail later, at the first call that used it.
 
 **No pool is a valid gateway.** The owner's configuration has an empty pools table until its first
 pool is added, and a gateway that refused to start would keep its service, and every later
@@ -79,13 +76,10 @@ TARGET_GROUPS = "RHI_TARGET_GROUPS"
 POOL_SECRETS = "RHI_POOL_SECRETS"
 KEYS_TABLE = "RHI_KEYS_TABLE"
 USAGE_TABLE = "RHI_USAGE_TABLE"
-HEARTBEAT_TABLE = "RHI_HEARTBEAT_TABLE"
 POOL_STATE_TABLE = "RHI_POOL_STATE_TABLE"
-SCALER_FUNCTION = "RHI_SCALER_FUNCTION"
 COURSE_END = "RHI_COURSE_END"
 BODY_LIMIT_BYTES = "RHI_BODY_LIMIT_BYTES"
 LONGEST_REQUEST_SECONDS = "RHI_LONGEST_REQUEST_SECONDS"
-KEEPALIVE_SECONDS = "RHI_KEEPALIVE_SECONDS"
 RETRY_AFTER_WARMING = "RHI_RETRY_AFTER_WARMING"
 RETRY_AFTER_CAPACITY_UNAVAILABLE = "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE"
 RETRY_AFTER_CONCURRENCY_LIMIT = "RHI_RETRY_AFTER_CONCURRENCY_LIMIT"
@@ -102,9 +96,7 @@ REQUIRED = (
     POOL_SECRETS,
     KEYS_TABLE,
     USAGE_TABLE,
-    HEARTBEAT_TABLE,
     POOL_STATE_TABLE,
-    SCALER_FUNCTION,
     COURSE_END,
 )
 
@@ -113,7 +105,6 @@ NUMERIC_DEFAULTS: Mapping[str, int] = MappingProxyType(
     {
         BODY_LIMIT_BYTES: 8_388_608,
         LONGEST_REQUEST_SECONDS: 1800,
-        KEEPALIVE_SECONDS: 10,
         RETRY_AFTER_WARMING: 30,
         RETRY_AFTER_CAPACITY_UNAVAILABLE: 60,
         RETRY_AFTER_CONCURRENCY_LIMIT: 5,
@@ -135,9 +126,8 @@ _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
 _DECIMAL = re.compile(r"[0-9]{1,32}(?:\.[0-9]{1,32})?", re.ASCII)
 # The fields a refusal of the pools table may name: a pool's own, never anything a value held.
 _POOL_FIELDS = FIELDS | {"name"}
-# The names DynamoDB and Lambda accept, as their APIs document them.
+# The names DynamoDB accepts, as its API documents them.
 _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
-_FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
 # A date as the deployment writes it, YYYY-MM-DD.
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 # An ARN's partition, service, region and account, then the resource of the one kind a variable holds.
@@ -171,13 +161,10 @@ class Settings:
     pool_secrets: Mapping[str, str]
     keys_table: str
     usage_table: str
-    heartbeat_table: str
     pool_state_table: str
-    scaler_function: str
     course_end: datetime.date
     body_limit_bytes: int = NUMERIC_DEFAULTS[BODY_LIMIT_BYTES]
     longest_request_seconds: int = NUMERIC_DEFAULTS[LONGEST_REQUEST_SECONDS]
-    keepalive_seconds: int = NUMERIC_DEFAULTS[KEEPALIVE_SECONDS]
     retry_after_warming: int = NUMERIC_DEFAULTS[RETRY_AFTER_WARMING]
     retry_after_capacity_unavailable: int = NUMERIC_DEFAULTS[RETRY_AFTER_CAPACITY_UNAVAILABLE]
     retry_after_concurrency_limit: int = NUMERIC_DEFAULTS[RETRY_AFTER_CONCURRENCY_LIMIT]
@@ -219,13 +206,6 @@ def _table(environ: Mapping[str, str], variable: str) -> str:
     value = _required(environ, variable)
     if _TABLE_NAME.fullmatch(value) is None:
         raise SettingsError(variable, "must be a table's name: 3 to 255 letters, digits, '_', '-' and '.'")
-    return value
-
-
-def _function(environ: Mapping[str, str], variable: str) -> str:
-    value = _required(environ, variable)
-    if _FUNCTION_NAME.fullmatch(value) is None:
-        raise SettingsError(variable, "must be a function's name: 1 to 64 letters, digits, '_' and '-'")
     return value
 
 
@@ -343,13 +323,10 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         pool_secrets=_by_pool(environ, POOL_SECRETS, pools, "secret's ARN", _SECRET_ARN),
         keys_table=_table(environ, KEYS_TABLE),
         usage_table=_table(environ, USAGE_TABLE),
-        heartbeat_table=_table(environ, HEARTBEAT_TABLE),
         pool_state_table=_table(environ, POOL_STATE_TABLE),
-        scaler_function=_function(environ, SCALER_FUNCTION),
         course_end=_date(environ, COURSE_END),
         body_limit_bytes=_number(environ, BODY_LIMIT_BYTES),
         longest_request_seconds=_number(environ, LONGEST_REQUEST_SECONDS),
-        keepalive_seconds=_number(environ, KEEPALIVE_SECONDS),
         retry_after_warming=_number(environ, RETRY_AFTER_WARMING),
         retry_after_capacity_unavailable=_number(environ, RETRY_AFTER_CAPACITY_UNAVAILABLE),
         retry_after_concurrency_limit=_number(environ, RETRY_AFTER_CONCURRENCY_LIMIT),

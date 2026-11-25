@@ -25,6 +25,13 @@ the instance roles the workspace. So every export of those two stacks that it im
 workspace's that only the scaler names with the pools table empty included (`_keep_exports`), is
 kept, through the exporting stack's `export_value`: an export that a deployed stack imports cannot
 be deleted, and this stack's update, which drops the import, comes after theirs.
+
+**Exports the gateway stack no longer imports** (`_keep_gateway_exports`). The gateway's role once
+invoked the scaler and wrote the heartbeats table, so the gateway stack imported the function's
+name and ARN and the table's name and ARN. It imports none of the four now, but the gateway stack
+that is deployed still does until its own update, which comes after this stack's: unparked, this
+stack keeps the four exports, under the names they had, so that its update deletes no export in
+use. They can go in a later change, once every deployed gateway stack is one that imports none.
 """
 
 from __future__ import annotations
@@ -161,6 +168,7 @@ class PoolsStack(cdk.Stack):
             log_group(Construct(self, "Scaler"))
         else:
             self._fleet(config, network, observability)
+            self._keep_gateway_exports()
         # The name of each pool's release parameter, by the pool's name, as text: a stack that does
         # not hold the parameter, the pipeline's, names it so. The output holds the same names.
         self.release_parameters = {name: release_parameter(name) for name in self.releases}
@@ -244,6 +252,18 @@ class PoolsStack(cdk.Stack):
             pool.name: PoolHooks(self, f"Hooks-{pool.name}", pool=pool, group=self.groups[pool.name].group)
             for pool in config.pools
         }
+
+    def _keep_gateway_exports(self) -> None:
+        """Keeps the four exports of this stack that the gateway stack imported while its role invoked
+        the scaler and wrote the heartbeats table (the module's docstring)."""
+        assert self.scaler is not None, "an unparked stage has the scaler"
+        for value in (
+            self.tables.heartbeats.table_arn,
+            self.tables.heartbeats.table_name,
+            self.scaler.function.function_arn,
+            self.scaler.function.function_name,
+        ):
+            self.export_value(value)
 
     def _keep_exports(self, network: NetworkStack, observability: ObservabilityStack) -> None:
         """Parked, keeps the exports this stack imports unparked of what stays in the network stack

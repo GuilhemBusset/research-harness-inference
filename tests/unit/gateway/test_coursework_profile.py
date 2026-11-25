@@ -30,7 +30,6 @@ from rhi_common import tables
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.records import Session
 from rhi_common.students import StudentKey
-from rhi_gateway import main as entry
 from rhi_gateway import profile, routes
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.main import Gateway, aws_clients, build
@@ -43,7 +42,6 @@ UPSTREAM = "http://internal.example.com:8000"
 TABLES = {
     "RHI_KEYS_TABLE": (tables.KEYS, "keys-of-the-test"),
     "RHI_USAGE_TABLE": (tables.USAGE, "usage-of-the-test"),
-    "RHI_HEARTBEAT_TABLE": (tables.HEARTBEATS, "heartbeats-of-the-test"),
     "RHI_POOL_STATE_TABLE": (tables.POOL_STATE, "pool-state-of-the-test"),
 }
 
@@ -111,7 +109,6 @@ def aws(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.delenv(entry.METADATA_VARIABLE, raising=False)
     # The gateway calls the SDK from several threads, and moto's tables take one call at a time.
     one_at_a_time = threading.Lock()
     make_api_call = BaseClient._make_api_call
@@ -152,7 +149,6 @@ def example_settings() -> Settings:
         "RHI_UPSTREAM_URL": UPSTREAM,
         "RHI_TARGET_GROUPS": json.dumps({name: target_group(name) for name in names}),
         "RHI_POOL_SECRETS": json.dumps(arns),
-        "RHI_SCALER_FUNCTION": "scaler-of-the-test",
         "RHI_COURSE_END": "2027-01-15",
         **{variable: name for variable, (_, name) in TABLES.items()},
     }

@@ -8,15 +8,13 @@
 #   the pool-state table, by their ARNs: the gateway reads the key of each request, and each pool's
 #   state record and the scaler's note.
 # - the same reads, and dynamodb:BatchWriteItem, DeleteItem, PutItem and UpdateItem, on the usage
-#   table and on the heartbeat table, by their ARNs: the gateway counts each student's tokens
-#   against the budget, and writes its own heartbeat rows.
+#   table, by its ARN: the gateway counts each student's tokens against the budget, and keeps
+#   there each student's concurrency slots and the load balancer's cookie.
 # - secretsmanager:GetSecretValue and secretsmanager:DescribeSecret on each pool's bearer secret,
 #   /rhi/pools/<pool>/bearer-??????, by its fixed name: the gateway reads it at start and sends it
 #   to the pool's engines.
 # - elasticloadbalancing:DescribeTargetHealth on every resource: the gateway reads the health of
 #   each pool's target group to know when the pool is ready.
-# - lambda:InvokeFunction on the scaler function only, by its ARN: a request for a pool that
-#   sleeps asks the scaler to wake it.
 # - aps:RemoteWrite on the metrics workspace only, by its ARN: the collector pushes the gateway's
 #   metrics.
 #
