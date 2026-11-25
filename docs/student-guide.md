@@ -71,16 +71,15 @@ completes a task on the coursework model (section 7), but expect rough edges.
 ### Codex
 
 `rhi login` writes a Codex profile named `rhi` (`~/.codex/rhi.config.toml`): the endpoint, the
-default model, `rhi token` as the command that gives Codex the key, and a 15-minute stream timeout.
-Use Codex with that profile:
+default model, and `rhi token` as the command that gives Codex the key. Use Codex with that
+profile:
 
 ```sh
 codex --profile rhi
 ```
 
-Always pass `--profile rhi`. Without the profile's timeout, Codex gives up after 5 minutes when the
-endpoint keeps its request waiting for a machine to start (section 6). Your own `config.toml` is
-never changed by `rhi login`.
+Always pass `--profile rhi`: without it, Codex does not know the endpoint. The profile sets no
+timeout, so Codex keeps its own. Your own `config.toml` is never changed by `rhi login`.
 
 ### An SDK script
 
@@ -200,60 +199,64 @@ script, give the model's name as `model`.
 
 ## 5. The endpoint serves during class sessions only
 
-The model serves students only while a class session is on. The instructor switches each session
-on before the class and off after it. There is no schedule to look up.
+The model serves students only during class sessions. A session is a booking of one pool, with a
+start, an end and a number of GPU machines, and the instructor books each one ahead of the class.
+The machines are asked for when the session starts, so that they are there when you arrive. The
+endpoint has no timetable of the sessions to come: while a pool's session is on, `rhi status`
+shows when it ends.
 
-Outside a session, a request to the model, and the wake that `rhi wait coursework` sends, are
-answered at once with the cause `no_session`, and `rhi status` lists each pool as unavailable with
-that cause. The rest of `rhi` works at any time: log in before your first session, check
-`rhi status`, and revoke a key whenever you need to. A request already running when the session
-ends is allowed to finish.
+Sessions are booked pool by pool, so one pool can have a session on while another has none. A
+request to a pool that has no session on gets its answer at once: an error with the cause
+`no_session`. `rhi status` shows that pool as unavailable with that cause, whatever the other
+pools show. When the coursework pool is the one with no session on, `rhi wait coursework` stops
+with the same cause. Nothing you send starts a session or a machine. The rest of `rhi` works at
+any time: log in before your first session, check `rhi status`, and revoke a key whenever you need
+to. A request already running when its pool's session ends is allowed to finish.
 
 For homework, between sessions, and whenever the endpoint is down or not ready, use your own
 subscriptions to hosted models. The endpoint does not stand in for them.
 
-## 6. Waiting for a cold pool
+## 6. Waiting for a session's machines
 
-To save money, a pool with no users scales down to zero machines. The first request to a cold pool
-starts a machine, which takes a few minutes: an estimated 2 to 6 minutes from a prepared machine,
-longer otherwise. While it starts, the endpoint holds your request rather than refusing it:
+A pool answers once one of its session's machines is in service. A machine takes an estimated 3 to
+13 minutes to start, and when no GPU machine is free in the cloud, the pool waits for one, which
+can take half an hour or more. That is why the instructor books a session early. When you arrive
+before the machines all the same, the pool is in one of two situations:
 
-- **A streaming request** (what Claude Code and Codex send) is held for up to 7 minutes. During the
-  wait, the endpoint sends a keep-alive every 10 seconds, so the connection stays open. Your
-  harness may look stuck: let it wait.
-- **A non-streaming call** (a script that does not stream) is held for up to 4 minutes.
+- a machine is starting: the pool's state is `warming`;
+- the pool is waiting for a GPU machine to become available: its state is `unavailable`, with the
+  cause `capacity_unavailable`. The pool keeps asking until it has its machines.
 
-If the pool is still not ready when the hold ends, the request fails with one of two causes:
+The endpoint keeps no request waiting. A request to a pool that cannot serve yet gets its answer at
+once: an error with the cause `warming` or `capacity_unavailable`. Claude Code, Codex and the SDKs
+retry such an error a few times by themselves, which covers the last moments of a start and
+nothing longer. A token count, which Claude Code sends often to measure its context, gets the same
+answer, and Claude Code carries on without it. No request, and no command of `rhi`, starts a
+machine or makes one come faster.
 
-- `capacity_unavailable` when the pool's last attempt to start a machine, in the past 10 minutes,
-  found no GPU machine available;
-- `warming` otherwise: a machine is still starting.
-
-A token count, which Claude Code sends often to measure its context, is never held: on a pool that
-is not ready it is answered at once with `warming`. Claude Code carries on without it.
-
-When a session begins, start the pool you will use and wait for it:
+So before you start your harness, wait until the pool is ready:
 
 ```sh
 rhi wait coursework
 ```
 
-The command starts the pool, prints its state each time it changes, and returns when the pool is
-ready. It stops with the cause if the pool cannot start, and gives up after 20 minutes. Pass
-`--timeout` with a number of minutes to change that:
+The command reads the pool's state every 10 seconds, prints it each time it changes, and returns
+when the pool is ready. It starts nothing: it only waits. It keeps waiting while the pool is
+`warming` or waits for a machine, stops with the cause `no_session` when the pool has no session
+on, and gives up after 20 minutes. Pass `--timeout` with a number of minutes to change that:
 
 ```sh
-rhi wait coursework --timeout 10
+rhi wait coursework --timeout 45
 ```
 
-`rhi status` shows each pool as one of:
+`rhi status` shows each pool in one of three states, and, while its session is on, when the
+session ends:
 
 | State | Meaning |
 | --- | --- |
-| `cold` | No machine is running, and none has been asked for |
-| `warming` | A machine is starting |
-| `ready` | The pool answers now |
-| `unavailable` | The pool cannot be started for you; `rhi status` prints the cause (section 8) |
+| `ready` | The session is on and a machine is in service: the pool answers now |
+| `warming` | The session is on and a machine is starting |
+| `unavailable` | The pool cannot answer, and `rhi status` prints the cause (section 8): `capacity_unavailable` when the session is on and the pool waits for a GPU machine, `no_session` when the pool has no session on |
 
 ## 7. What the coursework model cannot do here
 
@@ -295,11 +298,9 @@ ask for help, give the cause's name. Never paste your key.
 | `not_found` | The request went to an address the endpoint does not serve | Check the endpoint's address: Claude Code takes it as given, Codex, OpenCode, Pi and SDK scripts take it followed by `/v1`. Run `rhi login` again to rewrite the settings of Claude Code and Codex; for OpenCode and Pi, check the base URL of their entry (section 3) |
 | `request_refused` | The endpoint refused the body of the request: not JSON, too large, or an image given by URL instead of inline | Send images inline, and split very large inputs. If a harness does this on its own, tell the instructor which harness and version |
 | `concurrency_limit` | You already have as many requests running as you are allowed (section 9) | Wait for one to end: harnesses and SDKs retry by themselves. Run fewer agents at once |
-| `no_session` | No class session is on | Use your own subscription to a hosted model. The endpoint answers again when the instructor starts the next session |
-| `warming` | The pool was still starting when the hold ended, or a token count reached a pool that was not ready (section 6) | Run `rhi wait coursework`, with the model's name, then try again |
-| `capacity_unavailable` | The pool's last attempt to start a machine found no GPU machine available | Retry later: the pool keeps trying. If it lasts, use your own subscription for this session |
-| `pool_scheduled_only` | Only the instructor can start this pool | Use another model (`rhi status` lists them), or ask the instructor |
-| `pool_disabled` | The instructor has switched this pool off | Use another model (`rhi status` lists them) |
+| `no_session` | No session is on for this pool (section 5) | Use your own subscription to a hosted model. The pool answers again during the next session the instructor books |
+| `warming` | The pool's session is on and a machine is starting, but none is in service yet (section 6) | Run `rhi wait coursework`, with the model's name, then try again |
+| `capacity_unavailable` | The pool's session is on, and the pool waits for a GPU machine to become available (section 6) | Run `rhi wait coursework`, with the model's name: the pool keeps asking for its machines. If it lasts, use your own subscription for this session |
 | `engine_error` | The model failed, or ended its answer early | Try again. If it keeps happening, start a fresh session of your harness and tell the instructor |
 | `time_limit` | The request reached the 30-minute limit | Split the work into smaller requests |
 

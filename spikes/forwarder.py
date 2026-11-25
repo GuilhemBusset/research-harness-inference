@@ -5,11 +5,12 @@ This module is not a job. A spike that runs a client imports it as `forwarder`.
 
 **The clients** (`Client`): Claude Code and Codex at the versions `spikes/harnesses.py` pins and
 installs, Codex once with its default timer and once with the profile `rhi login` writes, and a
-script of each SDK of the group `spikes`.
+script of each SDK of the group `spikes`. A login writes no stream timeout any more, so the two
+are the same client today.
 
 **The home.** Each run of a client has a home of its own, holding what `rhi login` writes there
 (`rhi_cli.harness`): Claude Code's settings, Codex's profile `rhi` (for Codex with its default
-timer, the same profile without `stream_idle_timeout_ms`), and the key in the CLI's key file
+timer, the same profile without any `stream_idle_timeout_ms`), and the key in the CLI's key file
 (`write_home`). `rhi token`, which both harnesses run for the key, is a command of the home's `bin`
 folder that runs the CLI of this repository from the job's environment, since the job installs the
 repository's libraries and not the CLI's entry point.
@@ -385,7 +386,7 @@ def _environment(values: Mapping[str, str]) -> Generator[None]:
 
 
 def without_timer(profile: str) -> str:
-    """Codex's profile with its stream timeout left out: Codex with its default timer."""
+    """Codex's profile with any stream timeout left out: Codex with its default timer."""
     return "".join(
         line for line in profile.splitlines(keepends=True) if not line.strip().startswith("stream_idle_timeout_ms")
     )

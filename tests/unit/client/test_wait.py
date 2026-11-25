@@ -1,9 +1,7 @@
 """`rhi status`, `rhi wait` and `rhi revoke`, with every key made at run time.
 
-The status and the wake are answered by a stand-in for the endpoint these commands were written
-for (`Gateway`, below). The gateway itself no longer has a wake, a state `cold` or a pool's mode
-(system design, section 5.3), and the two commands follow it in their own change: until then they
-speak the earlier protocol, and these tests hold what they do with its answers. GitHub's device
+The status is answered by a stand-in for the gateway (`Gateway`, below), which has the three
+states and the two causes of the system design, section 5.3, and no other route. GitHub's device
 endpoint and the issuer's routes are stubs. One clock, which the test moves, is the CLI's and the
 stand-in's.
 """
@@ -30,12 +28,12 @@ from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
 
 ENDPOINT = "https://example.com"
-NOW = 1_800_000_000
 INTERVAL = 7
+# When the stand-in's sessions end, in seconds since the epoch: 2027-01-15 13:30 UTC.
+SESSION_ENDS_AT = 1_800_019_800
 
 
-# The pools the stand-in lists, in its order: the first is the default one, and the last is one
-# that students could not start.
+# The pools the stand-in lists, in its order.
 POOLS = ("coursework", "mock", "evening")
 
 
@@ -51,41 +49,37 @@ class Clock:
 
 @dataclass
 class Gateway:
-    """The endpoint behind the CLI's transport, as the commands were written for it.
+    """The gateway behind the CLI's transport: `GET /status`, to the stored key alone, and no other route.
 
-    `GET /status` gives each pool's record, and `POST /wake` the record of the pool its body's
-    `model` names (a `claude-` name is the default pool's), both to the stored key alone. A pool
-    is `ready` from the second `ready_at` gives it, and `unavailable` with `pool_disabled` from
-    the second `disabled_at` gives it; before that it is `cold`, and `warming` once a wake for it
-    has been answered. The pool `evening` is `unavailable` with `pool_scheduled_only`.
+    `reads` gives, for a pool, what it reads from which second on, in order: `no_session`,
+    `capacity_unavailable`, `warming` or `ready`. A pool has no session before its first second,
+    and one that is not named never has one. A pool whose session is on gives when it ends.
     """
 
+    reads: dict[str, dict[float, str]] = field(default_factory=dict)
     clock: Clock = field(default_factory=Clock)
-    ready_at: dict[str, float] = field(default_factory=dict)
-    disabled_at: dict[str, float] = field(default_factory=dict)
     key: str = field(default_factory=generate_key)
 
     def __post_init__(self) -> None:
         self.calls: list[tuple[str, str, float]] = []
-        self.woken: set[str] = set()
 
-    def record(self, name: str) -> dict[str, str]:
+    def record(self, name: str) -> dict[str, str | int]:
         """The pool's record now."""
-        now = self.clock.now
-        if now >= self.disabled_at.get(name, float("inf")):
-            return {"model": name, "state": "unavailable", "cause": Cause.POOL_DISABLED.value}
-        if now >= self.ready_at.get(name, float("inf")):
-            return {"model": name, "state": "ready"}
-        if name == "evening":
-            return {"model": name, "state": "unavailable", "cause": Cause.POOL_SCHEDULED_ONLY.value}
-        return {"model": name, "state": "warming" if name in self.woken else "cold"}
+        read = [what for since, what in self.reads.get(name, {}).items() if since <= self.clock.now]
+        what = read[-1] if read else "no_session"
+        if what == "no_session":
+            return {"model": name, "state": "unavailable", "cause": Cause.NO_SESSION.value}
+        session: dict[str, str | int] = {"model": name, "session_ends_at": SESSION_ENDS_AT}
+        if what == "capacity_unavailable":
+            return {**session, "state": "unavailable", "cause": Cause.CAPACITY_UNAVAILABLE.value}
+        return {**session, "state": what}
 
     @staticmethod
     def refusal(status: int, cause: Cause) -> tuple[int, Any]:
         return status, {"type": "error", "error": {"type": cause.value, "message": cause.sentence}}
 
     def __call__(self, call: login.Call) -> tuple[int, Any]:
-        """The CLI's transport: the status and the body the endpoint answers."""
+        """The CLI's transport: the status and the body the gateway answers."""
         assert call.url.startswith(ENDPOINT + "/")
         path = call.url.removeprefix(ENDPOINT)
         self.calls.append((call.method, path, self.clock.now))
@@ -93,20 +87,7 @@ class Gateway:
             return self.refusal(401, Cause.INVALID_KEY)
         if (call.method, path) == ("GET", "/status"):
             return 200, {"pools": [self.record(name) for name in POOLS]}
-        if (call.method, path) == ("POST", "/wake"):
-            model = (call.fields or {}).get("model", "")
-            name = POOLS[0] if model.startswith("claude-") else model
-            if name not in POOLS:
-                return self.refusal(400, Cause.REQUEST_REFUSED)
-            # The record as it was when the wake arrived: the wake shows from the next call on.
-            answer = self.record(name)
-            self.woken.add(model)
-            return 200, answer
         return self.refusal(404, Cause.NOT_FOUND)
-
-    def wakes(self) -> list[float]:
-        """When each wake reached the gateway, in seconds on the test's clock."""
-        return [at for method, path, at in self.calls if (method, path) == ("POST", "/wake")]
 
     def wait(self, model: str, *arguments: float) -> int:
         """`rhi wait` on the test's clock; its exit status."""
@@ -191,35 +172,67 @@ def gateway(monkeypatch: pytest.MonkeyPatch) -> Gateway:
     return made
 
 
-def test_status_prints_each_pool_with_its_state_and_cause(gateway: Gateway, capsys: pytest.CaptureFixture[str]) -> None:
-    gateway.ready_at["coursework"] = 0
+@pytest.fixture
+def two_hours_ahead_of_utc(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The time zone of the student's machine, for the test."""
+    with monkeypatch.context() as patch:
+        patch.setenv("TZ", "UTC-2")
+        time.tzset()
+        yield
+    time.tzset()
+
+
+@pytest.mark.usefixtures("two_hours_ahead_of_utc")
+def test_status_prints_each_pool_with_its_state_its_cause_and_the_end_of_its_session(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gateway.reads.update(coursework={0: "ready"}, mock={0: "capacity_unavailable"})
     assert main.main(["status"]) == 0
     output = capsys.readouterr().out
-    assert [line.split() for line in output.splitlines()] == [
-        ["coursework", "ready"],
-        ["mock", "cold"],
-        ["evening", "unavailable", "pool_scheduled_only"],
-    ]
+    coursework, mock, evening = output.splitlines()
+    assert coursework.split()[:2] == ["coursework", "ready"]
+    assert mock.split()[:3] == ["mock", "unavailable", "capacity_unavailable"]
+    # A pool whose session is on says when it ends, in the machine's own time; a pool with none says no time.
+    assert "15:30" in coursework and "15:30" in mock
+    assert evening.split() == ["evening", "unavailable", "no_session"]
     assert gateway.key not in output
-    assert gateway.wakes() == []
+    assert gateway.calls == [("GET", "/status", 0)]
 
 
-def test_a_wait_wakes_at_once_and_every_minute_until_the_pool_is_ready(capsys: pytest.CaptureFixture[str]) -> None:
-    gateway = Gateway(ready_at={"mock": 3 * 60 + 1})
+def test_a_wait_reads_only_the_status_every_10_seconds_until_the_pool_is_ready(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The session is on: an instance starts, is lost at second 35, and the pool is ready at second 125.
+    gateway = Gateway({"mock": {0: "warming", 35: "capacity_unavailable", 125: "ready"}})
     logged_in(gateway.key)
     assert gateway.wait("mock") == 0
-    assert gateway.wakes() == [0, 60, 120, 180]
-    assert 181 <= gateway.clock.now < 181 + wait.POLL_SECONDS
-    assert capsys.readouterr().out.splitlines() == ["mock: cold", "mock: warming", "mock: ready"]
-    assert {path for _, path, _ in gateway.calls} == {"/wake", "/status"}
+    assert gateway.calls == [("GET", "/status", at) for at in range(0, 131, wait.POLL_SECONDS)]
+    # Each change is printed once, under the pool's name.
+    printed = [line.split() for line in capsys.readouterr().out.splitlines()]
+    assert [line[1:] for line in printed] == [["warming"], ["unavailable", "capacity_unavailable"], ["ready"]]
+    assert all(line[0].startswith("mock") for line in printed)
+
+
+def test_the_10_seconds_run_from_one_status_call_to_the_next_whatever_an_answer_takes() -> None:
+    gateway = Gateway({"mock": {0: "warming", 20: "ready"}})
+    logged_in(gateway.key)
+
+    def slow(call: login.Call) -> tuple[int, Any]:
+        # Each answer takes 2 seconds, and the one asked for at second 10 takes 13.
+        answer = gateway(call)
+        gateway.clock.now += 13 if gateway.clock.now == 10 else 2
+        return answer
+
+    assert wait.wait("mock", transport=slow, sleep=gateway.clock.sleep, clock=lambda: gateway.clock.now) == 0
+    # Second 10 follows second 0 by the interval; the next call follows the slow answer at once.
+    assert [at for _, _, at in gateway.calls] == [0, 10, 23]
 
 
 def test_a_wait_gives_up_at_its_timeout(capsys: pytest.CaptureFixture[str]) -> None:
-    gateway = Gateway()
+    gateway = Gateway({"mock": {0: "capacity_unavailable"}})
     logged_in(gateway.key)
-    assert gateway.wait("mock", 3) != 0
+    assert gateway.wait("mock", 3) == 1
     assert gateway.clock.now == 3 * 60
-    assert gateway.wakes() == [0, 60, 120]
     assert "not ready after 3 minutes" in capsys.readouterr().err
 
     # Without the option, the timeout is 20 minutes.
@@ -227,13 +240,13 @@ def test_a_wait_gives_up_at_its_timeout(capsys: pytest.CaptureFixture[str]) -> N
     wait.register(parser.add_subparsers())
     assert parser.parse_args(["wait", "mock"]).timeout == 20
     assert parser.parse_args(["wait", "mock", "--timeout", "3"]).timeout == 3
-    unhurried = Gateway(key=gateway.key)
-    assert unhurried.wait("mock") != 0
+    unhurried = Gateway({"mock": {0: "warming"}}, key=gateway.key)
+    assert unhurried.wait("mock") == 1
     assert unhurried.clock.now == 20 * 60
 
 
 def test_an_answer_that_arrives_after_the_timeout_is_not_a_success(capsys: pytest.CaptureFixture[str]) -> None:
-    gateway = Gateway(ready_at={"mock": 55})
+    gateway = Gateway({"mock": {0: "warming", 55: "ready"}})
     logged_in(gateway.key)
 
     def slow(call: login.Call) -> tuple[int, Any]:
@@ -243,37 +256,37 @@ def test_an_answer_that_arrives_after_the_timeout_is_not_a_success(capsys: pytes
         return gateway(call)
 
     result = wait.wait("mock", 1, transport=slow, sleep=gateway.clock.sleep, clock=lambda: gateway.clock.now)
-    assert result != 0
+    assert result == 1
     assert gateway.calls[-1] == ("GET", "/status", 65)
     assert "not ready after 1 minutes" in capsys.readouterr().err
 
 
-def test_an_unavailable_pool_stops_the_wait(
-    gateway: Gateway, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_a_pool_with_no_session_stops_the_wait_with_its_cause(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main.main(["wait", "evening"]) != 0
-    assert gateway.calls == [("POST", "/wake", 0)]
-    assert "pool_scheduled_only" in capsys.readouterr().err
+    assert main.main(["wait", "evening"]) == 1
+    assert gateway.calls == [("GET", "/status", 0)]
+    assert "no_session" in capsys.readouterr().err
 
-    # A pool that turns unavailable during the wait stops it too, at the first status that says so.
-    disabled = Gateway(disabled_at={"mock": 1}, key=gateway.key)
-    assert disabled.wait("mock") != 0
-    assert [path for _, path, _ in disabled.calls] == ["/wake", "/status"]
-    assert "pool_disabled" in capsys.readouterr().err
-
-    # A wake the gateway refuses with an error stops it at once.
-    refused = Gateway(key=gateway.key)
-    monkeypatch.setattr(login, "http_transport", refused)
-    assert main.main(["wait", "no-such-pool"]) != 0
-    assert refused.calls == [("POST", "/wake", 0)]
-    assert "request_refused" in capsys.readouterr().err
+    # A session that ends during the wait stops it too, at the first status that says so.
+    ended = Gateway({"mock": {0: "warming", 25: "no_session"}}, key=gateway.key)
+    assert ended.wait("mock") == 1
+    assert [at for _, _, at in ended.calls] == [0, 10, 20, 30]
+    assert "no_session" in capsys.readouterr().err
 
 
-def test_a_wait_for_a_claude_name_follows_the_default_pool(capsys: pytest.CaptureFixture[str]) -> None:
-    gateway = Gateway(ready_at={"coursework": 15})
-    logged_in(gateway.key)
-    assert gateway.wait("claude-sonnet") == 0
-    assert capsys.readouterr().out.splitlines() == ["coursework: cold", "coursework: ready"]
+def test_an_error_of_the_gateway_or_a_name_the_status_does_not_list_stops_the_wait(
+    gateway: Gateway, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main.main(["wait", "no-such-pool"]) == 1
+    assert gateway.calls == [("GET", "/status", 0)]
+    assert "no-such-pool" in capsys.readouterr().err
+
+    # A gateway that refuses the stored key: its cause is told, and the wait ends.
+    another = Gateway({"mock": {0: "warming"}})
+    assert another.wait("mock") == 1
+    assert another.calls == [("GET", "/status", 0)]
+    assert "invalid_key" in capsys.readouterr().err
 
 
 def test_revoke_one_or_all(home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

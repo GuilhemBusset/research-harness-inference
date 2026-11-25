@@ -364,6 +364,8 @@ def test_a_client_s_home_is_what_rhi_login_writes(tmp_path: Path) -> None:
             assert settings == {"apiKeyHelper": "rhi token", "env": {"ANTHROPIC_BASE_URL": endpoint}}
         elif client in (Client.CODEX_DEFAULT, Client.CODEX_PROFILE):
             profiles[client] = (home / ".codex" / "rhi.config.toml").read_text()
-    assert "stream_idle_timeout_ms = 900000" in profiles[Client.CODEX_PROFILE]
-    assert forwarder.without_timer(profiles[Client.CODEX_PROFILE]) == profiles[Client.CODEX_DEFAULT]
-    assert "stream_idle_timeout_ms" not in profiles[Client.CODEX_DEFAULT]
+    # A login writes no stream timeout, so Codex with its profile is Codex with its default timer.
+    assert "stream_idle_timeout_ms" not in profiles[Client.CODEX_PROFILE]
+    assert profiles[Client.CODEX_PROFILE] == profiles[Client.CODEX_DEFAULT]
+    timed = profiles[Client.CODEX_PROFILE] + "stream_idle_timeout_ms = 900000\n"
+    assert forwarder.without_timer(timed) == profiles[Client.CODEX_DEFAULT]
