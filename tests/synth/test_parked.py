@@ -82,8 +82,8 @@ MAY_STAY = {
 }
 
 # What parking removes, by type: the load balancers, their listeners, rules and target groups, the
-# alias record and the web ACL, the NAT gateway, the Fargate services, the groups and warm pools,
-# the scaler's schedule and the alarms.
+# alias record and the web ACL, the NAT gateway, the Fargate services, the groups, the scaler's
+# schedule and the alarms.
 REMOVED = (
     "AWS::ElasticLoadBalancingV2::LoadBalancer",
     "AWS::ElasticLoadBalancingV2::Listener",
@@ -94,7 +94,6 @@ REMOVED = (
     "AWS::EC2::NatGateway",
     "AWS::ECS::Service",
     "AWS::AutoScaling::AutoScalingGroup",
-    "AWS::AutoScaling::WarmPool",
     "AWS::Events::Rule",
     "AWS::CloudWatch::Alarm",
 )

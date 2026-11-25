@@ -25,17 +25,15 @@ SESSION_MAX_HOURS = 12
 class Supply:
     """What a pool's group holds, from Auto Scaling and target health.
 
-    `desired` is the group's desired capacity. The four states each list their instances: in
-    service, starting (launched, or leaving the warm pool, and not yet in service), draining
-    (leaving service) and warm (in the warm pool). `running` lists every running instance of the
-    group in any state, one being prepared for the warm pool included.
+    `desired` is the group's desired capacity. The three states each list their instances: in
+    service, starting (launched and not yet in service) and draining (leaving service). `running`
+    lists every running instance of the group in any state.
     """
 
     desired: int
     in_service: tuple[str, ...] = ()
     starting: tuple[str, ...] = ()
     draining: tuple[str, ...] = ()
-    warm: tuple[str, ...] = ()
     running: tuple[str, ...] = ()
 
 

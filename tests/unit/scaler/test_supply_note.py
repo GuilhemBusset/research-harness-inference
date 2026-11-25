@@ -139,7 +139,6 @@ class Pool:
         named = {"AutoScalingGroupName": GROUP}
         history = [{"ActivityId": f"activity-{n}", **named, "Cause": "the scaler", **a} for n, a in enumerate(activities)]
         self.autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": [GROUP]})
-        self.autoscaling.add_response("describe_warm_pool", {"Instances": []}, named)
         self.autoscaling.add_response("describe_scaling_activities", {"Activities": history}, named)
         health = [{"Target": {"Id": name}, "TargetHealth": {"State": "healthy"}} for name in in_service]
         self.elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": health}, {"TargetGroupArn": TARGETS})

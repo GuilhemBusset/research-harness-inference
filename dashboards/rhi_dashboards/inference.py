@@ -50,9 +50,8 @@ the gateway cannot know which instance serves a student (section 5.5). No series
 alias.
 
 **The cost is the cost dashboard's** (`rhi_dashboards.cost`): Auto Scaling's count of the pool's
-running instances, warm-pool preparation included, summed over the window and times the pool's
-configured hourly price, over the output tokens the gateway settled for the pool in that same
-window, in millions. It is an estimate, and its title says so. The panel reads the dashboard's
+running instances, summed over the window and times the pool's configured hourly price, over the
+output tokens the gateway settled for the pool in that same window, in millions. It is an estimate, and its title says so. The panel reads the dashboard's
 range, a past session's fixed dates included, as the cost dashboard's companion does. The month's
 estimate, from the start of the month to now, in UTC, as AWS bills, is the cost dashboard's own,
 and the panel links to it: CloudWatch answers only inside a panel's range, and on fixed dates

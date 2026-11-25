@@ -15,18 +15,18 @@ Then one row for each pool of the configuration, of five panels:
 
 | Panel | Shows | From |
 | --- | --- | --- |
-| Instances | The desired capacity, the instances in service and the instances in the warm pool | The scaler's gauges (section 7.2) |
+| Instances | The desired capacity and the instances in service | The scaler's gauges (section 7.2) |
 | Scale decisions | The decisions made, counted by reason | The scaler's counter |
 | Engine requests | The requests running and waiting, for each instance: the scaler's view of the engine's load (section 5.1) | The engine, by the names of the per-engine table |
-| Start from the warm pool | The seconds each stage of a start took, for each launch | The lifecycle agent (section 5.2) |
-| Cold launch | The same, for the launches that had no warm instance to promote | The lifecycle agent |
+| Promotion | The seconds each stage of a start took, for each launch that started a stopped instance | The lifecycle agent (section 5.2) |
+| Cold launch | The same, for the launches of a new instance | The lifecycle agent |
 
 **A launch is an instance's series.** The lifecycle agent's gauge holds what each stage took in
 the instance's last launch, and the collector labels it with the instance. So one series is one
 stage of one launch: it starts when the stage ends and lasts while the instance reports. The two
 transitions are two panels, never one: a cold launch may have the image to pull, and its seconds
-beside a promotion's would hide the number the design is judged on, the start from the warm pool.
-An entry to the warm pool starts no engine and is in neither.
+are not a promotion's. A group keeps no stopped instance (section 4.5), so every start is a cold
+launch and the promotion's panel has no new launch to show; the lifecycle agent still knows both.
 
 **The decisions are counted over a window of their own.** The scaler sends one sample a minute.
 `rules.WINDOW` can be as short as one minute, which holds one sample at most times, and an
@@ -65,7 +65,6 @@ LIFECYCLE = "services/engine/lifecycle/rhi_lifecycle/stages.py"
 COUNTS = {
     "desired": "rhi_scaler_desired_capacity",
     "in service": rules.IN_SERVICE,
-    "warm": "rhi_scaler_warm_instances",
 }
 # The scaler's count of its decisions, labelled by reason.
 DECISIONS = "rhi_scaler_decisions_total"
@@ -84,7 +83,7 @@ TRANSITION = "transition"
 STAGE = "stage"
 # The two transitions that put an instance in service, each with its panel's title.
 STARTS = {
-    "promotion": "Start from the warm pool: seconds per stage, per launch",
+    "promotion": "Promotion of a stopped instance: seconds per stage, per launch",
     "cold-launch": "Cold launch: seconds per stage, per launch",
 }
 
@@ -134,9 +133,9 @@ def _queries(panel: timeseries_builders.Panel, queries: dict[str, str]) -> times
 
 
 def counts(pool: Pool) -> timeseries_builders.Panel:
-    """The pool's desired capacity, its instances in service and its warm instances."""
+    """The pool's desired capacity and its instances in service."""
     queries = {legend: rules.selector(metric, {rules.POOL: pool.name}) for legend, metric in COUNTS.items()}
-    return _queries(_graph("Instances: desired, in service, warm"), queries).decimals(0).min(0)
+    return _queries(_graph("Instances: desired, in service"), queries).decimals(0).min(0)
 
 
 def decisions(pool: Pool) -> timeseries_builders.Panel:

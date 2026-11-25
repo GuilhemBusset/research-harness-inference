@@ -7,7 +7,7 @@ five panels, then one row of the bill:
 
 | Panel | Window | Shows |
 | --- | --- | --- |
-| GPU-hours today | The day so far | The hours of the pool's running instances, warm-pool preparation included |
+| GPU-hours today | The day so far | The hours of the pool's running instances |
 | GPU-hours this month | The month so far | The same |
 | Cost today | The day so far | Those hours at the pool's configured hourly price |
 | Cost this month | The month so far | The same |
@@ -24,21 +24,21 @@ reconciled.
 
 **The hours are Auto Scaling's count of the pool's running instances**, from the group metrics
 `rhi.pools.group` turns on, in the namespace `AWS/AutoScaling`: `GroupTotalInstances` (in service,
-pending and terminating) plus `WarmPoolPendingCapacity` (an instance prepared for the warm pool
-runs before it stops), as the fleet's alarms read them (`rhi.guardrails.alarms_fleet`). Each series
-has one data point a minute, the count during that minute, so the `Sum` statistic over a period is
-the instance-minutes inside it. A period cut short by the window's edge, the hour that is still
+pending and terminating), as the fleet's alarms read it (`rhi.guardrails.alarms_fleet`). The group
+keeps no stopped instance, so every instance it counts runs. The series has one data point a
+minute, the count during that minute, so the `Sum` statistic over a period is the instance-minutes
+inside it. A period cut short by the window's edge, the hour that is still
 running included, holds only its own minutes: nothing counts a partial hour as a whole one.
 
 **A pool's group is read by its name**, which the pools stack fixes, `rhi-pool-<pool>`
 (`rhi_common.pool_config.group_name`), and no other pool's group has: a group deleted and created
 again, a parked stage's once unparked, publishes under the same name, so its hours are counted too.
-Over the month, each count is one metric, read by its namespace, its name and the one dimension
+Over the month, the count is one metric, read by its namespace, its name and the one dimension
 `AutoScalingGroupName` with that value exactly, which CloudWatch answers with every data point it
 keeps in the window: no search, which finds only the metrics that reported in the past two weeks.
-Such a read always gives a series, one with no point where the group published none (the warm
-pool's count of a group without one), which sums to zero. Grafana's server-side expressions sum
-each count over the window, add the two, and divide by 60: the instance-hours.
+Such a read always gives a series, one with no point where the group published none, which sums to
+zero. Grafana's server-side expressions sum the count over the window and divide by 60: the
+instance-hours.
 
 **The price is the hourly price the configuration gives the pool's first instance type**, the one
 the group launches first (section 5.4): a fallback type launched in its place is counted at that
@@ -69,7 +69,7 @@ start and end), whatever window a panel asks for (its query options, "Relative t
 query is bounded by the range it is given. So the calendar panels never ask for a window of their
 own: the dashboard's range is the month so far, its time picker is hidden, and the day is chosen
 inside CloudWatch's answer, which has one point an hour from the start of the month: one query of
-CloudWatch's metric math adds both counts of the pool's group, found by a search for its name
+CloudWatch's metric math reads the count of the pool's group, found by a search for its name
 exactly (`SUM(SEARCH(...))`; a group that reported today reported in the past two weeks), and keeps
 the points whose UTC day of the month is the last one of the range, today's
 (`IF(DATE(x) == MAX(DATE(x)), x)`, the search written out for each `x`). Grafana sends each query of
@@ -117,17 +117,17 @@ GATEWAY_METRICS = "services/gateway/rhi_gateway/metrics.py"
 OUTPUT_TOKENS = "rhi_gateway_student_output_tokens"
 METRICS: tuple[rules.Declared, ...] = (rules.EmittedBy(OUTPUT_TOKENS, GATEWAY_METRICS),)
 
-# Auto Scaling's group metrics: the namespace, the group's dimension, and the two counts whose sum
-# is the instances running.
+# Auto Scaling's group metrics: the namespace, the group's dimension, and the count of the
+# instances running.
 AUTO_SCALING = "AWS/AutoScaling"
 GROUP_DIMENSION = "AutoScalingGroupName"
-INSTANCE_COUNTS = ("GroupTotalInstances", "WarmPoolPendingCapacity")
-# The period the counts are summed over, in seconds: a whole number of minutes, and of the five
+INSTANCE_COUNT = "GroupTotalInstances"
+# The period the count is summed over, in seconds: a whole number of minutes, and of the five
 # minutes CloudWatch keeps one-minute data at after 15 days.
 PERIOD = 3600
 MINUTES_AN_HOUR = 60
-# Both counts of the group of that name exactly, added: the instance-minutes of each period.
-RUNNING = "SUM(SEARCH('{{{namespace},{dimension}}} {dimension}=\"{group}\" ({metrics})', 'Sum', {period}))"
+# The count of the group of that name exactly: the instance-minutes of each period.
+RUNNING = "SUM(SEARCH('{{{namespace},{dimension}}} {dimension}=\"{group}\" MetricName=\"{metric}\"', 'Sum', {period}))"
 
 # The billing metric: where AWS publishes it, its namespace, name and dimension, and how often.
 BILLING_REGION = "us-east-1"
@@ -193,22 +193,21 @@ def metric(namespace: str, name: str, dimensions: cloudwatch.Dimensions, ref_id:
     )
 
 
-def count(pool: Pool, name: str, ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """One count of the pool's group, read by the group's name exactly, in the endpoint's region: its
+def count(pool: Pool, ref_id: str) -> cloudwatch_builders.MetricsQuery:
+    """The count of the pool's group, read by the group's name exactly, in the endpoint's region: its
     instance-minutes in each period."""
-    query = metric(AUTO_SCALING, name, {GROUP_DIMENSION: group_name(pool.name)}, ref_id)
+    query = metric(AUTO_SCALING, INSTANCE_COUNT, {GROUP_DIMENSION: group_name(pool.name)}, ref_id)
     return query.statistic("Sum").region(OWN_REGION).period(str(PERIOD))
 
 
 def today(pool: Pool, ref_id: str) -> cloudwatch_builders.MetricsQuery:
-    """Both counts of the pool's group, added, of today: one query of CloudWatch's metric math that
-    refers to no other, in the endpoint's region, hidden."""
-    metrics = " OR ".join(f'MetricName="{name}"' for name in INSTANCE_COUNTS)
+    """The count of the pool's group, of today: one query of CloudWatch's metric math that refers to
+    no other, in the endpoint's region, hidden."""
     running = RUNNING.format(
         namespace=AUTO_SCALING,
         dimension=GROUP_DIMENSION,
         group=group_name(pool.name),
-        metrics=metrics,
+        metric=INSTANCE_COUNT,
         period=PERIOD,
     )
     return (
@@ -261,18 +260,12 @@ type Target = cloudwatch_builders.MetricsQuery | expr_builders.TypeReduce
 
 
 def hours(pool: Pool, suffix: str = "", *, of_today: bool = False) -> tuple[list[Target], str]:
-    """The queries of the pool's counts, each summed over the window (today's points if `of_today`),
-    and the server-side expression of the hours they add up to. `suffix` tells one pool's queries
+    """The query of the pool's count and its sum over the window (today's points if `of_today`),
+    and the server-side expression of the hours it comes to. `suffix` tells one pool's queries
     from another's."""
-    if of_today:
-        return [today(pool, f"D{suffix}"), reduce(f"S{suffix}", f"D{suffix}", "sum")], f"$S{suffix} / {MINUTES_AN_HOUR}"
-    targets: list[Target] = []
-    summed = []
-    for name, letter in zip(INSTANCE_COUNTS, ("N", "W"), strict=True):
-        targets.append(count(pool, name, f"{letter}{suffix}"))
-        targets.append(reduce(f"S{letter}{suffix}", f"{letter}{suffix}", "sum"))
-        summed.append(f"$S{letter}{suffix}")
-    return targets, f"({' + '.join(summed)}) / {MINUTES_AN_HOUR}"
+    read = today(pool, f"D{suffix}") if of_today else count(pool, f"N{suffix}")
+    targets: list[Target] = [read, reduce(f"S{suffix}", f"{'D' if of_today else 'N'}{suffix}", "sum")]
+    return targets, f"$S{suffix} / {MINUTES_AN_HOUR}"
 
 
 def dollars(pool: Pool, suffix: str = "", *, of_today: bool = False) -> tuple[list[Target], str]:
@@ -349,8 +342,7 @@ def hours_stat(pool: Pool, *, of_today: bool) -> stat_builders.Panel:
     """The pool's GPU-hours of the day, or of the month."""
     name, since = _CALENDAR[of_today]
     description = (
-        f"The hours of the pool's running instances, warm-pool preparation included, {since} to now: "
-        f"Auto Scaling's {' plus '.join(INSTANCE_COUNTS)} of its group."
+        f"The hours of the pool's running instances, {since} to now: Auto Scaling's {INSTANCE_COUNT} of its group."
     )
     targets, expression = hours(pool, of_today=of_today)
     panel = _stat(f"GPU-hours {name}, estimate", description, COUNT).datasource(rules.CLOUDWATCH)

@@ -66,7 +66,6 @@ def log_decisions(run: aws_io.Run, decision: Decision) -> None:
             "desired": pool.desired,
             "in_service": len(supply.in_service),
             "starting": len(supply.starting),
-            "warm": len(supply.warm),
             "launches_suspended": pool.suspend_launches,
         }
         LOGGER.info(json.dumps(record, sort_keys=True))

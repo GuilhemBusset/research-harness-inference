@@ -18,12 +18,9 @@
 # The volume of 150 GB the launch template gives a GPU pool's instances, encrypted like the mock
 # pool's, is a property of the launch template: it brings no role, no action and no cdk-nag finding.
 #
-# The warm pool is a resource Auto Scaling acts on with its own service-linked role: it brings no
-# role of this module, no action and no cdk-nag finding.
-#
-# The group metrics the group publishes to CloudWatch every minute, the warm pool's included, are a
-# property of the group that Auto Scaling acts on with its own service-linked role: they bring no
-# role of this module, no action and no cdk-nag finding.
+# The group metrics the group publishes to CloudWatch every minute are a property of the group that
+# Auto Scaling acts on with its own service-linked role: they bring no role of this module, no
+# action and no cdk-nag finding.
 
 [nag]
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:autoscaling:<AWS::Region>:<AWS::AccountId>:autoScalingGroup:*:autoScalingGroupName/*]" = "Auto Scaling puts an identifier it chooses at creation before the name in every group's ARN, so the statement names groups by pattern, and its condition on the tag rhi-pool narrows it to the pool's own group."
