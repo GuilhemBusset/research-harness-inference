@@ -18,7 +18,14 @@ import pytest
 import s5_capacity as s5
 from rhi_common.keys import generate_key
 from rhi_reporter.measure import Verdict, decode, read_event
-from test_s5 import COMMIT, blank_record, job, settings, verdict  # the recorded runs of the verdict's own tests
+from test_s5 import (  # the recorded runs of the verdict's own tests, and the job's environment
+    COMMIT,
+    ENVIRON,
+    blank_record,
+    job,
+    settings,
+    verdict,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -27,23 +34,18 @@ LABEL = "8bit-baseline-1"
 
 
 @pytest.fixture
-def post(monkeypatch: pytest.MonkeyPatch) -> Any:
+def post(monkeypatch: pytest.MonkeyPatch, pool_state: Any) -> Any:
     """Runs the job, its runs at the class size given, and returns the statuses its event becomes."""
     sent: list[dict[str, str]] = []
     events = SimpleNamespace(put_events=lambda Entries: sent.extend(Entries) or {"FailedEntryCount": 0})
     monkeypatch.setattr(s5.boto3, "client", lambda service: events)
-    monkeypatch.setattr(s5.boto3, "Session", lambda: SimpleNamespace(get_credentials=lambda: None))
+    pool_state.book()
     monkeypatch.setattr(s5.common, "canary_keys", lambda: SimpleNamespace(students=(generate_key(),)))
     monkeypatch.setattr(s5.config, "read_ssm", settings)
 
     def posted(class_size: int = 20, **at_class: Any) -> list[Any]:
         monkeypatch.setattr(s5.Job, "measure", lambda self: job(class_size=class_size, **at_class))
-        environ = {
-            "AWS_REGION": "us-east-1", "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
-            "RHI_SPIKE_ENDPOINT": "example.com", "RHI_S5_BUILD": "8bit", "RHI_S5_CLASS_SIZE": str(class_size),
-            "RHI_S5_DURATION_SECONDS": "600", "RHI_MEASUREMENT_BUS": "rhi-measurements",
-            "CODEBUILD_RESOLVED_SOURCE_VERSION": COMMIT,
-        }  # fmt: skip
+        environ = ENVIRON | pool_state.environ | {"RHI_S5_CLASS_SIZE": str(class_size)}
         assert s5.main(environ) is Verdict.PASS
         return read_event({"detail": json.loads(sent[-1]["Detail"])})
 

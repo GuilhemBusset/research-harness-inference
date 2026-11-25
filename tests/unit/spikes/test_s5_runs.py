@@ -152,14 +152,14 @@ def test_the_cost_per_million_output_tokens_at_3_36_an_hour_matches_the_recorded
 
 
 class Gateway:
+    """The gateway's status, and nothing else to ask it: the pool cold at first, ready from the next read."""
+
     def __init__(self) -> None:
-        self.woken = 0
+        self.read = 0
 
     def state(self) -> str:
-        return "ready" if self.woken else "cold"
-
-    def wake(self) -> None:
-        self.woken += 1
+        self.read += 1
+        return "cold" if self.read == 1 else "ready"
 
 
 class Clock:

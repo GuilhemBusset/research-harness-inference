@@ -55,7 +55,7 @@ keeps (`Lines`). Every line has `at`, its UTC time, and `kind`:
 | `replay` | The replay of the recorded Claude Code session: its times and its requests |
 | `engine_counters` | The engine's input and cached input token counters, at the replay's start and at its end |
 | `step_failed` | A step that raised, or a reading of the workspace that failed: its name and the type of the error |
-| `job_failed` | An error that stopped the job: the type of the error |
+| `job_failed` | An error that stopped the job: the type of the error, and for a job the pool's session does not carry, the reason |
 
 **The turns.** Claude Code's are the turns its own result counts (`num_turns`): its main loop, with
 its side queries and token counts left out; when it gave no result, because it was stopped, the
@@ -121,6 +121,15 @@ runs with none of the job's credentials, nor the variables that say where CodeBu
 | `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, or an `https://` address |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
+| `RHI_SPIKE_INSTANCES` | The instances the job needs in service: `1` unless given |
+| `RHI_SPIKE_RUN_MINUTES` | How long the job lasts, in minutes, which the session must outlast. Required |
+| `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
+
+**In a booked session.** The job starts no machine: the owner books a session of the pool first,
+and before it sends anything the job checks it (`common.require_session`): the session is active,
+it has the instances in service, and it lasts the run's minutes from now. Otherwise the job writes
+`job_failed` with the reason, `no-session`, `too-few-instances` or `session-too-short`, sends
+nothing to the gateway, and exits 1. Without `RHI_SPIKE_RUN_MINUTES` it does not start.
 
 The pool's engine comes from the deployed configuration (`rhi.config.read_ssm`), the region from
 CodeBuild's `AWS_REGION`. The canary students need six keys with the default budget, one for
@@ -210,7 +219,6 @@ SCRAPE_SECONDS = s5.SCRAPE_SECONDS
 SETTLE_SECONDS = s5.SETTLE_SECONDS
 POLL_SECONDS = 5
 READY_WAIT_SECONDS = 40 * 60
-WAKE_EVERY_SECONDS = 60
 
 # The image step: the file, its side in pixels, and the colours it may be filled with.
 IMAGE_FILE = "figure.png"
@@ -1005,7 +1013,7 @@ def install_harnesses(folder: Path) -> tuple[dict[str, Path], dict[str, str]]:
 
 class Job:
     """The job: the task given to each harness against the pool `pool` (served by `engine`), through
-    the gateway at `endpoint`, as the canary students of `keys`; the pool woken through `gateway`,
+    the gateway at `endpoint`, as the canary students of `keys`; the pool's state read through `gateway`,
     the workspace read through `workspace`; every line written to `lines`."""
 
     def __init__(
@@ -1052,17 +1060,11 @@ class Job:
             self.sleep(left)
 
     def ready(self) -> None:
-        """Wakes the pool and waits until it is ready, so that no harness meets a cold start."""
-        started = woke = self.wall()
-        if self.gateway.state() == s5.READY:
-            return
-        self.gateway.wake()
+        """Waits until the status reads the pool ready, so that no harness meets one that does not serve."""
+        started = self.wall()
         while self.gateway.state() != s5.READY:
             if self.wall() - started >= READY_WAIT_SECONDS:
                 raise TimeoutError("the pool was not ready in time")
-            if self.wall() - woke >= WAKE_EVERY_SECONDS:
-                self.gateway.wake()
-                woke = self.wall()
             self.sleep(POLL_SECONDS)
 
     def build_in(self, start: float, end: float) -> str | None:
@@ -1351,22 +1353,37 @@ def sdk_script(environ: Mapping[str, str], folder: Path) -> int:
 def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = print) -> int:
     """Runs the job with its environment and credentials; exits 1 when a step failed, or when an
     error stopped the job: that error is a line `job_failed` with its type's name, never its text,
-    which may be what AWS returned."""
+    which may be what AWS returned. A job the pool's session does not carry is that line with the
+    reason, one of `common.Refusal`."""
     try:
         return run_job(environ, out)
+    except common.SessionRefused as refused:
+        Lines((), out=out).write(Line.JOB_FAILED, error=type(refused).__name__, reason=refused.reason.value)
+        return 1
     except Exception as error:  # noqa: BLE001 - the job's boundary: no traceback reaches the log
         Lines((), out=out).write(Line.JOB_FAILED, error=type(error).__name__)
         return 1
 
 
 def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
-    """The job, from its environment and credentials; 1 when a step failed."""
+    """The job, from its environment and credentials; 1 when a step failed. `common.SessionRefused`,
+    with nothing sent to the gateway, when the pool's session does not carry the run."""
+    needs = common.needs_of(environ)
     endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
-    pools = [pool for pool in config.read_ssm().pools if pool.name == name]
+    settings = config.read_ssm()
+    pools = [pool for pool in settings.pools if pool.name == name]
     if len(pools) != 1:
         raise ValueError("the deployed configuration has no pool of that name")
     (pool,) = pools
+    common.require_session(
+        common.pool_state_table(environ),
+        name,
+        instances=needs.instances,
+        run_minutes=needs.run_minutes,
+        session_max_hours=settings.session_max_hours,
+        now=time.time,
+    )
     keys = common.canary_keys()
     session = boto3.Session()
     workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())

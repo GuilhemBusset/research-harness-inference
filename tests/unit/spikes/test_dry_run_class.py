@@ -9,6 +9,7 @@ import heapq
 import itertools
 import json
 import secrets
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -68,19 +69,13 @@ class Clock:
 
 
 class Gateway:
-    """The gateway's status and wake: cold until woken, then each state of `after_wake` in turn, then ready."""
+    """The gateway's status, and nothing else to ask it: each state of `before_ready` in turn, then ready."""
 
-    def __init__(self, after_wake: list[str]) -> None:
-        self.woken = False
-        self.after_wake = list(after_wake)
+    def __init__(self, before_ready: list[str]) -> None:
+        self.before_ready = list(before_ready)
 
     def state(self) -> str:
-        if not self.woken:
-            return "cold"
-        return self.after_wake.pop(0) if self.after_wake else "ready"
-
-    def wake(self) -> None:
-        self.woken = True
+        return self.before_ready.pop(0) if self.before_ready else "ready"
 
 
 def _event(name: str, data: dict[str, Any]) -> bytes:
@@ -193,7 +188,7 @@ def _conversation(seed: int) -> loadgen.Session:
 
 
 def _rehearsal(
-    lines: list[str], *, after_wake: list[str] | None = None, shape: Shape = Shape.HANDS_ON
+    lines: list[str], *, before_ready: list[str] | None = None, shape: Shape = Shape.HANDS_ON
 ) -> tuple[dry.Rehearsal, list[str], list[str]]:
     clock = Clock()
     keys = [generate_key() for _ in range(3)]
@@ -208,7 +203,7 @@ def _rehearsal(
         shape=shape,
         keys=keys,
         endpoint="https://gateway.example.com",
-        gateway=Gateway(["warming"] if after_wake is None else after_wake),
+        gateway=Gateway(["warming"] if before_ready is None else before_ready),
         workspace=Workspace(*instances),
         recorder=Recorder(clock, lines.append),
         clock=clock,
@@ -244,7 +239,8 @@ def test_each_step_writes_lines_with_a_time_and_a_kind_and_no_identifier_or_key(
 
     (start,) = [line for line in written if line["kind"] == "start"]
     assert (start["class_size"], start["shape"], start["pool"]) == (3, "hands-on", "coursework")
-    assert [line["woke"] for line in written if line["kind"] == "pool_ready"] == [True]
+    # The pool read warming, then ready: the job waited one read of the status for it.
+    assert [line["waited_seconds"] for line in written if line["kind"] == "pool_ready"] == [dry.POLL_SECONDS]
 
 
 def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
@@ -284,7 +280,7 @@ def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
 @pytest.mark.parametrize("cut", [True, False], ids=["cut-after-headers", "error-event"])
 def test_an_answer_that_never_came_ends_its_conversation(cut: bool) -> None:
     lines: list[str] = []
-    rehearsal, _, _ = _rehearsal(lines, after_wake=[])
+    rehearsal, _, _ = _rehearsal(lines, before_ready=[])
     rehearsal.class_size = 1
 
     async def broken() -> Any:
@@ -339,7 +335,7 @@ def test_the_readings_name_instances_and_tell_a_launch_in_the_hour_from_one_befo
 @pytest.mark.parametrize("boot", [40.0, 108.0], ids=["seen-after-the-hour", "booting-past-the-final-reads"])
 def test_a_launch_that_began_just_before_the_hour_ended_is_written(boot: float) -> None:
     lines: list[str] = []
-    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    rehearsal, _, instances = _rehearsal(lines, before_ready=[])
     # The kernel starts 3 seconds before the end of the hour; each stage is first sampled on the
     # 15-second grid after it ends.
     stages = {"boot": boot, "image": 10.0, "release-check": 1.0, "container-start": 3.0, "weights": 6.0, "hook": 1.0}
@@ -373,7 +369,7 @@ def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_ste
     kernel: float, phase: float, in_hour: list[str]
 ) -> None:
     lines: list[str] = []
-    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    rehearsal, _, instances = _rehearsal(lines, before_ready=[])
     stages = {"boot": 20.0, "image": 2.0, "release-check": 1.0, "container-start": 3.0, "weights": 148.0}
     stages |= {"warm-up": 3.0, "hook": 1.0}
     ends = list(itertools.accumulate(stages.values(), initial=START + kernel))[1:]
@@ -410,7 +406,7 @@ def test_a_launch_is_placed_by_when_its_stages_were_scraped_not_by_the_query_ste
 @pytest.mark.parametrize("kernel", [-5.0, 55.0], ids=["just-before", "just-before-the-end"])
 def test_a_first_scrape_long_after_its_stages_ended_leaves_the_earliest_unknown(kernel: float) -> None:
     lines: list[str] = []
-    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    rehearsal, _, instances = _rehearsal(lines, before_ready=[])
     stages = {"boot": 20.0, "image": 5.0, "release-check": 1.0, "container-start": 4.0, "weights": 5.0}
     stages |= {"warm-up": 4.0, "hook": 1.0}
     hooked = START + kernel + sum(stages.values())
@@ -443,7 +439,7 @@ def test_a_first_scrape_long_after_its_stages_ended_leaves_the_earliest_unknown(
 @pytest.mark.parametrize("kernel", [-3.0, 55.0], ids=["just-before", "just-before-the-end"])
 def test_a_launch_without_its_boot_is_not_bounded_from_below_by_its_own_scrapes(kernel: float) -> None:
     lines: list[str] = []
-    rehearsal, _, instances = _rehearsal(lines, after_wake=[])
+    rehearsal, _, instances = _rehearsal(lines, before_ready=[])
     # The agent could not read the uptime, so it wrote no boot: the kernel started 20 seconds before
     # the image stage, which no sample shows. Each stage is scraped on the grid after it ends.
     stages = {"image": 5.0, "release-check": 12.0, "hook": 1.0}
@@ -532,3 +528,89 @@ def test_the_job_refuses_a_class_it_was_not_given_or_cannot_key(capsys: pytest.C
             recorder=Recorder(clock, lines.append),
             clock=clock,
         )
+
+
+# The session the job runs in.
+
+ENVIRON = {
+    "AWS_REGION": "us-east-1",
+    "RHI_SPIKE_ENDPOINT": "https://example.com",
+    "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
+    dry.CLASS_SIZE_VARIABLE: "3",
+    dry.SHAPE_VARIABLE: "hands-on",
+}
+
+
+class Stepping:
+    """The clock the job's `main` is given here: a wait moves the time and ends at once."""
+
+    def __init__(self) -> None:
+        self.at = START
+
+    def now(self) -> float:
+        return self.at
+
+    async def sleep(self, seconds: float) -> None:
+        self.at += seconds
+
+
+class Reached(Exception):
+    """Raised where the job would send the class's first request to the pool."""
+
+
+@pytest.fixture
+def started(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """When the class would have begun, for each job that got that far: the deployed
+    configuration, as much of it as the job reads, three canary students, and no start reading."""
+    reached: list[float] = []
+    pool = SimpleNamespace(name=dry.POOL, engine="vllm")
+    keys = SimpleNamespace(students=tuple(generate_key() for _ in range(3)))
+
+    async def replay(self: dry.Rehearsal, deadline: float) -> None:
+        reached.append(deadline)
+        raise Reached
+
+    async def no_reading(self: dry.Rehearsal, start: float) -> None:
+        return None
+
+    monkeypatch.setattr(dry.config, "read_ssm", lambda: SimpleNamespace(pools=[pool], session_max_hours=12))
+    monkeypatch.setattr(dry.common, "canary_keys", lambda: keys)
+    monkeypatch.setattr(dry.Rehearsal, "replay", replay)
+    monkeypatch.setattr(dry.Rehearsal, "_start_readings", no_reading)
+    return reached
+
+
+def test_the_job_admitted_to_its_session_waits_for_the_status_and_sends_no_wake(
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[float], capsys: pytest.CaptureFixture[str]
+) -> None:
+    pool_state.book(in_service=2, now=int(START))
+    # The job ends where the class would begin: this test's `replay` sends nothing.
+    assert dry.main(ENVIRON | pool_state.environ | {"RHI_SPIKE_INSTANCES": "2"}, Stepping()) == 1
+    assert len(started) == 1
+    kinds = [json.loads(line)["kind"] for line in capsys.readouterr().out.splitlines()]
+    assert kinds[:3] == ["start", "pool_ready", "hour_started"]
+    # The pool read cold, then ready: all the job asked the gateway before the class.
+    assert gateway_requests == [("GET", "https://example.com/status")] * 2
+
+
+@pytest.mark.parametrize(
+    ("in_service", "minutes", "given", "reason"),
+    [
+        (None, 600, {}, "no-session"),
+        (1, 600, {"RHI_SPIKE_INSTANCES": "2"}, "too-few-instances"),
+        (1, 30, {}, "session-too-short"),
+        # Without its minutes the job does not start, and reads nothing.
+        (1, 600, {"RHI_SPIKE_RUN_MINUTES": ""}, "no_run_needs"),
+    ],
+)
+def test_the_job_refused_by_its_session_sends_nothing_and_writes_the_reason(
+    in_service: int | None, minutes: int, given: dict[str, str], reason: str,
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[float], capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    if in_service is not None:
+        pool_state.book(in_service=in_service, minutes=minutes, now=int(START))
+    assert dry.main(ENVIRON | pool_state.environ | given, Stepping()) == 1
+    (line,) = [json.loads(one) for one in capsys.readouterr().out.splitlines()]
+    assert (line["kind"], line["reason"]) == ("refused", reason)
+    assert (gateway_requests, started) == ([], [])
+    assert bool(pool_state.reads) == (reason != "no_run_needs")

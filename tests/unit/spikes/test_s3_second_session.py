@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from random import Random
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -96,9 +97,6 @@ class Workspace:
 class Ready:
     def state(self) -> str:
         return "ready"
-
-    def wake(self) -> None:
-        raise AssertionError("a ready pool is not woken")
 
 
 # The stand-in for Claude Code.
@@ -390,3 +388,71 @@ def test_the_pdf_program_writes_a_pdf_that_gives_its_word(tmp_path: Path) -> Non
     assert [data[int(at) :].split(b" ", 1)[0] for at in offsets] == [
         str(n).encode() for n in range(1, len(offsets) + 1)
     ]
+
+
+# The session the job runs in.
+
+ENVIRON = {
+    "AWS_REGION": "us-east-1",
+    "RHI_SPIKE_ENDPOINT": "https://example.com",
+    "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
+}
+
+
+@pytest.fixture
+def started(monkeypatch: pytest.MonkeyPatch) -> list[job.Job]:
+    """The jobs that got as far as their steps, each of which does nothing here: the deployed
+    configuration, as much of it as the job reads, a canary student, a harness that installs as
+    nothing, and no wait between two reads of the status."""
+    reached: list[job.Job] = []
+    pool = SimpleNamespace(name="coursework", engine="vllm")
+    keys = SimpleNamespace(students=(generate_key(),))
+    monkeypatch.setattr(job.config, "read_ssm", lambda: SimpleNamespace(pools=[pool], session_max_hours=12))
+    monkeypatch.setattr(job.common, "canary_keys", lambda: keys)
+    monkeypatch.setattr(job.harnesses, "install", lambda folder: {})
+    monkeypatch.setattr(job.harnesses, "versions", lambda binaries: {})
+    monkeypatch.setattr(job.Job, "_step", lambda self, step, action: reached.append(self))
+    monkeypatch.setattr(job.s3, "POLL_SECONDS", 0)
+    return reached
+
+
+def test_the_job_admitted_to_its_session_waits_for_the_status_and_sends_no_wake(
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[job.Job]
+) -> None:
+    pool_state.book()
+    written: list[str] = []
+    assert job.main(ENVIRON | pool_state.environ, out=written.append) == 0
+    assert started
+    # The pool read cold, then ready: all the job asked the gateway before its first step.
+    assert gateway_requests == [("GET", "https://example.com/status")] * 2
+
+
+@pytest.mark.parametrize(
+    ("in_service", "minutes", "given", "reason"),
+    [
+        (None, 600, {}, "no-session"),
+        (1, 600, {"RHI_SPIKE_INSTANCES": "2"}, "too-few-instances"),
+        (1, 30, {}, "session-too-short"),
+    ],
+)
+def test_the_job_refused_by_its_session_sends_nothing_and_fails_with_the_reason(
+    in_service: int | None, minutes: int, given: dict[str, str], reason: str,
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[job.Job],
+) -> None:  # fmt: skip
+    if in_service is not None:
+        pool_state.book(in_service=in_service, minutes=minutes)
+    written: list[str] = []
+    assert job.main(ENVIRON | pool_state.environ | given, out=written.append) == 1
+    (line,) = [json.loads(one) for one in written]
+    assert (line["kind"], line["reason"]) == ("job_failed", reason)
+    assert (gateway_requests, started) == ([], [])
+
+
+def test_the_job_does_not_start_without_its_minutes(
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[job.Job]
+) -> None:
+    pool_state.book()
+    written: list[str] = []
+    assert job.main(ENVIRON | {"RHI_SPIKE_POOL_STATE_TABLE": "pool-state"}, out=written.append) == 1
+    assert [json.loads(one)["kind"] for one in written] == ["job_failed"]
+    assert (pool_state.reads, gateway_requests, started) == ([], [], [])
