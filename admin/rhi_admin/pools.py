@@ -19,7 +19,8 @@ The commands:
   never sets a mark back once it is cleared (`rhi_scaler.aws_io.memory_update`);
 - `run_scaler`: asks the scaler for a run now, and gives each pool's decision. A run under way
   refuses a second one: that refusal is a `ScalerBusy`, which the commands on a pool's session
-  (`rhi_admin.session`) report without failing.
+  (`rhi_admin.session`) report without failing. A request that Lambda throttles for another
+  reason fails as any other error does.
 
 Each change writes who made it, the caller's identity without its account (`identity_name`), and
 when.
@@ -67,6 +68,11 @@ class Pools:
     functions: Any
     scaler: str | None
     caller: Callable[[], str]
+
+
+# Why Lambda refuses an invocation while the function's reserved concurrency is all in use. Its
+# other reasons for the same error are limits on the rate of requests, not a run under way.
+RUN_UNDER_WAY = "ReservedFunctionConcurrentInvocationLimitExceeded"
 
 
 class ScalerBusy(AdminError):
@@ -206,10 +212,13 @@ def run_scaler(*, pools: Pools) -> list[dict[str, Any]]:
     try:
         answer = pools.functions.invoke(FunctionName=pools.scaler, InvocationType="RequestResponse", Payload=b"{}")
     except ClientError as error:
-        # Its reserved concurrency is 1: a run under way refuses a second one.
-        if error.response.get("Error", {}).get("Code") == "TooManyRequestsException":
+        if error.response.get("Error", {}).get("Code") != "TooManyRequestsException":
+            raise
+        # Its reserved concurrency is 1: a run under way refuses a second one, and Lambda names that
+        # limit as the reason. Any other reason (the rate of the requests) says nothing of a run.
+        if error.response.get("Reason") == RUN_UNDER_WAY:
             raise ScalerBusy("the scaler is already running; its next run is within a minute") from None
-        raise
+        raise AdminError("Lambda throttled the request for a run of the scaler, which did not run for it; its next run is within a minute") from None
     if answer.get("FunctionError"):
         raise AdminError("the scaler's run failed; its log group /rhi/scaler says why")
     return json.loads(answer["Payload"].read())["pools"]

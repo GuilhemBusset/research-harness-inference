@@ -358,7 +358,8 @@ def stop_all(*, sessions: Sessions, now: int) -> Iterator[tuple[str, Session | N
 
 def applied(sessions: Sessions) -> bool:
     """Asks the scaler for a run, so that a write applies within seconds; whether it ran. It did
-    not when a run is under way, which refuses a second one: the next run is within a minute."""
+    not when a run is under way, which refuses a second one: the next run is within a minute. A
+    run that fails, or that Lambda throttles for another reason, is the command's failure."""
     try:
         admin_pools.run_scaler(pools=sessions.pools)
     except admin_pools.ScalerBusy:

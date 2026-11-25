@@ -222,7 +222,8 @@ def test_asking_for_a_run_invokes_the_function_found_by_its_logical_id(deployed:
     assert out.splitlines() == ["coursework\t0\tunchanged", "mock\t1\twake"]
 
     # A run under way: the function's one reserved invocation is taken.
-    deployed.functions.add_client_error("invoke", "TooManyRequestsException", http_status_code=429)
+    under_way = {"Reason": "ReservedFunctionConcurrentInvocationLimitExceeded"}
+    deployed.functions.add_client_error("invoke", "TooManyRequestsException", http_status_code=429, modeled_fields=under_way)
     status, _, err = deployed.run("run", settings=None)
     assert status == 1 and "already running" in err
 

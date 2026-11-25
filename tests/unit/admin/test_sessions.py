@@ -72,18 +72,18 @@ class _Stack:
 
 
 class _Functions:
-    """Lambda: the scaler's settings, and its runs, refused while `busy` as a run under way refuses a second."""
+    """Lambda: the scaler's settings, and its runs, throttled for the reason `throttle` while it is set."""
 
     def __init__(self) -> None:
-        self.runs, self.busy = 0, False
+        self.runs, self.throttle = 0, ""
 
     def get_function_configuration(self, **_: str) -> dict[str, Any]:
         return {"Environment": {"Variables": {"RHI_SCALER_SETTINGS": SETTINGS}}}
 
     def invoke(self, **_: object) -> dict[str, Any]:
         self.runs += 1
-        if self.busy:
-            raise ClientError({"Error": {"Code": "TooManyRequestsException"}}, "Invoke")
+        if self.throttle:
+            raise ClientError({"Error": {"Code": "TooManyRequestsException"}, "Reason": self.throttle}, "Invoke")
         return {"StatusCode": 200, "Payload": io.BytesIO(b'{"pools": []}')}
 
 
@@ -336,7 +336,8 @@ def test_each_refusal_exits_1_with_its_reason(deployed: Deployed, refusal: str) 
 
 def test_a_run_refused_because_one_is_under_way_exits_0(deployed: Deployed) -> None:
     _, ran, _ = deployed.run("start", "1", "--pool", "mock", "--for", "1h")
-    deployed.functions.busy = True
+    # A run under way holds the function's one reserved invocation, and Lambda names that limit.
+    deployed.functions.throttle = "ReservedFunctionConcurrentInvocationLimitExceeded"
 
     status, out, err = deployed.run("start", "2", "--for", "1h")
 
@@ -346,6 +347,17 @@ def test_a_run_refused_because_one_is_under_way_exits_0(deployed: Deployed) -> N
     assert booked is not None and booked.instances == 2
     assert deployed.functions.runs == 2
     assert "already running" in out and "already running" not in ran
+
+
+def test_a_run_throttled_for_its_rate_is_a_failure_not_a_run_under_way(deployed: Deployed) -> None:
+    deployed.functions.throttle = "ReservedFunctionInvocationRateLimitExceeded"
+
+    status, out, err = deployed.run("start", "2", "--for", "1h")
+
+    # The session is written, and no run under way is claimed: the command fails on the run.
+    assert status == 1 and "throttled" in err
+    assert deployed.session() is not None and deployed.functions.runs == 1
+    assert "already running" not in out + err
 
 
 def test_stop_ends_one_pool_or_all_and_a_pool_with_no_session_has_nothing_to_stop(deployed: Deployed) -> None:
