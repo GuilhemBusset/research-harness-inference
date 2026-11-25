@@ -16,9 +16,9 @@ gives one, the local stack everywhere else. Two tests cannot assert the same thi
 
 Every stream test takes `booked`: the pool is in a session and reads ready before the first
 stream, on the local stack because the fixture books it, on a deployed one because the
-verification did. One task of a deployed gateway may read the pool ready a moment after another:
-a stream answered `warming` is asked again for that moment (`Stack.stream`), and the test still
-needs the whole stream and its usage.
+verification did. One task of a deployed gateway may read the pool a moment after another: a
+stream that such a task answers 503, with a cause of a pool that cannot serve, is asked again for
+that moment (`Stack.stream`), and the test still needs the whole stream and its usage.
 
 Each test carries its fixed ID (`smoke_id`), listed in `ids.py`. The last tests are about the
 smoke tests themselves, and run against no stack: the IDs, the collection of `deployed/`, and what

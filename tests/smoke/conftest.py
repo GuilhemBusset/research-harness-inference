@@ -33,13 +33,23 @@ deployed stack it does nothing, because the verification booked the pool before 
 (`scripts/pipeline/verify.py`). The one test of a pool nobody has booked takes `stack` alone, and
 runs before any test that takes `booked`.
 
-**A stream that is answered `warming`.** A deployed gateway is several tasks, and each reads its
-pools on its own, every 5 seconds (`rhi_gateway.readiness`). `GET /status` is one task's answer:
-when it first reads the pool ready, which is when whoever booked the pool starts the tests, another
-task may still answer a request 503 with `warming` until its next read. So `Stack.stream` makes a
-request again while the answer is that one, for `SETTLE_SECONDS` at most, three of those reads. It
-gives the answer it ends on: a stream test still needs a whole stream, and a pool that is still
-warming by then fails it. No other answer is asked again.
+**A stream that one task does not serve yet.** A deployed gateway is several tasks, and each reads
+its pools on its own, every 5 seconds: the target group's health, then the scaler's note, then the
+session (`rhi_gateway.readiness`). `GET /status` is one task's answer: when it first reads the pool
+ready, which is when whoever booked the pool starts the tests, another task may still hold an older
+view, and answers a request 503 from it until its next read, with any of the three causes of a pool
+that cannot serve (`NOT_READY`, the causes of `PoolView.refusal`):
+
+- `warming`: it has read neither the healthy target nor a newer note;
+- `capacity_unavailable`: its read of the health came before the target was healthy, and its read
+  of the note after the scaler counted the instance in service, so none starting;
+- `no_session`: it has not read the session yet, on a pool whose target was healthy when the
+  session was booked.
+
+So `Stack.stream` makes a request again while the answer is one of those, for `SETTLE_SECONDS` at
+most, three of those reads. It gives the answer it ends on: a stream test still needs a whole
+stream, and a pool that cannot serve by then fails it. No other answer is asked again, and only a
+stream is: the test of the pool nobody has booked makes one request and reads its answer.
 
 The stack is one test file's: the fixture `stack` is built for a module and taken down after it,
 so moto and its placeholder credentials never outlive the smoke tests in a run of every test.
@@ -74,6 +84,7 @@ from botocore.client import BaseClient
 from moto import mock_aws
 
 from rhi_common import sessions, tables
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.records import ScalerNote, Session
 from rhi_common.students import StudentKey
@@ -96,12 +107,14 @@ READY_SECONDS = 30.0
 # How long the client waits for the next bytes of an answer: an engine is silent while it computes
 # a long transcript.
 READ_SECONDS = 120.0
-# How long a stream is asked again while its answer is 503 with the cause `WARMING`, since the first
-# such answer, and between two requests: the gateway's tasks do not read a pool ready at the same
-# moment, and are at most one read of 5 seconds apart.
+# What a gateway task answers, each as a 503, for a pool its view says cannot serve
+# (`rhi_gateway.readiness.PoolView.refusal`).
+NOT_READY = frozenset({Cause.NO_SESSION, Cause.WARMING, Cause.CAPACITY_UNAVAILABLE})
+# How long a stream is asked again while its answer is one of those, since the first such answer,
+# and between two requests: the gateway's tasks do not read a pool at the same moment, and are at
+# most one read of 5 seconds apart.
 SETTLE_SECONDS = 15.0
 AGAIN_SECONDS = 1.0
-WARMING = "warming"
 
 # Placeholders, which moto never checks.
 _ACCOUNT = "123456789012"
@@ -195,12 +208,12 @@ class Stack:
 
     def stream(self, path: str, body: Mapping[str, Any]) -> Stream:
         """A streamed request with the canary's key, read to the end of its answer. While the
-        answer is 503 with the cause `warming`, the request is made again every `AGAIN_SECONDS`,
+        answer is 503 with a cause of `NOT_READY`, the request is made again every `AGAIN_SECONDS`,
         for `SETTLE_SECONDS` at most since the first such answer: the answer given is the last."""
         until: float | None = None
         while True:
             answer, cause = self._streamed(path, body)
-            if answer.status != 503 or cause != WARMING:
+            if answer.status != 503 or cause not in NOT_READY:
                 return answer
             until = time.monotonic() + SETTLE_SECONDS if until is None else until
             if time.monotonic() + AGAIN_SECONDS > until:
