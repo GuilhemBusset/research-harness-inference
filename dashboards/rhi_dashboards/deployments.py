@@ -25,7 +25,7 @@ it, one band ends and another starts.
 
 The release series is not an engine metric: it is the agent's, and the agent reports it from the
 moment its instance serves. Nothing in this dashboard is read from the per-engine table, so it has
-no "asleep" series. A pool with no instance draws no band.
+no series of the pool's state. A pool with no instance draws no band.
 """
 
 from __future__ import annotations

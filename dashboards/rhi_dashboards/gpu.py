@@ -34,9 +34,9 @@ remote-writes Prometheus' counter suffix, and it takes only a lowercase `_total`
 there, so the exporter's `..._JOULES_TOTAL` reaches the workspace as `..._JOULES_TOTAL_total`. A
 gauge keeps its name.
 
-Every panel follows the rule of a pool at zero (`rules.engine_timeseries`): it reads "asleep"
-while the scaler counts no instance in service, and never shows what a stopped instance last
-reported.
+Every panel follows the rule of a pool with no instance (`rules.engine_timeseries`): it reads "no
+session" while the pool's session is not active and "waiting for capacity" while it is active and
+the scaler counts no instance in service, and never shows what a stopped instance last reported.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ XID = "DCGM_FI_DEV_XID_ERROR"
 
 # The label the collector gives every series of an instance (its ID), and the exporter's label for
 # a GPU of the instance (its index).
-INSTANCE = "instance"
+INSTANCE = rules.INSTANCE
 GPU = "gpu"
 
 # Each gauge, in the row's order: its panel's title and its unit, by Grafana's unit identifiers.

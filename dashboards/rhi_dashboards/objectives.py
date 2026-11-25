@@ -1,4 +1,4 @@
-"""The five objectives of section 7.3, measured while a session is on, each with its target.
+"""The four objectives of section 7.3, each pool's measured while its session is active, each with its target.
 
 Defined once, here: the fleet dashboard shows them (`rhi_dashboards.fleet`) and the reading of the
 dry-run class is judged against them (section 14).
@@ -6,30 +6,36 @@ dry-run class is judged against them (section 14).
 | Objective | Target | Measured as | From |
 | --- | --- | --- | --- |
 | Gateway answers | At least 99.5%, the design's | The share of requests that are not a 5xx answer of the gateway's own fault | The gateway's requests and its own faults: an answer of 500 or above that names no cause of section 6.2 (`rhi_gateway.metrics`) |
-| Time to first token, warm pool | The 95th percentile under `target_ttft_p95_seconds` | The share of the requests that were not held whose first token came under the target, first turns and later turns apart: at least 95% | The gateway's histogram of what students wait (`rhi_gateway.experience`) |
-| Output speed per stream, warm pool | The median at `target_stream_median_tokens_per_second` or more, the slowest tenth at `target_stream_p10_tokens_per_second` or more | For each pool whose engine is not the mock, the share of the streams that were not held at each floor or more: above 50%, above 90% | The gateway's histogram of each stream's speed |
+| Time to first token | The 95th percentile under `target_ttft_p95_seconds` | For each pool, the share of its requests that were not held whose first token came under the target, first turns and later turns apart: at least 95% | The gateway's histogram of what students wait (`rhi_gateway.experience`) |
+| Output speed per stream | On the coursework pool, the median at `target_stream_median_tokens_per_second` or more, the slowest tenth at `target_stream_p10_tokens_per_second` or more | The share of the pool's streams that were not held at each floor or more: above 50%, above 90% | The gateway's histogram of each stream's speed |
 | Cached share of input | Above `cached_share_flag_percent` | For each pool: its engine's cached input tokens over its input tokens | The engine, by the per-engine table |
-| Cold start from the warm pool | The 90th percentile under 5 minutes, the design's | The share of the promotions from the warm pool completed in the session that took under 5 minutes: at least 90% | The lifecycle agent's histogram of the seconds its stages took in each launch completed (`rhi_lifecycle.stages`) |
 
 The provisional targets are the configuration's (`rhi.config.Config`), until spike S5 has measured
-the pool; 99.5% and 5 minutes are fixed by the design.
+the pool; 99.5% is fixed by the design. There is no objective on the time a launch takes: nobody
+waits for a launch behind a request, since a session's instances are asked for ahead of it.
 
-**Only what happened while a session was on.** Every query is built with `rules.over_sessions`:
-each sample of a counter is counted by what it adds (`rules.session_increment`), and only where it
-was taken inside the dashboard's range while the session gauge's latest reading was 1, by the
+**Only what happened while the session was active.** Sessions are per pool, and so are three of the
+objectives: a measure of a pool counts that pool's series only, and only the samples taken while
+that pool's session was active (`Measure.pool`). The gateway's answers are about no pool: they are
+counted while any pool's session was active. Every query is built with `rules.over_sessions`: each
+sample of a counter is counted by what it adds (`rules.session_increment`), and only where it was
+taken inside the dashboard's range while the latest reading of the session's gauge was 1, by the
 timestamps of both. A share is taken of the sums, never of each step's: the share of the session's
 requests, of the session's streams. So the same query is right for any session, and over a range
 with no session it reads no data.
+
+**The coursework pool** is the configuration's default pool (`default_pool`; section 4.2), and the
+speed objective is measured on it alone: its floors are that pool's. A mock engine runs no GPU, so
+a configuration whose default pool is the mock has no measure of speed.
 
 **A percentile is judged by a share.** The q-th percentile is the smallest value with at least q
 of the observations at or under it, so it is under a target exactly when at least q of the
 observations are under it, and at a floor or more exactly when more than 1 - q are at the floor or
 more. That share is what each measure shows and is judged on, with the observations behind it, and
 `target` and `percentile` say which percentile it stands for. The gateway's buckets count the
-values strictly under their boundary (`rhi_gateway.experience`), and so do the lifecycle agent's
-(`rhi_lifecycle.stages`). Each target is a boundary of its histogram: the gateway takes the
-configured floors among its boundaries (`rhi_gateway.settings`), and 5 minutes is a boundary of the
-agent's. A bucket is selected by its `le` label as the workspace holds it: the collectors (release
+values strictly under their boundary (`rhi_gateway.experience`). Each target is a boundary of its
+histogram: the gateway takes the configured floors among its boundaries (`rhi_gateway.settings`).
+A bucket is selected by its `le` label as the workspace holds it: the collectors (release
 0.165.0) write a boundary in the fewest digits that give it back, with no exponent and no ".0"
 (`5`, `12.5`), not as the client library serves it (`5.0`).
 
@@ -48,12 +54,6 @@ a verdict its buckets do not prove.
 
 **Gateway answers.** Where there are requests and no fault was counted, zero faults are read, so a
 session without a fault reads 100%.
-
-**Cold start.** The lifecycle agent observes each launch whose hook Auto Scaling took with
-`CONTINUE`, once, with the seconds its stages took in all: a launch abandoned, or whose completion
-was refused, is not observed, and two launches are two observations whatever their seconds. Its
-count is read like a counter, so each launch is counted by the first sample that shows it, and one
-completed before the session is not.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
-from rhi_common.engine_metrics import Quantity
+from rhi_common.engine_metrics import MOCK, Quantity
 from rhi_dashboards import rules
 
 if TYPE_CHECKING:
@@ -75,33 +75,26 @@ if TYPE_CHECKING:
 
 GATEWAY_METRICS = "services/gateway/rhi_gateway/metrics.py"
 GATEWAY_EXPERIENCE = "services/gateway/rhi_gateway/experience.py"
-LIFECYCLE = "services/engine/lifecycle/rhi_lifecycle/stages.py"
 
 # The gateway's counts of requests, and of its own faults (section 6.2: a 5xx that names no cause).
 REQUESTS = "rhi_gateway_student_requests_total"
 OWN_FAULTS = "rhi_gateway_own_faults_total"
-# The gateway's histograms of what students experience, and the labels that select a warm request.
+# The gateway's histograms of what students experience, and the labels that select a request that
+# was not held (`start` reads `warm` for it) and its turn.
 FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 SPEED = "rhi_gateway_stream_output_tokens_per_second"
-START, WARM = "start", "warm"
+START, NOT_HELD = "start", "warm"
 TURN, FIRST_TURN, LATER_TURN = "turn", "first", "later"
 BOUNDARY, INFINITY = "le", "+Inf"
-# The seconds of each launch completed, and the transition of a start from the warm pool.
-LAUNCH_SECONDS = "rhi_lifecycle_launch_seconds"
-TRANSITION, PROMOTION = "transition", "promotion"
-# The engine of the mock pool, which the speed objective leaves out: it runs no GPU.
-MOCK_ENGINE = "mock"
 
-# The design's two fixed targets (section 7.3).
+# The design's fixed target (section 7.3).
 GATEWAY_TARGET = 0.995
-COLD_START_TARGET_SECONDS = 300.0
 
 METRICS: tuple[rules.Declared, ...] = (
     rules.EmittedBy(REQUESTS.removesuffix("_total"), GATEWAY_METRICS),
     rules.EmittedBy(OWN_FAULTS.removesuffix("_total"), GATEWAY_METRICS),
     rules.EmittedBy(FIRST_TOKEN, GATEWAY_EXPERIENCE),
     rules.EmittedBy(SPEED, GATEWAY_EXPERIENCE),
-    rules.EmittedBy(LAUNCH_SECONDS, LIFECYCLE),
     rules.FromEngineTable(Quantity.INPUT_TOKENS),
     rules.FromEngineTable(Quantity.CACHED_INPUT_TOKENS),
 )
@@ -129,12 +122,14 @@ class Measure:
     """One query of an objective, and what its value is judged against.
 
     `target` is the objective's target, as section 7.3 states it (99.5%, 5 seconds, 15 tokens per
-    second, 85%, 300 seconds), and `percentile`, from 0 to 1, the percentile it bounds, if any. The
+    second, 85%), and `percentile`, from 0 to 1, the percentile it bounds, if any. The
     value meets the objective when it is `comparison` `threshold`: the target itself, or, for a
     percentile, the share of the observations it needs. `share` is the query of that value, or of
     the least it can be when `ceiling`, the most it can be, is given too: a share an older gateway
     task's buckets only bound. `unit` is Grafana's unit of the value, and `count` the query of the
-    observations behind a share, over the same steps.
+    observations behind a share, over the same steps. `pool` is the pool the measure is of, by its
+    name: it counts that pool's series, while that pool's session is active. It is None
+    (`rules.ANY_POOL`) for the gateway's answers, counted while any pool's session is active.
     """
 
     legend: str
@@ -147,6 +142,7 @@ class Measure:
     percentile: float | None = None
     count: str | None = None
     ceiling: str | None = None
+    pool: rules.Session = rules.ANY_POOL
 
     @property
     def expression(self) -> str:
@@ -188,17 +184,20 @@ def boundary(value: float) -> str:
 
 
 def _count(histogram: str, matchers: dict[str, str]) -> str:
-    """The session's observations of the histogram."""
-    return rules.over_sessions(rules.step_increase(f"{histogram}_count", matchers))
+    """The observations of the histogram of a pool in the pool's session: `matchers` names the pool."""
+    return rules.over_sessions(rules.step_increase(f"{histogram}_count", matchers, session=matchers[rules.POOL]))
 
 
 def _nearest_bucket(histogram: str, matchers: dict[str, str], bounds: list[str], reduce: str) -> str:
-    """The session's observations in each series' bucket nearest the floor among `bounds`: the one
-    `reduce` (`max` or `min`) picks of the cumulative buckets the series has."""
+    """The observations of a pool in its session, in each series' bucket nearest the floor among
+    `bounds`: the one `reduce` (`max` or `min`) picks of the cumulative buckets the series has."""
     pattern = "|".join(re.escape(bound) for bound in bounds)
     series = rules.selector(f"{histogram}_bucket", matchers, matching={BOUNDARY: pattern})
+    session = matchers[rules.POOL]
     return rules.over_sessions(
-        lambda previous: f"sum by () ({reduce} without ({BOUNDARY}) ({rules.session_increment(series, previous)}))"
+        lambda previous: (
+            f"sum by () ({reduce} without ({BOUNDARY}) ({rules.session_increment(series, previous, session)}))"
+        )
     )
 
 
@@ -227,9 +226,10 @@ def _under_bounds(
 
 
 def gateway_answers() -> Objective:
-    """The share of the session's requests that were not a 5xx of the gateway's own fault."""
-    requests = rules.over_sessions(rules.step_increase(REQUESTS))
-    faults = rules.over_sessions(rules.step_increase(OWN_FAULTS))
+    """The share of the requests that were not a 5xx of the gateway's own fault, while any pool's
+    session was active: the gateway's answers are about no pool."""
+    requests = rules.over_sessions(rules.step_increase(REQUESTS, session=rules.ANY_POOL))
+    faults = rules.over_sessions(rules.step_increase(OWN_FAULTS, session=rules.ANY_POOL))
     share = f"(({requests}) - (({faults}) or on () (0 * ({requests})))) / ({requests})"
     goal = f"at least {GATEWAY_TARGET:.1%} of requests not a 5xx of the gateway's own fault"
     measure = Measure(
@@ -239,44 +239,54 @@ def gateway_answers() -> Objective:
 
 
 def first_token(config: Config) -> Objective:
-    """The 95th percentile of the time to first token of warm requests, first and later turns apart."""
+    """The 95th percentile of the time to first token of each pool's requests that were not held,
+    first and later turns apart, in the pool's session."""
     target, q = config.target_ttft_p95_seconds, 0.95
     measures = []
-    for turn in (FIRST_TURN, LATER_TURN):
-        matchers = {START: WARM, TURN: turn}
-        count = _count(FIRST_TOKEN, matchers)
-        least, most = _under_bounds(FIRST_TOKEN, matchers, target, WAIT_BUCKETS, count)
-        goal = f"p95 under {target:g} s: at least {q:.0%} of warm {turn} turns with a first token under {target:g} s"
-        measures.append(
-            Measure(
-                f"{turn} turns under {target:g} s",
-                f"({least}) / ({count})",
-                target,
-                Comparison.AT_LEAST,
-                q,
-                "percentunit",
-                goal,
-                q,
-                count,
-                None if least == most else f"({most}) / ({count})",
+    for pool in config.pools:
+        for turn in (FIRST_TURN, LATER_TURN):
+            matchers = {rules.POOL: pool.name, START: NOT_HELD, TURN: turn}
+            count = _count(FIRST_TOKEN, matchers)
+            least, most = _under_bounds(FIRST_TOKEN, matchers, target, WAIT_BUCKETS, count)
+            goal = (
+                f"p95 under {target:g} s: at least {q:.0%} of the {turn} turns that were not held"
+                f" with a first token under {target:g} s"
             )
-        )
-    return Objective("Time to first token, warm pool", tuple(measures))
+            measures.append(
+                Measure(
+                    f"{pool.name} {turn} turns under {target:g} s",
+                    f"({least}) / ({count})",
+                    target,
+                    Comparison.AT_LEAST,
+                    q,
+                    "percentunit",
+                    goal,
+                    q,
+                    count,
+                    None if least == most else f"({most}) / ({count})",
+                    pool.name,
+                )
+            )
+    return Objective("Time to first token", tuple(measures))
 
 
 def stream_speed(config: Config) -> Objective:
-    """The median and the slowest tenth of warm streams' speed, for each pool whose engine is not the mock."""
+    """The median and the slowest tenth of the speed of the coursework pool's streams that were not
+    held, in the pool's session."""
     measures = []
     for pool in speed_pools(config):
         for q, name, floor in (
             (0.5, "median", config.target_stream_median_tokens_per_second),
             (0.1, "slowest tenth", config.target_stream_p10_tokens_per_second),
         ):
-            matchers = {rules.POOL: pool.name, START: WARM}
+            matchers = {rules.POOL: pool.name, START: NOT_HELD}
             count = _count(SPEED, matchers)
             least, most = _under_bounds(SPEED, matchers, floor, SPEED_BUCKETS, count)
             needed = round(1 - q, 12)
-            goal = f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of warm streams at {floor:g} or more"
+            goal = (
+                f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of the streams that were not held"
+                f" at {floor:g} or more"
+            )
             measures.append(
                 Measure(
                     f"{pool.name} {name}, at {floor:g} tokens/s or more",
@@ -289,20 +299,23 @@ def stream_speed(config: Config) -> Objective:
                     q,
                     count,
                     None if least == most else f"(({count}) - ({least})) / ({count})",
+                    pool.name,
                 )
             )
-    return Objective("Output speed per stream, warm pool", tuple(measures))
+    return Objective("Output speed per stream", tuple(measures))
 
 
 def speed_pools(config: Config) -> tuple[Pool, ...]:
-    """The pools the speed objective is measured for: those whose engine is not the mock."""
-    return tuple(pool for pool in config.pools if pool.engine != MOCK_ENGINE)
+    """The pool the speed objective is measured for: the coursework pool, which is the
+    configuration's default pool (section 4.2), unless its engine is the mock, which runs no GPU."""
+    return tuple(pool for pool in config.pools if pool.name == config.default_pool and pool.engine != MOCK)
 
 
 def cached_share(config: Config) -> Objective:
-    """For each pool, its engine's cached input tokens over its input tokens, while a session is on:
-    every sample an instance reported in the session, the scaler's count of instances in service
-    aside, which may not have caught up with an instance that has just started reporting."""
+    """For each pool, its engine's cached input tokens over its input tokens, while the pool's
+    session is active: every sample an instance reported in the session, the scaler's count of
+    instances in service aside, which may not have caught up with an instance that has just started
+    reporting."""
     target = config.cached_share_flag_percent / 100
     measures = []
     for pool in config.pools:
@@ -311,27 +324,17 @@ def cached_share(config: Config) -> Objective:
             for quantity in (Quantity.CACHED_INPUT_TOKENS, Quantity.INPUT_TOKENS)
         )
         goal = f"above {config.cached_share_flag_percent:g}% of input tokens cached"
-        measures.append(Measure(pool.name, f"({cached}) / ({total})", target, Comparison.ABOVE, target, "percentunit", goal))
+        measures.append(
+            Measure(
+                pool.name, f"({cached}) / ({total})", target, Comparison.ABOVE, target, "percentunit", goal, pool=pool.name
+            )
+        )
     return Objective("Cached share of input", tuple(measures))
 
 
-def cold_start() -> Objective:
-    """The 90th percentile of the seconds a start from the warm pool took, over the session's launches."""
-    q, target = 0.9, COLD_START_TARGET_SECONDS
-    matchers = {TRANSITION: PROMOTION}
-    # 5 minutes is a boundary of every agent's histogram: its bucket is read as it is.
-    under = rules.over_sessions(rules.step_increase(f"{LAUNCH_SECONDS}_bucket", {**matchers, BOUNDARY: boundary(target)}))
-    count = _count(LAUNCH_SECONDS, matchers)
-    goal = f"p90 under {target / 60:g} minutes: at least {q:.0%} of the session's promotions under {target:g} s"
-    measure = Measure(
-        f"under {target / 60:g} minutes", f"({under}) / ({count})", target, Comparison.AT_LEAST, q, "percentunit", goal, q, count
-    )
-    return Objective("Cold start from the warm pool", (measure,))
-
-
 def objectives(config: Config) -> tuple[Objective, ...]:
-    """The five objectives, in the order of section 7.3, with the configuration's targets."""
-    return (gateway_answers(), first_token(config), stream_speed(config), cached_share(config), cold_start())
+    """The four objectives, in the order of section 7.3, with the configuration's targets."""
+    return (gateway_answers(), first_token(config), stream_speed(config), cached_share(config))
 
 
 def threshold_step(measure: Measure) -> float:

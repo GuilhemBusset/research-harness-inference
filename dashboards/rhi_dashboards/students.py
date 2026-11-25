@@ -31,7 +31,7 @@ each query takes the rate of each series first, then sums by pool and alias, whi
 **By pool too.** A student may use more than one pool, and a pool is one entry of the
 configuration (section 4.2): each series is one alias on one pool, never a pool's numbers mixed
 into another's. The panels need no row per pool, and nothing here is read from an engine, so there
-is no "asleep" series: a student who sent nothing draws nothing.
+is no series of a pool's state: a student who sent nothing draws nothing.
 """
 
 from __future__ import annotations
