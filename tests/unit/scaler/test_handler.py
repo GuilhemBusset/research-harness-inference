@@ -16,10 +16,10 @@ from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
-from rhi_common.records import Session, SessionSwitch
+from rhi_common.records import Session
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
-from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
+from rhi_scaler.metrics import DECISIONS, GAUGES, DecisionCounts, RemoteWriter, decode
 from rhi_scaler.model import Memory, Reason
 from rhi_scaler.settings import read_settings
 
@@ -116,7 +116,6 @@ class Edge:
         instances: Sequence[dict[str, Any]],
         records: Sequence[dict[str, Any]],
         heartbeats: Sequence[dict[str, Any]],
-        switch_error: str | None = None,
     ) -> None:
         group = {
             "AutoScalingGroupName": GROUP,
@@ -133,40 +132,39 @@ class Edge:
         self.autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": [GROUP]})
         self.autoscaling.add_response("describe_scaling_activities", {"Activities": []}, {"AutoScalingGroupName": GROUP})
         self.elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": []}, {"TargetGroupArn": TARGET_GROUP})
-        for table, items in (("pool-state-table", records), ("heartbeats-table", heartbeats)):
-            query = {
-                "TableName": table,
-                "KeyConditionExpression": ANY,
-                "ExpressionAttributeNames": ANY,
-                "ExpressionAttributeValues": {":pool": {"S": "mock"}},
-                "ConsistentRead": True,
-            }
-            self.dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, query)
-        # No session switch, or a read of it that fails with the error named.
-        switch = {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True}
-        if switch_error is None:
-            self.dynamodb.add_response("get_item", {}, switch)
-        else:
-            self.dynamodb.add_client_error("get_item", switch_error, expected_params=switch)
+        # The pool's memory and session by their keys, then its instances' heartbeats: the Stubber
+        # refuses any other read of the tables.
+        keys = [{"pool": {"S": "mock"}, "record": {"S": record}} for record in ("memory", "session")]
+        self.dynamodb.add_response(
+            "batch_get_item",
+            {"Responses": {"pool-state-table": [serialize(item) for item in records]}},
+            {"RequestItems": {"pool-state-table": {"Keys": keys, "ConsistentRead": True}}},
+        )
+        query = {
+            "TableName": "heartbeats-table",
+            "KeyConditionExpression": ANY,
+            "ExpressionAttributeNames": ANY,
+            "ExpressionAttributeValues": {":pool": {"S": "mock"}, ":instance": {"S": "instance#"}},
+            "ConsistentRead": True,
+        }
+        self.dynamodb.add_response("query", {"Items": [serialize(item) for item in heartbeats]}, query)
 
-    def expect_writes(self, note: dict[str, Any], *, published: bool = True) -> None:
-        """The note put whole, then the memory updated: what it stores is in `updates`. Then, if
-        `published`, the run's data points published to CloudWatch (`rhi_scaler.cloudwatch`)."""
+    def expect_writes(self, note: dict[str, Any]) -> None:
+        """The note put whole, then the memory updated: what it stores is in `updates`. Then the
+        run's data points published to CloudWatch (`rhi_scaler.cloudwatch`)."""
         self.dynamodb.add_response("put_item", {}, {"TableName": "pool-state-table", "Item": serialize(note)})
-        update = ("Key", "UpdateExpression", "ExpressionAttributeNames", "ExpressionAttributeValues")
-        self.dynamodb.add_response("update_item", {}, {"TableName": "pool-state-table", **dict.fromkeys(update, ANY)})
-        if published:
-            self.cloudwatch.add_response("put_metric_data", {}, {"Namespace": "rhi/scaler", "MetricData": ANY})
+        self.dynamodb.add_response("update_item", {})
+        self.cloudwatch.add_response("put_metric_data", {}, {"Namespace": "rhi/scaler", "MetricData": ANY})
 
-    def queue_first_run(self, switch_error: str | None = None) -> None:
+    def queue_first_run(self) -> None:
         """A pool at zero whose session asks for one instance: it is asked for, and the memory
-        stored. Nothing is published when the switch's read fails with `switch_error`."""
-        self.queue_read(desired=0, instances=[], records=[session_record()], heartbeats=[], switch_error=switch_error)
+        stored."""
+        self.queue_read(desired=0, instances=[], records=[session_record()], heartbeats=[])
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
         # The instance asked for has not come: it waits, from this run on.
-        self.expect_writes(note(1, requested=1, waiting=1, waiting_since=NOW), published=switch_error is None)
+        self.expect_writes(note(1, requested=1, waiting=1, waiting_since=NOW))
 
 
 @pytest.fixture
@@ -209,8 +207,8 @@ def test_a_session_raises_the_pool_stores_the_memory_and_emits_its_metrics(edge:
         "rhi_scaler_instances_in_service": 0.0,
     }
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "provision")))][-1] == 1.0
-    # The session switch has no record: the session gauge reads 0.
-    assert sent[(SESSION_ON, ())] == [0.0]
+    # Every series is a pool's: the run sends none for the whole system.
+    assert all(dict(labels).get("pool") == "mock" for _, labels in sent)
     # What the note holds goes out too: one instance asked of AWS that has not come.
     assert sent[("rhi_scaler_instances_waiting", pool)] == [1.0]
     # The pool, the reason and the cause are the only labels: nothing names a student.
@@ -237,32 +235,16 @@ def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_setting
     assert [(pool.desired, pool.requested) for pool in decision.pools] == [(0, 0)]
 
 
-def test_a_switch_that_cannot_be_read_still_lets_the_session_raise_the_pool_then_fails_the_run(edge: Edge) -> None:
-    # The capacity, the note and the memory are queued, and no publication: the fixture checks all.
-    edge.queue_first_run(switch_error="ProvisionedThroughputExceededException")
-    with pytest.raises(ClientError):
-        scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
-    assert len(edge.updates) == 1
-    # The push still goes, with no session sample: the run does not know what the switch reads.
-    ((_, _, body),) = edge.pushes
-    assert SESSION_ON not in {name for name, _ in series(body)}
-
-
-def test_a_run_that_cannot_read_the_pools_still_sends_the_switch_it_reads(edge: Edge) -> None:
-    # Auto Scaling refuses the first read; the switch, read on its own, reads off.
+def test_a_run_that_cannot_read_the_pools_fails_on_that_error_and_sends_nothing(edge: Edge) -> None:
+    # Auto Scaling refuses the first read. No read of the table is queued: the run makes none.
     edge.autoscaling.add_client_error("describe_auto_scaling_groups", "Throttling")
-    switch = {"TableName": "pool-state-table", "Key": ANY, "ConsistentRead": True}
-    off = SessionSwitch(on=False, set_by="instructor", set_at=NOW - 60).to_item()
-    edge.dynamodb.add_response("get_item", {"Item": serialize(off)}, switch)
-    with pytest.raises(ClientError):
+    with pytest.raises(ClientError, match="Throttling"):
         scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
-    # The session gauge alone, at 0: a session that has ended does not seem to go on.
-    ((_, _, body),) = edge.pushes
-    assert series(body) == {(SESSION_ON, ()): [0.0]}
+    assert edge.pushes == []
 
 
-def test_a_run_whose_pool_write_fails_still_sends_the_switch_it_read(edge: Edge) -> None:
-    # The capacity is set, then DynamoDB refuses the pool's note; the switch has no record: off.
+def test_a_run_whose_pool_write_fails_fails_on_that_error_and_sends_nothing(edge: Edge) -> None:
+    # The capacity is set, then DynamoDB refuses the pool's note.
     edge.queue_read(desired=0, instances=[], records=[session_record()], heartbeats=[])
     edge.autoscaling.add_response(
         "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
@@ -270,9 +252,7 @@ def test_a_run_whose_pool_write_fails_still_sends_the_switch_it_read(edge: Edge)
     edge.dynamodb.add_client_error("put_item", "ProvisionedThroughputExceededException")
     with pytest.raises(ClientError, match="ProvisionedThroughputExceededException"):
         scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
-    # The session gauge alone, at 0, and the run fails on its write.
-    ((_, _, body),) = edge.pushes
-    assert series(body) == {(SESSION_ON, ()): [0.0]}
+    assert edge.pushes == []
 
 
 def test_a_second_run_is_harmless(edge: Edge) -> None:

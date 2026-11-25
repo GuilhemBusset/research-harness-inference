@@ -9,7 +9,7 @@ namespace `NAMESPACE`:
 | --- | --- | --- |
 | `RunCompleted` | none | 1: a run completed. Its absence for five minutes is the alarm (section 5.1) |
 | `LaunchesSuspended` | `Pool` | 1 while the pool's launches are suspended after three abandoned launches, else 0 (sections 5.1 and 5.4) |
-| `MinutesInServiceOutsideSessions` | `Pool` | The whole minutes the pool has been in service while no session is on (`rhi_scaler.outside_sessions`) |
+| `MinutesInServiceOutsideSessions` | `Pool` | The whole minutes the pool has been in service while its session is not active (`rhi_scaler.outside_sessions`) |
 
 The data points carry no timestamp: CloudWatch dates them when it receives them, after the run has
 applied its decision. The pool's name is the only dimension any of them carries. A CloudWatch metric cannot be deleted

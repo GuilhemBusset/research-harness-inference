@@ -38,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from rhi_common.pool_config import Pool
-from rhi_common.records import InstanceHeartbeat, Mode, Session, is_fresh
+from rhi_common.records import InstanceHeartbeat, Session, is_fresh
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Supply
 
@@ -173,7 +173,6 @@ class Sim:
         )
         pool = PoolInputs(
             config=self.pool,
-            mode=Mode.ENABLED,
             supply=supply,
             instance_heartbeats=tuple(row for row in self.instance_rows.values() if is_fresh(row, self.now)),
             abandoned_launches=self._abandoned_in_a_row(),

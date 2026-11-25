@@ -22,7 +22,7 @@ from moto import mock_aws
 
 from rhi_admin import main
 from rhi_admin.pools import identity_name
-from rhi_common.records import Mode
+from rhi_common.records import CONFIGURED_MODE, Mode
 from rhi_scaler.aws_io import memory_from_item, memory_update
 from rhi_scaler.settings import SETTINGS_VARIABLE, parse_settings
 
@@ -260,7 +260,9 @@ def test_no_command_parks_a_pool(deployed: Deployed, argv: Sequence[str]) -> Non
 
 
 def test_the_settings_read_are_the_scalers_own() -> None:
-    modes = {pool.config.name: pool.configured_mode for pool in parse_settings(SETTINGS, "us-east-1").pools}
+    # The scaler's settings give a pool no mode: the configured one follows the pool's `wake`.
+    pools = [pool.config for pool in parse_settings(SETTINGS, "us-east-1").pools]
+    modes = {pool.name: CONFIGURED_MODE[pool.wake] for pool in pools}
     assert modes == {"coursework": Mode.SCHEDULED_ONLY, "mock": Mode.ENABLED}
 
 

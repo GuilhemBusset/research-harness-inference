@@ -17,7 +17,7 @@ from botocore.stub import Stubber
 from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import LaunchFailure, Mode, ScalerNote, Session
+from rhi_common.records import LaunchFailure, ScalerNote, Session
 from rhi_scaler.aws_io import Clients, PoolSettings, TableNames, apply, launch_history, memory_to_item, read
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Memory
@@ -41,7 +41,7 @@ POOL = parse_pools(
         }
     }
 )[0]
-SETTINGS = PoolSettings(config=POOL, group=GROUP, target_group=TARGETS, configured_mode=Mode.SCHEDULED_ONLY)
+SETTINGS = PoolSettings(config=POOL, group=GROUP, target_group=TARGETS)
 # The session that asks the pool for three instances, through every run below.
 SESSION = Session("coursework", 3, NOW - 600, NOW + 7200, set_by="instructor", set_at=NOW - 900)
 # The instances in service of a pool that waits for two of its three, and of one that has them all.

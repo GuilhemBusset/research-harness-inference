@@ -25,29 +25,10 @@ words of `rhi_common.records.LaunchFailure`, on every run, so that a cause that 
 rather than stays at its last 1: at most one of the four is 1, and none is while nothing waits or
 no launch has failed.
 
-And once for the whole system, on every run:
-
-| Series | Kind | Labels | Value |
-| --- | --- | --- | --- |
-| `rhi_scaler_session_on` | gauge | none | 1 while the session switch reads on; 0 while it reads off or has no record |
-
-The only labels are the pool's name, the decision's reason and the cause of a failed launch, the
-last two from fixed vocabularies (`rhi_scaler.model.Reason`, `rhi_common.records.LaunchFailure`):
-no metric can carry a student, or text from AWS.
-
-**The session gauge** (system design, sections 5.6 and 7.3). PromQL knows nothing of the session
-switch, so the scaler, which runs every minute, says what it read: the objectives keep only the
-samples taken while this gauge is 1 (`rhi_dashboards.objectives`). A run that could not read the
-switch sends no sample of it, rather than a value it does not know.
-
-A reading takes effect no earlier than the change it reads. A run reads the switch some seconds
-after it starts, and the switch may have changed in between: its sample then carries the first
-millisecond of the second after the switch's own time (`set_at`, a whole second, so the change
-falls within it), not the run's time, and every scrape before that still reads the state before.
-A reading, on or off, carries at the earliest the time its read returned: the admin's command
-takes `set_at` before its write, which may commit later still, and until it does the switch still
-reads as before, so a scrape taken before the read returned keeps the session's last reading (an
-off stays off, and an on stays on).
+Every series carries the pool's label: the scaler sends none for the whole system. The only labels
+are the pool's name, the decision's reason and the cause of a failed launch, the last two from
+fixed vocabularies (`rhi_scaler.model.Reason`, `rhi_common.records.LaunchFailure`): no metric can
+carry a student, or text from AWS.
 
 The function keeps nothing between runs but what its process holds, so the counter counts from
 the process's start, and Prometheus reads a smaller value as a restart (as it does for any
@@ -68,7 +49,6 @@ from __future__ import annotations
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import cramjam
@@ -77,14 +57,13 @@ from botocore.awsrequest import AWSRequest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from rhi_common import sessions
-from rhi_common.records import LaunchFailure, ScalerNote, SessionSwitch, session_is_on
+from rhi_common.records import LaunchFailure, ScalerNote
 from rhi_scaler.model import Decision, Inputs, PoolInputs
 
 DESIRED_CAPACITY = "rhi_scaler_desired_capacity"
 INSTANCES_IN_SERVICE = "rhi_scaler_instances_in_service"
 DECISIONS = "rhi_scaler_decisions_total"
 GAUGES = (DESIRED_CAPACITY, INSTANCES_IN_SERVICE)
-SESSION_ON = "rhi_scaler_session_on"
 SESSION_ACTIVE = "rhi_scaler_session_active"
 INSTANCES_REQUESTED = "rhi_scaler_instances_requested"
 INSTANCES_WAITING = "rhi_scaler_instances_waiting"
@@ -180,46 +159,6 @@ class DecisionCounts:
         self.last_milliseconds = milliseconds
         return milliseconds
 
-    def passed(self, milliseconds: int) -> None:
-        """A sample of this run went out at `milliseconds`: no later run stamps one at or before it."""
-        if self.last_milliseconds is None or milliseconds > self.last_milliseconds:
-            self.last_milliseconds = milliseconds
-
-
-class Unread(Enum):
-    """A session switch the run could not read: neither on nor off."""
-
-    UNREAD = "unread"
-
-
-UNREAD = Unread.UNREAD
-
-
-def session_series(switch: SessionSwitch | None, milliseconds: int, read_at: int | None = None) -> Series:
-    """The session gauge's sample: 1 while the switch reads on, 0 while it reads off or has no record.
-
-    It carries the run's time `milliseconds`, or, when the switch changed later than that, the
-    first millisecond of the second after its change: never a time before the change it reads. A
-    reading, on or off, carries no time before `read_at`, when the read returned, if it is given:
-    the write it reads committed by then, and maybe only just.
-    """
-    on = session_is_on(switch)
-    if switch is not None:
-        milliseconds = max(milliseconds, (switch.set_at + 1) * 1000)
-    if read_at is not None:
-        milliseconds = max(milliseconds, read_at)
-    return Series(SESSION_ON, (), ((1.0 if on else 0.0, milliseconds),))
-
-
-def session_alone(
-    switch: SessionSwitch | None, counts: DecisionCounts, milliseconds: int, *, read_at: int | None = None
-) -> list[Series]:
-    """The session gauge on its own, for a run whose fleet series are not sent, at the run's time
-    `milliseconds` (or later, as `session_series` says)."""
-    series = session_series(switch, counts.stamp(milliseconds), read_at)
-    counts.passed(series.samples[-1][1])
-    return [series]
-
 
 def supply_gauges(pool: PoolInputs, note: ScalerNote, now: int, session_max_hours: int) -> dict[str, int]:
     """What one pool's note and session give at the time `now`, by series: what the pool was asked
@@ -246,24 +185,16 @@ def fleet_series(
     milliseconds: int | None = None,
     *,
     notes: Mapping[str, ScalerNote],
-    session: SessionSwitch | None | Unread = UNREAD,
-    read_at: int | None = None,
 ) -> list[Series]:
     """Counts this run's decisions, and returns every series to send for it, pool by pool.
 
     `milliseconds` is the run's time; without it, the decision clock's second. `notes` holds each
     pool's note as the run wrote it (`rhi_scaler.aws_io.apply`): what the pool was asked, what
-    waits and why. `session` is what the run read of the session switch (`None` for no record),
-    and gives the session gauge; `UNREAD`, a switch the run could not read, gives no sample of it.
-    `read_at` is when the read of the switch returned (`session_series`).
+    waits and why.
     """
     milliseconds = counts.stamp(inputs.now * 1000 if milliseconds is None else milliseconds)
     read_pools = {pool.config.name: pool for pool in inputs.pools}
     out: list[Series] = []
-    if not isinstance(session, Unread):
-        gauge = session_series(session, milliseconds, read_at)
-        counts.passed(gauge.samples[-1][1])
-        out.append(gauge)
     for pool in decision.pools:
         read, note = read_pools[pool.pool], notes[pool.pool]
         gauges = {
