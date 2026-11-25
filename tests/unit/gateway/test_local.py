@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pytest
@@ -18,7 +18,7 @@ from starlette.types import Message
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import Mode, PoolState, ScalerNote
+from rhi_common.records import Mode, PoolState, ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import budget, routes, waker
 from rhi_gateway.app import build_app
@@ -69,7 +69,10 @@ class CountingStore:
 
 @dataclass
 class Gateway:
-    """The application with the local routes over two pools, `coursework` the default; the test sets the views and the time."""
+    """The application with the local routes over two pools, `coursework` the default; the test sets the views and the time.
+
+    Each pool is in a session, active for an hour from `NOW`, whatever view the test sets for it.
+    """
 
     store: CountingStore
     key: str = field(default_factory=generate_key)
@@ -81,11 +84,18 @@ class Gateway:
         local = LocalRoutes(
             Authenticator(self.store, wall_clock=lambda: NOW),
             configured,
-            lambda: self.views,
+            self.in_session,
             default_pool=configured[0],
             clock=lambda: self.now,
         )
         self.app = build_app(local=local)
+
+    def in_session(self) -> dict[str, PoolView]:
+        booked = {
+            name: Session(name, instances=1, starts_at=NOW, ends_at=NOW + 3600, set_by="owner", set_at=NOW)
+            for name in ("coursework", "mock")
+        }
+        return {name: replace(self.views.get(name, PoolView()), session=booked[name]) for name in booked}
 
     def send(self, method: str, path: str, headers: dict[str, str]) -> tuple[int, bytes]:
         """The status and the body the application answers."""

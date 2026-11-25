@@ -12,7 +12,7 @@ import json
 import threading
 from typing import Any
 
-from rhi_common.records import Mode, PoolState, ScalerNote
+from rhi_common.records import Mode, PoolState, ScalerNote, Session
 from rhi_gateway.readiness import Readiness
 from rhi_gateway.waker import Waker
 
@@ -53,7 +53,7 @@ class PoolStateTable:
         self.failing = False
         self.reads: list[tuple[str, str]] = []
 
-    def put(self, record: PoolState | ScalerNote) -> None:
+    def put(self, record: PoolState | ScalerNote | Session) -> None:
         item = record.to_item()
         self.items[str(item["pool"]), str(item["record"])] = item
 
@@ -162,6 +162,38 @@ def test_the_records_are_kept_and_a_failed_read_keeps_the_previous_ones() -> Non
     assert readiness.pool("coursework").mode == disabled
 
 
+def test_each_pool_keeps_its_own_session_and_a_failed_read_keeps_the_session_last_read() -> None:
+    _, _, table, readiness = build()
+    now = int(START)
+    booked = Session("coursework", instances=2, starts_at=now, ends_at=now + 3600, set_by="owner", set_at=now)
+    table.put(booked)
+    table.failing = True
+    readiness.refresh()
+    # In the table, and not read yet: the pool has no session until a first read succeeds.
+    assert readiness.pool("coursework").session is None
+    table.failing = False
+    readiness.refresh()
+    assert {pool: readiness.pool(pool).session for pool in POOLS} == {"coursework": booked, "upgrade": None, "mock": None}
+
+    # Stopped in the table, behind a read that fails, and then an item that is no session: the session last read is kept.
+    stopped = Session("coursework", instances=2, starts_at=now, ends_at=now + 60, set_by="owner", set_at=now + 60)
+    table.put(stopped)
+    table.failing = True
+    readiness.refresh()
+    assert readiness.pool("coursework").session == booked
+    table.failing = False
+    table.items["coursework", "session"] = {"pool": "coursework", "record": "session"}
+    readiness.refresh()
+    assert readiness.pool("coursework").session == booked
+    table.put(stopped)
+    readiness.refresh()
+    assert readiness.pool("coursework").session == stopped
+    # No item is an answer: the pool has no session.
+    del table.items["coursework", "session"]
+    readiness.refresh()
+    assert readiness.pool("coursework").session is None
+
+
 def test_each_pool_gives_the_rebalance_number_of_the_note_last_read() -> None:
     _, _, table, readiness = build()
     assert readiness.pool("coursework").rebalance_number is None  # nothing read yet
@@ -190,8 +222,10 @@ def test_read_every_5_seconds_for_every_pool() -> None:
         assert [at for read, at in elbv2.reads if read == group] == [START + 5 * n for n in range(6)]
         assert table.reads.count((pool, "mode")) == 6
         assert table.reads.count((pool, "note")) == 6
-    # The session switch, once a cycle with the pools' records.
-    assert table.reads.count(("_session", "switch")) == 6
+        # The pool's session, once a cycle with its two other records.
+        assert table.reads.count((pool, "session")) == 6
+    # Nothing but the pools' own records: the session switch is never read.
+    assert {pool for pool, _ in table.reads} == set(POOLS)
     alone = (len(elbv2.reads), len(table.reads))
 
     clock, elbv2, table, readiness = build()

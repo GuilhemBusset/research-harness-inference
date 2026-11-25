@@ -16,10 +16,11 @@ The deployment fills these variables in, and nothing else configures the gateway
 | `RHI_LONGEST_REQUEST_SECONDS` | The longest a request may run | 1800 |
 | `RHI_KEEPALIVE_SECONDS` | The interval between the keep-alives of a held request | 10 |
 | `RHI_RETRY_AFTER_WARMING`, `RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE`, `RHI_RETRY_AFTER_CONCURRENCY_LIMIT` | The seconds of `Retry-After` for the three causes that carry one | 30, 60, 5 |
+| `RHI_SESSION_MAX_HOURS` | The longest a session may last, in hours: the bound every pool's session is read under (`rhi_common.sessions`, section 5.6) | 12 |
 | `RHI_TARGET_TTFT_P95_SECONDS`, `RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND`, `RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND` | The floors of the objectives of section 7.3 (seconds to a first token, tokens a second of a stream), which the gateway's histograms take among their boundaries | 5, 15, 10 |
 
 The defaults are section 17's, and the configuration's (`src/rhi/config.py`) for the keys the
-deployment writes into the six numeric variables and the three floors. A numeric variable is a
+deployment writes into the seven numeric variables and the three floors. A numeric variable is a
 whole number above zero, in digits; a floor is a number above zero, in digits with at most one
 decimal point.
 
@@ -38,8 +39,8 @@ fail later, at the first call that used it.
 **No pool is a valid gateway.** The owner's configuration has an empty pools table until its first
 pool is added, and a gateway that refused to start would keep its service, and every later
 deployment, from a steady state. So `RHI_POOLS`, `RHI_TARGET_GROUPS` and `RHI_POOL_SECRETS` may
-each be `{}`, and `RHI_DEFAULT_POOL` may be left out: every model name is then refused with
-`request_refused`, a `claude-` name included.
+each be `{}`, and `RHI_DEFAULT_POOL` may be left out: no pool has a session then, so every
+forwarded request is refused with `no_session`, a `claude-` name included (`rhi_gateway.app`).
 
 The three tables of pools agree: the target groups and the secrets name exactly the pools of the
 pools table, and the default pool, when given, is one of them. Whether an on-demand pool is priced
@@ -88,6 +89,7 @@ KEEPALIVE_SECONDS = "RHI_KEEPALIVE_SECONDS"
 RETRY_AFTER_WARMING = "RHI_RETRY_AFTER_WARMING"
 RETRY_AFTER_CAPACITY_UNAVAILABLE = "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE"
 RETRY_AFTER_CONCURRENCY_LIMIT = "RHI_RETRY_AFTER_CONCURRENCY_LIMIT"
+SESSION_MAX_HOURS = "RHI_SESSION_MAX_HOURS"
 TARGET_TTFT_P95_SECONDS = "RHI_TARGET_TTFT_P95_SECONDS"
 TARGET_STREAM_MEDIAN = "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND"
 TARGET_STREAM_P10 = "RHI_TARGET_STREAM_P10_TOKENS_PER_SECOND"
@@ -115,6 +117,7 @@ NUMERIC_DEFAULTS: Mapping[str, int] = MappingProxyType(
         RETRY_AFTER_WARMING: 30,
         RETRY_AFTER_CAPACITY_UNAVAILABLE: 60,
         RETRY_AFTER_CONCURRENCY_LIMIT: 5,
+        SESSION_MAX_HOURS: 12,
     }
 )
 
@@ -178,6 +181,7 @@ class Settings:
     retry_after_warming: int = NUMERIC_DEFAULTS[RETRY_AFTER_WARMING]
     retry_after_capacity_unavailable: int = NUMERIC_DEFAULTS[RETRY_AFTER_CAPACITY_UNAVAILABLE]
     retry_after_concurrency_limit: int = NUMERIC_DEFAULTS[RETRY_AFTER_CONCURRENCY_LIMIT]
+    session_max_hours: int = NUMERIC_DEFAULTS[SESSION_MAX_HOURS]
     target_ttft_p95_seconds: float = FLOOR_DEFAULTS[TARGET_TTFT_P95_SECONDS]
     target_stream_median_tokens_per_second: float = FLOOR_DEFAULTS[TARGET_STREAM_MEDIAN]
     target_stream_p10_tokens_per_second: float = FLOOR_DEFAULTS[TARGET_STREAM_P10]
@@ -349,6 +353,7 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         retry_after_warming=_number(environ, RETRY_AFTER_WARMING),
         retry_after_capacity_unavailable=_number(environ, RETRY_AFTER_CAPACITY_UNAVAILABLE),
         retry_after_concurrency_limit=_number(environ, RETRY_AFTER_CONCURRENCY_LIMIT),
+        session_max_hours=_number(environ, SESSION_MAX_HOURS),
         target_ttft_p95_seconds=_floor(environ, TARGET_TTFT_P95_SECONDS),
         target_stream_median_tokens_per_second=_floor(environ, TARGET_STREAM_MEDIAN),
         target_stream_p10_tokens_per_second=_floor(environ, TARGET_STREAM_P10),

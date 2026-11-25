@@ -44,7 +44,7 @@ from moto import mock_aws
 from rhi_common import tables
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
-from rhi_common.records import GatewayHeartbeat, SessionSwitch
+from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import main as entry
 from rhi_gateway import metrics
@@ -137,13 +137,17 @@ def create_tables() -> None:
             AttributeDefinitions=[{"AttributeName": key.name, "AttributeType": key.type.value} for key, _ in keys],
             BillingMode="PAY_PER_REQUEST",
         )
-    # A session is on: the student of these tests is served (section 5.6).
-    switch = SessionSwitch(on=True, set_by="owner", set_at=int(time.time())).to_item()
-    boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).put_item(Item=switch)
 
 
 def environment(*pools: str) -> tuple[dict[str, str], dict[str, str]]:
-    """The environment of a gateway of these pools, the first the default one, and the secret moto holds for each."""
+    """The environment of a gateway of these pools, the first the default one, and the secret moto holds for each.
+
+    Each pool is booked for the hour that starts now: the student of these tests is served on it (section 5.6).
+    """
+    now, pool_state = int(time.time()), boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1])
+    for pool in pools:
+        booked = Session(pool, instances=1, starts_at=now, ends_at=now + 3600, set_by="owner", set_at=now)
+        pool_state.put_item(Item=booked.to_item())
     secretsmanager = boto3.client("secretsmanager")
     values = {pool: secrets.token_urlsafe(24) for pool in pools}
     arns = {
@@ -270,9 +274,10 @@ def test_the_application_built_from_an_environment_answers_from_the_tables_moto_
 
 
 @pytest.mark.usefixtures("aws")
-def test_a_gateway_whose_table_holds_no_switch_refuses_a_student_with_no_session() -> None:
+def test_a_gateway_whose_table_holds_no_session_for_its_pool_refuses_a_student_with_no_session() -> None:
     environ, _ = environment("mock")
-    boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).delete_item(Key=tables.SESSION_SWITCH_KEY)
+    pool_state = boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1])
+    pool_state.delete_item(Key={"pool": "mock", "record": SESSION_RECORD})
     key = issue_key()
     gateway = build(read_settings(environ), aws_clients(), task=TASK)
 
@@ -299,10 +304,10 @@ def test_a_gateway_with_no_pool_and_no_default_pool_starts_and_answers_the_hello
         listed = (await client.get("/v1/models", headers=bearer(key))).json()
         assert (listed["data"], listed["default"]) == ([], None)
         assert (await client.get("/status", headers=bearer(key))).json() == {"pools": []}
-        # No name is a pool's, and with no default pool a claude- name is refused like any other.
+        # No pool, so no pool's session is active: a request is refused before its body is read, whatever it names.
         for model in ("claude-sonnet-4-5", "mock"):
             refused = await client.post("/v1/messages", headers=bearer(key), json={**MESSAGE, "model": model})
-            assert (refused.status_code, refused.json()["error"]["type"]) == (400, "request_refused")
+            assert (refused.status_code, refused.json()["error"]["type"]) == (503, "no_session")
 
     started(gateway, scenario)
 

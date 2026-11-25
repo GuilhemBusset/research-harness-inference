@@ -18,7 +18,7 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import Mode, PoolState, ScalerNote
+from rhi_common.records import Mode, PoolState, ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway.app import build_app
 from rhi_gateway.auth import Authenticator
@@ -51,13 +51,18 @@ POOLS = (pool("coursework"), pool("mock"), pool("evening", wake="scheduled-only"
 
 
 class Doubles:
-    """`describe_target_health` (no healthy target), `get_item` on the pool-state table, and the scaler's `invoke`."""
+    """`describe_target_health` (no healthy target), `get_item` on the pool-state table, and the scaler's `invoke`.
+
+    The table holds every pool's session, active for an hour from the moment the gateway's clocks stand at.
+    """
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.invocations: list[dict[str, Any]] = []
+        for configured in POOLS:
+            self.put(Session(configured.name, 1, starts_at=NOW, ends_at=NOW + 3600, set_by="owner", set_at=NOW))
 
-    def put(self, record: PoolState | ScalerNote) -> None:
+    def put(self, record: PoolState | ScalerNote | Session) -> None:
         item = record.to_item()
         self.items[str(item["pool"]), str(item["record"])] = item
 

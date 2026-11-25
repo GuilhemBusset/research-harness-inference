@@ -56,6 +56,7 @@ FULL = {
     "RHI_RETRY_AFTER_WARMING": "31",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "61",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "6",
+    "RHI_SESSION_MAX_HOURS": "9",
 }
 REQUIRED = (
     "RHI_POOLS",
@@ -77,6 +78,7 @@ NUMERIC = {
     "RHI_RETRY_AFTER_WARMING": ("retry_after_warming", 30),
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": ("retry_after_capacity_unavailable", 60),
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": ("retry_after_concurrency_limit", 5),
+    "RHI_SESSION_MAX_HOURS": ("session_max_hours", 12),
 }
 
 # The floors of the objectives, the field each fills and its default (the configuration's, section 17).
@@ -128,6 +130,7 @@ def test_a_full_environment_gives_the_settings() -> None:
         retry_after_warming=31,
         retry_after_capacity_unavailable=61,
         retry_after_concurrency_limit=6,
+        session_max_hours=9,
     )
     # The pools are the pool configuration's, with its defaults.
     assert (mock.hold_seconds, second.hold_seconds) == (420, 60)
