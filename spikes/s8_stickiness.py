@@ -7,20 +7,36 @@ requirement for stickiness, which a pool of two instances over three zones does 
 replay itself has not been tried (evidence E13, known gap 10). This job asks it of the mock pool.
 **Pass:** every request of a student reaches one instance until that instance leaves.
 
-**What it does**, through the gateway only, as canary students (`common.canary_keys`), and reading
-the pool only from the workspace and the pool-state table. It never changes the pool: the scaler
-alone moves it (section 5.1).
+**The session.** A pool has what its session asks for, and no rule reads its load (section 5.1),
+so the job books the pool itself, as section 12 says of the jobs that run on the mock pool, through
+the module the pipeline's verification books with (`scripts/pipeline/booking.py`). Before it sends
+anything it books a session of two instances, from now, for the minutes of `RHI_SPIKE_RUN_MINUTES`,
+under the name `spike/s8_stickiness` (`SET_BY`). It does not start (`Refused`), with nothing written
+and nothing sent, when the pool has a session booked or active, which is left as it is, or when
+the pool's `max_instances` is below two; and without the minutes it does not start at all. For the
+departure it lowers its session to one instance (step 3). When it ends, whatever came of the run,
+a verdict, a run not measured or an error, it stops its session. It changes and stops only a
+session that still reads as the one it wrote: one that someone changed, stopped or replaced
+meanwhile is theirs, is left as it is, and stops the run when the job would have lowered it
+(`Taken`). A job that dies leaves a session that ends by itself after its minutes, and so does a
+stop that fails, which fails the run.
 
-1. **Two instances.** It holds twice the pool's `target_concurrency` of streams open, each sending
-   one short stream after another, as the canary students after the first two, until the workspace
-   shows two instances in service in one observation (`Pool.present`): both writing, both streaming
-   answers, and both asked for and read in service by the scaler, whose gauge of the instances in
-   service is in the workspace too. The scaler adds the second once the load is above target for 60
-   seconds, and an instance writes, and answers its launch's warm-up, before its launch completes and
-   it enters service. It records how many zones the two are in, by the label `zone` the node's
-   collector adds to every series; an instance whose series has no zone label is not a zone, and
-   the load is held until both have one. Then it stops the load and waits until the workspace shows
-   nothing running or waiting on the pool.
+**What it does**, through the gateway only, as canary students (`common.canary_keys`), and reading
+the pool only from the workspace and the pool-state table. Of the pool it writes its session, and
+nothing else: the scaler alone moves the instances (section 5.1).
+
+1. **Two instances.** With the session booked, it sends nothing until the pool holds its two
+   instances in service (`Run.holds`): the scaler's note asks for two and reads two in service,
+   and the workspace shows two in one observation (`Pool.present`), both writing, both asked for
+   and read in service by the scaler, whose gauge of the instances in service is in the workspace
+   too. A request sent before that would be refused, or would find one instance. An instance
+   writes, and answers its launch's warm-up, before its launch completes and it enters service.
+   Then it holds twice the pool's `target_concurrency` of streams open, each sending one short
+   stream after another, as the canary students after the first two, until the workspace shows
+   the two in service both streaming answers. It records how many zones the two are in, by the
+   label `zone` the node's collector adds to every series; an instance whose series has no zone
+   label is not a zone, and the load is held until both have one. Then it stops the load and waits
+   until the workspace shows nothing running or waiting on the pool.
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
    one of them has to move. Then each student in turn sends the number of requests it is given, one
@@ -40,9 +56,10 @@ alone moves it (section 5.1).
    writing, or one the group replaced) and that had not yet shown in the workspace: that makes the
    run not measured rather than failed. A scale-in the scaler asks for while it looks began after
    the phase, when both instances were in service: the split stands, and the run goes on.
-3. **After the departure.** It sends nothing until the scaler has taken the pool to one instance:
-   its note asks for one, its gauge reads one in service, and the workspace shows exactly one
-   writing (load that fits in one instance for 10 minutes, and 15 since the scale-out, section 5.1).
+3. **After the departure.** It lowers its session to one instance, and the scaler releases one of
+   the two, by the order of section 5.1. It sends nothing until the scaler has taken the pool to
+   one instance: its note asks for one and reads one in service, its gauge reads one in service,
+   and the workspace shows exactly one writing. A pool with no note has not been taken to one.
    A sample that has gone stale is not a departure while the scaler still asks for two, nor while it
    still reads two in service: an instance being drained stays in service until it is gone. Then
    each student sends its requests again, and every one of them must have reached the instance
@@ -104,13 +121,37 @@ its numbers with no verdict (`Verdict.NOT_MEASURED`, the state error).
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S8_REQUESTS` | The requests each student sends in each phase, one after another |
+| `RHI_SPIKE_RUN_MINUTES` | The minutes the job books the pool for, from its start: required, a whole number of one or more |
 | `RHI_SPIKE_POOL` | The pool, `mock` unless given |
 
-The pool's `target_concurrency` comes from the deployed configuration (`rhi.config.read_ssm`), and
-the region from CodeBuild's `AWS_REGION`. The canary students need keys for the two measured
-students and enough others to hold the load, three streams each (`STREAMS_PER_STUDENT`). Run it
-while nothing else sends to the pool: another request in a student's window is measured again, and
-one that lands after the departure on an instance other than the remaining one stops the run.
+The minutes are the whole run's: the session ends by itself once they have passed, so give enough
+for the waits for the two instances, for the load and for the departure (`IN_SERVICE_WAIT_SECONDS`,
+`LOAD_END_WAIT_SECONDS`, `DEPARTURE_WAIT_SECONDS`) and the two phases. They are at most the
+configuration's `session_max_hours`: a longer booking is refused and nothing is written. The job
+stops its session when it ends, so minutes it does not use cost nothing. The instances are the
+question's two, whatever `RHI_SPIKE_INSTANCES` says.
+
+The job does not watch its session's end, and no rule makes a run not measured because the minutes
+ran out: what the run then shows decides, as for any run. A session that has ended when the job
+would lower it is not lowered, and the run stops there (`Taken`). One that ends earlier, or between
+the lowering and the last phase's requests, leaves the pool with no session: the scaler takes its
+instances away, and the run stops on what it then reads of the pool, an instance that left during
+a phase (`Departed`), a wait that ran out, a request that was not answered. Each of these is a run
+not measured. A session that ends once the last requests were answered, while the job reads what
+they reached, changes nothing the run measured: when the remaining instance still reads in service
+at the phase's end, the numbers and their verdict stand. At its end the job finds such a session
+already ended, and has nothing to stop.
+
+The pool's `target_concurrency` and `max_instances` and the bound `session_max_hours` come from the
+deployed configuration (`rhi.config.read_ssm`), and the region from CodeBuild's `AWS_REGION`. The
+job's role may write the mock pool's records of the pool-state table and no other pool's
+(`rhi.pipeline.spikes`): given another pool, the booking is refused by the role, and nothing is
+sent. The canary students need keys for the two measured students and enough others to hold the
+load, three streams each (`STREAMS_PER_STUDENT`). Run it while nothing else sends to the pool:
+another request in a student's window is measured again, and one that lands after the departure on
+an instance other than the remaining one stops the run. The scaler releases an instance of a
+lowered session from issue E6-15 on: before it is deployed, the departure does not come, and the
+run ends not measured, with its session stopped.
 """
 
 from __future__ import annotations
@@ -129,12 +170,13 @@ from typing import TYPE_CHECKING, Any
 
 import boto3
 
+import booking
 import common
 import loadgen
 from rhi import config
 from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
-from rhi_common.records import NOTE_RECORD, ScalerNote
+from rhi_common.records import NOTE_RECORD, ScalerNote, Session
 from rhi_gateway.readiness import INTERVAL_SECONDS as GATEWAY_CYCLE_SECONDS
 from rhi_mock_engine.app import ANSWER, REASONING
 from rhi_reporter.measure import Verdict
@@ -152,6 +194,8 @@ POOL_STATE_TABLE_VARIABLE = "RHI_SPIKE_POOL_STATE_TABLE"
 REQUESTS_VARIABLE = "RHI_S8_REQUESTS"
 POOL_VARIABLE = "RHI_SPIKE_POOL"
 DEFAULT_POOL = "mock"
+# The name the job books under: who set the session, as the record keeps it.
+SET_BY = f"spike/{JOB}"
 
 # The streams one student of the load holds: one under a student's default limit, since a refused
 # request ends its stream's session (`loadgen.replay`) and a lease may outlive its stream a moment.
@@ -172,11 +216,13 @@ SCALER_RUN_SECONDS = 50
 # its runs, with a margin, and a collector's after several of its scrapes.
 FRESH_SECONDS = SCALER_PERIOD_SECONDS + SCALER_RUN_SECONDS + 10
 POLL_SECONDS = 30
-# Seconds. The scaler adds an instance after 60 seconds above target, and the mock starts in about
-# a minute; it removes one after 10 idle minutes and 15 since the scale-out (section 5.1).
-SCALE_OUT_WAIT_SECONDS = 20 * 60
+# Seconds. The scaler asks for a session's instances at its next run, and the mock starts in about
+# a minute: the longest the job waits for the two in service, and then for both to serve the load.
+IN_SERVICE_WAIT_SECONDS = 20 * 60
 LOAD_END_WAIT_SECONDS = 5 * 60
-DEPARTURE_WAIT_SECONDS = 40 * 60
+# Seconds. The scaler releases an instance of a lowered session at its next run, and the instance
+# is gone within about eleven minutes of its release (section 5.1).
+DEPARTURE_WAIT_SECONDS = 20 * 60
 # Seconds. After a phase in which a student's requests were split, the job looks this long, every
 # `POLL_SECONDS`, whether an instance left: one that stopped writes no sample after `FRESH_SECONDS`,
 # and one the group replaces shows a third instance once its replacement serves.
@@ -389,6 +435,16 @@ class NotExercised(RuntimeError):
     both did, and the run does not show one student moving while the other stays."""
 
 
+class Refused(RuntimeError):
+    """The job does not start: the pool has a session booked or active, or allows fewer than two
+    instances. Nothing was written and nothing was sent."""
+
+
+class Taken(RuntimeError):
+    """The pool's session no longer reads as the one the job wrote: someone changed, stopped or
+    replaced it. It is theirs, and is left as it is."""
+
+
 class Leaving(RuntimeError):
     """The scaler asks for fewer instances than the workspace shows, or than it reads in service:
     one is leaving, and the workspace cannot say which. `present` are the instances the workspace
@@ -521,6 +577,72 @@ class Pool:
         note = self._note()
         return 0 if note is None else note.rebalance_number
 
+    def noted(self) -> tuple[int, int] | None:
+        """The instances the scaler's note asks for and those it reads in service, in that order:
+        `None` while the pool has no note."""
+        note = self._note()
+        return None if note is None else (note.capacity_asked, note.in_service)
+
+
+# The job's session.
+
+
+@dataclass
+class Booked:
+    """The session the job booked on the pool-state table `table`, as the job last wrote it, with
+    the two bounds of the configuration it is written under."""
+
+    table: Any
+    session: Session
+    max_instances: int
+    session_max_hours: int
+
+    def lower(self, instances: int) -> None:
+        """Lowers the session to `instances`. `Taken`, with nothing written, when the item no longer
+        reads as the session the job wrote, or its end has come."""
+        lowered = booking.changed(
+            self.table,
+            self.session,
+            instances=instances,
+            max_instances=self.max_instances,
+            now=int(time.time()),
+            session_max_hours=self.session_max_hours,
+        )
+        if lowered is None:
+            raise Taken("the pool's session no longer reads as the job's: it is left as it is")
+        self.session = lowered
+        print(f"lowered the session to {instances} instance(s)")
+
+    def stop(self) -> None:
+        """Stops the session, only while it still reads as the one the job wrote."""
+        ended = booking.stop(self.table, self.session, now=int(time.time()), session_max_hours=self.session_max_hours)
+        if ended is None:
+            print("the pool's session no longer reads as the job's, or has ended: it is left as it is")
+        else:
+            print("stopped the session the job booked")
+
+
+def booked(table: Any, pool: str, *, minutes: int, max_instances: int, session_max_hours: int) -> Booked:
+    """Books the two instances on the pool, from now, for `minutes`, under the name `SET_BY`.
+    `Refused`, with nothing written, when the pool allows fewer than two instances or has a session
+    booked or active; `rhi_common.sessions.SessionError` for more minutes than a session may last."""
+    if max_instances < INSTANCES:
+        raise Refused(f"the pool's `max_instances` is below {INSTANCES}")
+    session = booking.book(
+        table,
+        pool,
+        minutes=minutes,
+        set_by=SET_BY,
+        now=int(time.time()),
+        session_max_hours=session_max_hours,
+        instances=INSTANCES,
+        max_instances=max_instances,
+    )
+    if session is None:
+        raise Refused("the pool has a session booked or active: it is left as it is")
+    # Nothing between the write and the return can fail: the caller stops what is returned.
+    return Booked(table, session, max_instances, session_max_hours)
+
 
 # The load and the students' requests.
 
@@ -635,13 +757,25 @@ class Run:
         if remaining > 0:
             time.sleep(remaining)
 
+    def holds(self, instances: int) -> bool:
+        """Whether the pool holds exactly `instances` in service: the workspace shows that many
+        (`Pool.present`), and the scaler's note itself asks for that many and reads that many in
+        service. A pool with no note holds none."""
+        try:
+            present = self.pool.present()
+        except (Leaving, Unseen):
+            return False
+        return len(present) == instances and self.pool.noted() == (instances, instances)
+
     async def two_instances(self) -> dict[str, str]:
-        """Holds the load until two instances serve, and returns them with their zones once it has ended."""
+        """Waits, sending nothing, until the session's two instances are in service, then holds the
+        load until both serve, and returns them with their zones once it has ended."""
         streams = 2 * self.target_concurrency
         holders = math.ceil(streams / STREAMS_PER_STUDENT)
         load_keys = self.keys[len(STUDENTS) :]
         if len(load_keys) < holders:
             raise ValueError(f"the load needs {holders} canary students besides the {len(STUDENTS)} measured")
+        await _wait(lambda: self.holds(INSTANCES), IN_SERVICE_WAIT_SECONDS, "the session's two instances in service")
         stop = asyncio.Event()
         request = _first_request(self.pool.name)
         load = loadgen.Load(
@@ -678,7 +812,7 @@ class Run:
             return True
 
         try:
-            await _wait(two, SCALE_OUT_WAIT_SECONDS, "two instances serving")
+            await _wait(two, IN_SERVICE_WAIT_SECONDS, "two instances serving")
         finally:
             stop.set()
             await held
@@ -769,7 +903,25 @@ class Run:
 
         return measure_undisturbed(phase, measure, self.rebalance_number)
 
-    def measure(self) -> dict[str, int | float]:
+    def in_session(self, *, minutes: int, max_instances: int, session_max_hours: int) -> dict[str, int | float]:
+        """The run's numbers, measured in a session of two instances the job books first, for
+        `minutes`, and stops when the run ends, whatever came of it. `Refused` when the pool cannot
+        be booked: nothing is sent."""
+        session = booked(
+            self.pool.table,
+            self.pool.name,
+            minutes=minutes,
+            max_instances=max_instances,
+            session_max_hours=session_max_hours,
+        )
+        # From the booking on, whatever fails, a line of the log included, stops the session.
+        try:
+            print(f"booked {INSTANCES} instances on the pool for {minutes} minutes")
+            return self.measure(session)
+        finally:
+            session.stop()
+
+    def measure(self, session: Booked) -> dict[str, int | float]:
         # Read before the load, so that a number the scaler does not change during it needs no wait.
         self.rebalance_number()
         found = asyncio.run(self.two_instances())
@@ -787,8 +939,11 @@ class Run:
                 return False
             if not remaining:
                 raise RuntimeError("the pool went to no instance before the departure was measured")
-            return len(remaining) == 1
+            # The scaler's own note asks for one and reads one in service: a pool with no note,
+            # or one whose note still reads the other, has not been taken to one.
+            return len(remaining) == 1 and self.pool.noted() == (1, 1)
 
+        session.lower(1)
         asyncio.run(_wait(departed, DEPARTURE_WAIT_SECONDS, "the scaler to take the pool to one instance"))
         if not remaining <= set(found):
             raise RuntimeError("the instance that remains is not one of the two measured")
@@ -811,11 +966,14 @@ class Run:
 
 
 def main(environ: Mapping[str, str] = os.environ) -> Verdict:
-    """Runs the spike with the job's environment and credentials, and posts its numbers."""
+    """Runs the spike with the job's environment and credentials, and posts its numbers. ValueError,
+    with nothing booked, sent or posted, without the minutes of `RHI_SPIKE_RUN_MINUTES`."""
+    minutes = common.needs_of(environ).run_minutes
 
     def measure() -> dict[str, int | float]:
         name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
-        (pool,) = [pool for pool in config.read_ssm().pools if pool.name == name]
+        deployed = config.read_ssm()
+        (pool,) = [pool for pool in deployed.pools if pool.name == name]
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
         table = session.resource("dynamodb").Table(environ[POOL_STATE_TABLE_VARIABLE])
@@ -823,9 +981,10 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
         if requests < 1:
             raise ValueError("each student sends one request or more")
         keys = common.canary_keys().students
-        return Run(
-            Pool(name, workspace, table), environ[ENDPOINT_VARIABLE], keys, requests, pool.target_concurrency
-        ).measure()
+        run = Run(Pool(name, workspace, table), environ[ENDPOINT_VARIABLE], keys, requests, pool.target_concurrency)
+        return run.in_session(
+            minutes=minutes, max_instances=pool.max_instances, session_max_hours=deployed.session_max_hours
+        )
 
     return common.run_spike(SPIKE, JOB, measure, environ=environ)
 

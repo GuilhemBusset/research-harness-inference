@@ -256,6 +256,12 @@ def test_every_job_runs_on_the_one_role_log_group_and_key(app_module: ModuleType
                 "{}",
             ),
             (("dynamodb:GetItem", "dynamodb:Query"), here.format("dynamodb", f"table/{table}"), "{}"),
+            # The one write: the items of that table whose partition key is the mock pool's name.
+            (
+                ("dynamodb:PutItem",),
+                here.format("dynamodb", f"table/{table}"),
+                json.dumps({"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["mock"]}}),
+            ),
             (("secretsmanager:GetSecretValue",), here.format("secretsmanager", "secret:rhi/spike-keys-??????"), "{}"),
             (
                 ("aps:QueryMetrics",),
