@@ -42,6 +42,12 @@ CHECKSUM = re.compile(r"\b[0-9a-f]{64}\b")
 EMULATOR_RELEASE = r"https://github\.com/tonistiigi/binfmt/releases/download/deploy/v(?P<qemu>\d+\.\d+\.\d+)-\d+"
 EMULATOR_TOOL = re.compile(rf"(?P<release>{EMULATOR_RELEASE})/binfmt_linux-amd64\.tar\.gz")
 EMULATORS = re.compile(rf"(?P<release>{EMULATOR_RELEASE})/qemu_v(?P=qemu)_linux-amd64\.tar\.gz")
+# The kernel's binfmt_misc, mounted when nothing has mounted it, and the arm64 entry the tool
+# writes there, checked enabled.
+MOUNTS_BINFMT_MISC = (
+    "[ -e /proc/sys/fs/binfmt_misc/status ] || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc"
+)
+CHECKS_THE_REGISTRATION = "grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-aarch64"
 
 # The names Docker Hub's registry answers to, on any port. An image reference with no host names
 # it too.
@@ -372,6 +378,14 @@ def test_each_image_project_registers_the_emulator_from_the_release(template: di
         ((register, registration),) = [(i, w) for i, w in enumerate(words) if w[-2:] == ["--install", "arm64"]]
         assert registration[:-2] == [f"QEMU_BINARY_PATH={qemu_folder}", f"{tool_folder}/binfmt"]
         assert register > max(tool_extracted, qemu_extracted)
+        # Since Linux 6.7 a registration lasts only while binfmt_misc is mounted, and the tool
+        # unmounts what it mounted when it exits, with status 0 either way. So binfmt_misc is
+        # mounted first, unless it already is, and stays mounted for the build; and the entry is
+        # checked enabled after the tool exits, so that a lost registration ends the install phase
+        # rather than failing the arm64 build with `exec format error`.
+        (mount,) = [i for i, command in enumerate(install) if command == MOUNTS_BINFMT_MISC]
+        (verified,) = [i for i, command in enumerate(install) if command == CHECKS_THE_REGISTRATION]
+        assert mount < register < verified
         # Registered before the build phase, which publishes, and so builds the image.
         assert build and all(PUBLISHES.fullmatch(command) for command in build)
         assert not any(PUBLISHES.fullmatch(command) for command in install)

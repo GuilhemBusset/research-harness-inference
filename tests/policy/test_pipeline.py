@@ -10,7 +10,8 @@ listed, because every stack and every asset a later change adds to the stage bri
 - an asset-publishing action: a CodeBuild action whose project does nothing but publish assets
   with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
   an arm64 emulator and the buildx plugin, each a download from its project's releases on GitHub
-  by its exact version, checked against a checksum before it is extracted or run: the commands of
+  by its exact version, checked against a checksum before it is extracted or run, the emulator
+  registered under a `binfmt_misc` mount the project keeps and checked registered: the commands of
   `INSTALLS_THE_IMAGE_BUILDER`, all of them and in their order, in the `commands` of one phase,
   and no other. It runs, pulls and creates no image, an emulator's or a builder's. It is left out
   in the asset stage, and so is that stage while it holds nothing else: CDK Pipelines creates it
@@ -218,14 +219,17 @@ INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
 # arm64 emulator and the buildx plugin, each a download by its exact version, checked against a
 # checksum (sections 4.2 and 8.2, step 4). The emulator is the two files of one release of the
 # binfmt project, the tool and the emulators of the QEMU version the release is named after: each
-# downloaded, checked and extracted in one folder, then registered by the tool. Nothing here runs
-# an image or creates a builder: the build is the Docker daemon's own builder's.
+# downloaded, checked and extracted in one folder, then registered by the tool, under the kernel's
+# `binfmt_misc` file system, mounted first when nothing has mounted it and kept for the build, and
+# its entry checked enabled after. Nothing here runs an image or creates a builder: the build is
+# the Docker daemon's own builder's.
 # The commands are allowed as one sequence, whole and in this order, in the `commands` of one
 # phase, and not one by one: a file is extracted, and a tool run, only under the check of its
 # checksum, and a check that fails ends the `commands` of its phase and nothing else.
 # `INSTALLS_THE_IMAGE_BUILDER` matches them joined by a line feed, so that the release and the
 # QEMU version of one line are those of the others.
 EMULATOR = r"/opt/binfmt"
+BINFMT_MISC = r"/proc/sys/fs/binfmt_misc"
 EMULATOR_TOOL = r"binfmt_linux-amd64\.tar\.gz"
 EMULATORS = r"qemu_v(?P=qemu)_linux-amd64\.tar\.gz"
 BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
@@ -240,7 +244,9 @@ INSTALLS_THE_IMAGE_BUILDER = re.compile(
             rf'curl -fsSL --create-dirs -o "{EMULATOR}/{EMULATORS}" (?P=release)/{EMULATORS}',
             rf'echo "[0-9a-f]{{64}}  {EMULATOR}/{EMULATORS}" \| sha256sum -c -',
             rf'tar -xzf "{EMULATOR}/{EMULATORS}" -C "{EMULATOR}"',
+            rf"\[ -e {BINFMT_MISC}/status \] \|\| mount -t binfmt_misc binfmt_misc {BINFMT_MISC}",
             rf"QEMU_BINARY_PATH={EMULATOR} {EMULATOR}/binfmt --install arm64",
+            rf"grep -qx enabled {BINFMT_MISC}/qemu-aarch64",
             rf'curl -fsSL --create-dirs -o "{BUILDX}" {BUILDX_RELEASE}/buildx-v(?P=buildx)\.linux-amd64',
             rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -',
             rf'chmod \+x "{BUILDX}"',
@@ -1792,7 +1798,9 @@ IMAGE_BUILDER = [
             f'tar -xzf "{EMULATOR_FOLDER}/{file}" -C "{EMULATOR_FOLDER}"',
         )
     ),
+    "[ -e /proc/sys/fs/binfmt_misc/status ] || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc",
     f"QEMU_BINARY_PATH={EMULATOR_FOLDER} {EMULATOR_FOLDER}/binfmt --install arm64",
+    "grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-aarch64",
     (
         f'curl -fsSL --create-dirs -o "{PLUGIN}" '
         "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64"
@@ -1912,6 +1920,16 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage whose emulators are not those of the release it downloads",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                [
+                    command.replace("mount -t binfmt_misc binfmt_misc", "mount -t tmpfs tmpfs")
+                    for command in IMAGE_BUILDER
+                ]
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that mounts another file system than binfmt_misc",
         ),
         pytest.param(
             a_publisher_that_installs([*IMAGE_BUILDER, RUNS_THE_EMULATOR_IMAGE]),

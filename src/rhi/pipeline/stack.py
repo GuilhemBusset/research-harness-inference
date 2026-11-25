@@ -38,11 +38,13 @@ The asset step builds every image asset of the stage for its pool's processor ar
 build hosts are x86_64, so each project that publishes an image first registers an emulator for
 arm64 (`IMAGE_BUILDER`). The emulator comes from the binfmt project's release on GitHub: the tool
 and QEMU's emulators, downloaded by exact version, each file checked against its checksum, and
-registered with the host's kernel by the tool. The builder is the Docker daemon's own, buildx's
-default builder with its `docker` driver, which builds an image for either platform under that
-emulator: the project creates no builder and selects none, and installs only the pinned buildx
-plugin. Neither comes from an image, so the step pulls nothing from Docker Hub before it builds:
-Docker Hub limits anonymous pulls by address, and the build hosts share theirs.
+registered with the host's kernel by the tool, under a `binfmt_misc` mount the project keeps for
+the whole build, and checked to be registered before the build starts. The builder is the Docker
+daemon's own, buildx's default builder with its `docker` driver, which builds an image for either
+platform under that emulator and has no emulator of its own: the project creates no builder and
+selects none, and installs only the pinned buildx plugin. Neither comes from an image, so the step
+pulls nothing from Docker Hub before it builds: Docker Hub limits anonymous pulls by address, and
+the build hosts share theirs.
 
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
 function that posts commit statuses to GitHub (step 7), and sends the owner, on the topic of
@@ -122,6 +124,13 @@ SOURCE_ACTION = "GitHub"
 # tool. Its release carries the tool and the emulators as two files for the x86_64 build host. The
 # tool registers the emulator of the folder `QEMU_BINARY_PATH` names, and the kernel opens it
 # then, so a build's containers need no copy of it.
+# Since Linux 6.7 a registration lasts only while `binfmt_misc` is mounted somewhere, and the tool
+# unmounts the one it mounts when it exits, with its exit status 0 whether it registered or not.
+# So the project mounts `binfmt_misc` first, when nothing has, and keeps it for the build; the tool
+# then registers under that mount, and the entry it writes is checked enabled after it exits. The
+# Docker daemon's builder, unlike the BuildKit image the step used before, carries no QEMU of its
+# own: without the registration, a `RUN` of an arm64 image fails with `exec format error`.
+BINFMT_MISC = "/proc/sys/fs/binfmt_misc"
 EMULATOR_QEMU_VERSION = "10.2.3"
 EMULATOR_RELEASE = f"deploy/v{EMULATOR_QEMU_VERSION}-68"
 EMULATOR_URL = f"https://github.com/tonistiigi/binfmt/releases/download/{EMULATOR_RELEASE}"
@@ -154,7 +163,9 @@ IMAGE_BUILDER = [
             f'tar -xzf "{EMULATOR_FOLDER}/{file}" -C "{EMULATOR_FOLDER}"',
         )
     ),
+    f"[ -e {BINFMT_MISC}/status ] || mount -t binfmt_misc binfmt_misc {BINFMT_MISC}",
     f"QEMU_BINARY_PATH={EMULATOR_FOLDER} {EMULATOR_FOLDER}/binfmt --install arm64",
+    f"grep -qx enabled {BINFMT_MISC}/qemu-aarch64",
     f'curl -fsSL --create-dirs -o "{BUILDX_PLUGIN}" {BUILDX_URL}',
     f'echo "{BUILDX_SHA256}  {BUILDX_PLUGIN}" | sha256sum -c -',
     f'chmod +x "{BUILDX_PLUGIN}"',
