@@ -7,9 +7,13 @@ harness sessions for an hour, in a session switched on for it, within the object
 whether the hour met the five objectives, and how each measurement compares with the pool's
 expected values, is read later, from its lines, by an issue written then (section 12).
 
-**Before it starts**, the owner switches a session on for the rehearsal and turns the public HTTPS
-listener on; the job then wakes the pool as `rhi wait` does and waits until the gateway says it is
-`ready` (`Rehearsal.ready`), so that the hour measures a warm pool, not a cold start.
+**Before it starts**, the owner books a session of the pool for the rehearsal and turns the public
+HTTPS listener on. The job starts no machine: before it sends anything it checks the session
+(`common.require_session`): it is active, it has the instances the rehearsal needs in service, and
+it lasts the run's minutes from now. Otherwise the job writes `refused` with the reason,
+`no-session`, `too-few-instances` or `session-too-short`, sends nothing to the gateway, and exits 1.
+It then waits until the gateway says the pool is `ready` (`Rehearsal.ready`), so that the hour
+measures a pool that serves.
 
 **The class.** The number of sessions is the class size, decision 5 of the design, which the owner
 gives: the job has no default for it. A session is one student, sent as a canary student of its own
@@ -51,7 +55,7 @@ number and its cause only when that is one of the gateway's own (`rhi_common.cau
 | Kind | When, and what it holds |
 | --- | --- |
 | `start` | The pool, the class size and the shape it was given, the sessions and the agents each runs, the hour's seconds |
-| `pool_ready` | The pool was ready: whether the job woke it, and the seconds it waited |
+| `pool_ready` | The pool was ready: the seconds the job waited for it |
 | `hour_started`, `hour_ended` | The hour's bounds |
 | `engine_counters` | At the hour's `start` and `end`: each instance's counters of the engine's row of the per-engine table (`rhi_common.engine_metrics`), cached and input tokens and preemptions among them where the row has them; a quantity the row leaves out is not written |
 | `cache_capacity` | At the start: the cache capacity in tokens each instance's engine reported (`rhi_lifecycle.cache`) |
@@ -97,11 +101,16 @@ last stage, for at most `LAUNCH_WAIT_SECONDS` after the hour.
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_DRY_RUN_CLASS_SIZE` | The class size, in students: the sessions it replays. Required |
 | `RHI_DRY_RUN_SHAPE` | `hands-on` or `several-agents`. Required |
+| `RHI_SPIKE_INSTANCES` | The instances the rehearsal needs in service: `1` unless given |
+| `RHI_SPIKE_RUN_MINUTES` | How long the job lasts, in minutes, which the session must outlast. Required |
+| `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 
 The pool is the one named `coursework` (`POOL`), always; its engine comes from the deployed
 configuration (`rhi.config.read_ssm`), and the region from CodeBuild's `AWS_REGION`. The job refuses,
-before it sends anything, a class size that is missing or below one, a shape of another name, and a
-class larger than the canary students' keys.
+before it sends anything, a class size that is missing or below one, a shape of another name, a
+run whose minutes are missing or whose minutes or instances are not a whole number of one or more
+(`no_run_needs`), a session that does not carry the run, and a class larger than the canary
+students' keys.
 """
 
 from __future__ import annotations
@@ -144,10 +153,9 @@ SHAPE_VARIABLE = "RHI_DRY_RUN_SHAPE"
 POOL = "coursework"
 HOUR_SECONDS = 3600.0
 
-# Seconds. While the pool wakes, its status is read this often, and the wake repeated this often
-# while it is not ready, as `rhi wait` does; a cold launch may take 40 minutes at worst (spike S1).
+# Seconds. Until the pool is ready its status is read this often, for as long as a cold launch
+# may take at worst (spike S1).
 POLL_SECONDS = 5.0
-WAKE_EVERY_SECONDS = 60.0
 READY_WAIT_SECONDS = 40 * 60.0
 # Seconds before the next conversation of an agent whose conversation ended refused or failed.
 AFTER_REFUSAL_SECONDS = 10.0
@@ -197,10 +205,6 @@ class Gateway(Protocol):
 
     def state(self) -> str:
         """The pool's state as the status gives it; empty when it could not be read."""
-        ...
-
-    def wake(self) -> None:
-        """Wakes the pool, as a student's `rhi wait` does."""
         ...
 
 
@@ -380,21 +384,15 @@ class Rehearsal:
     # The pool.
 
     async def ready(self) -> None:
-        """Wakes the pool, as `rhi wait` does, and waits until the gateway says it is ready.
-        TimeoutError when it is not within `READY_WAIT_SECONDS`."""
+        """Waits until the gateway says the pool is ready. TimeoutError when it is not within
+        `READY_WAIT_SECONDS`."""
         self.step = "ready"
-        started = woke = self.clock.now()
-        waking = (await self.offload(self.gateway.state)) != State.READY
-        if waking:
-            await self.offload(self.gateway.wake)
-            while (await self.offload(self.gateway.state)) != State.READY:
-                if self.clock.now() - started >= READY_WAIT_SECONDS:
-                    raise TimeoutError("the pool was not ready in time")
-                if self.clock.now() - woke >= WAKE_EVERY_SECONDS:
-                    await self.offload(self.gateway.wake)
-                    woke = self.clock.now()
-                await self.clock.sleep(POLL_SECONDS)
-        self.recorder.line("pool_ready", woke=waking, waited_seconds=round(self.clock.now() - started, 3))
+        started = self.clock.now()
+        while (await self.offload(self.gateway.state)) != State.READY:
+            if self.clock.now() - started >= READY_WAIT_SECONDS:
+                raise TimeoutError("the pool was not ready in time")
+            await self.clock.sleep(POLL_SECONDS)
+        self.recorder.line("pool_ready", waited_seconds=round(self.clock.now() - started, 3))
 
     # The workspace.
 
@@ -640,11 +638,30 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
         if class_size is None or shape is None:
             recorder.line("refused", reason="no_class_size" if class_size is None else "no_shape")
             return 1
-        pools = [pool for pool in config.read_ssm().pools if pool.name == POOL]
+        try:
+            needs = common.needs_of(environ)
+        except ValueError:
+            recorder.line("refused", reason="no_run_needs")
+            return 1
+        settings = config.read_ssm()
+        pools = [pool for pool in settings.pools if pool.name == POOL]
         if len(pools) != 1:
             recorder.line("refused", reason="no_coursework_pool")
             return 1
         endpoint = common.gateway_address(environ[ENDPOINT_VARIABLE])
+        step = "session"
+        try:
+            common.require_session(
+                common.pool_state_table(environ),
+                POOL,
+                instances=needs.instances,
+                run_minutes=needs.run_minutes,
+                session_max_hours=settings.session_max_hours,
+                now=int(clock.now()),
+            )
+        except common.SessionRefused as refused:
+            recorder.line("refused", reason=refused.reason.value)
+            return 1
         step = "clients"
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
