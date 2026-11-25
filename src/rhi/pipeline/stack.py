@@ -36,7 +36,13 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
 The asset step builds every image asset of the stage for its pool's processor architecture
 (sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
 build hosts are x86_64, so each project that publishes an image first registers an emulator for
-arm64 and selects a builder that can target either platform, all pinned (`IMAGE_BUILDER`).
+arm64 (`IMAGE_BUILDER`). The emulator comes from the binfmt project's release on GitHub: the tool
+and QEMU's emulators, downloaded by exact version, each file checked against its checksum, and
+registered with the host's kernel by the tool. The builder is the Docker daemon's own, buildx's
+default builder with its `docker` driver, which builds an image for either platform under that
+emulator: the project creates no builder and selects none, and installs only the pinned buildx
+plugin. Neither comes from an image, so the step pulls nothing from Docker Hub before it builds:
+Docker Hub limits anonymous pulls by address, and the build hosts share theirs.
 
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
 function that posts commit statuses to GitHub (step 7), and sends the owner, on the topic of
@@ -108,35 +114,53 @@ CONNECTION_NAME = "rhi-github"
 SOURCE_ACTION = "GitHub"
 
 # What a project that publishes an image installs, so that one run builds an image for linux/arm64
-# as well as one for linux/amd64. Each is pinned, by digest or by version and checksum, and each
-# release had been out a week when it was pinned (the cooling-off of sections 9 and 17).
-# The emulator: QEMU's arm64 handler, registered with the host's kernel by this image.
-EMULATOR_IMAGE = (
-    "tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
-)
-# The builder: Docker's buildx plugin, for the x86_64 build host, checked against its release's checksum.
+# as well as one for linux/amd64. Each is a download from its project's releases on GitHub, pinned
+# by its exact version and checked against its checksum, and each release had been out a week when
+# it was pinned (the cooling-off of sections 9 and 17). None is an image: Docker Hub limits
+# anonymous pulls by address, and the build hosts share theirs.
+# The emulator: QEMU's arm64 handler, registered with the host's kernel by the binfmt project's
+# tool. Its release carries the tool and the emulators as two files for the x86_64 build host. The
+# tool registers the emulator of the folder `QEMU_BINARY_PATH` names, and the kernel opens it
+# then, so a build's containers need no copy of it.
+EMULATOR_QEMU_VERSION = "10.2.3"
+EMULATOR_RELEASE = f"deploy/v{EMULATOR_QEMU_VERSION}-68"
+EMULATOR_URL = f"https://github.com/tonistiigi/binfmt/releases/download/{EMULATOR_RELEASE}"
+EMULATOR_FOLDER = "/opt/binfmt"
+# Each file of the release, with its sha256.
+EMULATOR_FILES = {
+    "binfmt_linux-amd64.tar.gz": "9f955e980acb29986365766db7d36383a1dbbf2159f30b532a74474f6f5dd75d",
+    f"qemu_v{EMULATOR_QEMU_VERSION}_linux-amd64.tar.gz": (
+        "8e7d8f4c0c7809fc3fea0085199fd6b16f671e7c73d9bf6bec711e1cb535920a"
+    ),
+}
+# The builder: the Docker daemon's own, which is buildx's default builder, with its `docker`
+# driver. `cdk-assets` builds each image for one platform, which that builder does under the
+# registered emulator, and what it builds is already in the daemon, from where `cdk-assets` tags
+# and pushes it. No builder is created, and none is selected. What is installed is Docker's buildx
+# plugin, for the x86_64 build host, checked against its release's checksum.
 BUILDX_VERSION = "0.38.2"
 BUILDX_SHA256 = "7992ec09413b80ff57ba4e081f56fc833d7bac1d5e71143c6c809e7e6065f6d6"
 BUILDX_URL = (
     f"https://github.com/docker/buildx/releases/download/v{BUILDX_VERSION}/buildx-v{BUILDX_VERSION}.linux-amd64"
 )
 BUILDX_PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
-# The BuildKit the builder runs in a container. It builds for any platform the emulator adds, and
-# loads what it builds into Docker, from where `cdk-assets` tags and pushes it.
-BUILDKIT_IMAGE = "moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
-BUILDER = "rhi-assets"
 IMAGE_BUILDER = [
-    f"docker run --privileged --rm {EMULATOR_IMAGE} --install arm64",
+    *(
+        command
+        for file, sha256 in EMULATOR_FILES.items()
+        for command in (
+            f'curl -fsSL --create-dirs -o "{EMULATOR_FOLDER}/{file}" {EMULATOR_URL}/{file}',
+            f'echo "{sha256}  {EMULATOR_FOLDER}/{file}" | sha256sum -c -',
+            f'tar -xzf "{EMULATOR_FOLDER}/{file}" -C "{EMULATOR_FOLDER}"',
+        )
+    ),
+    f"QEMU_BINARY_PATH={EMULATOR_FOLDER} {EMULATOR_FOLDER}/binfmt --install arm64",
     f'curl -fsSL --create-dirs -o "{BUILDX_PLUGIN}" {BUILDX_URL}',
     f'echo "{BUILDX_SHA256}  {BUILDX_PLUGIN}" | sha256sum -c -',
     f'chmod +x "{BUILDX_PLUGIN}"',
-    (
-        f"docker buildx create --name {BUILDER} --driver docker-container --driver-opt image={BUILDKIT_IMAGE}"
-        " --driver-opt default-load=true --bootstrap --use"
-    ),
 ]
-# `docker build`, as `cdk-assets` runs it, is the builder's: BuildKit, on the builder created above.
-IMAGE_BUILDER_ENVIRONMENT = {"DOCKER_BUILDKIT": "1", "BUILDX_BUILDER": BUILDER}
+# `docker build`, as `cdk-assets` runs it, is BuildKit's, through the plugin, on the default builder.
+IMAGE_BUILDER_ENVIRONMENT = {"DOCKER_BUILDKIT": "1"}
 
 
 class PipelineStack(cdk.Stack):

@@ -3,11 +3,13 @@
 # Built from the context src/rhi/packaging.py's `image_context("gateway", ...)` gives: this file,
 # requirements.txt (the gateway group of uv.lock, with hashes), rhi_common/ and rhi_gateway/.
 #
-# The base is pinned by the digest of its multi-architecture index, which is published for
-# linux/arm64 and linux/amd64 among others. No platform is fixed here: the builder's `--platform`,
-# or its own platform when it gives none, takes its image from the same index. An update is a
-# change to this line.
-FROM python:3.13.14-slim-trixie@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
+# The base is Amazon ECR Public's copy of the Docker Official Image, the same tag and digest as on
+# Docker Hub: the pipeline's build hosts share their addresses, and Docker Hub limits anonymous
+# pulls by address. It is pinned by the digest of its multi-architecture index, which is published
+# for linux/arm64 and linux/amd64 among others. No platform is fixed here: the builder's
+# `--platform`, or its own platform when it gives none, takes its image from the same index. An
+# update is a change to this line.
+FROM public.ecr.aws/docker/library/python:3.13.14-slim-trixie@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
