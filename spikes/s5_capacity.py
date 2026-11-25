@@ -1157,8 +1157,6 @@ class Figure(StrEnum):
     FAILED_CONCURRENCY_LIMIT = "failed_concurrency_limit"
     FAILED_WARMING = "failed_warming"
     FAILED_CAPACITY_UNAVAILABLE = "failed_capacity_unavailable"
-    FAILED_POOL_SCHEDULED_ONLY = "failed_pool_scheduled_only"
-    FAILED_POOL_DISABLED = "failed_pool_disabled"
     FAILED_NO_SESSION = "failed_no_session"
     FAILED_ENGINE_ERROR = "failed_engine_error"
     FAILED_TIME_LIMIT = "failed_time_limit"

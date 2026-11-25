@@ -18,11 +18,14 @@ holds a table `[profiles.rhi]`. The profile holds:
 
 - `model_provider = "rhi"`, and `model`, the default pool's model name as the gateway's
   `GET /v1/models` gives it (`default_model`): Codex sends the name its profile holds;
-- `[model_providers.rhi]`: `name`, `base_url` (the endpoint's `/v1`), `wire_api = "responses"`,
-  the only format Codex accepts, and `stream_idle_timeout_ms = 900000`. Codex's idle timer ignores
-  the gateway's keep-alive comments and stops a stream after 300 seconds by default, which is
-  shorter than the hold of a cold pool (section 5.3);
+- `[model_providers.rhi]`: `name`, `base_url` (the endpoint's `/v1`) and `wire_api = "responses"`,
+  the only format Codex accepts;
 - `[model_providers.rhi.auth]`: `command = "rhi"`, `args = ["token"]`.
+
+The profile sets no stream timeout: the gateway keeps no stream waiting (section 5.3), and Codex
+keeps its own default. An earlier `rhi login` wrote `stream_idle_timeout_ms = 900000` in the
+provider's table, for a gateway that did; a login removes that line (`WITHDRAWN`), and leaves any
+other value, which is the student's own.
 
 Those settings are the ones a login owns. Every other one in the two files keeps its value, and a
 file whose owned settings are already right is not written: each function returns the file's path when it wrote it
@@ -31,7 +34,7 @@ touching another setting, is left as it is and `HarnessError` says so.
 
 Codex's profile is edited as text, a line per owned setting, so the comments and the layout of what
 a student added to it stay. The result is then read back: it is written only if the owned settings
-are right and every other setting is what it was.
+are right, the withdrawn one is gone and every other setting is what it was.
 """
 
 from __future__ import annotations
@@ -41,13 +44,12 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 HELPER = ("rhi", "token")
 NAME = "rhi"
-STREAM_IDLE_TIMEOUT_MS = 900_000
 
 type Table = tuple[str, ...]
 
@@ -55,6 +57,9 @@ type Table = tuple[str, ...]
 TOP: Table = ()
 PROVIDER: Table = ("model_providers", NAME)
 AUTH: Table = (*PROVIDER, "auth")
+
+# What an earlier `rhi login` wrote in Codex's profile and a login now removes, at that value alone.
+WITHDRAWN: dict[Table, dict[str, Any]] = {PROVIDER: {"stream_idle_timeout_ms": 900_000}}
 
 
 class HarnessError(Exception):
@@ -118,7 +123,7 @@ def configure_claude_code(endpoint: str) -> Path | None:
 
 
 def configure_codex(endpoint: str, model: str) -> Path | None:
-    """Give Codex the profile `rhi`: the endpoint as its provider, `rhi token`, the timeout and the model."""
+    """Give Codex the profile `rhi`: the endpoint as its provider, `rhi token` and the model, and no stream timeout."""
     path = codex_profile()
     text = _read(path)
     try:
@@ -127,27 +132,33 @@ def configure_codex(endpoint: str, model: str) -> Path | None:
         raise HarnessError(f"{path} is not valid TOML: it is left as it is.") from error
     wanted: dict[Table, dict[str, Any]] = {
         TOP: {"model_provider": NAME, "model": model},
-        PROVIDER: {
-            "name": NAME,
-            "base_url": endpoint + "/v1",
-            "wire_api": "responses",
-            "stream_idle_timeout_ms": STREAM_IDLE_TIMEOUT_MS,
-        },
+        PROVIDER: {"name": NAME, "base_url": endpoint + "/v1", "wire_api": "responses"},
         AUTH: {"command": HELPER[0], "args": list(HELPER[1:])},
     }
-    if _owned(before, wanted) == wanted:
+    # The withdrawn settings this file holds, at the value an earlier login wrote.
+    stale = {table: values for table, values in _owned(before, WITHDRAWN).items() if values == WITHDRAWN[table]}
+    if _owned(before, wanted) == wanted and not stale:
         return None
 
     lines = text.removesuffix("\n").split("\n") if text else []
     for table, values in wanted.items():
         held = _table(before, table)
         _set(lines, table, {key: value for key, value in values.items() if key not in held or held[key] != value})
+    for table, values in stale.items():
+        _remove(lines, table, values)
     edited = "\n".join(lines) + "\n"
     try:
         after = tomllib.loads(edited)
     except tomllib.TOMLDecodeError:
         after = None
-    if after is None or _owned(after, wanted) != wanted or _others(after, wanted) != _others(before, wanted):
+    # What the login may change: its own settings, and the withdrawn ones it removes.
+    changed = {table: {**values, **stale.get(table, {})} for table, values in wanted.items()}
+    if (
+        after is None
+        or _owned(after, wanted) != wanted
+        or any(_owned(after, stale).values())
+        or _others(after, changed) != _others(before, changed)
+    ):
         raise HarnessError(
             f"{path} holds its settings in a form that rhi login cannot change: it is left as it is. "
             f"Remove its settings model and model_provider and its table {'.'.join(PROVIDER)}, "
@@ -200,26 +211,53 @@ def _value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _set(lines: list[str], table: Table, values: Mapping[str, Any]) -> None:
-    """Set the keys of one table in the file's lines: in its section when it has one, in a new one at the end.
+def _key(name: str) -> str:
+    """A pattern for one key as TOML lets a file write it: bare, or between quotes of either kind."""
+    name = re.escape(name)
+    return rf"""(?:{name}|"{name}"|'{name}')"""
 
-    The top level's section is the lines before the first table.
-    """
-    if not values:
-        return
-    name = r"\s*\.\s*".join(rf"""(?:{part}|"{part}"|'{part}')""" for part in map(re.escape, table))
+
+def _setting(key: str) -> re.Pattern[str]:
+    """A pattern for the start of a line that sets that key."""
+    return re.compile(rf"\s*{_key(key)}\s*=")
+
+
+def _section(lines: list[str], table: Table) -> tuple[int, int] | None:
+    """Where one table's section is in the file's lines: its header's line (-1 for the top level,
+    whose section is the lines before the first table) and the line after its last; None when the
+    file has no such section."""
+    name = r"\s*\.\s*".join(map(_key, table))
     header = re.compile(rf"\s*\[\s*{name}\s*\]\s*(?:#.*)?")
     start = next((index for index, line in enumerate(lines) if header.fullmatch(line)), None) if table else -1
+    if start is None:
+        return None
+    end = next((index for index in range(start + 1, len(lines)) if lines[index].lstrip().startswith("[")), len(lines))
+    return start, end
+
+
+def _remove(lines: list[str], table: Table, keys: Iterable[str]) -> None:
+    """Take the lines that set those keys out of one table's section."""
+    start, end = _section(lines, table) or (0, 0)
+    settings = [_setting(key) for key in keys]
+    lines[start + 1 : end] = [
+        line for line in lines[start + 1 : end] if not any(setting.match(line) for setting in settings)
+    ]
+
+
+def _set(lines: list[str], table: Table, values: Mapping[str, Any]) -> None:
+    """Set the keys of one table in the file's lines: in its section when it has one, in a new one at the end."""
+    if not values:
+        return
+    start, end = _section(lines, table) or (None, 0)
     if start is None:
         if lines and lines[-1].strip():
             lines.append("")
         lines.append(f"[{'.'.join(table)}]")
         lines.extend(f"{key} = {_value(value)}" for key, value in values.items())
         return
-    end = next((index for index in range(start + 1, len(lines)) if lines[index].lstrip().startswith("[")), len(lines))
     added = []
     for key, value in values.items():
-        setting = re.compile(rf"\s*{re.escape(key)}\s*=")
+        setting = _setting(key)
         at = next((index for index in range(start + 1, end) if setting.match(lines[index])), None)
         if at is None:
             added.append(f"{key} = {_value(value)}")

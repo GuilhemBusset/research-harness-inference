@@ -147,8 +147,9 @@ def test_codex_is_given_a_provider_profile_for_the_endpoint(home: Path) -> None:
     provider = profile.pop("model_providers")["rhi"]
     assert provider["base_url"] == ENDPOINT + "/v1"
     assert provider["wire_api"] == "responses"
-    assert provider["stream_idle_timeout_ms"] == 900000
     assert (provider["auth"]["command"], provider["auth"]["args"]) == ("rhi", ["token"])
+    # No stream timeout: Codex keeps its own default.
+    assert set(provider) == {"name", "base_url", "wire_api", "auth"}
     assert profile == tomllib.loads(CODEX_BEFORE)
     assert "# kept" in (home / ".codex" / "rhi.config.toml").read_text(encoding="utf-8")
     assert (home / ".codex" / "config.toml").read_text(encoding="utf-8") == CODEX_CONFIG
@@ -163,6 +164,37 @@ def test_both_files_are_made_when_a_harness_has_none(home: Path) -> None:
     profile = codex(home)
     assert (profile["model_provider"], profile["model"]) == ("rhi", endpoint.default)
     assert set(profile) == {"model_provider", "model", "model_providers"}
+    assert "stream_idle_timeout_ms" not in profile["model_providers"]["rhi"]
+
+
+# A key as TOML lets a file write it: bare, or between quotes of either kind.
+WRITTEN = ("{}", '"{}"', "'{}'")
+
+
+@pytest.mark.parametrize("key", [form.format("stream_idle_timeout_ms") for form in WRITTEN])
+def test_a_login_removes_the_stream_timeout_an_earlier_login_wrote_and_keeps_a_student_s_own(
+    home: Path, key: str
+) -> None:
+    endpoint = Endpoint()
+    log_in(endpoint)
+    path = home / ".codex" / "rhi.config.toml"
+    written = path.read_text(encoding="utf-8")
+    assert written.count('wire_api = "responses"\n') == 1
+
+    def with_timeout(milliseconds: int) -> str:
+        line = f"{key} = {milliseconds}\n"
+        return written.replace('wire_api = "responses"\n', 'wire_api = "responses"\n' + line)
+
+    # The profile as an earlier login left it, with the 15 minutes in the provider's table.
+    path.write_text(with_timeout(900000), encoding="utf-8")
+    assert codex(home)["model_providers"]["rhi"]["stream_idle_timeout_ms"] == 900000
+    assert str(path) in log_in(endpoint)
+    assert path.read_text(encoding="utf-8") == written
+
+    # Another value was not written by a login: it stays, and the file is not written.
+    path.write_text(with_timeout(600000), encoding="utf-8")
+    assert str(path) not in log_in(endpoint)
+    assert path.read_text(encoding="utf-8") == with_timeout(600000)
 
 
 def test_the_key_is_in_no_file(home: Path) -> None:
@@ -198,12 +230,14 @@ def test_the_login_prints_each_file_it_changed(home: Path) -> None:
     assert [path in third for path in files] == [False, True]
 
 
-def test_a_new_default_model_changes_that_setting_and_keeps_what_the_student_added(home: Path) -> None:
+@pytest.mark.parametrize("key", [form.format("model") for form in WRITTEN])
+def test_a_new_default_model_changes_that_setting_and_keeps_what_the_student_added(home: Path, key: str) -> None:
     endpoint = Endpoint()
     log_in(endpoint)
     path = home / ".codex" / "rhi.config.toml"
     text = path.read_text(encoding="utf-8")
-    assert "[model_providers.rhi]\n" in text
+    assert "[model_providers.rhi]\n" in text and text.count("\nmodel = ") == 1
+    text = text.replace("\nmodel = ", f"\n{key} = ")
     path.write_text(
         text.replace("[model_providers.rhi]\n", "[model_providers.rhi]  # mine\nrequest_max_retries = 2\n"),
         encoding="utf-8",
