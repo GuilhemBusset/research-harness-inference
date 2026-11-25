@@ -37,7 +37,9 @@ completion with `CONTINUE` (`Host.end_launch`), not before: an instance whose la
 waits is never taken for one that serves. A launch that is abandoned stays on record, and so does
 one whose completion did not reach Auto Scaling. A launch that cannot be put on record is
 abandoned before the engine starts. A record that cannot be removed is logged, and the instance
-serves: Auto Scaling has let it in.
+serves: Auto Scaling has let it in. So a record that is there says a launch may not have ended in
+service, never that it did not: an agent that starts and finds one drains the instance when its
+group terminates it, as it drains one that served (`rhi_lifecycle.__main__`).
 
 **A launch may be run again.** The agent that finds a launch on record runs the launch again
 (`rhi_lifecycle.__main__`), and every step can be repeated: the image is on disk, the release is

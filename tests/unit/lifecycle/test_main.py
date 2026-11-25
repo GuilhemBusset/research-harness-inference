@@ -23,13 +23,14 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+from botocore.exceptions import ClientError
 from prometheus_client import CollectorRegistry
 
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import __main__ as program
 from rhi_lifecycle import launch, metrics, release, serving
-from rhi_lifecycle.host import Host
+from rhi_lifecycle.host import Host, HostError
 from rhi_lifecycle.termination import POLL_SECONDS
 from rhi_mock_engine.app import Settings as MockSettings
 from rhi_mock_engine.app import create_app
@@ -560,19 +561,92 @@ def test_a_restarted_agent_runs_an_interrupted_launch_again_before_it_serves(tmp
     run(scenario)
 
 
-def test_a_restarted_agent_leaves_an_abandoned_launch_alone_once_the_group_terminates_it(tmp_path: Path) -> None:
+class RecordStays(World):
+    """An instance whose host removes no record of a launch. Auto Scaling takes one completion of
+    the launch hook: after it no launch hook waits, and another completion is `refused`."""
+
+    refused = 0
+
+    def end_launch(self) -> None:
+        raise HostError("record", 1)
+
+    def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
+        if request["LifecycleHookName"] == "launch" and self.completions:
+            self.refused += 1
+            raise ClientError({}, "CompleteLifecycleAction")
+        return super().complete_lifecycle_action(**request)
+
+    async def served(self) -> None:
+        """The launch of an agent that ran before the program let the instance into service."""
+        assert await asyncio.to_thread(self.earlier_launch().run) is launch.Outcome.CONTINUED
+        assert self.launching
+        self.readings.clear()
+
+    async def drains(self, student: asyncio.Future[httpx.Response]) -> None:
+        """The program, with the target state `Terminated`, waits for the student's request, then
+        completes the termination hook and stops the engine."""
+        await self.ticks(3)
+        assert self.completions == [completion("launch")]
+        assert "stop" not in self.calls
+
+        self.gate.set()
+        assert (await student).status_code == 200
+        await self.clock.advance(POLL_SECONDS)
+        await until(lambda: self.calls[-1] == "stop")
+        assert self.calls[-2:] == ["termination hook", "stop"]
+        assert self.completions == [completion("launch"), completion("termination")]
+
+
+def test_an_agent_restarted_on_a_terminated_instance_drains_it_though_its_launch_is_still_on_record(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        world = RecordStays(tmp_path, IN_SERVICE)
+        await world.served()
+        # The group terminates the instance while a student's request runs on it, and the agent's
+        # unit is restarted.
+        student = await world.student()
+        world.target = TERMINATED
+        async with world.running():
+            await until(lambda: world.readings != [])
+            await world.drains(student)
+
+    run(scenario)
+
+
+def test_an_agent_restarted_in_service_with_its_launch_still_on_record_drains_the_instance_later(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        world = RecordStays(tmp_path, IN_SERVICE)
+        await world.served()
+        async with world.running():
+            # The launch is run again, and Auto Scaling takes no second completion.
+            await until(lambda: world.refused == 1)
+            await world.ticks(1)
+
+            student = await world.student()
+            world.target = TERMINATED
+            await world.drains(student)
+
+    run(scenario)
+
+
+def test_a_restarted_agent_drains_an_instance_whose_abandoned_launch_started_the_engine(tmp_path: Path) -> None:
     async def scenario() -> None:
         # The engine was started, the launch was abandoned at its warm-up request, and the agent's
-        # unit was restarted: the launch is on record still.
+        # unit was restarted: the launch is on record still, as on an instance that served.
         world = World(tmp_path, TERMINATED)
         world.serves_already()
         world.launching = True
         async with world.running():
-            await until(lambda: world.readings != [])
+            await until(lambda: world.calls[-1:] == ["stop"])
             await world.ticks(3)
 
-        assert world.calls == []
-        assert world.completions == []
+        # Nothing runs on the engine: its termination hook is completed at once, and nothing of a
+        # launch or of the serving duties is run.
+        assert world.calls == ["termination hook", "stop"]
+        assert world.completions == [completion("termination")]
         assert world.items == []
 
     run(scenario)

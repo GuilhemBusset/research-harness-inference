@@ -18,9 +18,10 @@ on its standard input: reading it back needs no permission of the instance role.
 
 The host also keeps the record of a launch under way: an empty file, `LAUNCH_RECORD`, that is
 there from the start of a launch until Auto Scaling has taken the completion that lets the instance
-into service. The agent's program reads it when it starts, to tell a launch that was interrupted
-from an instance that serves (`rhi_lifecycle.__main__`). It is under `/run`, which is empty at
-every start of the instance, beside the settings the boot program writes there.
+into service. The agent's program reads it when it starts: beside a started engine, no record
+says the instance serves, and a record that it may not (`rhi_lifecycle.__main__`). It is under
+`/run`, which is empty at every start of the instance, beside the settings the boot program writes
+there.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
@@ -134,8 +135,8 @@ class Host:
         self._run("record", ("rm", "-f", f"{RUN_FOLDER}/{LAUNCH_RECORD}"))
 
     def launch_begun(self) -> bool:
-        """Whether a launch is on record on the host: one was begun, and has not ended with the
-        instance in service. A host that did not list its folder has not said no: `HostError`."""
+        """Whether a launch is on record on the host: one was begun, and its record was not
+        removed. A host that did not list its folder has not said no: `HostError`."""
         # The names in the folder, one on each line. The exit status of a command that looks for
         # one file would not tell a file that is absent from a host that could not be entered.
         returncode, names = self._read("record", ("ls", RUN_FOLDER))

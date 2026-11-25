@@ -18,9 +18,9 @@ running.
 
 **Which instance drains.** `Termination.run` reads the target lifecycle state in the instance
 metadata and drains an instance whose target is `Terminated`. The agent's program, which reads the
-target state itself and knows whether the instance is in service, hands an instance in service
-whose target is `Terminated` to `Termination.drain` (`rhi_lifecycle.__main__`). No other target
-state starts a drain.
+target state itself and knows whether the instance is in service, hands an instance whose target
+is `Terminated` to `Termination.drain` when it is in service, or when the program cannot tell
+whether it served (`rhi_lifecycle.__main__`). No other target state starts a drain.
 
 **What cannot be completed.** The hook is named in the settings of the release parameter, and the
 instance by its metadata. Without one of them there is nothing to call: the result is

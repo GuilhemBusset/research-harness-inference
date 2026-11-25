@@ -25,14 +25,14 @@ one. What a reading calls for:
 | --- | --- | --- |
 | not in service | `InService`, and no launch run yet | runs the launch (`rhi_lifecycle.launch`), once |
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
-| in service | `Terminated` | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
+| in service, or one that may have served | `Terminated` | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
 | not in service | none: the metadata says the instance has no such item | runs the canary (`rhi_lifecycle.canary`), once |
 
-Any other reading calls for nothing. An instance that is not in service and whose target state is
-`Terminated` is among them: its launch was abandoned, or it has drained, and the program leaves it
-alone. So is an instance in service whose target state is neither `InService` nor `Terminated`: the
-group's instances leave service one way, terminated, and no other state starts a drain or stops the
-serving duties.
+Any other reading calls for nothing. An instance that the program knows never served, or has
+drained, and whose target state is `Terminated` is among them: this program abandoned its launch,
+or completed its termination hook, and leaves it alone. So is an instance in service whose target
+state is neither `InService` nor `Terminated`: the group's instances leave service one way,
+terminated, and no other state starts a drain or stops the serving duties.
 
 The instance is in service once its launch has completed the launch hook: the serving duties start
 then. They run until the target state is `Terminated`, and on while the termination handling waits
@@ -79,11 +79,17 @@ unit asks again.
   takes the instance as in service: with the target state `InService` the serving duties resume,
   and with `Terminated` the instance is handed to the termination handling.
 - A launch is on record: the program was restarted during a launch, whose hook still waits, or
-  after one that was abandoned. A started engine says nothing more there. The instance is not in
-  service: no serving duty runs and no serving heartbeat is written. With the target state
-  `InService` the launch is run again, by all its steps, and only its completion of the hook lets
-  the instance into service. The hook's timeout still bounds it, counted from the instance's start.
-  On an instance in no group the canary's run is made again, and writes its line.
+  after one that was abandoned, or after one whose record stayed when Auto Scaling had taken its
+  completion: the record is removed after that answer, and the removal can fail, or the program
+  stop before it. The host cannot tell these apart, so the instance may have served. It is not
+  taken as in service: no serving duty runs and no serving heartbeat is written. With the target
+  state `InService` the launch is run again, by all its steps, and only its completion of the hook
+  lets the instance into service. The hook's timeout still bounds it, counted from the instance's
+  start. With `Terminated` the instance is handed to the termination handling, whatever a launch
+  run again came to: an instance that served may hold a request, and one that never served loses
+  nothing by a drain, because nothing runs on its engine and its termination hook, if one waits,
+  is completed at once. On an instance in no group the canary's run is made again, and writes its
+  line.
 
 The serving duties end only by failing, and the program then ends with them, so that its unit
 restarts it and they resume.
@@ -334,6 +340,9 @@ class Agent:
         self._instance: str | None = None
         # Whether the launch hook was completed, and no termination hook since.
         self._in_service = False
+        # Whether the program started on an instance whose engine's unit was started with a launch
+        # on record, and has not drained it: it cannot tell whether the instance entered service.
+        self._may_have_served = False
         # Whether the instance's launch was run, or is over because the instance serves or has
         # served: it is run once.
         self._launched = False
@@ -357,9 +366,12 @@ class Agent:
         self._loop.set_default_executor(self._workers)
         self.server = server = metrics.serve(self._registry, port=self._port)
         try:
-            # A unit restarted on an instance whose engine was started, with no launch on record:
-            # the instance was let into service, and no launch is run on it.
-            self._in_service = self._launched = await asyncio.to_thread(self._found_in_service)
+            # A unit restarted on an instance whose engine was started. With no launch on record
+            # the instance was let into service, and no launch is run on it. With one, it may have
+            # been.
+            started, begun = await asyncio.to_thread(self._found)
+            self._in_service = self._launched = started and not begun
+            self._may_have_served = started and begun
             next_at = self._clock()
             while True:
                 await self.tick()
@@ -411,6 +423,8 @@ class Agent:
                 self._begin(self._leave(instance))
         elif target == launch.IN_SERVICE and not self._launched:
             self._begin(self._enter(instance))
+        elif target == TERMINATED and self._may_have_served:
+            self._begin(self._leave(instance))
 
     def _begin(self, transition: Coroutine[Any, Any, None]) -> None:
         """Run `transition` beside the readings."""
@@ -451,9 +465,11 @@ class Agent:
             _LOG.warning("the instance metadata did not give %s", error)  # the item's name
             return None
 
-    def _found_in_service(self) -> bool:
-        """Whether the program starts on an instance that a launch before it let into service."""
-        return self._host.engine_started() and not self._host.launch_begun()
+    def _found(self) -> tuple[bool, bool]:
+        """Whether the program starts on an instance whose engine's unit is started, and whether a
+        launch is on record there. The record is asked for only beside a started engine."""
+        started = self._host.engine_started()
+        return started, started and self._host.launch_begun()
 
     async def _enter(self, instance: str) -> None:
         self._launched = True
@@ -471,8 +487,10 @@ class Agent:
         outcome = await asyncio.to_thread(self._termination.drain, instance)
         _LOG.info("the termination handling ended: %s", outcome.value)
         if outcome is Outcome.DRAINED:
-            # The duties are at rest: the engine's unit was stopped only once they were.
-            self._in_service = False
+            # The duties are at rest: the engine's unit was stopped only once they were. The
+            # instance is out of service for good, and no launch is run on it.
+            self._in_service = self._may_have_served = False
+            self._launched = True
 
     def _serve(self, instance: str) -> None:
         """Start the serving duties, with the release the instance holds."""
