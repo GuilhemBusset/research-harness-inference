@@ -24,6 +24,7 @@ import runpy
 import secrets
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -139,7 +140,7 @@ def verification(environ: Mapping[str, str], clock: Clock | None = None, **given
     and a clock that only its `sleep` moves."""
     clock = clock or Clock()
     stand_ins: dict[str, Any] = {
-        "status": lambda: "ready",
+        "status": lambda within: "ready",
         "cloudformation": Stacks(),
         "resource": boto3.resource("dynamodb", region_name=REGION),
     }
@@ -354,7 +355,7 @@ def test_a_pool_that_already_has_a_session_is_neither_booked_nor_stopped(
     clock = Clock()
     run = Booked(pool_state, clock)
 
-    def never_read() -> str:
+    def never_read(within: float) -> str:
         raise AssertionError("the status is not waited for on a pool the step did not book")
 
     assert verification(ENVIRON, clock, client=Secrets(a_key()), run=run, status=never_read) == 0
@@ -377,10 +378,10 @@ def test_a_session_someone_else_booked_meanwhile_is_not_stopped(pool_state: Any)
     assert session_of(pool_state) == theirs
 
 
-def states(*read: str | None) -> Callable[[], str | None]:
+def states(*read: str | None) -> Callable[[float], str | None]:
     """A status that reads each of `read` in turn, then the last of them for good."""
     left = list(read)
-    return lambda: left.pop(0) if len(left) > 1 else left[0]
+    return lambda within: left.pop(0) if len(left) > 1 else left[0]
 
 
 @pytest.mark.parametrize(
@@ -394,7 +395,7 @@ def states(*read: str | None) -> Callable[[], str | None]:
     ids=["ready at once", "ready at the fourth reading", "never ready", "no reading"],
 )
 def test_the_tests_start_once_the_status_reads_ready_or_the_wait_is_over(
-    pool_state: Any, status: Callable[[], str | None], waited: float
+    pool_state: Any, status: Callable[[float], str | None], waited: float
 ) -> None:
     clock = Clock()
     run = Booked(pool_state, clock)
@@ -408,6 +409,27 @@ def test_the_tests_start_once_the_status_reads_ready_or_the_wait_is_over(
     assert during is not None and during.ends_at == NOW + 90 * 60
     stopped = session_of(pool_state)
     assert stopped is not None and stopped.ends_at == NOW + waited + 300
+
+
+@pytest.mark.parametrize("takes", [5, 8], ids=["a reading would start then", "a reading is under way then"])
+def test_no_reading_of_the_status_goes_past_the_end_of_the_wait(pool_state: Any, takes: int) -> None:
+    clock = Clock()
+    run = Booked(pool_state, clock)
+    read_at: list[float] = []
+
+    def warming(within: float) -> str | None:
+        # A reading takes `takes` seconds to say the pool is warming, and gives nothing when it is
+        # allowed less.
+        read_at.append(clock.now)
+        clock.sleep(min(takes, within))
+        return "warming" if within >= takes else None
+
+    env = {**ENVIRON, verify.CHECK_WAIT_MINUTES_VARIABLE: "1"}
+    assert verification(env, clock, client=Secrets(a_key()), run=run, status=warming) == 0
+
+    # The tests start one minute after the booking, not one reading later.
+    assert run.started_at == [NOW + 60]
+    assert read_at and max(read_at) < NOW + 60
 
 
 def test_the_pool_s_state_is_read_from_the_gateway_s_status_with_the_canary_s_key() -> None:
@@ -433,9 +455,28 @@ def test_the_pool_s_state_is_read_from_the_gateway_s_status_with_the_canary_s_ke
     read = verify.status_reader(ENDPOINT, "a-key", httpx.MockTransport(answer))
 
     # The mock pool's own state; a status that does not give it, or does not answer, reads as none.
-    assert [read() for _ in range(5)] == ["cold", "ready", None, None, None]
+    # A reading may take the seconds it is given, and no longer than the longest one may.
+    assert [read(within) for within in (2.5, 3600, 1, 1, 1)] == ["cold", "ready", None, None, None]
+    assert [request.extensions["timeout"]["read"] for request in asked[:2]] == [2.5, verify.READ_SECONDS]
     assert {str(request.url) for request in asked} == {f"https://{ENDPOINT}/status"}
     assert {request.headers["Authorization"] for request in asked} == {"Bearer a-key"}
+
+
+def test_a_reading_of_the_status_that_has_no_answer_in_its_seconds_is_given_up() -> None:
+    import httpx
+
+    let_go = threading.Event()
+
+    def held(request: httpx.Request) -> httpx.Response:
+        # The gateway holds its answer far longer than the reading may take.
+        let_go.wait(5)
+        return httpx.Response(200, json={"pools": [{"model": "mock", "state": "ready"}]})
+
+    read = verify.status_reader(ENDPOINT, "a-key", httpx.MockTransport(held))
+    try:
+        assert read(0.05) is None
+    finally:
+        let_go.set()
 
 
 def test_a_pool_that_cannot_be_booked_fails_the_script_before_any_test(

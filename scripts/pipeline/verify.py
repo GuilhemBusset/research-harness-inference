@@ -30,6 +30,7 @@ that dies leaves a session that ends by itself. It finds the stage's pool-state 
 logical ID in the pools stack, as the deployment hold does. It then reads the gateway's
 `GET /status`, with the canary's key, every `POLL_SECONDS`, until the pool reads `ready` or
 `RHI_VERIFY_CHECK_WAIT_MINUTES` have passed since the booking, and runs the tests in either case.
+No reading starts once the wait is over, and each is given no longer than what is left of it.
 Whatever the run's result, it then stops the session, only while the session still reads as the
 booking it made. A pool that already has a session booked or active is neither booked nor stopped:
 the tests run at once, on the instances that are there. A pool that cannot be booked fails the
@@ -109,6 +110,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,7 +152,8 @@ MOCK_POOL = "mock"
 BOOKED_BY = "pipeline/verify"
 # The state `GET /status` gives a pool that serves (section 5.3).
 READY = "ready"
-# Between two readings of the pool's state while the script waits for it, and the longest one may take.
+# Between two readings of the pool's state while the script waits for it, and the longest one may
+# take: less when less is left of the wait.
 POLL_SECONDS = 10.0
 READ_SECONDS = 10.0
 MINUTE_SECONDS = 60
@@ -393,17 +396,32 @@ def check_of(env: Mapping[str, str]) -> Check | None:
     return Check(stack=stack, logical_id=logical_id, wait_minutes=wait_minutes, session_max_hours=hours)
 
 
-def status_reader(endpoint: str, key: str, transport: httpx.BaseTransport | None = None) -> Callable[[], str | None]:
+def status_reader(
+    endpoint: str, key: str, transport: httpx.BaseTransport | None = None
+) -> Callable[[float], str | None]:
     """What reads the mock pool's state from `GET /status` of `endpoint`, with the canary's key,
-    through `transport` when one is given: None for a reading that failed. Nothing of the
-    machine's own configuration, a proxy among it, takes part in a reading."""
+    through `transport` when one is given: None for a reading that failed. A reading is given the
+    seconds it may take, and `READ_SECONDS` when that is more: one that has no answer by then is
+    given up, and reads as None. Nothing of the machine's own configuration, a proxy among it,
+    takes part in a reading."""
     import httpx
 
     address = (endpoint if "://" in endpoint else f"https://{endpoint}").rstrip("/")
 
-    def read() -> str | None:
+    def read(within: float) -> str | None:
+        # A time-out of httpx is for each step of a request, the connection then each wait for the
+        # answer, not for the whole of it: the request is made aside, and left when its seconds
+        # are over. Its own time-outs end it soon after.
+        seconds = min(READ_SECONDS, within)
+        states: list[str | None] = []
+        request = threading.Thread(target=lambda: states.append(answered(seconds)), daemon=True)
+        request.start()
+        request.join(seconds)
+        return states[0] if states else None
+
+    def answered(seconds: float) -> str | None:
         try:
-            with httpx.Client(timeout=READ_SECONDS, trust_env=False, transport=transport) as http:
+            with httpx.Client(timeout=seconds, trust_env=False, transport=transport) as http:
                 answer = http.get(f"{address}/status", headers={"Authorization": f"Bearer {key}"})
             states = {record["model"]: record["state"] for record in answer.json()["pools"]}
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
@@ -415,16 +433,16 @@ def status_reader(endpoint: str, key: str, transport: httpx.BaseTransport | None
 
 
 def wait_until_ready(
-    status: Callable[[], str | None], *, until: float, sleep: Callable[[float], None], clock: Callable[[], float]
+    status: Callable[[float], str | None], *, until: float, sleep: Callable[[float], None], clock: Callable[[], float]
 ) -> bool:
     """Reads the pool's state with `status` every `POLL_SECONDS` until it reads `READY`, or until
-    the time `until` has come; whether it read ready."""
-    while status() != READY:
-        left = until - clock()
-        if left <= 0:
-            return False
-        sleep(min(POLL_SECONDS, left))
-    return True
+    the time `until` has come; whether it read ready. No reading starts at that time or after it,
+    and each is given what is left until then as the seconds it may take."""
+    while (left := until - clock()) > 0:
+        if status(left) == READY:
+            return True
+        sleep(max(0.0, min(POLL_SECONDS, until - clock())))
+    return False
 
 
 def run_in_a_session(
@@ -433,7 +451,7 @@ def run_in_a_session(
     *,
     cloudformation: Any,
     resource: Any,
-    status: Callable[[], str | None],
+    status: Callable[[float], str | None],
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> tuple[int | None, bool]:
@@ -505,7 +523,7 @@ def main(
     *,
     cloudformation: Any = None,
     resource: Any = None,
-    status: Callable[[], str | None] | None = None,
+    status: Callable[[float], str | None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
@@ -514,7 +532,8 @@ def main(
     a CloudFormation one and `resource` a DynamoDB resource; without one, the build's own
     credentials and region make it. `run` runs the smoke tests in the environment it is given: once
     on the mock pool, in a session the script books and stops, then once on each pool the decision
-    left. `status` reads the mock pool's state, from the endpoint's `GET /status` when left out;
+    left. `status` reads the mock pool's state in the seconds it is given, from the endpoint's
+    `GET /status` when left out;
     `sleep` waits that many seconds and `clock` gives the time, in seconds since the epoch. When a
     run fails, the last stage each instance of the tested pools reached is left for the step's
     post-build phase."""
