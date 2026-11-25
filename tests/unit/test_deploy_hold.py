@@ -187,10 +187,11 @@ def test_an_item_that_is_not_a_session_holds_the_deployment(item: dict[str, Any]
     assert clock.now == 0
 
 
-def test_a_stage_with_no_pool_passes_at_once_and_reads_no_item() -> None:
-    dynamodb, clock = DynamoDB(), Clock()
-    assert run(CloudFormation(), dynamodb, clock, **{deploy_hold.POOLS_VARIABLE: ""}) == 0
-    assert (dynamodb.asked, clock.now) == ([], 0)
+def test_a_stage_with_no_pool_passes_at_once_and_asks_aws_nothing() -> None:
+    # A lookup would fail the job: with no pool there is no session to read, so none is made.
+    cloudformation, dynamodb, clock = CloudFormation(error("AccessDenied")), DynamoDB(), Clock()
+    assert run(cloudformation, dynamodb, clock, **{deploy_hold.POOLS_VARIABLE: ""}) == 0
+    assert (cloudformation.reads, dynamodb.asked, clock.now) == (0, [], 0)
 
 
 @pytest.mark.parametrize(

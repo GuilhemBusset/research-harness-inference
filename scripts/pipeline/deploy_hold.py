@@ -17,12 +17,12 @@ no other item.
 table as the admin CLI finds its tables (`admin/rhi_admin/main.py`),
 `cloudformation:DescribeStackResource` gives the table's name. `RHI_HOLD_POOLS` holds the names of
 the stage's pools, separated by commas: empty for a stage with no pool, whose deployment then waits
-on nothing. `RHI_HOLD_SESSION_MAX_HOURS` is the configuration's `session_max_hours`, a
+on nothing, and the job then looks up no table and reads no item. `RHI_HOLD_SESSION_MAX_HOURS` is the configuration's `session_max_hours`, a
 whole number above zero. A variable that is missing, a pool's name that is empty beside others, or
 hours that are not such a number fail the job before it reads anything.
 
-**When it passes at once.** When no session is active, which is also how a pool with no session
-item and a stage with no pool read, and when the pools stack, or its table, does not exist yet, as
+**When it passes at once.** When the stage has no pool, before any call to AWS. When no session is
+active, which is also how a pool with no session item reads, and when the pools stack, or its table, does not exist yet, as
 before the stage's first deployment: CloudFormation then answers `ValidationError` saying that the stack or
 the resource does not exist, or names the resource with no physical ID (its creation failed before
 the table existed), and DynamoDB answers `ResourceNotFoundException`. Any other error, a
@@ -186,6 +186,10 @@ def main(
             file=sys.stderr,
         )
         return 1
+    if not pools:
+        # No pool, so no session: nothing is looked up, and no answer of AWS can hold the deployment.
+        print(f"{NAME}: the stage has no pool: no session can be active, and the deployment goes ahead")
+        return 0
     if cloudformation is None or dynamodb is None:
         import boto3
 

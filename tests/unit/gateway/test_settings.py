@@ -352,6 +352,10 @@ def test_a_refused_pool_field_is_named_from_the_fixed_list_only() -> None:
     assert "'largest_output'" in str(known)
     # The pool's name is part of the value: it is not repeated.
     assert "mock" not in str(known)
+    # A retired field an entry still holds is of the fixed list too: a value of another type is refused by its name.
+    retired = refusal({**FULL, "RHI_POOLS": json.dumps({**POOLS, "mock": {**MOCK, "idle_minutes": SECRET}})})
+    assert "'idle_minutes'" in str(retired)
+    assert SECRET not in as_logged(retired)
 
 
 def test_the_tables_of_pools_must_agree_with_an_empty_pools_table_too() -> None:

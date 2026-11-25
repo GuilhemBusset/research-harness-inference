@@ -48,7 +48,8 @@ through the Secrets Manager API at start (`rhi_gateway.main`).
 **A refusal names the variable and never its value.** A required variable that is missing, or any
 variable that is not of its form, raises `SettingsError` before anything listens. Its message is
 the variable's name and a fixed sentence; for `RHI_POOLS` it may add the pool field at fault, from
-the fixed list of a pool's fields. Nothing else of a value, a pool's name included, reaches the
+the fixed list of a pool's fields and of the retired ones an entry may still hold
+(`rhi_common.pool_config.RETIRED_FIELDS`). Nothing else of a value, a pool's name included, reaches the
 message or an error chained to it: the task's log shows it.
 """
 
@@ -64,7 +65,7 @@ from urllib.parse import urlsplit
 
 from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS, with_floors
 from rhi_common.causes import Cause
-from rhi_common.pool_config import FIELDS, Pool, PoolConfigError, parse_pools
+from rhi_common.pool_config import FIELDS, RETIRED_FIELDS, Pool, PoolConfigError, parse_pools
 
 POOLS = "RHI_POOLS"
 DEFAULT_POOL = "RHI_DEFAULT_POOL"
@@ -121,8 +122,9 @@ VARIABLES = (*REQUIRED, DEFAULT_POOL, *NUMERIC_DEFAULTS, *FLOOR_DEFAULTS)
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
 # A floor: digits, with at most one decimal point and digits on both of its sides.
 _DECIMAL = re.compile(r"[0-9]{1,32}(?:\.[0-9]{1,32})?", re.ASCII)
-# The fields a refusal of the pools table may name: a pool's own, never anything a value held.
-_POOL_FIELDS = FIELDS | {"name"}
+# The fields a refusal of the pools table may name: a pool's own and the retired ones an entry may
+# still hold, never anything a value held.
+_POOL_FIELDS = FIELDS | RETIRED_FIELDS | {"name"}
 # The names DynamoDB accepts, as its API documents them.
 _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
 # A date as the deployment writes it, YYYY-MM-DD.
