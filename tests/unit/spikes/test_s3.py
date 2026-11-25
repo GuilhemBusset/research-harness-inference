@@ -460,11 +460,11 @@ def claude_session(
 
 
 def test_a_refusal_s_cause_is_kept_only_when_it_is_a_published_name() -> None:
-    names = ["pool_disabled", "overloaded_error", "PrivateBackendDiagnostic"]
+    names = ["no_session", "overloaded_error", "PrivateBackendDiagnostic"]
     refused = [exchange("/v1/messages", {}, 1.0, 503, cause=name) for name in names]
     rows = s3.refusals_of(claude_session(s3.Step.TASK, [], refused))
     assert [(row["status"], row["cause"]) for row in rows] == [
-        (503, "pool_disabled"),
+        (503, "no_session"),
         (503, "overloaded_error"),
         (503, "other"),
     ]

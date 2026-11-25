@@ -22,8 +22,6 @@ DESIGN = {
     "concurrency_limit": (429, 5),
     "warming": (503, 30),
     "capacity_unavailable": (503, 60),
-    "pool_scheduled_only": (503, None),
-    "pool_disabled": (503, None),
     "no_session": (503, None),
     "engine_error": (502, None),
     "time_limit": (504, None),
@@ -53,7 +51,7 @@ def read_event(raw: bytes) -> tuple[str | None, object]:
 
 def test_statuses_are_the_designs() -> None:
     assert {cause.value: (cause.status, cause.retry_after) for cause in Cause} == DESIGN
-    assert len(Cause) == 11
+    assert len(Cause) == 9
 
     for name, (status, seconds) in DESIGN.items():
         for wire in FORMATS:
@@ -70,8 +68,8 @@ def test_statuses_are_the_designs() -> None:
     # A value for one cause leaves the two others at their defaults, and adds no header elsewhere.
     only_warming = {Cause.WARMING: 45}
     assert render_json(Cause.CAPACITY_UNAVAILABLE, WireFormat.MESSAGES, only_warming).headers["Retry-After"] == "60"
-    assert "Retry-After" not in render_json(Cause.POOL_DISABLED, WireFormat.MESSAGES, only_warming).headers
-    # No caller can give the header to one of the eight others.
+    assert "Retry-After" not in render_json(Cause.NO_SESSION, WireFormat.MESSAGES, only_warming).headers
+    # No caller can give the header to one of the six others.
     for name, (_, seconds) in DESIGN.items():
         if seconds is None:
             with pytest.raises(ValueError, match="carries none"):
@@ -115,7 +113,7 @@ def test_an_exception_renders_as_the_cause_it_carries_or_as_engine_error() -> No
     assert cause_of(RuntimeError("anything")) is Cause.ENGINE_ERROR
 
     for wire in WireFormat:
-        assert render_json(GatewayError(Cause.POOL_DISABLED), wire) == render_json(Cause.POOL_DISABLED, wire)
+        assert render_json(GatewayError(Cause.NO_SESSION), wire) == render_json(Cause.NO_SESSION, wire)
         assert render_json(TimeoutError(), wire) == render_json(Cause.ENGINE_ERROR, wire)
         assert render_stream_event(GatewayError(Cause.TIME_LIMIT), wire) == render_stream_event(Cause.TIME_LIMIT, wire)
         assert render_stream_event(KeyError("pool"), wire) == render_stream_event(Cause.ENGINE_ERROR, wire)

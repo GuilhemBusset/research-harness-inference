@@ -103,7 +103,7 @@ def _stream(*, ping: bool) -> bytes:
 class Pool(httpx.AsyncBaseTransport):
     """The gateway's answers by student: the first held, with a keep-alive first on its first request
     only, the second warm, its engine opening each stream with a comment, with its third request cut,
-    the third refused because its pool is disabled."""
+    the third refused because its pool has no session."""
 
     def __init__(self, keys: list[str], clock: Clock) -> None:
         self.keys, self.clock, self.sent = keys, clock, 0
@@ -113,7 +113,7 @@ class Pool(httpx.AsyncBaseTransport):
         student = self.keys.index(request.headers["authorization"].removeprefix("Bearer "))
         self.by_student[student] += 1
         if student == 2:
-            body = {"type": "error", "error": {"type": "pool_disabled", "message": "disabled"}}
+            body = {"type": "error", "error": {"type": "no_session", "message": "no session"}}
             return httpx.Response(503, json=body)
         if student == 1 and self.by_student[1] == 3:
             raise httpx.ReadError("cut")
@@ -266,7 +266,7 @@ def test_each_request_line_holds_its_times_tokens_hold_and_first_turn() -> None:
     refused = [line for line in requests if line["session"] == 2]
     assert refused
     assert all(
-        (line["status"], line["cause"], line["held"]) == (503, "pool_disabled", False) for line in refused
+        (line["status"], line["cause"], line["held"]) == (503, "no_session", False) for line in refused
     )
     # The cut request is a line of its own, and the session goes on after it.
     cut = [line for line in requests if line["failure"] is not None]

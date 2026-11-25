@@ -107,12 +107,12 @@ def design_causes() -> set[str]:
 
 
 def test_guide_explains_every_cause() -> None:
-    """Every cause the gateway can answer today, and every cause of the design's table."""
+    """Every cause the gateway can answer, which are the causes of the design's table, and no other."""
     design = design_causes()
     assert "no_session" in design
-    causes = design | {cause.value for cause in Cause}
+    assert design == {cause.value for cause in Cause}
     rows = re.findall(r"^\| `([a-z_]+)` \|\s*\S[^|]*\|\s*\S[^|]*\|$", GUIDE.read_text(encoding="utf-8"), re.MULTILINE)
-    assert causes <= set(rows), sorted(causes - set(rows))
+    assert sorted(rows) == sorted(design)
 
 
 def provider_entries(text: str) -> dict[str, tuple[str, str]]:
