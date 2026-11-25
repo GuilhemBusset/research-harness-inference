@@ -1,8 +1,8 @@
 """The pipeline's step that holds the stage's deployment while a session is on
 (src/rhi/pipeline/hold.py; system design, sections 5.6 and 8.2): the action named Hold, after the
 copy of the weights and before the stage's deployment actions, which runs the hold job on the
-source with a timeout of 36 hours; the pools stack's name and the pool-state table's logical ID in
-its environment, as text; and a role that reads that stack's resources and that table's items and
+source with a timeout of 36 hours; the pools stack's name, the pool-state table's logical ID, the
+names of the stage's pools and the longest a session lasts in its environment, as text; and a role that reads that stack's resources and that table's items and
 holds nothing else but what CDK Pipelines gives every project.
 
 The tests read the app's own pipeline, the one that is deployed.
@@ -26,6 +26,8 @@ ACTION = "Hold"
 SCRIPT = "scripts/pipeline/deploy_hold.py"
 STACK_VARIABLE = "RHI_HOLD_POOLS_STACK"
 LOGICAL_ID_VARIABLE = "RHI_HOLD_TABLE_LOGICAL_ID"
+POOLS_VARIABLE = "RHI_HOLD_POOLS"
+SESSION_MAX_HOURS_VARIABLE = "RHI_HOLD_SESSION_MAX_HOURS"
 
 
 def as_list(value: Any) -> list[Any]:
@@ -127,6 +129,14 @@ def test_the_hold_is_told_the_pools_stack_and_the_pool_state_table(
     }
     resource = templates[path]["Resources"][logical_id]
     assert resource["Type"] == "AWS::DynamoDB::Table" and "TableName" not in resource["Properties"]
+
+
+def test_the_hold_is_told_every_pool_of_the_stage_and_the_longest_session(hold: Hold, app: cdk.App) -> None:
+    stage: Any = app.node.find_child(STAGE)
+    pools = [pool.name for pool in stage.config.pools]
+    # The job reads one session item per name: every pool is named, and nothing else is.
+    assert pools and hold.environment[POOLS_VARIABLE].split(",") == pools
+    assert hold.environment[SESSION_MAX_HOURS_VARIABLE] == str(stage.config.session_max_hours)
 
 
 def test_the_hold_s_role_reads_the_stack_resource_and_the_table_and_nothing_else(hold: Hold) -> None:
