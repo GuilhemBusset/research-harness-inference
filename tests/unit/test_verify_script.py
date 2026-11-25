@@ -10,9 +10,10 @@ Around each run the script books the run's pool, waits until the gateway's statu
 or the wait is over, and stops the session it booked, also when the tests fail; a pool that already
 has a session is neither booked nor stopped. On a pool the decision left, a wait that ends with the
 pool not ready and no instance's heartbeat row written since the booking runs no test: the script
-stops its session and exits with the result of its other runs, and leaves `no-capacity` when that
-is a pass; with such a row, also one that expired before the wait ended, or when it cannot tell,
-the tests run and their failure is the script's.
+stops its session, leaves `no-capacity` and exits with the result of its other runs; with such a
+row, also one that expired before the wait ended, or when the table's answers cannot tell, the
+tests run and their failure is the script's. A read of the table that failed is neither a launch
+nor the lack of one.
 
 A stand-in for the Secrets Manager client replaces AWS, and moto holds the heartbeats table and
 the pool-state table in process: no account, no credentials, no network. A clock the test controls
@@ -38,7 +39,7 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 import verify
-from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, InstanceHeartbeat, Session
+from rhi_common.records import EXPIRY_SECONDS, SESSION_RECORD, GatewayHeartbeat, InstanceHeartbeat, Session
 from rhi_common.tables import HEARTBEATS, POOL_STATE
 
 if TYPE_CHECKING:
@@ -758,10 +759,9 @@ def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capa
 
     exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, OneRowAPage(heartbeats) if paged else heartbeats)
 
-    # No test on the pool, and the exit of the other run, the mock pool's. The one line is the
-    # word of a script that passed: a failed attempt leaves none for the retry that passes, whose
-    # success would read as one whose GPU tests did not run.
-    assert (exited, reason) == (on_mock, "no-capacity\n" if on_mock == 0 else None)
+    # No test on the pool, the one line of the reason, and the exit of the other run, the mock
+    # pool's, whatever it is: what a failed build's reason becomes is the step's affair.
+    assert (exited, reason) == (on_mock, "no-capacity\n")
     assert run.pools == [None]
     # The session the script booked on the pool is stopped when the wait ends.
     stopped = session_of(pool_state, "coursework")
@@ -801,13 +801,60 @@ def test_a_launch_is_not_forgotten_when_its_row_expires_before_the_wait_ends(
     assert row["expires_at"] < NOW + 120 * 60
     run, clock = PoolRuns(coursework=3), Lifetimes(row)
 
-    exited, reason, _ = on_a_pool_that_is_not_ready(
+    exited, reason, stages = on_a_pool_that_is_not_ready(
         tmp_path, run, heartbeats, clock, **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"}
     )
 
-    # The table holds no row of the pool when the wait ends, and the launch still counts.
+    # The table holds no row of the pool when the wait ends, and the launch still counts: the
+    # tests run and fail, and the stage the instance was last seen at is the one that is left.
     assert heartbeats.scan(TableName=TABLE)["Items"] == [] and clock.now >= NOW + 120 * 60
-    assert (exited, reason) == (3, None)
+    assert (exited, reason, stages) == (3, None, "boot\n")
+    assert run.pools == [None, "coursework"]
+
+
+class UnreadableUntil:
+    """A DynamoDB client whose queries fail until the time `until` of `clock`, then are `client`'s."""
+
+    def __init__(self, client: Any, clock: Clock, until: int) -> None:
+        self.client, self.clock, self.until = client, clock, until
+
+    def query(self, **request: Any) -> dict[str, Any]:
+        if self.clock.time() < self.until:
+            raise ClientError({"Error": {"Code": "InternalServerError", "Message": "said by AWS"}}, "Query")
+        return self.client.query(**request)
+
+
+def test_a_read_that_failed_is_not_a_launch_when_a_later_answer_covers_the_whole_wait(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    assert verify.ROW_LASTS_SECONDS == EXPIRY_SECONDS
+    # A wait of 45 minutes, less than a row lasts: the table cannot be read until the wait's last
+    # minute, and then holds no row since the booking. A row written at any time of the wait would
+    # still be there, so no instance was launched.
+    run, clock = PoolRuns(coursework=4), Clock()
+    dynamodb = UnreadableUntil(heartbeats, clock, WAIT_ENDS - 60)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, dynamodb, clock)
+
+    assert (exited, reason) == (0, "no-capacity\n")
+    assert run.pools == [None]
+
+
+def test_answers_too_far_apart_do_not_say_that_no_instance_was_launched(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. The table cannot be read for longer than a row lasts, and an instance
+    # launched then wrote its row once: the row is gone when the table answers again, with no row.
+    row = instance_row("coursework", "boot", NOW + 60)[1]
+    run, clock = PoolRuns(coursework=4), Lifetimes(row)
+    dynamodb = UnreadableUntil(heartbeats, clock, row["expires_at"] + 60)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(
+        tmp_path, run, dynamodb, clock, **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"}
+    )
+
+    # Every answer the script had held no row, and none says what happened before: the tests run.
+    assert (exited, reason) == (4, None)
     assert run.pools == [None, "coursework"]
 
 

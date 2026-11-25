@@ -209,10 +209,12 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
         stages: str | None = None,
         gpu: str | None = None,
         refuses: bool = False,
+        succeeding: bool = True,
     ) -> tuple[int, dict[str, str]]:
         """Runs the phase for the execution `an-execution`, after a script that left `reason`,
         the failed tests `failed`, the instances' last stages `stages` and `gpu` as the reason its
-        GPU tests did not run: its exit, and the objects of the buckets."""
+        GPU tests did not run, in a build CodeBuild says is `succeeding` or not: its exit, and the
+        objects of the buckets."""
         shutil.rmtree(buckets, ignore_errors=True)
         folder = tmp_path / "left"
         folder.mkdir(exist_ok=True)
@@ -224,6 +226,7 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
             "PATH": f"{tools}:/usr/bin:/bin",
             "BUCKETS": str(buckets),
             "REFUSES": "yes" if refuses else "",
+            "CODEBUILD_BUILD_SUCCEEDING": "1" if succeeding else "0",
             reason_file: str(folder / "reason"),
             failed_file: str(folder / "failed"),
             stages_file: str(folder / "stages"),
@@ -249,18 +252,16 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
     assert post_build("listener-off\n") == (0, {"artifacts/verification/an-execution/not-run": "listener-off\n"})
     # The IDs of the tests that failed, as the script left them, beside where the reason goes. The
     # phase is the build's post-build phase, which CodeBuild runs after a build phase that failed.
-    assert post_build(None, failed="hello\nno-key\n") == (
+    assert post_build(None, failed="hello\nno-key\n", succeeding=False) == (
         0,
         {"artifacts/verification/an-execution/failed-smoke-tests": "hello\nno-key\n"},
     )
     # And, after tests that failed, the last stage each instance reached, as the script left them.
-    assert post_build(None, failed="hello\n", stages="weights\nboot\n") == (
-        0,
-        {
-            "artifacts/verification/an-execution/failed-smoke-tests": "hello\n",
-            "artifacts/verification/an-execution/last-stages": "weights\nboot\n",
-        },
-    )
+    failed = {
+        "artifacts/verification/an-execution/failed-smoke-tests": "hello\n",
+        "artifacts/verification/an-execution/last-stages": "weights\nboot\n",
+    }
+    assert post_build(None, failed="hello\n", stages="weights\nboot\n", succeeding=False) == (0, failed)
     # And the reason the GPU tests did not run, to the mark gpu-not-run, which is not the mark of a
     # verification that ran no test. A copy of it that fails fails the build too: such a
     # verification is not taken for one whose GPU tests ran.
@@ -269,6 +270,13 @@ def test_the_post_build_phase_copies_what_the_script_left(verification: Verifica
         {"artifacts/verification/an-execution/gpu-not-run": "no-capacity\n"},
     )
     assert post_build(None, gpu="no-capacity\n", refuses=True)[0] != 0
+    # The mark is read for a success, by the execution's ID, which a retry keeps: the reason a
+    # failing build left, after the mock pool's tests failed say, is not copied, so that the retry
+    # that passes says by itself whether its GPU tests ran. What a failure left still is.
+    assert post_build(None, failed="hello\n", stages="weights\nboot\n", gpu="no-capacity\n", succeeding=False) == (
+        0,
+        failed,
+    )
 
 
 def test_the_inputs_are_outputs_of_the_stage_s_stacks_and_the_execution_s_id(verification: Verification) -> None:

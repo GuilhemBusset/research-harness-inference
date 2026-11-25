@@ -139,9 +139,9 @@ Rules hold those two, and every action:
   tables' `PoolState`, by the name CloudFormation gives it; write, with `dynamodb:PutItem` and no
   other action, the items of that table whose partition key is the mock pool's name, `mock`, for
   the session a job books on that pool (section 12): the statement's condition is
-  `OF_THE_MOCK_POOL`, alone, as on the verification's role, so the role writes no other pool's
-  items, not every item, and no other table; read the spikes' one secret,
-  `rhi/spike-keys`; query the workspace of a stage a pipeline deploys, by the condition on its tag
+  `OF_THE_MOCK_POOL`, alone, in the form the verification's role has for its two pools, so the role
+  writes no other pool's items, the coursework pool's among them, not every item, and no other
+  table; read the spikes' one secret, `rhi/spike-keys`; query the workspace of a stage a pipeline deploys, by the condition on its tag
   alone, as the verification's role does; put events on the measurement bus; use the connection of
   its own template; write to the log group its project names and use the key its project is
   encrypted with. So no action of Auto Scaling, EC2 or IAM, and no other secret. A wildcard
@@ -314,6 +314,9 @@ MOCK_POOL = "mock"
 COURSEWORK_POOL = "coursework"
 BOOKED_POOLS = [MOCK_POOL, COURSEWORK_POOL]
 OF_THE_BOOKED_POOLS = {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": BOOKED_POOLS}}
+# The one condition under which a spike job's role may write items of that table: the same
+# operator on the same key, with the mock pool's name alone.
+OF_THE_MOCK_POOL = {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}}
 VERIFICATION_MAY = {
     "secretsmanager:GetSecretValue": "secret",
     "aps:QueryMetrics": "workspaces",
@@ -1115,6 +1118,19 @@ def of_the_booked_pools(condition: Any) -> bool:
         return False
     pools = as_list(keys["dynamodb:LeadingKeys"])
     return bool(pools) and all(isinstance(pool, str) and pool in BOOKED_POOLS for pool in pools)
+
+
+def of_the_mock_pool(condition: Any) -> bool:
+    """Whether a statement's condition is `OF_THE_MOCK_POOL` and nothing else: that one operator on
+    that one key, with the mock pool's name as its only value."""
+    if not isinstance(condition, dict) or list(condition) != list(OF_THE_MOCK_POOL):
+        return False
+    (keys,) = condition.values()
+    return (
+        isinstance(keys, dict)
+        and list(keys) == ["dynamodb:LeadingKeys"]
+        and as_list(keys["dynamodb:LeadingKeys"]) == [MOCK_POOL]
+    )
 
 
 def holds(template: Mapping[str, Any]) -> list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]]:

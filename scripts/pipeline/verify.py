@@ -56,32 +56,35 @@ the decision did not run, and the script fails before any test.
 release (`docs/design/evidence.md`, E32). So when the wait for a pool of the decision's file ends
 and the pool does not read ready, the script asks whether an instance was launched at all: the
 lifecycle agent writes its instance's heartbeat row from the first stage of a launch, so the script
-queries the pool's instance rows of the table `RHI_VERIFY_HEARTBEATS_TABLE` names for one written
+queries the pool's instance rows of the table `RHI_VERIFY_HEARTBEATS_TABLE` names for those written
 at the booking's time or after it, `written_at`. It reads every page of the answer, with a strongly
-consistent read, so that a row written as the wait ended is seen. A row does not outlast its
-instance by more than an hour, and a wait may be longer: so the script also asks through the wait,
-every `LAUNCH_POLL_SECONDS` while the pool does not read ready, and a launch it saw once stays
-seen. Three cases:
+consistent read, so that a row written as the wait ended is seen. Three cases:
 
 - the pool reads ready: the tests run, and their result stands;
-- the pool does not read ready and no query, through the wait or at its end, found a row written
-  since the booking: no instance was launched. No test runs on that pool, its session is stopped,
-  and that pool adds nothing to the script's exit, which is that of its other runs. When that exit
-  is 0, the mock pool's tests passed, the script leaves the one line `no-capacity` in the file
-  `RHI_VERIFY_GPU_REASON_FILE` names, which the step's post-build phase copies to where the
-  reporter reads that the GPU tests did not run;
+- the pool does not read ready and no instance was launched since the booking. No test runs on
+  that pool, its session is stopped, and that pool adds nothing to the script's exit, which is that
+  of its other runs. Whatever that exit is, the script leaves the one line `no-capacity` in the
+  file `RHI_VERIFY_GPU_REASON_FILE` names;
 - the pool does not read ready and a row was written since the booking: an instance was launched
   and does not serve. The tests run and fail, and the last stages are left, below.
 
-Only the queries' own answers say that no instance was launched. Without the table's name, or when
-one of them could not read the table, the script cannot tell, says so in a line of its own, and
-runs the tests: a launched instance is never reported as a lack of capacity. Without
-`RHI_VERIFY_GPU_REASON_FILE`, the reason cannot be left, and the script fails.
+**What says that no instance was launched.** A row lasts `ROW_LASTS_SECONDS` after its last
+writing, and a wait may be longer. So the script also asks through the wait, every
+`LAUNCH_POLL_SECONDS` while the pool does not read ready, and keeps three things apart
+(`Launches`): a query that found a row, which is a launch, and stays one after the row expired; a
+query that found none, which says that no instance was launched up to its time, when the answer
+before it is recent enough that no row could have come and gone between the two; and a query that
+could not read the table, which says nothing, neither way. No instance was launched only when the
+query at the end of the wait was answered, no query found a row, and the answers left no such gap
+since the booking: with a wait shorter than a row lasts, the last answer alone is enough, whatever
+the queries before it met. Otherwise, without the table's name among it, the script cannot tell,
+says so in a line of its own, and runs the tests: a launched instance is never reported as a lack
+of capacity. Without `RHI_VERIFY_GPU_REASON_FILE`, the reason cannot be left, and the script fails.
 
-The reason is the word of a script that passed, and of no other. The reporter reads it for a
-verification that succeeded, by the execution's ID, which a retry of the stage keeps, and the step
-may not remove what an earlier attempt copied. So a script that fails leaves no reason, whatever
-its pools had: the attempt that then passes says by itself whether its GPU tests ran.
+The reason is left whatever the script's exit: it says what this run did on the pool. Which run's
+word reaches the reporter is the step's affair: its post-build phase copies the file only from a
+build that succeeds (`src/rhi/pipeline/verify.py`), since the reporter reads the mark for a
+verification that succeeded, by the execution's ID, which a retry of the stage keeps.
 
 **When no test runs.** Two states of a correct deployment leave nothing to test: the endpoint has
 no HTTPS listener yet, which its address reading `none` says, or the canary's secret does not
@@ -103,8 +106,10 @@ the table `RHI_VERIFY_HEARTBEATS_TABLE` names, and leaves the last lifecycle sta
 reached as one line of the file `RHI_VERIFY_LAST_STAGES_FILE` names: the row's `stage`, and nothing
 else of a row, neither the instance's ID nor its release. It asks DynamoDB for that one attribute.
 A launch names a stage of `rhi_lifecycle.stages` there, and an instance in service the serving
-module's own name. No row, or no table named, leaves no file, and so does a table that cannot be
-read, after a line in the log: the exit stays the tests'. The post-build phase copies the file to
+module's own name. For a pool that has no row left by then, or when the table cannot be read, which
+is a line in the log, the stages are those the script last saw during its wait for that pool, when
+it saw a launch: a row may expire before a long wait and the tests are over. No stage, or no table
+named, leaves no file: the exit stays the tests'. The post-build phase copies the file to
 where the reporter reads it, and the reporter names only the stages of its own list.
 
 What the step gives, in the environment:
@@ -204,9 +209,10 @@ STAGE_ATTRIBUTE = "stage"
 WRITTEN_AT_ATTRIBUTE = "written_at"
 # At most this many pages of a pool's rows are read for the instances' last stages.
 ROW_PAGES = 10
-# Between two queries for a launch while the script waits for a pool of the decision's file: far
-# less than a row lasts after its last writing (`rhi_common.records.EXPIRY_SECONDS`), so a row
-# written during the wait is seen before it expires.
+# How long a row lasts after its last writing (`rhi_common.records.EXPIRY_SECONDS`), and between
+# two queries for a launch while the script waits for a pool of the decision's file: far less, so
+# a row written during the wait is seen before it expires.
+ROW_LASTS_SECONDS = 3600
 LAUNCH_POLL_SECONDS = 60.0
 
 # What the endpoint's output reads while there is no HTTPS listener (`rhi.gateway.stack`), and the
@@ -292,49 +298,50 @@ def release_parameters(text: str) -> dict[str, str]:
     return dict(pair.split("=", 1) for pair in text.split(","))
 
 
-def last_stages(client: Any, table: str, pools: Iterable[str]) -> list[str]:
-    """The last lifecycle stage each instance of `pools` reached: the `stage` of each instance's row
+def _stage(item: Mapping[str, Any]) -> str | None:
+    """The stage a heartbeat row holds, `None` when it is not one line of text."""
+    stage = item.get(STAGE_ATTRIBUTE, {}).get("S")
+    return stage if isinstance(stage, str) and stage.splitlines() == [stage] else None
+
+
+def last_stages(client: Any, table: str, pool: str) -> list[str]:
+    """The last lifecycle stage each instance of `pool` reached: the `stage` of each instance's row
     of the heartbeats table `table`, read by pool with `client`, a DynamoDB client of the AWS SDK.
     Only that attribute is asked for, and a row whose stage is not one line of text gives none."""
     found: list[str] = []
-    for pool in pools:
-        request: dict[str, Any] = {
-            "TableName": table,
-            "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
-            "ProjectionExpression": "#stage",
-            "ExpressionAttributeNames": {
-                "#pool": POOL_ATTRIBUTE,
-                "#source": SOURCE_ATTRIBUTE,
-                "#stage": STAGE_ATTRIBUTE,
-            },
-            "ExpressionAttributeValues": {":pool": {"S": pool}, ":instance": {"S": INSTANCE_SOURCE}},
-        }
-        for _ in range(ROW_PAGES):
-            answer = client.query(**request)
-            stages = [item.get(STAGE_ATTRIBUTE, {}).get("S") for item in answer.get("Items", [])]
-            found += [stage for stage in stages if isinstance(stage, str) and stage.splitlines() == [stage]]
-            if "LastEvaluatedKey" not in answer:
-                break
-            request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
+    request: dict[str, Any] = {
+        "TableName": table,
+        "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
+        "ProjectionExpression": "#stage",
+        "ExpressionAttributeNames": {"#pool": POOL_ATTRIBUTE, "#source": SOURCE_ATTRIBUTE, "#stage": STAGE_ATTRIBUTE},
+        "ExpressionAttributeValues": {":pool": {"S": pool}, ":instance": {"S": INSTANCE_SOURCE}},
+    }
+    for _ in range(ROW_PAGES):
+        answer = client.query(**request)
+        found += [stage for stage in map(_stage, answer.get("Items", [])) if stage is not None]
+        if "LastEvaluatedKey" not in answer:
+            break
+        request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
     return found
 
 
-def launched_since(client: Any, table: str, pool: str, since: int) -> bool:
-    """Whether an instance of `pool` wrote its heartbeat row at the time `since` or after it, in
-    seconds since the epoch: the pool's instance rows of the heartbeats table `table`, counted with
-    `client`, a DynamoDB client of the AWS SDK, in a strongly consistent read, so that a row
-    written a moment ago is counted. False only once every page of the pool's instance rows was
-    read and none is that recent; an answer without a count reads as a launch."""
+def rows_since(client: Any, table: str, pool: str, since: int) -> list[str | None]:
+    """The instances of `pool` that wrote their heartbeat row at the time `since` or after it, in
+    seconds since the epoch: for each such row of the heartbeats table `table`, its stage, or
+    `None` when it is not one line of text. Read with `client`, a DynamoDB client of the AWS SDK,
+    in a strongly consistent read, so that a row written a moment ago is among them, and every
+    page of the pool's instance rows: an empty answer says that the table holds no such row."""
     request: dict[str, Any] = {
         "TableName": table,
         "ConsistentRead": True,
-        "Select": "COUNT",
         "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
         "FilterExpression": "#written >= :since",
+        "ProjectionExpression": "#stage",
         "ExpressionAttributeNames": {
             "#pool": POOL_ATTRIBUTE,
             "#source": SOURCE_ATTRIBUTE,
             "#written": WRITTEN_AT_ATTRIBUTE,
+            "#stage": STAGE_ATTRIBUTE,
         },
         "ExpressionAttributeValues": {
             ":pool": {"S": pool},
@@ -342,44 +349,48 @@ def launched_since(client: Any, table: str, pool: str, since: int) -> bool:
             ":since": {"N": str(since)},
         },
     }
+    rows: list[str | None] = []
     while True:
         answer = client.query(**request)
-        if answer.get("Count") != 0:
-            return True
+        rows += map(_stage, answer.get("Items", []))
         if "LastEvaluatedKey" not in answer:
-            return False
+            return rows
         request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
-def was_launched(env: Mapping[str, str], pool: str, since: int, client: Any = None) -> bool:
-    """Whether an instance of `pool` was launched since the time `since`, a booking's, as far as
-    the heartbeats table `RHI_VERIFY_HEARTBEATS_TABLE` names tells (`launched_since`). True also
+def launched_rows(env: Mapping[str, str], pool: str, since: int, client: Any = None) -> list[str | None] | None:
+    """The rows of the instances of `pool` launched since the time `since`, a booking's, as the
+    heartbeats table `RHI_VERIFY_HEARTBEATS_TABLE` names holds them now (`rows_since`). `None`
     when the script cannot tell, without the table's name or when the table cannot be read, after
-    a line in the log: only the query's own answer says that no instance was launched."""
+    a line in the log: that is neither a launch nor the lack of one."""
     table = env.get(HEARTBEATS_TABLE_VARIABLE)
     if not table:
         problem = f"{HEARTBEATS_TABLE_VARIABLE} is not set"
         print(f"{NAME}: whether an instance of the pool {pool} was launched is not known: {problem}", file=sys.stderr)
-        return True
+        return None
     try:
         if client is None:
             import boto3
 
             client = boto3.client("dynamodb")
-        return launched_since(client, table, pool, since)
+        return rows_since(client, table, pool, since)
     except (BotoCoreError, ClientError) as error:
         problem = f"its rows were not read ({type(error).__name__})"
         print(f"{NAME}: whether an instance of the pool {pool} was launched is not known: {problem}", file=sys.stderr)
-        return True
+        return None
 
 
-def leave_last_stages(env: Mapping[str, str], pools: Iterable[str], client: Any = None) -> None:
+def leave_last_stages(
+    env: Mapping[str, str], pools: Iterable[str], client: Any = None, seen: Mapping[str, Sequence[str]] | None = None
+) -> None:
     """After a run of the tests that failed: leaves the last stage each instance of `pools` reached,
     one per line and nothing else, in the file `RHI_VERIFY_LAST_STAGES_FILE` names, for the step's
-    post-build phase. Without the table's name, the file's or a row, it leaves no file. A table
-    that cannot be read is a line in the log and no file: the tests' exit is the script's."""
+    post-build phase. `seen` holds, by pool, the stages the script last saw during its wait for the
+    pool: they stand for a pool that has no row now, and for every pool when the table cannot be
+    read, which is a line in the log. Without the table's name, the file's or a stage, it leaves no
+    file: the tests' exit is the script's."""
     table, named = env.get(HEARTBEATS_TABLE_VARIABLE), env.get(LAST_STAGES_FILE_VARIABLE)
-    pools = list(pools)
+    pools, seen = list(pools), seen or {}
     if not table or not named or not pools:
         return
     try:
@@ -387,10 +398,10 @@ def leave_last_stages(env: Mapping[str, str], pools: Iterable[str], client: Any 
             import boto3
 
             client = boto3.client("dynamodb")
-        stages = last_stages(client, table, pools)
+        stages = [stage for pool in pools for stage in last_stages(client, table, pool) or seen.get(pool, ())]
     except (BotoCoreError, ClientError) as error:
         print(f"{NAME}: the instances' last stages were not read ({type(error).__name__})", file=sys.stderr)
-        return
+        stages = [stage for pool in pools for stage in seen.get(pool, ())]
     if not stages:
         return
     path = Path(named)
@@ -560,40 +571,64 @@ def wait_until_ready(
 
 
 class Launches:
-    """Whether an instance of a pool was launched since the time `since`, a booking's, asked of
-    `launched` through the wait for the pool and remembered: a heartbeat row may expire before a
-    long wait ends, and what it said must not. `launched` is given `since`, and says yes also when
-    it cannot tell; `clock` gives the time."""
+    """What the heartbeats table said, through the wait for a pool, of the instances launched since
+    the time `since`, a booking's. `rows` is given `since` and answers with the stage of each row
+    written since then, as the table holds them at that moment, or with `None` when it cannot
+    tell; `clock` gives the time. Three answers are kept apart: a row, which is a launch, and
+    stays one after the row expired; no row, which says that no instance was launched up to then,
+    unless the answer before it is so old that a row may have come and gone between the two; and
+    `None`, which says nothing."""
 
-    def __init__(self, launched: Callable[[int], bool], since: int, clock: Callable[[], float]) -> None:
-        self._launched, self._since, self._clock = launched, since, clock
-        self._seen = False
+    def __init__(self, rows: Callable[[int], list[str | None] | None], since: int, clock: Callable[[], float]) -> None:
+        self._rows, self._since, self._clock = rows, since, clock
+        self._launched = False
+        # The time up to which the answers tell every launch since the booking, while no answer
+        # came too long after the one before it.
+        self._told_until: float = since
+        self._gap = False
         self._asked_at: float | None = None
+        # The stages of the rows of the last answer that held one.
+        self.stages: tuple[str, ...] = ()
+
+    def _ask(self) -> bool:
+        """Asks; whether there was an answer."""
+        now = self._asked_at = self._clock()
+        rows = self._rows(self._since)
+        if rows is None:
+            return False
+        # A row lasts `ROW_LASTS_SECONDS` after its writing, by the instance's clock and the
+        # table's: one poll less is taken, for this clock is not theirs.
+        if now - self._told_until > ROW_LASTS_SECONDS - LAUNCH_POLL_SECONDS:
+            self._gap = True
+        self._told_until = now
+        if rows:
+            self._launched = True
+            self.stages = tuple(stage for stage in rows if stage is not None)
+        return True
 
     def look(self) -> None:
-        """During the wait: asks, unless a launch was seen already or the last asking is less than
-        `LAUNCH_POLL_SECONDS` old."""
-        now = self._clock()
-        if self._seen or (self._asked_at is not None and now - self._asked_at < LAUNCH_POLL_SECONDS):
-            return
-        self._asked_at = now
-        self._seen = self._launched(self._since)
+        """During the wait: asks, unless the last asking is less than `LAUNCH_POLL_SECONDS` old."""
+        if self._asked_at is None or self._clock() - self._asked_at >= LAUNCH_POLL_SECONDS:
+            self._ask()
 
-    def seen(self) -> bool:
-        """Once the wait is over: whether a launch was seen during it, or is seen now."""
-        self._seen = self._seen or self._launched(self._since)
-        return self._seen
+    def none(self) -> bool:
+        """Once the wait is over: asks once more; whether no instance was launched since the
+        booking. True only when that last asking was answered, no answer held a row, and no
+        answer came too long after the one before it."""
+        return self._ask() and not self._launched and not self._gap
 
 
 @dataclass(frozen=True)
 class Outcome:
     """What became of a pool's run of the tests: the run's exit, `None` when no run was made;
-    whether the session was stopped or was not the script's to stop; and whether no run was made
-    because no instance was launched during the wait, and not because the pool was not booked."""
+    whether the session was stopped or was not the script's to stop; whether no run was made
+    because no instance was launched during the wait, and not because the pool was not booked;
+    and the stages the script last saw, during the wait, of the instances launched in it."""
 
     exit_code: int | None
     in_order: bool
     no_capacity: bool = False
+    stages: tuple[str, ...] = ()
 
 
 def run_in_a_session(
@@ -606,17 +641,17 @@ def run_in_a_session(
     status: Callable[[float], str | None],
     sleep: Callable[[float], None],
     clock: Callable[[], float],
-    launched: Callable[[int], bool] | None = None,
+    launched: Callable[[int], list[str | None] | None] | None = None,
 ) -> Outcome:
     """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool and
     stops after the run, whatever its result, or after its wait when no run is made. A pool that
     already has a session is neither booked nor stopped, and the run is made at once. A pool that
     cannot be booked gets no run. `status` reads the pool's state in the seconds it is given. With
-    `launched`, which says whether an instance of the pool was launched since the time it is
-    given: it is asked through the wait, while the pool does not read ready, and once more when the
-    wait ends; when the pool does not read ready by then and `launched` never said that an instance
-    was launched since the booking, no run is made, for lack of capacity. Without it, the run is
-    made when the wait ends."""
+    `launched`, which gives the rows of the instances of the pool launched since the time it is
+    given, or `None` when it cannot tell: it is asked through the wait, while the pool does not
+    read ready, and once more when the wait ends; when the pool does not read ready by then and its
+    answers say that no instance was launched since the booking (`Launches`), no run is made, for
+    lack of capacity. Without it, the run is made when the wait ends."""
     # Here and not at the top: the script's paths that book nothing, and the run of the tests that
     # loads this file as its plugin, need no import path.
     import booking
@@ -663,8 +698,8 @@ def run_in_a_session(
         if wait_until_ready(read, until=until, sleep=sleep, clock=clock):
             print(f"{NAME}: the pool {pool} reads ready")
             exit_code = run()
-        elif launches is not None and not launches.seen():
-            # Only here: every query read every row of the pool and found none since the booking.
+        elif launches is not None and launches.none():
+            # Only here: the table's own answers say that no instance was launched since the booking.
             no_capacity = True
             waited = f"no instance of the pool {pool} was launched in {check.wait_minutes} minutes"
             print(f"{NAME}: {waited}: its tests are not run, for lack of capacity")
@@ -684,7 +719,8 @@ def run_in_a_session(
                 print(f"{NAME}: the session on the pool {pool} no longer reads as the booking: it is left as it is")
             else:
                 print(f"{NAME}: stopped the session it booked on the pool {pool}")
-    return Outcome(exit_code, in_order=stopped, no_capacity=no_capacity)
+    stages = () if launches is None else launches.stages
+    return Outcome(exit_code, in_order=stopped, no_capacity=no_capacity, stages=stages)
 
 
 def main(
@@ -705,8 +741,8 @@ def main(
     build's own credentials and region make it. `run` runs the smoke tests in the environment it is
     given: once on the mock pool, then once on each pool the decision left, each in a session the
     script books and stops. A pool the decision left on which no instance was launched during the
-    wait gets no run, and the exit is that of the other runs: when it is 0, the reason is left for
-    the step's post-build phase. `status` reads the state of the pool it is given in the seconds it
+    wait gets no run, the reason is left for the step's post-build phase, and the exit is that of
+    the other runs. `status` reads the state of the pool it is given in the seconds it
     is given, from the endpoint's `GET /status` when left out; `sleep` waits that many seconds and
     `clock` gives the time, in seconds since the epoch. When a run fails, the last stage each
     instance of the tested pools reached is left for the step's post-build phase."""
@@ -758,16 +794,18 @@ def main(
             status=lambda within: read(pool, within),
             sleep=sleep,
             clock=clock,
-            launched=(lambda since: was_launched(env, pool, since, dynamodb)) if told_of_launches else None,
+            launched=(lambda since: launched_rows(env, pool, since, dynamodb)) if told_of_launches else None,
         )
 
     on_mock = in_a_session(MOCK_POOL, given, told_of_launches=False)
     if on_mock.exit_code is None:
         return 1
     exits, in_order, no_capacity = [on_mock.exit_code], on_mock.in_order, False
+    seen: dict[str, tuple[str, ...]] = {}
     for pool in passes:
         on_pool = in_a_session(pool, {**given, POOL_VARIABLE: pool}, told_of_launches=True)
         in_order = in_order and on_pool.in_order
+        seen[pool] = on_pool.stages
         if on_pool.no_capacity:
             # No instance was launched: the pool adds nothing to the exit.
             no_capacity = True
@@ -776,17 +814,15 @@ def main(
             exits.append(1 if on_pool.exit_code is None else on_pool.exit_code)
     exit_code = next((code for code in exits if code != 0), 0)
     if exit_code != 0:
-        leave_last_stages(env, pools, dynamodb)
+        leave_last_stages(env, pools, dynamodb, seen)
     elif not in_order:
         # A session the script booked and could not stop fails a verification whose tests passed.
         exit_code = 1
-    if not no_capacity:
-        return exit_code
-    if exit_code != 0:
-        # The reason is read for a verification that passed, and a retry would find this one's.
-        print(f"{NAME}: the script fails: it leaves no reason the GPU tests were not run")
-        return exit_code
-    return gpu_not_run(NO_CAPACITY, env)
+    if no_capacity:
+        # Left whatever the exit: a reason that cannot be left fails a script that passed.
+        left = gpu_not_run(NO_CAPACITY, env)
+        exit_code = exit_code or left
+    return exit_code
 
 
 if __name__ == "__main__":
