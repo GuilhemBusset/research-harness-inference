@@ -16,6 +16,7 @@ from rhi_common.engine_metrics import Quantity, metric_names
 from rhi_dashboards import check, objectives, rules
 from rhi_gateway import experience
 from rhi_gateway import metrics as gateway
+from rhi_gateway.errors import WireFormat
 from rhi_scaler import metrics as scaler
 
 SUBQUERY = f"[{rules.SESSION_RANGE}:{rules.SESSION_STEP}]"
@@ -82,7 +83,7 @@ def test_a_pools_objective_is_read_in_that_pools_session_and_the_gateways_in_any
     assert of_pools == {
         "Gateway answers": {rules.ANY_POOL},
         "Time to first token": every,
-        "Output speed per stream": {config.default_pool},
+        "Output speed per stream": {"coursework"},
         "Cached share of input": every,
     }
     for measure in measures:
@@ -173,14 +174,41 @@ def test_first_turns_apart_for_each_pool(example: rhi_config.Config) -> None:
         read = selectors(measure.expression)
         assert set(read) == {f"{experience.FIRST_TOKEN}_bucket", f"{experience.FIRST_TOKEN}_count", rules.SESSION_ACTIVE}
         matchers = read[f"{experience.FIRST_TOKEN}_bucket"][0]
-        # The pool's requests that were not held, under the target's boundary...
+        # The pool's streamed requests, held for their pool or not, under the target's boundary...
         assert re.fullmatch(matchers.pop("le"), "5")
-        assert matchers["start"] == "warm"
+        assert "start" not in matchers
         apart.append((matchers["pool"], matchers["turn"]))
         # ...over all of the same requests, which the panel shows beside it.
         assert read[f"{experience.FIRST_TOKEN}_count"][0] == matchers
         assert selectors(measure.count or "")[f"{experience.FIRST_TOKEN}_count"][0] == matchers
     assert apart == [(pool.name, turn) for pool in example.pools for turn in ("first", "later")]
+
+
+def test_a_stream_held_for_its_pool_counts_in_the_pools_objectives(example: rhi_config.Config) -> None:
+    # The gateway records a first turn that waited for its pool: its first token after 6 seconds,
+    # then 4 tokens a second.
+    registry = CollectorRegistry()
+    made = experience.Experience(registry, clock=iter((0.0, 6.0, 7.0)).__next__)
+    turn = made.request("coursework", WireFormat.MESSAGES, held=True, first_turn=True)
+    turn.token_sent(answer=True)
+    turn.token_sent(answer=True)
+    turn.settled(input_tokens=20, output_tokens=5)
+    served = {sample.name: sample for family in registry.collect() for sample in family.samples}
+    found = by_name(example)
+    # It is among the observations of its pool's first turns, and of both measures of the speed.
+    for family, name, measured in ((experience.FIRST_TOKEN, "Time to first token", 1), (experience.SPEED, "Output speed per stream", 2)):
+        sample = served[f"{family}_count"]
+        assert sample.value == 1 and sample.labels["start"] == "held"
+        counting = [
+            measure.pool
+            for measure in found[name].measures
+            if all(
+                sample.labels[label] == value
+                for matchers in selectors(measure.count or "")[f"{family}_count"]
+                for label, value in matchers.items()
+            )
+        ]
+        assert counting == ["coursework"] * measured
 
 
 def test_the_targets_follow_the_configuration(example: rhi_config.Config) -> None:
@@ -377,19 +405,19 @@ def test_the_gateway_counts_as_its_fault_a_5xx_that_names_no_cause(example: rhi_
 
 
 def test_the_speed_is_measured_on_the_coursework_pool_alone(example: rhi_config.Config) -> None:
-    # The coursework pool is the configuration's default pool (system design, section 4.2).
-    coursework = next(pool for pool in example.pools if pool.name == example.default_pool)
-    assert coursework.name == "coursework" and coursework.engine != "mock"
-    # Another GPU pool has floors of its own: the objective is not measured on it.
-    second = dataclasses.replace(coursework, name="second")
-    config = dataclasses.replace(example, pools=(*example.pools, second))
-    speed = by_name(config)["Output speed per stream"]
-    read = [selectors(query)[f"{experience.SPEED}_count"][0] for query in speed.queries]
-    assert read == [{"pool": "coursework", "start": "warm"}] * 2
-    assert [pool.name for pool in objectives.speed_pools(config)] == ["coursework"]
-    # A mock engine runs no GPU: a configuration whose default pool is the mock has no measure of speed.
-    on_the_mock = dataclasses.replace(example, default_pool="mock")
-    assert by_name(on_the_mock)["Output speed per stream"].measures == ()
+    coursework = next(pool for pool in example.pools if pool.name == "coursework")
+    # Another GPU pool has floors of its own: the objective is not measured on it, and it stays on
+    # the coursework pool when the gateway's default route points at the other.
+    upgrade = dataclasses.replace(coursework, name="upgrade")
+    for default_pool in ("coursework", "upgrade"):
+        config = dataclasses.replace(example, pools=(*example.pools, upgrade), default_pool=default_pool)
+        speed = by_name(config)["Output speed per stream"]
+        assert [measure.pool for measure in speed.measures] == ["coursework"] * 2
+        read = [selectors(query)[f"{experience.SPEED}_count"][0] for query in speed.queries]
+        assert read == [{"pool": "coursework"}] * 2
+    # A configuration with no coursework pool has no measure of speed.
+    without = dataclasses.replace(example, pools=tuple(pool for pool in example.pools if pool.name != "coursework"))
+    assert by_name(without)["Output speed per stream"].measures == ()
 
 
 def test_the_cached_share_counts_every_engine_sample_in_the_session(example: rhi_config.Config) -> None:

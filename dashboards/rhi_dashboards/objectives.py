@@ -6,8 +6,8 @@ dry-run class is judged against them (section 14).
 | Objective | Target | Measured as | From |
 | --- | --- | --- | --- |
 | Gateway answers | At least 99.5%, the design's | The share of requests that are not a 5xx answer of the gateway's own fault | The gateway's requests and its own faults: an answer of 500 or above that names no cause of section 6.2 (`rhi_gateway.metrics`) |
-| Time to first token | The 95th percentile under `target_ttft_p95_seconds` | For each pool, the share of its requests that were not held whose first token came under the target, first turns and later turns apart: at least 95% | The gateway's histogram of what students wait (`rhi_gateway.experience`) |
-| Output speed per stream | On the coursework pool, the median at `target_stream_median_tokens_per_second` or more, the slowest tenth at `target_stream_p10_tokens_per_second` or more | The share of the pool's streams that were not held at each floor or more: above 50%, above 90% | The gateway's histogram of each stream's speed |
+| Time to first token | The 95th percentile under `target_ttft_p95_seconds` | For each pool, the share of its streamed requests whose first token came under the target, first turns and later turns apart: at least 95% | The gateway's histogram of what students wait (`rhi_gateway.experience`) |
+| Output speed per stream | On the coursework pool, the median at `target_stream_median_tokens_per_second` or more, the slowest tenth at `target_stream_p10_tokens_per_second` or more | The share of the pool's streams at each floor or more: above 50%, above 90% | The gateway's histogram of each stream's speed |
 | Cached share of input | Above `cached_share_flag_percent` | For each pool: its engine's cached input tokens over its input tokens | The engine, by the per-engine table |
 
 The provisional targets are the configuration's (`rhi.config.Config`), until spike S5 has measured
@@ -24,9 +24,14 @@ timestamps of both. A share is taken of the sums, never of each step's: the shar
 requests, of the session's streams. So the same query is right for any session, and over a range
 with no session it reads no data.
 
-**The coursework pool** is the configuration's default pool (`default_pool`; section 4.2), and the
-speed objective is measured on it alone: its floors are that pool's. A mock engine runs no GPU, so
-a configuration whose default pool is the mock has no measure of speed.
+**The coursework pool** is the pool of that name (`COURSEWORK`; section 4.2), and the speed
+objective is measured on it alone: its floors are that pool's. It is not the pool the gateway maps
+`claude-*` names to (`default_pool`), which the owner may point at another pool. A configuration
+with no pool of that name has no measure of speed.
+
+**Every stream the gateway recorded in the session counts**, whether its request waited for its
+pool or not: the gateway labels each with `start`, `held` or `warm`, and the objectives select
+neither, so both are summed. Only the turn is told apart, for the time to first token.
 
 **A percentile is judged by a share.** The q-th percentile is the smallest value with at least q
 of the observations at or under it, so it is under a target exactly when at least q of the
@@ -66,7 +71,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
-from rhi_common.engine_metrics import MOCK, Quantity
+from rhi_common.engine_metrics import Quantity
 from rhi_dashboards import rules
 
 if TYPE_CHECKING:
@@ -79,13 +84,15 @@ GATEWAY_EXPERIENCE = "services/gateway/rhi_gateway/experience.py"
 # The gateway's counts of requests, and of its own faults (section 6.2: a 5xx that names no cause).
 REQUESTS = "rhi_gateway_student_requests_total"
 OWN_FAULTS = "rhi_gateway_own_faults_total"
-# The gateway's histograms of what students experience, and the labels that select a request that
-# was not held (`start` reads `warm` for it) and its turn.
+# The gateway's histograms of what students experience, and the label that tells a first turn from
+# a later one.
 FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 SPEED = "rhi_gateway_stream_output_tokens_per_second"
-START, NOT_HELD = "start", "warm"
 TURN, FIRST_TURN, LATER_TURN = "turn", "first", "later"
 BOUNDARY, INFINITY = "le", "+Inf"
+
+# The pool the speed objective is measured on (sections 4.2 and 7.3), by its name.
+COURSEWORK = "coursework"
 
 # The design's fixed target (section 7.3).
 GATEWAY_TARGET = 0.995
@@ -239,19 +246,16 @@ def gateway_answers() -> Objective:
 
 
 def first_token(config: Config) -> Objective:
-    """The 95th percentile of the time to first token of each pool's requests that were not held,
-    first and later turns apart, in the pool's session."""
+    """The 95th percentile of the time to first token of each pool's streamed requests, first and
+    later turns apart, in the pool's session."""
     target, q = config.target_ttft_p95_seconds, 0.95
     measures = []
     for pool in config.pools:
         for turn in (FIRST_TURN, LATER_TURN):
-            matchers = {rules.POOL: pool.name, START: NOT_HELD, TURN: turn}
+            matchers = {rules.POOL: pool.name, TURN: turn}
             count = _count(FIRST_TOKEN, matchers)
             least, most = _under_bounds(FIRST_TOKEN, matchers, target, WAIT_BUCKETS, count)
-            goal = (
-                f"p95 under {target:g} s: at least {q:.0%} of the {turn} turns that were not held"
-                f" with a first token under {target:g} s"
-            )
+            goal = f"p95 under {target:g} s: at least {q:.0%} of the {turn} turns with a first token under {target:g} s"
             measures.append(
                 Measure(
                     f"{pool.name} {turn} turns under {target:g} s",
@@ -271,22 +275,19 @@ def first_token(config: Config) -> Objective:
 
 
 def stream_speed(config: Config) -> Objective:
-    """The median and the slowest tenth of the speed of the coursework pool's streams that were not
-    held, in the pool's session."""
+    """The median and the slowest tenth of the speed of the coursework pool's streams, in the
+    pool's session."""
     measures = []
     for pool in speed_pools(config):
         for q, name, floor in (
             (0.5, "median", config.target_stream_median_tokens_per_second),
             (0.1, "slowest tenth", config.target_stream_p10_tokens_per_second),
         ):
-            matchers = {rules.POOL: pool.name, START: NOT_HELD}
+            matchers = {rules.POOL: pool.name}
             count = _count(SPEED, matchers)
             least, most = _under_bounds(SPEED, matchers, floor, SPEED_BUCKETS, count)
             needed = round(1 - q, 12)
-            goal = (
-                f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of the streams that were not held"
-                f" at {floor:g} or more"
-            )
+            goal = f"{name} at {floor:g} tokens/s or more: above {needed:.0%} of the streams at {floor:g} or more"
             measures.append(
                 Measure(
                     f"{pool.name} {name}, at {floor:g} tokens/s or more",
@@ -306,9 +307,9 @@ def stream_speed(config: Config) -> Objective:
 
 
 def speed_pools(config: Config) -> tuple[Pool, ...]:
-    """The pool the speed objective is measured for: the coursework pool, which is the
-    configuration's default pool (section 4.2), unless its engine is the mock, which runs no GPU."""
-    return tuple(pool for pool in config.pools if pool.name == config.default_pool and pool.engine != MOCK)
+    """The pool the speed objective is measured for: the coursework pool, by its name, wherever
+    the gateway's default route points."""
+    return tuple(pool for pool in config.pools if pool.name == COURSEWORK)
 
 
 def cached_share(config: Config) -> Objective:
