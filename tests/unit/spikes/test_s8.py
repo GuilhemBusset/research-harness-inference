@@ -8,7 +8,10 @@ moto holds the pool-state table in process: no account, no credentials, no netwo
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import io
+import itertools
 import urllib.request
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -1040,6 +1043,63 @@ def test_a_session_someone_else_changed_is_neither_lowered_nor_stopped(
     # The run stopped where it would have lowered the session, which is as the admin wrote it.
     assert len(sent) == 4
     assert theirs and _stored(table) == theirs[0]
+
+
+class _ClosedLog(io.StringIO):
+    """A build log that takes no more lines."""
+
+    def write(self, text: str) -> int:
+        raise BrokenPipeError("the build log is closed")
+
+
+def test_a_log_line_that_fails_once_the_pool_is_booked_still_stops_the_session(
+    monkeypatch: pytest.MonkeyPatch, table: Any
+) -> None:
+    run, sent = _booking_run(monkeypatch, _Following(table, []), _Clock(1000))
+
+    with contextlib.redirect_stdout(_ClosedLog()), pytest.raises(BrokenPipeError):
+        run.in_session(minutes=90, max_instances=2, session_max_hours=HOURS)
+
+    ended = _stored(table)
+    assert sent == [] and ended is not None and ended.set_by == "spike/s8_stickiness"
+    assert not sessions.is_active(ended, 1000, session_max_hours=HOURS)
+
+
+@pytest.mark.parametrize(
+    ("reading", "outcome", "instances"),
+    [
+        # Once the phase before the departure is read: the job would lower a session that has ended.
+        pytest.param(3, s8.Taken, 2, id="before the lowering"),
+        # Once the last requests were answered, while the job reads what they reached.
+        pytest.param(5, Verdict.PASS, 1, id="at the last reading"),
+    ],
+)
+def test_a_session_whose_minutes_ran_out_is_not_lowered_and_keeps_a_run_already_answered(
+    monkeypatch: pytest.MonkeyPatch, table: Any, reading: int, outcome: Verdict | type[Exception], instances: int
+) -> None:
+    clock, readings = _Clock(1000), itertools.count(1)
+    pool = _Following(table, [FIRSTS, {"instance-b": 2}, {"instance-a": 2}, *ON_THE_REMAINING])
+    read = pool.served
+
+    def served(start: float, end: float) -> dict[str, int]:
+        # The session's ten minutes have passed at that reading, and the scaler has not yet acted.
+        if next(readings) == reading:
+            clock.now = 1000 + 10 * 60 + 1
+        return read(start, end)
+
+    monkeypatch.setattr(pool, "served", served)
+    run, _ = _booking_run(monkeypatch, pool, clock)
+
+    if isinstance(outcome, Verdict):
+        assert s8.SPIKE.verdict(run.in_session(minutes=10, max_instances=2, session_max_hours=HOURS)) is outcome
+    else:
+        with pytest.raises(outcome):
+            run.in_session(minutes=10, max_instances=2, session_max_hours=HOURS)
+
+    # The session ended by itself, at the end the job booked: the job's stop found nothing to write.
+    ended = _stored(table)
+    assert ended is not None and (ended.instances, ended.ends_at) == (instances, 1600)
+    assert not sessions.is_active(ended, int(clock.now), session_max_hours=HOURS)
 
 
 def test_the_job_does_not_start_without_the_minutes_of_the_run(monkeypatch: pytest.MonkeyPatch) -> None:

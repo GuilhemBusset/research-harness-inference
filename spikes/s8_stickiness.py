@@ -124,12 +124,23 @@ its numbers with no verdict (`Verdict.NOT_MEASURED`, the state error).
 | `RHI_SPIKE_RUN_MINUTES` | The minutes the job books the pool for, from its start: required, a whole number of one or more |
 | `RHI_SPIKE_POOL` | The pool, `mock` unless given |
 
-The minutes are the whole run's: the session ends by itself once they have passed, and a run it
-ends under is not measured. They cover the waits for the two instances, for the load and for the
-departure (`IN_SERVICE_WAIT_SECONDS`, `LOAD_END_WAIT_SECONDS`, `DEPARTURE_WAIT_SECONDS`) and the
-two phases, and are at most the configuration's `session_max_hours`: a longer booking is refused
-and nothing is written. The job stops its session when it ends, so minutes it does not use cost
-nothing. The instances are the question's two, whatever `RHI_SPIKE_INSTANCES` says.
+The minutes are the whole run's: the session ends by itself once they have passed, so give enough
+for the waits for the two instances, for the load and for the departure (`IN_SERVICE_WAIT_SECONDS`,
+`LOAD_END_WAIT_SECONDS`, `DEPARTURE_WAIT_SECONDS`) and the two phases. They are at most the
+configuration's `session_max_hours`: a longer booking is refused and nothing is written. The job
+stops its session when it ends, so minutes it does not use cost nothing. The instances are the
+question's two, whatever `RHI_SPIKE_INSTANCES` says.
+
+The job does not watch its session's end, and no rule makes a run not measured because the minutes
+ran out: what the run then shows decides, as for any run. A session that has ended when the job
+would lower it is not lowered, and the run stops there (`Taken`). One that ends earlier, or between
+the lowering and the last phase's requests, leaves the pool with no session: the scaler takes its
+instances away, and the run stops on what it then reads of the pool, an instance that left during
+a phase (`Departed`), a wait that ran out, a request that was not answered. Each of these is a run
+not measured. A session that ends once the last requests were answered, while the job reads what
+they reached, changes nothing the run measured: when the remaining instance still reads in service
+at the phase's end, the numbers and their verdict stand. At its end the job finds such a session
+already ended, and has nothing to stop.
 
 The pool's `target_concurrency` and `max_instances` and the bound `session_max_hours` come from the
 deployed configuration (`rhi.config.read_ssm`), and the region from CodeBuild's `AWS_REGION`. The
@@ -629,7 +640,7 @@ def booked(table: Any, pool: str, *, minutes: int, max_instances: int, session_m
     )
     if session is None:
         raise Refused("the pool has a session booked or active: it is left as it is")
-    print(f"booked {INSTANCES} instances on the pool for {minutes} minutes")
+    # Nothing between the write and the return can fail: the caller stops what is returned.
     return Booked(table, session, max_instances, session_max_hours)
 
 
@@ -903,7 +914,9 @@ class Run:
             max_instances=max_instances,
             session_max_hours=session_max_hours,
         )
+        # From the booking on, whatever fails, a line of the log included, stops the session.
         try:
+            print(f"booked {INSTANCES} instances on the pool for {minutes} minutes")
             return self.measure(session)
         finally:
             session.stop()
