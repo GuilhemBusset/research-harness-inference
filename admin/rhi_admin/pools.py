@@ -17,15 +17,20 @@ The commands:
   which the scaler sets after three launches abandoned in a row (section 5.4), and writes who
   cleared it and when beside it; the rest of the scaler's memory is left as it is, and the scaler
   never sets a mark back once it is cleared (`rhi_scaler.aws_io.memory_update`);
-- `run_scaler`: asks the scaler for a run now, and gives each pool's decision.
+- `run_scaler`: asks the scaler for a run now, and gives each pool's decision. A run under way
+  refuses a second one: that refusal is a `ScalerBusy`, which the commands on a pool's session
+  (`rhi_admin.session`) report without failing. A request that Lambda throttles for another
+  reason fails as any other error does.
 
 Each change writes who made it, the caller's identity without its account (`identity_name`), and
 when.
 
-The deployed pools and their configured modes are read from the scaler's function, from the
-settings its construct gave it (`RHI_SCALER_SETTINGS`): that is the configuration the running scaler
+The deployed pools, their configured modes and their `max_instances` are read from the scaler's
+function, from the settings its construct gave it (`RHI_SCALER_SETTINGS`): that is the configuration the running scaler
 and gateway decide from, whereas the configuration's SSM parameters may already hold an edit that
-the next deployment has not yet carried.
+the next deployment has not yet carried. A parked stage keeps the table and holds no scaler
+(section 11.2): no pool is deployed then, `status` has no line, and a command that needs a pool or
+the scaler is refused.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from rhi_admin.roster import AdminError
-from rhi_common.pool_config import PoolConfigError, parse_pools
+from rhi_common.pool_config import Pool, PoolConfigError, parse_pools
 from rhi_common.records import CONFIGURED_MODE, MODE_RECORD, Mode, PoolState, RecordError
 from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD
 
@@ -48,17 +53,30 @@ SCALER_SETTINGS = "RHI_SCALER_SETTINGS"
 # What the memory record holds beside the mark, once the admin has cleared it.
 CLEARED_BY = "cleared_by"
 CLEARED_AT = "cleared_at"
+# What refuses a command that needs a pool or the scaler when the pools stack holds no scaler.
+NO_SCALER = "no pool is deployed: the pools stack holds no scaler, as while the endpoint is parked"
 
 
 @dataclass(frozen=True)
 class Pools:
     """What the commands act on: the pool-state table (a boto3 table resource), a Lambda client, the
-    deployed name of the scaler's function, and the name of whoever runs the command."""
+    deployed name of the scaler's function, and the name of whoever runs the command. `scaler` is
+    `None` when the pools stack holds no scaler, as while the endpoint is parked: no pool is
+    deployed then, and the table is still there."""
 
     table: Any
     functions: Any
-    scaler: str
+    scaler: str | None
     caller: Callable[[], str]
+
+
+# Why Lambda refuses an invocation while the function's reserved concurrency is all in use. Its
+# other reasons for the same error are limits on the rate of requests, not a run under way.
+RUN_UNDER_WAY = "ReservedFunctionConcurrentInvocationLimitExceeded"
+
+
+class ScalerBusy(AdminError):
+    """The scaler was asked for a run while one is under way: its next run is within a minute."""
 
 
 @dataclass(frozen=True)
@@ -80,27 +98,46 @@ def identity_name(arn: str) -> str:
     return parts[5]
 
 
-def configured_modes(pools: Pools) -> dict[str, Mode]:
-    """Every deployed pool and its configured mode, from the settings of the scaler's function.
+def _deployed(pools: Pools) -> tuple[Pool, ...]:
+    """Every deployed pool, from the settings of the scaler's function.
 
     The deployment checked the prices of a pool that wakes on demand against the configuration's
     limit, which the settings do not carry: they are not checked again here, so that the admin can
-    always disable a deployed pool.
+    always disable a deployed pool. With no scaler deployed there is none.
     """
+    if pools.scaler is None:
+        return ()
     configuration = pools.functions.get_function_configuration(FunctionName=pools.scaler)
     text = configuration.get("Environment", {}).get("Variables", {}).get(SCALER_SETTINGS)
     try:
         entries = json.loads(text or "")["pools"]
-        parsed = parse_pools({name: value["entry"] for name, value in entries.items()}, on_demand_price_limit=math.inf)
+        return parse_pools({name: value["entry"] for name, value in entries.items()}, on_demand_price_limit=math.inf)
     except (ValueError, KeyError, TypeError, AttributeError, PoolConfigError):
         raise AdminError("the scaler's function does not hold the pools' settings") from None
-    return {pool.name: CONFIGURED_MODE[pool.wake] for pool in parsed}
+
+
+def configured_modes(pools: Pools) -> dict[str, Mode]:
+    """Every deployed pool and its configured mode, from the settings of the scaler's function."""
+    return {pool.name: CONFIGURED_MODE[pool.wake] for pool in _deployed(pools)}
+
+
+def max_instances(pools: Pools) -> dict[str, int]:
+    """Every deployed pool and its `max_instances`, the most a session may book of it, from the
+    settings of the scaler's function."""
+    return {pool.name: pool.max_instances for pool in _deployed(pools)}
+
+
+def not_deployed(pool: str, pools: Pools) -> AdminError:
+    """The refusal of a command on a pool that is not deployed, which says so when none is."""
+    if pools.scaler is None:
+        return AdminError(NO_SCALER)
+    return AdminError(f"no deployed pool is named {pool!r}")
 
 
 def _configured_mode(pool: str, pools: Pools) -> Mode:
     modes = configured_modes(pools)
     if pool not in modes:
-        raise AdminError(f"no deployed pool is named {pool!r}")
+        raise not_deployed(pool, pools)
     return modes[pool]
 
 
@@ -170,13 +207,18 @@ def clear_suspension(pool: str, *, pools: Pools, now: int) -> str:
 
 def run_scaler(*, pools: Pools) -> list[dict[str, Any]]:
     """One run of the scaler now, and what it decided for each pool: `pool`, `desired`, `reason`."""
+    if pools.scaler is None:
+        raise AdminError(NO_SCALER)
     try:
         answer = pools.functions.invoke(FunctionName=pools.scaler, InvocationType="RequestResponse", Payload=b"{}")
     except ClientError as error:
-        # Its reserved concurrency is 1: a run under way refuses a second one.
-        if error.response.get("Error", {}).get("Code") == "TooManyRequestsException":
-            raise AdminError("the scaler is already running; its next run is within a minute") from None
-        raise
+        if error.response.get("Error", {}).get("Code") != "TooManyRequestsException":
+            raise
+        # Its reserved concurrency is 1: a run under way refuses a second one, and Lambda names that
+        # limit as the reason. Any other reason (the rate of the requests) says nothing of a run.
+        if error.response.get("Reason") == RUN_UNDER_WAY:
+            raise ScalerBusy("the scaler is already running; its next run is within a minute") from None
+        raise AdminError("Lambda throttled the request for a run of the scaler, which did not run for it; its next run is within a minute") from None
     if answer.get("FunctionError"):
         raise AdminError("the scaler's run failed; its log group /rhi/scaler says why")
     return json.loads(answer["Payload"].read())["pools"]
