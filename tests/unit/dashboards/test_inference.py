@@ -85,6 +85,16 @@ def test_each_pool_has_its_row_and_the_engine_queries_follow_the_rules(example: 
         queried = {name for panel in found[one.name].values() for e in series(panel).values() for name in names(e)}
         assert queried & every_engine <= table_names((one.engine,)), one.name
         assert queried & every_engine
+        # A panel that draws a series of the engine or of an instance reads the pool's state
+        # while the pool does not serve: "no session", or "waiting for capacity".
+        states = list(rules.state_queries(one.name).values())
+        kept = rules.serving(one.name, "")[len("(") :]
+        of_instances = [
+            panel for panel in found[one.name].values() if any(e.endswith(kept) for e in series(panel).values())
+        ]
+        assert of_instances
+        for panel in of_instances:
+            assert [e for e in series(panel).values() if e in states] == states, panel["title"]
 
 
 def test_the_coursework_row_holds_every_panel_with_both_sources(example: rhi_config.Config) -> None:
@@ -144,12 +154,12 @@ def test_the_mock_row_draws_nothing_its_engine_leaves_out(example: rhi_config.Co
     assert {legend.split(" {{")[0] for legend in series(row[inference.CACHE])} == {
         "cache use",
         "reported capacity",
-        rules.ASLEEP,
+        *(state.text for state in rules.STATES),
     }
     assert further_names("mock") == {}
     queried = {name for panel in row.values() for e in series(panel).values() for name in names(e)}
     assert not queried & table_names(("vllm",))
-    # The transcript panel keeps the gateway's series alone, with no engine series to read asleep.
+    # The transcript panel keeps the gateway's series alone, with no engine series to read the pool's state for.
     transcript = series(row[inference.TRANSCRIPT])
     assert transcript
     assert all("rhi_gateway_" in expression for expression in transcript.values())
@@ -164,17 +174,20 @@ def test_the_cached_share_is_flagged_below_the_configured_threshold(example: rhi
             assert steps[1]["value"] == pytest.approx(threshold)
             assert defaults["color"]["mode"] == "thresholds"
             assert defaults["custom"]["thresholdsStyle"]["mode"] != "off"
-            # The asleep series is zero: it keeps a colour that is neither the flag's red nor its green.
-            asleep = [
-                {prop["id"]: prop["value"] for prop in override["properties"]}
-                for override in panels[inference.CACHED_SHARE]["fieldConfig"]["overrides"]
-                if override["matcher"] == {"id": "byFrameRefID", "options": rules.ASLEEP_REF}
-            ]
-            colours = {one["color"]["fixedColor"] for one in asleep if "color" in one}
-            colours |= {step["color"] for one in asleep if "thresholds" in one for step in one["thresholds"]["steps"]}
-            assert colours
-            assert not colours & {"red", "green"}
-            assert all(one["color"]["mode"] == "fixed" for one in asleep if "color" in one)
+            # A state's series is zero: each keeps a colour that is neither the flag's red nor its green.
+            for state in rules.STATES:
+                of_state = [
+                    {prop["id"]: prop["value"] for prop in override["properties"]}
+                    for override in panels[inference.CACHED_SHARE]["fieldConfig"]["overrides"]
+                    if override["matcher"] == {"id": "byFrameRefID", "options": state.ref}
+                ]
+                colours = {one["color"]["fixedColor"] for one in of_state if "color" in one}
+                colours |= {
+                    step["color"] for one in of_state if "thresholds" in one for step in one["thresholds"]["steps"]
+                }
+                assert colours
+                assert not colours & {"red", "green"}
+                assert all(one["color"]["mode"] == "fixed" for one in of_state if "color" in one)
 
 
 def lines(panel: dict[str, Any], prefix: str) -> list[str]:
