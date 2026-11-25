@@ -9,13 +9,9 @@ listed, because every stack and every asset a later change adds to the stage bri
 
 - an asset-publishing action: a CodeBuild action whose project does nothing but publish assets
   with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
-  an arm64 emulator and the buildx plugin, each a download from its project's releases on GitHub
-  by its exact version, checked against a checksum before it is extracted or run, the emulator
-  registered under a `binfmt_misc` mount the project keeps and checked registered: the commands of
-  `INSTALLS_THE_IMAGE_BUILDER`, all of them and in their order, in the `commands` of one phase,
-  and no other. It runs, pulls and creates no image, an emulator's or a builder's. It is left out
-  in the asset stage, and so is that stage while it holds nothing else: CDK Pipelines creates it
-  with the first asset;
+  an arm64 emulator and a multi-platform builder, each pinned by its digest or by its version and
+  checksum (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
+  while it holds nothing else: CDK Pipelines creates it with the first asset;
 - a stack's deployment action: a CloudFormation action that prepares or executes a change set, or
   creates and updates a stack.
 
@@ -215,46 +211,24 @@ ASSET_STAGE = "Assets"
 # What a project that only publishes assets runs, as CDK Pipelines writes it.
 PUBLISHES_ASSETS = re.compile(r'cdk-assets --path "[\w./-]+" --verbose publish "[\w:.-]+"')
 INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
-# What a project that publishes images also runs, as `src/rhi/pipeline/stack.py` writes it: an
-# arm64 emulator and the buildx plugin, each a download by its exact version, checked against a
-# checksum (sections 4.2 and 8.2, step 4). The emulator is the two files of one release of the
-# binfmt project, the tool and the emulators of the QEMU version the release is named after: each
-# downloaded, checked and extracted in one folder, then registered by the tool, under the kernel's
-# `binfmt_misc` file system, mounted first when nothing has mounted it and kept for the build, and
-# its entry checked enabled after. Nothing here runs an image or creates a builder: the build is
-# the Docker daemon's own builder's.
-# The commands are allowed as one sequence, whole and in this order, in the `commands` of one
-# phase, and not one by one: a file is extracted, and a tool run, only under the check of its
-# checksum, and a check that fails ends the `commands` of its phase and nothing else.
-# `INSTALLS_THE_IMAGE_BUILDER` matches them joined by a line feed, so that the release and the
-# QEMU version of one line are those of the others.
-EMULATOR = r"/opt/binfmt"
-BINFMT_MISC = r"/proc/sys/fs/binfmt_misc"
-EMULATOR_TOOL = r"binfmt_linux-amd64\.tar\.gz"
-EMULATORS = r"qemu_v(?P=qemu)_linux-amd64\.tar\.gz"
+# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: an
+# arm64 emulator and a builder for either platform, each image by its digest and the builder's
+# download by its version, checked against its checksum (sections 4.2 and 8.2, step 4).
+DIGEST = r"(:[\w.-]+)?@sha256:[0-9a-f]{64}"
 BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
-EMULATOR_RELEASE = r"https://github\.com/tonistiigi/binfmt/releases/download/deploy/v(?P<qemu>\d+\.\d+\.\d+)-\d+"
-BUILDX_RELEASE = r"https://github\.com/docker/buildx/releases/download/v(?P<buildx>\d+\.\d+\.\d+)"
-INSTALLS_THE_IMAGE_BUILDER = re.compile(
-    "\n".join(
-        [
-            rf'curl -fsSL --create-dirs -o "{EMULATOR}/{EMULATOR_TOOL}" (?P<release>{EMULATOR_RELEASE})/{EMULATOR_TOOL}',
-            rf'echo "[0-9a-f]{{64}}  {EMULATOR}/{EMULATOR_TOOL}" \| sha256sum -c -',
-            rf'tar -xzf "{EMULATOR}/{EMULATOR_TOOL}" -C "{EMULATOR}"',
-            rf'curl -fsSL --create-dirs -o "{EMULATOR}/{EMULATORS}" (?P=release)/{EMULATORS}',
-            rf'echo "[0-9a-f]{{64}}  {EMULATOR}/{EMULATORS}" \| sha256sum -c -',
-            rf'tar -xzf "{EMULATOR}/{EMULATORS}" -C "{EMULATOR}"',
-            rf"\[ -e {BINFMT_MISC}/status \] \|\| mount -t binfmt_misc binfmt_misc {BINFMT_MISC}",
-            rf"QEMU_BINARY_PATH={EMULATOR} {EMULATOR}/binfmt --install arm64",
-            rf"grep -qx enabled {BINFMT_MISC}/qemu-aarch64",
-            rf'curl -fsSL --create-dirs -o "{BUILDX}" {BUILDX_RELEASE}/buildx-v(?P=buildx)\.linux-amd64',
-            rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -',
-            rf'chmod \+x "{BUILDX}"',
-        ]
-    )
-)
-# The phases of a build specification, in the order CodeBuild runs them.
-PHASES = ("install", "pre_build", "build", "post_build")
+INSTALLS_THE_IMAGE_BUILDER = [
+    re.compile(rf"docker run --privileged --rm tonistiigi/binfmt{DIGEST} --install arm64"),
+    re.compile(
+        rf'curl -fsSL --create-dirs -o "{BUILDX}" '
+        r"https://github\.com/docker/buildx/releases/download/v(\d+\.\d+\.\d+)/buildx-v\1\.linux-amd64"
+    ),
+    re.compile(rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -'),
+    re.compile(rf'chmod \+x "{BUILDX}"'),
+    re.compile(
+        rf"docker buildx create --name [\w-]+ --driver docker-container --driver-opt image=moby/buildkit{DIGEST}"
+        r" --driver-opt default-load=true --bootstrap --use"
+    ),
+]
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
 # one that failed.
 DEPLOYS = ("CHANGE_SET_REPLACE", "CHANGE_SET_EXECUTE", "CREATE_UPDATE")
@@ -515,48 +489,31 @@ def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any
     return resource.get("Properties", {}).get("Source", {}).get("BuildSpec")
 
 
-def blocks_of(build_spec: Any) -> list[list[str]] | None:
-    """The commands of a build specification written as text, as the blocks CodeBuild runs: the
-    `commands` of each phase, then its `finally`, in the order CodeBuild runs the phases whatever
-    the order they are written in, a phase it does not know last. A command that fails ends its
-    `commands` block, and nothing else: the `finally` of its phase runs after it, and a later
-    phase may. A phase's `commands` block is first of its two, at an even place. None when it is
-    not such a build specification."""
+def commands_of(build_spec: Any) -> list[str] | None:
+    """The commands of a build specification written as text, in every phase. None when it is not
+    such a build specification."""
     try:
         phases = json.loads(build_spec)["phases"]
-        ordered = sorted(phases, key=lambda phase: PHASES.index(phase) if phase in PHASES else len(PHASES))
-        blocks = [list(phases[phase].get(key, [])) for phase in ordered for key in ("commands", "finally")]
+        commands = [
+            command for phase in phases.values() for key in ("commands", "finally") for command in phase.get(key, [])
+        ]
     except (TypeError, ValueError, KeyError, AttributeError):  # Not such a build specification.
         return None
-    return blocks if all(isinstance(command, str) for block in blocks for command in block) else None
-
-
-def commands_of(build_spec: Any) -> list[str] | None:
-    """The commands of a build specification written as text, of every block, in the order
-    CodeBuild runs them. None when it is not such a build specification."""
-    blocks = blocks_of(build_spec)
-    return None if blocks is None else [command for block in blocks for command in block]
+    return commands if all(isinstance(command, str) for command in commands) else None
 
 
 def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
     """Whether an action is a CodeBuild action whose project does nothing but publish assets:
-    its build specification installs `cdk-assets` and publishes with it, and runs nothing else,
-    or nothing else than the whole sequence that installs the pinned emulator and buildx plugin an
-    image is built with, in its order and in the `commands` of one phase: there, and only there,
-    a checksum that does not match ends the sequence before the file is extracted or run."""
-    blocks = blocks_of(build_spec_of(action, template))
-    if blocks is None:
+    every command of its build specification installs `cdk-assets`, publishes with it, or
+    installs the pinned emulator and builder an image is built with."""
+    commands = commands_of(build_spec_of(action, template))
+    if commands is None:
         return False
-    publishes = any(PUBLISHES_ASSETS.fullmatch(command) for block in blocks for command in block)
-    others = [
-        (place, command)
-        for place, block in enumerate(blocks)
-        for command in block
-        if not PUBLISHES_ASSETS.fullmatch(command) and not INSTALLS_THE_PUBLISHER.fullmatch(command)
-    ]
-    in_one_commands_block = len({place for place, _ in others}) == 1 and others[0][0] % 2 == 0
-    installs = INSTALLS_THE_IMAGE_BUILDER.fullmatch("\n".join(command for _, command in others)) is not None
-    return publishes and (not others or (in_one_commands_block and installs))
+    publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
+    installs = [INSTALLS_THE_PUBLISHER, *INSTALLS_THE_IMAGE_BUILDER]
+    return bool(publishing) and all(
+        any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
+    )
 
 
 def deploys_a_stack(action: Mapping[str, Any]) -> bool:
@@ -1784,60 +1741,33 @@ def more_than_publishing(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
     pipeline.stage(ASSET_STAGE).add_action(action)
 
 
-# The emulator and the buildx plugin as a project that publishes images installs them, pinned.
+# The emulator and the builder as a project that publishes images installs them, pinned.
+PINNED = "@sha256:" + "0" * 64
 PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
-EMULATOR_FOLDER = "/opt/binfmt"
-EMULATOR_URL = "https://github.com/tonistiigi/binfmt/releases/download/deploy/v10.2.3-68"
 IMAGE_BUILDER = [
-    *(
-        command
-        for file in ("binfmt_linux-amd64.tar.gz", "qemu_v10.2.3_linux-amd64.tar.gz")
-        for command in (
-            f'curl -fsSL --create-dirs -o "{EMULATOR_FOLDER}/{file}" {EMULATOR_URL}/{file}',
-            f'echo "{"0" * 64}  {EMULATOR_FOLDER}/{file}" | sha256sum -c -',
-            f'tar -xzf "{EMULATOR_FOLDER}/{file}" -C "{EMULATOR_FOLDER}"',
-        )
-    ),
-    "[ -e /proc/sys/fs/binfmt_misc/status ] || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc",
-    f"QEMU_BINARY_PATH={EMULATOR_FOLDER} {EMULATOR_FOLDER}/binfmt --install arm64",
-    "grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-aarch64",
+    f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64",
     (
         f'curl -fsSL --create-dirs -o "{PLUGIN}" '
         "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64"
     ),
     f'echo "{"0" * 64}  {PLUGIN}" | sha256sum -c -',
     f'chmod +x "{PLUGIN}"',
+    (
+        f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image=moby/buildkit{PINNED}"
+        " --driver-opt default-load=true --bootstrap --use"
+    ),
 ]
-# What a project that publishes images installed before, each image pinned by its digest: the
-# emulator from its image, and a builder that ran BuildKit from its image. Both are on Docker Hub.
-PINNED = "@sha256:" + "0" * 64
-RUNS_THE_EMULATOR_IMAGE = f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64"
-CREATES_A_BUILDER = (
-    f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image=moby/buildkit:v0.34.2{PINNED}"
-    " --driver-opt default-load=true --bootstrap --use"
-)
-
-
-# In `IMAGE_BUILDER`, the download of the emulator's tool, the check of its checksum and its
-# extraction, in that order.
-DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL, EXTRACTS_THE_TOOL = IMAGE_BUILDER[:3]
-INSTALLS_CDK_ASSETS = "npm install -g cdk-assets@latest"
 
 
 def a_publisher_that_installs(installs: list[str]) -> Change:
     """Adds to the asset stage a project that installs the publisher and `installs`, then publishes."""
-    return a_publisher_with({"install": [INSTALLS_CDK_ASSETS, *installs], "build": [PUBLISH]})
-
-
-def a_publisher_with(commands: dict[str, list[str]], last: dict[str, list[str]] | None = None) -> Change:
-    """Adds to the asset stage a project whose build specification writes these phases, in this
-    order, each with its commands, and with those of `last` in its `finally` block."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         codebuild = cdk.aws_codebuild
-        phases: dict[str, dict[str, list[str]]] = {phase: {"commands": commands[phase]} for phase in commands}
-        for phase, run_last in (last or {}).items():
-            phases[phase]["finally"] = run_last
+        phases = {
+            "install": {"commands": ["npm install -g cdk-assets@latest", *installs]},
+            "build": {"commands": [PUBLISH]},
+        }
         spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
         project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
         synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
@@ -1868,83 +1798,12 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             id="a project of the asset stage that does more than publish assets",
         ),
         pytest.param(
-            a_publisher_that_installs(
-                [command.replace("download/deploy/v10.2.3-68", "latest/download") for command in IMAGE_BUILDER]
-            ),
+            a_publisher_that_installs([IMAGE_BUILDER[0].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that downloads the emulator release without its exact version",
+            id="a project of the asset stage that installs an emulator without its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([command for command in IMAGE_BUILDER if command != CHECKS_THE_TOOL]),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that extracts the emulator's tool without checking its checksum",
-        ),
-        pytest.param(
-            a_publisher_that_installs(
-                [DOWNLOADS_THE_TOOL, EXTRACTS_THE_TOOL, CHECKS_THE_TOOL, *IMAGE_BUILDER[3:]],
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that extracts the emulator's tool before checking its checksum",
-        ),
-        pytest.param(
-            a_publisher_with(
-                {
-                    "build": [DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL, PUBLISH],
-                    "install": [INSTALLS_CDK_ASSETS, *IMAGE_BUILDER[2:]],
-                }
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that writes the check first, in a phase that runs after the extraction",
-        ),
-        pytest.param(
-            a_publisher_with(
-                {"install": [INSTALLS_CDK_ASSETS, DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL], "build": [PUBLISH]},
-                last={"install": IMAGE_BUILDER[2:]},
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that extracts the emulator's tool in a block a failed check does not end",
-        ),
-        pytest.param(
-            a_publisher_with(
-                {
-                    "build": [INSTALLS_CDK_ASSETS, DOWNLOADS_THE_TOOL, CHECKS_THE_TOOL],
-                    "post_build": [*IMAGE_BUILDER[2:], PUBLISH],
-                }
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that extracts the emulator's tool in a phase a failed check does not end",
-        ),
-        pytest.param(
-            a_publisher_that_installs(
-                [command.replace("qemu_v10.2.3_linux", "qemu_v9.2.2_linux") for command in IMAGE_BUILDER]
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage whose emulators are not those of the release it downloads",
-        ),
-        pytest.param(
-            a_publisher_that_installs(
-                [
-                    command.replace("mount -t binfmt_misc binfmt_misc", "mount -t tmpfs tmpfs")
-                    for command in IMAGE_BUILDER
-                ]
-            ),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that mounts another file system than binfmt_misc",
-        ),
-        pytest.param(
-            a_publisher_that_installs([*IMAGE_BUILDER, RUNS_THE_EMULATOR_IMAGE]),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that runs the emulator image, pinned by digest",
-        ),
-        pytest.param(
-            a_publisher_that_installs([*IMAGE_BUILDER, CREATES_A_BUILDER]),
-            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
-            id="a project of the asset stage that creates a builder from the BuildKit image, pinned by digest",
-        ),
-        pytest.param(
-            a_publisher_that_installs(
-                [command.replace("download/v0.38.2", "latest/download") for command in IMAGE_BUILDER]
-            ),
+            a_publisher_that_installs([IMAGE_BUILDER[1].replace("download/v0.38.2", "latest/download")]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that downloads the builder without its version",
         ),
