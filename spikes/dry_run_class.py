@@ -93,7 +93,7 @@ last stage, for at most `LAUNCH_WAIT_SECONDS` after the hour.
 
 | Variable | What it is |
 | --- | --- |
-| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`s4_weights.gateway_address`) |
+| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`common.gateway_address`) |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_DRY_RUN_CLASS_SIZE` | The class size, in students: the sessions it replays. Required |
 | `RHI_DRY_RUN_SHAPE` | `hands-on` or `several-agents`. Required |
@@ -120,7 +120,6 @@ import httpx
 
 import common
 import loadgen
-import s4_weights
 from rhi import config
 from rhi_common.engine_metrics import Kind, Name, further_names, metric_names
 from rhi_gateway.local import State
@@ -194,7 +193,7 @@ _LAST_STAGE = Stage.HOOK.value
 
 
 class Gateway(Protocol):
-    """What the job asks the gateway: `s4_weights.Gateway`, or a test's."""
+    """What the job asks the gateway: `common.Gateway`, or a test's."""
 
     def state(self) -> str:
         """The pool's state as the status gives it; empty when it could not be read."""
@@ -645,7 +644,7 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
         if len(pools) != 1:
             recorder.line("refused", reason="no_coursework_pool")
             return 1
-        endpoint = s4_weights.gateway_address(environ[ENDPOINT_VARIABLE])
+        endpoint = common.gateway_address(environ[ENDPOINT_VARIABLE])
         step = "clients"
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
@@ -660,7 +659,7 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
             shape=shape,
             keys=keys,
             endpoint=endpoint,
-            gateway=s4_weights.Gateway(endpoint, POOL, keys[0]),
+            gateway=common.Gateway(endpoint, POOL, keys[0]),
             workspace=workspace,
             recorder=recorder,
             clock=clock,

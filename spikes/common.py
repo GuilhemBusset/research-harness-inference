@@ -19,6 +19,11 @@ its samples.
 **The canary students.** `canary_keys` reads their keys from the spikes' secret
 (`rhi_common.spike_keys`), one key for each student.
 
+**The gateway.** `Gateway` asks the gateway about one pool as a canary student: the pool's state in
+the status, and a wake. `gateway_address` makes its address from the gateway stack's output. The
+canary key goes to the gateway over HTTPS only: an address of any other scheme is refused before
+anything is sent, and the key is sent with no redirect the gateway answers.
+
 **Posting.** A job cannot post a commit status. `run_spike` hands one run's numbers to the reporter
 as the measurement event of `rhi_reporter.measure`, on the bus the variable `RHI_MEASUREMENT_BUS`
 names, for the commit CodeBuild gives in `CODEBUILD_RESOLVED_SOURCE_VERSION`. A spike declares
@@ -42,8 +47,9 @@ import math
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
@@ -65,6 +71,8 @@ RUN_LABEL_VARIABLE = "RHI_RUN_LABEL"
 SIGNING_SERVICE = "aps"
 # How long one read of the workspace may take.
 QUERY_TIMEOUT_SECONDS = 30
+# Seconds: how long one answer of the gateway, its status or a wake, may take.
+STATUS_TIMEOUT = 30
 
 _RUN_LABEL = re.compile(r"[a-z0-9-]+")
 
@@ -197,6 +205,55 @@ def canary_keys(secrets: Any = None) -> spike_keys.SpikeKeys:
     """The canary students' keys, from the spikes' secret. `secrets` is a Secrets Manager client of
     the AWS SDK; without it, one made with the job's own credentials."""
     return spike_keys.read(boto3.client("secretsmanager") if secrets is None else secrets)
+
+
+# The gateway.
+
+
+def gateway_address(endpoint: str) -> str:
+    """The gateway's HTTPS address from `endpoint`: the gateway stack's output, a host name, or an
+    `https://` address. ValueError for any other: the canary key is sent over HTTPS only."""
+    address = endpoint.strip()
+    if "://" not in address:
+        address = f"https://{address}"
+    parts = urllib.parse.urlsplit(address)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("the gateway's address is not a host name or an https address")
+    return address.rstrip("/")
+
+
+@dataclass(frozen=True)
+class Gateway:
+    """The gateway at `endpoint` (`gateway_address`), asked about the pool `pool` as the canary
+    student of `key`."""
+
+    endpoint: str
+    pool: str
+    key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "endpoint", gateway_address(self.endpoint))
+
+    def _ask(self, method: str, path: str, body: bytes | None = None) -> Any:
+        headers = {"Content-Type": "application/json"}
+        request = urllib.request.Request(self.endpoint + path, data=body, headers=headers, method=method)
+        # Sent with this request only: urllib does not copy it onto a redirect, so the key never
+        # follows the gateway's answer to another address, of any scheme.
+        request.add_unredirected_header("Authorization", f"Bearer {self.key}")
+        with urllib.request.urlopen(request, timeout=STATUS_TIMEOUT) as answer:
+            return json.loads(answer.read())
+
+    def state(self) -> str:
+        """The pool's state as the status gives it; empty when the status could not be read."""
+        try:
+            pools = self._ask("GET", "/status")["pools"]
+            return next(str(record["state"]) for record in pools if record["model"] == self.pool)
+        except (OSError, ValueError, KeyError, TypeError, StopIteration):
+            return ""
+
+    def wake(self) -> None:
+        """Wakes the pool, as a student's `rhi wait` does."""
+        self._ask("POST", "/wake", json.dumps({"model": self.pool}).encode())
 
 
 # Posting.

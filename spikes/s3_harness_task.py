@@ -32,7 +32,7 @@ endpoint's `/v1`, the model's name and the key. The key reaches each only throug
 `KEY_VARIABLE`, which its configuration names (`{env:…}` for OpenCode, `$…` for Pi): no file of
 their homes holds it.
 
-Each runs in a home of its own, through a forwarder of its own (`s2_client_hold.Forwarder`), which
+Each runs in a home of its own, through a forwarder of its own (`forwarder.Forwarder`), which
 sends every request on to the gateway with the pool's name as its model, so that every request,
 whatever name the harness asks for, reaches the named pool, and records each exchange.
 
@@ -66,7 +66,7 @@ title for the session, a request that carries the prompt and declares no tool: f
 a turn is a request that declares tools.
 
 **A refused request** is one the forwarder saw answered with a status other than 200, or with a
-stream that an error event ended (`s2_client_hold.refused`): the gateway answers a held stream 200
+stream that an error event ended (`forwarder.refused`): the gateway answers a held stream 200
 at once, and the engine may refuse it afterwards. A request that got no answer at all is not one:
 nothing shows that either refused it. Its cause is what the error names, when that is a name.
 
@@ -158,10 +158,9 @@ import openai
 from openai.types.chat import ChatCompletionMessageFunctionToolCall
 
 import common
+import forwarder
 import harnesses
 import loadgen
-import s2_client_hold as s2
-import s4_weights
 import s5_capacity as s5
 from rhi import config
 from rhi_cli import harness as login_files
@@ -339,12 +338,12 @@ VERSION_OF = {
     Harness.OPENCODE: harnesses.OPENCODE.name,
     Harness.PI: harnesses.PI.name,
 }
-# The home `rhi login` writes for each harness it sets up (`s2_client_hold.write_home`); OpenCode
+# The home `rhi login` writes for each harness it sets up (`forwarder.write_home`); OpenCode
 # and Pi have none: the job writes their configuration (`opencode_config`, `pi_models`).
 HOME_OF = {
-    Harness.CLAUDE_CODE: s2.Client.CLAUDE_CODE,
-    Harness.CODEX: s2.Client.CODEX_PROFILE,
-    Harness.SDK_SCRIPT: s2.Client.OPENAI_SDK,
+    Harness.CLAUDE_CODE: forwarder.Client.CLAUDE_CODE,
+    Harness.CODEX: forwarder.Client.CODEX_PROFILE,
+    Harness.SDK_SCRIPT: forwarder.Client.OPENAI_SDK,
 }
 
 
@@ -609,7 +608,7 @@ class Session:
     started_at: float
     ended_at: float
     ran: Ran
-    exchanges: list[s2.Exchange]
+    exchanges: list[forwarder.Exchange]
 
     def events(self) -> list[tuple[float, dict[str, Any]]]:
         """The lines of the output that are JSON objects, with the time each arrived: Claude Code's events."""
@@ -629,7 +628,7 @@ class Session:
         return results[-1] if results else {}
 
 
-def carries(exchange: s2.Exchange, marker: str) -> bool:
+def carries(exchange: forwarder.Exchange, marker: str) -> bool:
     return marker.encode() in exchange.body
 
 
@@ -684,7 +683,7 @@ def refusals_of(session: Session) -> list[dict[str, Any]]:
     """Each request of the run the gateway or the engine refused, whatever its kind, as its line's fields."""
     found = []
     for exchange in session.exchanges:
-        if exchange.status is None or not s2.refused(exchange):
+        if exchange.status is None or not forwarder.refused(exchange):
             continue
         body = exchange.json() or {}
         found.append(
@@ -706,7 +705,7 @@ def _blocks(content: object) -> list[dict[str, Any]]:
     return [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
 
 
-def image_in_tool_result(exchange: s2.Exchange) -> bool:
+def image_in_tool_result(exchange: forwarder.Exchange) -> bool:
     """Whether a Messages request carries an image inside a tool result."""
     messages = (exchange.json() or {}).get("messages")
     for message in messages if isinstance(messages, list) else []:
@@ -718,9 +717,9 @@ def image_in_tool_result(exchange: s2.Exchange) -> bool:
     return False
 
 
-def accepted(exchange: s2.Exchange) -> bool:
+def accepted(exchange: forwarder.Exchange) -> bool:
     """Whether the request was answered whole, with no refusal."""
-    return exchange.status == 200 and exchange.completed and not s2.refused(exchange)
+    return exchange.status == 200 and exchange.completed and not forwarder.refused(exchange)
 
 
 def colours_named(answer: object) -> set[str]:
@@ -815,7 +814,7 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
         after = next_turn_completed(events[index + 1 :])
     trigger = metadata.get("trigger")
     answer = session.result().get("result")
-    refused = [one for one in session.exchanges if main_turn(one) and s2.refused(one)]
+    refused = [one for one in session.exchanges if main_turn(one) and forwarder.refused(one)]
     window_refusals = len(window_refusals_of(session))
     undetermined = len(window_refusals_of(session, _refused_undetermined))
     return {
@@ -842,8 +841,8 @@ def compaction_of(session: Session, word: str) -> dict[str, Any]:
 
 
 def window_refusals_of(
-    session: Session, kind: Callable[[s2.Exchange], bool] | None = None
-) -> list[s2.Exchange]:
+    session: Session, kind: Callable[[forwarder.Exchange], bool] | None = None
+) -> list[forwarder.Exchange]:
     """The turns of the main loop refused as longer than the model's context (or, given `kind`, refused
     as it decides), each larger than every turn accepted before it: what a session refused at its
     window looks like. A refusal on the first turn, or of a kind no length causes (a budget, a limit,
@@ -852,36 +851,36 @@ def window_refusals_of(
     for one in session.exchanges:
         if not main_turn(one):
             continue
-        if not s2.refused(one):
+        if not forwarder.refused(one):
             largest = max(largest or 0, len(one.body))
         elif largest is not None and len(one.body) > largest and (kind or _refused_as_too_long)(one):
             found.append(one)
     return found
 
 
-def main_turn(exchange: s2.Exchange) -> bool:
+def main_turn(exchange: forwarder.Exchange) -> bool:
     """Whether a request is a turn of the main loop: a Messages request that declares tools, never
     a token count or a side query."""
     return exchange.route == MESSAGES_ROUTE and bool((exchange.json() or {}).get("tools"))
 
 
-def _refused_as_too_long(exchange: s2.Exchange) -> bool:
+def _refused_as_too_long(exchange: forwarder.Exchange) -> bool:
     return exchange.cause in LENGTH_CAUSES
 
 
-def _refused_undetermined(exchange: s2.Exchange) -> bool:
+def _refused_undetermined(exchange: forwarder.Exchange) -> bool:
     if exchange.cause is not None:
         return exchange.cause in UNDETERMINED_CAUSES
     return exchange.status in UNDETERMINED_STATUSES
 
 
-def recorded_session(exchanges: Sequence[s2.Exchange]) -> loadgen.RecordedSession:
+def recorded_session(exchanges: Sequence[forwarder.Exchange]) -> loadgen.RecordedSession:
     """The Claude Code session as it was sent: every Messages request answered, side queries and token
     counts included, in order, each with the pause from the end of the one before."""
     kept = [
         one
         for one in exchanges
-        if one.method == "POST" and one.route in REPLAYED_ROUTES and one.status == 200 and not s2.refused(one)
+        if one.method == "POST" and one.route in REPLAYED_ROUTES and one.status == 200 and not forwarder.refused(one)
     ]
     found, before = [], None
     for one in kept:
@@ -1084,14 +1083,14 @@ class Job:
         """Runs `harness` once on `folder` with `prompt`, through a forwarder of its own."""
         home = Path(tempfile.mkdtemp(prefix=f"{harness}-{step}-", dir=self.work))
         key = self.key_of(harness)
-        with s2.Forwarder(self.endpoint, self.pool, self.wall) as forwarder:
+        with forwarder.Forwarder(self.endpoint, self.pool, self.wall) as own:
             if harness in HOME_OF:
-                s2.write_home(home, HOME_OF[harness], forwarder.url, self.pool, key)
+                forwarder.write_home(home, HOME_OF[harness], own.url, self.pool, key)
             command = command_of(
                 harness,
                 home=home,
                 folder=folder,
-                endpoint=forwarder.url,
+                endpoint=own.url,
                 model=self.pool,
                 key=key,
                 prompt=prompt,
@@ -1100,7 +1099,7 @@ class Job:
             started = self.wall()
             ran = self.launch(command)
             ended = self.wall()
-            exchanges = forwarder.recorded()
+            exchanges = own.recorded()
         return Session(harness, step, started, ended, ran, exchanges)
 
     def _refusals(self, session: Session) -> None:
@@ -1362,7 +1361,7 @@ def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = p
 
 def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
     """The job, from its environment and credentials; 1 when a step failed."""
-    endpoint = s4_weights.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
+    endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
     pools = [pool for pool in config.read_ssm().pools if pool.name == name]
     if len(pools) != 1:
@@ -1378,7 +1377,7 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
             engine=pool.engine,
             endpoint=endpoint,
             keys=keys.students,
-            gateway=s4_weights.Gateway(endpoint, name, keys.students[0]),
+            gateway=common.Gateway(endpoint, name, keys.students[0]),
             workspace=workspace,
             lines=lines,
             work=Path(work),

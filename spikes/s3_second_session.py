@@ -84,10 +84,9 @@ from urllib.parse import urlsplit, urlunsplit
 import boto3
 
 import common
+import forwarder
 import harnesses
-import s2_client_hold as s2
 import s3_harness_task as s3
-import s4_weights
 import s5_capacity as s5
 from rhi import config
 
@@ -196,7 +195,7 @@ class Turn:
     started_at: float
     ended_at: float
     ran: s3.Ran
-    exchanges: list[s2.Exchange]
+    exchanges: list[forwarder.Exchange]
     launch_error: str | None = None
 
     def events(self) -> list[dict[str, Any]]:
@@ -300,17 +299,17 @@ def refused_requests(turn: Turn) -> list[dict[str, Any]]:
             "cause": s3.safe_cause(one.cause),
         }
         for one in turn.exchanges
-        if one.status is not None and s2.refused(one)
+        if one.status is not None and forwarder.refused(one)
     ]
 
 
-def declares(exchange: s2.Exchange, tool: str) -> bool:
+def declares(exchange: forwarder.Exchange, tool: str) -> bool:
     tools = (exchange.json() or {}).get("tools")
     held = tools if isinstance(tools, list) else []
     return any(isinstance(one, dict) and one.get("name") == tool for one in held)
 
 
-def carries_document(exchange: s2.Exchange) -> bool:
+def carries_document(exchange: forwarder.Exchange) -> bool:
     """Whether a Messages request carries a document block, which is how Claude Code sends a PDF."""
     messages = (exchange.json() or {}).get("messages")
     for message in messages if isinstance(messages, list) else []:
@@ -477,7 +476,7 @@ class Job:
         self.binaries: Mapping[str, Path] = {}
         self.versions: Mapping[str, str] = {}
         self.session: str | None = None
-        self.forwarder: s2.Forwarder | None = None
+        self.forwarder: forwarder.Forwarder | None = None
         self.failures = 0
 
     def _marker(self) -> str:
@@ -645,9 +644,9 @@ class Job:
             Step.AGENTS: self.agents,
             Step.SEARCH: self.search,
         }
-        with s2.Forwarder(self.endpoint, self.pool, self.wall) as forwarder:
-            self.forwarder = forwarder
-            s2.write_home(self.home, s2.Client.CLAUDE_CODE, forwarder.url, self.pool, self.key)
+        with forwarder.Forwarder(self.endpoint, self.pool, self.wall) as own:
+            self.forwarder = own
+            forwarder.write_home(self.home, forwarder.Client.CLAUDE_CODE, own.url, self.pool, self.key)
             for step in Step:
                 self._step(step, actions[step])
         return self.failures
@@ -666,7 +665,7 @@ def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = p
 
 def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
     """The job, from its environment and credentials; 1 when a step failed."""
-    endpoint = s4_weights.gateway_address(environ.get(s3.ENDPOINT_VARIABLE, ""))
+    endpoint = common.gateway_address(environ.get(s3.ENDPOINT_VARIABLE, ""))
     name = environ.get(s3.POOL_VARIABLE, s3.DEFAULT_POOL)
     pools = [pool for pool in config.read_ssm().pools if pool.name == name]
     if len(pools) != 1:
@@ -684,7 +683,7 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
             engine=pool.engine,
             endpoint=endpoint,
             key=key,
-            gateway=s4_weights.Gateway(endpoint, name, key),
+            gateway=common.Gateway(endpoint, name, key),
             workspace=workspace,
             lines=lines,
             work=Path(work),
