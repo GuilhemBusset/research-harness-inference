@@ -14,7 +14,7 @@ rules of `rhi_common.sessions`, the same for every writer:
 - `supply`, the lines of `session status`: for each deployed pool, its session if one is
   booked or active, and what the scaler wrote in its note (`rhi_common.records.ScalerNote`): the
   instances requested, asked of AWS, waiting and since when, starting and in service, and why the
-  last launch failed.
+  last launch failed. It reads those two items by their keys, and no other item of the pool.
 
 A refusal of those rules (`rhi_common.sessions.SessionError`) is the command's, with its reason.
 A write holds only if the item still reads what the command read, no item or the same instances,
@@ -306,19 +306,18 @@ def supply(sessions: Sessions, *, now: int) -> list[Supply]:
     """Every deployed pool, by name: its session and what the scaler's note says of its instances."""
     found = []
     for pool in sorted(admin_pools.max_instances(sessions.pools)):
-        answer = sessions.pools.table.query(
-            KeyConditionExpression="#pool = :pool",
-            ExpressionAttributeNames={"#pool": "pool"},
-            ExpressionAttributeValues={":pool": pool},
-            ConsistentRead=True,
-        )
-        records = {item.get("record"): item for item in answer.get("Items", [])}
-        session = _session(records.get(SESSION_RECORD), pool)
+        # The two items the status shows, each by its key: no other item of the pool is read, a
+        # record of a retired kind that an earlier release left in the table among them.
+        records = {
+            record: sessions.pools.table.get_item(Key={"pool": pool, "record": record}, ConsistentRead=True).get("Item")
+            for record in (SESSION_RECORD, NOTE_RECORD)
+        }
+        session = _session(records[SESSION_RECORD], pool)
         if session is not None:
             end = rules.end(session, session_max_hours=sessions.session_max_hours)
             session = dataclasses.replace(session, ends_at=end) if now < end else None
         note = ScalerNote(pool=pool, capacity_asked=0, no_capacity_at=None, written_at=0)
-        if NOTE_RECORD in records:
+        if records[NOTE_RECORD] is not None:
             try:
                 note = ScalerNote.from_item(records[NOTE_RECORD])
             except RecordError as error:

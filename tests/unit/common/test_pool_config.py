@@ -8,8 +8,7 @@ from collections.abc import Mapping
 import pytest
 
 from rhi.config import deployed_entry, pool_entry
-from rhi_common.pool_config import HistogramBuckets, PoolConfigError, parse_pools
-from rhi_common.records import SESSION_PARTITION
+from rhi_common.pool_config import FIELDS, RETIRED_FIELDS, HistogramBuckets, PoolConfigError, parse_pools
 
 # A commit hash made when the test runs: 40 hexadecimal characters that name no real commit.
 REVISION = hashlib.sha1(b"a pinned commit", usedforsecurity=False).hexdigest()
@@ -24,11 +23,7 @@ COURSEWORK = {
     "instance_types": ["g7e.2xlarge"],
     "prices": {"g7e.2xlarge": 3.36},
     "max_instances": 2,
-    "warm_instances": 2,
-    "wake": "on-demand",
     "target_concurrency": 8,
-    "hold_seconds": 420,
-    "idle_minutes": 20,
     "drain_seconds": 300,
     "context_length": 262144,
     "largest_output": 32000,
@@ -38,8 +33,6 @@ MOCK = {
     "instance_types": ["t4g.small"],
     "prices": {"t4g.small": 0.0168},
     "max_instances": 1,
-    "warm_instances": 0,
-    "wake": "scheduled-only",
     "target_concurrency": 64,
     "context_length": 8192,
     "largest_output": 1024,
@@ -56,43 +49,56 @@ def test_coursework_entry_parses_to_section_4_2() -> None:
     assert pool.name == "coursework"
     assert (pool.engine, pool.model, pool.revision) == ("vllm", "Qwen/Qwen3.8-27B-FP8", REVISION)
     assert pool.instance_types == ("g7e.2xlarge",)
-    assert (pool.max_instances, pool.warm_instances, pool.wake) == (2, 2, "on-demand")
-    assert pool.target_concurrency == 8
-    assert (pool.hold_seconds, pool.idle_minutes, pool.drain_seconds) == (420, 20, 300)
+    assert (pool.max_instances, pool.target_concurrency, pool.drain_seconds) == (2, 8, 300)
     assert (pool.context_length, pool.largest_output) == (262144, 32000)
 
 
-def test_the_retired_gpu_hours_per_day_is_read_into_nothing() -> None:
-    # An entry written before the field was removed loads to the same pool as one without it.
-    (without,) = parse_pools({"coursework": COURSEWORK})
-    for value in (16, 0):
-        (with_hours,) = parse_pools({"coursework": changed(COURSEWORK, {"gpu_hours_per_day": value})})
-        assert with_hours == without
-    assert not hasattr(without, "gpu_hours_per_day")
-    assert "gpu_hours_per_day" not in pool_entry(without)
+# Every retired field, with a value an entry written before its removal may hold: the fields that
+# served scaling by load, and the GPU hours of ADR 0003.
+RETIRED = {
+    "wake": "scheduled-only",
+    "warm_instances": 2,
+    "hold_seconds": 600,
+    "hold_seconds_non_streaming": 120,
+    "idle_minutes": 5,
+    "start_delay_seconds": 400,
+    "gpu_hours_per_day": 16,
+}
+
+
+def test_an_entry_that_gives_every_retired_field_loads_and_the_pool_has_none_of_them() -> None:
+    assert set(RETIRED) == RETIRED_FIELDS
+    assert not RETIRED_FIELDS & FIELDS
+    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK)):
+        (without,) = parse_pools({name: entry})
+        # An entry written before the fields were removed loads to the same pool as one without them.
+        assert parse_pools({name: entry | RETIRED}) == (without,)
+        # The least each may be, and the other word of `wake`.
+        least = {"wake": "on-demand", "hold_seconds": 1, "hold_seconds_non_streaming": 1}
+        assert parse_pools({name: entry | dict.fromkeys(RETIRED, 0) | least}) == (without,)
+        for field, value in RETIRED.items():
+            # One alone, too: none needs another.
+            assert parse_pools({name: entry | {field: value}}) == (without,)
+            assert not hasattr(without, field)
+        # The entry the deployment writes for the gateway and the scaler holds none.
+        assert not RETIRED_FIELDS & pool_entry(without).keys()
 
 
 def test_defaults_of_section_17() -> None:
-    # Given other values, the three fields are read as given: 420, 20 and 300 are defaults.
-    given = changed(COURSEWORK, {"hold_seconds": 600, "idle_minutes": 5, "drain_seconds": 0})
-    (pool,) = parse_pools({"coursework": given})
-    assert (pool.hold_seconds, pool.idle_minutes, pool.drain_seconds) == (600, 5, 0)
-
-    left_out = changed(COURSEWORK, {"hold_seconds": ABSENT, "idle_minutes": ABSENT, "drain_seconds": ABSENT})
-    (pool,) = parse_pools({"coursework": left_out})
-    assert (pool.hold_seconds, pool.idle_minutes, pool.drain_seconds) == (420, 20, 300)
-    assert pool.hold_seconds_non_streaming == 240
+    # Given another value, the drain is read as given: 300 is a default.
+    (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"drain_seconds": 0})})
+    assert pool.drain_seconds == 0
+    (pool,) = parse_pools({"coursework": changed(COURSEWORK, {"drain_seconds": ABSENT})})
+    assert pool.drain_seconds == 300
 
 
 def test_optional_fields() -> None:
     measured = changed(MOCK, {"measured_start_seconds": 95})
-    mock, second = parse_pools({"mock": changed(MOCK, {"hold_seconds_non_streaming": 120}), "mock-2": measured})
+    mock, second = parse_pools({"mock": MOCK, "mock-2": measured})
     assert (mock.name, mock.engine, second.name) == ("mock", "mock", "mock-2")
     assert (mock.model, mock.revision, mock.measured_start_seconds) == (None,) * 3
-    assert mock.hold_seconds_non_streaming == 120
     assert (mock.context_length, mock.largest_output) == (8192, 1024)
     assert second.measured_start_seconds == 95
-    assert second.hold_seconds_non_streaming == 240
 
 
 @pytest.mark.parametrize(
@@ -103,28 +109,34 @@ def test_optional_fields() -> None:
         pytest.param("Coursework", {}, "name", id="name-with-an-upper-case-letter"),
         pytest.param("course_work", {}, "name", id="name-with-an-underscore"),
         pytest.param("", {}, "name", id="name-empty"),
-        pytest.param("coursework", {"warm_instances": 3}, "warm_instances", id="warm-above-max"),
-        pytest.param("coursework", {"warm_instances": -1}, "warm_instances", id="warm-below-0"),
         pytest.param("coursework", {"prewarm_minutes": 60}, "prewarm_minutes", id="unknown-field"),
         pytest.param("coursework", {"revision": "main"}, "revision", id="revision-main"),
         pytest.param("coursework", {"revision": "g" * 40}, "revision", id="revision-not-hexadecimal"),
         pytest.param("coursework", {"revision": REVISION[:39]}, "revision", id="revision-39-characters"),
         pytest.param("coursework", {"revision": ABSENT}, "revision", id="vllm-without-revision"),
         pytest.param("coursework", {"model": ABSENT}, "model", id="vllm-without-model"),
-        # The retired field is still checked: a whole number not below 0, and nothing else.
+        # A retired field is still held to the type it had, and refused by its name: a whole number
+        # not below its least, and nothing else; for `wake`, one of its two words.
         *(
-            pytest.param("coursework", {"gpu_hours_per_day": value}, "gpu_hours_per_day", id=f"gpu-hours-{value}")
-            for value in (-1, 16.5, True, "16")
+            pytest.param("coursework", {field: value}, field, id=f"retired-{field}-{value!r}")
+            for field, least in (
+                ("gpu_hours_per_day", 0),
+                ("warm_instances", 0),
+                ("idle_minutes", 0),
+                ("start_delay_seconds", 0),
+                ("hold_seconds", 1),
+                ("hold_seconds_non_streaming", 1),
+            )
+            for value in (least - 1, 16.5, True, "16", None, [16])
         ),
-        pytest.param("coursework", {"wake": "always"}, "wake", id="wake-unknown"),
-        pytest.param("coursework", {"max_instances": 0, "warm_instances": 0}, "max_instances", id="max-below-1"),
+        *(
+            pytest.param("coursework", {"wake": value}, "wake", id=f"retired-wake-{value!r}")
+            for value in ("always", "", 1, True, None, ["on-demand"])
+        ),
+        pytest.param("coursework", {"max_instances": 0}, "max_instances", id="max-below-1"),
         pytest.param("coursework", {"target_concurrency": 0}, "target_concurrency", id="concurrency-below-1"),
         pytest.param("coursework", {"context_length": 0}, "context_length", id="context-below-1"),
         pytest.param("coursework", {"largest_output": 0}, "largest_output", id="output-below-1"),
-        pytest.param("coursework", {"hold_seconds": 0}, "hold_seconds", id="hold-below-1"),
-        pytest.param(
-            "coursework", {"hold_seconds_non_streaming": 0}, "hold_seconds_non_streaming", id="other-hold-below-1"
-        ),
         # None of these fields has a default: left out, it is refused.
         *(
             pytest.param("coursework", {field: ABSENT}, field, id=f"without-{field}")
@@ -133,8 +145,6 @@ def test_optional_fields() -> None:
                 "instance_types",
                 "prices",
                 "max_instances",
-                "warm_instances",
-                "wake",
                 "target_concurrency",
                 "context_length",
                 "largest_output",
@@ -217,11 +227,6 @@ def test_optional_fields() -> None:
             pytest.param("coursework", {"loader": loader}, "loader", id=f"loader-{loader!r}")
             for loader in ("disk", "Download", "", True)
         ),
-        # Only a mock pool may give a start delay, even at 0.
-        *(
-            pytest.param("coursework", {"start_delay_seconds": delay}, "start_delay_seconds", id=f"vllm-delay-{delay}")
-            for delay in (400, 0)
-        ),
         # A pool's zones are at least one zone name, each named once.
         *(
             pytest.param("coursework", {"zones": zones}, "zones", id=f"zones-{case}")
@@ -247,17 +252,17 @@ def test_refusals(name: str, changes: dict[str, object], field: str) -> None:
     assert repr(field) in str(refusal.value)
 
 
-def refused(name: str, entry: Mapping[str, object], **limit: float) -> PoolConfigError:
+def refused(name: str, entry: Mapping[str, object]) -> PoolConfigError:
     with pytest.raises(PoolConfigError) as refusal:
-        parse_pools({name: entry}, **limit)
+        parse_pools({name: entry})
     assert refusal.value.pool == name
     assert repr(name) in str(refusal.value)
     return refusal.value
 
 
-def test_no_pool_can_take_the_session_switch_s_key() -> None:
-    # The switch sits in the pool-state table under this partition key, beside the pools' items.
-    assert refused(SESSION_PARTITION, COURSEWORK).field == "name"
+def test_no_pool_can_take_the_partition_of_the_item_an_earlier_release_left() -> None:
+    # The session switch's item may still sit in the pool-state table under this partition key.
+    assert refused("_session", COURSEWORK).field == "name"
 
 
 def test_prices() -> None:
@@ -281,19 +286,18 @@ def test_prices() -> None:
         assert repr("prices") in str(refusal)
 
 
-def test_price_limit() -> None:
-    def priced(price: float, wake: str, fallback: float | None = None) -> dict[str, object]:
-        prices = {"g7e.2xlarge": price} if fallback is None else {"g7e.2xlarge": price, "g7e.4xlarge": fallback}
-        return changed(COURSEWORK, {"instance_types": list(prices), "prices": prices, "wake": wake})
-
-    assert parse_pools({"coursework": priced(3.36, "on-demand")})[0].wake == "on-demand"
-    assert parse_pools({"coursework": priced(5, "on-demand")})[0].wake == "on-demand"
-    assert refused("coursework", priced(16.57, "on-demand")).field == "wake"
-    assert parse_pools({"coursework": priced(16.57, "scheduled-only")})[0].wake == "scheduled-only"
-    assert refused("coursework", priced(3.36, "on-demand", fallback=6)).field == "wake"
-    # A limit given replaces the default.
-    assert parse_pools({"coursework": priced(16.57, "on-demand")}, on_demand_price_limit=20)[0].prices
-    assert refused("coursework", priced(3.36, "on-demand"), on_demand_price_limit=3).field == "wake"
+def test_no_rule_holds_a_pools_prices_to_a_limit() -> None:
+    # Above the 5 dollars an hour that a pool waking on demand was once held to, whatever its
+    # `wake`, given or not, and on its first type or on a fallback.
+    for prices in ({"g7e.2xlarge": 16.57}, {"g7e.2xlarge": 3.36, "g7e.4xlarge": 6}):
+        priced = changed(COURSEWORK, {"instance_types": list(prices), "prices": prices})
+        (pool,) = parse_pools({"coursework": priced})
+        assert pool.prices == prices
+        for wake in ("on-demand", "scheduled-only"):
+            assert parse_pools({"coursework": priced | {"wake": wake}}) == (pool,)
+    # No caller gives a limit any more: the parser takes the table alone.
+    with pytest.raises(TypeError):
+        parse_pools({"coursework": COURSEWORK}, on_demand_price_limit=20)  # ty: ignore[unknown-argument]
 
 
 def test_expected_values() -> None:
@@ -459,26 +463,6 @@ def test_a_vllm_pool_streams_its_weights_unless_it_asks_for_a_download() -> None
     # Any other loader, such as `disk`, is refused by the pool's name and the field: `test_refusals`.
 
 
-def test_a_mock_pools_start_delay_is_0_unless_it_gives_one() -> None:
-    # Left out, as in every entry written before the field: the mock is ready at once.
-    for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
-        (pool,) = parse_pools({name: entry})
-        assert pool.start_delay_seconds == 0
-
-    for delay in (0, 400):
-        (pool,) = parse_pools({"mock": changed(MOCK, {"start_delay_seconds": delay})})
-        assert pool.start_delay_seconds == delay
-        # The entry the deployment writes reads back the same.
-        assert parse_pools({"mock": pool_entry(pool)}) == (pool,)
-
-    # A negative value, or one that is not a whole number, is refused by the pool's name and the
-    # field; so is the field on a vllm pool (`test_refusals`).
-    for delay in (-1, 400.0, "400", True):
-        refusal = refused("mock", changed(MOCK, {"start_delay_seconds": delay}))
-        assert refusal.field == "start_delay_seconds"
-        assert repr("start_delay_seconds") in str(refusal)
-
-
 def test_a_pools_zones_are_none_unless_it_lists_them() -> None:
     # Left out, as in every entry written before the field: the group spans the VPC's first three.
     for name, entry in (("coursework", COURSEWORK), ("mock", MOCK), ("mock", FIRST_DEPLOYED_MOCK)):
@@ -519,8 +503,8 @@ FIRST_DEPLOYED_MOCK = {
 def test_the_first_deployed_pool_still_parses() -> None:
     # A field added later without a default is missing from this entry, and the parser refuses it.
     (mock,) = parse_pools({"mock": FIRST_DEPLOYED_MOCK})
-    assert (mock.engine, mock.instance_types, mock.wake) == ("mock", ("t4g.small",), "on-demand")
+    assert (mock.engine, mock.instance_types) == ("mock", ("t4g.small",))
     assert mock.prices == {"t4g.small": 0.02}
-    assert (mock.max_instances, mock.warm_instances, mock.target_concurrency) == (2, 1, 8)
+    assert (mock.max_instances, mock.target_concurrency) == (2, 8)
     assert (mock.context_length, mock.largest_output) == (262144, 32000)
     assert (mock.expected, mock.measured_start_seconds) == (None, None)

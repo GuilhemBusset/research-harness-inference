@@ -40,9 +40,7 @@ each be `{}`, and `RHI_DEFAULT_POOL` may be left out: no pool has a session then
 forwarded request is refused with `no_session`, a `claude-` name included (`rhi_gateway.app`).
 
 The three tables of pools agree: the target groups and the secrets name exactly the pools of the
-pools table, and the default pool, when given, is one of them. Whether an on-demand pool is priced
-within the configuration's limit was decided when the configuration loaded, with a limit the
-gateway is not given: it is not checked again here.
+pools table, and the default pool, when given, is one of them.
 
 No variable holds a secret. `RHI_POOL_SECRETS` holds ARNs, and the gateway reads the values
 through the Secrets Manager API at start (`rhi_gateway.main`).
@@ -50,7 +48,8 @@ through the Secrets Manager API at start (`rhi_gateway.main`).
 **A refusal names the variable and never its value.** A required variable that is missing, or any
 variable that is not of its form, raises `SettingsError` before anything listens. Its message is
 the variable's name and a fixed sentence; for `RHI_POOLS` it may add the pool field at fault, from
-the fixed list of a pool's fields. Nothing else of a value, a pool's name included, reaches the
+the fixed list of a pool's fields and of the retired ones an entry may still hold
+(`rhi_common.pool_config.RETIRED_FIELDS`). Nothing else of a value, a pool's name included, reaches the
 message or an error chained to it: the task's log shows it.
 """
 
@@ -58,7 +57,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -67,7 +65,7 @@ from urllib.parse import urlsplit
 
 from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS, with_floors
 from rhi_common.causes import Cause
-from rhi_common.pool_config import FIELDS, Pool, PoolConfigError, parse_pools
+from rhi_common.pool_config import FIELDS, RETIRED_FIELDS, Pool, PoolConfigError, parse_pools
 
 POOLS = "RHI_POOLS"
 DEFAULT_POOL = "RHI_DEFAULT_POOL"
@@ -124,8 +122,9 @@ VARIABLES = (*REQUIRED, DEFAULT_POOL, *NUMERIC_DEFAULTS, *FLOOR_DEFAULTS)
 _DIGITS = re.compile(r"[0-9]{1,18}", re.ASCII)
 # A floor: digits, with at most one decimal point and digits on both of its sides.
 _DECIMAL = re.compile(r"[0-9]{1,32}(?:\.[0-9]{1,32})?", re.ASCII)
-# The fields a refusal of the pools table may name: a pool's own, never anything a value held.
-_POOL_FIELDS = FIELDS | {"name"}
+# The fields a refusal of the pools table may name: a pool's own and the retired ones an entry may
+# still hold, never anything a value held.
+_POOL_FIELDS = FIELDS | RETIRED_FIELDS | {"name"}
 # The names DynamoDB accepts, as its API documents them.
 _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
 # A date as the deployment writes it, YYYY-MM-DD.
@@ -256,8 +255,7 @@ def _pools(environ: Mapping[str, str]) -> tuple[Pool, ...]:
     expected = "a JSON object of the configuration's pools, from each pool's name to its entry"
     table = _json_object(environ, POOLS, expected)
     try:
-        # The price limit is the configuration's, checked when the stage loaded it.
-        return parse_pools(table, on_demand_price_limit=math.inf)
+        return parse_pools(table)
     except PoolConfigError as error:
         # The parser's message names the pool, which is part of the value: only a field of the fixed list is kept.
         field = f" (the pool field {error.field!r} is refused)" if error.field in _POOL_FIELDS else ""

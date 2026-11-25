@@ -28,8 +28,8 @@ file source read: each source loads what its writer wrote as the same object. Th
 imported by the ssm source and by `write_ssm` only, when one of them runs.
 
 **The pools.** The `pools` table maps each pool's name to its entry (`[pools.<name>]` in TOML),
-which the pool parser of `rhi_common.pool_config` validates when the configuration loads, with the
-configuration's `on_demand_price_limit`. Two keys are then read against the pools:
+which the pool parser of `rhi_common.pool_config` validates when the configuration loads. Two keys
+are then read against the pools:
 `allowed_instance_types`, left out, is every instance type the pools list, so that it never needs
 a value the deployed configuration lacks; given, a pool that lists another type is refused.
 `default_pool`, the pool the gateway maps `claude-*` model names to (sections 5.4 and 6.2), left
@@ -75,7 +75,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from rhi_common.pool_config import DEFAULT_ON_DEMAND_PRICE_LIMIT, ZONE_NAME, Pool, PoolConfigError, parse_pools
+from rhi_common.pool_config import ZONE_NAME, Pool, PoolConfigError, parse_pools
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -127,15 +127,13 @@ class Config:
     # synthesis reads them.
     budget_alert_percentages: tuple[int, ...]
     # The schedule: an IANA time zone name and the course end date. Sessions have no schedule:
-    # the instructor switches them on and off (section 5.6).
+    # the instructor books them (section 5.6).
     time_zone: str
     course_end: datetime.date
     # One entry per pool, parsed by `rhi_common.pool_config`, in the table's order.
     pools: tuple[Pool, ...]
     # The instance types a pool may list: a hard cap (section 11.3).
     allowed_instance_types: tuple[str, ...]
-    # Dollars an hour: a pool with an instance type priced above it may not wake on demand (17).
-    on_demand_price_limit: float
     # The pool of the `claude-*` model names, or None when no pool is configured (5.4, 6.2).
     default_pool: str | None
     # The zones the VPC spans, by name, in the order of its subnets, or None for the region's first
@@ -153,11 +151,10 @@ class Config:
     gateway_tasks: int
     # The gateway's numeric settings (section 17), each of which the deployment writes into the
     # variable `services/gateway/rhi_gateway/settings.py` reads it from: the largest request body
-    # in bytes, the longest request and the keep-alive interval of a hold in seconds, and the
-    # seconds of `Retry-After` for the three causes that carry one.
+    # in bytes, the longest request in seconds, and the seconds of `Retry-After` for the three
+    # causes that carry one.
     request_body_limit_bytes: int
     longest_request_seconds: int
-    keepalive_seconds: int
     retry_after_warming_seconds: int
     retry_after_capacity_unavailable_seconds: int
     retry_after_concurrency_limit_seconds: int
@@ -339,8 +336,7 @@ def _pool_table(value: object) -> Mapping[str, object]:
 
 
 def _pools(value: object) -> tuple[Pool, ...]:
-    # The shape of every entry. The price limit is another key's: `parse` checks it once both are read.
-    return parse_pools(_pool_table(value), on_demand_price_limit=math.inf)
+    return parse_pools(_pool_table(value))
 
 
 def _instance_types(value: object) -> tuple[str, ...]:
@@ -474,7 +470,6 @@ KEYS: dict[str, Key] = {
     "pools": Key("a table of pools, one entry per pool, each as section 4.2 gives it", _pools, _json_from_text),
     "https_listener": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "allowed_instance_types": Key("a list of instance types, each a string", _instance_types, _json_from_text),
-    "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
     "default_pool": _STRING,
     "zones": Key(
         "a list of at least three zone names, each of lower-case letters, digits and hyphens with a letter last, "
@@ -487,7 +482,6 @@ KEYS: dict[str, Key] = {
     "gateway_tasks": _WHOLE_NUMBER,
     "request_body_limit_bytes": _WHOLE_NUMBER,
     "longest_request_seconds": _WHOLE_NUMBER,
-    "keepalive_seconds": _WHOLE_NUMBER,
     "retry_after_warming_seconds": _WHOLE_NUMBER,
     "retry_after_capacity_unavailable_seconds": _WHOLE_NUMBER,
     "retry_after_concurrency_limit_seconds": _WHOLE_NUMBER,
@@ -522,12 +516,16 @@ KEYS: dict[str, Key] = {
 
 # Keys a source may still hold though the configuration has none: each is checked with its old
 # parser and then dropped, so that a source holding it loads as if it did not, and any other value
-# is refused as before. `session_windows` (ADR 0003, decision 2) and `nightly_stop`, the time of day
-# of the nightly stop that sessions replaced (section 5.1), each stay until the owner has deleted
-# its parameter in SSM; a later change then removes the entry.
+# is refused as before. `session_windows` (ADR 0003, decision 2), `nightly_stop`, the time of day
+# of the nightly stop that sessions replaced (section 5.1), and the two keys that served scaling by
+# load (section 5.6), the price above which a pool could not wake on demand and the keep-alive
+# interval of a held request, each stay until the owner has deleted its parameter in SSM; a later
+# change then removes the entry.
 RETIRED_KEYS: dict[str, Key] = {
     "session_windows": _EMPTY_LIST,
     "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
+    "on_demand_price_limit": Key("a number of US dollars an hour above zero", _dollars_an_hour, _price_from_text),
+    "keepalive_seconds": _WHOLE_NUMBER,
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -541,20 +539,17 @@ DEFAULTS: dict[str, object] = {
     # The design gives no such key (issue E2-47): off keeps a deployed stage as it was, with no
     # certificate waiting on a domain that does not resolve yet.
     "https_listener": False,
-    # Section 17: 5 dollars an hour.
-    "on_demand_price_limit": DEFAULT_ON_DEMAND_PRICE_LIMIT,
     # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
     "issuer_reserved_concurrency": 5,
     "key_issuances_per_day": 5,
     # Sections 2 and 11.2: the gateway runs two tasks.
     "gateway_tasks": 2,
-    # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, a keep-alive
-    # every 10 seconds of a hold, and a `Retry-After` of 30 seconds for `warming`, 60 for
-    # `capacity_unavailable` and 5 for `concurrency_limit`. The gateway's reader of its environment
+    # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, and a
+    # `Retry-After` of 30 seconds for `warming`, 60 for `capacity_unavailable` and 5 for
+    # `concurrency_limit`. The gateway's reader of its environment
     # (`rhi_gateway.settings`) has the same defaults.
     "request_body_limit_bytes": 8_388_608,
     "longest_request_seconds": 1800,
-    "keepalive_seconds": 10,
     "retry_after_warming_seconds": 30,
     "retry_after_capacity_unavailable_seconds": 60,
     "retry_after_concurrency_limit_seconds": 5,
@@ -632,9 +627,8 @@ def parse(data: Mapping[str, object], source: str) -> Config:
                 f"the key {name!r} in the configuration source {source!r} must be {key.expected}"
             ) from None
     values: dict[str, Any] = {}
-    # Where each key's value came from, and the value as it came, for the keys read against the pools.
+    # Where each key's value came from, for the keys read against the pools.
     origins: dict[str, str] = {}
-    raws: dict[str, object] = {}
     for name, key in KEYS.items():
         if name in data:
             origin = f"the configuration source {source!r}"
@@ -647,29 +641,21 @@ def parse(data: Mapping[str, object], source: str) -> Config:
             continue
         else:
             raise ConfigError(f"the configuration source {source!r} lacks the key {name!r}, which has no default")
-        origins[name], raws[name] = origin, raw
+        origins[name] = origin
         try:
             values[name] = key.parse(raw)
         except ValueError as error:
             # The pool parser's message names the pool and the field, never a value.
             detail = f" ({error})" if isinstance(error, PoolConfigError) else ""
             raise ConfigError(f"the key {name!r} in {origin} must be {key.expected}{detail}") from None
-    values |= _read_against_the_pools(values, origins, raws["pools"], source)
+    values |= _read_against_the_pools(values, origins, source)
     return Config(**values)
 
 
-def _read_against_the_pools(
-    values: Mapping[str, Any], origins: Mapping[str, str], table: object, source: str
-) -> dict[str, Any]:
-    """The pools parsed again with the configuration's price limit, and the optional keys that
-    are read against them: two checked or filled, and the zones, which each pool's own are held to."""
-    try:
-        pools = parse_pools(_pool_table(table), on_demand_price_limit=values["on_demand_price_limit"])
-    except PoolConfigError as error:
-        raise ConfigError(
-            f"the key 'pools' in {origins['pools']} must hold no pool that wakes on demand above the key "
-            f"'on_demand_price_limit' in {origins['on_demand_price_limit']} ({error})"
-        ) from None
+def _read_against_the_pools(values: Mapping[str, Any], origins: Mapping[str, str], source: str) -> dict[str, Any]:
+    """The optional keys that are read against the pools: two checked or filled, and the zones,
+    which each pool's own are held to."""
+    pools: tuple[Pool, ...] = values["pools"]
     allowed = values["allowed_instance_types"]
     if allowed is None:
         allowed = tuple(dict.fromkeys(kind for pool in pools for kind in pool.instance_types))
@@ -703,7 +689,7 @@ def _read_against_the_pools(
         default = names[0] if names else None
     elif default not in names:
         raise ConfigError(f"the key 'default_pool' in {origins['default_pool']} must name a configured pool")
-    return {"pools": pools, "allowed_instance_types": allowed, "default_pool": default}
+    return {"allowed_instance_types": allowed, "default_pool": default}
 
 
 def _read(path: Path, source: str, where: str) -> dict[str, Any]:
@@ -801,14 +787,11 @@ def read_ssm(client: Any = None) -> Config:
 
 
 def pool_entry(pool: Pool) -> dict[str, object]:
-    """A pool's entry, as the pool parser reads it: every field the pool holds, but its name.
-
-    A start delay of 0 is left out: only a mock pool may give the field, and 0 is its default.
-    """
+    """A pool's entry, as the pool parser reads it: every field the pool holds, but its name."""
     entry: dict[str, object] = {}
     for field in dataclasses.fields(Pool):
         value = getattr(pool, field.name)
-        if field.name == "name" or value is None or (field.name == "start_delay_seconds" and value == 0):
+        if field.name == "name" or value is None:
             continue
         if dataclasses.is_dataclass(value):
             value = {key: list(bounds) for key, bounds in dataclasses.asdict(value).items() if bounds is not None}

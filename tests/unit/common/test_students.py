@@ -255,16 +255,11 @@ def test_an_attribute_outside_the_lists_is_reported() -> None:
     assert unlisted(usage, LISTED[UsageDay]) == {"leases.req-2.request_body"}
 
 
-def test_the_owners_entries_are_the_canary_and_the_spikes_students() -> None:
-    assert students.is_owner_entry(0)
-    assert students.is_owner_entry(10**18)
-    assert students.is_owner_entry(10**18 + 3)
-    assert not students.is_owner_entry(1)
-    assert not students.is_owner_entry(4242)
-    assert not students.is_owner_entry(10**18 - 1)
+def test_the_owners_entries_are_under_ids_no_github_account_has_and_no_rule_tells_them_apart() -> None:
     # The admin CLI puts its entries under these same numbers.
     from rhi_admin import canary, spikes
 
     assert canary.CANARY_GITHUB_ID == students.CANARY_GITHUB_ID == 0
     assert spikes.SPIKE_GITHUB_ID_BASE == students.SPIKE_GITHUB_ID_BASE == 10**18
-    assert students.is_owner_entry(spikes.spike_github_id(1))
+    # They are served as every key is: the rule that told them apart is gone.
+    assert not hasattr(students, "is_owner_entry")

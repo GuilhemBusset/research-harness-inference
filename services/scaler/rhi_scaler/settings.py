@@ -29,7 +29,6 @@ settings still read.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -86,9 +85,7 @@ def _pool(name: str, value: object) -> PoolSettings:
     if not isinstance(entry, Mapping):
         raise SettingsError(f"{where}entry", "is missing" if entry is None else "must be an object")
     try:
-        # The price limit is the configuration's, checked when the stage loaded it: the settings do
-        # not carry it, and the default would refuse a pool the deployment accepted.
-        (config,) = parse_pools({name: entry}, on_demand_price_limit=math.inf)
+        (config,) = parse_pools({name: entry})
     except PoolConfigError as error:
         raise SettingsError(f"{where}entry", f"does not parse: {error}") from None
     return PoolSettings(

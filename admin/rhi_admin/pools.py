@@ -31,7 +31,6 @@ scaler is refused.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -90,19 +89,14 @@ def identity_name(arn: str) -> str:
 
 
 def _deployed(pools: Pools) -> tuple[Pool, ...]:
-    """Every deployed pool, from the settings of the scaler's function.
-
-    The deployment checked the prices of a pool that wakes on demand against the configuration's
-    limit, which the settings do not carry: they are not checked again here, so that a command
-    always reaches a deployed pool. With no scaler deployed there is none.
-    """
+    """Every deployed pool, from the settings of the scaler's function. With no scaler deployed there is none."""
     if pools.scaler is None:
         return ()
     configuration = pools.functions.get_function_configuration(FunctionName=pools.scaler)
     text = configuration.get("Environment", {}).get("Variables", {}).get(SCALER_SETTINGS)
     try:
         entries = json.loads(text or "")["pools"]
-        return parse_pools({name: value["entry"] for name, value in entries.items()}, on_demand_price_limit=math.inf)
+        return parse_pools({name: value["entry"] for name, value in entries.items()})
     except (ValueError, KeyError, TypeError, AttributeError, PoolConfigError):
         raise AdminError("the scaler's function does not hold the pools' settings") from None
 

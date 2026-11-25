@@ -446,9 +446,8 @@ def test_without_the_parameter_no_hook_is_named_and_nothing_is_completed(tmp_pat
 
 
 def test_the_warm_up_is_a_request_the_engine_contract_answers() -> None:
-    # The mock engine, in process, 30 seconds after which it is healthy.
-    now = 0.0
-    app = create_app(Settings(secret=SECRET, start_seconds=30), clock=lambda: now)
+    # The mock engine, in process.
+    app = create_app(Settings(secret=SECRET))
 
     def to_the_mock(request: urllib.request.Request, timeout: float | None) -> tuple[int, bytes] | None:
         async def call() -> httpx.Response:
@@ -464,8 +463,6 @@ def test_the_warm_up_is_a_request_the_engine_contract_answers() -> None:
         return answer.status_code, answer.content
 
     engine = Engine(to_the_mock)
-    assert not engine.healthy()
-    now = 30.0
     assert engine.healthy()
     assert engine.warm_up("coursework", SECRET)
     assert not engine.warm_up("coursework", "another secret")

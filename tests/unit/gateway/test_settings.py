@@ -30,7 +30,7 @@ MOCK = {
     "context_length": 262144,
     "largest_output": 32000,
 }
-POOLS = {"mock": MOCK, "second": {**MOCK, "wake": "scheduled-only", "hold_seconds": 60}}
+POOLS = {"mock": MOCK, "second": {**MOCK, "drain_seconds": 60}}
 ACCOUNT = "123456789012"
 TARGET_GROUPS = {
     name: f"arn:aws:elasticloadbalancing:us-east-1:{ACCOUNT}:targetgroup/{name}/0123456789abcdef" for name in POOLS
@@ -124,7 +124,7 @@ def test_a_full_environment_gives_the_settings() -> None:
         session_max_hours=9,
     )
     # The pools are the pool configuration's, with its defaults.
-    assert (mock.hold_seconds, second.hold_seconds) == (420, 60)
+    assert (mock.drain_seconds, second.drain_seconds) == (300, 60)
     assert settings.retry_after == {Cause.WARMING: 31, Cause.CAPACITY_UNAVAILABLE: 61, Cause.CONCURRENCY_LIMIT: 6}
     # A variable the gateway does not read changes nothing.
     assert read_settings({**FULL, "RHI_SOMETHING_ELSE": "1", "PATH": "/usr/bin"}) == settings
@@ -138,7 +138,7 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
         "model": "example/model",
         "revision": "0123456789abcdef0123456789abcdef01234567",
         "instance_types": ["g7e.2xlarge", "g7e.4xlarge"],
-        # Above the default price limit: the configuration's own limit was applied when it loaded.
+        # No rule holds a price to a limit.
         "prices": {"g7e.2xlarge": 3.5, "g7e.4xlarge": 7.25},
         "gpu_hours_per_day": 12,
         "measured_start_seconds": 240,
@@ -149,7 +149,7 @@ def test_the_pools_are_read_as_the_configuration_loaded_them() -> None:
         # And so does the scope of its cache salt.
         "cache_salt_scope": "class",
     }
-    loaded = parse_pools({"mock": MOCK, "coursework": vllm}, on_demand_price_limit=10)
+    loaded = parse_pools({"mock": MOCK, "coursework": vllm})
     written = json.dumps({pool.name: config.deployed_entry(pool) for pool in loaded})
 
     names = [pool.name for pool in loaded]
@@ -352,6 +352,10 @@ def test_a_refused_pool_field_is_named_from_the_fixed_list_only() -> None:
     assert "'largest_output'" in str(known)
     # The pool's name is part of the value: it is not repeated.
     assert "mock" not in str(known)
+    # A retired field an entry still holds is of the fixed list too: a value of another type is refused by its name.
+    retired = refusal({**FULL, "RHI_POOLS": json.dumps({**POOLS, "mock": {**MOCK, "idle_minutes": SECRET}})})
+    assert "'idle_minutes'" in str(retired)
+    assert SECRET not in as_logged(retired)
 
 
 def test_the_tables_of_pools_must_agree_with_an_empty_pools_table_too() -> None:

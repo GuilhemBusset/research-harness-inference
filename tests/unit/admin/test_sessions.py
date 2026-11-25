@@ -25,7 +25,7 @@ from rhi_admin import main
 from rhi_admin import session as admin_session
 from rhi_admin.roster import AdminError
 from rhi_common import sessions as rules
-from rhi_common.records import LaunchFailure, ScalerNote, Session, SessionSwitch
+from rhi_common.records import LaunchFailure, ScalerNote, Session
 
 # 2027-01-15T08:00 UTC, which the clock of `ZONE` shows as 09:00.
 NOW = 1_800_000_000
@@ -440,8 +440,10 @@ def test_a_parked_stage_has_no_pool(deployed: Deployed) -> None:
 
 def test_status_prints_the_supply(deployed: Deployed) -> None:
     deployed.run("start", "3", "--for", "6h")
-    # A switch that an earlier `session on` left in the table has no line: nothing reads it.
-    deployed.table.put_item(Item=SessionSwitch(on=True, set_by="user/earlier", set_at=NOW - HOUR).to_item())
+    # What an earlier release left in the table, a switch and a pool's mode, has no line: nothing reads it.
+    earlier = {"set_by": "user/earlier", "set_at": NOW - HOUR}
+    deployed.table.put_item(Item={"pool": "_session", "record": "switch", "on": True, **earlier})
+    deployed.table.put_item(Item={"pool": "coursework", "record": "mode", "mode": "disabled", **earlier})
     note = ScalerNote(
         pool="coursework",
         capacity_asked=3,
@@ -454,10 +456,22 @@ def test_status_prints_the_supply(deployed: Deployed) -> None:
         launch_failure=LaunchFailure.INSUFFICIENT_CAPACITY,
     )
     deployed.table.put_item(Item=note.to_item())
+    # Every item DynamoDB gives the command, whatever the read: its record.
+    given: list[object] = []
+
+    def record(parsed: dict[str, Any], **_: object) -> None:
+        items = [*parsed.get("Items", []), *([parsed["Item"]] if "Item" in parsed else [])]
+        items += [item for found in parsed.get("Responses", {}).values() for item in found]
+        given.extend(item.get("record") for item in items)
+
+    deployed.table.meta.client.meta.events.register("after-call.dynamodb", record)
 
     status, out, err = deployed.run("status", now=NOW + 660)
 
+    deployed.table.meta.client.meta.events.unregister("after-call.dynamodb", record)
     assert (status, err) == (0, "")
+    # The session and the note of the pool that has them, by their keys: the mode is not read.
+    assert sorted(given, key=str) == ["note", "session"]
     lines = [line.split("\t") for line in out.splitlines()]
     # The header, then one line for each deployed pool, and nothing else.
     coursework, mock = (dict(zip(lines[0], line, strict=True)) for line in lines[1:])

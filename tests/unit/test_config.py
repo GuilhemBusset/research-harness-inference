@@ -43,7 +43,6 @@ GATEWAY_KEYS = {
     "gateway_tasks": 2,
     "request_body_limit_bytes": 8388608,
     "longest_request_seconds": 1800,
-    "keepalive_seconds": 10,
     "retry_after_warming_seconds": 30,
     "retry_after_capacity_unavailable_seconds": 60,
     "retry_after_concurrency_limit_seconds": 5,
@@ -207,10 +206,6 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("pools", f"[{MARK}]"),
         ("allowed_instance_types", f'"{MARK}"'),
         ("allowed_instance_types", f"[{MARK}]"),
-        ("on_demand_price_limit", f'"{MARK}"'),
-        ("on_demand_price_limit", f"-{MARK}"),
-        ("on_demand_price_limit", "0"),
-        ("on_demand_price_limit", "true"),
         ("default_pool", MARK),
         ("https_listener", f'"{MARK}"'),
         ("https_listener", '"true"'),
@@ -258,6 +253,80 @@ def test_the_retired_session_windows_load_only_as_an_empty_list(tmp_path: Path) 
         message = refusal(tmp_path, text)
         assert repr("session_windows") in message
         assert MARK not in message
+
+
+# What served scaling by load, as the deployed configuration still holds it (section 5.6): the two
+# keys, and the six fields of a pool's entry. Each with a value that is not its old default.
+RETIRED_KEY_LINES = "on_demand_price_limit = 4.5\nkeepalive_seconds = 15\n"
+RETIRED_POOL_LINES = (
+    'wake = "scheduled-only"\nwarm_instances = 1\nhold_seconds = 600\nhold_seconds_non_streaming = 120\n'
+    "idle_minutes = 5\nstart_delay_seconds = 400\n"
+)
+RETIRED_NAMES = [line.split(" = ")[0] for line in (RETIRED_KEY_LINES + RETIRED_POOL_LINES).splitlines()]
+
+
+def with_the_retired_pool_fields(text: str, lines: str = RETIRED_POOL_LINES) -> str:
+    """The text with the lines at the head of each of the example's two pools."""
+    for pool in ("coursework", "mock"):
+        header = f"[pools.{pool}]\n"
+        assert text.count(header) == 1
+        text = text.replace(header, header + lines)
+    return text
+
+
+def test_a_configuration_that_still_gives_what_served_scaling_by_load_loads_as_one_without_it(tmp_path: Path) -> None:
+    loaded = config.load({"RHI_CONFIG": "example"})
+    without = load_text(tmp_path, example_with())
+    assert without == loaded
+    # Every retired key and every retired field of both pools, with `nightly_stop`, in one source.
+    deployed = 'nightly_stop = "02:00"\n' + RETIRED_KEY_LINES + with_the_retired_pool_fields(example_with())
+    assert load_text(tmp_path, deployed) == without
+    # The typed configuration has neither key, and no source needs them.
+    for key in ("on_demand_price_limit", "keepalive_seconds"):
+        assert key in config.RETIRED_KEYS
+        assert key not in config.KEYS and key not in config.DEFAULTS
+        assert not hasattr(loaded, key)
+    # No rule compares a pool's prices with the limit: one far below both pools' prices loads.
+    assert load_text(tmp_path, "on_demand_price_limit = 0.001\n" + example_with()) == without
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        *(("on_demand_price_limit", value) for value in (f'"{MARK}"', f"-{MARK}", "0", "true", f"[{MARK}]")),
+        *(("keepalive_seconds", value) for value in (f'"{MARK}"', f"{MARK}.5", f"-{MARK}", "0", "true")),
+    ],
+)
+def test_a_retired_key_of_another_type_is_refused_by_its_name(tmp_path: Path, key: str, value: str) -> None:
+    message = refusal(tmp_path, f"{key} = {value}\n" + example_with())
+    assert repr(key) in message
+    assert "'file'" in message
+    assert MARK not in message
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wake", f'"always{MARK}"'),
+        ("wake", MARK),
+        ("warm_instances", f'"{MARK}"'),
+        ("hold_seconds", f"{MARK}.5"),
+        ("hold_seconds_non_streaming", "true"),
+        ("idle_minutes", f"-{MARK}"),
+        ("start_delay_seconds", f'"{MARK}"'),
+    ],
+)
+def test_a_retired_pool_field_of_another_type_is_refused_by_its_name(tmp_path: Path, field: str, value: str) -> None:
+    message = refusal(tmp_path, with_the_retired_pool_fields(example_with(), f"{field} = {value}\n"))
+    assert f"pool 'coursework', field {field!r}" in message
+    assert MARK not in message
+
+
+def test_the_example_gives_none_of_the_eight_retired_names() -> None:
+    # Not as a key, not in a pool's entry and not in a comment.
+    assert len(RETIRED_NAMES) == 8
+    words = set(re.findall(r"[A-Za-z_]+", EXAMPLE.read_text(encoding="utf-8")))
+    assert not words & set(RETIRED_NAMES)
 
 
 def test_the_retired_nightly_stop_loads_only_as_a_time_of_day(tmp_path: Path) -> None:
@@ -523,9 +592,7 @@ MOCK_LINES = (
     ("engine", '"mock"'),
     ("instance_types", '["t4g.small"]'),
     ("prices", '{ "t4g.small" = 0.02 }'),
-    ("wake", '"on-demand"'),
     ("max_instances", "2"),
-    ("warm_instances", "1"),
     ("target_concurrency", "8"),
     ("context_length", "262144"),
     ("largest_output", "32000"),
@@ -549,10 +616,10 @@ def test_the_example_holds_the_mock_pool() -> None:
     mock = next(pool for pool in loaded.pools if pool.name == "mock")
     assert (mock.name, mock.engine, mock.instance_types) == ("mock", "mock", ("t4g.small",))
     assert mock.prices == {"t4g.small": 0.02}
-    assert (mock.wake, mock.max_instances, mock.warm_instances, mock.target_concurrency) == ("on-demand", 2, 1, 8)
+    assert (mock.max_instances, mock.target_concurrency) == (2, 8)
     assert (mock.context_length, mock.largest_output) == (262144, 32000)
     assert (mock.expected, mock.measured_start_seconds) == (None, None)
-    assert (loaded.allowed_instance_types, loaded.on_demand_price_limit) == (("t4g.small", "g7e.2xlarge"), 5)
+    assert loaded.allowed_instance_types == ("t4g.small", "g7e.2xlarge")
     # The mock pool is the one the lines above give, parsed.
     assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["pools"]["mock"] == {
         field: tomllib.loads(f"v = {value}")["v"] for field, value in MOCK_LINES
@@ -571,9 +638,7 @@ def test_the_example_coursework_pool() -> None:
     # One 96 GB GPU, with no fallback type, at its price of evidence E5.
     assert (coursework.instance_types, coursework.prices) == (("g7e.2xlarge",), {"g7e.2xlarge": 3.36})
     assert "g7e.2xlarge" in loaded.allowed_instance_types
-    assert (coursework.max_instances, coursework.warm_instances, coursework.wake) == (2, 2, "on-demand")
-    assert coursework.target_concurrency == 8
-    assert (coursework.hold_seconds, coursework.idle_minutes, coursework.drain_seconds) == (420, 20, 300)
+    assert (coursework.max_instances, coursework.target_concurrency, coursework.drain_seconds) == (2, 8, 300)
     assert (coursework.context_length, coursework.largest_output) == (262144, 32000)
     # The estimates of section 4.7, and no measured start until spike S1 has one.
     assert coursework.expected == ExpectedValues(
@@ -687,22 +752,19 @@ def test_a_pools_zones_are_read_against_the_key(tmp_path: Path) -> None:
         assert MARK not in message
 
 
-def test_the_three_pool_keys_default_from_the_only_pool(tmp_path: Path) -> None:
-    text = with_the_mock_pool_alone(allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
+def test_the_two_pool_keys_default_from_the_only_pool(tmp_path: Path) -> None:
+    text = with_the_mock_pool_alone(allowed_instance_types=None, default_pool=None)
     loaded = load_text(tmp_path, text)
     assert loaded.default_pool == "mock"
     assert loaded.allowed_instance_types == ("t4g.small",)
-    assert loaded.on_demand_price_limit == 5
-    assert config.DEFAULTS["on_demand_price_limit"] == 5
 
 
 def test_an_empty_pools_table_needs_no_new_key(tmp_path: Path) -> None:
     # The deployed configuration until the owner adds the mock pool; `[]` is its earlier spelling.
     for pools in ("{}", "[]"):
-        text = example_with(pools=pools, allowed_instance_types=None, on_demand_price_limit=None, default_pool=None)
+        text = example_with(pools=pools, allowed_instance_types=None, default_pool=None)
         loaded = load_text(tmp_path, text)
         assert (loaded.pools, loaded.allowed_instance_types, loaded.default_pool) == ((), (), None)
-        assert loaded.on_demand_price_limit == 5
 
 
 def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
@@ -710,7 +772,6 @@ def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
     assert wider.allowed_instance_types == ("t4g.small", "g7e.2xlarge", "g7e.4xlarge")
     more = load_text(tmp_path, with_a_second_pool(example_with(default_pool='"second"')))
     assert ([pool.name for pool in more.pools], more.default_pool) == (["coursework", "mock", "second"], "second")
-    assert load_text(tmp_path, example_with(on_demand_price_limit="4.5")).on_demand_price_limit == 4.5
 
 
 @pytest.mark.parametrize(
@@ -723,7 +784,6 @@ def test_the_keys_an_owner_gives_are_kept(tmp_path: Path) -> None:
             example_with(allowed_instance_types=f'["t{MARK}.small"]'), "allowed_instance_types", id="not-allowed"
         ),
         pytest.param(example_with(allowed_instance_types="[]"), "allowed_instance_types", id="none-allowed"),
-        pytest.param(example_with(on_demand_price_limit="0.01"), "on_demand_price_limit", id="priced-above-limit"),
     ],
 )
 def test_a_key_read_against_the_pools_is_refused_by_name(tmp_path: Path, text: str, key: str) -> None:

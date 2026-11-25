@@ -1,7 +1,7 @@
 """The deployment hold (scripts/pipeline/deploy_hold.py): it passes once no session is active on
-a pool of the stage and the session switch reads off, at once when that is already so, when the
-items are missing, or when the pools stack or its table does not exist yet; until then, it reads
-them again every 60 seconds.
+a pool of the stage, at once when that is already so, when the items are missing, or when the pools
+stack or its table does not exist yet; until then, it reads them again every 60 seconds. It reads
+the pools' sessions and no other item.
 
 Stand-ins answer in the place of CloudFormation and DynamoDB, and a clock the test controls stands
 for time: its `sleep` moves it forward.
@@ -15,9 +15,8 @@ import pytest
 from botocore.exceptions import ClientError
 
 import deploy_hold
-from rhi_common.records import MODE_RECORD, SESSION_RECORD, Session, SessionSwitch
+from rhi_common.records import SESSION_RECORD, Session
 from rhi_common.sessions import stopped
-from rhi_common.tables import SESSION_SWITCH_KEY
 
 STACK = "Rhi-Pools"
 LOGICAL_ID = "TablesPoolState68A872F7"
@@ -70,21 +69,15 @@ class CloudFormation:
 
 
 class DynamoDB:
-    """The pool-state table, whose switch reads each of `answers` in turn, on, off, no item, or the
-    item given, and has no item after the last; and the item under each pool's session key, for the
-    pools of `sessions`. `reads` counts the reads of the switch, and `asked` lists the pools whose
-    session was read."""
+    """The pool-state table: the item under each pool's session key, for the pools of `sessions`,
+    or `failure` on every read. It refuses a read of any other key, the switch an earlier release
+    left in the table among them. `asked` lists the pools whose session was read."""
 
     def __init__(
-        self,
-        *answers: bool | dict[str, Any] | None,
-        failure: ClientError | None = None,
-        sessions: dict[str, dict[str, Any]] | None = None,
+        self, *, failure: ClientError | None = None, sessions: dict[str, dict[str, Any]] | None = None
     ) -> None:
-        self.answers = list(answers)
         self.failure = failure
         self.sessions = sessions or {}
-        self.reads = 0
         self.asked: list[str] = []
 
     def Table(self, name: str) -> DynamoDB:
@@ -93,18 +86,13 @@ class DynamoDB:
 
     def get_item(self, *, Key: dict[str, str], ConsistentRead: bool) -> dict[str, Any]:
         assert ConsistentRead
-        if Key != SESSION_SWITCH_KEY:
-            assert Key == {"pool": Key["pool"], "record": SESSION_RECORD}
-            self.asked.append(Key["pool"])
-            item = self.sessions.get(Key["pool"])
-            return {} if item is None else {"Item": item}
-        self.reads += 1
+        assert Key == {"pool": Key["pool"], "record": SESSION_RECORD}
+        assert Key["pool"] in POOLS
+        self.asked.append(Key["pool"])
         if self.failure is not None:
             raise self.failure
-        on = self.answers.pop(0) if self.answers else None
-        if isinstance(on, dict):
-            return {"Item": on}
-        return {} if on is None else {"Item": SessionSwitch(on=on, set_by="admin", set_at=1).to_item()}
+        item = self.sessions.get(Key["pool"])
+        return {} if item is None else {"Item": item}
 
 
 def run(cloudformation: CloudFormation, dynamodb: DynamoDB, clock: Clock, **environ: str) -> int:
@@ -113,13 +101,11 @@ def run(cloudformation: CloudFormation, dynamodb: DynamoDB, clock: Clock, **envi
     )
 
 
-@pytest.mark.parametrize("answer", [pytest.param(False, id="switch off"), pytest.param(None, id="item missing")])
-def test_passes_at_once_when_no_session_is_on(answer: bool | None) -> None:
-    dynamodb, clock = DynamoDB(answer), Clock()
+def test_passes_at_once_when_no_pool_has_a_session() -> None:
+    dynamodb, clock = DynamoDB(), Clock()
     assert run(CloudFormation(), dynamodb, clock) == 0
-    assert (dynamodb.reads, clock.now) == (1, 0)
-    # No pool has a session item, and every pool was asked for one.
-    assert dynamodb.asked == POOLS
+    # No pool has a session item, and every pool was asked for one. The stand-in refuses any other read.
+    assert (dynamodb.asked, clock.now) == (POOLS, 0)
 
 
 @pytest.mark.parametrize(
@@ -128,26 +114,20 @@ def test_passes_at_once_when_no_session_is_on(answer: bool | None) -> None:
 def test_passes_at_once_when_the_stack_or_its_table_does_not_exist(message: str) -> None:
     cloudformation, dynamodb, clock = CloudFormation(error("ValidationError", message)), DynamoDB(), Clock()
     assert run(cloudformation, dynamodb, clock) == 0
-    assert (cloudformation.reads, dynamodb.reads, clock.now) == (1, 0, 0)
+    assert (cloudformation.reads, dynamodb.asked, clock.now) == (1, [], 0)
 
 
 def test_passes_at_once_when_the_table_was_never_created() -> None:
     cloudformation = CloudFormation(detail={"LogicalResourceId": LOGICAL_ID, "ResourceStatus": "CREATE_FAILED"})
     dynamodb, clock = DynamoDB(), Clock()
     assert run(cloudformation, dynamodb, clock) == 0
-    assert (cloudformation.reads, dynamodb.reads, clock.now) == (1, 0, 0)
+    assert (cloudformation.reads, dynamodb.asked, clock.now) == (1, [], 0)
 
 
 def test_passes_at_once_when_the_table_is_not_there() -> None:
     dynamodb, clock = DynamoDB(failure=error("ResourceNotFoundException")), Clock()
     assert run(CloudFormation(), dynamodb, clock) == 0
-    assert (dynamodb.reads, clock.now) == (1, 0)
-
-
-def test_waits_while_the_session_is_on() -> None:
-    dynamodb, clock = DynamoDB(True, True, True, False), Clock()
-    assert run(CloudFormation(), dynamodb, clock) == 0
-    assert (dynamodb.reads, clock.now) == (4, 180)
+    assert (dynamodb.asked, clock.now) == (POOLS[:1], 0)
 
 
 @pytest.mark.parametrize(
@@ -162,18 +142,13 @@ def test_a_read_that_fails_otherwise_holds_the_deployment(cloudformation: CloudF
     assert run(cloudformation, dynamodb, Clock()) == 1
 
 
-def test_a_switch_that_does_not_read_holds_the_deployment() -> None:
-    dynamodb = DynamoDB({**SESSION_SWITCH_KEY, "on": "yes", "set_by": "admin", "set_at": 1})
-    assert run(CloudFormation(), dynamodb, Clock()) == 1
-
-
 def test_waits_while_one_pool_s_session_is_active_and_passes_once_it_has_ended() -> None:
-    # The switch is off. One pool's session ends at 150 s, and the other's is booked for later.
+    # One pool's session ends at 150 s, and the other's is booked for later.
     sessions = {"mock": session("mock", 0, 150), "coursework": session("coursework", HOUR, 2 * HOUR)}
     dynamodb, clock = DynamoDB(sessions=sessions), Clock()
     assert run(CloudFormation(), dynamodb, clock) == 0
     # Read at 0, 60 and 120 s, when it is active, and at 180 s, when it has ended.
-    assert (clock.now, dynamodb.reads, dynamodb.asked) == (180, 4, POOLS * 4)
+    assert (clock.now, dynamodb.asked) == (180, POOLS * 4)
 
 
 def test_passes_once_the_session_is_stopped() -> None:
@@ -202,7 +177,7 @@ def test_a_session_holds_no_longer_than_the_longest_session() -> None:
 @pytest.mark.parametrize(
     "item",
     [
-        pytest.param({"pool": "mock", "record": MODE_RECORD, "mode": "auto"}, id="another record"),
+        pytest.param({"pool": "mock", "record": "mode", "mode": "enabled"}, id="another record"),
         pytest.param(session("mock", 0, 150) | {"ends_at": "later"}, id="an end that is not a time"),
     ],
 )
@@ -212,10 +187,11 @@ def test_an_item_that_is_not_a_session_holds_the_deployment(item: dict[str, Any]
     assert clock.now == 0
 
 
-def test_a_stage_with_no_pool_waits_on_the_switch_alone() -> None:
-    dynamodb, clock = DynamoDB(True, False), Clock()
-    assert run(CloudFormation(), dynamodb, clock, **{deploy_hold.POOLS_VARIABLE: ""}) == 0
-    assert (dynamodb.reads, dynamodb.asked, clock.now) == (2, [], 60)
+def test_a_stage_with_no_pool_passes_at_once_and_asks_aws_nothing() -> None:
+    # A lookup would fail the job: with no pool there is no session to read, so none is made.
+    cloudformation, dynamodb, clock = CloudFormation(error("AccessDenied")), DynamoDB(), Clock()
+    assert run(cloudformation, dynamodb, clock, **{deploy_hold.POOLS_VARIABLE: ""}) == 0
+    assert (cloudformation.reads, dynamodb.asked, clock.now) == (0, [], 0)
 
 
 @pytest.mark.parametrize(
@@ -232,4 +208,4 @@ def test_without_its_pools_or_the_longest_session_the_job_fails_before_it_reads(
     environ = {name: text for name, text in ENVIRON.items() if name != variable} | ({} if value is None else {variable: value})
     cloudformation, dynamodb = CloudFormation(), DynamoDB()
     assert deploy_hold.main(environ, cloudformation=cloudformation, dynamodb=dynamodb, sleep=Clock().sleep) == 1
-    assert (cloudformation.reads, dynamodb.reads, dynamodb.asked) == (0, 0, [])
+    assert (cloudformation.reads, dynamodb.asked) == (0, [])

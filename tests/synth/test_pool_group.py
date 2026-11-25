@@ -121,10 +121,9 @@ def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
         assert call["parameters"] == {"AutoScalingGroupName": "NAME", "ScalingProcesses": ["AZRebalance"]}
 
 
-def test_no_pool_has_a_warm_pool_whatever_its_entry_gives(pools: dict[str, Any]) -> None:
+def test_no_pool_has_a_warm_pool(pools: dict[str, Any]) -> None:
     """A stopped instance can start only in its own zone and as its own type (section 4.5): no group
     keeps one, and none publishes a metric of a warm pool."""
-    assert {pool.name: pool.warm_instances for pool in EXAMPLE.pools} == {"coursework": 2, "mock": 1}
     assert of_type(pools, "AWS::AutoScaling::WarmPool") == {}
     groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
     assert len(groups) == len(EXAMPLE.pools)

@@ -276,8 +276,8 @@ def test_the_admin_finds_the_function_and_the_pool_state_table_by_their_logical_
 @pytest.fixture(scope="module")
 def changed(app_module: Any, tmp_path_factory: pytest.TempPathFactory) -> Any:
     """The scaler's settings in a stage whose configuration is the example's with two values
-    changed: a pool priced between the default limit and the configured one, and a longest session
-    that is not the default."""
+    changed: a pool priced above the 5 dollars an hour a pool was once held to, and a longest
+    session that is not the default."""
     import json
     import tomllib
 
@@ -285,7 +285,6 @@ def changed(app_module: Any, tmp_path_factory: pytest.TempPathFactory) -> Any:
     from aws_cdk.assertions import Template as Assertions
 
     source = tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8"))
-    source["on_demand_price_limit"] = 8.0
     mock = source["pools"]["mock"]
     mock["prices"] = dict.fromkeys(mock["instance_types"], 6.0)
     source["session_max_hours"] = 6
@@ -302,11 +301,10 @@ def changed(app_module: Any, tmp_path_factory: pytest.TempPathFactory) -> Any:
     return parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
 
 
-def test_the_settings_read_when_a_pool_is_priced_between_the_default_and_the_configured_limit(changed: Any) -> None:
-    # The deployment holds an on-demand pool's prices to the configuration's limit, which the
-    # settings do not carry: the scaler must read the pool the deployment accepted.
+def test_the_settings_read_whatever_a_pool_s_prices(changed: Any) -> None:
+    # No rule holds a pool's prices to a limit, in the deployment or in the scaler: the scaler
+    # reads the pool the deployment accepted.
     (mock_pool,) = [pool for pool in changed.pools if pool.config.name == "mock"]
-    assert mock_pool.config.wake == "on-demand"
     assert set(mock_pool.config.prices.values()) == {6.0}
 
 

@@ -248,7 +248,6 @@ def test_sigterm_finishes_requests_in_flight() -> None:
             "RHI_MOCK_FIRST_BYTE_SECONDS": "0",
             # 21 tokens at 20 a second: about a second of stream after the signal.
             "RHI_MOCK_TOKENS_PER_SECOND": "20",
-            "RHI_MOCK_START_SECONDS": "0",
             "RHI_MOCK_HANG": "0",
         }
         with (Path(folder) / "mock.log").open("wb") as log:

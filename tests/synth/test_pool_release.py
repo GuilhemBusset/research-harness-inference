@@ -575,28 +575,17 @@ def test_a_vllm_pool_carries_its_engine_flags(app_module: ModuleType, alone: Rel
     }
 
 
-def test_the_mock_start_delay_is_a_flag(app_module: ModuleType, mock: Release, alone: Release, tmp_path: Path) -> None:
-    def with_delay(delay: int) -> Release:
-        (pool,) = pool_config.parse_pools({"mock": config.pool_entry(MOCK) | {"start_delay_seconds": delay}})
-        return standalone(app_module, tmp_path / str(delay), pool)
-
-    # A mock pool that gives 400: the flag and its value, in the parameter the agent reads.
-    delayed = with_delay(400)
-    flags = ["--start-delay-seconds", "400"]
-    assert delayed.value["engine_flags"] == flags
-    assert agent_release.parse_current(sample(delayed.parameter["Value"])).release.engine_flags == tuple(flags)
-    # Nothing else of the release changes, and no role or action comes with the flags.
-    assert {**delayed.value, "engine_flags": []} == alone.value
-    assert len(of_type(delayed.template, "AWS::IAM::Role")) == len(of_type(alone.template, "AWS::IAM::Role"))
-    assert granted(delayed.template) == granted(alone.template)
-
-    # The example configuration's mock pool leaves the field out: no flag. A pool that gives 0 has
-    # the same release as one that leaves it out.
-    assert MOCK.start_delay_seconds == 0
+def test_a_mock_pool_s_release_gives_its_engine_no_flag_whatever_start_delay_its_entry_still_gives(
+    app_module: ModuleType, mock: Release, alone: Release, tmp_path: Path
+) -> None:
     for release in (mock, alone):
         assert release.value["engine_flags"] == []
-    zero = with_delay(0)
-    assert zero.parameter["Value"] == alone.parameter["Value"]
+    # The retired field is read into nothing: the pool's release is the one of an entry without it.
+    (pool,) = pool_config.parse_pools({"mock": config.pool_entry(MOCK) | {"start_delay_seconds": 400}})
+    delayed = standalone(app_module, tmp_path / "delayed", pool)
+    assert delayed.value["engine_flags"] == []
+    assert agent_release.parse_current(sample(delayed.parameter["Value"])).release.engine_flags == ()
+    assert delayed.parameter["Value"] == alone.parameter["Value"]
 
 
 # The grants.

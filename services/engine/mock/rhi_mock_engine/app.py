@@ -10,7 +10,7 @@ serves the four inference routes in their three wire formats, streamed and not, 
 | `POST /v1/responses` | a response, or its events from `response.created` to `response.completed` |
 | `POST /v1/messages` | a message, or its events from `message_start` to `message_stop` |
 | `POST /v1/messages/count_tokens` | `{"input_tokens": n}` |
-| `GET /health` | 503 until the start delay has passed, then 200 |
+| `GET /health` | 200, from the moment the mock listens |
 | `GET /metrics` | the contract's metrics in Prometheus' text format, to a loopback client; 404 to any other |
 | `POST /invocations`, `/pause`, `/tokenize` | 200, without the secret |
 
@@ -55,7 +55,6 @@ block, and they do nothing here but answer.
 | --- | --- | --- |
 | `RHI_MOCK_FIRST_BYTE_SECONDS` | wait before the first byte of an inference answer | 0 |
 | `RHI_MOCK_TOKENS_PER_SECOND` | rate of a stream: one delta every 1/rate seconds | 50 |
-| `RHI_MOCK_START_SECONDS` | time after start during which `/health` answers 503 | 0 |
 | `RHI_MOCK_HANG` | `1`: an inference request is never answered, and `/health` still is | `0` |
 | `RHI_MOCK_MAX_RUNNING` | requests generated at once; the others wait for a slot | 8 |
 | `RHI_MOCK_CACHE_TOKENS` | capacity of the imitated prefix cache, in tokens | 1000000 |
@@ -73,11 +72,8 @@ label of an information metric whose value is 1, named in the mock's row beside 
 The lifecycle agent reads it there. The route answers only a client on a loopback address, where
 the node's collector scrapes it; any other gets the 404 of a route that does not exist.
 
-**The argument.** `main` takes one optional argument, `--start-delay-seconds <seconds>`, which a
-pool's release gives the engine's container when the pool sets a start delay
-(`rhi_common.pool_config`). Given, it replaces `RHI_MOCK_START_SECONDS`; every other setting still
-comes from the environment. The image adds the container's arguments to the mock's command, so a
-container started with none runs the mock as the environment says.
+**No argument.** `main` reads the environment and nothing else: a pool's release gives the mock's
+container no flag (`rhi.pools.release`).
 
 **Shutdown.** `main` serves the application on port 8000 through `serve`. On SIGTERM the server
 accepts nothing new, lets every request already accepted run to its end, with no deadline that
@@ -86,16 +82,13 @@ would cut a stream short, and then exits.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import dataclasses
 import hashlib
 import hmac
 import ipaddress
 import json
 import math
 import os
-import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
@@ -119,7 +112,6 @@ PORT = 8000
 SECRET_VARIABLE = "RHI_POOL_SECRET"
 FIRST_BYTE_VARIABLE = "RHI_MOCK_FIRST_BYTE_SECONDS"
 RATE_VARIABLE = "RHI_MOCK_TOKENS_PER_SECOND"
-START_VARIABLE = "RHI_MOCK_START_SECONDS"
 HANG_VARIABLE = "RHI_MOCK_HANG"
 MAX_RUNNING_VARIABLE = "RHI_MOCK_MAX_RUNNING"
 CACHE_TOKENS_VARIABLE = "RHI_MOCK_CACHE_TOKENS"
@@ -156,7 +148,6 @@ class Settings:
     secret: str
     first_byte_seconds: float = 0.0
     tokens_per_second: float = 50.0
-    start_seconds: float = 0.0
     hang: bool = False
     # The coursework pool's engine runs at most 8 requests at once (system design, section 4.2).
     max_running: int = 8
@@ -170,8 +161,6 @@ class Settings:
             raise SettingsError(f"{FIRST_BYTE_VARIABLE} must be a number of seconds, zero or more")
         if not (math.isfinite(self.tokens_per_second) and self.tokens_per_second > 0):
             raise SettingsError(f"{RATE_VARIABLE} must be a number of tokens per second above zero")
-        if not (math.isfinite(self.start_seconds) and self.start_seconds >= 0):
-            raise SettingsError(f"{START_VARIABLE} must be a number of seconds, zero or more")
         if isinstance(self.max_running, bool) or not isinstance(self.max_running, int) or self.max_running < 1:
             raise SettingsError(f"{MAX_RUNNING_VARIABLE} must be a whole number of requests, one or more")
         if isinstance(self.cache_tokens, bool) or not isinstance(self.cache_tokens, int) or self.cache_tokens < 1:
@@ -200,7 +189,6 @@ class Settings:
             secret=environ.get(SECRET_VARIABLE, ""),
             first_byte_seconds=number(FIRST_BYTE_VARIABLE, cls.first_byte_seconds),
             tokens_per_second=number(RATE_VARIABLE, cls.tokens_per_second),
-            start_seconds=number(START_VARIABLE, cls.start_seconds),
             hang=hang,
             max_running=whole(MAX_RUNNING_VARIABLE, cls.max_running),
             cache_tokens=whole(CACHE_TOKENS_VARIABLE, cls.cache_tokens),
@@ -664,7 +652,6 @@ def create_app(
     sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> Starlette:
     """The mock engine as an ASGI application. `clock` and `sleep` are arguments so that a test waits for nothing."""
-    started = clock()
     secret = settings.secret.encode()
     slots = _Slots(settings.max_running)
     metrics = _Metrics(settings.cache_tokens)
@@ -758,7 +745,7 @@ def create_app(
         return JSONResponse({"input_tokens": count_input_tokens(body)})
 
     async def health(request: Request) -> Response:
-        return Response(status_code=200 if clock() - started >= settings.start_seconds else 503)
+        return Response(status_code=200)
 
     async def exposition(request: Request) -> Response:
         if not _loopback(request):
@@ -789,33 +776,10 @@ def serve(settings: Settings, **where: Any) -> None:
     uvicorn.run(create_app(settings), **where, timeout_graceful_shutdown=None)
 
 
-START_DELAY_ARGUMENT = "--start-delay-seconds"
-
-
-def _arguments(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="rhi_mock_engine.app", description="The mock engine.")
-    parser.add_argument(
-        START_DELAY_ARGUMENT,
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help=f"time after start during which /health answers 503; replaces {START_VARIABLE}",
-    )
-    return parser.parse_args(list(argv))
-
-
-def main(argv: Sequence[str] = ()) -> None:
-    """Serve the mock on port 8000. With no secret in the environment it raises before anything listens.
-
-    `argv` is the process's arguments after the command: `--start-delay-seconds` replaces the start
-    delay of the environment.
-    """
-    arguments = _arguments(argv)
-    settings = Settings.from_env(os.environ)
-    if arguments.start_delay_seconds is not None:
-        settings = dataclasses.replace(settings, start_seconds=arguments.start_delay_seconds)
-    serve(settings, host="0.0.0.0", port=PORT)
+def main() -> None:
+    """Serve the mock on port 8000. With no secret in the environment it raises before anything listens."""
+    serve(Settings.from_env(os.environ), host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

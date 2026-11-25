@@ -8,27 +8,31 @@ needs the standard library only, and knows nothing of where the configuration co
 `parse_pools` takes the table as the source gave it.
 
 The entry's key is the pool's name, the model name students choose it by (section 4.2): it holds
-only lower-case letters, digits and hyphens. The rule also keeps the session switch's partition key
-free (section 5.6; `SESSION_PARTITION` in `rhi_common.records`): the switch is an item of the
-pool-state table beside the pools' own items, which sit under the pool's name, and its key starts
-with `_`, which no pool's name may hold. A rule that admitted it would let a pool's records and the
-switch share one partition.
+only lower-case letters, digits and hyphens. A pool's items of the pool-state table sit under its
+name, so no pool shares the partition `_session`, where an earlier release left an item that
+nothing reads.
 
-Seven fields have a default of section 17, which gives them to every pool: the two holds, the idle
-time, the drain and the three settings of student affinity, below. `target_concurrency` is a
-pool's own value, so every pool gives it. A mock pool serves canned responses from no model
-repository: it may leave out `model` and `revision`.
+Four fields have a default of section 17, which gives them to every pool: the drain and the three
+settings of student affinity, below. `target_concurrency` is a pool's own value, so every pool
+gives it. A mock pool serves canned responses from no model repository: it may leave out `model`
+and `revision`.
 
-`gpu_hours_per_day` is a retired field (ADR 0003, decision 2): a pool has none, but an entry may
-still hold it, as a whole number not below 0, which is read into nothing, so that an entry written
-before its removal still loads. Any other value is refused. A later change removes the tolerance
-once the deployed entries no longer hold it.
+**Retired fields.** A pool has none of the fields of `RETIRED_FIELDS`, but an entry may still hold
+them, so that an entry written before their removal still loads: the deployed configuration holds
+them, and the loader refuses a field it does not know. A retired field that is given is held to the
+type it had, then read into nothing; one that is left out is not missed. Any other value is
+refused, by the field's name. A later change removes the tolerance once the deployed entries no
+longer hold them.
+
+- `gpu_hours_per_day` (ADR 0003, decision 2): a whole number not below 0.
+- The fields that served scaling by load (section 5.6: no request wakes a pool, and only the
+  instructor books one). `wake` is `on-demand` or `scheduled-only`. `warm_instances`,
+  `idle_minutes` and `start_delay_seconds` are whole numbers not below 0. `hold_seconds` and
+  `hold_seconds_non_streaming` are whole numbers of at least 1.
 
 Each pool prices every instance type it lists, in dollars an hour (sections 5.4 and 7.2): the
 first listed type is the one it runs, the others are its fallbacks, the next sizes of the same GPU,
-which cost more. A fallback is a price the pool can run at, so every listed type is held to the
-on-demand price limit: a pool priced above it may only wake on schedule (sections 11.3 and 17).
-The limit is the caller's, 5 dollars an hour when none is given.
+which cost more. No rule holds a price to a limit.
 
 A pool may give `expected`, the values the inference dashboard draws beside the measured series
 (sections 4.7 and 7.3): each of speed per stream, time to first token and cache capacity is
@@ -96,12 +100,6 @@ prefix only under the salt it was computed for.
   whatever part of its opening is identical, and one student can then test whether another has sent
   a given text.
 
-A mock pool may give `start_delay_seconds`, a whole number of seconds during which its engine's
-health route answers 503 after the engine starts, so that the gateway holds a request that long
-(sections 4.1 and 5.3; spike S2 in section 12). The design gives no such setting: left out, it is
-0, the mock ready at once. Its release passes it to the mock as the flag `--start-delay-seconds`
-(`rhi.pools.release`). Only a pool whose engine is mock may give it, even at 0.
-
 A pool may give `zones`, the zones its Auto Scaling group spans (section 5.4): a list of at least
 one zone name, none named twice. A zone name holds lower-case letters, digits and hyphens, and ends
 in a lower-case letter. Left out, it is None, and the group spans the first three zones of the VPC.
@@ -126,12 +124,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
 ENGINES = ("mock", "vllm")
-WAKES = ("on-demand", "scheduled-only")
 
-# The defaults of section 17.
-DEFAULT_HOLD_SECONDS = 420
-DEFAULT_HOLD_SECONDS_NON_STREAMING = 240
-DEFAULT_IDLE_MINUTES = 20
+# The default of section 17.
 DEFAULT_DRAIN_SECONDS = 300
 # Student affinity (section 5.5): the stickiness of a pool's target group, the share of its students
 # one rebalance number moves, and the least time between two numbers.
@@ -140,16 +134,11 @@ DEFAULT_REBALANCE_SHARE = 0.1
 DEFAULT_REBALANCE_INTERVAL_SECONDS = 60
 # The longest stickiness the load balancer accepts: 7 days (evidence E13).
 LONGEST_STICKINESS_SECONDS = 7 * 24 * 3600
-# Dollars an hour: a pool with an instance type priced above it may not wake on demand (11.3, 17).
-DEFAULT_ON_DEMAND_PRICE_LIMIT = 5.0
 
 # Whose cached prefixes a request may reuse: its student's alone, or those of the pool's whole
 # class (sections 4.7 and 6.6). A pool that gives no scope has the first.
 CACHE_SALT_SCOPES = ("student", "class")
 DEFAULT_CACHE_SALT_SCOPE = "student"
-
-# The start delay of a mock pool that gives none: its engine is ready at once.
-DEFAULT_START_DELAY_SECONDS = 0
 
 # How a vllm pool's engine reads the model's weights: streamed from S3, or copied to the instance's
 # disk first (section 4.4). A pool that gives no loader streams.
@@ -237,17 +226,10 @@ class Pool:
     # Dollars an hour for each instance type, in the order of `instance_types`.
     prices: dict[str, float]
     max_instances: int
-    # Prepared instances, running or stopped, that the group keeps: from 0 to `max_instances`.
-    warm_instances: int
-    wake: str
     target_concurrency: int
     # In tokens: the limits the gateway's body filter clamps to (section 17).
     context_length: int
     largest_output: int
-    # How long a call is held while the pool wakes: a stream, then a non-streaming call (5.3).
-    hold_seconds: int
-    hold_seconds_non_streaming: int
-    idle_minutes: int
     drain_seconds: int
     # None until a start has been measured (spike S1): the launch hook's deadline becomes twice
     # this (sections 4.3 and 17).
@@ -288,16 +270,23 @@ class Pool:
     rebalance_interval_seconds: int
     # Whose cached prefixes a request on the pool may reuse: `student` or `class` (section 4.7).
     cache_salt_scope: str
-    # Seconds after its start during which a mock engine's health route answers 503 (section 4.1).
-    # 0 for every pool that does not give it, and only a mock pool may give it.
-    start_delay_seconds: int
     # The zones the pool's group spans, by name, or None for the first three zones of the VPC.
     zones: tuple[str, ...] | None
 
 
 FIELDS = frozenset(field.name for field in fields(Pool)) - {"name"}
-# The fields an entry may still hold though a pool has none: each is checked, then dropped.
-RETIRED_FIELDS = frozenset({"gpu_hours_per_day"})
+# The fields an entry may still hold though a pool has none: each is checked, then dropped. A whole
+# number, with the least it may be, or `wake`, with the words it may be.
+_RETIRED_WHOLE_NUMBERS = {
+    "gpu_hours_per_day": 0,
+    "warm_instances": 0,
+    "hold_seconds": 1,
+    "hold_seconds_non_streaming": 1,
+    "idle_minutes": 0,
+    "start_delay_seconds": 0,
+}
+_RETIRED_WAKES = ("on-demand", "scheduled-only")
+RETIRED_FIELDS = frozenset({*_RETIRED_WHOLE_NUMBERS, "wake"})
 
 
 def _text(pool: str, entry: Mapping[str, object], field: str) -> str:
@@ -510,11 +499,13 @@ def _rebalance_share(pool: str, entry: Mapping[str, object]) -> float:
     return share
 
 
-def _start_delay_seconds(pool: str, entry: Mapping[str, object], engine: str) -> int:
-    field = "start_delay_seconds"
-    if field in entry and engine != "mock":
-        raise PoolConfigError(pool, field, "may only be given by a pool whose engine is mock")
-    return _whole(pool, entry, field, least=0, default=DEFAULT_START_DELAY_SECONDS)
+def _check_retired(pool: str, entry: Mapping[str, object]) -> None:
+    """Holds each retired field the entry gives to the type it had. None is read into anything."""
+    for field, least in _RETIRED_WHOLE_NUMBERS.items():
+        if field in entry:
+            _whole(pool, entry, field, least=least)
+    if "wake" in entry:
+        _choice(pool, entry, "wake", _RETIRED_WAKES)
 
 
 def _zones(pool: str, entry: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -535,7 +526,7 @@ def _zones(pool: str, entry: Mapping[str, object]) -> tuple[str, ...] | None:
     return tuple(value)
 
 
-def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
+def _parse_pool(name: str, entry: object) -> Pool:
     if not isinstance(name, str) or _NAME.fullmatch(name) is None:
         raise PoolConfigError(str(name), "name", "must hold only lower-case letters, digits and hyphens")
     if not isinstance(entry, Mapping):
@@ -543,8 +534,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     unknown = sorted(str(field) for field in entry if field not in FIELDS | RETIRED_FIELDS)
     if unknown:
         raise PoolConfigError(name, unknown[0], "is not a field of a pool")
-    if "gpu_hours_per_day" in entry:
-        _whole(name, entry, "gpu_hours_per_day", least=0)  # checked, and read into nothing
+    _check_retired(name, entry)
 
     engine = _choice(name, entry, "engine", ENGINES)
     served_by_vllm = engine == "vllm"
@@ -553,16 +543,7 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
     if served_by_vllm and (revision is None or _COMMIT.fullmatch(revision) is None):
         raise PoolConfigError(name, "revision", "must be a commit hash of 40 lower-case hexadecimal characters")
 
-    max_instances = _whole(name, entry, "max_instances", least=1)
-    warm_instances = _whole(name, entry, "warm_instances", least=0)
-    if warm_instances > max_instances:
-        raise PoolConfigError(name, "warm_instances", "must be at most max_instances")
-
     instance_types = _instance_types(name, entry)
-    prices = _prices(name, entry, instance_types)
-    wake = _choice(name, entry, "wake", WAKES)
-    if wake == "on-demand" and any(price > on_demand_price_limit for price in prices.values()):
-        raise PoolConfigError(name, "wake", "must be scheduled-only: an instance type is priced above the limit")
     trust_remote_code, trust_remote_code_reason = _trust_remote_code(name, entry)
 
     return Pool(
@@ -571,18 +552,11 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
         model=model,
         revision=revision,
         instance_types=instance_types,
-        prices=prices,
-        max_instances=max_instances,
-        warm_instances=warm_instances,
-        wake=wake,
+        prices=_prices(name, entry, instance_types),
+        max_instances=_whole(name, entry, "max_instances", least=1),
         target_concurrency=_whole(name, entry, "target_concurrency", least=1),
         context_length=_whole(name, entry, "context_length", least=1),
         largest_output=_whole(name, entry, "largest_output", least=1),
-        hold_seconds=_whole(name, entry, "hold_seconds", least=1, default=DEFAULT_HOLD_SECONDS),
-        hold_seconds_non_streaming=_whole(
-            name, entry, "hold_seconds_non_streaming", least=1, default=DEFAULT_HOLD_SECONDS_NON_STREAMING
-        ),
-        idle_minutes=_whole(name, entry, "idle_minutes", least=0, default=DEFAULT_IDLE_MINUTES),
         drain_seconds=_whole(name, entry, "drain_seconds", least=0, default=DEFAULT_DRAIN_SECONDS),
         measured_start_seconds=(
             _whole(name, entry, "measured_start_seconds", least=1) if "measured_start_seconds" in entry else None
@@ -614,18 +588,14 @@ def _parse_pool(name: str, entry: object, on_demand_price_limit: float) -> Pool:
             if "cache_salt_scope" in entry
             else DEFAULT_CACHE_SALT_SCOPE
         ),
-        start_delay_seconds=_start_delay_seconds(name, entry, engine),
         zones=_zones(name, entry),
     )
 
 
-def parse_pools(
-    table: Mapping[str, object], *, on_demand_price_limit: float = DEFAULT_ON_DEMAND_PRICE_LIMIT
-) -> tuple[Pool, ...]:
+def parse_pools(table: Mapping[str, object]) -> tuple[Pool, ...]:
     """The pools of the configuration's `pools` table, typed, in the table's order.
 
-    `table` maps each pool's name to its entry, as TOML reads `[pools.<name>]`. A pool that wakes
-    on demand may price no instance type above `on_demand_price_limit`, in dollars an hour. The
-    first entry that breaks a rule raises `PoolConfigError`.
+    `table` maps each pool's name to its entry, as TOML reads `[pools.<name>]`. The first entry
+    that breaks a rule raises `PoolConfigError`.
     """
-    return tuple(_parse_pool(name, entry, on_demand_price_limit) for name, entry in table.items())
+    return tuple(_parse_pool(name, entry) for name, entry in table.items())
