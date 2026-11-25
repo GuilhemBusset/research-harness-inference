@@ -137,6 +137,8 @@ def test_a_stop_ends_the_session_now(current: Session) -> None:
 
 def test_each_refusal() -> None:
     passed = dataclasses.replace(ACTIVE, starts_at=NOW - 1)
+    # A session two hours in: an end can be after its start and still not after now.
+    running = dataclasses.replace(ACTIVE, starts_at=NOW - 2 * HOUR, set_at=NOW - 3 * HOUR)
     refused: dict[str, Callable[[], Session]] = {
         # `started`: what is accepted is in `test_a_booking_is_the_session_to_write`.
         "a booking of a pool whose session is booked": lambda: start(BOOKED),
@@ -158,6 +160,8 @@ def test_each_refusal() -> None:
         "a change to no instance": lambda: change(ACTIVE, instances=0),
         "a change to more than max_instances": lambda: change(ACTIVE, instances=MOST + 1),
         "an end moved to now": lambda: change(ACTIVE, ends_at=NOW),
+        "an end moved to now, after the start": lambda: change(running, ends_at=NOW),
+        "an end moved before now, after the start": lambda: change(running, ends_at=NOW - HOUR),
         "an end moved to the start of a booked session": lambda: change(BOOKED, ends_at=BOOKED.starts_at),
         "a start moved to the end": lambda: change(BOOKED, starts_at=BOOKED.ends_at),
         "an end more than session_max_hours after now": lambda: change(passed, ends_at=NOW + HOURS * HOUR + 1),
@@ -169,6 +173,7 @@ def test_each_refusal() -> None:
     # Each bound is exact: one second inside it, the same booking and the same change are accepted.
     assert start(None, instances=1).instances == 1
     assert start(None, ends_at=NOW + HOURS * HOUR).ends_at == NOW + HOURS * HOUR
+    assert change(running, ends_at=NOW + 1).ends_at == NOW + 1
     assert change(passed, ends_at=NOW + HOURS * HOUR).ends_at == NOW + HOURS * HOUR
     assert change(BOOKED, ends_at=BOOKED.starts_at + HOURS * HOUR).ends_at == BOOKED.starts_at + HOURS * HOUR
 
