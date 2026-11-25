@@ -47,10 +47,15 @@ counts nor ends the row. The time of the last launch that found no capacity is r
 history too, whatever came after it.
 
 The last launch that failed (section 5.4) is the launch activity, into service or into the warm
-pool, that failed or was cancelled and completed last. Its cause is one of three words
-(`rhi_common.records.LaunchFailure`), told from the error code its message carries and from
-nothing else of it: `insufficient-capacity` for a launch that found no capacity, `quota` for one
-the account's vCPU quota refused, and `launch-failed` for any other, an abandoned launch included.
+pool, that failed or was cancelled and completed last, by the time AWS gives and not by its whole
+second; of two that completed at the same instant, the one that started last. Its cause is one of
+three words (`rhi_common.records.LaunchFailure`): `insufficient-capacity` for a launch that found
+no capacity, `quota` for one the account's quota of running instances, which EC2 counts in vCPUs,
+refused, and `launch-failed` for any other, an abandoned launch included. A cause is told from the
+EC2 error code the activity's message carries or, since Auto Scaling also reports both without a
+code, from the fixed words of its sentence (`NO_CAPACITY_SIGNS`, `QUOTA_SIGNS`); nothing else of
+the message is read, and none of it is kept. The time of the last launch that found no capacity is
+told the same way.
 
 `apply` makes, for each pool, these calls and only those that change something, in this order:
 
@@ -121,12 +126,24 @@ from rhi_scaler.model import SESSION_MAX_HOURS, Decision, Inputs, Memory, PoolDe
 
 # The process a launch loop suspends, and the only one this module ever names.
 LAUNCH_PROCESS = "Launch"
-# The EC2 error code of a launch that found no capacity, as the group's activity carries it.
-NO_CAPACITY = "InsufficientInstanceCapacity"
-# The EC2 error code of a launch the account's vCPU quota refused, and the words EC2's own message
-# has for it when the activity carries no code: they are compared in lower case.
-QUOTA = "VcpuLimitExceeded"
-QUOTA_WORDS = "vcpu limit"
+# What tells a failed launch's cause in its activity's message, compared in lower case: the EC2
+# error codes, and the words Auto Scaling's own sentences have when the message carries no code.
+# A launch that found no capacity, On-Demand or Spot:
+NO_CAPACITY_SIGNS = (
+    "insufficientinstancecapacity",
+    "do not have sufficient",
+    "insufficient capacity",
+    "no spot capacity available",
+)
+# A launch the account's quota of running instances refused. EC2 counts that quota in vCPUs.
+QUOTA_SIGNS = (
+    "vcpulimitexceeded",
+    "instancelimitexceeded",
+    "maxspotinstancecountexceeded",
+    "vcpu limit",
+    "quota allows for",
+    "instance(s) are already running",
+)
 # How many instances one SetInstanceProtection call may name.
 PROTECTION_BATCH = 50
 
@@ -281,10 +298,11 @@ def _into_warm_pool(description: str) -> bool:
 
 
 def _failure_cause(message: str) -> LaunchFailure:
-    """Why a launch failed, from the error code its status message carries: one of three words."""
-    if NO_CAPACITY in message:
+    """Why a launch failed, from the signs its status message carries: one of three words."""
+    said = message.lower()
+    if any(sign in said for sign in NO_CAPACITY_SIGNS):
         return LaunchFailure.INSUFFICIENT_CAPACITY
-    if QUOTA in message or QUOTA_WORDS in message.lower():
+    if any(sign in said for sign in QUOTA_SIGNS):
         return LaunchFailure.QUOTA
     return LaunchFailure.LAUNCH_FAILED
 
@@ -306,22 +324,28 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
     abandons: list[int] = []
     no_capacity_at: int | None = None
     last_failed: FailedLaunch | None = None
+    # When the last failed launch completed and started, as AWS gives them: two launches can
+    # complete within one second, and the later of them is the last.
+    last_failed_at: tuple[datetime, datetime] | None = None
     for activity in activities:
         description = str(activity.get("Description", "")).lower()
         if not _is_launch(description):
             continue
         status = activity.get("StatusCode")
         message = str(activity.get("StatusMessage", ""))
-        moment = _seconds(activity.get("EndTime") or activity["StartTime"])
+        completed: datetime = activity.get("EndTime") or activity["StartTime"]
+        moment = _seconds(completed)
         if status == "Successful":
             if not _into_warm_pool(description):
                 reached_service = moment if reached_service is None else max(reached_service, moment)
             continue
         if status not in ("Failed", "Cancelled"):
             continue
-        if last_failed is None or moment >= last_failed.at:
-            last_failed = FailedLaunch(moment, _failure_cause(message))
-        if NO_CAPACITY in message:
+        cause = _failure_cause(message)
+        failed_at = (completed, activity.get("StartTime") or completed)
+        if last_failed_at is None or failed_at > last_failed_at:
+            last_failed, last_failed_at = FailedLaunch(moment, cause), failed_at
+        if cause is LaunchFailure.INSUFFICIENT_CAPACITY:
             no_capacity_at = moment if no_capacity_at is None else max(no_capacity_at, moment)
         elif "abandon" in message.lower():
             abandons.append(moment)

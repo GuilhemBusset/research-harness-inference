@@ -7,7 +7,7 @@ Each run goes the whole way: `rhi_scaler.aws_io.read` against a scripted group, 
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import boto3
@@ -18,7 +18,7 @@ from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
 from rhi_common.records import LaunchFailure, Mode, ScalerNote, Session
-from rhi_scaler.aws_io import Clients, PoolSettings, TableNames, apply, memory_to_item, read
+from rhi_scaler.aws_io import Clients, PoolSettings, TableNames, apply, launch_history, memory_to_item, read
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Memory
 
@@ -54,6 +54,11 @@ NOTE_KEY = {"pool": "coursework", "record": "note"}
 NO_CAPACITY = "Could not launch On-Demand Instances. InsufficientInstanceCapacity - no capacity in the zone"
 OVER_QUOTA = "Could not launch On-Demand Instances. VcpuLimitExceeded - over the family's limit"
 OVER_QUOTA_IN_WORDS = "the launch is over the account's vCPU limit"
+# The same two causes as Auto Scaling words them when the activity carries no error code.
+NO_CAPACITY_IN_WORDS = "we do not have sufficient example-gpu capacity in the zone asked"
+NO_SPOT_CAPACITY = "there is no Spot capacity available for the request"
+NO_QUOTA_LEFT = "the quota allows for 0 more running instance(s). 2 requested"
+ALREADY_RUNNING = "4 instance(s) are already running"
 ABANDONED = "the instance's launch lifecycle action was abandoned"
 NO_IMAGE = "the image of the launch template is not there"
 
@@ -188,8 +193,12 @@ def test_more_instances_than_were_asked_for_is_nothing_waiting(pool: Pool) -> No
     ("message", "cause"),
     [
         (NO_CAPACITY, LaunchFailure.INSUFFICIENT_CAPACITY),
+        (NO_CAPACITY_IN_WORDS, LaunchFailure.INSUFFICIENT_CAPACITY),
+        (NO_SPOT_CAPACITY, LaunchFailure.INSUFFICIENT_CAPACITY),
         (OVER_QUOTA, LaunchFailure.QUOTA),
         (OVER_QUOTA_IN_WORDS, LaunchFailure.QUOTA),
+        (NO_QUOTA_LEFT, LaunchFailure.QUOTA),
+        (ALREADY_RUNNING, LaunchFailure.QUOTA),
         (ABANDONED, LaunchFailure.LAUNCH_FAILED),
         (NO_IMAGE, LaunchFailure.LAUNCH_FAILED),
     ],
@@ -207,6 +216,33 @@ def test_the_cause_is_that_of_the_last_launch_that_failed_since_the_wait_began(
     # The last one that failed gives the cause, wherever the history lists it.
     newer = [*history, launch("Failed", NOW + 100, NO_IMAGE)]
     assert pool.run(NOW + 120, activities=newer, in_service=ONE).launch_failure is LaunchFailure.LAUNCH_FAILED
+
+
+def test_the_last_launch_that_failed_is_the_one_that_completed_last_even_within_one_second() -> None:
+    second = datetime.fromtimestamp(NOW, UTC)
+
+    def failed(started_ms: int, ended_ms: int, message: str) -> dict[str, Any]:
+        times = {"StartTime": second + timedelta(milliseconds=started_ms), "EndTime": second + timedelta(milliseconds=ended_ms)}
+        return {**launch("Failed", NOW, message), **times}
+
+    last, first = failed(600, 900, OVER_QUOTA), failed(0, 200, NO_CAPACITY)
+    # Whatever order the history lists them in: Auto Scaling's is by start, the latest first.
+    for history in ([last, first], [first, last]):
+        found = launch_history(history, None).last_failed
+        assert found is not None and (found.at, found.cause) == (NOW, LaunchFailure.QUOTA)
+    # A launch that started first can complete last: it is then the last that failed.
+    outlasted = failed(700, 800, NO_IMAGE)
+    found = launch_history([outlasted, last, first], None).last_failed
+    assert found is not None and found.cause is LaunchFailure.QUOTA
+
+
+def test_a_launch_that_found_no_capacity_is_told_with_or_without_its_error_code(pool: Pool) -> None:
+    # The time the note carries for the gateway is told as the cause is.
+    for message in (NO_CAPACITY, NO_CAPACITY_IN_WORDS, NO_SPOT_CAPACITY):
+        history = launch_history([launch("Failed", NOW - 120, message), launch("Failed", NOW - 60, NO_QUOTA_LEFT)], None)
+        assert history.no_capacity_at == NOW - 120
+    note = pool.run(NOW, activities=[launch("Failed", NOW - 120, NO_CAPACITY_IN_WORDS)], in_service=ALL)
+    assert (note.no_capacity_at, note.launch_failure) == (NOW - 120, None)
 
 
 def test_each_cause(pool: Pool) -> None:
