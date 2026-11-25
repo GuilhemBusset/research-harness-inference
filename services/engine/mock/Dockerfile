@@ -4,13 +4,11 @@
 # file, requirements.txt (the mock-engine group of uv.lock, with hashes), rhi_common/ and
 # rhi_mock_engine/.
 #
-# The base is Amazon ECR Public's copy of the Docker Official Image, the same tag and digest as on
-# Docker Hub: the pipeline's build hosts share their addresses, and Docker Hub limits anonymous
-# pulls by address. It is pinned by the digest of its multi-architecture index, which is published
-# for linux/arm64 and linux/amd64 among others. No platform is fixed here: `--platform linux/arm64`
+# The base is pinned by the digest of its multi-architecture index, which is published for
+# linux/arm64 and linux/amd64 among others. No platform is fixed here: `--platform linux/arm64`
 # (the pipeline, for the mock pool) and a build with none (CI, on its runner's own platform) each
 # take their own image from the same index. An update is a change to this line.
-FROM public.ecr.aws/docker/library/python:3.13.14-slim-trixie@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
+FROM python:3.13.14-slim-trixie@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
