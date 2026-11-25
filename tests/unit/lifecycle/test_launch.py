@@ -393,7 +393,7 @@ def test_a_launch_that_cannot_put_its_steps_on_record_as_passed_is_abandoned(tmp
     ("refuses", "outcome"),
     [
         pytest.param(None, Outcome.CONTINUED, id="the-hook-still-waits"),
-        pytest.param(NO_ACTION, Outcome.CONTINUED, id="no-action-waits"),
+        pytest.param(NO_ACTION, Outcome.REFUSED, id="no-action-waits"),
         pytest.param("Throttling", Outcome.NOT_COMPLETED, id="the-call-fails"),
     ],
 )
@@ -407,11 +407,24 @@ def test_a_launch_whose_steps_passed_is_resumed_by_its_completion_alone(
 
     assert world.launch().resume() is outcome
 
-    # No step is repeated. The hook that still waits is completed; when none waits, the instance
-    # was let in before. Both leave no launch on record, and a call that failed leaves it there.
-    assert world.calls == ["complete"]
+    # No step is repeated but the check of the release. Only a completion that Auto Scaling took
+    # lets the instance in, and leaves no launch on record: one it refused does not, because the
+    # same answer is given for a hook that is over and for one that waits under another name.
+    assert world.calls == ["check", "complete"]
     assert world.completions == ([completion("CONTINUE")] if refuses is None else [])
-    assert world.on_record is world.passed is (outcome is Outcome.NOT_COMPLETED)
+    assert world.on_record is world.passed is (outcome is not Outcome.CONTINUED)
+
+
+def test_a_resumed_launch_whose_release_differs_by_now_is_abandoned(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
+    world.on_record = world.passed = True
+    another_release(world)
+
+    assert world.launch().resume() is Outcome.ABANDONED
+
+    assert world.calls == ["check", "complete"]
+    assert world.completions == [completion("ABANDON")]
+    assert world.on_record
 
 
 @pytest.mark.parametrize("target", ["Terminated", "Warmed:Stopped", None])

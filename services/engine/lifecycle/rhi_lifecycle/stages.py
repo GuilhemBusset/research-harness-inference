@@ -37,7 +37,9 @@ dashboard reads the launches of this agent as it read the ones before.
 **The launches completed.** `rhi_lifecycle_launch_seconds`, a histogram with the label
 `transition`, observes once each launch whose hook Auto Scaling took with `CONTINUE`: the seconds
 its stages took in all, from the kernel's start to the completed hook. A launch that was abandoned,
-or whose completion did not reach Auto Scaling, is not observed. So its count is the launches
+or whose completion did not reach Auto Scaling, is not observed. A launch that a restarted agent
+resumes (`Launch.resume`) is observed when Auto Scaling takes the completion sent again, with the
+seconds the kernel has been up by then. So the histogram's count is the launches
 completed, two of them two even when they took the same seconds. 300 seconds is a boundary, and a
 launch is observed one step of the float above its seconds, so the bucket of 300 counts the
 launches strictly under 5 minutes.
@@ -114,6 +116,12 @@ def uptime(path: Path = UPTIME_FILE) -> float | None:
         return None
 
 
+def completed(seconds: float, launches: Histogram = LAUNCHES) -> None:
+    """Count one launch completed with `CONTINUE`, `seconds` after the kernel's start. They are
+    observed strictly above themselves, so that a boundary's bucket holds what is under it."""
+    launches.labels(transition=Transition.LAUNCH.value).observe(math.nextafter(seconds, math.inf))
+
+
 class Timings:
     """The seconds each stage of one launch took. `clock` gives the moments the stages are marked
     at, in seconds, and `gauge` is where the durations are exposed: a new launch empties it."""
@@ -145,9 +153,8 @@ class Timings:
 
     def completed(self) -> None:
         """The launch's hook was completed with `CONTINUE`: observe, once, the seconds its stages
-        took, strictly above themselves so that a boundary's bucket holds what is under it."""
-        total = math.nextafter(sum(self.seconds.values()), math.inf)
-        self._launches.labels(transition=Transition.LAUNCH.value).observe(total)
+        took."""
+        completed(sum(self.seconds.values()), self._launches)
 
     def _end(self, moment: float) -> None:
         if self._under_way is None:

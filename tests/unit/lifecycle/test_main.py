@@ -637,7 +637,7 @@ def test_an_agent_restarted_on_a_terminated_instance_drains_it_though_its_launch
     run(scenario)
 
 
-def test_an_agent_restarted_in_service_with_its_launch_still_on_record_resumes_serving_and_drains_later(
+def test_an_agent_restarted_with_its_launch_still_on_record_serves_nothing_on_a_refused_completion(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -650,20 +650,95 @@ def test_an_agent_restarted_in_service_with_its_launch_still_on_record_resumes_s
             # runs yet, and the next reading sends it once more.
             await until(lambda: world.throttled == 0)
             assert (world.refused, world.beats) == (0, [])
-            # Auto Scaling answers that no launch hook waits: the instance serves, as it did.
-            # The duties start: a first heartbeat, and a first completion that the engine answers.
+            # Auto Scaling answers that no launch hook waits, as it would for a hook the settings
+            # misname. The agent cannot tell, so it does not say the instance serves, and does not
+            # send the completion a third time.
             await world.ticks(1)
-            await until(lambda: len(world.beats) == 1 and world.calls.count("completion") == 2)
+            await until(lambda: world.refused == 1)
+            await world.ticks(2)
             assert world.refused == 1
+            # No step of the launch was run again but the check of the release, and no row was
+            # written: none of a launch's stage, and none of the serving duties.
+            assert world.calls[launched:] == ["check", "check"]
+            assert len(world.items) == rows
 
-            # No step of the launch was run again, and no row names a launch's stage after the
-            # ones of the launch itself: the rows since are the serving duties'.
-            assert world.calls[launched:] == ["completion"]
-            assert len(world.items) == rows + 1
-
+            # The instance did serve, and holds a request when its group terminates it.
             student = await world.student()
             world.target = TERMINATED
             await world.drains(student)
+
+    run(scenario)
+
+
+class StopsAtCompletion(World):
+    """An instance whose agent stops as it sends its launch's completion, which does not reach
+    Auto Scaling, until `stops` is cleared. With `misnamed`, the pool's parameter then names a
+    launch hook the group does not have, and Auto Scaling answers a completion under that name as
+    it answers one for which no lifecycle action waits."""
+
+    stops = True
+    misnamed = False
+    refused = 0
+
+    def get_parameter(self, **request: Any) -> dict[str, Any]:
+        answer = super().get_parameter(**request)
+        if self.misnamed:
+            settings = VALUE["settings"] | {"launch_hook": "another"}
+            answer["Parameter"]["Value"] = json.dumps(VALUE | {"settings": settings})
+        return answer
+
+    def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
+        if self.stops:
+            raise AgentStopped
+        if request["LifecycleHookName"] == "another":
+            self.refused += 1
+            raise ClientError({"Error": {"Code": launch.NO_ACTION}}, "CompleteLifecycleAction")
+        return super().complete_lifecycle_action(**request)
+
+    async def interrupted(self) -> None:
+        """The launch of an agent that ran before the program passed its steps, and stopped there."""
+        with pytest.raises(AgentStopped):
+            await asyncio.to_thread(self.earlier_launch().run)
+        assert (self.launching, self.passed, self.completions) == (True, True, [])
+        self.stops = False
+
+
+def test_a_restarted_agent_sends_a_lost_completion_again_and_serves_once_auto_scaling_takes_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = StopsAtCompletion(tmp_path, IN_SERVICE)
+        await world.interrupted()
+        launched, rows = len(world.calls), len(world.items)
+        async with world.running():
+            # The duties start: a first heartbeat, and a first completion that the engine answers.
+            await until(lambda: len(world.beats) == 1 and world.calls.count("completion") == 2)
+
+        # The release is checked and the hook completed. No other step of the launch is run again,
+        # and the one row since is the serving duties'.
+        assert world.calls[launched:] == ["check", "launch hook", "completion"]
+        assert world.completions == [completion("launch")]
+        assert len(world.items) == rows + 1
+        assert not world.launching
+
+    run(scenario)
+
+
+def test_a_launch_hook_that_still_waits_under_another_name_lets_no_restarted_agent_serve(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = StopsAtCompletion(tmp_path, IN_SERVICE)
+        await world.interrupted()
+        world.misnamed = True
+        launched, rows = len(world.calls), len(world.items)
+        async with world.running():
+            await until(lambda: world.refused == 1)
+            await world.ticks(3)
+
+        # Auto Scaling took no completion, and the launch hook waits: nothing says the instance
+        # serves, and the completion is not sent again. The hook's timeout abandons the instance.
+        assert world.refused == 1
+        assert world.calls[launched:] == ["check"]
+        assert world.completions == []
+        assert len(world.items) == rows
+        assert world.launching
 
     run(scenario)
 

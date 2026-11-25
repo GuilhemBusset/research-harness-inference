@@ -54,16 +54,26 @@ stays so, and the engine answers one more warm-up request. The hook's timeout is
 instance's start, not from the second run.
 
 **A launch whose steps passed is resumed, not run again** (`Launch.resume`). Only the answer to
-its completion is missing, so the agent sends the completion again, with `CONTINUE`, and does
-nothing else: no step is repeated, and no row of a launch's stage is written over the row of an
-instance that serves. Auto Scaling takes that completion when the launch hook still waits. When it
-answers that no lifecycle action waits for the instance (`NO_ACTION`), the hook is over: by the
-completion sent before, and the instance serves; or by its timeout, and the group terminates the
-instance, whose target state then says so. Either way the records are removed and the instance is
-taken as let into service. Any other failure of the call says nothing: the launch stays on record,
-and the completion is sent again later. Auto Scaling gives the same answer for a hook or a group
-it does not know, so settings that misname one are read as a hook that is over; a launch with such
-settings completes no hook at all, and its hook's timeout abandons the instance.
+its completion is missing, so the agent checks the release once more and sends the completion
+again: with `CONTINUE`, or with `ABANDON` when the release differs by now, as at any launch. It
+does nothing else: no other step is repeated, and no row of a launch's stage is written over the
+row of an instance that serves. The instance is let into service only when Auto Scaling takes
+`CONTINUE`: the records are removed then, and the launch is counted among the launches completed,
+with the seconds since the kernel's start.
+
+**A completion Auto Scaling refuses lets no instance in.** Auto Scaling answers a resumed launch
+that no lifecycle action waits for the instance under the names the settings give (`NO_ACTION`)
+in three cases, and the answer does not say which: the completion sent before was taken, and the
+instance serves; the hook's timeout has passed, and the group terminates the instance; or the
+settings misname the hook or the group, and the hook still waits. The instance role may complete a
+lifecycle action and may not ask Auto Scaling for an instance's state (`rhi.pools.role`), so
+nothing on the instance tells the three apart. `resume` therefore returns `REFUSED`: the instance
+is not taken as in service, the launch stays on record, and the completion is not sent again,
+because the answer would be the same. What that costs: an instance that a completion let in, and
+whose agent stopped before it removed the records or could not remove them, writes no serving
+heartbeat once its agent has restarted. It is drained when its group terminates it, like any
+instance that may have served. Any other failure of the call says nothing either: the launch stays
+on record, and the completion is sent again later.
 
 **The stages.** A launch marks where each stage of the start begins and ends
 (`rhi_lifecycle.stages`, which says what each stage covers), so the agent's metrics give the
@@ -112,7 +122,8 @@ ABANDON = "ABANDON"
 IN_SERVICE = "InService"
 
 # The error code of Auto Scaling's answer to the completion of a lifecycle action that does not
-# wait: the hook was completed before, or its timeout has passed.
+# wait under the names given: the hook was completed before, its timeout has passed, or the names
+# are not the hook's and the group's.
 NO_ACTION = "ValidationError"
 
 # The model revision of a pool that serves no model: the heartbeat's row takes no empty value.
@@ -235,8 +246,7 @@ class Engine:
 class Outcome(enum.Enum):
     """How `Launch.run`, or `Termination.run`, ended."""
 
-    # The launch hook was completed with `CONTINUE`: by this call or, for a launch resumed, by
-    # the one sent before it.
+    # The launch hook was completed with `CONTINUE`: Auto Scaling took the completion.
     CONTINUED = "continued"
     # The launch hook was completed with `ABANDON`.
     ABANDONED = "abandoned"
@@ -249,6 +259,9 @@ class Outcome(enum.Enum):
     # No completion reached Auto Scaling: the target state, the instance or the hook is unknown, or
     # the call failed. The hook's own timeout ends the wait.
     NOT_COMPLETED = "not-completed"
+    # Auto Scaling refused the completion of a launch resumed: no lifecycle action waits for the
+    # instance under the names the settings give. Whether the instance serves is not known.
+    REFUSED = "refused"
 
 
 class Abandon(Exception):
@@ -415,21 +428,34 @@ class Launch:
 
     def resume(self) -> Outcome:
         """Send again the completion of a launch whose steps have all passed, as the host has on
-        record, and do nothing else: `CONTINUED` when Auto Scaling takes it, or answers that no
-        lifecycle action waits for the instance."""
+        record: `CONTINUE` when the disk still holds the pool's current release, `ABANDON` when it
+        does not. Nothing else of a launch is done. `CONTINUED` only when Auto Scaling takes
+        `CONTINUE`; `REFUSED` when it answers that no lifecycle action waits."""
         launching = self._launching()
         if isinstance(launching, Outcome):
             return launching
         current, instance = launching
         try:
-            self._complete(current.settings, instance, CONTINUE)
+            self._steps_of().check(current)
+        except Abandon:
+            result = ABANDON
+        else:
+            result = CONTINUE
+        try:
+            self._complete(current.settings, instance, result)
         except ClientError as refusal:
-            if refusal.response.get("Error", {}).get("Code") != NO_ACTION:
-                return Outcome.NOT_COMPLETED
-            # The launch hook is over. The stages of this launch were timed by the agent that ran
-            # it, so no metric counts it a second time.
+            if refusal.response.get("Error", {}).get("Code") == NO_ACTION:
+                return Outcome.REFUSED
+            return Outcome.NOT_COMPLETED
         except BotoCoreError:
             return Outcome.NOT_COMPLETED
+        if result != CONTINUE:
+            return Outcome.ABANDONED
+        # The stages of this launch were timed by the agent that ran it. The launch itself ends
+        # here, this long after the kernel's start: a host that does not say how long counts none.
+        launched = self.uptime()
+        if launched is not None:
+            stages.completed(launched)
         self._off_record()
         return Outcome.CONTINUED
 
@@ -478,9 +504,12 @@ class Launch:
         table = self.dynamodb.Table(current.settings.heartbeat_table)
         return _Start(stages.Timings(self.clock), table, row, self.wall)
 
+    def _steps_of(self) -> Steps:
+        return Steps(self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep)
+
     def _steps(self, current: release.Current, start: _Start) -> None:
         """The steps before the hook's completion, none with a time limit."""
-        steps = Steps(self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep)
+        steps = self._steps_of()
         try:
             # On record before the engine's unit can be started: an agent that starts and finds the
             # unit started knows by the record that the launch hook still waits.

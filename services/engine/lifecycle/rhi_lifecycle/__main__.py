@@ -89,11 +89,15 @@ and the next start of its unit asks again.
 - A launch is on record with its steps as passed: the program was restarted while the launch's
   completion was sent, or after Auto Scaling had taken it: the records are removed after that
   answer, and the removal can fail, or the program stop before it. The instance is not taken as
-  in service yet, and no step of the launch is run again. With the target state `InService` the
-  program resumes the launch (`Launch.resume`): it sends the completion again, and writes no row
-  of a launch's stage. When Auto Scaling takes it, or answers that no lifecycle action waits, the
-  instance is in service: the serving duties resume, and their heartbeats with them. A completion
-  that got no such answer is sent again after the next reading.
+  in service yet, and no step of the launch is run again but the check of the release. With the
+  target state `InService` the program resumes the launch (`Launch.resume`): it sends the
+  completion again, and writes no row of a launch's stage. Only when Auto Scaling takes that
+  completion, with `CONTINUE`, is the instance in service: the serving duties start, and their
+  heartbeats with them. A completion that Auto Scaling refuses, because no lifecycle action waits
+  under the names the settings give, lets the instance into nothing: the answer is the same for a
+  hook that is over and for one the settings misname, which still waits. No serving duty runs, no
+  serving heartbeat is written, and the completion is not sent again. A completion whose call
+  failed otherwise is sent again after the next reading.
 
 In both cases the instance may have served. So with the target state `Terminated` it is handed to
 the termination handling, whatever a launch run again or resumed came to: an instance that served
@@ -495,7 +499,8 @@ class Agent:
         self._launched = True
         if self._passed:
             outcome = await asyncio.to_thread(self._launch.resume)
-            # A completion that got no answer is sent again after the next reading.
+            # A completion whose call failed is sent again after the next reading. One that Auto
+            # Scaling refused is not: the launch is over for this program, and nothing serves.
             self._launched = outcome is not Outcome.NOT_COMPLETED
         else:
             outcome = await asyncio.to_thread(self._launch.run)

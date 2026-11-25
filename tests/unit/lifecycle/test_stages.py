@@ -304,6 +304,21 @@ def test_each_launch_completed_is_counted_once_and_no_other(tmp_path: Path) -> N
     assert completed() == before + 2
 
 
+def test_a_resumed_launch_is_counted_when_auto_scaling_takes_its_completion(tmp_path: Path) -> None:
+    before, before_under, before_slower = completed(), completed(under=300), completed(under=420)
+    # An agent restarted after the launch's last step sends the completion again, 5 minutes and
+    # more after the kernel's start.
+    world = World(tmp_path, on_disk=True)
+    world.now = 300.0
+    assert world.launch().resume() is Outcome.CONTINUED
+    assert world.results == ["CONTINUE"]
+    # One launch more, of the seconds the kernel had been up when the completion was taken, and
+    # no row of a launch's stage.
+    assert completed() == before + 1
+    assert (completed(under=300), completed(under=420)) == (before_under, before_slower + 1)
+    assert world.rows == []
+
+
 def test_a_launch_of_exactly_five_minutes_is_not_under_them() -> None:
     launches = Histogram("launch_seconds", "", ("transition",), buckets=stages.LAUNCH_BUCKETS, registry=None)
     timings = stages.Timings(lambda: 0.0, launches=launches)
