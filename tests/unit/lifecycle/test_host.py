@@ -26,13 +26,14 @@ IN_THE_HOST = ["--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "
 
 # One file per call, numbered: the arguments, one per line, then the standard input. The call
 # exits with status 3 when one of its arguments is the word in the file `fail`, and does not end
-# by itself when one is the word in the file `hang`.
+# by itself when one is the word in the file `hang`. It prints what the file `say` holds.
 STAND_IN = """\
 #!/bin/sh
 here=$(dirname "$0")
 call=$(ls "$here/arguments" | wc -l)
 printf '%s\\n' "$@" > "$here/arguments/$call"
 cat > "$here/input/$call"
+if [ -f "$here/say" ]; then cat "$here/say"; fi
 for argument in "$@"; do
     if [ -f "$here/fail" ] && [ "$argument" = "$(cat "$here/fail")" ]; then exit 3; fi
     if [ -f "$here/hang" ] && [ "$argument" = "$(cat "$here/hang")" ]; then exec sleep 60; fi
@@ -68,6 +69,9 @@ class Nsenter:
 
     def hang_on(self, word: str) -> None:
         (self.folder / "hang").write_text(word)
+
+    def say(self, line: str) -> None:
+        (self.folder / "say").write_text(line + "\n")
 
     def calls(self) -> list[list[str]]:
         files = sorted((self.folder / "arguments").iterdir(), key=lambda file: int(file.name))
@@ -159,6 +163,21 @@ def test_the_host_says_whether_its_docker_holds_an_image(nsenter: Nsenter) -> No
     assert not host(nsenter).holds(IMAGE)
 
 
+@pytest.mark.parametrize(
+    ("state", "started"),
+    [("active", True), ("activating", True), ("deactivating", True), ("failed", True), ("inactive", False)],
+)
+def test_the_engines_unit_is_started_in_every_state_of_systemd_but_inactive(
+    state: str, started: bool, nsenter: Nsenter
+) -> None:
+    nsenter.say(state)
+    if state != "active":
+        nsenter.fail_on("is-active")  # systemd's exit status for a unit that is not active
+
+    assert host(nsenter).engine_started() is started
+    assert nsenter.calls() == [[*IN_THE_HOST, "systemctl", "is-active", "rhi-engine"]]
+
+
 @pytest.mark.parametrize(("word", "action"), [("login", "login"), ("pull", "pull")])
 def test_a_pull_still_running_at_its_time_limit_is_stopped_and_reported(
     word: str, action: str, nsenter: Nsenter
@@ -199,6 +218,60 @@ def test_a_command_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
 
     assert (raised.value.action, raised.value.returncode) == ("start", None)
 
-    # No answer is not the answer "no": the host could not be asked whether it holds the image.
+    # No answer is not the answer "no": the host could not be asked whether it holds the image, or
+    # whether the engine's unit was started.
     with pytest.raises(HostError):
         Host(Ecr(), nsenter=str(tmp_path / "missing")).holds(IMAGE)
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).engine_started()
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).launch_begun()
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).launch_passed()
+
+
+def test_a_systemd_that_gives_the_engines_unit_no_state_has_not_said_that_it_is_stopped(nsenter: Nsenter) -> None:
+    with pytest.raises(HostError) as raised:
+        host(nsenter).engine_started()
+
+    assert raised.value.action == "state"
+
+
+def test_a_launch_is_put_on_record_in_the_hosts_run_folder_and_removed_from_it(nsenter: Nsenter) -> None:
+    host(nsenter).begin_launch()
+    host(nsenter).pass_launch()
+    host(nsenter).end_launch()
+
+    # The launch's own record is removed first: a removal cut short leaves no launch on record.
+    assert nsenter.calls() == [
+        [*IN_THE_HOST, "touch", "/run/rhi/launching"],
+        [*IN_THE_HOST, "touch", "/run/rhi/launch-passed"],
+        [*IN_THE_HOST, "rm", "-f", "/run/rhi/launching", "/run/rhi/launch-passed"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("names", "begun", "passed"),
+    [
+        ("engine-flags\nlaunch-passed\nlaunching\nrelease.env", True, True),
+        ("engine-flags\nlaunching\nrelease.env", True, False),
+        ("release.env", False, False),
+    ],
+)
+def test_a_launch_is_on_record_when_the_hosts_run_folder_lists_its_file(
+    names: str, begun: bool, passed: bool, nsenter: Nsenter
+) -> None:
+    nsenter.say(names)
+
+    assert host(nsenter).launch_begun() is begun
+    assert host(nsenter).launch_passed() is passed
+    assert nsenter.calls() == [[*IN_THE_HOST, "ls", "/run/rhi"]] * 2
+
+
+def test_a_host_that_does_not_list_its_run_folder_has_not_said_that_no_launch_is_on_record(nsenter: Nsenter) -> None:
+    nsenter.fail_on("ls")
+
+    with pytest.raises(HostError) as raised:
+        host(nsenter).launch_begun()
+
+    assert (raised.value.action, raised.value.returncode) == ("record", 3)

@@ -16,9 +16,21 @@ The host's console is the instance's serial console, which EC2 keeps and gives a
 console output. A line is written there on the host's own console device, and reaches the command
 on its standard input: reading it back needs no permission of the instance role.
 
+The host also keeps the record of a launch under way: an empty file, `LAUNCH_RECORD`, that is
+there from the start of a launch until Auto Scaling has taken the completion that lets the instance
+into service. A second empty file, `PASSED_RECORD`, joins it once every step of the launch has
+passed, before the completion is sent. The agent's program reads both when it starts: beside a
+started engine, no record says the instance serves, the first alone that its launch hook still
+waits, and the two that only the completion's answer is missing (`rhi_lifecycle.__main__`). They
+are under `/run`, which is empty at every start of the instance, beside the settings the boot
+program writes there.
+
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
-caller gave it has passed: it is stopped, because a transition has a deadline (section 4.3).
+caller gave it has passed: it is stopped, because the run of a canary has a deadline
+(`rhi_lifecycle.canary`). Two answers are read, compared and never repeated: the state systemd
+gives the engine's unit, a word of systemd's own vocabulary, and the names of the files beside the
+records.
 """
 
 from __future__ import annotations
@@ -38,6 +50,13 @@ ENGINE_UNIT = "rhi-engine"
 # The host's console device: the kernel writes it to the serial console of an instance.
 CONSOLE = "/dev/console"
 
+# The record of a launch under way: an empty file of this name in this folder of the host, where
+# the boot program writes the release's settings. The record that its steps have all passed is
+# another, beside it.
+RUN_FOLDER = "/run/rhi"
+LAUNCH_RECORD = "launching"
+PASSED_RECORD = "launch-passed"
+
 # The host's first process, and the namespaces of it a command enters.
 HOST_NAMESPACES = ("--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid")
 
@@ -47,7 +66,8 @@ _REGISTRY = re.compile(r"([A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?)/\S+", re.ASCII)
 
 class HostError(Exception):
     """An action on the host failed. `action` is `login`, `pull`, `inspect`, `start`, `restart`,
-    `stop` or `console`; `returncode` is the command's exit status, or None when no command ran to its end."""
+    `stop`, `state`, `record` or `console`; `returncode` is the command's exit status, or None when no
+    command ran to its end."""
 
     def __init__(self, action: str, returncode: int | None = None) -> None:
         how = "could not be run" if returncode is None else f"exited with status {returncode}"
@@ -66,9 +86,9 @@ class Host:
         self._nsenter = nsenter
 
     def holds(self, image: str, timeout: float | None = None) -> bool:
-        """Whether the host's docker holds `image`: an instance that went through the warm pool
-        pulled it there, and one launched straight into service has not. A docker that has not
-        answered within `timeout` seconds, when one is given, has not said no: `HostError`."""
+        """Whether the host's docker holds `image`: a launch pulls it only when the disk lacks it.
+        A docker that has not answered within `timeout` seconds, when one is given, has not said
+        no: `HostError`."""
         end = None if timeout is None else time.monotonic() + timeout
         try:
             self._run("inspect", ("docker", "image", "inspect", image), end=end, quiet=True)
@@ -97,6 +117,52 @@ class Host:
     def restart_engine(self) -> None:
         self._run("restart", ("systemctl", "restart", ENGINE_UNIT))
 
+    def engine_started(self) -> bool:
+        """Whether the engine's unit has been started on the host and not stopped since: systemd
+        gives it any state but `inactive`. A unit that is starting, or that systemd is about to
+        start again after a failure, counts: only the agent starts the unit
+        (`services/engine/units/rhi-engine.service`), and only the agent stops it. A systemd that
+        gave no state has not said no: `HostError`."""
+        # The state is systemd's one word on the standard output. The exit status tells only a
+        # unit that is active from every other.
+        returncode, state = self._read("state", ("systemctl", "is-active", ENGINE_UNIT))
+        if not state:
+            raise HostError("state", returncode)
+        return state != "inactive"
+
+    def begin_launch(self) -> None:
+        """Put on record that a launch is under way on the host."""
+        self._run("record", ("touch", f"{RUN_FOLDER}/{LAUNCH_RECORD}"))
+
+    def pass_launch(self) -> None:
+        """Put on record that every step of the launch under way has passed: its completion of the
+        launch hook is sent next."""
+        self._run("record", ("touch", f"{RUN_FOLDER}/{PASSED_RECORD}"))
+
+    def end_launch(self) -> None:
+        """Remove the records of the launch: Auto Scaling has let the instance into service."""
+        # The launch's own record first: a removal that stops between the two leaves no launch on
+        # record, which is what an instance in service has.
+        self._run("record", ("rm", "-f", f"{RUN_FOLDER}/{LAUNCH_RECORD}", f"{RUN_FOLDER}/{PASSED_RECORD}"))
+
+    def launch_begun(self) -> bool:
+        """Whether a launch is on record on the host: one was begun, and its record was not
+        removed. A host that did not list its folder has not said no: `HostError`."""
+        return LAUNCH_RECORD in self._records()
+
+    def launch_passed(self) -> bool:
+        """Whether the host has on record that every step of a launch passed. A host that did not
+        list its folder has not said no: `HostError`."""
+        return PASSED_RECORD in self._records()
+
+    def _records(self) -> list[str]:
+        # The names in the folder, one on each line. The exit status of a command that looks for
+        # one file would not tell a file that is absent from a host that could not be entered.
+        returncode, names = self._read("record", ("ls", RUN_FOLDER))
+        if returncode != 0:
+            raise HostError("record", returncode)
+        return names.splitlines()
+
     def stop_engine(self) -> None:
         self._run("stop", ("systemctl", "stop", ENGINE_UNIT))
 
@@ -121,6 +187,18 @@ class Host:
         if not (user and colon and password):
             raise HostError("login")
         return user, password
+
+    def _read(self, action: str, command: tuple[str, ...]) -> tuple[int, str]:
+        """Run `command` in the host's namespaces, and give its exit status and what it wrote on
+        its standard output."""
+        arguments = (self._nsenter, *HOST_NAMESPACES, "--", *command)
+        try:
+            done = subprocess.run(
+                arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+            )
+        except OSError:
+            raise HostError(action) from None
+        return done.returncode, done.stdout.decode("ascii", errors="replace").strip()
 
     def _run(
         self,

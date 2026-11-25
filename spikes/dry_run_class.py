@@ -194,9 +194,11 @@ _ORDER = tuple(
         Stage.HOOK,
     )
 )
-# The transitions in the order a launch's label may move along: a launch into service is taken for a
-# promotion before it may turn out to be a cold launch. A step that shows two takes the later.
-_TRANSITIONS = tuple(transition.value for transition in Transition)
+# The labels a launch's series may carry in the workspace. The agent gives one, a launch's
+# (`Transition`); the agents before it gave two more, and a launch's label could move along them in
+# this order: a launch into service was taken for a promotion before it turned out to be a cold
+# launch. A step that shows two takes the later.
+_TRANSITIONS = ("entry", "promotion", Transition.LAUNCH.value)
 _LAST_STAGE = Stage.HOOK.value
 
 

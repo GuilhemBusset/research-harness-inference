@@ -20,12 +20,10 @@ from botocore.exceptions import ClientError
 from prometheus_client import Histogram
 from prometheus_client.parser import text_string_to_metric_families
 
-from rhi_common.engine_metrics import MOCK
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import metrics, stages
 from rhi_lifecycle.host import Host
 from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, NO_MODEL, Engine, Launch, Metadata, Outcome
-from rhi_lifecycle.termination import Termination
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -52,7 +50,9 @@ VALUE: dict[str, Any] = {
         "secret_id": "rhi/coursework/engine",
     },
 }
-WARM, IN_SERVICE = "Warmed:Stopped", "InService"
+IN_SERVICE = "InService"
+# The one value of the metrics' label `transition`: the fleet dashboard selects its series by it.
+LAUNCH = "cold-launch"
 # The time of day when the kernel started, in seconds since the epoch.
 EPOCH = 1_800_000_000
 
@@ -66,40 +66,33 @@ class World(Host):
     """An instance prepared with the release of `VALUE`, whose kernel started at 0 on the clock.
     `rows` holds the heartbeat rows the launch wrote, `results` what it completed the hook with."""
 
-    def __init__(self, folder: Path, target: str, *, on_disk: bool, measured: int | None = None) -> None:
+    def __init__(self, folder: Path, *, on_disk: bool) -> None:
         super().__init__(ecr=object())
         self.now = BOOT
-        self.target, self.on_disk = target, on_disk
+        self.target, self.on_disk = IN_SERVICE, on_disk
         self.parameter = copy.deepcopy(VALUE)
-        if measured is not None:
-            self.parameter["measured_start_seconds"] = measured
-        self.held, self.served = folder / "release.json", folder / "run" / "served"
+        self.held = folder / "release.json"
         self.held.write_text(json.dumps(VALUE))
-        # The engine: when its health route starts to answer 200 (None: never), whether its model
-        # ever loads, and the status of its answer to the warm-up request.
+        # The engine: when its health route starts to answer 200 (None: not started), and the
+        # status of its answer to the warm-up request.
         self.healthy_at: float | None = None
-        self.loads, self.warm_up = True, 200
+        self.warm_up = 200
         self.table_refuses = False
         self.tables: list[str] = []
         self.rows: list[InstanceHeartbeat] = []
         self.results: list[str] = []
 
     def launch(self) -> Launch:
-        metadata = Metadata(self.fetch)
         return Launch(
             NAME,
-            metadata=metadata,
+            metadata=Metadata(self.fetch),
             autoscaling=self,
             ssm=self,
             secrets=self,
             dynamodb=self,
             host=self,
             engine=Engine(self.fetch),
-            termination=Termination(
-                NAME, metadata, autoscaling=self, ssm=self, host=self, engine=MOCK, fetch=self.fetch, sleep=self.sleep
-            ),
             held=self.held,
-            served=self.served,
             clock=lambda: self.now,
             sleep=self.sleep,
             wall=lambda: EPOCH + self.now,
@@ -121,7 +114,16 @@ class World(Host):
 
     def start_engine(self, timeout: float | None = None) -> None:
         self.now += UNIT
-        self.healthy_at = self.now + LOAD if self.loads else None
+        self.healthy_at = self.now + LOAD
+
+    def begin_launch(self) -> None:
+        pass
+
+    def pass_launch(self) -> None:
+        pass
+
+    def end_launch(self) -> None:
+        pass
 
     # The SDK's clients, and the heartbeats table of its DynamoDB resource.
 
@@ -176,19 +178,21 @@ def exposed() -> dict[tuple[str, str], float]:
     }
 
 
-def test_a_promotion_gives_one_duration_per_stage_and_they_sum_to_the_whole(tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
+def test_a_launch_gives_one_duration_per_stage_and_they_sum_to_the_whole(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=False)
 
     assert world.launch().run() is Outcome.CONTINUED
 
+    # Every stage under the one transition, by the value the dashboard selects.
+    assert [transition.value for transition in stages.Transition] == [LAUNCH]
     assert exposed() == {
-        ("promotion", "boot"): BOOT,
-        ("promotion", "image"): READ + ASK,
-        ("promotion", "release-check"): READ,
-        ("promotion", "container-start"): SECRET_READ + UNIT,
-        ("promotion", "weights"): LOAD,
-        ("promotion", "warm-up"): ANSWER,
-        ("promotion", "hook"): COMPLETE,
+        (LAUNCH, "boot"): BOOT,
+        (LAUNCH, "image"): READ + ASK + PULL,
+        (LAUNCH, "release-check"): READ,
+        (LAUNCH, "container-start"): SECRET_READ + UNIT,
+        (LAUNCH, "weights"): LOAD,
+        (LAUNCH, "warm-up"): ANSWER,
+        (LAUNCH, "hook"): COMPLETE,
     }
     assert {stage for _, stage in exposed()} == {stage.value for stage in stages.Stage}
     # The whole: from the kernel's start, at 0 on the clock, to the completed hook.
@@ -213,22 +217,15 @@ def another_release(world: World) -> None:
     world.parameter["engine_flags"] = ["--max-model-len", "32768"]
 
 
-def never_healthy(world: World) -> None:
-    world.loads = False
-
-
 def failed_warm_up(world: World) -> None:
     world.warm_up = 500
 
 
-@pytest.mark.parametrize(
-    ("failure", "last"),
-    [(another_release, "release-check"), (never_healthy, "weights"), (failed_warm_up, "warm-up")],
-)
+@pytest.mark.parametrize(("failure", "last"), [(another_release, "release-check"), (failed_warm_up, "warm-up")])
 def test_an_abandoned_launch_leaves_its_last_stage_in_the_heartbeat(
     failure: Callable[[World], None], last: str, tmp_path: Path
 ) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True, measured=200)
+    world = World(tmp_path, on_disk=True)
     failure(world)
 
     assert world.launch().run() is Outcome.ABANDONED
@@ -240,31 +237,19 @@ def test_an_abandoned_launch_leaves_its_last_stage_in_the_heartbeat(
     assert sum(exposed().values()) == world.now - COMPLETE
 
 
-def test_each_transition_times_the_stages_it_has(tmp_path: Path) -> None:
-    (tmp_path / "entry").mkdir()
-    entry = World(tmp_path / "entry", WARM, on_disk=False)
-    assert entry.launch().run() is Outcome.CONTINUED
-    # An entry to the warm pool starts no engine.
-    assert exposed() == {
-        ("entry", "boot"): BOOT,
-        ("entry", "image"): READ + PULL,
-        ("entry", "release-check"): READ,
-        ("entry", "hook"): COMPLETE,
-    }
-    assert [row.stage for row in entry.rows] == ["image", "release-check", "hook"]
-
-    # A launch straight into service pulls the image first. The endpoint gives the last launch only.
-    (tmp_path / "cold").mkdir()
-    cold = World(tmp_path / "cold", IN_SERVICE, on_disk=False)
-    assert cold.launch().run() is Outcome.CONTINUED
-    assert {transition for transition, _ in exposed()} == {"cold-launch"}
-    assert exposed()["cold-launch", "image"] == READ + ASK + PULL
+def test_the_endpoint_gives_the_last_launch_only(tmp_path: Path) -> None:
+    for name, on_disk in (("first", False), ("second", True)):
+        (tmp_path / name).mkdir()
+        world = World(tmp_path / name, on_disk=on_disk)
+        assert world.launch().run() is Outcome.CONTINUED
+    # The second launch found the image on its disk: its image stage is the one exposed.
+    assert exposed()[LAUNCH, "image"] == READ + ASK
     assert len(exposed()) == len(stages.Stage)
-    assert sum(exposed().values()) == cold.now
+    assert sum(exposed().values()) == world.now
 
 
 def test_a_row_that_cannot_be_written_does_not_stop_the_launch(tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
+    world = World(tmp_path, on_disk=True)
     world.table_refuses = True
 
     assert world.launch().run() is Outcome.CONTINUED
@@ -278,15 +263,15 @@ def test_the_boot_is_what_the_kernel_says_it_has_been_up(tmp_path: Path) -> None
     assert stages.uptime(tmp_path / "missing") is None
 
     # A host that does not say gives the launch no boot stage, and nothing else changes.
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
+    world = World(tmp_path, on_disk=True)
     assert replace(world.launch(), uptime=lambda: None).run() is Outcome.CONTINUED
-    assert ("promotion", "boot") not in exposed()
+    assert (LAUNCH, "boot") not in exposed()
     assert sum(exposed().values()) == world.now - BOOT
 
 
-def completed(transition: str = "promotion", under: float | None = None) -> float:
+def completed(under: float | None = None) -> float:
     """The launches the agent's endpoint counts as completed, or those of them under `under` seconds."""
-    sample, labels = f"{stages.LAUNCH_METRIC}_count", {"transition": transition}
+    sample, labels = f"{stages.LAUNCH_METRIC}_count", {"transition": LAUNCH}
     if under is not None:
         sample, labels = f"{stages.LAUNCH_METRIC}_bucket", {**labels, "le": f"{under:.1f}"}
     return metrics.REGISTRY.get_sample_value(sample, labels) or 0.0
@@ -294,17 +279,17 @@ def completed(transition: str = "promotion", under: float | None = None) -> floa
 
 def test_each_launch_completed_is_counted_once_and_no_other(tmp_path: Path) -> None:
     before, before_under = completed(), completed(under=300)
-    # Two promotions that took the same seconds are two launches completed.
+    # Two launches that took the same seconds are two launches completed.
     for name in ("first", "second"):
         (tmp_path / name).mkdir()
-        assert World(tmp_path / name, IN_SERVICE, on_disk=True).launch().run() is Outcome.CONTINUED
+        assert World(tmp_path / name, on_disk=True).launch().run() is Outcome.CONTINUED
     assert completed() == before + 2
     # Each took the sum of its stages, under 5 minutes.
     assert completed(under=300) == before_under + 2
 
     # A completion that Auto Scaling refused, and an abandoned launch, complete nothing.
     (tmp_path / "refused").mkdir()
-    refused = World(tmp_path / "refused", IN_SERVICE, on_disk=True)
+    refused = World(tmp_path / "refused", on_disk=True)
 
     def refuse(**request: str) -> dict[str, Any]:
         refused.now += COMPLETE
@@ -313,15 +298,30 @@ def test_each_launch_completed_is_counted_once_and_no_other(tmp_path: Path) -> N
     refused.complete_lifecycle_action = refuse
     assert refused.launch().run() is Outcome.NOT_COMPLETED
     (tmp_path / "abandoned").mkdir()
-    abandoned = World(tmp_path / "abandoned", IN_SERVICE, on_disk=True, measured=200)
-    never_healthy(abandoned)
+    abandoned = World(tmp_path / "abandoned", on_disk=True)
+    failed_warm_up(abandoned)
     assert abandoned.launch().run() is Outcome.ABANDONED
     assert completed() == before + 2
 
 
+def test_a_resumed_launch_is_counted_when_auto_scaling_takes_its_completion(tmp_path: Path) -> None:
+    before, before_under, before_slower = completed(), completed(under=300), completed(under=420)
+    # An agent restarted after the launch's last step sends the completion again, 5 minutes and
+    # more after the kernel's start.
+    world = World(tmp_path, on_disk=True)
+    world.now = 300.0
+    assert world.launch().resume() is Outcome.CONTINUED
+    assert world.results == ["CONTINUE"]
+    # One launch more, of the seconds the kernel had been up when the completion was taken, and
+    # no row of a launch's stage.
+    assert completed() == before + 1
+    assert (completed(under=300), completed(under=420)) == (before_under, before_slower + 1)
+    assert world.rows == []
+
+
 def test_a_launch_of_exactly_five_minutes_is_not_under_them() -> None:
     launches = Histogram("launch_seconds", "", ("transition",), buckets=stages.LAUNCH_BUCKETS, registry=None)
-    timings = stages.Timings(stages.Transition.PROMOTION, lambda: 0.0, launches=launches)
+    timings = stages.Timings(lambda: 0.0, launches=launches)
     timings.seconds = {stages.Stage.BOOT: 100.0, stages.Stage.HOOK: 200.0}
     timings.completed()
     buckets = {(s.labels["le"], s.value) for s in next(iter(launches.collect())).samples if s.name.endswith("_bucket")}
