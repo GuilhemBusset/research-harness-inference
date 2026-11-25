@@ -29,19 +29,18 @@ while the pool is not ready, the script reads the pool's rows of the heartbeats 
 instance row written since the booking, no instance was launched. It then runs no test on that
 pool, stops its session and leaves the one line `no-capacity` in the file
 `RHI_VERIFY_GPU_REASON_FILE` names; its exit is that of the mock pool's run. The step's post-build
-phase copies the file, when there is one and the build is succeeding, to the object
-`verification/<execution ID>/gpu-not-run`, the mark by which the reporter gives the verification's
-success the description of one whose GPU tests did not run for lack of capacity
-(`rhi_reporter.status`). An instance that was launched and does not serve is a failed run, below.
+phase copies the file, when there is one, to the object `verification/<execution ID>/gpu-not-run`,
+the mark by which the reporter gives the verification's success the description of one whose GPU
+tests did not run for lack of capacity (`rhi_reporter.status`). An instance that was launched and
+does not serve is a failed run, below.
 
-**Why a failing build's reason is not copied.** The reporter reads the mark for a verification that
-succeeded, and finds it by the execution's ID. A retry of the stage keeps that ID, and the role may
-not delete a mark. So were the reason of an attempt that failed copied, on the mock pool's tests
-say, the retry that then passes with its GPU tests run would be reported as one whose GPU tests did
-not run. The phase reads whether the build is succeeding from CodeBuild's own
-`CODEBUILD_BUILD_SUCCEEDING`, `1` in the post-build phase of a build whose earlier phases passed.
-The marks of a failure, the tests that failed and the last stages, are read for a failure only, and
-are copied from any build.
+**The reason is copied from any build, and a retry is told by its time.** The file says what this
+build did on the pool, so the phase copies it whether the build passes or fails, on the mock pool's
+tests say. A retry of the stage keeps the execution's ID, and the role may not delete a mark: the
+mark of an attempt that failed is still there when the retry passes with its GPU tests run. So the
+reporter takes the mark for a verification's success only when it was written since the run of the
+action that succeeded started (`rhi_reporter.handler`). A retry that finds no capacity again writes
+the mark again.
 
 **How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, a refresh
 and two runs of the tests, and `check_wait_minutes` more for each pool of `BOOKED_POOLS`, the
@@ -245,27 +244,21 @@ def timeout(check_wait_minutes: int) -> cdk.Duration:
     return cdk.Duration.minutes(minutes)
 
 
-# CodeBuild's own variable: `1` while the build is succeeding, `0` once a phase of it failed.
-SUCCEEDING = '[ "$CODEBUILD_BUILD_SUCCEEDING" = 1 ]'
-
-
-def _copy(file_variable: str, key: str, *, succeeding: bool = False) -> str:
+def _copy(file_variable: str, key: str) -> str:
     """The command that copies the file a variable names, when there is one, to the object `key`
-    of the execution's folder, where the reporter reads it; with `succeeding`, only in a build
-    that is succeeding."""
+    of the execution's folder, where the reporter reads it."""
     to = f"s3://${BUCKET_VARIABLE}/{PREFIX}/${EXECUTION_VARIABLE}/{key}"
-    when = f'[ -f "${file_variable}" ]' + (f" && {SUCCEEDING}" if succeeding else "")
-    return f'if {when}; then aws s3 cp "${file_variable}" "{to}"; fi'
+    return f'if [ -f "${file_variable}" ]; then aws s3 cp "${file_variable}" "{to}"; fi'
 
 
 # What the script left, as the objects the reporter reads: its reason, the tests that failed, the
-# last stage each instance reached, and the reason its GPU tests did not run. The last is the mark
-# of a success: it is not copied from a build that is failing, whose retry has the same execution.
+# last stage each instance reached, and the reason its GPU tests did not run. Each is copied from a
+# build that passes and from one that fails.
 POST_BUILD_COMMANDS = [
     _copy(REASON_FILE_VARIABLE, NOT_RUN),
     _copy(FAILED_TESTS_FILE_VARIABLE, FAILED_TESTS),
     _copy(LAST_STAGES_FILE_VARIABLE, LAST_STAGES),
-    _copy(GPU_REASON_FILE_VARIABLE, GPU_NOT_RUN, succeeding=True),
+    _copy(GPU_REASON_FILE_VARIABLE, GPU_NOT_RUN),
 ]
 
 

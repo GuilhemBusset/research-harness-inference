@@ -812,6 +812,27 @@ def test_a_launch_is_not_forgotten_when_its_row_expires_before_the_wait_ends(
     assert run.pools == [None, "coursework"]
 
 
+def test_an_instance_that_was_replaced_keeps_the_stage_it_was_last_seen_at(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. The first instance stops at its boot and its row expires; the group
+    # launches another, which stops at its weights and whose row is there when the tests fail.
+    first = instance_row("coursework", "boot", NOW + 60)[1]
+    second = instance_row("coursework", "weights", first["expires_at"] + 240)[1]
+    assert second["written_at"] < NOW + 120 * 60 < second["expires_at"]
+
+    _, _, stages = on_a_pool_that_is_not_ready(
+        tmp_path,
+        PoolRuns(coursework=3),
+        heartbeats,
+        Lifetimes(first, second),
+        **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"},
+    )
+
+    # Each instance has its line, once: the one that is gone, and the one whose row is still read.
+    assert sorted((stages or "").splitlines()) == ["boot", "weights"]
+
+
 class UnreadableUntil:
     """A DynamoDB client whose queries fail until the time `until` of `clock`, then are `client`'s."""
 

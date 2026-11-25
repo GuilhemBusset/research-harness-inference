@@ -49,8 +49,9 @@ deployment, with the folders of pytest's import path in `PYTHONPATH` for the boo
   instance's heartbeat row written since the booking, which it looks for through the wait and at
   its end, no instance was launched: it runs no test on that pool, stops its session, leaves the
   one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names and exits with the result
-  of its other runs. The post-build phase copies that file as the mark `gpu-not-run` only from a
-  build that succeeds, so that a retry's success says only what the retry ran. With such a row, or
+  of its other runs. The post-build phase copies that file as the mark `gpu-not-run`, from a build
+  that fails too; the reporter takes the mark for a success only when the run that succeeded wrote
+  it, so that a retry's success says only what the retry ran. With such a row, or
   when the table's answers cannot tell, a read that failed among them, the tests run and their
   failure is the script's.
 - `booking.py` is what a check books a pool through: `book` writes a session of one instance, for

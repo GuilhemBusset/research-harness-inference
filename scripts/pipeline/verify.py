@@ -81,10 +81,11 @@ the queries before it met. Otherwise, without the table's name among it, the scr
 says so in a line of its own, and runs the tests: a launched instance is never reported as a lack
 of capacity. Without `RHI_VERIFY_GPU_REASON_FILE`, the reason cannot be left, and the script fails.
 
-The reason is left whatever the script's exit: it says what this run did on the pool. Which run's
-word reaches the reporter is the step's affair: its post-build phase copies the file only from a
-build that succeeds (`src/rhi/pipeline/verify.py`), since the reporter reads the mark for a
-verification that succeeded, by the execution's ID, which a retry of the stage keeps.
+The reason is left whatever the script's exit: it says what this run did on the pool, and the
+step's post-build phase copies it from a build that fails as from one that passes
+(`src/rhi/pipeline/verify.py`). Which run's word counts for a success is the reporter's affair: a
+retry of the stage keeps the execution's ID, so it takes the mark only of the run that succeeded
+(`rhi_reporter.handler`).
 
 **When no test runs.** Two states of a correct deployment leave nothing to test: the endpoint has
 no HTTPS listener yet, which its address reading `none` says, or the canary's secret does not
@@ -104,13 +105,16 @@ failed.
 rows of the instances of each pool it tested, the pools `RHI_VERIFY_RELEASE_PARAMETERS` names, from
 the table `RHI_VERIFY_HEARTBEATS_TABLE` names, and leaves the last lifecycle stage each instance
 reached as one line of the file `RHI_VERIFY_LAST_STAGES_FILE` names: the row's `stage`, and nothing
-else of a row, neither the instance's ID nor its release. It asks DynamoDB for that one attribute.
+else of a row, neither the instance's ID nor its release. It asks DynamoDB for that attribute and
+the row's key, by which it tells one instance from another and which it writes nowhere.
 A launch names a stage of `rhi_lifecycle.stages` there, and an instance in service the serving
-module's own name. For a pool that has no row left by then, or when the table cannot be read, which
-is a line in the log, the stages are those the script last saw during its wait for that pool, when
-it saw a launch: a row may expire before a long wait and the tests are over. No stage, or no table
-named, leaves no file: the exit stays the tests'. The post-build phase copies the file to
-where the reporter reads it, and the reporter names only the stages of its own list.
+module's own name. An instance the script saw during its wait for a pool, launched since the
+booking, and that has no row left by then keeps the stage it was last seen at: a row may expire
+before a long wait and the tests are over, and the instance that replaced it has a row of its own.
+When the table cannot be read, which is a line in the log, the stages are those seen during the
+waits. No stage, or no table named, leaves no file: the exit stays the tests'. The post-build phase
+copies the file to where the reporter reads it, and the reporter names only the stages of its own
+list.
 
 What the step gives, in the environment:
 
@@ -151,7 +155,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -304,39 +308,47 @@ def _stage(item: Mapping[str, Any]) -> str | None:
     return stage if isinstance(stage, str) and stage.splitlines() == [stage] else None
 
 
-def last_stages(client: Any, table: str, pool: str) -> list[str]:
-    """The last lifecycle stage each instance of `pool` reached: the `stage` of each instance's row
-    of the heartbeats table `table`, read by pool with `client`, a DynamoDB client of the AWS SDK.
-    Only that attribute is asked for, and a row whose stage is not one line of text gives none."""
-    found: list[str] = []
+def _by_instance(items: Iterable[Mapping[str, Any]]) -> dict[str, str | None]:
+    """The stage each row of `items` holds, by the row's sort key, which names its instance."""
+    return {item.get(SOURCE_ATTRIBUTE, {}).get("S", ""): _stage(item) for item in items}
+
+
+def last_stages(client: Any, table: str, pool: str) -> dict[str, str]:
+    """The last lifecycle stage each instance of `pool` reached, by the instance's sort key: the
+    `stage` of each instance's row of the heartbeats table `table`, read by pool with `client`, a
+    DynamoDB client of the AWS SDK. Only the key and that attribute are asked for, and a row whose
+    stage is not one line of text gives none."""
+    found: dict[str, str] = {}
     request: dict[str, Any] = {
         "TableName": table,
         "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
-        "ProjectionExpression": "#stage",
+        "ProjectionExpression": "#source, #stage",
         "ExpressionAttributeNames": {"#pool": POOL_ATTRIBUTE, "#source": SOURCE_ATTRIBUTE, "#stage": STAGE_ATTRIBUTE},
         "ExpressionAttributeValues": {":pool": {"S": pool}, ":instance": {"S": INSTANCE_SOURCE}},
     }
     for _ in range(ROW_PAGES):
         answer = client.query(**request)
-        found += [stage for stage in map(_stage, answer.get("Items", [])) if stage is not None]
+        rows = _by_instance(answer.get("Items", []))
+        found |= {instance: stage for instance, stage in rows.items() if stage is not None}
         if "LastEvaluatedKey" not in answer:
             break
         request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
     return found
 
 
-def rows_since(client: Any, table: str, pool: str, since: int) -> list[str | None]:
+def rows_since(client: Any, table: str, pool: str, since: int) -> dict[str, str | None]:
     """The instances of `pool` that wrote their heartbeat row at the time `since` or after it, in
-    seconds since the epoch: for each such row of the heartbeats table `table`, its stage, or
-    `None` when it is not one line of text. Read with `client`, a DynamoDB client of the AWS SDK,
-    in a strongly consistent read, so that a row written a moment ago is among them, and every
-    page of the pool's instance rows: an empty answer says that the table holds no such row."""
+    seconds since the epoch: for each such row of the heartbeats table `table`, by its sort key,
+    its stage, or `None` when it is not one line of text. Read with `client`, a DynamoDB client of
+    the AWS SDK, in a strongly consistent read, so that a row written a moment ago is among them,
+    and every page of the pool's instance rows: an empty answer says that the table holds no such
+    row."""
     request: dict[str, Any] = {
         "TableName": table,
         "ConsistentRead": True,
         "KeyConditionExpression": "#pool = :pool AND begins_with(#source, :instance)",
         "FilterExpression": "#written >= :since",
-        "ProjectionExpression": "#stage",
+        "ProjectionExpression": "#source, #stage",
         "ExpressionAttributeNames": {
             "#pool": POOL_ATTRIBUTE,
             "#source": SOURCE_ATTRIBUTE,
@@ -349,16 +361,16 @@ def rows_since(client: Any, table: str, pool: str, since: int) -> list[str | Non
             ":since": {"N": str(since)},
         },
     }
-    rows: list[str | None] = []
+    rows: dict[str, str | None] = {}
     while True:
         answer = client.query(**request)
-        rows += map(_stage, answer.get("Items", []))
+        rows |= _by_instance(answer.get("Items", []))
         if "LastEvaluatedKey" not in answer:
             return rows
         request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
 
 
-def launched_rows(env: Mapping[str, str], pool: str, since: int, client: Any = None) -> list[str | None] | None:
+def launched_rows(env: Mapping[str, str], pool: str, since: int, client: Any = None) -> dict[str, str | None] | None:
     """The rows of the instances of `pool` launched since the time `since`, a booking's, as the
     heartbeats table `RHI_VERIFY_HEARTBEATS_TABLE` names holds them now (`rows_since`). `None`
     when the script cannot tell, without the table's name or when the table cannot be read, after
@@ -381,14 +393,17 @@ def launched_rows(env: Mapping[str, str], pool: str, since: int, client: Any = N
 
 
 def leave_last_stages(
-    env: Mapping[str, str], pools: Iterable[str], client: Any = None, seen: Mapping[str, Sequence[str]] | None = None
+    env: Mapping[str, str],
+    pools: Iterable[str],
+    client: Any = None,
+    seen: Mapping[str, Mapping[str, str]] | None = None,
 ) -> None:
     """After a run of the tests that failed: leaves the last stage each instance of `pools` reached,
     one per line and nothing else, in the file `RHI_VERIFY_LAST_STAGES_FILE` names, for the step's
-    post-build phase. `seen` holds, by pool, the stages the script last saw during its wait for the
-    pool: they stand for a pool that has no row now, and for every pool when the table cannot be
-    read, which is a line in the log. Without the table's name, the file's or a stage, it leaves no
-    file: the tests' exit is the script's."""
+    post-build phase. `seen` holds, by pool then by instance, the stage the script last saw during
+    its wait for the pool: it stands for an instance that has no row now, and for every instance
+    when the table cannot be read, which is a line in the log. Without the table's name, the file's
+    or a stage, it leaves no file: the tests' exit is the script's."""
     table, named = env.get(HEARTBEATS_TABLE_VARIABLE), env.get(LAST_STAGES_FILE_VARIABLE)
     pools, seen = list(pools), seen or {}
     if not table or not named or not pools:
@@ -398,10 +413,12 @@ def leave_last_stages(
             import boto3
 
             client = boto3.client("dynamodb")
-        stages = [stage for pool in pools for stage in last_stages(client, table, pool) or seen.get(pool, ())]
+        # An instance's row of now stands before what was seen of it during the wait.
+        by_pool = [{**seen.get(pool, {}), **last_stages(client, table, pool)} for pool in pools]
     except (BotoCoreError, ClientError) as error:
         print(f"{NAME}: the instances' last stages were not read ({type(error).__name__})", file=sys.stderr)
-        stages = [stage for pool in pools for stage in seen.get(pool, ())]
+        by_pool = [seen.get(pool, {}) for pool in pools]
+    stages = [stage for by_instance in by_pool for stage in by_instance.values()]
     if not stages:
         return
     path = Path(named)
@@ -573,13 +590,15 @@ def wait_until_ready(
 class Launches:
     """What the heartbeats table said, through the wait for a pool, of the instances launched since
     the time `since`, a booking's. `rows` is given `since` and answers with the stage of each row
-    written since then, as the table holds them at that moment, or with `None` when it cannot
-    tell; `clock` gives the time. Three answers are kept apart: a row, which is a launch, and
-    stays one after the row expired; no row, which says that no instance was launched up to then,
-    unless the answer before it is so old that a row may have come and gone between the two; and
-    `None`, which says nothing."""
+    written since then, by its instance, as the table holds them at that moment, or with `None`
+    when it cannot tell; `clock` gives the time. Three answers are kept apart: a row, which is a
+    launch, and stays one after the row expired; no row, which says that no instance was launched
+    up to then, unless the answer before it is so old that a row may have come and gone between
+    the two; and `None`, which says nothing."""
 
-    def __init__(self, rows: Callable[[int], list[str | None] | None], since: int, clock: Callable[[], float]) -> None:
+    def __init__(
+        self, rows: Callable[[int], Mapping[str, str | None] | None], since: int, clock: Callable[[], float]
+    ) -> None:
         self._rows, self._since, self._clock = rows, since, clock
         self._launched = False
         # The time up to which the answers tell every launch since the booking, while no answer
@@ -587,8 +606,9 @@ class Launches:
         self._told_until: float = since
         self._gap = False
         self._asked_at: float | None = None
-        # The stages of the rows of the last answer that held one.
-        self.stages: tuple[str, ...] = ()
+        # The stage each instance was last seen at, by instance: one whose row expired, and that
+        # another replaced, keeps its own.
+        self.stages: dict[str, str] = {}
 
     def _ask(self) -> bool:
         """Asks; whether there was an answer."""
@@ -603,7 +623,7 @@ class Launches:
         self._told_until = now
         if rows:
             self._launched = True
-            self.stages = tuple(stage for stage in rows if stage is not None)
+            self.stages |= {instance: stage for instance, stage in rows.items() if stage is not None}
         return True
 
     def look(self) -> None:
@@ -623,12 +643,13 @@ class Outcome:
     """What became of a pool's run of the tests: the run's exit, `None` when no run was made;
     whether the session was stopped or was not the script's to stop; whether no run was made
     because no instance was launched during the wait, and not because the pool was not booked;
-    and the stages the script last saw, during the wait, of the instances launched in it."""
+    and the stage the script last saw, during the wait, of each instance launched in it, by
+    instance."""
 
     exit_code: int | None
     in_order: bool
     no_capacity: bool = False
-    stages: tuple[str, ...] = ()
+    stages: Mapping[str, str] = field(default_factory=dict)
 
 
 def run_in_a_session(
@@ -641,7 +662,7 @@ def run_in_a_session(
     status: Callable[[float], str | None],
     sleep: Callable[[float], None],
     clock: Callable[[], float],
-    launched: Callable[[int], list[str | None] | None] | None = None,
+    launched: Callable[[int], Mapping[str, str | None] | None] | None = None,
 ) -> Outcome:
     """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool and
     stops after the run, whatever its result, or after its wait when no run is made. A pool that
@@ -719,7 +740,7 @@ def run_in_a_session(
                 print(f"{NAME}: the session on the pool {pool} no longer reads as the booking: it is left as it is")
             else:
                 print(f"{NAME}: stopped the session it booked on the pool {pool}")
-    stages = () if launches is None else launches.stages
+    stages = {} if launches is None else launches.stages
     return Outcome(exit_code, in_order=stopped, no_capacity=no_capacity, stages=stages)
 
 
@@ -801,7 +822,7 @@ def main(
     if on_mock.exit_code is None:
         return 1
     exits, in_order, no_capacity = [on_mock.exit_code], on_mock.in_order, False
-    seen: dict[str, tuple[str, ...]] = {}
+    seen: dict[str, Mapping[str, str]] = {}
     for pool in passes:
         on_pool = in_a_session(pool, {**given, POOL_VARIABLE: pool}, told_of_launches=True)
         in_order = in_order and on_pool.in_order

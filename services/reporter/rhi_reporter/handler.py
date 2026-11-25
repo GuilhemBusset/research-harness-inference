@@ -18,12 +18,12 @@ in that order with `rhi_reporter.github`.
   logging `NO_NOT_RUN` and posts no such success, so that the event is invoked again: a
   verification that may have run nothing is not reported as one that passed.
 - A verification that ended in success and ran its tests is then asked whether its GPU tests ran:
-  the step leaves the mark `gpu-not-run` when it booked the coursework pool, no instance was
-  launched during its wait and its build succeeds. With the mark, the status is a success whose
-  description says that the
-  mock pool's tests passed and that the GPU tests did not run for lack of capacity
-  (`status.without_gpu_tests`), never `VERIFIED_DESCRIPTION`. It is read with the mark `not-run`,
-  for the same statuses, and a mark that cannot be read posts no success in the same way.
+  the step leaves the mark `gpu-not-run` when it booked the coursework pool and no instance was
+  launched during its wait. With the mark of the run that succeeded (below), the status is a
+  success whose description says that the mock pool's tests passed and that the GPU tests did not
+  run for lack of capacity (`status.without_gpu_tests`), never `VERIFIED_DESCRIPTION`. It is read
+  with the mark `not-run`, for the same statuses, and a mark that cannot be read, or whose run
+  cannot be, posts no success in the same way.
 - An action of a step that runs before those stages (source, synthesis, self-update, assets)
   reports under each of them, as one of their actions, so that a failure there ends the stage's
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
@@ -101,10 +101,18 @@ an execution are the objects under `verification/<execution ID>/`, and the event
 - `not-run`: one line, the reason no test ran: `canary-missing` or `listener-off`, which the
   verification script leaves, or `parked`, which the step leaves while the system is parked;
 - `gpu-not-run`: one line, the reason the GPU tests did not run, `no-capacity`, which the
-  verification script leaves when no instance of the coursework pool was launched during its wait,
-  and the step copies from a build that succeeds only: a failed attempt leaves no mark for the
-  retry that passes, which has the same execution ID. The mark alone says so: its line is not read
-  into a status.
+  verification script leaves when no instance of the coursework pool was launched during its wait.
+  The mark alone says so: its line is not read, only the listing of its key, which also says when
+  it was written.
+
+**The mark of an earlier attempt.** The step leaves `gpu-not-run` from a build that fails too, on
+the mock pool's tests say, and a retry of the stage keeps the execution's ID: the mark of the
+attempt that failed is still there when the retry succeeds, with its GPU tests run or not. So the
+mark counts for a success only when it was written, as S3's listing says, at or after the start of
+the latest run of the action `Verify` of that stage in the execution, as CodePipeline's records
+say: the run that succeeded. A mark written before that start is an earlier attempt's, and says
+nothing of this success. While the records show no such run, or the listing no time, the mark
+counts: a success is not given `VERIFIED_DESCRIPTION` on a mark that cannot be dated.
 
 A mark is first looked for by listing its key, then read: the function's role may list that
 prefix, so a mark that is not there is told from one that cannot be read. At most `MARK_BYTES` of
@@ -165,7 +173,7 @@ from rhi_reporter.status import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from rhi_reporter.status import CommitStatus
 
@@ -370,11 +378,14 @@ def handle(
             records.append(_read(aws, action_runs=runs, stage=stage, action=action))
         return records[0]
 
+    def verification_started() -> object:
+        return _started(_latest_verification(runs(), stage))
+
     try:
         for under in [stage] if stage in stages else stages:
             facts = {"stage": under, "action": action, "category": category, "state": detail.get("state")}
             facts["commit"] = commit
-            (status,) = _as_they_ran(aws, artifacts, execution, [status_for(facts)])
+            (status,) = _as_they_ran(aws, artifacts, execution, [status_for(facts)], verification_started)
             if status.state is State.PENDING:
                 if execution_status in EXECUTION_ENDED:
                     continue
@@ -453,9 +464,11 @@ def _reconcile(
             if execution not in (cover.superseded.execution_id, cover.covering.execution_id):
                 continue
             for stage in stages:
-                verification = _verification(aws.codepipeline, pipeline, cover, stage) if cover.ended else None
-                statuses = superseded.statuses_for(cover, stage, verification)
-                for status in _as_they_ran(aws, artifacts, cover.covering.execution_id, statuses):
+                latest = _verification(aws.codepipeline, pipeline, cover, stage) if cover.ended else None
+                state = latest.get("status") if latest is not None else None
+                statuses = superseded.statuses_for(cover, stage, state if isinstance(state, str) else None)
+                started = functools.partial(_started, latest)
+                for status in _as_they_ran(aws, artifacts, cover.covering.execution_id, statuses, started):
                     _post(client, status)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
@@ -485,39 +498,65 @@ def _executions(codepipeline: Any, pipeline: object, execution: object) -> list[
     return found
 
 
-def _verification(codepipeline: Any, pipeline: object, cover: superseded.Cover, stage: str) -> str | None:
-    """The status of the latest run of the action named Verify of `stage` in the covering
-    execution, as CodePipeline spells it. None when it did not run, or cannot be read."""
+def _verification(codepipeline: Any, pipeline: object, cover: superseded.Cover, stage: str) -> Mapping[str, Any] | None:
+    """The latest run of the action named Verify of `stage` in the covering execution, as
+    CodePipeline records it. None when it did not run, or cannot be read."""
     try:
-        runs = [
-            detail
-            for detail in _action_executions(codepipeline, pipeline, cover.covering.execution_id)
-            if (detail.get("stageName"), detail.get("actionName")) == (stage, VERIFY_ACTION)
-        ]
-        latest = max(runs, key=lambda detail: detail["startTime"], default=None)
+        return _latest_verification(_action_executions(codepipeline, pipeline, cover.covering.execution_id), stage)
     except (BotoCoreError, ClientError, KeyError, TypeError):
         logger.warning(NO_VERIFICATION)
         return None
-    status = latest.get("status") if latest is not None else None
-    return status if isinstance(status, str) else None
+
+
+def _latest_verification(runs: Iterable[Mapping[str, Any]], stage: object) -> Mapping[str, Any] | None:
+    """The latest run, by its start, of the action named Verify of `stage` among `runs`, an
+    execution's action runs: a stage that is retried runs the action again. None without one."""
+    found = [detail for detail in runs if (detail.get("stageName"), detail.get("actionName")) == (stage, VERIFY_ACTION)]
+    return max(found, key=lambda detail: detail["startTime"], default=None)
+
+
+def _started(run: Mapping[str, Any] | None) -> object:
+    """When `run`, an action's run, started, as CodePipeline records it. None without a run."""
+    return run["startTime"] if run is not None else None
 
 
 def _post(client: Any, status: CommitStatus) -> None:
     client.post_status(status.commit, status.state.value, status.context, status.description)
 
 
-def _mark(s3: Any, bucket: str | None, execution: object, name: str) -> list[str] | None:
-    """The lines of the mark `name` that the verification of `execution` left in `bucket`, without
-    the blank ones. None when it left no such mark, or when no bucket or no execution is named.
-    What S3 raises is raised: a mark that cannot be read is not a mark that is not there."""
+def _listed(s3: Any, bucket: str | None, execution: object, name: str) -> Mapping[str, Any] | None:
+    """The mark `name` that the verification of `execution` left in `bucket`, as the listing of
+    its key gives it: its key, and when it was last written. None when it left no such mark, or
+    when no bucket or no execution is named. What S3 raises is raised: a mark that cannot be read
+    is not a mark that is not there."""
     if bucket is None or not isinstance(execution, str) or not execution:
         return None
     key = f"{MARKS_PREFIX}/{execution}/{name}"
     listed = s3.list_objects_v2(Bucket=bucket, Prefix=key)
-    if not any(entry.get("Key") == key for entry in listed.get("Contents", [])):
+    return next((entry for entry in listed.get("Contents", []) if entry.get("Key") == key), None)
+
+
+def _mark(s3: Any, bucket: str | None, execution: object, name: str) -> list[str] | None:
+    """The lines of the mark `name` that the verification of `execution` left in `bucket`, without
+    the blank ones. None when it left no such mark (`_listed`). What S3 raises is raised."""
+    entry = _listed(s3, bucket, execution, name)
+    if entry is None:
         return None
-    text = s3.get_object(Bucket=bucket, Key=key)["Body"].read(MARK_BYTES).decode("utf-8", errors="replace")
+    text = s3.get_object(Bucket=bucket, Key=entry["Key"])["Body"].read(MARK_BYTES).decode("utf-8", errors="replace")
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _gpu_not_run(aws: Aws, artifacts: str | None, execution: object, started: Callable[[], object]) -> bool:
+    """Whether the run of the verification of `execution` that started at `started()` left the
+    mark `gpu-not-run`: the mark is there, and was not written before that run started. A mark
+    written before is an earlier attempt's, which a retry of the stage does not remove. `started`
+    is asked only when the mark is there; while it gives None, no run in the records, or the
+    listing gives no time, the mark counts. What S3 or `started` raises is raised."""
+    entry = _listed(aws.s3, artifacts, execution, GPU_NOT_RUN_MARK)
+    if entry is None:
+        return False
+    written, start = entry.get("LastModified"), started()
+    return written is None or start is None or written >= start
 
 
 def _failed_tests(aws: Aws, artifacts: str | None, execution: object) -> list[str]:
@@ -543,19 +582,25 @@ def _last_stages(aws: Aws, artifacts: str | None, execution: object) -> list[str
 
 
 def _as_they_ran(
-    aws: Aws, artifacts: str | None, execution: object, statuses: Sequence[CommitStatus]
+    aws: Aws,
+    artifacts: str | None,
+    execution: object,
+    statuses: Sequence[CommitStatus],
+    started: Callable[[], object],
 ) -> list[CommitStatus]:
     """`statuses` as the verification of `execution` ran. When one of them says that the
     verification's tests ran and passed, the mark `not-run` of that execution is read first, and
     with it that status says instead that no test ran, and why. Without it, the mark `gpu-not-run`
-    is read, and with it that status says instead that the mock pool's tests passed and that the
-    GPU tests did not run for lack of capacity. Raises, after logging `NO_NOT_RUN`, when the marks
-    cannot be read: no status then claims a verification that may have run less than its tests."""
+    is looked for, and with the one of the verification's latest run, which `started` gives the
+    start of (`_gpu_not_run`), that status says instead that the mock pool's tests passed and that
+    the GPU tests did not run for lack of capacity. Raises, after logging `NO_NOT_RUN`, when the
+    marks or that start cannot be read: no status then claims a verification that may have run
+    less than its tests."""
     if not any(status.description == VERIFIED_DESCRIPTION for status in statuses):
         return list(statuses)
     try:
         lines = _mark(aws.s3, artifacts, execution, NOT_RUN_MARK)
-        gpu_not_run = lines is None and _mark(aws.s3, artifacts, execution, GPU_NOT_RUN_MARK) is not None
+        gpu_not_run = lines is None and _gpu_not_run(aws, artifacts, execution, started)
     except Exception:
         logger.warning(NO_NOT_RUN)
         raise
