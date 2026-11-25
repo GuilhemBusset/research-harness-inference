@@ -7,13 +7,16 @@ gives one, the local stack everywhere else. Two tests cannot assert the same thi
   `not_found`, and the local stack's gateway is reached directly, so both are required there. A
   deployed stack's public load balancer forwards only the paths of the gateway's table and answers
   every other path with its own fixed 404, which carries no cause: the status alone is required.
-- **The wake and the hold.** A deployed pool is cold only after its idle time, so a run soon after
-  another finds it ready. `first_stream` reads `GET /status` just before the first stream of the
-  run, and the wake and the hold are asserted only when that read was `cold`. The local stack's
-  pool always starts cold, which is asserted too, so there the hold is always asserted.
+- **The pool nobody has booked.** A request starts no machine, and a pool is served only in its
+  session (sections 5.3 and 5.6): `no-session` asserts that a request for a pool without one is
+  answered 503 with `no_session`. The local stack's pool is unbooked until a test takes the
+  fixture `booked`, and this test is written before those, so there it always runs on an unbooked
+  pool. On a deployed stack the verification runs it alone, before it books the mock pool, and
+  leaves it out of every other run (`scripts/pipeline/verify.py`).
 
-Every stream test takes `first_stream`, so the stream after the status read is the first of the
-run whichever tests are selected.
+Every stream test takes `booked`: the pool is in a session and reads ready before the first
+stream, on the local stack because the fixture books it, on a deployed one because the
+verification did.
 
 Each test carries its fixed ID (`smoke_id`), listed in `ids.py`. The last tests are about the
 smoke tests themselves, and run against no stack: the IDs, the collection of `deployed/`, and what
@@ -29,26 +32,19 @@ import runpy
 import shutil
 import subprocess
 import sys
-import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from rhi_gateway.readiness import INTERVAL_SECONDS
 from rhi_reporter.report import build_report, statuses_of
 
 SMOKE = Path(__file__).resolve().parent
 REPO = SMOKE.parents[1]
 DEPLOYED = SMOKE / "deployed"
 SMOKE_TEST_IDS: tuple[str, ...] = runpy.run_path(str(SMOKE / "ids.py"))["SMOKE_TEST_IDS"]
-
-# The keep-alives of a held stream (`rhi_gateway.hold`): a `ping` event on Messages, an SSE comment
-# on the OpenAI formats.
-PING = "ping"
 
 PROMPT = "Say hello."
 
@@ -114,43 +110,6 @@ def responses_usage(stream: Any) -> tuple[bool, int, int]:
     return ended, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
 
 
-@dataclass(frozen=True)
-class FirstStream:
-    """The first stream of the run, and the pool's state as `GET /status` read it just before and after."""
-
-    before: str
-    stream: Any
-    after: str
-
-
-# How long the pool's state may take to read the same on every gateway task. A deployed stack runs
-# several, the load balancer may send a status read to another task than the one that served the
-# stream, and each task's view of the pool is up to one readiness cycle old.
-SETTLE_SECONDS = 2 * INTERVAL_SECONDS
-
-
-def settled(read: Callable[[], str], expected: str, within: float = SETTLE_SECONDS) -> str:
-    """What `read` gives once it gives `expected`, or what it gives after `within` seconds."""
-    deadline = time.monotonic() + within
-    state = read()
-    while state != expected and time.monotonic() < deadline:
-        time.sleep(0.5)
-        state = read()
-    return state
-
-
-def first_stream_of(stack: Any) -> FirstStream:
-    """The first stream, and the pool's state before it and once every gateway task reads it ready."""
-    before = stack.pool_state()
-    stream = stack.stream("/v1/messages", messages_body(stack.pool))
-    return FirstStream(before=before, stream=stream, after=settled(stack.pool_state, "ready"))
-
-
-@pytest.fixture(scope="module")
-def first_stream(stack: Any) -> FirstStream:
-    return first_stream_of(stack)
-
-
 # --- What both stacks answer ---------------------------------------------------------------------
 
 
@@ -187,22 +146,13 @@ def test_a_forbidden_route_is_not_found(stack: Any, method: str, path: str) -> N
         assert answer.json()["error"]["type"] == "not_found"
 
 
-@pytest.mark.smoke_id("first-stream-wake")
-def test_the_first_stream_wakes_a_cold_pool_and_is_held_until_it_is_ready(
-    stack: Any, first_stream: FirstStream
-) -> None:
-    if not stack.deployed:
-        assert first_stream.before == "cold", "the local stack's pool starts cold"
-    stream = first_stream.stream
-    assert stream.status == 200
-    ended, input_tokens, output_tokens = messages_usage(stream)
-    assert ended and input_tokens > 0 and output_tokens > 0
-    if first_stream.before == "cold":
-        # Held: the keep-alives come before anything of the engine's answer.
-        names = [event.name for event in stream.events]
-        assert PING in names[: names.index("message_start")]
-        # Woken: the request was forwarded, so the pool had turned ready, and it still is.
-        assert first_stream.after == "ready"
+@pytest.mark.smoke_id("no-session")
+def test_a_request_to_a_pool_nobody_has_booked_is_answered_no_session(stack: Any) -> None:
+    # Before any test that takes `booked`: the pool has no session, and the request starts nothing.
+    body = {"model": stack.pool, "max_tokens": 64, "messages": [{"role": "user", "content": PROMPT}]}
+    answer = stack.request("POST", "/v1/messages", json=body)
+    assert answer.status_code == 503
+    assert answer.json()["error"]["type"] == "no_session"
 
 
 @pytest.mark.parametrize(
@@ -215,14 +165,13 @@ def test_the_first_stream_wakes_a_cold_pool_and_is_held_until_it_is_ready(
         pytest.param("/v1/responses", responses_body, responses_usage, marks=pytest.mark.smoke_id("stream-responses")),
     ],
 )
-@pytest.mark.usefixtures("first_stream")
 def test_a_stream_completes_with_its_usage(
-    stack: Any,
+    booked: Any,
     path: str,
     body: Callable[[str], dict[str, Any]],
     usage_of: Callable[[Any], tuple[bool, int, int]],
 ) -> None:
-    stream = stack.stream(path, body(stack.pool))
+    stream = booked.stream(path, body(booked.pool))
     assert stream.status == 200
     ended, input_tokens, output_tokens = usage_of(stream)
     assert ended, "the stream did not end with the last event of its wire format"
@@ -350,25 +299,6 @@ def test_deployed_tests_need_an_endpoint() -> None:
     # A node's ID is its file's path, `::`, its function and, in brackets, its parameters.
     collected = {node.partition("[")[0].rpartition("/")[2] for node, _ in collect(DEPLOYED, endpoint=True)}
     assert collected == defined
-
-
-@pytest.mark.smoke_id("first-stream-settles")
-def test_the_state_after_the_first_stream_is_read_until_every_gateway_task_reads_it_ready() -> None:
-    # On a deployed stack the read after the stream may reach another gateway task, still warming.
-    class Lagging:
-        pool = "mock"
-
-        def __init__(self) -> None:
-            self.states = iter(["cold", "warming", "ready"])
-
-        def pool_state(self) -> str:
-            return next(self.states)
-
-        def stream(self, path: str, body: Mapping[str, Any]) -> str:
-            return "the stream"
-
-    first = first_stream_of(Lagging())
-    assert (first.before, first.stream, first.after) == ("cold", "the stream", "ready")
 
 
 @pytest.mark.smoke_id("environment")

@@ -15,13 +15,14 @@ request profile that names an entry the gateway does not have (`rhi_gateway.prof
 names the pool and the entry.
 
 **The parts** (`build`). The keys table is read through `DynamoKeyStore`, the usage table is the
-`DynamoDBLedger`'s, given the course end its rows expire by, the pool-state table and the target groups are the `Readiness` reader's, the
-scaler function is the `Waker`'s, and the heartbeats table is the `Heartbeat`'s. The body filters
-are the three formats', with the body limit of the settings and, on each forwarded route, every
-pool's request profile, which is built first; the proxy has the upstream address,
-the pools' secrets and the longest request; the hold has the keep-alive interval, and with the
-local routes the longest session, under which each pool's session is read; the refusals
-have the three `Retry-After`. With no pool, every one of these is built the same, over no pool.
+`DynamoDBLedger`'s, given the course end its rows expire by, and the pool-state table and the
+target groups are the `Readiness` reader's. Nothing is built that calls the scaler or writes the heartbeats table: a request starts no machine
+(section 5.3), and the task's count of requests in flight (`rhi_gateway.heartbeat`) has no table.
+The body filters are the three formats', with the body limit of the settings and, on each
+forwarded route, every pool's request profile, which is built first; the proxy has the upstream
+address, the pools' secrets and the longest request; the request path and the local routes have
+the longest session, under which each pool's session is read; the refusals have the three
+`Retry-After`. With no pool, every one of these is built the same, over no pool.
 
 **The secrets.** A pool's bearer secret is in no variable and no template: the settings hold its
 ARN, and `read_secrets` reads the value through the Secrets Manager API, once, at start, with the
@@ -30,15 +31,15 @@ task's role. The values stay in the proxy.
 **AWS.** The clients are the AWS SDK's (`aws_clients`), made with what the task gives the SDK: the
 credentials of the task's role and the region of the task. Nothing here names either.
 
-**The task's ID** names this task's heartbeat rows. `task_id` reads it from the task metadata
-endpoint ECS gives the container (`ECS_CONTAINER_METADATA_URI_V4`): the last part of the task's
-ARN, the ID the collector labels this task's series with. Without the endpoint, or when it does
-not answer with one, the ID is random: the rows of two tasks must never be one row.
+**The task's ID** names this task's count of requests in flight. `task_id` reads it from the task
+metadata endpoint ECS gives the container (`ECS_CONTAINER_METADATA_URI_V4`): the last part of the
+task's ARN, the ID the collector labels this task's series with. Without the endpoint, or when it
+does not answer with one, the ID is random: the counts of two tasks must never be one.
 
 **SIGTERM** (`serve`). uvicorn stops accepting connections, lets every request it has accepted
-run to its end, with no deadline of its own (a held stream may last minutes; the longest request
-is the proxy's limit), and then ends the application's lifespan, where the heartbeat writes its
-last rows, with both counts at zero (`rhi_gateway.app.build_app`). uvicorn writes no access log:
+run to its end, with no deadline of its own (the longest request is the proxy's limit), and then
+ends the application's lifespan, where the reads of the pools stop
+(`rhi_gateway.app.build_app`). uvicorn writes no access log:
 the gateway's own record of each request is the log (`rhi_gateway.telemetry`).
 """
 
@@ -58,7 +59,7 @@ from starlette.applications import Starlette
 
 from rhi_gateway import metrics as metrics_endpoint
 from rhi_gateway import profile, routes
-from rhi_gateway.app import Filter, Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Filter, Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter, Rewrite
 from rhi_gateway.budget import DynamoDBLedger
@@ -71,7 +72,6 @@ from rhi_gateway.metrics import Metrics
 from rhi_gateway.proxy import Proxy, upstream_client
 from rhi_gateway.readiness import Readiness
 from rhi_gateway.settings import Settings, read_settings
-from rhi_gateway.waker import Waker
 
 # Every address of the task: the load balancer reaches the container on the task's own address, and
 # the task's security group decides who reaches the port.
@@ -96,15 +96,14 @@ class Clients:
     """The clients of the AWS SDK the gateway's parts are given.
 
     `dynamodb` is `boto3.client("dynamodb")`, the ledger's; `tables` is
-    `boto3.resource("dynamodb")`, which gives the keys, pool-state and heartbeats tables;
-    `secretsmanager`, `elbv2` and `lambda_client` are the clients of those services.
+    `boto3.resource("dynamodb")`, which gives the keys and pool-state tables;
+    `secretsmanager` and `elbv2` are the clients of those services.
     """
 
     dynamodb: Any
     tables: Any
     secretsmanager: Any
     elbv2: Any
-    lambda_client: Any
 
 
 def aws_clients() -> Clients:
@@ -117,7 +116,6 @@ def aws_clients() -> Clients:
         tables=boto3.resource("dynamodb"),
         secretsmanager=boto3.client("secretsmanager"),
         elbv2=boto3.client("elbv2"),
-        lambda_client=boto3.client("lambda"),
     )
 
 
@@ -151,10 +149,11 @@ def task_id(environ: Mapping[str, str], *, transport: httpx.BaseTransport | None
             found = arn.rsplit("/", 1)[-1] if isinstance(arn, str) else ""
             if _TASK_ID.fullmatch(found):
                 return found
-            _LOG.warning("the task metadata gave no task ID: the heartbeat rows are under a random one")
+            _LOG.warning("the task metadata gave no task ID: the count of requests in flight is under a random one")
         except Exception as error:  # noqa: BLE001 - whatever the read raised, the gateway starts, under a random ID
             _LOG.warning(
-                "the task metadata was not read (%s): the heartbeat rows are under a random ID", type(error).__name__
+                "the task metadata was not read (%s): the count of requests in flight is under a random ID",
+                type(error).__name__,
             )
     return uuid.uuid4().hex
 
@@ -180,8 +179,8 @@ def build(
 
     Every pool's request profile is built first: one that names an entry the gateway does not have
     raises `rhi_gateway.profile.ProfileError`, which names the pool and the entry, before a secret
-    is read. `task` names the heartbeat rows, a random identifier when none is given. `transport`
-    replaces the network between the gateway and the engines, for tests.
+    is read. `task` names the count of requests in flight, a random identifier when none is given.
+    `transport`     replaces the network between the gateway and the engines, for tests.
     """
     profiles = profile.build(settings.pools)
     secrets = read_secrets(settings, aws.secretsmanager)
@@ -191,13 +190,7 @@ def build(
     authenticator = Authenticator(keys)
     ledger = DynamoDBLedger(aws.dynamodb, settings.usage_table, course_end=settings.course_end)
     readiness = Readiness(settings.target_groups, elbv2=aws.elbv2, table=aws.tables.Table(settings.pool_state_table))
-    waker = Waker(readiness, lambda_client=aws.lambda_client, function_name=settings.scaler_function)
-    heartbeat = Heartbeat(
-        aws.tables.Table(settings.heartbeat_table),
-        task or uuid.uuid4().hex,
-        [pool.name for pool in pools],
-        waker=waker,
-    )
+    heartbeat = Heartbeat(task or uuid.uuid4().hex, [pool.name for pool in pools])
     gateway_metrics = Metrics(keys)
 
     def rewrites(route: routes.Route) -> dict[str, Rewrite]:
@@ -235,12 +228,7 @@ def build(
             secrets,
             longest_request_seconds=settings.longest_request_seconds,
         ),
-        holding=Holding(
-            views=readiness.views,
-            wake=waker.ask,
-            keepalive_seconds=settings.keepalive_seconds,
-            session_max_hours=settings.session_max_hours,
-        ),
+        pools=Pools(views=readiness.views, session_max_hours=settings.session_max_hours),
         heartbeat=heartbeat,
         retry_after=settings.retry_after,
     )
@@ -249,7 +237,6 @@ def build(
         pools=pools,
         views=readiness.views,
         default_pool=default_pool,
-        waker=waker,
         session_max_hours=settings.session_max_hours,
     )
     app = build_app(
@@ -274,7 +261,7 @@ def serve(gateway: Gateway, *, metrics_port: int = metrics_endpoint.PORT, **wher
     uvicorn.run(
         gateway.app,
         **where,
-        # The readiness reads and the heartbeat run in the lifespan: without it there is no gateway.
+        # The readiness reads run in the lifespan: without it there is no gateway.
         lifespan="on",
         # No deadline cuts a request in flight.
         timeout_graceful_shutdown=None,

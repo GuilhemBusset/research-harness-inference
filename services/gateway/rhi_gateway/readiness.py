@@ -5,16 +5,25 @@ establishes that by checking each engine directly, and the gateway reads it thro
 The gateway never probes through the load balancer, which forwards the four inference routes and
 nothing else (section 5.3).
 
-On the same cycle it reads the pool's three records in the pool-state table: `mode`, the admin's
-(`rhi_common.records.PoolState`, section 11.3), `note`, the scaler's (`ScalerNote`: whether
-it asked for capacity, when a launch last found none, and the pool's rebalance number, which
-`PoolView.rebalance_number` gives: section 5.5), and `session`, the pool's booking
-(`rhi_common.records.Session`, section 5.6). The session is read as the two others are: no item
-reads as no session, a failed read, or an item that is not a session, keeps the session last read,
-and a pool has no session until a first read succeeds. Whether the session kept is active is the
-shared rule (`rhi_common.sessions.is_active`), which `PoolView.in_session` applies at the time
-and under the longest session it is given: the gateway serves a pool while its session is active,
-and at no other time (`rhi_gateway.app`, `rhi_gateway.local`).
+On the same cycle it reads two of the pool's records in the pool-state table: `note`, the scaler's
+(`rhi_common.records.ScalerNote`: how many instances are starting, and the pool's rebalance number,
+which `PoolView.rebalance_number` gives: section 5.5), and `session`, the pool's booking
+(`rhi_common.records.Session`, section 5.6). It reads no pool's mode record. The session is read
+as the note is: no item reads as no session, a failed read, or an item that is not a session, keeps
+the session last read, and a pool has no session until a first read succeeds. Whether the session
+kept is active is the shared rule (`rhi_common.sessions.is_active`), which `PoolView.in_session`
+applies at the time and under the longest session it is given: the gateway serves a pool while its
+session is active, and at no other time (`rhi_gateway.app`, `rhi_gateway.local`).
+
+**Whether a pool can serve** (section 5.3) is one rule on the kept view, `PoolView.refusal`, which
+the request path and the status both apply:
+
+| The view | The cause |
+| --- | --- |
+| The session is not active | `no_session` |
+| The session is active and a target is healthy | none: the pool serves |
+| The session is active, no target is healthy, the note counts at least one instance starting | `warming` |
+| The session is active, no target is healthy, the note counts none starting, or there is no note | `capacity_unavailable` |
 
 `Readiness.run` repeats the cycle every 5 seconds for every pool, whether or not anyone asks, and
 keeps the last values. Callers read only the kept values (`Readiness.pool`, `Readiness.views`): no request causes a
@@ -39,7 +48,8 @@ from types import MappingProxyType
 from typing import Any
 
 from rhi_common import sessions
-from rhi_common.records import MODE_RECORD, NOTE_RECORD, SESSION_RECORD, PoolState, ScalerNote, Session
+from rhi_common.causes import Cause
+from rhi_common.records import NOTE_RECORD, SESSION_RECORD, ScalerNote, Session
 from rhi_common.tables import POOL_STATE
 
 # How often every pool is read (section 5.3).
@@ -53,12 +63,11 @@ class PoolView:
     """What the last cycle left for one pool.
 
     `ready` is whether the target group had a healthy target, and `observed_at` when that answer
-    came back (the moment the gateway learnt it), `None` before the first read. `mode`, `note` and
+    came back (the moment the gateway learnt it), `None` before the first read. `note` and
     `session` are the last records read, `None` when the table holds none (or nothing was read yet).
     """
 
     ready: bool = False
-    mode: PoolState | None = None
     note: ScalerNote | None = None
     observed_at: float | None = None
     session: Session | None = None
@@ -70,6 +79,26 @@ class PoolView:
         a pool with no session kept is in none.
         """
         return sessions.is_active(self.session, math.floor(now), session_max_hours=session_max_hours)
+
+    def session_end(self, now: float, *, session_max_hours: int) -> int | None:
+        """When the pool's session ends, in seconds since the epoch; `None` unless it is active at the time `now`."""
+        if self.session is None or not self.in_session(now, session_max_hours=session_max_hours):
+            return None
+        return sessions.end(self.session, session_max_hours=session_max_hours)
+
+    def refusal(self, now: float, *, session_max_hours: int) -> Cause | None:
+        """Why the pool cannot serve a request at the time `now`; `None` when it can (section 5.3).
+
+        A pool whose session is active and that has no healthy target is `warming` when the
+        scaler's note counts at least one instance starting, and `capacity_unavailable` when it
+        counts none: a note that holds no count, or no note at all, reads as none starting.
+        """
+        if not self.in_session(now, session_max_hours=session_max_hours):
+            return Cause.NO_SESSION
+        if self.ready:
+            return None
+        starting = 0 if self.note is None else self.note.starting
+        return Cause.WARMING if starting >= 1 else Cause.CAPACITY_UNAVAILABLE
 
     @property
     def rebalance_number(self) -> int | None:
@@ -145,7 +174,6 @@ class Readiness:
             observed_at = self._clock()
             views[pool] = PoolView(
                 ready=ready,
-                mode=self._read_record(pool, MODE_RECORD, PoolState.from_item, before.mode),
                 note=self._read_record(pool, NOTE_RECORD, ScalerNote.from_item, before.note),
                 observed_at=observed_at,
                 session=self._read_record(pool, SESSION_RECORD, Session.from_item, before.session),

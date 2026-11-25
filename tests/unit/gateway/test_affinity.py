@@ -25,7 +25,7 @@ from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import COOKIE_NAME, Affinity
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -54,7 +54,7 @@ ATTRIBUTES = "; Expires=Fri, 15 Jan 2027 09:20:00 GMT; Path=/"
 
 
 def in_session(pool: str, *, ready: bool = True) -> PoolView:
-    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
     now = int(time.time())
     booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
     return PoolView(ready=ready, session=booked)
@@ -142,7 +142,7 @@ class LoadBalancer:
 class Gateway:
     """The whole gateway in front of `LoadBalancer`, with two students and two pools, every pool ready."""
 
-    def __init__(self, views: Callable[[], dict[str, PoolView]] | None = None) -> None:
+    def __init__(self) -> None:
         self.balancer = LoadBalancer()
         self.ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
         self.keys = {OTTER: generate_key(), HERON: generate_key()}
@@ -173,11 +173,7 @@ class Gateway:
                 "http://pools.example.com:8080",
                 {pool.name: f"{pool.name}-secret" for pool in POOLS},
             ),
-            holding=Holding(
-                views=views or (lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
-                wake=lambda pool: None,
-                sleep=lambda seconds: asyncio.sleep(0),
-            ),
+            pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
         )
         self.app: Starlette = build_app(forwarding_handlers(forwarding))
 
@@ -316,27 +312,6 @@ def test_parallel_requests_of_a_student_follow_the_same_cookie() -> None:
         await asyncio.gather(ask(), ask(stream=False), ask(entry=routes.RESPONSES))
         assert balancer.carried[1:] == [("coursework", cookie(balancer.issued[0]))] * 3
         assert gateway.cookies(OTTER)["coursework"] in balancer.issued[1:]
-
-    run(gateway, scenario)
-
-
-def test_a_held_stream_carries_the_cookie_and_stores_the_one_its_answer_set() -> None:
-    ready, cold = in_session("coursework"), in_session("coursework", ready=False)
-    views = [ready]
-    gateway = Gateway(lambda: {"coursework": views.pop(0) if len(views) > 1 else views[0]})
-    balancer = gateway.balancer
-
-    async def scenario(ask: Ask) -> None:
-        await ask()
-        # The pool is not ready when the second request comes: it is answered at once, held, then forwarded.
-        # The first two views are read for the pool's session, the others by the hold.
-        views[:] = [cold, cold, cold, cold, ready]
-        held = await ask()
-        assert held.status_code == 200
-        assert balancer.carried[1] == ("coursework", cookie(balancer.issued[0]))
-        assert gateway.cookies(OTTER) == {"coursework": balancer.issued[1]}
-        assert "set-cookie" not in held.headers
-        assert COOKIE_NAME.encode() not in held.content
 
     run(gateway, scenario)
 

@@ -8,7 +8,7 @@ port 8080. A deployment starts new tasks before it stops old ones.
 
 **How it is reached.** One rule of the public load balancer's HTTPS listener, at priority
 `PRIORITY`, forwards the paths of the gateway's route table (`PATH_PATTERNS`: everything under
-`/v1/`, and `/status`, `/wake` and `/api/hello`) to the service's target group, on port 8080. The
+`/v1/`, and `/status` and `/api/hello`) to the service's target group, on port 8080. The
 issuer's rule is at 20 and Grafana's at 30; the load balancer answers every other path with its
 fixed 404, and the gateway's own table is still the control. The listener exists only while the
 configuration's `https_listener` is true (`rhi.network.edge`), and ECS refuses a service whose
@@ -188,7 +188,7 @@ GATEWAY_CONTAINER = "Gateway"
 PRIORITY = 10
 # The paths of the gateway's route table (`rhi_gateway.routes`): the forwarded and local routes
 # under /v1/, and the three others.
-PATH_PATTERNS = ["/v1/*", "/status", "/wake", "/api/hello"]
+PATH_PATTERNS = ["/v1/*", "/status", "/api/hello"]
 # How long a deregistering task keeps its requests: the longest request, 30 minutes.
 DEREGISTRATION_SECONDS = 1800
 # What the health check asks, with no key, and the status the gateway answers it with.

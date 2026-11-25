@@ -27,7 +27,7 @@ from rhi_common.records import ScalerNote, Session
 from rhi_common.students import StudentKey, UsageDay, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import COOKIE_NAME, Affinity, selects
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -146,7 +146,6 @@ class Instance:
         reservation = self.ledger.reserve(
             who,
             uuid.uuid4().hex,
-            hold_seconds=POOLS[pool].hold_seconds,
             longest_request_seconds=1800,
             pool=pool,
         )
@@ -364,7 +363,7 @@ def test_the_gateway_judges_each_request_on_the_number_its_reader_holds() -> Non
             "http://pools.example.com:8080",
             {name: f"{name}-secret" for name in POOLS},
         ),
-        holding=Holding(views=readiness.views, wake=lambda pool: None, clock=lambda: float(NOW)),
+        pools=Pools(views=readiness.views, clock=lambda: float(NOW)),
     )
     app = build_app(forwarding_handlers(forwarding))
 

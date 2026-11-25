@@ -12,8 +12,11 @@ that ran no test) would discharge items nothing proved.
 The verification does not run every smoke test: its script deselects some
 (`scripts/pipeline/verify.py`). The table names, in `unverified_tests`, the test files of which a
 test is left out, and the engine leaves an item that names one of them to the owner. This test
-holds that list equal to the files of the tests the verification's own run deselects, so a test
-that is newly left out cannot go on discharging the items it decides.
+holds that list equal to the files of the tests that none of the verification's own runs on the
+mock pool keeps, so a test that is newly left out cannot go on discharging the items it decides.
+The script makes two runs there: one before it books the pool, of the test of a pool nobody has
+booked, and one in the session it books, of the others. On a mock pool that already has a session
+it does not make the first, and says so in its log.
 
 The engine also reads, in `discharge_contexts`, verification contexts it never waits for: only to
 discharge such an item after the fact, from a later verification of the merge commit or of a `main`
@@ -44,8 +47,8 @@ DESCRIPTIONS = {
 }
 A_COMMIT = "0" * 40
 
-# A plugin of the collection below: it writes, as JSON, the files of the tests that were deselected
-# and the number of tests that were kept, to the file its variable names.
+# A plugin of the collection below: it writes, as JSON, the tests that were deselected and the
+# number of tests that were kept, to the file its variable names.
 RECORDER = """
 import json, os
 
@@ -53,7 +56,7 @@ deselected = []
 
 
 def pytest_deselected(items):
-    deselected.extend(item.nodeid.partition("::")[0] for item in items)
+    deselected.extend(item.nodeid for item in items)
 
 
 def pytest_collection_finish(session):
@@ -65,9 +68,11 @@ def pytest_collection_finish(session):
 @functools.cache
 def left_out_by_the_verification() -> tuple[str, ...]:
     """The smoke test files of which the verification leaves a test out, from the repository's
-    root: what the script's own run of the smoke tests deselects (`verify.run_tests`), with an
-    endpoint given, so that the deployed-only tests are collected. Collection only: nothing is
-    run, so nothing is reached."""
+    root: the tests that both of the script's own runs on the mock pool deselect
+    (`verify.run_tests`), the one before the booking and the one in the session, with an endpoint
+    given, so that the deployed-only tests are collected. Collection only: nothing is run, so
+    nothing is reached."""
+    left_out: set[str] | None = None
     with tempfile.TemporaryDirectory() as folder:
         recorded = Path(folder) / "recorded.json"
         (Path(folder) / "recorder.py").write_text(RECORDER, encoding="utf-8")
@@ -78,10 +83,13 @@ def left_out_by_the_verification() -> tuple[str, ...]:
             "PYTEST_ADDOPTS": "-p recorder --collect-only -q -p no:cacheprovider",
             "RECORDED": str(recorded),
         }
-        assert verify.run_tests(environ) == 0, "the smoke tests are not collected as the verification collects them"
-        found = json.loads(recorded.read_text(encoding="utf-8"))
-    assert found["kept"], "the verification would run no test"
-    return tuple(found["deselected"])
+        for of_this_run in ({verify.UNBOOKED_VARIABLE: verify.UNBOOKED_RUN}, {}):
+            collected = verify.run_tests(environ | of_this_run)
+            assert collected == 0, "the smoke tests are not collected as the verification collects them"
+            found = json.loads(recorded.read_text(encoding="utf-8"))
+            assert found["kept"], "a run of the verification would run no test"
+            left_out = set(found["deselected"]) if left_out is None else left_out & set(found["deselected"])
+    return tuple(sorted({test.partition("::")[0] for test in left_out or ()}))
 
 
 def posted_by_the_reporter(context: object) -> bool:
@@ -207,5 +215,5 @@ def test_a_table_that_does_not_name_the_tests_the_verification_leaves_out_fails(
 
 def test_the_files_left_out_are_read_from_the_verification_s_own_run() -> None:
     files = left_out_by_the_verification()
-    assert sorted(files) == [LEFT_OUT], "the run on the mock pool leaves out the GPU-only test's file"
+    assert sorted(files) == [LEFT_OUT], "the runs on the mock pool leave out the GPU-only test's file, and no other"
     assert all(file.startswith("tests/smoke/") and (verify.REPO / file).is_file() for file in files)

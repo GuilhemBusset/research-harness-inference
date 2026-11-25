@@ -68,7 +68,7 @@ from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import profile, proxy, routes
 from rhi_gateway.affinity import Affinity
-from rhi_gateway.app import Filter, Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Filter, Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import CACHE_SALT_FIELD, REQUEST_ID_FIELD, BodyFilter, Forwarded, Rewrite
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -109,7 +109,7 @@ GUARD_SECONDS = 30.0
 
 
 def in_session(pool: str, *, ready: bool = True) -> PoolView:
-    """The pool's view, in a session that is active now on the clock the hold reads, the machine's."""
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
     now = int(time.time())
     booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
     return PoolView(ready=ready, session=booked)
@@ -519,8 +519,8 @@ async def _replay(
         ledger=ledger,
         filters=filters(capture.profile),
         proxy=gateway_proxy,
-        # Every pool is ready: the request is forwarded at once, with no hold.
-        holding=Holding(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}, wake=lambda pool: None),
+        # Every pool is ready: the request is forwarded.
+        pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
     )
     app = build_app(forwarding_handlers(forwarding))
     await asyncio.wait_for(app(client.scope, client.receive, client.send), timeout=GUARD_SECONDS)
