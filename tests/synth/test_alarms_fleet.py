@@ -99,8 +99,11 @@ def test_each_pool_alarms_on_a_session_short_of_its_instances_for_30_whole_minut
     found = by_metric(alarms, "InstancesMissing")
     assert sorted(a["Dimensions"][0]["Value"] for a in found) == sorted(POOLS)
     for alarm in found:
-        assert (alarm["Namespace"], alarm["Period"], alarm["Statistic"]) == ("rhi/scaler", 60, "Maximum")
+        assert (alarm["Namespace"], alarm["Period"]) == ("rhi/scaler", 60)
         assert [d["Name"] for d in alarm["Dimensions"]] == ["Pool"]
+        # A minute reads the least of its runs: one that saw the session filled breaks the shortage,
+        # so a session filled in the last of the 30 minutes sends nothing.
+        assert alarm["Statistic"] == "Minimum"
         # Above zero in each of the 30 minutes, and in exactly those: no older data point stands in
         # for a minute with none, which leaves the alarm in the state it has.
         assert (alarm["ComparisonOperator"], alarm["Threshold"]) == ("GreaterThanThreshold", 0)

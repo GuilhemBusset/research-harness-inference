@@ -21,18 +21,22 @@ the fleet's expression has no data for does not breach, so the condition must be
 period; a period with no completed run does.
 
 Three more come from the scaler's own rules, each per pool, from what the scaler publishes in the
-namespace `rhi/scaler` with the dimension `Pool`, each statistic the most of its one-minute period:
+namespace `rhi/scaler` with the dimension `Pool`, the first two reading the most of their one-minute
+period and the third the least:
 
 - **Launches suspended**: `LaunchesSuspended` at 1 in one period, after three abandoned launches
   (section 5.1).
 - **In service while no session is on**: `MinutesInServiceOutsideSessions` above
   outside_sessions_alarm_hours, 1 by default, in minutes, in one period (sections 11.3 and 17).
 - **A session short of its instances**: `InstancesMissing` above 0 in each of
-  capacity_alarm_minutes one-minute periods, 30 by default (sections 5.4 and 17). It evaluates the
-  same wall-clock window of whole minutes, so it reads exactly its periods: when one of them has
-  no data point, no older data point stands in for it, and the alarm keeps its state. It clears
-  when the session is filled, when it ends and when it is lowered to what is in service, since
-  `InstancesMissing` is then 0.
+  capacity_alarm_minutes one-minute periods, 30 by default (sections 5.4 and 17). It reads the
+  least of each period, so a minute in which one run saw the session filled is not a minute short,
+  whatever another run of that minute saw: a session filled within the window sends nothing. It
+  evaluates the same wall-clock window of whole minutes, so it reads exactly its periods: when one
+  of them has no data point, no older data point stands in for it, and the alarm keeps its state.
+  It clears when the session is filled, when it ends and when it is lowered to what is in service,
+  since `InstancesMissing` is then 0. The configuration refuses more minutes than the day
+  CloudWatch evaluates one-minute periods over (`rhi.config.MOST_CAPACITY_ALARM_MINUTES`).
 
 These three keep their state while the scaler publishes nothing: the scaler's own alarm says so.
 
@@ -155,9 +159,10 @@ class AlarmsFleet(Construct):
             operator: str,
             threshold: float,
             periods: int | None = None,
+            statistic: str = "Maximum",
         ) -> cloudwatch.CfnAlarm:
             """Over one period, or, when `periods` is given, over exactly that many whole minutes,
-            the condition in each."""
+            the condition in each. The statistic is what a period holding several runs reads."""
             return cloudwatch.CfnAlarm(
                 self,
                 alarm_id,
@@ -165,7 +170,7 @@ class AlarmsFleet(Construct):
                 namespace=SCALER_NAMESPACE,
                 metric_name=name,
                 dimensions=[cloudwatch.CfnAlarm.DimensionProperty(name=POOL_DIMENSION, value=pool)],
-                statistic="Maximum",
+                statistic=statistic,
                 period=PERIOD_SECONDS,
                 evaluation_periods=periods or 1,
                 datapoints_to_alarm=periods,
@@ -233,4 +238,6 @@ class AlarmsFleet(Construct):
                 "GreaterThanThreshold",
                 0,
                 short_minutes,
+                # A minute in which a run saw the session filled is not a minute short.
+                "Minimum",
             )
