@@ -119,10 +119,6 @@ class SpikeJob:
 JOBS: tuple[SpikeJob, ...] = (
     SpikeJob("s8_stickiness", "s8_stickiness.py"),
     SpikeJob("s7_drain", "s7_drain.py"),
-    SpikeJob("s2_client_hold", "s2_client_hold.py"),
-    SpikeJob("s4_weights", "s4_weights.py"),
-    # Twenty starts, each until the pool falls idle and the scaler returns its instance.
-    SpikeJob("s1_cold_start", "s1_cold_start.py", timeout_hours=24),
     SpikeJob("s5_capacity", "s5_capacity.py"),
     SpikeJob("s3_harness_task", "s3_harness_task.py"),
     SpikeJob("s3_second_session", "s3_second_session.py"),

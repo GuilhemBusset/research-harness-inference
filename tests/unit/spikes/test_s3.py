@@ -448,12 +448,15 @@ def test_a_line_that_would_hold_a_key_is_not_written() -> None:
     assert written == []
 
 
-def exchange(path: str, body: dict[str, Any], at: float, status: int | None = 200, **fields: Any) -> s3.s2.Exchange:
-    return s3.s2.Exchange("POST", path, json.dumps(body).encode(), at, status=status, ended_at=at + 0.5, **fields)
+def exchange(
+    path: str, body: dict[str, Any], at: float, status: int | None = 200, **fields: Any
+) -> s3.forwarder.Exchange:
+    sent = json.dumps(body).encode()
+    return s3.forwarder.Exchange("POST", path, sent, at, status=status, ended_at=at + 0.5, **fields)
 
 
 def claude_session(
-    step: s3.Step, events: Sequence[dict[str, Any]], exchanges: Sequence[s3.s2.Exchange] = ()
+    step: s3.Step, events: Sequence[dict[str, Any]], exchanges: Sequence[s3.forwarder.Exchange] = ()
 ) -> s3.Session:
     return s3.Session(s3.Harness.CLAUDE_CODE, step, 0.0, 9.0, s3.Ran(0, printed(*events)), list(exchanges))
 

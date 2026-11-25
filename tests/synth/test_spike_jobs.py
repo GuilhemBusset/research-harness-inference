@@ -11,7 +11,6 @@ Each test builds the app as `app.py` does, from the example configuration, with 
 from __future__ import annotations
 
 import json
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -297,17 +296,12 @@ def test_a_new_entry_brings_no_new_finding(app_module: ModuleType, tmp_path: Pat
     assert len({json.dumps(project["LogsConfig"]) for project in projects}) == 1
 
 
-def test_each_job_has_its_entrys_timeout_and_s1_has_time_for_its_default_run(templates: dict[str, Any]) -> None:
-    import s1_cold_start as s1
+def test_each_job_has_its_entrys_timeout(templates: dict[str, Any]) -> None:
     from rhi.pipeline.spikes import JOBS, SpikeJob
 
     (pipeline,) = [template for path, template in templates.items() if path == "RhiPipeline.template.json"]
     projects = of_type(pipeline, "AWS::CodeBuild::Project").values()
     timeouts = {project["Name"]: project["TimeoutInMinutes"] for project in projects if runs_a_spike(project)}
     assert timeouts == {job.project_name: job.timeout_hours * 60 for job in JOBS}
-    # S1's default starts, each until its deadline, then idle for the example's coursework pool.
-    idle = tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8"))["pools"]["coursework"]
-    per_start = (s1.READY_WAIT_SECONDS + s1.LATE_SECONDS) / 60 + idle["idle_minutes"]
-    assert timeouts["rhi-spike-s1_cold_start"] >= s1.starts_of({}) * per_start
     with pytest.raises(ValueError, match="timeout"):
         SpikeJob("long_spike", "long_spike.py", timeout_hours=37)

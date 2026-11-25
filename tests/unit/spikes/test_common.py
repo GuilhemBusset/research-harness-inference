@@ -1,16 +1,21 @@
 """What the spikes share (`spikes/common.py`): timing, percentiles, reading the workspace, the canary
-students' keys, and a run's numbers sent to the reporter. The workspace, the secret and the bus
-are stubs. No number here is a measurement; the commit and every key are made while the tests run.
+students' keys, how the gateway is reached, and a run's numbers sent to the reporter. The workspace,
+the secret, the gateway and the bus are stubs. No number here is a measurement; the commit and
+every key are made while the tests run.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import secrets
+import urllib.request
+from email.message import Message
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
+from urllib.response import addinfourl
 
 import pytest
 from botocore.credentials import Credentials
@@ -303,3 +308,54 @@ def test_a_job_that_cannot_post_measures_nothing(environ: dict[str, str]) -> Non
     with pytest.raises(ValueError, match="enumeration"):
         common.run_spike(SPIKE, "s1_warm_start", lambda: {**NUMBERS, "undeclared": 1}, environ=environ, events=bus)
     assert [(run.verdict, dict(run.numbers)) for _, run in runs(bus)] == [(Verdict.NOT_MEASURED, {})]
+
+
+# The gateway.
+
+
+def test_the_gateway_stack_s_host_name_reaches_the_gateway_over_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def urlopen(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
+        calls.append((request.get_method(), request.full_url))
+        return io.BytesIO(b'{"pools":[{"model":"coursework","state":"cold"}]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    # The gateway stack's output is a host name; an `https://` address is taken as it is.
+    assert common.gateway_address("example.com") == "https://example.com"
+    assert common.gateway_address(" https://example.com/ ") == "https://example.com"
+    gateway = common.Gateway("example.com", "coursework", generate_key())
+    assert gateway.state() == "cold"
+    gateway.wake()
+    assert calls == [("GET", "https://example.com/status"), ("POST", "https://example.com/wake")]
+
+
+def test_the_canary_key_is_never_sent_over_plain_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    def urlopen(*_: object, **__: object) -> None:
+        raise AssertionError("a request was sent")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    for endpoint in ("http://example.com", "ftp://example.com", ""):
+        with pytest.raises(ValueError):
+            common.Gateway(endpoint, "coursework", generate_key()).state()
+
+
+def test_the_canary_key_does_not_follow_a_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = []
+
+    def transport(_: object, __: object, request: urllib.request.Request, **___: object) -> addinfourl:
+        sent.append((request.full_url, request.has_header("Authorization")))
+        headers, body = Message(), b'{"pools":[{"model":"coursework","state":"cold"}]}'
+        if request.type == "https":
+            headers["Location"] = "http://example.com/status"
+            response = addinfourl(io.BytesIO(), headers, request.full_url, 302)
+        else:
+            response = addinfourl(io.BytesIO(body), headers, request.full_url, 200)
+        # urllib reads the reason of a real HTTP answer from `msg`, which the stub of addinfourl leaves out.
+        response.msg = ""  # ty: ignore[missing-attribute]
+        return response
+
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    monkeypatch.setattr(urllib.request.AbstractHTTPHandler, "do_open", transport)
+    common.Gateway("example.com", "coursework", generate_key()).state()
+    assert sent == [("https://example.com/status", True), ("http://example.com/status", False)]

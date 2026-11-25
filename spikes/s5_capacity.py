@@ -224,7 +224,6 @@ import boto3
 
 import common
 import loadgen
-import s4_weights
 from rhi import config
 from rhi_common.causes import Cause
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
@@ -1712,7 +1711,7 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
     class_size, duration = whole_of(environ, CLASS_SIZE_VARIABLE), whole_of(environ, DURATION_VARIABLE)
     instances, window = whole_of(environ, INSTANCES_VARIABLE, DEFAULT_INSTANCES), window_of(environ)
     # Refused before anything is sent: the canary keys go over HTTPS only.
-    endpoint = s4_weights.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
+    endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
     settings = config.read_ssm()
     pools = [pool for pool in settings.pools if pool.name == name]
@@ -1737,7 +1736,7 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
             duration=duration,
             keys=keys,
             endpoint=endpoint,
-            gateway=s4_weights.Gateway(endpoint, name, keys[0]),
+            gateway=common.Gateway(endpoint, name, keys[0]),
             workspace=workspace,
             instances=instances,
             window_tokens=window,
