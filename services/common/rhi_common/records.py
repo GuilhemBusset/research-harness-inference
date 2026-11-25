@@ -7,7 +7,7 @@ holds a table reads and writes it.
 
 | Table | Partition key | Sort key | Items |
 | --- | --- | --- | --- |
-| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote` |
+| pool-state | `pool` | `record` | `mode`, the admin's record: `PoolState`. `note`, the scaler's: `ScalerNote`. `session`, the pool's booking: `Session` |
 | pool-state | `_session` | `switch` | The session switch, the admin's: `SessionSwitch` |
 | heartbeats | `pool` | `source` | `gateway#<task ID>`: `GatewayHeartbeat`. `instance#<instance ID>`: `InstanceHeartbeat` |
 
@@ -32,6 +32,12 @@ name is lower-case letters, digits and hyphens, so none is `_session`. Only the 
 `set_by` and `set_at` say who last changed the switch and when: setting it to what it already
 reads writes nothing (`switched` is that rule), so the time an off switch was set is
 the time the last session ended, which the scaler's count outside sessions reads.
+
+A pool's session (section 5.6) is the record `session` under the pool's name: a booking of the
+pool, with a number of instances, a start and an end. A pool has one at a time, and a pool with no
+such item has none. `set_by` and `set_at` say who last wrote it and when. The record is only the
+shape of the item: the bounds every reader and writer holds a session to are in
+`rhi_common.sessions`. Nothing reads the record yet.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ from typing import Self
 # The sort keys of the pool-state table that this module owns.
 MODE_RECORD = "mode"
 NOTE_RECORD = "note"
+SESSION_RECORD = "session"
 # The keys of the session switch's item in the pool-state table.
 SESSION_PARTITION = "_session"
 SWITCH_RECORD = "switch"
@@ -294,6 +301,46 @@ class SessionSwitch:
         if not isinstance(on, bool):
             raise RecordError("`on` is not true or false")
         return cls(on=on, set_by=_text(item, "set_by"), set_at=_whole(item, "set_at"))
+
+
+@dataclass(frozen=True)
+class Session:
+    """A pool's session: a booking of the pool, and who last wrote it and when (section 5.6).
+
+    `instances` is the number of instances booked, `starts_at` and `ends_at` the start and the end.
+    The record holds what was written: `rhi_common.sessions` says when a session is active and how
+    many instances it asks for, under the bounds of the configuration.
+    """
+
+    pool: str
+    instances: int
+    starts_at: int
+    ends_at: int
+    set_by: str
+    set_at: int
+
+    def to_item(self) -> Item:
+        return {
+            "pool": self.pool,
+            "record": SESSION_RECORD,
+            "instances": self.instances,
+            "starts_at": self.starts_at,
+            "ends_at": self.ends_at,
+            "set_by": self.set_by,
+            "set_at": self.set_at,
+        }
+
+    @classmethod
+    def from_item(cls, item: Mapping[str, object]) -> Self:
+        _record(item, SESSION_RECORD)
+        return cls(
+            pool=_text(item, "pool"),
+            instances=_whole(item, "instances"),
+            starts_at=_whole(item, "starts_at"),
+            ends_at=_whole(item, "ends_at"),
+            set_by=_text(item, "set_by"),
+            set_at=_whole(item, "set_at"),
+        )
 
 
 def switched(current: SessionSwitch | None, on: bool, set_by: str, now: int) -> SessionSwitch | None:

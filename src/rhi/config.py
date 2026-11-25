@@ -190,6 +190,9 @@ class Config:
     # The whole hours a pool may be in service while no session is on before its alarm fires
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
+    # The longest a session may last, in whole hours after the later of its start and the moment it
+    # was last written (`rhi_common.sessions`; sections 5.6 and 17). Nothing reads it yet.
+    session_max_hours: int
     # The share of the gateway's requests, in percent, that may fail for its own fault over the whole
     # minutes of the period before its alarm fires (`rhi.guardrails.alarms_gateway`; sections 7.3
     # and 17). Only synthesis reads them.
@@ -489,6 +492,7 @@ KEYS: dict[str, Key] = {
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "outside_sessions_alarm_hours": _WHOLE_NUMBER,
+    "session_max_hours": _WHOLE_NUMBER,
     "gateway_error_alarm_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
     "gateway_error_alarm_minutes": _WHOLE_NUMBER,
     "parked": Key("true or false, without quotes", _boolean, _boolean_from_text),
@@ -554,6 +558,9 @@ DEFAULTS: dict[str, object] = {
     "cost_anomaly_detection": False,
     # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
     "outside_sessions_alarm_hours": 1,
+    # Sections 5.6 and 17: a session ends at most 12 hours after the later of its start and the
+    # last command.
+    "session_max_hours": 12,
     # Section 17: the gateway's alarm fires when more than 5% of its requests fail for its own fault
     # over 5 minutes.
     "gateway_error_alarm_percent": 5,

@@ -218,6 +218,7 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         *(("cost_anomaly_detection", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(("parked", value) for value in (f'"{MARK}"', '"true"', "1")),
         *(("outside_sessions_alarm_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
+        *(("session_max_hours", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(("gateway_error_alarm_minutes", value) for value in (f'"{MARK}"', "0", "1.5", f"-{MARK}", "true")),
         *(("gateway_error_alarm_percent", value) for value in (f'"{MARK}"', "0", f"100.{MARK}", f"-{MARK}", "true")),
         *(
@@ -309,6 +310,15 @@ def test_outside_sessions_alarm_hours_reads_1_when_left_out(tmp_path: Path) -> N
     assert load_text(tmp_path, example_with(outside_sessions_alarm_hours=None)).outside_sessions_alarm_hours == 1
     assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["outside_sessions_alarm_hours"] == 1
     assert load_text(tmp_path, example_with(outside_sessions_alarm_hours="3")).outside_sessions_alarm_hours == 3
+
+
+def test_session_max_hours_reads_12_when_left_out(tmp_path: Path) -> None:
+    # Sections 5.6 and 17: 12 hours, so that a configuration written before the key loads unchanged.
+    assert load_text(tmp_path, example_with(session_max_hours=None)).session_max_hours == 12
+    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["session_max_hours"] == 12
+    # A whole number of at least 1.
+    assert load_text(tmp_path, example_with(session_max_hours="1")).session_max_hours == 1
+    assert load_text(tmp_path, example_with(session_max_hours="6")).session_max_hours == 6
 
 
 def test_the_gateway_error_alarm_reads_5_percent_over_5_minutes_when_left_out(tmp_path: Path) -> None:
