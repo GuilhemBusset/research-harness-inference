@@ -46,13 +46,10 @@ FULL = {
     "RHI_POOL_SECRETS": json.dumps(POOL_SECRETS),
     "RHI_KEYS_TABLE": "keys-of-the-test",
     "RHI_USAGE_TABLE": "usage-of-the-test",
-    "RHI_HEARTBEAT_TABLE": "heartbeats-of-the-test",
     "RHI_POOL_STATE_TABLE": "pool-state-of-the-test",
-    "RHI_SCALER_FUNCTION": "scaler-of-the-test",
     "RHI_COURSE_END": "2027-01-15",
     "RHI_BODY_LIMIT_BYTES": "1048576",
     "RHI_LONGEST_REQUEST_SECONDS": "900",
-    "RHI_KEEPALIVE_SECONDS": "7",
     "RHI_RETRY_AFTER_WARMING": "31",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "61",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "6",
@@ -65,16 +62,13 @@ REQUIRED = (
     "RHI_POOL_SECRETS",
     "RHI_KEYS_TABLE",
     "RHI_USAGE_TABLE",
-    "RHI_HEARTBEAT_TABLE",
     "RHI_POOL_STATE_TABLE",
-    "RHI_SCALER_FUNCTION",
     "RHI_COURSE_END",
 )
 # Each numeric variable, the field it fills and what the field is when the variable is unset (section 17).
 NUMERIC = {
     "RHI_BODY_LIMIT_BYTES": ("body_limit_bytes", 8388608),
     "RHI_LONGEST_REQUEST_SECONDS": ("longest_request_seconds", 1800),
-    "RHI_KEEPALIVE_SECONDS": ("keepalive_seconds", 10),
     "RHI_RETRY_AFTER_WARMING": ("retry_after_warming", 30),
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": ("retry_after_capacity_unavailable", 60),
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": ("retry_after_concurrency_limit", 5),
@@ -120,13 +114,10 @@ def test_a_full_environment_gives_the_settings() -> None:
         pool_secrets=POOL_SECRETS,
         keys_table="keys-of-the-test",
         usage_table="usage-of-the-test",
-        heartbeat_table="heartbeats-of-the-test",
         pool_state_table="pool-state-of-the-test",
-        scaler_function="scaler-of-the-test",
         course_end=datetime.date(2027, 1, 15),
         body_limit_bytes=1048576,
         longest_request_seconds=900,
-        keepalive_seconds=7,
         retry_after_warming=31,
         retry_after_capacity_unavailable=61,
         retry_after_concurrency_limit=6,
@@ -282,9 +273,7 @@ def test_a_required_variable_left_out_raises_an_error_that_names_it(variable: st
                 ("an-arn", POOL_SECRETS["mock"] + SECRET),
             )
         ),
-        *(pytest.param(variable, "ab", id=f"{variable}-too-short") for variable in REQUIRED[4:8]),
-        pytest.param("RHI_SCALER_FUNCTION", SECRET * 2, id="RHI_SCALER_FUNCTION-too-long"),
-        pytest.param("RHI_SCALER_FUNCTION", f"{SECRET}.name", id="RHI_SCALER_FUNCTION-a-dot"),
+        *(pytest.param(variable, "ab", id=f"{variable}-too-short") for variable in REQUIRED[4:7]),
         *(
             pytest.param("RHI_COURSE_END", value, id=f"RHI_COURSE_END-{case}")
             for case, value in (
@@ -346,18 +335,15 @@ def test_the_names_and_arns_a_deployment_can_give_are_accepted() -> None:
         "RHI_POOL_SECRETS": json.dumps(dict.fromkeys(POOLS, secret)),
         "RHI_KEYS_TABLE": "Stage-Tables.Keys_1A2B3C",
         "RHI_USAGE_TABLE": "abc",
-        "RHI_HEARTBEAT_TABLE": "t" * 255,
-        "RHI_POOL_STATE_TABLE": "Stage_pool-state",
-        "RHI_SCALER_FUNCTION": "Stage-Scaler_Function1A2B3C",
+        "RHI_POOL_STATE_TABLE": "t" * 255,
     }
 
     settings = read_settings({**FULL, **given})
 
     assert settings.target_groups == dict.fromkeys(POOLS, target_group)
     assert settings.pool_secrets == dict.fromkeys(POOLS, secret)
-    tables = (settings.keys_table, settings.usage_table, settings.heartbeat_table, settings.pool_state_table)
-    assert (*tables, settings.scaler_function) == tuple(list(given.values())[2:])
-    assert read_settings({**FULL, "RHI_SCALER_FUNCTION": "f" * 64}).scaler_function == "f" * 64
+    tables = (settings.keys_table, settings.usage_table, settings.pool_state_table)
+    assert tables == tuple(list(given.values())[2:])
 
 
 def test_a_refused_pool_field_is_named_from_the_fixed_list_only() -> None:

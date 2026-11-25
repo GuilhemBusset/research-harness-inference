@@ -19,8 +19,8 @@ rule of its own.
 
 **A deployment never cuts a request.** ECS waits for an old task's target to finish deregistering
 before it stops the task, and the target group's deregistration delay is `DEREGISTRATION_SECONDS`,
-1800: a held request or a stream up to 30 minutes long finishes, and a gateway deployment takes
-that long to complete (section 8.5; the number is a default of section 17).
+1800: a stream up to 30 minutes long finishes, and a gateway deployment takes that long to
+complete (section 8.5; the number is a default of section 17).
 
 **The health check** sends `GET /v1/models`, as a load balancer does, with no key, and counts the
 status 401 as healthy. The route table is closed, and its one route answered without a key,
@@ -40,12 +40,11 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 - `RHI_TARGET_GROUPS` and `RHI_POOL_SECRETS`: each pool's target group and each pool's secret, by
   ARN. No variable, parameter or template holds a secret's value: the gateway reads it from
   Secrets Manager at start, with the task's role;
-- `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_HEARTBEAT_TABLE`, `RHI_POOL_STATE_TABLE`: the names the
-  deployment gives the four tables;
-- `RHI_SCALER_FUNCTION`: the scaler function's name;
+- `RHI_KEYS_TABLE`, `RHI_USAGE_TABLE`, `RHI_POOL_STATE_TABLE`: the names the deployment gives the
+  three tables;
 - `RHI_COURSE_END`: the configuration's course end date, YYYY-MM-DD, by which every usage row
   the gateway writes expires (section 6.6);
-- the seven numeric variables, each from its configuration key (`NUMERIC`): the last,
+- the six numeric variables, each from its configuration key (`NUMERIC`): the last,
   `RHI_SESSION_MAX_HOURS`, is the longest a session may last, under which the gateway reads every
   pool's session (section 5.6);
 - the three floors of the objectives, each from its configuration key (`FLOORS`), which the
@@ -77,13 +76,12 @@ with its reason, and nothing else:
 
 - read the items of the keys table (a request's key) and of the pool-state table (each pool's
   state record and the scaler's note), by their ARNs;
-- read and write the items of the usage table (the students' budgets) and of the heartbeat table
-  (this task's rows), by their ARNs;
+- read and write the items of the usage table (the students' budgets: the concurrency slots and
+  the load balancer's cookies are kept there), by its ARN;
 - `secretsmanager:GetSecretValue` and `DescribeSecret` on each pool's bearer secret, by its fixed
   name (`rhi.pools.secret`): the gateway sends it to the pool's engines;
 - `elasticloadbalancing:DescribeTargetHealth` on every resource, the only way AWS grants it: the
   gateway reads each pool's target group to know when the pool is ready;
-- `lambda:InvokeFunction` on the scaler function alone: a request for a pool that sleeps wakes it;
 - `aps:RemoteWrite` on the metrics workspace alone: the collector pushes the gateway's metrics.
 
 Pulling the two images' layers and writing the two containers' logs is the task's execution role,
@@ -123,7 +121,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from aws_cdk import aws_dynamodb as dynamodb
-    from aws_cdk import aws_lambda as lambda_
 
     from rhi.config import Config
     from rhi.observability.prometheus import PrometheusWorkspace
@@ -160,15 +157,12 @@ TARGET_GROUPS_VARIABLE = "RHI_TARGET_GROUPS"
 POOL_SECRETS_VARIABLE = "RHI_POOL_SECRETS"
 KEYS_TABLE_VARIABLE = "RHI_KEYS_TABLE"
 USAGE_TABLE_VARIABLE = "RHI_USAGE_TABLE"
-HEARTBEAT_TABLE_VARIABLE = "RHI_HEARTBEAT_TABLE"
 POOL_STATE_TABLE_VARIABLE = "RHI_POOL_STATE_TABLE"
-SCALER_FUNCTION_VARIABLE = "RHI_SCALER_FUNCTION"
 COURSE_END_VARIABLE = "RHI_COURSE_END"
 # Each numeric variable, and the configuration key it is written from.
 NUMERIC = {
     "RHI_BODY_LIMIT_BYTES": "request_body_limit_bytes",
     "RHI_LONGEST_REQUEST_SECONDS": "longest_request_seconds",
-    "RHI_KEEPALIVE_SECONDS": "keepalive_seconds",
     "RHI_RETRY_AFTER_WARMING": "retry_after_warming_seconds",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "retry_after_capacity_unavailable_seconds",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "retry_after_concurrency_limit_seconds",
@@ -196,7 +190,6 @@ HEALTH_CHECK_PATH = "/v1/models"
 HEALTH_CHECK_STATUS = "401"
 
 TARGET_HEALTH_ACTIONS = ["elasticloadbalancing:DescribeTargetHealth"]
-INVOKE_ACTIONS = ["lambda:InvokeFunction"]
 
 
 def log_group(scope: Construct) -> logs.LogGroup:
@@ -231,9 +224,7 @@ class GatewayService(Construct):
         secrets: Mapping[str, PoolSecret],
         keys: dynamodb.ITable,
         usage: dynamodb.ITable,
-        heartbeats: dynamodb.ITable,
         pool_state: dynamodb.ITable,
-        scaler: lambda_.Function,
         workspace: PrometheusWorkspace,
         listener: elbv2.IApplicationListener | None,
     ) -> None:
@@ -255,13 +246,11 @@ class GatewayService(Construct):
             iam.PolicyStatement(actions=READ_ACTIONS, resources=[keys.table_arn, pool_state.table_arn])
         )
         self.task_role.add_to_policy(
-            iam.PolicyStatement(actions=READ_ACTIONS + WRITE_ACTIONS, resources=[usage.table_arn, heartbeats.table_arn])
+            iam.PolicyStatement(actions=READ_ACTIONS + WRITE_ACTIONS, resources=[usage.table_arn])
         )
         for name in names:
             secrets[name].grant_read(self.task_role)
         self.task_role.add_to_policy(iam.PolicyStatement(actions=TARGET_HEALTH_ACTIONS, resources=["*"]))
-        # The function itself, as the gateway invokes it: no version and no alias.
-        self.task_role.add_to_policy(iam.PolicyStatement(actions=INVOKE_ACTIONS, resources=[scaler.function_arn]))
         # Inline rather than the workspace's `write_policy`: a policy of another stack is one the
         # invariants of this stack's template cannot read.
         self.task_role.add_to_policy(
@@ -294,9 +283,7 @@ class GatewayService(Construct):
             POOL_SECRETS_VARIABLE: stack.to_json_string({name: secrets[name].secret.secret_arn for name in names}),
             KEYS_TABLE_VARIABLE: keys.table_name,
             USAGE_TABLE_VARIABLE: usage.table_name,
-            HEARTBEAT_TABLE_VARIABLE: heartbeats.table_name,
             POOL_STATE_TABLE_VARIABLE: pool_state.table_name,
-            SCALER_FUNCTION_VARIABLE: scaler.function_name,
             COURSE_END_VARIABLE: config.course_end.isoformat(),
             **{variable: str(getattr(config, key)) for variable, key in NUMERIC.items()},
             **{variable: _decimal(getattr(config, key)) for variable, key in FLOORS.items()},

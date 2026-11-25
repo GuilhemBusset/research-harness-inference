@@ -182,11 +182,10 @@ def gateway(app_module: ModuleType, tmp_path_factory: pytest.TempPathFactory) ->
     return synthesize(app_module, tmp_path_factory.mktemp("example"))
 
 
-# Seven numbers that are neither the configuration's defaults nor the settings reader's.
+# Six numbers that are neither the configuration's defaults nor the settings reader's.
 OTHER_NUMBERS = {
     "request_body_limit_bytes": 1_048_576,
     "longest_request_seconds": 900,
-    "keepalive_seconds": 7,
     "retry_after_warming_seconds": 31,
     "retry_after_capacity_unavailable_seconds": 61,
     "retry_after_concurrency_limit_seconds": 6,
@@ -303,11 +302,10 @@ def test_the_environment_is_what_the_gateway_reads(gateway: Gateway) -> None:
     for rule in forwarding:
         assert rule["Actions"] == [{"Type": "forward", "TargetGroupArn": {"Ref": target_group}}]
 
-    # The tables are the four the gateway names, each by its keys, and the function is the scaler.
+    # The tables are the three the gateway names, each by its keys.
     for name, schema in (
         (read.keys_table, tables.KEYS),
         (read.usage_table, tables.USAGE),
-        (read.heartbeat_table, tables.HEARTBEATS),
         (read.pool_state_table, tables.POOL_STATE),
     ):
         path, table = stands_for[name]
@@ -316,11 +314,10 @@ def test_the_environment_is_what_the_gateway_reads(gateway: Gateway) -> None:
             for key in gateway.deployment.templates[path]["Resources"][table]["Properties"]["KeySchema"]
         ]
         assert keys == [key.name for key in (schema.partition_key, schema.sort_key) if key is not None]
-    path, function = stands_for[read.scaler_function]
-    assert (
-        gateway.deployment.templates[path]["Resources"][function]["Properties"]["Handler"]
-        == "rhi_scaler.handler.handler"
-    )
+    # The gateway holds no request and asks the scaler for nothing: it is told neither the scaler's
+    # function, nor the heartbeats table, nor a keep-alive interval.
+    assert not [name for name in environment if re.search("SCALER|HEARTBEAT|KEEPALIVE", name)]
+    assert not {placeholder for placeholder in environment.values()} & no_longer_the_gateway_s(gateway)
 
 
 def test_the_numeric_settings_are_the_configuration_s(gateway: Gateway, one_task: Gateway) -> None:
@@ -330,7 +327,6 @@ def test_the_numeric_settings_are_the_configuration_s(gateway: Gateway, one_task
     assert {
         "request_body_limit_bytes": read.body_limit_bytes,
         "longest_request_seconds": read.longest_request_seconds,
-        "keepalive_seconds": read.keepalive_seconds,
         "retry_after_warming_seconds": read.retry_after_warming,
         "retry_after_capacity_unavailable_seconds": read.retry_after_capacity_unavailable,
         "retry_after_concurrency_limit_seconds": read.retry_after_concurrency_limit,
@@ -390,17 +386,56 @@ def test_the_task_role_may_do_what_the_gateway_does_and_nothing_else(gateway: Ga
     expected: set[tuple[str, Resource | str]] = {
         (action, stands_for[table]) for action in READS for table in (read.keys_table, read.pool_state_table)
     }
-    expected |= {
-        (action, stands_for[table]) for action in READS | WRITES for table in (read.usage_table, read.heartbeat_table)
-    }
+    expected |= {(action, stands_for[read.usage_table]) for action in READS | WRITES}
     # A pool's secret by its name, whatever six characters Secrets Manager ends its ARN with.
     expected |= {(action, arn[:-6] + "??????") for action in SECRET_READS for arn in read.pool_secrets.values()}
     expected |= {
         ("elasticloadbalancing:DescribeTargetHealth", "*"),
-        ("lambda:InvokeFunction", stands_for[read.scaler_function]),
         ("aps:RemoteWrite", stands_for[endpoint]),
     }
     assert allowed == expected
+    # Named apart: the role invokes no function, and holds nothing on the heartbeats table or on
+    # the scaler's function, by name or by ARN.
+    assert not [action for action, _ in allowed if action.startswith("lambda:")]
+    texts = {gateway.deployment.text(resource, gateway.path) for s in statements for resource in as_list(s["Resource"])}
+    assert not texts & no_longer_the_gateway_s(gateway)
+
+
+def once_the_gateway_s(gateway: Gateway) -> list[Any]:
+    """The pools template's references to the name and the ARN of the heartbeats table and of the
+    scaler's function: what the gateway's task was once given, and its role once held."""
+    _, pools = find(gateway.deployment.templates, "RhiPools")
+    schema = [key.name for key in (tables.HEARTBEATS.partition_key, tables.HEARTBEATS.sort_key) if key is not None]
+    (heartbeats,) = [
+        name
+        for name, table in of_type(pools, "AWS::DynamoDB::Table").items()
+        if [key["AttributeName"] for key in table["KeySchema"]] == schema
+    ]
+    (scaler,) = [
+        name
+        for name, function in of_type(pools, "AWS::Lambda::Function").items()
+        if function.get("Handler") == "rhi_scaler.handler.handler"
+    ]
+    return [reference for name in (heartbeats, scaler) for reference in ({"Ref": name}, {"Fn::GetAtt": [name, "Arn"]})]
+
+
+def no_longer_the_gateway_s(gateway: Gateway) -> set[str]:
+    """The same four, as the placeholders a deployment would give."""
+    pools_path, _ = find(gateway.deployment.templates, "RhiPools")
+    return {gateway.deployment.text(reference, pools_path) for reference in once_the_gateway_s(gateway)}
+
+
+def test_the_pools_stack_keeps_the_exports_the_deployed_gateway_stack_imports(gateway: Gateway) -> None:
+    # The gateway stack imported the name and the ARN of the heartbeats table and of the scaler's
+    # function. The pools stack is updated before the gateway stack, and CloudFormation refuses to
+    # delete an export a deployed stack imports: the four are still exported, and no longer imported.
+    _, pools = find(gateway.deployment.templates, "RhiPools")
+    exports = {output["Export"]["Name"]: output["Value"] for output in pools["Outputs"].values() if "Export" in output}
+    kept = once_the_gateway_s(gateway)
+    assert all(reference in exports.values() for reference in kept)
+    imported = set(re.findall(r'"Fn::ImportValue": "([^"]+)"', json.dumps(gateway.template)))
+    assert imported & exports.keys()
+    assert not [name for name in imported if exports.get(name) in kept]
 
 
 def test_an_action_on_every_resource_is_one_the_module_s_file_lists(gateway: Gateway) -> None:

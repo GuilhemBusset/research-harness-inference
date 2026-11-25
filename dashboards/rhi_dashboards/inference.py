@@ -7,14 +7,14 @@ each pool of the configuration, of the panels of section 7.2's performance table
 | --- | --- | --- |
 | Output speed per stream | The mean, output tokens over decode time (the headline); the median and the slowest tenth, from the time per output token; each instance's computed-input rate, which is what slows a stream | The median and the slowest tenth of each stream's tokens a second |
 | Output throughput | Output tokens a second, for the pool and for each instance | Output tokens settled a second |
-| Time to first token | The median and the 95th percentile, and those of its two parts, queue time and prefill time | The same, by start (warm or held) and turn (first or later), to the first token and to the first token that is not reasoning |
+| Time to first token | The median and the 95th percentile, and those of its two parts, queue time and prefill time | The same, by turn (first or later), to the first token and to the first token that is not reasoning |
 | Input throughput | Input tokens a second, cached ones included, and the part computed beside it | Input tokens settled a second |
 | Prefill speed | Tokens computed over prefill time | None |
 | Transcript size and output per turn | The median and the 95th percentile of each request's input and output tokens | The same, from the tokens settled |
 | Cached share of input | Cached input tokens over input tokens | None |
 | Cache use against capacity | Each instance's cache use and preemptions; the capacity in tokens the lifecycle agent exports, beside the pool's expected capacity | None |
 | Sessions the cache forgot | The median and the 95th percentile of how long a block sat idle before it was evicted, and the blocks evicted | None |
-| Concurrent streams and the queue | Each instance's running and waiting requests | The requests in flight and held, summed over the gateway's tasks |
+| Concurrent streams and the queue | Each instance's running and waiting requests | The requests in flight, summed over the gateway's tasks |
 | Students per instance, an average | None | The students with a request in the last five minutes, over the scaler's instances in service |
 | Cost per million output tokens, estimate | None | The cost dashboard's estimated dollars over the gateway's output tokens, over the dashboard's range; linked to the month's, on the cost dashboard |
 | Tokens per GPU-hour and per joule | Output throughput over the scaler's instances in service, and over the rate of the DCGM exporter's energy counter | None |
@@ -99,7 +99,6 @@ GATEWAY_OUTPUT = "rhi_gateway_request_output_tokens"
 GATEWAY_FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 GATEWAY_FIRST_ANSWER = "rhi_gateway_time_to_first_answer_seconds"
 GATEWAY_IN_FLIGHT = "rhi_gateway_requests_in_flight"
-GATEWAY_HELD = "rhi_gateway_requests_held"
 # The gateway's per-student counter of requests, by alias and pool: read only to count the aliases.
 GATEWAY_STUDENTS = "services/gateway/rhi_gateway/metrics.py"
 STUDENT_REQUESTS = "rhi_gateway_student_requests"
@@ -109,8 +108,8 @@ STUDENT_WINDOW = "5m"
 # The cache capacity in tokens each instance's lifecycle agent exports, a gauge.
 LIFECYCLE_CACHE = "services/engine/lifecycle/rhi_lifecycle/cache.py"
 CACHE_CAPACITY = "rhi_lifecycle_engine_cache_capacity_tokens"
-# The labels of the gateway's two waits: warm or held, and first turn or later.
-WAIT_LABELS = ("start", "turn")
+# The label of the gateway's two waits: first turn or later.
+WAIT_LABELS = ("turn",)
 # The label the collector gives every series of an instance: the instance's ID.
 INSTANCE = rules.INSTANCE
 
@@ -198,7 +197,6 @@ METRICS: tuple[rules.Declared, ...] = (
             GATEWAY_FIRST_TOKEN,
             GATEWAY_FIRST_ANSWER,
             GATEWAY_IN_FLIGHT,
-            GATEWAY_HELD,
         )
     ),
     rules.EmittedBy(STUDENT_REQUESTS, GATEWAY_STUDENTS),
@@ -365,16 +363,13 @@ def forgotten(pool: Pool) -> list[rules.Series]:
 
 
 def streams(pool: Pool) -> list[rules.Series]:
-    """Each instance's running and waiting requests, and the gateway's in flight and held, summed over its tasks."""
+    """Each instance's running and waiting requests, and the gateway's in flight, summed over its tasks."""
     measured = [
         _engine(f"{legend} {{{{{INSTANCE}}}}}", _per_instance(rules.engine_selector(pool, quantity), "sum"))
         for quantity, legend in ((Quantity.RUNNING_REQUESTS, "running"), (Quantity.WAITING_REQUESTS, "waiting"))
     ]
-    measured += [
-        rules.Series(legend, f"sum by ({rules.POOL}) ({rules.selector(gauge, _gateway(pool))})")
-        for gauge, legend in ((GATEWAY_IN_FLIGHT, "gateway in flight"), (GATEWAY_HELD, "gateway held"))
-    ]
-    return measured
+    in_flight = f"sum by ({rules.POOL}) ({rules.selector(GATEWAY_IN_FLIGHT, _gateway(pool))})"
+    return [*measured, rules.Series("gateway in flight", in_flight)]
 
 
 def active(pool: Pool) -> str:

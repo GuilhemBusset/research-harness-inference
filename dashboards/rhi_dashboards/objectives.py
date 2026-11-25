@@ -29,9 +29,10 @@ objective is measured on it alone: its floors are that pool's. It is not the poo
 `claude-*` names to (`default_pool`), which the owner may point at another pool. A configuration
 with no pool of that name has no measure of speed.
 
-**Every stream the gateway recorded in the session counts**, whether its request waited for its
-pool or not: the gateway labels each with `start`, `held` or `warm`, and the objectives select
-neither, so both are summed. Only the turn is told apart, for the time to first token.
+**Every stream the gateway recorded in the session counts.** No request waits for its pool, so the
+gateway's histograms carry no label that tells one start of a request from another
+(`rhi_gateway.experience`), and the objectives select none. Only the turn is told apart, for the
+time to first token.
 
 **A percentile is judged by a share.** The q-th percentile is the smallest value with at least q
 of the observations at or under it, so it is under a target exactly when at least q of the

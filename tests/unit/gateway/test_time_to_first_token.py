@@ -251,17 +251,17 @@ def served(made: Gateway, name: str) -> list[Sample]:
     return [sample for family in families if family.name == name for sample in family.samples]
 
 
-def waits(made: Gateway, name: str) -> dict[tuple[str, str, str], list[float]]:
+def waits(made: Gateway, name: str) -> dict[tuple[str, str], list[float]]:
     """What one histogram holds: the requests and the sum of their seconds, for each series it serves.
 
-    A series is named by its wire format, `warm` (no request is held), and `first` or `later`. The sum is
-    rounded: each wait is observed one step of the float above itself.
+    A series is named by its wire format, and `first` or `later`. The sum is rounded: each wait is
+    observed one step of the float above itself.
     """
-    found: dict[tuple[str, str, str], list[float]] = {}
+    found: dict[tuple[str, str], list[float]] = {}
     for sample in served(made, name):
         labels = sample.labels
         assert labels["pool"] == POOL
-        series = found.setdefault((labels["wire_format"], labels["start"], labels["turn"]), [0.0, 0.0])
+        series = found.setdefault((labels["wire_format"], labels["turn"]), [0.0, 0.0])
         if sample.name == name + "_count":
             series[0] = sample.value
         elif sample.name == name + "_sum":
@@ -273,9 +273,9 @@ def test_a_stream_waits_for_its_first_token_then_its_first_answer() -> None:
     made = gateway()
     turn(made, MESSAGES, (12, "reasoning"), (20, "text"), (25, "text"))
 
-    # One request in each histogram, under `warm` and under nothing else: 12 seconds, and 20.
-    assert waits(made, FIRST_TOKEN) == {("messages", "warm", "first"): [1, 12]}
-    assert waits(made, FIRST_ANSWER) == {("messages", "warm", "first"): [1, 20]}
+    # One request in each histogram, in one series: 12 seconds, and 20.
+    assert waits(made, FIRST_TOKEN) == {("messages", "first"): [1, 12]}
+    assert waits(made, FIRST_ANSWER) == {("messages", "first"): [1, 20]}
 
 
 @pytest.mark.parametrize(
@@ -286,10 +286,10 @@ def test_a_stream_waits_for_its_first_token_then_its_first_answer() -> None:
 def test_first_turn_or_later(wire_format: WireFormat, earlier: list[dict[str, Any]]) -> None:
     made = gateway()
     turn(made, wire_format, (2, "text"), said=[HELLO])
-    assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {(wire_format.value, "warm", "first"): [1, 2]}
+    assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {(wire_format.value, "first"): [1, 2]}
 
     turn(made, wire_format, (7, "text"), said=earlier)
-    expected = {(wire_format.value, "warm", "first"): [1, 2], (wire_format.value, "warm", "later"): [1, 7]}
+    expected = {(wire_format.value, "first"): [1, 2], (wire_format.value, "later"): [1, 7]}
     assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == expected
 
 
@@ -298,8 +298,8 @@ def test_chat_reasoning_deltas() -> None:
     # The delta at 3 seconds has text in a field of the engine's: neither `content` nor a tool call.
     turn(made, CHAT, (3, "reasoning"), (5, "reasoning"), (9, "text"), (11, "text"))
 
-    assert waits(made, FIRST_TOKEN) == {("chat_completions", "warm", "first"): [1, 3]}
-    assert waits(made, FIRST_ANSWER) == {("chat_completions", "warm", "first"): [1, 9]}
+    assert waits(made, FIRST_TOKEN) == {("chat_completions", "first"): [1, 3]}
+    assert waits(made, FIRST_ANSWER) == {("chat_completions", "first"): [1, 9]}
 
 
 @pytest.mark.parametrize("answer", ["text", "arguments"], ids=["text", "tool call"])
@@ -309,21 +309,21 @@ def test_first_answer_is_the_first_text_or_tool_call_after_the_reasoning(wire_fo
     # A tool call's name, sent at 6 before any of its arguments, is no token: the answer begins at 7.
     turn(made, wire_format, (4, "reasoning"), (5, "reasoning"), (6, "named"), (7, answer), (8, answer))
 
-    assert waits(made, FIRST_TOKEN) == {(wire_format.value, "warm", "first"): [1, 4]}
-    assert waits(made, FIRST_ANSWER) == {(wire_format.value, "warm", "first"): [1, 7]}
+    assert waits(made, FIRST_TOKEN) == {(wire_format.value, "first"): [1, 4]}
+    assert waits(made, FIRST_ANSWER) == {(wire_format.value, "first"): [1, 7]}
 
 
 def test_chat_function_call_arguments_are_the_answer() -> None:
     made = gateway()
     # Its name, sent at 6 before any of its arguments, is no token: the answer begins at 9.
     turn(made, CHAT, (3, "reasoning"), (6, "function named"), (9, "function arguments"), (10, "function arguments"))
-    assert waits(made, FIRST_TOKEN) == {("chat_completions", "warm", "first"): [1, 3]}
-    assert waits(made, FIRST_ANSWER) == {("chat_completions", "warm", "first"): [1, 9]}
+    assert waits(made, FIRST_TOKEN) == {("chat_completions", "first"): [1, 3]}
+    assert waits(made, FIRST_ANSWER) == {("chat_completions", "first"): [1, 9]}
 
     # With no reasoning before them, the arguments are the first token as well.
     made = gateway()
     turn(made, CHAT, (6, "function named"), (9, "function arguments"))
-    assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {("chat_completions", "warm", "first"): [1, 9]}
+    assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {("chat_completions", "first"): [1, 9]}
 
 
 @pytest.mark.parametrize("wire_format", list(WireFormat))
@@ -334,7 +334,7 @@ def test_only_what_a_stream_sent_is_waited_for(wire_format: WireFormat) -> None:
     assert waits(made, FIRST_TOKEN) == waits(made, FIRST_ANSWER) == {}
     # A stream that only reasoned sent a first token, and no answer.
     turn(made, wire_format, (4, "reasoning"), (6, "reasoning"))
-    assert waits(made, FIRST_TOKEN) == {(wire_format.value, "warm", "first"): [1, 4]}
+    assert waits(made, FIRST_TOKEN) == {(wire_format.value, "first"): [1, 4]}
     assert waits(made, FIRST_ANSWER) == {}
 
 
@@ -349,13 +349,7 @@ def test_five_seconds_is_a_boundary_and_no_label_is_a_student() -> None:
     names = [str(name) for alias, github_id in students for name in (alias, github_id, made.keys[alias])]
     for histogram in (FIRST_TOKEN, FIRST_ANSWER):
         samples = served(made, histogram)
-        assert {label for sample in samples for label in sample.labels} == {
-            "pool",
-            "wire_format",
-            "start",
-            "turn",
-            "le",
-        }
+        assert {label for sample in samples for label in sample.labels} == {"pool", "wire_format", "turn", "le"}
         for sample in samples:
             assert not any(name in " ".join([sample.name, *sample.labels.values()]) for name in names)
         # The objective's 5 seconds is read exactly. Each stream sent its first token at 4 seconds and
@@ -364,8 +358,6 @@ def test_five_seconds_is_a_boundary_and_no_label_is_a_student() -> None:
         at_five = [
             sample.value
             for sample in samples
-            if sample.name == histogram + "_bucket"
-            and sample.labels["le"] == "5.0"
-            and sample.labels["start"] == "warm"
+            if sample.name == histogram + "_bucket" and sample.labels["le"] == "5.0"
         ]
         assert at_five == [2 if histogram == FIRST_TOKEN else 0] * (2 * len(WireFormat))

@@ -1,41 +1,36 @@
 """What students experience, per pool, as the gateway sees it (system design, sections 4.7, 7.2 and 7.3).
 
 The engine measures its own work. The gateway measures what the student got, which adds the wait in
-front of the engine, the hold and the network. These are the gateway's series for the quantities of
+front of the engine and the network. These are the gateway's series for the quantities of
 section 4.7 that it can see, beside the per-student ones (`rhi_gateway.metrics`) and on the same
 registry, so the one endpoint serves both:
 
 | Series | Kind | Labels | Value |
 | --- | --- | --- | --- |
-| `rhi_gateway_time_to_first_token_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The seconds from a streamed request accepted to its first token sent |
-| `rhi_gateway_time_to_first_answer_seconds` | histogram | `pool`, `wire_format`, `start`, `turn` | The same, to its first token that is not reasoning |
-| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format`, `start` | The output speed of each streamed request |
+| `rhi_gateway_time_to_first_token_seconds` | histogram | `pool`, `wire_format`, `turn` | The seconds from a streamed request accepted to its first token sent |
+| `rhi_gateway_time_to_first_answer_seconds` | histogram | `pool`, `wire_format`, `turn` | The same, to its first token that is not reasoning |
+| `rhi_gateway_stream_output_tokens_per_second` | histogram | `pool`, `wire_format` | The output speed of each streamed request |
 | `rhi_gateway_request_input_tokens` | histogram | `pool`, `wire_format` | The input tokens of each request settled: the transcript's size |
 | `rhi_gateway_request_output_tokens` | histogram | `pool`, `wire_format` | The output tokens of each request settled: the output of a turn |
 | `rhi_gateway_requests_in_flight` | gauge | `pool` | The requests this task has forwarded and not yet ended |
-| `rhi_gateway_requests_held` | gauge | `pool` | The requests this task holds while their pool starts |
 
 **Never by student** (section 7.2). No series here carries a student: `Experience.request` is given
-a pool's name, a wire format and two facts of the request (whether it was held, whether it is a
-first turn) and nothing else, so no alias, key or GitHub ID can become a label. Every value is the
-gateway's own: a configured pool's name, one of the three formats, `warm` or `held`, `first` or
-`later`.
+a pool's name, a wire format and one fact of the request (whether it is a first turn) and nothing
+else, so no alias, key or GitHub ID can become a label. Every value is the gateway's own: a
+configured pool's name, one of the three formats, `first` or `later`.
 
 **The two waits of a request** (sections 4.2 and 7.2). What a student waits for is the first token,
 and then the first token that is not reasoning, which is when they see an answer begin: the model
 reasons before it answers. Both are counted in seconds from the request accepted, which is the
-moment `Experience.request` is called: its key, its body and its concurrency limit have passed, and its wait
-for its pool, if it has one, has not begun. The first is observed at the first `Turn.token_sent` of the request,
+moment `Experience.request` is called: its key, its body and its concurrency limit have passed. No
+request waits for its pool: one whose pool cannot serve is refused before it is accepted
+(`rhi_gateway.app`). The first is observed at the first `Turn.token_sent` of the request,
 the second at the first one that reports answer text or a tool call (`rhi_gateway.proxy` tells
 which, as each format's reference marks its events). Like the speed, both only mean something on a
 stream: a request that is not one observes neither, and a stream that only reasoned observes no
-answer. Each carries two more labels:
-
-- `start` is `held` for a request that waited for its pool, whose wait is then in both times, and
-  `warm` otherwise;
-- `turn` is `first` for a request whose conversation carries no earlier output of the model, and
-  `later` otherwise. A first turn computes its whole opening, which no cache holds yet (section
-  4.7), so the objective counts the first turns of sessions apart.
+answer. Each carries one more label, `turn`: `first` for a request whose conversation carries no
+earlier output of the model, and `later` otherwise. A first turn computes its whole opening, which
+no cache holds yet (section 4.7), so the objective counts the first turns of sessions apart.
 
 The objective of section 7.3 is a time to first token under 5 seconds at the 95th percentile on a
 warm pool (section 17). 5 seconds is a boundary of both histograms, so that it is read exactly.
@@ -57,23 +52,24 @@ settlement observed.
 
 The objectives of section 7.3 are read from this histogram against floors held in configuration:
 the median stream at 15 tokens per second or more, the slowest tenth at 10 or more (section 17), on
-a warm pool. So the speed carries `start` too, `held` or `warm` as the waits do: a request that
-waited for its pool is not one of a warm pool. A floor that falls between two buckets cannot be
-read exactly, so each floor of section 17 is a bucket boundary (`rhi_common.boundaries`), and the
-gateway adds the floors its configuration holds (`rhi_gateway.settings`), so that a revised one is
-read exactly too.
+a warm pool, which every stream the gateway forwards is on. A floor that falls between two buckets
+cannot be read exactly, so each floor of section 17 is a bucket boundary
+(`rhi_common.boundaries`), and the gateway adds the floors its configuration holds
+(`rhi_gateway.settings`), so that a revised one is read exactly too.
 
 **The tokens of a request** are observed once for every request that settles, whatever its end and
 streamed or not, with the tokens its settlement observed: the ones the per-student counters add up
-(`rhi_gateway.metrics`). A request that ended with nothing observed (its hold ran out, its engine
-failed) is observed at zero, and so is the output of a token count; each of the two histograms has
+(`rhi_gateway.metrics`). A request that ended with nothing observed (its engine failed) is
+observed at zero, and so is the output of a token count; each of the two histograms has
 a bucket at zero, so a panel can read the distribution above it.
 
-**In flight and held** are not counted here. At every scrape they are read from the rows the
-heartbeat would write at that moment (`rhi_gateway.heartbeat.Heartbeat.rows`), so they are the
-counts the scaler is told, an explicit wake counted as held included. Like those rows they are
-this task's own: the collector labels every series with the task's ID, and a sum over the tasks
-is the pool's.
+**In flight** is this task's count, per pool, of the requests it has forwarded and that have not
+ended, kept here. `Experience.forwarded` counts one request from that moment, and the `InFlight`
+it returns stops counting it at its end, once however often it is told. The gauge reads the count
+at every scrape, with a series for every configured pool, zero for a pool with no request. Token
+counting, the local routes and a request refused before it is forwarded are never counted
+(`rhi_gateway.app`). The count is this task's own: the collector labels every series with the
+task's ID, and a sum over the tasks is the pool's.
 """
 
 from __future__ import annotations
@@ -91,7 +87,6 @@ from rhi_common.boundaries import SPEED_BUCKETS, WAIT_BUCKETS
 if TYPE_CHECKING:
     from prometheus_client import Metric
 
-    from rhi_common.records import GatewayHeartbeat
     from rhi_gateway.errors import WireFormat
 
 # The families' names.
@@ -99,10 +94,9 @@ SPEED = "rhi_gateway_stream_output_tokens_per_second"
 INPUT_TOKENS = "rhi_gateway_request_input_tokens"
 OUTPUT_TOKENS = "rhi_gateway_request_output_tokens"
 IN_FLIGHT = "rhi_gateway_requests_in_flight"
-HELD = "rhi_gateway_requests_held"
 FIRST_TOKEN = "rhi_gateway_time_to_first_token_seconds"
 FIRST_ANSWER = "rhi_gateway_time_to_first_answer_seconds"
-SERIES = (SPEED, INPUT_TOKENS, OUTPUT_TOKENS, IN_FLIGHT, HELD, FIRST_TOKEN, FIRST_ANSWER)
+SERIES = (SPEED, INPUT_TOKENS, OUTPUT_TOKENS, IN_FLIGHT, FIRST_TOKEN, FIRST_ANSWER)
 
 # Tokens of one request. Zero is a request that settled with none observed. The last input boundary
 # is the full context of the coursework model (section 4.2).
@@ -113,8 +107,7 @@ OUTPUT_BUCKETS = (0, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_0
 # `rhi_common.boundaries`, with the configured floors of the objectives among them (`Settings`).
 
 _LABELS = ("pool", "wire_format")
-_SPEED_LABELS = (*_LABELS, "start")
-_WAIT_LABELS = (*_SPEED_LABELS, "turn")
+_WAIT_LABELS = (*_LABELS, "turn")
 
 
 def _strictly(value: float) -> float:
@@ -125,13 +118,10 @@ def _strictly(value: float) -> float:
 class Turn:
     """One request, from its reservation to its settlement: its token times, then its tokens."""
 
-    def __init__(
-        self, experience: Experience, pool: str, wire_format: WireFormat, *, held: bool, first_turn: bool
-    ) -> None:
+    def __init__(self, experience: Experience, pool: str, wire_format: WireFormat, *, first_turn: bool) -> None:
         self._experience = experience
         self._labels = (pool, wire_format.value)
-        self._speed_labels = (*self._labels, "held" if held else "warm")
-        self._wait_labels = (*self._speed_labels, "first" if first_turn else "later")
+        self._wait_labels = (*self._labels, "first" if first_turn else "later")
         self._accepted_at = experience.clock()
         self._first_token_at: float | None = None
         self._last_token_at: float | None = None
@@ -157,40 +147,53 @@ class Turn:
         first, last = self._first_token_at, self._last_token_at
         if first is None or last is None or last <= first or output_tokens < 2:
             return
-        series.speed.labels(*self._speed_labels).observe(_strictly((output_tokens - 1) / (last - first)))
+        series.speed.labels(*self._labels).observe(_strictly((output_tokens - 1) / (last - first)))
 
 
-class _Demand:
-    """The requests in flight and held, per pool, read from the heartbeat's rows at every scrape."""
+class InFlight:
+    """One forwarded request's part in the count: in flight, then nothing once it has ended."""
 
-    def __init__(self, rows: Callable[[], Iterable[GatewayHeartbeat]]) -> None:
-        self._rows = rows
+    def __init__(self, counts: dict[str, int], pool: str) -> None:
+        self._counts = counts
+        self._pool = pool
+        self._open = True
+        counts[pool] = counts.get(pool, 0) + 1
+
+    def end(self) -> None:
+        """The request has ended: it no longer counts. Once, however often called."""
+        if not self._open:
+            return
+        self._open = False
+        self._counts[self._pool] -= 1
+
+
+class _InFlight:
+    """The requests in flight, per pool, read from the module's count at every scrape."""
+
+    def __init__(self, counts: dict[str, int]) -> None:
+        self._counts = counts
 
     def describe(self) -> Iterable[Metric]:
-        # The registry asks the families' names when the collector is registered: no read for that.
-        return self._families()
+        # The registry asks the family's name when the collector is registered: no read for that.
+        return [self._family()]
 
     def collect(self) -> Iterable[Metric]:
-        in_flight, held = self._families()
-        for row in self._rows():
-            in_flight.add_metric([row.pool], row.in_flight)
-            held.add_metric([row.pool], row.held)
-        return [in_flight, held]
+        in_flight = self._family()
+        for pool, count in list(self._counts.items()):
+            in_flight.add_metric([pool], count)
+        return [in_flight]
 
     @staticmethod
-    def _families() -> tuple[GaugeMetricFamily, GaugeMetricFamily]:
-        return (
-            GaugeMetricFamily(IN_FLIGHT, "Requests forwarded to the pool and not yet ended.", labels=["pool"]),
-            GaugeMetricFamily(HELD, "Requests held while the pool starts, explicit wakes included.", labels=["pool"]),
-        )
+    def _family() -> GaugeMetricFamily:
+        return GaugeMetricFamily(IN_FLIGHT, "Requests forwarded to the pool and not yet ended.", labels=["pool"])
 
 
 class Experience:
     """The series of this module, on `registry`: the gateway's own, which its metrics endpoint serves.
 
-    `demand` gives the heartbeat's rows as they would be written now (`Heartbeat.rows`): without it
-    there are no series of requests in flight and held. `clock` gives the seconds a request's
-    acceptance and its token times are read in, on a clock that never goes back; a test gives its own.
+    `pools` names every configured pool: each has its series of requests in flight, zero for a pool
+    with no request. `clock` gives the seconds a request's acceptance and its token times are read
+    in, on a clock that never goes back; a test gives its own.
     `wait_buckets` and `speed_buckets` are the boundaries of the two waits and of the speed: the
     gateway's settings give them with the configured floors among them.
     """
@@ -198,13 +201,14 @@ class Experience:
     def __init__(
         self,
         registry: CollectorRegistry,
-        demand: Callable[[], Iterable[GatewayHeartbeat]] | None = None,
+        pools: Iterable[str] = (),
         *,
         clock: Callable[[], float] = time.monotonic,
         wait_buckets: tuple[float, ...] = WAIT_BUCKETS,
         speed_buckets: tuple[float, ...] = SPEED_BUCKETS,
     ) -> None:
         self.clock = clock
+        self._in_flight = dict.fromkeys(pools, 0)
         self.first_token = Histogram(
             FIRST_TOKEN,
             "Seconds from a streamed request accepted to its first token sent, reasoning included.",
@@ -222,7 +226,7 @@ class Experience:
         self.speed = Histogram(
             SPEED,
             "Output tokens after the first, over the seconds from the first token sent to the last, per stream.",
-            _SPEED_LABELS,
+            _LABELS,
             buckets=speed_buckets,
             registry=registry,
         )
@@ -236,13 +240,16 @@ class Experience:
         self.output_tokens = Histogram(
             OUTPUT_TOKENS, "Output tokens of a request settled.", _LABELS, buckets=OUTPUT_BUCKETS, registry=registry
         )
-        if demand is not None:
-            registry.register(_Demand(demand))
+        registry.register(_InFlight(self._in_flight))
 
-    def request(self, pool: str, wire_format: WireFormat, *, held: bool, first_turn: bool) -> Turn:
+    def request(self, pool: str, wire_format: WireFormat, *, first_turn: bool) -> Turn:
         """A request for `pool` in `wire_format`, accepted now, which will settle once.
 
-        `held` is whether it waits for its pool, and `first_turn` whether its conversation carries
-        no earlier output of the model. Nothing of its student is taken.
+        `first_turn` is whether its conversation carries no earlier output of the model. Nothing of
+        its student is taken.
         """
-        return Turn(self, pool, wire_format, held=held, first_turn=first_turn)
+        return Turn(self, pool, wire_format, first_turn=first_turn)
+
+    def forwarded(self, pool: str) -> InFlight:
+        """A request for `pool` is forwarded now: it counts as in flight until its `InFlight` ends."""
+        return InFlight(self._in_flight, pool)

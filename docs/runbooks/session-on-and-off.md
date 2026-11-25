@@ -267,10 +267,9 @@ Do these the day before the class, while no session is on.
    takes no new request, but one it was already holding while the pool started stays held until the
    pool is ready or the hold's deadline passes (7 minutes for a stream, 4 for a call, section 5.3),
    and the scaler counts it as demand, as it counts a request the gateway has forwarded and not yet
-   ended. A held request can be forwarded between two separate checks, so wait on one query that
-   counts both: in Grafana's Explore, on the Prometheus data source, wait until
-   `sum by (pool) (rhi_gateway_requests_held + rhi_gateway_requests_in_flight)` reads zero, or no
-   data, for the pool. Only then allow the full `idle_minutes` (20 for the example's coursework),
+   ended. The gateway no longer has a gauge of requests held, since it holds none: in Grafana's
+   Explore, on the Prometheus data source, wait until
+   `sum by (pool) (rhi_gateway_requests_in_flight)` reads zero for the pool. Only then allow the full `idle_minutes` (20 for the example's coursework),
    plus a few minutes for the scaler to act, before checking that each pool has no instance in
    service: in Grafana, on the dashboard "Fleet and scaling", in each pool's row, the panel
    "Instances: desired, in service" reads zero for desired and for in service.
