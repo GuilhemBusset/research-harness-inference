@@ -30,6 +30,5 @@ USER 65534:65534
 # port 9091, to the collector of the same task: that port is not exposed.
 EXPOSE 8080
 
-# Exec form: Python is process 1 and receives SIGTERM itself, so the requests in flight finish and
-# the heartbeat writes its last rows.
+# Exec form: Python is process 1 and receives SIGTERM itself, so the requests in flight finish.
 CMD ["python", "-m", "rhi_gateway.main"]

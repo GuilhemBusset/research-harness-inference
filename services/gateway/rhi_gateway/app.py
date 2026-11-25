@@ -52,10 +52,11 @@ check, so it gets the answer a request would get. Every request the check lets t
 forwarded as it is (`rhi_gateway.proxy.Proxy.forward`): the gateway answers no request 200 before
 the engine does, sends no keep-alive of its own and asks the scaler for nothing.
 
-**In flight** (section 7.2): with the task's count (`rhi_gateway.heartbeat`), a request counts as
-in flight from its reservation to its end, which the settlement marks. Token counting is never
-counted, and neither is anything the local routes answer. `build_app` given the readiness reader
-runs its cycle for as long as the application does.
+**In flight** (section 7.2): in the task's count (`rhi_gateway.experience`), which the gateway
+keeps with its metrics, a request counts as in flight from its forwarding, once its reservation is
+made, to its end, which the settlement marks. Token counting is never counted, and neither is
+anything the local routes answer. `build_app` given the readiness reader runs its cycle for as long
+as the application does.
 
 The models, status and hello routes are answered by `rhi_gateway.local`: `build_app` fills
 their slots from the `LocalRoutes` it is given.
@@ -80,9 +81,9 @@ student by alias and per pool, the requests, the tokens settled and the errors b
 
 **What students experience** (section 7.2): `build_app` given the metrics also puts on their
 registry the series of `rhi_gateway.experience`, per pool and wire format and never by student,
-and with the task's count the requests in flight as its rows report them. A forwarded
+with the task's count of the requests in flight of each pool it is given. A forwarded
 request tells them, once its reservation is made, which is when it is accepted, whether it is a
-first turn (`first_turn`); no request is held, so each is told as a warm one. Then
+first turn (`first_turn`). Then
 the proxy tells them each time a token of its stream has been sent to the client, and whether it
 is one of the answer or of the reasoning before it; and its settlement, the tokens it observed.
 """
@@ -93,7 +94,7 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -124,7 +125,7 @@ from rhi_gateway.settings import NUMERIC_DEFAULTS, SESSION_MAX_HOURS
 
 if TYPE_CHECKING:
     from rhi_gateway.auth import Authenticator
-    from rhi_gateway.heartbeat import Demand, Heartbeat
+    from rhi_gateway.experience import InFlight
     from rhi_gateway.keystore import KeyRecord
     from rhi_gateway.local import LocalRoutes
     from rhi_gateway.metrics import Metrics
@@ -188,23 +189,22 @@ def build_app(
     handlers: Mapping[Route, Handler] | None = None,
     *,
     local: LocalRoutes | None = None,
-    heartbeat: Heartbeat | None = None,
     metrics: Metrics | None = None,
+    pools: Iterable[str] = (),
     readiness: Readiness | None = None,
     wait_buckets: tuple[float, ...] = WAIT_BUCKETS,
     speed_buckets: tuple[float, ...] = SPEED_BUCKETS,
 ) -> Starlette:
     """The gateway's application: the table's routes, each with the handler given for it.
 
-    `heartbeat`, when given, is this task's count of requests in flight, which a gauge reads.
     `readiness`, when given, reads every pool on its cycle for as long (`rhi_gateway.readiness`):
     without it, whoever builds the application runs the cycle.
 
     `metrics`, when given, counts every request the application answers, the local routes, the
     refusals and the paths outside the table included (`rhi_gateway.metrics`). Its registry then
     also holds what students experience (`rhi_gateway.experience`), which the forwarded routes
-    report, with the task's own count of the requests in flight when it is given too,
-    in `wait_buckets` and `speed_buckets` (the settings' own, with the configured floors).
+    report, in `wait_buckets` and `speed_buckets` (the settings' own, with the configured floors),
+    and the task's own count of the requests in flight, with a series for each pool `pools` names.
 
     `local`, when given, answers the models, status and hello routes (`rhi_gateway.local`); a
     handler given for one of them as well is refused. A handler given for anything that is not an
@@ -230,12 +230,7 @@ def build_app(
     app.state.experience = (
         None
         if metrics is None
-        else Experience(
-            metrics.registry,
-            None if heartbeat is None else heartbeat.rows,
-            wait_buckets=wait_buckets,
-            speed_buckets=speed_buckets,
-        )
+        else Experience(metrics.registry, pools, wait_buckets=wait_buckets, speed_buckets=speed_buckets)
     )
     router = app.router
     router.redirect_slashes = False
@@ -326,7 +321,7 @@ class Forwarding:
     """What the forwarded routes are made of: who is let in, the concurrency slots, the filters, the pools and the proxy.
 
     `filters` holds the body filter of each forwarded route of the table, under its entry. The
-    longest a request may run is the proxy's. `heartbeat`, when given, counts the requests in flight.
+    longest a request may run is the proxy's.
     `retry_after` gives the seconds of `Retry-After` for the causes it names, in place of the
     design's (`rhi_gateway.errors.render_json`): only a cause that carries the header may be named.
     `clock` gives the seconds, on a clock that never goes back, of a request's acceptance and of
@@ -338,7 +333,6 @@ class Forwarding:
     filters: Mapping[Route, Filter]
     proxy: Proxy
     pools: Pools
-    heartbeat: Heartbeat | None = None
     retry_after: Mapping[Cause, int] = field(default_factory=dict)
     clock: Callable[[], float] = time.monotonic
 
@@ -475,22 +469,20 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
             share=forwarded.pool.rebalance_share,
         )
 
-        demand: Demand | None = None
-        if entry != routes.COUNT_TOKENS and forwarding.heartbeat is not None:
-            # A token count is a cheap call: it is never counted as a request in flight (section 5.3).
-            demand = forwarding.heartbeat.received(forwarded.pool.name)
-
         # From here the request is accepted, and settles exactly once: what students experience counts
         # its waits from this moment, and is told its tokens at its settlement.
         experience = _experience(request)
+        in_flight: InFlight | None = None
+        if experience is not None and entry != routes.COUNT_TOKENS:
+            # A token count is a cheap call: it is never counted as a request in flight (section 7.2).
+            in_flight = experience.forwarded(forwarded.pool.name)
         wire_format = entry.wire_format or WireFormat.MESSAGES
         # The turn is classified before the acceptance is read: the log and the histogram read it at the same moment.
         first = experience is not None and first_turn(wire_format, forwarded)
         accepted_at = forwarding.clock()
         turn = None
         if experience is not None:
-            # No request is held: the label that told a held request from a warm one reads warm on each.
-            turn = experience.request(forwarded.pool.name, wire_format, held=False, first_turn=first)
+            turn = experience.request(forwarded.pool.name, wire_format, first_turn=first)
 
         def token_sent(answer: bool) -> None:
             # The log's time to first token is read at the moments the histogram reads its own, with or without it.
@@ -500,8 +492,8 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
 
         async def settle(observed: Observed) -> None:
             telemetry.note_tokens(observed.input_tokens, observed.output_tokens, observed.cached_input_tokens)
-            if demand is not None:
-                demand.end()
+            if in_flight is not None:
+                in_flight.end()
             if turn is not None:
                 turn.settled(observed.input_tokens, observed.output_tokens)
             await run_in_threadpool(

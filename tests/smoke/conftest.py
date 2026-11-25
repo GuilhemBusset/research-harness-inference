@@ -122,7 +122,6 @@ _REGION = "us-east-1"
 _TABLES = {
     "RHI_KEYS_TABLE": (tables.KEYS, "smoke-keys"),
     "RHI_USAGE_TABLE": (tables.USAGE, "smoke-usage"),
-    "RHI_HEARTBEAT_TABLE": (tables.HEARTBEATS, "smoke-heartbeats"),
     "RHI_POOL_STATE_TABLE": (tables.POOL_STATE, "smoke-pool-state"),
 }
 # The local pool: the mock engine.
@@ -293,7 +292,6 @@ def _gateway_environment(pool: str) -> dict[str, str]:
         "RHI_UPSTREAM_URL": "http://internal.example.com",
         "RHI_TARGET_GROUPS": json.dumps({pool: target_group}),
         "RHI_POOL_SECRETS": json.dumps({pool: secret["ARN"]}),
-        "RHI_SCALER_FUNCTION": "smoke-scaler",
         "RHI_COURSE_END": "2027-01-15",
         **{variable: name for variable, (_, name) in _TABLES.items()},
     }

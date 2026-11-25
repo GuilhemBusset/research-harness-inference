@@ -2,8 +2,8 @@
 
 The stack references the other stacks of the stage: the network's VPC, the gateway's security
 group and the public load balancer's HTTPS listener, when it has one, the students' tables, the
-workspace, and the pools' internal load balancer, target groups, secrets, tables and scaler. None
-of them references it back.
+workspace, and the pools' internal load balancer, target groups, secrets and pool-state table.
+None of them references it back.
 
 The stack declares one output, `Endpoint`: the endpoint's address, which the pipeline's
 verification takes as an input (`rhi.pipeline.verify`). It is the configuration's domain while
@@ -80,7 +80,7 @@ class GatewayStack(cdk.Stack):
         observability: ObservabilityStack,
         pools: PoolsStack,
     ) -> service.GatewayService:
-        assert pools.routing is not None and pools.scaler is not None, "an unparked stage has both"
+        assert pools.routing is not None, "an unparked stage has the internal load balancer"
         return service.GatewayService(
             self,
             "Service",
@@ -92,9 +92,7 @@ class GatewayStack(cdk.Stack):
             secrets=pools.secrets,
             keys=access.tables.keys,
             usage=access.tables.usage,
-            heartbeats=pools.tables.heartbeats,
             pool_state=pools.tables.pool_state,
-            scaler=pools.scaler.function,
             workspace=observability.prometheus,
             listener=network.https_listener,
         )

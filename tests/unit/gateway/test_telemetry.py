@@ -58,7 +58,6 @@ FIELDS = {
     "output_tokens",
     "cached_input_tokens",
     "time_to_first_token_ms",
-    "held_ms",
     "latency_ms",
     "status",
     "cause",
@@ -231,7 +230,6 @@ def test_a_forwarded_request_gives_one_record_of_the_stated_fields(capsys: pytes
         "output_tokens": 7,
         "cached_input_tokens": 0,
         "time_to_first_token_ms": None,  # Not a stream: no token was sent as one.
-        "held_ms": 0,
         "status": 200,
         "cause": None,
     }
@@ -347,8 +345,6 @@ def test_a_stream_logs_its_route_tokens_and_waits(capsys: pytest.CaptureFixture[
     # The tokens as the Messages parser gives them: the whole input, its cached part apart, and the output.
     assert (record["input_tokens"], record["cached_input_tokens"], record["output_tokens"]) == (1000, 900, 40)
     assert record["time_to_first_token_ms"] == 2500
-    # No request is held.
-    assert record["held_ms"] == 0
     # Nothing of the request: not the marker of its body and headers, not its key, its hash or the GitHub ID.
     for secret in (MARKER, key, key_hash(key), str(GITHUB_ID)):
         assert secret not in logged
@@ -372,7 +368,7 @@ def test_the_log_and_the_histogram_read_the_same_wait(
     waits.sends = [(1.0 + at, part) for at, part in STREAM]
     assert call(app, "POST", "/v1/messages", key=key, body={**BODIES[routes.MESSAGES], "stream": True})[0] == 200
     [record] = records(capsys)
-    labels = {"pool": "coursework", "wire_format": "messages", "start": "warm", "turn": "first"}
+    labels = {"pool": "coursework", "wire_format": "messages", "turn": "first"}
     seconds = registry.get_sample_value(f"{FIRST_TOKEN}_sum", labels)
     assert seconds is not None
     assert record["time_to_first_token_ms"] == round(seconds * 1000) == 2500
@@ -392,7 +388,7 @@ def test_a_token_count_logs_its_route_and_its_count(capsys: pytest.CaptureFixtur
     [record] = records(capsys)
     assert record["route"] == "/v1/messages/count_tokens"
     assert (record["input_tokens"], record["output_tokens"]) == (12, 0)
-    assert (record["time_to_first_token_ms"], record["held_ms"]) == (None, 0)
+    assert record["time_to_first_token_ms"] is None
 
 
 def test_an_unhandled_error_is_cause_none(capsys: pytest.CaptureFixture[str]) -> None:

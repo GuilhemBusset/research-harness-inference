@@ -118,9 +118,7 @@ def environment(**profiles: list[str]) -> dict[str, str]:
         ),
         "RHI_KEYS_TABLE": "keys-of-the-test",
         "RHI_USAGE_TABLE": "usage-of-the-test",
-        "RHI_HEARTBEAT_TABLE": "heartbeats-of-the-test",
         "RHI_POOL_STATE_TABLE": "pool-state-of-the-test",
-        "RHI_SCALER_FUNCTION": "scaler-of-the-test",
         "RHI_COURSE_END": "2027-01-15",
     }
 

@@ -1,7 +1,7 @@
 """The gateway's entry point (`rhi_gateway.main`) and its image (`services/gateway/Dockerfile`).
 
 The gateway is built as `main` builds it, from an environment, over moto in place of DynamoDB and
-Secrets Manager: the four tables are created with the keys of `rhi_common.tables`, and each pool
+Secrets Manager: the three tables are created with the keys of `rhi_common.tables`, and each pool
 has a secret whose value is drawn when the tests run, like the students' keys. Nothing reaches
 AWS: the credentials and the region are placeholders that moto never checks. The target groups'
 health is a small double where a test needs a pool that is ready, and the engines are an
@@ -48,7 +48,7 @@ from rhi_common.records import SESSION_RECORD, ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import main as entry
 from rhi_gateway import metrics
-from rhi_gateway.main import Gateway, StartError, aws_clients, build, serve, task_id
+from rhi_gateway.main import Gateway, StartError, aws_clients, build, serve
 from rhi_gateway.settings import SettingsError, read_settings
 
 REPO = Path(__file__).resolve().parents[3]
@@ -56,17 +56,14 @@ DOCKERFILE = REPO / "services/gateway/Dockerfile"
 
 ACCOUNT = "123456789012"
 REGION = "us-east-1"
-TASK = "0123456789abcdef0123456789abcdef"
 UPSTREAM = "http://internal.example.com:8000"
-SCALER = "scaler-of-the-test"
 # The variable of each table, the table's keys and the name it is deployed under in the tests.
 TABLES = {
     "RHI_KEYS_TABLE": (tables.KEYS, "keys-of-the-test"),
     "RHI_USAGE_TABLE": (tables.USAGE, "usage-of-the-test"),
-    "RHI_HEARTBEAT_TABLE": (tables.HEARTBEATS, "heartbeats-of-the-test"),
     "RHI_POOL_STATE_TABLE": (tables.POOL_STATE, "pool-state-of-the-test"),
 }
-KEYS_TABLE, USAGE_TABLE, HEARTBEAT_TABLE = (TABLES[name][1] for name in list(TABLES)[:3])
+KEYS_TABLE, USAGE_TABLE, POOL_STATE_TABLE = (name for _, name in TABLES.values())
 POOL = {
     "engine": "mock",
     "instance_types": ["t4g.small"],
@@ -159,7 +156,6 @@ def environment(*pools: str) -> tuple[dict[str, str], dict[str, str]]:
         "RHI_UPSTREAM_URL": UPSTREAM,
         "RHI_TARGET_GROUPS": json.dumps({pool: target_group(pool) for pool in pools}),
         "RHI_POOL_SECRETS": json.dumps(arns),
-        "RHI_SCALER_FUNCTION": SCALER,
         "RHI_COURSE_END": "2027-01-15",
         **{variable: name for variable, (_, name) in TABLES.items()},
     }
@@ -207,7 +203,6 @@ def aws(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.delenv(entry.METADATA_VARIABLE, raising=False)
     with moto_aws():
         create_tables()
         yield
@@ -235,7 +230,7 @@ def started(gateway: Gateway, scenario: Callable[[httpx.AsyncClient], Awaitable[
 def test_the_application_built_from_an_environment_answers_from_the_tables_moto_holds() -> None:
     environ, _ = environment("mock")
     key = issue_key()
-    gateway = build(read_settings(environ), aws_clients(), task=TASK)
+    gateway = build(read_settings(environ), aws_clients())
 
     async def scenario(client: httpx.AsyncClient) -> None:
         assert (await client.head("/api/hello")).status_code == 200
@@ -254,9 +249,6 @@ def test_the_application_built_from_an_environment_answers_from_the_tables_moto_
 
     started(gateway, scenario)
 
-    # The gateway ran and stopped, and wrote no row to the heartbeats table.
-    assert items(HEARTBEAT_TABLE) == []
-
 
 @pytest.mark.usefixtures("aws")
 def test_a_gateway_whose_table_holds_no_session_for_its_pool_refuses_a_student_with_no_session() -> None:
@@ -264,7 +256,7 @@ def test_a_gateway_whose_table_holds_no_session_for_its_pool_refuses_a_student_w
     pool_state = boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1])
     pool_state.delete_item(Key={"pool": "mock", "record": SESSION_RECORD})
     key = issue_key()
-    gateway = build(read_settings(environ), aws_clients(), task=TASK)
+    gateway = build(read_settings(environ), aws_clients())
 
     async def scenario(client: httpx.AsyncClient) -> None:
         refused = await client.post("/v1/messages", headers=bearer(key), json=MESSAGE)
@@ -281,7 +273,7 @@ def test_a_gateway_with_no_pool_and_no_default_pool_starts_and_answers_the_hello
     assert (environ["RHI_POOLS"], environ["RHI_TARGET_GROUPS"], environ["RHI_POOL_SECRETS"]) == ("{}", "{}", "{}")
     assert "RHI_DEFAULT_POOL" not in environ
     key = issue_key()
-    gateway = build(read_settings(environ), aws_clients(), task=TASK)
+    gateway = build(read_settings(environ), aws_clients())
 
     async def scenario(client: httpx.AsyncClient) -> None:
         assert (await client.head("/api/hello")).status_code == 200
@@ -295,8 +287,6 @@ def test_a_gateway_with_no_pool_and_no_default_pool_starts_and_answers_the_hello
             assert (refused.status_code, refused.json()["error"]["type"]) == (503, "no_session")
 
     started(gateway, scenario)
-
-    assert items(HEARTBEAT_TABLE) == []
 
 
 @pytest.mark.usefixtures("aws")
@@ -320,7 +310,7 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
     starting = ScalerNote("second", capacity_asked=1, no_capacity_at=None, written_at=int(time.time()), starting=1)
     boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).put_item(Item=starting.to_item())
     clients = replace(aws_clients(), elbv2=Targets(target_group("mock")))
-    gateway = build(read_settings(environ), clients, task=TASK, transport=httpx.MockTransport(engine))
+    gateway = build(read_settings(environ), clients, transport=httpx.MockTransport(engine))
 
     async def scenario(client: httpx.AsyncClient) -> None:
         # The application runs the readiness reads: nothing else here refreshes them.
@@ -369,8 +359,8 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
     }
     # The floors of the environment are boundaries of what students experience, beside the gateway's own.
     experience = gateway.app.state.experience
-    experience.first_token.labels("mock", "messages", "warm", "first").observe(1)
-    experience.speed.labels("mock", "messages", "warm").observe(1)
+    experience.first_token.labels("mock", "messages", "first").observe(1)
+    experience.speed.labels("mock", "messages").observe(1)
     bounds: dict[str, set[str]] = {}
     for family in gateway.metrics.registry.collect():
         for sample in family.samples:
@@ -446,35 +436,6 @@ def test_a_refused_setting_or_an_unread_secret_stops_the_gateway_before_anything
     assert served == {"application": [], "metrics": []}
 
 
-def test_the_task_s_id_comes_from_the_task_metadata_and_is_random_without_it() -> None:
-    asked: list[str] = []
-    answers: list[httpx.Response] = []
-
-    def metadata(request: httpx.Request) -> httpx.Response:
-        asked.append(str(request.url))
-        return answers.pop(0)
-
-    environ = {"ECS_CONTAINER_METADATA_URI_V4": "http://metadata.example.com/v4/container-of-the-test"}
-    transport = httpx.MockTransport(metadata)
-
-    # The ID is the last part of the task's ARN: the account and the cluster are not in it.
-    arn = f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/cluster-of-the-test/{TASK}"
-    answers.append(httpx.Response(200, json={"Cluster": "cluster-of-the-test", "TaskARN": arn}))
-    assert task_id(environ, transport=transport) == TASK
-    assert asked == ["http://metadata.example.com/v4/container-of-the-test/task"]
-
-    # With no endpoint, the ID is random, and nothing is asked.
-    random = [task_id({}, transport=transport), task_id({}, transport=transport)]
-    assert len(asked) == 1
-    # An endpoint that gives no task ID leaves a random one too: the gateway starts still.
-    answers += [httpx.Response(500), httpx.Response(200, json=[]), httpx.Response(200, text="no JSON")]
-    answers.append(httpx.Response(200, json={"TaskARN": "an ARN with spaces"}))
-    random += [task_id(environ, transport=transport) for _ in range(4)]
-    assert answers == []
-    assert len(set(random)) == len(random)
-    assert all(re.fullmatch(r"[0-9a-f]{32}", name) for name in random)
-
-
 # --- The shutdown ------------------------------------------------------------------------------------
 
 # The files of the folder the test and its child share, and the variables the test gives the child.
@@ -508,7 +469,7 @@ def serve_until_sigterm(folder: Path) -> None:
         environ, _ = environment("mock", "second")
         issue_key(os.environ[KEY_VARIABLE])
         clients = replace(aws_clients(), elbv2=Targets(target_group("mock")))
-        gateway = build(read_settings(environ), clients, task=TASK, transport=httpx.MockTransport(engine))
+        gateway = build(read_settings(environ), clients, transport=httpx.MockTransport(engine))
         serve(gateway, metrics_port=int(os.environ[METRICS_PORT_VARIABLE]), uds=str(folder / SOCKET))
 
 
@@ -538,7 +499,6 @@ def test_sigterm_stops_new_connections_and_finishes_the_request_in_flight() -> N
             METRICS_PORT_VARIABLE: str(metrics_port),
         }
         environ.pop("AWS_PROFILE", None)
-        environ.pop(entry.METADATA_VARIABLE, None)
         with log.open("wb") as output:
             child = subprocess.Popen([sys.executable, __file__, name], env=environ, stdout=output, stderr=output)
 
@@ -611,9 +571,9 @@ def test_sigterm_stops_new_connections_and_finishes_the_request_in_flight() -> N
     assert (answer.status_code, answer.json()) == (200, ANSWER)
 
     # From its start to its end the gateway served a request, and it called AWS for its tables, its
-    # secrets and nothing else: no row of the heartbeats table, and no call of the scaler function.
+    # secrets and nothing else: no table but the three it is told, and no call of any function.
     assert USAGE_TABLE in {call["table"] for call in calls}
-    assert HEARTBEAT_TABLE not in {call["table"] for call in calls if call["operation"] != "CreateTable"}
+    assert {call["table"] for call in calls if call["table"]} <= {KEYS_TABLE, USAGE_TABLE, POOL_STATE_TABLE}
     assert "Invoke" not in {call["operation"] for call in calls}
 
 

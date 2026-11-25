@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from typing import Any
 
@@ -122,15 +123,15 @@ def test_the_coursework_row_holds_every_panel_with_both_sources(example: rhi_con
     assert f"{experience.SPEED}_bucket" in speed
     assert rules.engine_rate(coursework, Further.COMPUTED_INPUT_TOKENS, by=("instance",)) in speed
 
-    # First token: the engine's, its queue and prefill parts, and the gateway's two waits by start and turn.
+    # First token: the engine's, its queue and prefill parts, and the gateway's two waits by turn alone.
     first = expressions[inference.FIRST_TOKEN]
     for quantity in (Quantity.TIME_TO_FIRST_TOKEN, Further.QUEUE_TIME, Further.PREFILL_TIME):
         assert rules.engine_quantile(coursework, 0.95, quantity) in first
         assert rules.engine_request_count(coursework, quantity) in first
     for histogram in (experience.FIRST_TOKEN, experience.FIRST_ANSWER):
         matchers = {"pool": "coursework"}
-        assert rules.quantile(0.95, histogram, matchers, by=("start", "turn")) in first
-        assert rules.request_count(histogram, matchers, by=("start", "turn")) in first
+        assert rules.quantile(0.95, histogram, matchers, by=("turn",)) in first
+        assert rules.request_count(histogram, matchers, by=("turn",)) in first
 
     # Throughput, per pool and per instance, and transcript sizes, from both sources.
     assert rules.engine_rate(coursework, Quantity.OUTPUT_TOKENS, by=("instance",)) in expressions[inference.THROUGHPUT]
@@ -255,11 +256,14 @@ def test_the_new_panels_read_their_sources(example: rhi_config.Config) -> None:
     assert count in forgot[inference.EVICTED_BLOCKS]
     assert not [legend for legend in forgot if "request" in legend]
 
-    # Streams: each instance's running and waiting requests, and the gateway's in flight and held.
+    # Streams: each instance's running and waiting requests, and the gateway's in flight.
     for quantity in (Quantity.RUNNING_REQUESTS, Quantity.WAITING_REQUESTS):
         assert f"by (pool, instance) ({rules.engine_selector(coursework, quantity)})" in expressions[inference.STREAMS]
-    for gauge in (experience.IN_FLIGHT, experience.HELD):
-        assert f"sum by (pool) ({gauge}{{pool=\"coursework\"}})" in expressions[inference.STREAMS]
+    assert f"sum by (pool) ({experience.IN_FLIGHT}{{pool=\"coursework\"}})" in expressions[inference.STREAMS]
+    # The gateway holds no request: its one gauge on the panel is the requests in flight, and no
+    # panel of any dashboard reads a gauge of requests held.
+    assert [legend for legend in series(row[inference.STREAMS]) if legend.startswith("gateway")] == ["gateway in flight"]
+    assert not [one.uid for one in build.dashboards(example) if "requests_held" in json.dumps(one.document())]
 
     # Students over the instances in service, an average by its title.
     assert "average" in inference.STUDENTS
