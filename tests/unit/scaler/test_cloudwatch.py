@@ -10,6 +10,7 @@ from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
+from rhi_scaler import cloudwatch
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, Run, TableNames
 from rhi_scaler.metrics import DecisionCounts
@@ -29,8 +30,8 @@ ENTRY = {
     "largest_output": 4_096,
 }
 COURSEWORK, MOCK = parse_pools({"coursework": ENTRY, "mock": ENTRY})
-# Coursework, which has no session, has been in service since an hour and a minute ago; mock has no
-# instance in service and its launches are suspended.
+# Coursework, which has no session, has been in service since an hour and a minute ago; mock, whose
+# session requests two instances, has none in service and its launches are suspended.
 RUN = Run(
     inputs=Inputs(
         now=NOW,
@@ -44,7 +45,7 @@ RUN = Run(
 DECISION = Decision(
     pools=(
         PoolDecision("coursework", 1, (), False, Memory(), Reason.UNCHANGED),
-        PoolDecision("mock", 0, (), True, Memory(launch_suspended=True), Reason.LAUNCH_SUSPENDED),
+        PoolDecision("mock", 0, (), True, Memory(launch_suspended=True), Reason.LAUNCH_SUSPENDED, requested=2),
     )
 )
 SETTINGS = Settings(region="us-east-1", pools=(), tables=TableNames("heartbeats", "pool-state"), workspace_url="")
@@ -81,28 +82,54 @@ def a_run(monkeypatch: pytest.MonkeyPatch, cloudwatch: Any, failing: str | None 
     return scaler.run_cycle(SETTINGS, clients, Recorder(), NOW, DecisionCounts())  # ty: ignore[invalid-argument-type] - a test double
 
 
-def test_a_completed_run_publishes_that_it_completed_and_each_pool_s_two_values(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_completed_run_publishes_that_it_completed_and_each_pool_s_three_values(monkeypatch: pytest.MonkeyPatch) -> None:
     client = boto3.client("cloudwatch", region_name="us-east-1", aws_access_key_id="stub", aws_secret_access_key="stub")
 
-    def per_pool(pool: str, suspended: float, outside: float) -> list[dict[str, Any]]:
+    def per_pool(pool: str, suspended: float, outside: float, missing: float) -> list[dict[str, Any]]:
         pool_dimension = [{"Name": "Pool", "Value": pool}]
         return [
             {"MetricName": "LaunchesSuspended", "Dimensions": pool_dimension, "Value": suspended, "Unit": "None"},
             {"MetricName": "MinutesInServiceOutsideSessions", "Dimensions": pool_dimension, "Value": outside, "Unit": "None"},
+            {"MetricName": "InstancesMissing", "Dimensions": pool_dimension, "Value": missing, "Unit": "None"},
         ]
 
     expected = {
         "Namespace": "rhi/scaler",
         "MetricData": [
             {"MetricName": "RunCompleted", "Value": 1.0, "Unit": "Count"},
-            *per_pool("coursework", 0.0, 61.0),
-            *per_pool("mock", 1.0, 0.0),
+            *per_pool("coursework", 0.0, 61.0, 0.0),
+            *per_pool("mock", 1.0, 0.0, 2.0),
         ],
     }
     with Stubber(client) as stubber:
         stubber.add_response("put_metric_data", {}, expected)
         a_run(monkeypatch, client)
         stubber.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    ("requested", "in_service", "missing"),
+    [
+        pytest.param(3, 1, 2.0, id="a session short of its instances"),
+        pytest.param(1, 2, 0.0, id="more in service than the session requests"),
+        pytest.param(0, 1, 0.0, id="no session, in service"),
+        pytest.param(0, 0, 0.0, id="no session, nothing in service"),
+    ],
+)
+def test_instances_missing_is_what_the_session_requests_less_those_in_service_never_below_zero(
+    requested: int, in_service: int, missing: float
+) -> None:
+    serving = tuple(f"i-{n}" for n in range(in_service))
+    inputs = Inputs(now=NOW, pools=(PoolInputs(COURSEWORK, Supply(requested, in_service=serving)),))
+    decided = PoolDecision("coursework", requested, (), False, Memory(), Reason.UNCHANGED, requested=requested)
+    data = cloudwatch.metric_data(inputs, Decision(pools=(decided,)), NOW)
+    (point,) = [d for d in data if d["MetricName"] == "InstancesMissing"]
+    assert point == {
+        "MetricName": "InstancesMissing",
+        "Dimensions": [{"Name": "Pool", "Value": "coursework"}],
+        "Value": missing,
+        "Unit": "None",
+    }
 
 
 @pytest.mark.parametrize("failing", ["read", "decide", "apply"])

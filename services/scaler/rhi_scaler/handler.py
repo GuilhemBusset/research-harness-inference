@@ -87,7 +87,7 @@ def run_cycle(
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     try:
-        cloudwatch.publish(clients.cloudwatch, decision, now)
+        cloudwatch.publish(clients.cloudwatch, run.inputs, decision, now)
     except Exception as error:
         LOGGER.error(json.dumps({"event": "cloudwatch-not-published", "error": type(error).__name__}))
         raise

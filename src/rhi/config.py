@@ -187,6 +187,9 @@ class Config:
     # The whole hours a pool may be in service while no session is on before its alarm fires
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
+    # The whole minutes a session may have fewer instances in service than it asks before its alarm
+    # fires (`rhi.guardrails.alarms_fleet`; sections 5.4 and 17). Only synthesis reads it.
+    capacity_alarm_minutes: int
     # The longest a session may last, in whole hours after the later of its start and the moment it
     # was last written (`rhi_common.sessions`; sections 5.6 and 17). The scaler's settings carry it.
     session_max_hours: int
@@ -491,6 +494,7 @@ KEYS: dict[str, Key] = {
     ),
     "cost_anomaly_detection": Key("true or false, without quotes", _boolean, _boolean_from_text),
     "outside_sessions_alarm_hours": _WHOLE_NUMBER,
+    "capacity_alarm_minutes": _WHOLE_NUMBER,
     "session_max_hours": _WHOLE_NUMBER,
     "check_wait_minutes": _WHOLE_NUMBER,
     "gateway_error_alarm_percent": Key("a percentage above 0 and at most 100", _percent, _price_from_text),
@@ -558,6 +562,9 @@ DEFAULTS: dict[str, object] = {
     "cost_anomaly_detection": False,
     # Section 17: a pool in service while no session is on raises its alarm after 1 hour.
     "outside_sessions_alarm_hours": 1,
+    # Sections 5.4 and 17: a session short of the instances it asks raises its alarm after 30
+    # minutes.
+    "capacity_alarm_minutes": 30,
     # Sections 5.6 and 17: a session ends at most 12 hours after the later of its start and the
     # last command.
     "session_max_hours": 12,
