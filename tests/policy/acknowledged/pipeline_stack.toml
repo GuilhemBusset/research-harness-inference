@@ -13,6 +13,9 @@
 #   instances report.
 # - ssm:GetParameter on the release parameter of each pool the stage deploys, each by its name,
 #   /rhi/pools/<pool>/release: the release the pipeline deployed, which the served one must equal.
+#   Before the smoke tests, the step's decision (`scripts/pipeline/gpu_verification.py`) reads the
+#   same parameters, and the earlier versions of a GPU pool's, each as <name>:<version>, with this
+#   same action.
 # - dynamodb:Query on the heartbeats table of the stage the step verifies, and on no other table:
 #   when its tests failed, the step reads the heartbeat rows of the pools it tested, by pool, for
 #   the last lifecycle stage each instance reached. The table is named by the pattern
@@ -22,12 +25,20 @@
 #   the objects verification/<execution ID>/not-run, when no test could run,
 #   verification/<execution ID>/failed-smoke-tests, the IDs of the smoke tests that failed, and
 #   verification/<execution ID>/last-stages, the last lifecycle stage each instance reached.
-# - autoscaling:DescribeAutoScalingGroups and autoscaling:DescribeInstanceRefreshes on every
-#   resource, the only resource AWS grants them on: before the smoke tests, the step's decision
-#   finds each GPU pool's group by its tags rhi-pool and rhi-engine and reads its instance
-#   refreshes, to learn whether this execution started one and to wait for it to end.
 # - codepipeline:ListPipelineExecutions on this pipeline, by its ARN, and on no other: the decision
-#   reads when this execution started, which a refresh must have begun after.
+#   reads when this execution started. It compares with that time when each version of a GPU pool's
+#   release parameter was written, to find the last version written before the execution started,
+#   the release in effect before it, which it compares the current one with. The mock pool's
+#   parameter is not compared.
+# - cloudformation:DescribeStackResource on the pools stack, stack/<pools stack's name>/*, and on no
+#   other stack: the step finds the pool-state table's name by its logical ID in that stack, as the
+#   hold step does.
+# - dynamodb:GetItem and dynamodb:PutItem on the pool-state table of the stage the step verifies,
+#   and on no other table, only for the items whose partition key (dynamodb:LeadingKeys) is the
+#   name of a pool the step books, the mock pool's or the coursework pool's: the step reads the
+#   pool's session, books one for its run of the smoke tests on a pool that has none booked or
+#   active, and stops the session it booked after the run. The table is named by the pattern
+#   table/<pools stack's name>-<the table's logical ID>-*, the name CloudFormation gives it.
 # - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
 #   CDK Pipelines' grant to a project that takes an input, here the source the step runs.
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
@@ -67,7 +78,8 @@
 # - cloudformation:DescribeStackResource on the pools stack, stack/<pools stack's name>/*, and on no
 #   other stack: the job finds the pool-state table's name by its logical ID in that stack.
 # - dynamodb:GetItem on the pool-state table of the stage, and on no other table: the job reads the
-#   session switch, one item of it. The table is named by the pattern
+#   session of each pool of the stage, one item for each pool, and holds the deployment while one
+#   is active. The table is named by the pattern
 #   table/<pools stack's name>-<the table's logical ID>-*, the name CloudFormation gives it.
 # - s3:GetBucket*, s3:GetObject* and s3:List* on the pipeline's artifact bucket and its objects:
 #   CDK Pipelines' grant to a project that takes an input, here the source the job runs from.
@@ -103,8 +115,8 @@
 "AwsSolutions-IAM5[Resource::*]" = "CDK Pipelines writes these statements on every resource, each action listed with its reason in the wildcard_actions table of this module; the bounded bootstrap's permissions boundary still caps every role that holds one."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/codebuild/<CodePipelineRhiHoldC6295550>:*]" = "The project that holds the deployment while a session is on writes to the streams of its own log group, whose names CodeBuild chooses for each build."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:codebuild:<AWS::Region>:<AWS::AccountId>:report-group/<CodePipelineRhiHoldC6295550>-*]" = "The project that holds the deployment while a session is on writes the test reports of its own report groups, whose names CodeBuild derives from the project's name."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Pools/*]" = "The hold step finds the pool-state table's name by its logical ID in the pools stack, which it names by the stack's name; the wildcard stands for the stack's ID, which CloudFormation generates when the stack is created, so the pattern matches that one stack."
-"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "The hold step reads the session switch from the stage's pool-state table, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Pools/*]" = "The hold step and the verification step each find the pool-state table's name by its logical ID in the pools stack, which each names by the stack's name; the wildcard stands for the stack's ID, which CloudFormation generates when the stack is created, so the pattern matches that one stack."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "The hold step reads each pool's session from the stage's pool-state table, and the verification step reads and writes the items of the pools it books in that table, which this stack cannot refer to across assemblies and so names by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, and a logical ID holds no hyphen, so no other table matches."
 
 
 [wildcard_actions]
@@ -113,5 +125,3 @@
 "codebuild:BatchGetBuilds" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StartBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StopBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
-"autoscaling:DescribeAutoScalingGroups" = "The verification step's decision finds each GPU pool's group by its tags rhi-pool and rhi-engine, which it reads with the group; AWS grants describing groups on every resource only, and the action reads, never changes, a group."
-"autoscaling:DescribeInstanceRefreshes" = "The verification step's decision reads the instance refreshes of each GPU pool's group, to learn whether this execution started one and to wait for it to end; AWS grants describing refreshes on every resource only, and the action reads, never changes, a refresh."
