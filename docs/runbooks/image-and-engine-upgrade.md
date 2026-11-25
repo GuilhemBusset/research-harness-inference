@@ -433,24 +433,39 @@ release, the larger pools included, and the verification reads it on the coursew
        --query "Stacks[0].Outputs[?OutputKey=='HeartbeatsTable'].OutputValue" --output text
    ```
 
-   and, once the pool's session has an instance in service, the rows of the pool's instances,
-   with `coursework` or the pool's name in its place: for each, the stage it reached, the image
-   digest and the model revision it serves, and when it wrote the row, in seconds:
+   The table keeps an instance's row for an hour or more after the instance last wrote it, so
+   first read which instances the session being verified has. Once `rhi_admin session status`
+   counts an instance of the pool in service, the IDs of the instances its group has in service
+   now, with `coursework` or the pool's name in its place:
+
+   ```sh
+   aws autoscaling describe-auto-scaling-groups --filters Name=tag:rhi-pool,Values=coursework \
+       --query "AutoScalingGroups[].Instances[] | [?LifecycleState=='InService'].InstanceId" --output text
+   ```
+
+   Then the rows of the pool's instances: for each, `instance#` and the ID of the instance that
+   wrote it, the stage it reached, the image digest and the model revision it serves, and when it
+   wrote the row, in seconds:
 
    ```sh
    aws dynamodb query --table-name <heartbeats-table> --consistent-read \
        --key-condition-expression '#pool = :pool AND begins_with(#source, :instance)' \
        --expression-attribute-names '{"#pool": "pool", "#source": "source"}' \
        --expression-attribute-values '{":pool": {"S": "coursework"}, ":instance": {"S": "instance#"}}' \
-       --query 'Items[].[stage.S,image_digest.S,model_revision.S,written_at.N]' --output text
+       --query 'Items[].[source.S,stage.S,image_digest.S,model_revision.S,written_at.N]' --output text
    ```
 
-   An instance in service writes its row every 5 seconds, with the stage `serving`. Read the rows
-   written in the last minute, `date -u +%s` being now in the same seconds: an older row is that
-   of an instance that has left. The pool is verified when it has such a row and every such row
-   carries the digest and the revision of the parameter. The command prints nothing while the pool
-   has no instance, and a row with another stage is an instance still starting: read again once
-   `rhi_admin session status` counts it in service.
+   Only the rows of the instances the first command listed count. A row under any other ID proves
+   nothing about this session, whatever it carries: it is that of an instance of an earlier
+   session, or of the one the verification booked, and such an instance goes on writing its row,
+   with the stage `serving`, while it drains.
+
+   An instance in service writes its row every 5 seconds, with the stage `serving`. The pool is
+   verified when each instance the first command listed has a row that reads `serving`, was
+   written in the last minute (`date -u +%s` prints now in the same seconds) and carries the
+   digest and the revision of the parameter. An instance in service with no such row is not
+   verified yet: read both commands again. The first command prints nothing while the pool has no
+   instance in service.
 
    In Grafana, the dashboard "Deployments and releases" shows the same over time, in its panel
    "Release each instance serves: image digest and model revision".
