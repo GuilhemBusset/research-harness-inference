@@ -2,24 +2,35 @@
 design, sections 4.3 and 8.2, step 6). The pipeline's verification step runs it after the stage's
 deployment and before the smoke tests (`src/rhi/pipeline/verify.py`).
 
-A deployment does not reach an existing instance by itself: a release reaches a GPU pool's
-instances through an instance refresh of the pool's group, which every change of the pool's engine
-image, model revision, engine flags or machine image starts, and which an unrelated change does
-not start (`rhi.pools.release`). So the question "did this execution change what a GPU pool
-serves?" is asked of Auto Scaling: **yes** when an instance refresh of a GPU pool's group began
-after the execution started. A GPU pool's group is a group tagged with its pool, `rhi-pool`, whose
-engine, its tag `rhi-engine`, is not the mock's (`rhi.pools.group`).
+A deployment replaces no instance: it writes each pool's release parameter (`rhi.pools.release`),
+and the next session's instances read it at their start. So the question "did this execution
+change what a GPU pool serves?" is asked of the release parameters, the ones the step is given in
+`RHI_VERIFY_RELEASE_PARAMETERS`. A GPU pool is one whose engine, `settings.engine` in its
+parameter, is not the mock's; the mock pool's parameter is never compared. The answer is **yes**
+when, for a GPU pool:
 
-On yes, the script waits for every such refresh to end before it answers, polling every
-`POLL_SECONDS` for at most `WAIT_SECONDS`: the smoke tests are only meaningful against the
-instances the refresh left. A refresh that is still pending has no start time yet: it is waited
-for too, and counts once any read of it has given it one, even if a later read omits it. One that
-ends without ever having begun, a pending
-request cancelled, began after nothing and asks for no verification. A refresh that ends `Successful` lets the verification go on; while
-it is pending, in progress, baking, being cancelled or rolling back it is waited for; any other
-end, a failure, a cancellation or a rollback that succeeded or failed, fails the decision, and so
-does a refresh still running when the wait is over. Whichever GPU pool's refresh it was, the pool
-the smoke tests then run on is the coursework pool, `COURSEWORK_POOL`.
+- the parameter's `engine_image`, `model_revision` or `engine_flags` (`COMPARED`, three of the keys
+  `rhi_lifecycle.release` fixes) differ from those of its last version written before the
+  execution started; or
+- the parameter has no version written before the execution started: the pool is deployed for the
+  first time, or Parameter Store no longer holds a version that old.
+
+It is **no** otherwise: a parameter whose current version was written before the execution started
+was not changed by it, and a change of the agent's `files`, of the measured start or of a setting
+books no GPU, since the mock pool's instance runs the same files in the same verification. The
+machine image is not in the parameter and is not compared: a new one has its own canary start
+before it is promoted. Whichever GPU pool's release changed, the pool the smoke tests then run on
+is the coursework pool, `COURSEWORK_POOL`, which the verification script books (`verify.py`). The
+decision waits for nothing: the deployment left the pool's group alone.
+
+**Before means earlier.** A version written at the very time the execution started is not one
+written before it: it is compared with the last version written earlier, like one written since.
+
+**The earlier versions.** `ssm:GetParameter` reads a version of a parameter by its number, as
+`<name>:<version>`, with the time it was written. The script reads the current version, and, when
+that one was not written before the execution started, the versions below it one by one, down
+from the newest, until one was. So it needs no other action of SSM than the one the step's role
+holds on those parameters. It reads at most `VERSIONS` of them, as many as Parameter Store keeps.
 
 **When the execution started.** CodePipeline gives an action the execution's ID, which the step
 passes as `RHI_VERIFY_EXECUTION`, and CodeBuild names the pipeline that started the build in its
@@ -30,8 +41,10 @@ project, and a reference back would be a circular dependency.
 
 **What it leaves.** The pools to run the smoke tests on, one per line and nothing else, in the
 file `RHI_VERIFY_GPU_POOLS_FILE` names: `coursework`, or nothing when the answer is no. The
-verification script reads that file (`verify.py`). A decision that fails leaves no file and exits
-non-zero, which fails the step before any test runs.
+verification script reads that file (`verify.py`). It also prints one line per pool, which names
+the pool and, for a release that changed, the keys that differ, never a value. A decision that
+cannot be made, a parameter that cannot be read or that holds no JSON object, leaves no file and
+exits non-zero, which fails the step before any test runs.
 
 Run by the verification step, from the checkout:
 
@@ -40,12 +53,14 @@ Run by the verification step, from the checkout:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -55,42 +70,40 @@ NAME = "gpu-verification"
 
 # The pool the smoke tests run on when a GPU pool's release was deployed (section 8.2, step 6).
 COURSEWORK_POOL = "coursework"
-# The group's tags (`rhi.pools.group`), and the engine of the pool that is not a GPU pool.
-POOL_TAG = "rhi-pool"
-ENGINE_TAG = "rhi-engine"
+# The engine of the pool that is not a GPU pool, as the settings of its release name it.
 MOCK_ENGINE = "mock"
+# The keys of a release that only a GPU instance can test (`rhi_lifecycle.release`).
+COMPARED = ("engine_image", "model_revision", "engine_flags")
 
-# An instance refresh's statuses (Auto Scaling's own words): the one that lets the verification go
-# on, and those of a refresh that has not ended yet. Every other status is an end that fails.
-SUCCESSFUL = "Successful"
-RUNNING = frozenset({"Pending", "InProgress", "Baking", "Cancelling", "RollbackInProgress"})
-
-# Between two reads of a refresh, and the longest the script waits for the refreshes to end: the
-# deployment itself waits up to an hour for a refresh (`rhi.pools.release`).
-POLL_SECONDS = 30.0
-WAIT_SECONDS = 3600.0
-# At most this many pages of the pipeline's executions, of the groups and of a group's refreshes.
+# The most versions of one parameter the script reads: Parameter Store keeps a parameter's last
+# hundred. SSM's own code for a version it does not hold.
+VERSIONS = 100
+VERSION_NOT_FOUND = "ParameterVersionNotFound"
+# At most this many pages of the pipeline's executions.
 PAGES = 20
 
 EXECUTION_VARIABLE = "RHI_VERIFY_EXECUTION"
 GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
+RELEASE_PARAMETERS_VARIABLE = "RHI_VERIFY_RELEASE_PARAMETERS"
 INITIATOR_VARIABLE = "CODEBUILD_INITIATOR"
 INITIATOR_PREFIX = "codepipeline/"
+# What the pools' output reads while there is no pool (`rhi.pools.stack`).
+NO_POOL = "none"
 
 
 class DecisionError(Exception):
-    """The decision cannot be made, or a refresh did not end well. The message names a pool, a
-    variable or a status, never a value of the account."""
+    """The decision cannot be made. The message names a pool or a variable, never a value of the
+    account."""
 
 
 @dataclass(frozen=True)
-class Refresh:
-    """An instance refresh of a GPU pool's group, and when it began: None while it has not."""
+class Version:
+    """One version of a pool's release parameter: its number, when it was written, and the JSON
+    object it holds, None when it holds none."""
 
-    group: str
-    pool: str
-    refresh_id: str
-    began: datetime | None = None
+    number: int
+    written: datetime
+    release: Mapping[str, Any] | None
 
 
 def _pages(call: Callable[..., dict[str, Any]], token: str, **request: Any) -> list[dict[str, Any]]:
@@ -105,79 +118,80 @@ def _pages(call: Callable[..., dict[str, Any]], token: str, **request: Any) -> l
     return answers
 
 
-def gpu_groups(autoscaling: Any) -> list[tuple[str, str]]:
-    """Each GPU pool's group, as `(the group's name, the pool)`: a group tagged with its pool whose
-    engine is not the mock's."""
-    found = []
-    filters = [{"Name": "tag-key", "Values": [ENGINE_TAG]}]
-    for page in _pages(autoscaling.describe_auto_scaling_groups, "NextToken", Filters=filters):
-        for group in page.get("AutoScalingGroups", []):
-            tags = {tag.get("Key"): tag.get("Value") for tag in group.get("Tags", [])}
-            if tags.get(POOL_TAG) and tags.get(ENGINE_TAG) not in (None, MOCK_ENGINE):
-                found.append((group["AutoScalingGroupName"], tags[POOL_TAG]))
-    return found
+def release_parameters(text: str) -> dict[str, str]:
+    """Each pool's release parameter, by the pool's name, from the text of the pools stack's
+    output: `pool=name`, comma-separated, or `NO_POOL`."""
+    if not text or text == NO_POOL:
+        return {}
+    return dict(pair.split("=", 1) for pair in text.split(","))
 
 
-def refreshes_since(autoscaling: Any, started: datetime) -> list[Refresh]:
-    """The instance refreshes of the GPU pools' groups that began after `started`, and those that
-    have not begun yet: a refresh with no start time has not begun before it."""
-    found = []
-    for group, pool in gpu_groups(autoscaling):
-        pages = _pages(autoscaling.describe_instance_refreshes, "NextToken", AutoScalingGroupName=group)
-        for page in pages:
-            for refresh in page.get("InstanceRefreshes", []):
-                began = refresh.get("StartTime")
-                if began is None or began > started:
-                    found.append(Refresh(group, pool, refresh["InstanceRefreshId"], began))
-    return found
+def read_version(ssm: Any, pool: str, name: str, number: int | None = None) -> Version | None:
+    """The version `number` of the parameter `name`, the release parameter of `pool`, or its
+    current version; None for a numbered version that SSM does not hold. `ssm` is an SSM client of
+    the AWS SDK."""
+    try:
+        answer = ssm.get_parameter(Name=name if number is None else f"{name}:{number}")
+    except (ClientError, BotoCoreError) as error:
+        code = error.response.get("Error", {}).get("Code") if isinstance(error, ClientError) else None
+        if number is not None and code == VERSION_NOT_FOUND:
+            return None
+        # The pool's name, never SSM's own words.
+        raise DecisionError(f"the release parameter of the pool {pool} cannot be read") from None
+    parameter = answer.get("Parameter", {})
+    held, written = parameter.get("Version"), parameter.get("LastModifiedDate")
+    if not isinstance(held, int) or written is None:
+        raise DecisionError(f"the release parameter of the pool {pool} cannot be read")
+    try:
+        release = json.loads(parameter.get("Value", ""))
+    except ValueError:
+        release = None
+    return Version(held, written, release if isinstance(release, dict) else None)
 
 
-def status_of(autoscaling: Any, refresh: Refresh) -> tuple[str, datetime | None]:
-    """The refresh's status now, and its start time: the one read now, or else the one it had."""
-    answer = autoscaling.describe_instance_refreshes(
-        AutoScalingGroupName=refresh.group, InstanceRefreshIds=[refresh.refresh_id]
-    )
-    found = answer.get("InstanceRefreshes", [])
-    if not found:
-        return "unknown", refresh.began
-    return found[0].get("Status", "unknown"), found[0].get("StartTime") or refresh.began
+def last_before(ssm: Any, pool: str, name: str, current: int, started: datetime) -> Version | None:
+    """The last version of the parameter `name` written before `started`, among those below the
+    version `current`; None when SSM holds none."""
+    for number in range(current - 1, max(0, current - 1 - VERSIONS), -1):
+        version = read_version(ssm, pool, name, number)
+        if version is None:
+            return None
+        if version.written < started:
+            return version
+    return None
 
 
-def decide(
-    autoscaling: Any,
-    started: datetime,
-    *,
-    sleep: Callable[[float], object] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-    poll_seconds: float = POLL_SECONDS,
-    wait_seconds: float = WAIT_SECONDS,
-) -> list[str]:
-    """The pools to run the smoke tests on for an execution that started at `started`:
-    `[COURSEWORK_POOL]` once every refresh of a GPU pool's group that began after it has ended
-    well, `[]` when there is none. A pending refresh is waited for, and one that ends without
-    having begun is left out. A refresh that began and ended otherwise, or that is still running
-    after `wait_seconds`, raises `DecisionError`. `autoscaling` is an Auto Scaling client of the
-    AWS SDK."""
-    deadline = clock() + wait_seconds
-    began_since = False
-    for refresh in refreshes_since(autoscaling, started):
-        while True:
-            # A start time once read is kept: a later answer that omits it does not unbegin it.
-            status, began = status_of(autoscaling, refresh)
-            refresh = replace(refresh, began=began)
-            if status not in RUNNING:
-                break
-            if clock() >= deadline:
-                raise DecisionError(f"the instance refresh of the pool {refresh.pool} is still {status}")
-            sleep(poll_seconds)
-        if began is None or began <= started:
-            print(f"{NAME}: the instance refresh of the pool {refresh.pool} ended {status} without having begun")
+def decide(ssm: Any, parameters: Mapping[str, str], started: datetime) -> list[str]:
+    """The pools to run the smoke tests on for an execution that started at `started`, given each
+    pool's release parameter by the pool's name: `[COURSEWORK_POOL]` when a GPU pool's parameter
+    differs in a key of `COMPARED` from its last version written before `started`, or has no such
+    version; `[]` otherwise. A parameter that cannot be read, or whose current version holds no
+    JSON object, raises `DecisionError`. `ssm` is an SSM client of the AWS SDK."""
+    changed = False
+    for pool, name in parameters.items():
+        current = read_version(ssm, pool, name)
+        if current is None or current.release is None:
+            raise DecisionError(f"the release parameter of the pool {pool} holds no release")
+        settings = current.release.get("settings")
+        if isinstance(settings, dict) and settings.get("engine") == MOCK_ENGINE:
+            print(f"{NAME}: the pool {pool} runs the mock engine: its release is not compared")
             continue
-        if status != SUCCESSFUL:
-            raise DecisionError(f"the instance refresh of the pool {refresh.pool} ended {status}")
-        print(f"{NAME}: the instance refresh of the pool {refresh.pool} ended {status}")
-        began_since = True
-    return [COURSEWORK_POOL] if began_since else []
+        if current.written < started:
+            print(f"{NAME}: the release of the pool {pool} was not written since the execution started")
+            continue
+        before = last_before(ssm, pool, name, current.number, started)
+        if before is None:
+            print(f"{NAME}: the release of the pool {pool} has no version written before the execution started")
+            changed = True
+            continue
+        earlier = before.release
+        differing = [key for key in COMPARED if earlier is None or current.release.get(key) != earlier.get(key)]
+        if differing:
+            print(f"{NAME}: the release of the pool {pool} changed: {', '.join(differing)}")
+            changed = True
+        else:
+            print(f"{NAME}: the release of the pool {pool} changed nothing that only a GPU instance can test")
+    return [COURSEWORK_POOL] if changed else []
 
 
 def pipeline_name(env: Mapping[str, str]) -> str:
@@ -198,13 +212,7 @@ def execution_start(codepipeline: Any, pipeline: str, execution: str) -> datetim
     raise DecisionError(f"the execution {EXECUTION_VARIABLE} names is not among the pipeline's executions")
 
 
-def main(
-    environ: Mapping[str, str] | None = None,
-    autoscaling: Any = None,
-    codepipeline: Any = None,
-    sleep: Callable[[float], object] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> int:
+def main(environ: Mapping[str, str] | None = None, ssm: Any = None, codepipeline: Any = None) -> int:
     """Decides for the execution the environment names, and leaves the pools to verify on in the
     file it names; 0 once they are left. Without a client, the build's own credentials and region
     make it."""
@@ -214,13 +222,13 @@ def main(
         if not named or not execution:
             raise DecisionError(f"{GPU_POOLS_FILE_VARIABLE} and {EXECUTION_VARIABLE} must both be set")
         pipeline = pipeline_name(env)
-        if codepipeline is None or autoscaling is None:
+        if codepipeline is None or ssm is None:
             import boto3
 
             codepipeline = codepipeline or boto3.client("codepipeline")
-            autoscaling = autoscaling or boto3.client("autoscaling")
+            ssm = ssm or boto3.client("ssm")
         started = execution_start(codepipeline, pipeline, execution)
-        pools = decide(autoscaling, started, sleep=sleep, clock=clock)
+        pools = decide(ssm, release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, "")), started)
     except DecisionError as error:
         print(f"{NAME}: {error}", file=sys.stderr)
         return 1

@@ -7,7 +7,7 @@ last-stages, and the reason the GPU tests did not run to gpu-not-run; inputs tha
 stage's stacks and the execution's ID; and a role that
 reads the canary's secret, queries the stage's workspace, reads the stage's pools' release
 parameters, queries the stage's heartbeats table, and that one table, writes under
-verification/, describes groups and their refreshes, and lists its own pipeline's executions. For
+verification/, and lists its own pipeline's executions, with no action of Auto Scaling. For
 the sessions the script books, on the mock pool and on the coursework pool, the step is given the
 pools stack's name, the pool-state table's logical ID and the configuration's two numbers, its role
 may describe that one stack's resources and read and write the items of those two pools of that one
@@ -354,7 +354,6 @@ def test_the_role_reads_one_secret_and_writes_under_verification_only(verificati
         "ssm",
         "dynamodb",
         "cloudformation",
-        "autoscaling",
         "codepipeline",
         "logs",
         "codebuild",
@@ -382,7 +381,8 @@ def test_the_role_queries_the_stage_s_workspace_and_reads_the_stage_s_release_pa
     ]
     assert tagged == [address["Fn::GetAtt"][0]]
 
-    # Each parameter the step is given, by its name, and no pattern.
+    # Each parameter the step is given, by its name, and no pattern: one action of SSM, which
+    # also reads the earlier version the decision compares a release with.
     (read,) = verification.allowed("ssm")
     assert read["Action"] == "ssm:GetParameter"
     _, value, _ = verification.output(script.RELEASE_PARAMETERS_VARIABLE)
@@ -397,7 +397,7 @@ def test_the_decision_on_the_coursework_pool_ends_before_the_coursework_tests(
 ) -> None:
     # The decision runs in the build phase, after the locked environment and before the script that
     # runs the smoke tests on the coursework pool: a command that fails ends the phase, so a failed
-    # decision runs no test, and the tests begin once its wait for the refresh is over.
+    # decision runs no test.
     build = verification.phases["build"]["commands"]
     (decides,) = [at for at, command in enumerate(build) if "scripts/pipeline/gpu_verification.py" in command]
     (tests,) = [at for at, command in enumerate(build) if "scripts/pipeline/verify.py" in command]
@@ -412,19 +412,14 @@ def test_the_decision_on_the_coursework_pool_ends_before_the_coursework_tests(
     assert by_action[decision.EXECUTION_VARIABLE] == EXECUTION_ID
     (pipeline,) = [k for k, r in verification.resources.items() if r["Type"] == "AWS::CodePipeline::Pipeline"]
     assert pipeline not in json.dumps(verification.project)
-    # It may describe groups and their refreshes, which AWS grants on every resource only, and list
-    # the executions of this pipeline, by its ARN.
-    (describes,) = verification.allowed("autoscaling")
-    assert sorted(as_list(describes["Action"])) == [
-        "autoscaling:DescribeAutoScalingGroups",
-        "autoscaling:DescribeInstanceRefreshes",
-    ]
-    assert describes["Resource"] == "*" and "Condition" not in describes
+    # It reads the release parameters the script reads, under the same variable, and may list the
+    # executions of this pipeline, by its ARN. It asks nothing of Auto Scaling: no refresh is
+    # started, so the role may describe neither a group nor a refresh.
+    assert decision.RELEASE_PARAMETERS_VARIABLE == script.RELEASE_PARAMETERS_VARIABLE
+    assert verification.allowed("autoscaling") == []
     (lists,) = verification.allowed("codepipeline")
     assert lists["Action"] == "codepipeline:ListPipelineExecutions"
     assert text(lists["Resource"]) == f"arn:<>:codepipeline:<>:<>:<{pipeline}>"
-    # The step runs long enough for a refresh and two runs of the tests, each with a cold wake.
-    assert verification.project["TimeoutInMinutes"] >= decision.WAIT_SECONDS / 60 + 60
 
 
 def test_the_heartbeat_grant_names_one_table(verification: Verification) -> None:

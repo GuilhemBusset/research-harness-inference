@@ -16,9 +16,9 @@ One of the six dashboards of the system design (section 7.3). It reads two sourc
   agent reports it: one series of value 1, whose labels `image_digest` and `model_revision` are the
   release the instance holds. The node's collector adds `pool` and `instance`.
 
-A deployment does not reach an instance that is already running: a release starts an instance
-refresh, and the pipeline's verification asserts that the served release equals the deployed one
-(section 4.3). The release panels show the admin the same thing. There is one row for each pool of
+A deployment does not reach an instance that is already running, and replaces none: the next
+session's instances start on the new release, and the pipeline's verification asserts that the
+served release equals the deployed one (section 4.3). The release panels show the admin the same thing. There is one row for each pool of
 the configuration, in its order, and its panel draws one band for each instance and the release it
 serves, over the dashboard's range. When an instance's release changes, or a new instance replaces
 it, one band ends and another starts.
