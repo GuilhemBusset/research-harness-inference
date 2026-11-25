@@ -351,10 +351,10 @@ the next run uses the new key.
    - **A pool in mode `scheduled-only`**: the canary's key does not wake it. With no instance and
      no capacity asked for, the gateway answers at once with the cause `pool_scheduled_only`. Test
      it once it has been started through its normal capacity procedure (runbook
-     [a session switched on and off](session-on-and-off.md)), when `rhi status` lists it `ready`;
+     [a session booked, changed and stopped](sessions.md)), when `rhi status` lists it `ready`;
      until then nothing of it runs with either value.
    - **A pool in mode `disabled`** answers `pool_disabled` and is not tested: enable it first, or
-     test it when it is next enabled (runbook [a disabled pool](disabled-pool.md)).
+     test it when it is next enabled (runbook [a pool whose launches are suspended](suspended-launches.md)).
 
    An error is diagnosed by its cause, not taken as a failed rotation by default. The cause is the
    answer's `error.type`: the gateway answers a Messages request with an error body
@@ -412,7 +412,7 @@ the next run uses the new key.
        the error is not a bearer mismatch. It is another fault of the engine; the lifecycle
        agent's minute check uses Chat Completions while this request uses Messages, so its silence
        does not clear the engine. Read the engine's own lines in `/rhi/pools/<pool>` around the
-       time of the request, and follow the runbook [a disabled pool](disabled-pool.md) if the
+       time of the request, and follow the runbook [a pool whose launches are suspended](suspended-launches.md) if the
        pool must stop serving meanwhile.
    - `invalid_key`: the canary's key, not the pool's secret: the canary has no valid key (its
      part, below).

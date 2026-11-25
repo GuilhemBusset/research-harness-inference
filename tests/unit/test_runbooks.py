@@ -25,9 +25,9 @@ from rhi_cli import main as rhi_main
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNBOOKS = [
-    "session-on-and-off.md",
+    "sessions.md",
     "capacity-failure.md",
-    "disabled-pool.md",
+    "suspended-launches.md",
     "leaked-key.md",
     "bad-deployment.md",
     "secret-rotation.md",

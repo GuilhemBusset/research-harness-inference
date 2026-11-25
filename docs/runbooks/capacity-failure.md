@@ -63,8 +63,8 @@ During a session, a pool does not come up:
    ```
 
    A pool `unavailable` with `capacity_unavailable` is this runbook. `no_session` is the session
-   switch (runbook [a session switched on and off](session-on-and-off.md)), and `pool_disabled` a
-   pool the admin disabled (runbook [a disabled pool](disabled-pool.md)).
+   switch (runbook [a session booked, changed and stopped](sessions.md)), and `pool_disabled` a
+   pool the admin disabled (runbook [a pool whose launches are suspended](suspended-launches.md)).
 
 2. **What the scaler did.** The pool's mode, and whether the scaler has suspended its launches:
    after three abandoned launches in a row it stops launching and waits for the admin (section 5.4).
@@ -97,7 +97,7 @@ During a session, a pool does not come up:
      now. While the newest are refused for the quota, waking the pool again does not help, since
      every launch is refused the same way until the quota is raised, or until an instance of
      another pool in the same family is released. It is fixed by the quota step of the runbook
-     [a session switched on and off](session-on-and-off.md), which can take days, so not during
+     [a session booked, changed and stopped](sessions.md), which can take days, so not during
      the class: tell the students to work with their own subscriptions (Act, step 1).
 
 ## Act
@@ -132,7 +132,7 @@ During a session, a pool does not come up:
 
    It takes effect at the next pipeline run, which you start, while no session is on, with
    **Release change** on the pipeline's page in the CodePipeline console; check that execution, by
-   its ID, as the runbook [a session switched on and off](session-on-and-off.md) says in its check
+   its ID, as the runbook [a session booked, changed and stopped](sessions.md) says in its check
    2. The GPU quota must still cover one instance more than the pool's `max_instances`, of the
    largest type it lists, against the quota of that type's family.
 
