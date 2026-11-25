@@ -56,6 +56,7 @@ After this issue nothing deployed changes.
 
 - [ ] `uv run --locked pytest tests/unit/test_runbooks.py tests/unit/test_docs.py` passes: the new runbook has its four sections, and every command the runbooks show parses.
 - [ ] `git grep -n -e scale-to-zero -e idle_minutes -e hold_seconds -e warm_instances -e nightly_stop -- README.md pyproject.toml docs/runbooks scripts/pipeline/README.md` prints nothing.
+- [ ] The runbooks of a session short of capacity and of a scaler that does not run are each walked through once on the deployed system, and the date is recorded at the foot of each (needs aws:deployed-environment).
 
 ## References
 

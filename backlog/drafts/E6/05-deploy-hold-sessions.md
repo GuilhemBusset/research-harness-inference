@@ -35,6 +35,7 @@ while the switch is on.
 
 - [ ] `uv run --locked pytest tests/unit/test_deploy_hold.py` passes: the job waits while one pool's session is active and passes once it has ended, passes at once with no session item and the switch off, and exits 1 on an item that is not a session.
 - [ ] `uv run --locked pytest tests/synth/test_pipeline_hold.py tests/policy/test_pipeline.py` passes: the step's environment names every pool of the stage, and its role is the one the policy test already holds.
+- [ ] In the account, a merge while a pool's session is active deploys only after that session has ended or been stopped, and a merge while no session is active deploys at once (needs aws:deployed-environment).
 
 ## References
 

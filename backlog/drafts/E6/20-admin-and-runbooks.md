@@ -53,6 +53,7 @@ After this issue nothing deployed changes: the CLI is the instructor's, and runb
 - [ ] `uv run --locked pytest tests/unit/admin tests/unit/test_runbooks.py` passes: the parser refuses `session on`, `session off`, `pool disable` and `pool enable`, and every command the runbooks show parses.
 - [ ] `git grep -n -e session-on-and-off -e disabled-pool -e "rhi_admin session on" -e "rhi_admin session off" -e "rhi_admin pool disable" -e "rhi_admin pool enable" -- docs admin tests/unit/test_runbooks.py setup` prints nothing.
 - [ ] `tests/unit/admin/test_pools.py::test_status_names_no_mode` shows the status of a pool whose launches are suspended and of one whose are not.
+- [ ] The two runbooks this issue writes are each walked through once on the deployed system, and the date is recorded at the foot of each (needs aws:deployed-environment).
 
 ## References
 
