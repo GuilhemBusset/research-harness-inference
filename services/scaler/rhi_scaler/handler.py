@@ -7,10 +7,11 @@ the admin CLI. Whoever calls, a run does the same thing, and the event is never 
    pool's session among them, with the longest a session may last as the settings give it;
 2. decide (`rhi_scaler.decide`), from the inputs alone, and note in each pool's memory how long it
    has been in service outside a session (`rhi_scaler.outside_sessions`), which only reports;
-3. apply: the Auto Scaling calls that change something, then each pool's note and memory record;
-4. log one record per pool with its decision and its reason, send the fleet's metrics with the
-   session gauge, from the switch the run read (`rhi_scaler.metrics`), and publish to CloudWatch
-   what the alarms read (`rhi_scaler.cloudwatch`).
+3. apply: the Auto Scaling calls that change something, then each pool's note, with what the pool
+   was asked and what waits (section 5.4), and its memory record;
+4. log one record per pool with its decision and its reason, send the fleet's metrics, which carry
+   the numbers of each pool's note, with the session gauge, from the switch the run read
+   (`rhi_scaler.metrics`), and publish to CloudWatch what the alarms read (`rhi_scaler.cloudwatch`).
 
 A run that fails before its writes leaves the pool as it was; the next run reads the world again.
 A run that fails publishes nothing to CloudWatch: the missing `RunCompleted` is what the alarm
@@ -110,7 +111,7 @@ def run_cycle(
     readable = run.session_error is None
     decision = outside_sessions.carry(run.inputs, decide(run.inputs), run.session, read=readable)
     try:
-        aws_io.apply(clients, settings.tables, run, decision)
+        notes = aws_io.apply(clients, settings.tables, run, decision)
     except Exception:
         # The switch was read all the same: its reading goes, and the run fails on its writes.
         if readable:
@@ -119,7 +120,10 @@ def run_cycle(
     log_decisions(run, decision)
     try:
         session = run.session if readable else UNREAD
-        writer.push(fleet_series(run.inputs, decision, counts, milliseconds, session=session, read_at=run.session_read_at))
+        series = fleet_series(
+            run.inputs, decision, counts, milliseconds, notes=notes, session=session, read_at=run.session_read_at
+        )
+        writer.push(series)
     except Exception as error:  # noqa: BLE001 - the decision is applied; a lost push only leaves a gap
         LOGGER.warning(json.dumps({"event": "metrics-not-sent", "error": type(error).__name__}))
     if run.session_error is not None:

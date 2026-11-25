@@ -185,6 +185,7 @@ def test_the_number_reaches_the_note() -> None:
             decision = decide(read_run.inputs)
             # The two items the table must receive, exactly. No Auto Scaling call is queued: one would fail.
             note = {"pool": "coursework", "record": "note", "capacity_asked": 2, "written_at": now}
+            note |= {"requested": 0, "starting": 0, "in_service": 2, "draining": 0, "waiting": 0}
             note.update({} if number is None else {"rebalance_number": number})
             before = read_run.inputs.pools[0].memory
             stored = [note, memory_to_item("coursework", decision.pools[0].memory)]

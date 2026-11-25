@@ -58,6 +58,12 @@ def held_request(now: int) -> dict[str, Any]:
     return GatewayHeartbeat("task-1", "mock", 0, 1, NOW - 2, now - 1).to_item()
 
 
+def note(asked: int, now: int = NOW, **supply: int) -> dict[str, Any]:
+    """The pool's note of a run at `now` that asks for `asked`: zeros but for the `supply` given."""
+    counts = {"requested": 0, "starting": 0, "in_service": 0, "draining": 0, "waiting": 0}
+    return {"pool": "mock", "record": "note", "capacity_asked": asked, "written_at": now, **counts, **supply}
+
+
 def serialize(item: dict[str, Any]) -> dict[str, Any]:
     return {name: TypeSerializer().serialize(value) for name, value in item.items()}
 
@@ -162,7 +168,8 @@ class Edge:
         self.autoscaling.add_response(
             "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
         )
-        self.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW}, published=switch_error is None)
+        # The instance asked for has not come: it waits, from this run on.
+        self.expect_writes(note(1, waiting=1, waiting_since=NOW), published=switch_error is None)
 
 
 @pytest.fixture
@@ -192,7 +199,10 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     # The memory stored: the request received, the run that saw it held, the gateway's heartbeat.
     (update,) = edge.updates
     assert update["Key"] == {"pool": {"S": "mock"}, "record": {"S": "memory"}}
-    assert stored_memory(update) == Memory(last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1)
+    # And the run from which the pool waits for the instance it asked for.
+    assert stored_memory(update) == Memory(
+        last_request_at=NOW - 2, last_in_flight_at=NOW, last_gateway_at=NOW - 1, short_since=NOW
+    )
 
     ((url, headers, body),) = edge.pushes
     assert url == WORKSPACE
@@ -208,8 +218,10 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     assert sent[(DECISIONS, (("pool", "mock"), ("reason", "wake")))][-1] == 1.0
     # The session switch has no record: the session gauge reads 0.
     assert sent[(SESSION_ON, ())] == [0.0]
-    # The pool and the reason are the only labels: nothing names a student.
-    assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason"}
+    # What the note holds goes out too: one instance asked of AWS that has not come.
+    assert sent[("rhi_scaler_instances_waiting", pool)] == [1.0]
+    # The pool, the reason and the cause are the only labels: nothing names a student.
+    assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason", "cause"}
 
 
 def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_settings(edge: Edge) -> None:
@@ -219,7 +231,7 @@ def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_setting
     edge.autoscaling.add_response(
         "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
     )
-    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW})
+    edge.expect_writes(note(1, requested=1, waiting=1, waiting_since=NOW))
     decision = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
     assert [(pool.desired, pool.reason, pool.requested) for pool in decision.pools] == [(1, Reason.PROVISION, 1)]
 
@@ -227,7 +239,7 @@ def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_setting
     # to Auto Scaling is queued.
     shorter = read_settings({**ENVIRON, "RHI_SCALER_SETTINGS": json.dumps({**json.loads(ENVIRON["RHI_SCALER_SETTINGS"]), "session_max_hours": 1})})
     edge.queue_read(desired=0, instances=[], records=[session.to_item()], heartbeats=[])
-    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 0, "written_at": NOW})
+    edge.expect_writes(note(0))
     decision = scaler.run_cycle(shorter, edge.clients, edge.writer, NOW, DecisionCounts())
     assert [(pool.desired, pool.requested) for pool in decision.pools] == [(0, 0)]
 
@@ -284,7 +296,7 @@ def test_a_second_run_is_harmless(edge: Edge) -> None:
         heartbeats=[held_request(later)],
     )
     # No Auto Scaling call is queued: one would fail the test. Only the note and the memory.
-    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": later})
+    edge.expect_writes(note(1, later, starting=1))
     second = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, later, counts)
     assert [pool.desired for pool in second.pools] == [pool.desired for pool in first.pools] == [1]
 

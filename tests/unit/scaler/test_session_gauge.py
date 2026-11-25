@@ -14,7 +14,7 @@ from botocore.credentials import Credentials
 from botocore.stub import Stubber
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import Mode, RecordError, SessionSwitch
+from rhi_common.records import Mode, RecordError, ScalerNote, SessionSwitch
 from rhi_scaler import handler
 from rhi_scaler.aws_io import Clients, TableNames, read_session
 from rhi_scaler.metrics import SESSION_ON, UNREAD, DecisionCounts, RemoteWriter, Unread, decode, encode, fleet_series
@@ -59,7 +59,8 @@ def sent(
     """The series of one run at `milliseconds`, by name: their labels and their samples (value, time)."""
     inputs = Inputs(now=NOW, pools=(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=Supply(desired=0)),))
     decision = Decision(pools=(PoolDecision("mock", 0, (), False, Memory(), Reason.UNCHANGED),))
-    body = encode(fleet_series(inputs, decision, DecisionCounts(), milliseconds, session=session))
+    notes = {"mock": ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=NOW)}
+    body = encode(fleet_series(inputs, decision, DecisionCounts(), milliseconds, notes=notes, session=session))
     out = {}
     for timeseries in decode(body).timeseries:
         labels = {label.name: label.value for label in timeseries.labels}

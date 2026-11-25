@@ -16,7 +16,9 @@ strings and whole numbers. `to_item` writes every number as an `int`; `from_item
 `Decimal` that boto3 gives back for a number. A time is a whole number of seconds since the epoch.
 A time that may be unknown (no request received yet, no launch that found no capacity) is `None`
 in the record and absent from the item. A pool's rebalance number is absent from the scaler's note
-while it is 0, and a note stored without one reads as 0.
+while it is 0, and a note stored without one reads as 0. The note's counts of the pool's supply are
+always written, and a note stored before the scaler wrote them reads as zeros, with no time and no
+cause.
 
 A heartbeat is rewritten every 5 seconds and ignored once it is older than 20 seconds (section
 17): `is_fresh` is that rule. Its item also carries `expires_at`, the table's expiry attribute, one
@@ -79,6 +81,20 @@ class Mode(StrEnum):
     DISABLED = "disabled"
 
 
+class LaunchFailure(StrEnum):
+    """Why a pool's group last failed to launch, while the pool waits (section 5.4). The scaler's
+    note and its metrics carry one of these four words, never text from AWS."""
+
+    # The launch found no capacity for the pool's instance types in its zones.
+    INSUFFICIENT_CAPACITY = "insufficient-capacity"
+    # The account's vCPU quota refused the launch.
+    QUOTA = "quota"
+    # The scaler suspended the group's launches, after three abandoned in a row.
+    LAUNCHES_SUSPENDED = "launches-suspended"
+    # The launch failed for any other reason.
+    LAUNCH_FAILED = "launch-failed"
+
+
 # The mode of a pool that has no mode record, by the `wake` of its configuration (section 11.3):
 # what the scaler reads, and what the admin CLI re-enables a pool to.
 CONFIGURED_MODE = {"on-demand": Mode.ENABLED, "scheduled-only": Mode.SCHEDULED_ONLY}
@@ -103,6 +119,11 @@ def _whole(item: Mapping[str, object], name: str) -> int:
 
 def _optional_time(item: Mapping[str, object], name: str) -> int | None:
     return None if item.get(name) is None else _whole(item, name)
+
+
+def _count(item: Mapping[str, object], name: str) -> int:
+    """A count that an item stored before the count was written does not hold: it reads as 0."""
+    return 0 if item.get(name) is None else _whole(item, name)
 
 
 def _record(item: Mapping[str, object], record: str) -> None:
@@ -232,15 +253,26 @@ class PoolState:
 
 @dataclass(frozen=True)
 class ScalerNote:
-    """What only the scaler knows about a pool and every gateway task reads (section 5.3).
+    """What only the scaler knows about a pool, written on every run (sections 5.3 and 5.4). Every
+    gateway task reads it, and so does the admin CLI.
 
-    `capacity_asked` is the number of instances the scaler last asked the pool's group for: zero
-    says it asked for none. `no_capacity_at` is when a launch last found no capacity, `None` if
-    none did.
+    `capacity_asked` is the number of instances the scaler last asked the pool's group for, the
+    "asked of AWS" of section 5.4: zero says it asked for none. `no_capacity_at` is when a launch
+    last found no capacity, `None` if none did.
 
     `rebalance_number` is the pool's rebalance number (section 5.5): the scaler raises it while the
     pool is lopsided, and for each new number the gateway moves a share of the pool's students. It
     is 0 until the scaler first raises it, and the item holds it only once it is above 0.
+
+    The rest is what the pool was asked and what waits (section 5.4). `requested` is what the pool's
+    session asks for at the time of the run, 0 while none is active. `starting`, `in_service` and
+    `draining` count the instances the run read in each state. `waiting` is what was asked of AWS
+    and has no instance yet: `capacity_asked` less the instances starting and in service, never
+    below zero. `waiting_since` is the time of the first of the runs in a row that saw `waiting`
+    above zero, and `None` while nothing waits. `launch_failure` is why the group's last launch
+    failed since then, and `None` while nothing waits or no launch has failed. The item always
+    holds the five counts, and the time and the cause only while they are set. A note stored
+    without them reads as zeros, no time and no cause.
     """
 
     pool: str
@@ -248,6 +280,13 @@ class ScalerNote:
     no_capacity_at: int | None
     written_at: int
     rebalance_number: int = 0
+    requested: int = 0
+    starting: int = 0
+    in_service: int = 0
+    draining: int = 0
+    waiting: int = 0
+    waiting_since: int | None = None
+    launch_failure: LaunchFailure | None = None
 
     def to_item(self) -> Item:
         item: Item = {
@@ -255,23 +294,45 @@ class ScalerNote:
             "record": NOTE_RECORD,
             "capacity_asked": self.capacity_asked,
             "written_at": self.written_at,
+            "requested": self.requested,
+            "starting": self.starting,
+            "in_service": self.in_service,
+            "draining": self.draining,
+            "waiting": self.waiting,
         }
         if self.no_capacity_at is not None:
             item["no_capacity_at"] = self.no_capacity_at
         if self.rebalance_number > 0:
             item["rebalance_number"] = self.rebalance_number
+        if self.waiting_since is not None:
+            item["waiting_since"] = self.waiting_since
+        if self.launch_failure is not None:
+            item["launch_failure"] = self.launch_failure.value
         return item
 
     @classmethod
     def from_item(cls, item: Mapping[str, object]) -> Self:
         _record(item, NOTE_RECORD)
+        cause = item.get("launch_failure")
+        try:
+            launch_failure = None if cause is None else LaunchFailure(cause)
+        except ValueError:
+            raise RecordError("`launch_failure` is not one of the four causes") from None
         return cls(
             pool=_text(item, "pool"),
             capacity_asked=_whole(item, "capacity_asked"),
             no_capacity_at=_optional_time(item, "no_capacity_at"),
             written_at=_whole(item, "written_at"),
             # A note written before the scaler raised a number, or before it kept one, holds none.
-            rebalance_number=0 if item.get("rebalance_number") is None else _whole(item, "rebalance_number"),
+            rebalance_number=_count(item, "rebalance_number"),
+            # A note written before the scaler wrote these holds none of them.
+            requested=_count(item, "requested"),
+            starting=_count(item, "starting"),
+            in_service=_count(item, "in_service"),
+            draining=_count(item, "draining"),
+            waiting=_count(item, "waiting"),
+            waiting_since=_optional_time(item, "waiting_since"),
+            launch_failure=launch_failure,
         )
 
 
