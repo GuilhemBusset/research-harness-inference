@@ -53,8 +53,9 @@ A session is active and has fewer instances in service than it asks for:
   | `warming` | An instance is starting, and none is in service | Answered at once with `warming`; harnesses retry a few times |
   | `unavailable`, `capacity_unavailable` | No instance is in service or starting: the pool waits for capacity | Answered at once with `capacity_unavailable`; harnesses retry a few times |
 
-  The gateway keeps no request waiting. `rhi wait` waits through both, prints each change and
-  returns when the pool reads `ready`.
+  The gateway keeps no request waiting. `rhi wait` waits through both and prints each change. It
+  returns when the pool reads `ready`, and gives up after the minutes of its `--timeout`, 20 unless
+  given, which a wait for capacity outlasts (Act, step 6).
 - **A session filled in part** reads `ready`, since one instance in service is enough to serve:
   students see nothing but a slower pool. The alarm and `rhi_admin session status` are what say
   that it is short.
@@ -208,17 +209,28 @@ A session is active and has fewer instances in service than it asks for:
    Nothing in this repository stands in for a pool: there is no fallback command, and no other
    model is switched in. Leave the session booked while the class may still use the pool: an
    instance can arrive at any minute, and a student who wants to know when waits for it, which
-   starts nothing:
+   starts nothing.
+
+   Tell them how long to wait. `rhi wait` gives up after 20 minutes unless it is given another
+   time: it then prints that the pool is not ready, and exits 1. A wait for capacity lasts longer
+   than that, 21 to 37 minutes on the recorded day and with no upper bound, so that end says
+   nothing new about the pool: the session still asks, and the instance may still come. Give the
+   students a time that covers what is left of the class, in minutes, here two hours:
 
    ```sh
-   rhi wait coursework
+   rhi wait coursework --timeout 120
    ```
 
-   Once the class no longer wants the pool, stop the session, so that an instance that arrives
-   late is not paid for until the session's end:
+   A student whose wait has given up runs it again. The command ends at once, with `no_session`,
+   when the session is stopped or over: no instance is coming then, and waiting again does not
+   help.
+
+   Once the class no longer wants the pool, stop its session, so that an instance that arrives
+   late is not paid for until the session's end. Name the pool: without `--pool` the command acts
+   on the configuration's default pool, which need not be the one that is short.
 
    ```sh
-   rhi_admin session stop
+   rhi_admin session stop --pool coursework
    ```
 
 7. **After the class, if capacity failed often.**

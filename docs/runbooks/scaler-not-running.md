@@ -11,7 +11,9 @@ from scale-in until the scaler lifts that protection. So:
 - **a session's instances stay past its end.** After the end, or after `session stop`, the gateway
   answers `no_session` within seconds, since it reads the sessions by itself. The instances stay in
   service all the same, serve nobody and are billed, until the scaler runs again or the group is
-  emptied by hand (Act, step 2);
+  emptied by hand (Act, step 2). A group that was still waiting for capacity goes on asking AWS
+  after the end too, also when none of its instances has arrived: the instance that then comes is
+  launched, enters service and is billed like the others;
 - **a session that starts gets no instance,** and one that is raised gets no more: nothing asks AWS
   for them;
 - **an active session keeps what it has.** The instances in service go on serving, and the group
@@ -65,22 +67,33 @@ and this runbook does not apply.
    ```
 
    - One line for each pool, with the instances its group is asked for and the reason of the
-     decision: this run completed. The fault may be over, or the scaler may not be started every
-     minute any more: step 2 says which.
-   - The scaler is already running: a run is under way. Ask again a minute later.
+     decision: this run completed, and set every pool to what its session asks for. It proves
+     this one run, which you asked for, and nothing about the next: the fault may be over, or the
+     scaler may not be started every minute any more. Step 2 says which.
+   - The scaler is already running, or Lambda throttled the request: no run was made for this
+     command, and neither line says that the scaler fails. Ask again a minute later.
    - The scaler's run failed: it runs and fails. The line names its log group, which is
      `<scaler-log-group>` in step 3.
 
-2. **Since when it has completed no run.** The alarm's state, and when it last changed:
+2. **Since when it has completed no run, and whether its schedule still starts it.** The alarm's
+   state, and when it last changed:
 
    ```sh
    aws cloudwatch describe-alarms-for-metric --namespace rhi/scaler --metric-name RunCompleted \
        --query 'MetricAlarms[].[StateValue,StateUpdatedTimestamp]' --output text
    ```
 
-   `ALARM` since a time: no run has completed since about five minutes before it. The completed
-   runs of the last half hour, one data point a minute with the number of runs that completed in
-   it, and no line for a minute without one:
+   `ALARM` since a time: no run completed in the five minutes before it, and none has since.
+
+   `OK` says less. The alarm fires only when none of its five minutes has a completed run, so one
+   run is enough to clear it, a run that a command asked for included: the run of step 1, or the
+   one a command `session` asks for. After such a run the alarm reads `OK` within a minute or two
+   and stays so for five minutes, whether or not anything starts the scaler again. `OK` shows that
+   a run completed in the last five minutes. It does not show that the scaler runs every minute.
+
+   What shows that is the completed runs themselves. Those of the last half hour, one line for
+   each minute that has one, with the number of runs that completed in it, and no line for a
+   minute without one:
 
    ```sh
    aws cloudwatch get-metric-statistics --namespace rhi/scaler --metric-name RunCompleted \
@@ -90,8 +103,15 @@ and this runbook does not apply.
        --query 'sort_by(Datapoints, &Timestamp)[].[Timestamp,Sum]' --output text
    ```
 
-   A run that step 1 completed, with no other minute in the list, is a scaler that works when it
-   is asked and is no longer started by its schedule.
+   The last minute with a line before the gap is when the scaler last completed a run. To tell
+   the schedule's runs from yours, ask for no run and write no session for five minutes, then
+   read the list again:
+
+   | The minutes in which nobody asked for a run | What it is |
+   | --- | --- |
+   | A line for each | The schedule starts the scaler and its runs complete: the fault is over. Go to Verify |
+   | No line, while the run of step 1 completed | The scaler works when it is asked and its schedule no longer starts it. The alarm fires again five minutes after the last run someone asked for |
+   | No line, and the run of step 1 failed | The scaler runs and fails, or is not started at all: step 3 |
 
 3. **Why it fails.** The scaler's log group holds what each run logged. Its name is the one the
    failed command of step 1 printed, and `LOG_GROUP_NAME` in `src/rhi/pools/scaler.py` fixes it.
@@ -145,7 +165,7 @@ and this runbook does not apply.
 
    | The pool's session | Its group | What to do |
    | --- | --- | --- |
-   | `none`, or `booked` and not started | A capacity above zero, or an instance listed | Empty the group by hand (Act, step 2): it is billed and serves nobody |
+   | `none`, or `booked` and not started | A capacity above zero, or an instance listed | Empty the group by hand (Act, step 2). With an instance, it is billed and serves nobody. With a capacity above zero and no instance yet, it still waits for capacity, and the instance AWS gives it will be |
    | `none`, or `booked` and not started | Zero, and no instance | Nothing |
    | `active` | The session's number | Nothing now: it serves. Its end will not release it while the scaler does not run (Act, step 3) |
    | `active` | Fewer than the session's number | The class runs on what is in service, or on the students' own subscriptions when nothing is: the runbook [a session short of capacity](capacity-failure.md), Act, steps 5 and 6 |
@@ -162,8 +182,10 @@ and this runbook does not apply.
    on. The repair itself is the runbook the cause pointed to, and it can take long: steps 2 and 3
    stop the money first.
 
-2. **Empty by hand the group of a pool that has no active session.** Do it in this order, for each
-   such pool that Check, step 5, found with instances.
+2. **Empty by hand the group of a pool that has no active session.** Do it for each such pool
+   whose group Check, step 5, found with a capacity above zero or with an instance. A group that
+   still waits for its first instance is one of them: it lists no instance, costs nothing yet, and
+   goes on asking AWS until its capacity is set to zero. In this order.
 
    First make sure nothing asks for the pool, so that the scaler does not raise it again at its
    first run. The command writes the stop, then asks the scaler for a run: while the scaler
@@ -174,34 +196,38 @@ and this runbook does not apply.
    rhi_admin session stop --pool coursework
    ```
 
-   Then lift the scale-in protection of the group's instances, every one that Check, step 5,
-   listed as protected. While an instance is protected, the group does not terminate it, whatever
-   capacity it is asked for:
+   Then lift the scale-in protection of the group's instances in service: every one that Check,
+   step 5, listed as `InService` and protected. While an instance in service is protected, the
+   group does not terminate it, whatever capacity it is asked for. A group with no instance in
+   service has none to lift: go on to its capacity.
 
    ```sh
    aws autoscaling set-instance-protection --auto-scaling-group-name <group> \
        --instance-ids <instance> <instance> --no-protected-from-scale-in
    ```
 
-   Then set the group's desired capacity to zero:
+   Then set the group's desired capacity to zero, whether or not it has an instance:
 
    ```sh
    aws autoscaling set-desired-capacity --auto-scaling-group-name <group> --desired-capacity 0
    ```
 
-   The group stops asking AWS for what had not arrived, and takes its instances out of service.
-   Each one drains: the load balancer sends it nothing more, a request it still runs has the
-   pool's `drain_seconds` (300 by default) to finish, and the instance is gone within about eleven
-   minutes (section 5.1).
+   This is what stops the group asking AWS for the instances that had not arrived. It also takes
+   out of service those whose protection is lifted. Each one drains: the load balancer sends it
+   nothing more, a request it still runs has the pool's `drain_seconds` (300 by default) to finish,
+   and the instance is gone within about eleven minutes (section 5.1).
 
-   An instance that was still starting had no protection to lift. If the group keeps it, it enters
-   service protected: read the group's instances again a few minutes later (Check, step 5), and
-   lift the protection of any instance still listed. The capacity is already zero, so the group
-   then takes it out.
+   An instance that was still starting, or that AWS launched between your reading of the group
+   and the change of its capacity, is not in service yet: its protection starts when it enters
+   service, and there was none to lift. If the group keeps it, it enters service protected. So
+   read the group's instances again a few minutes later (Check, step 5), and lift the protection
+   of any instance then listed as `InService`. The capacity is already zero, so the group then
+   takes it out.
 
 3. **A pool whose session is active.** It serves, and nothing needs doing until the class is over.
    Then stop the session, which the gateway applies within seconds, and empty the pool's group by
-   hand as in step 2. Do not empty the group of a session the class is using.
+   hand as in step 2, also when some of its instances never arrived: its capacity is what still
+   asks for them. Do not empty the group of a session the class is using.
 
    A session cannot be booked or raised while the scaler does not run: the record is written and
    no instance is asked for. If a class is about to start on a pool that is empty, students work
@@ -219,14 +245,28 @@ and this runbook does not apply.
    rhi_admin pool run
    ```
 
-2. **The scaler runs by itself again.** The alarm reads `OK`, a minute or two after the first
-   completed run, and the list of completed runs has a line for each minute since (Check, step 2).
-   Nothing is sent when the alarm clears.
+2. **The scaler runs by itself again.** The run of step 1 does not show it, and neither does the
+   alarm: one completed run, yours included, turns the alarm to `OK` for five minutes (Check,
+   step 2). Ask for no run and write no session for five minutes, then read the completed runs.
+   The list has a line for each of those minutes:
+
+   ```sh
+   aws cloudwatch get-metric-statistics --namespace rhi/scaler --metric-name RunCompleted \
+       --statistics Sum --period 60 \
+       --start-time "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+       --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       --query 'sort_by(Datapoints, &Timestamp)[].[Timestamp,Sum]' --output text
+   ```
+
+   The alarm then reads `OK` and stays so. Nothing is sent when it clears.
 
    ```sh
    aws cloudwatch describe-alarms-for-metric --namespace rhi/scaler --metric-name RunCompleted \
        --query 'MetricAlarms[].[StateValue,StateUpdatedTimestamp]' --output text
    ```
+
+   A list with a gap in those minutes is a scaler that still does not run by itself, whatever the
+   alarm reads now: go back to Check, step 2.
 
 3. **Every pool is what its session asks for.** `requested` and `asked` read the session's
    instances for a pool whose session is active, and zero for every other; they follow a command
@@ -240,13 +280,17 @@ and this runbook does not apply.
    Act, step 2, stays at zero because its session was stopped, and a pool booked meanwhile gets its
    instances asked for now.
 
-4. **A group emptied by hand lists no instance,** about eleven minutes after its capacity was set
-   to zero. The command prints nothing:
+4. **A group emptied by hand asks for nothing and lists no instance,** about eleven minutes after
+   its capacity was set to zero. The command prints the capacity the group is asked for and the
+   number of its instances, zero and zero:
 
    ```sh
    aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <group> \
-       --query 'AutoScalingGroups[].Instances[].[InstanceId,LifecycleState]' --output text
+       --query 'AutoScalingGroups[].[DesiredCapacity,length(Instances)]' --output text
    ```
+
+   A pool booked again since then reads its session's number instead, which is the scaler's doing
+   (step 3).
 
 5. **No pool's launches are suspended,** as before the fault:
 

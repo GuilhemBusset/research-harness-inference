@@ -53,6 +53,7 @@ A name or an ID the account gives is a placeholder below, never the name itself:
 | `<image-parameter>` | The SSM parameter that holds the pool's machine image | `image_parameter` in `src/rhi/pools/image.py`, with the pool's name |
 | `<release-parameter>` | The SSM parameter that holds the pool's release | `release_parameter` in `src/rhi/pools/group.py`, with the pool's name |
 | `<build>` | The ID of a CodeBuild build | The command that started it, or step 2 of Verify |
+| `<heartbeats-table>` | The stage's heartbeats table | Step 3 of Verify prints it |
 | `<log-group>`, `<log-stream>` | Where a build's log is | The command below that reads a build |
 
 `coursework` stands for the pool you upgrade. The pipeline's name:
@@ -323,33 +324,40 @@ release, the larger pools included, and the verification reads it on the coursew
 
 ## Verify
 
-1. **Every action of the execution succeeded.** Read the actions of `<execution>`, the latest
-   attempt first:
+1. **Every action of the execution succeeded, at its latest attempt.** Read the actions of
+   `<execution>`, one line for each attempt, in the order they started, which is the last column:
 
    ```sh
    aws codepipeline list-action-executions --pipeline-name <pipeline> \
        --filter pipelineExecutionId=<execution> \
-       --query 'actionExecutionDetails[].[stageName,actionName,status,startTime]' --output text
+       --query 'actionExecutionDetails[].[stageName,actionName,status,startTime]' --output text | sort -k4
    ```
 
-   Every action reads `Succeeded`, `Verify` included. `Hold` reads `InProgress` for as long as a
-   session is active: the deployment waits for its end. A failed action is the runbook
-   [a bad deployment](bad-deployment.md); for a machine image, its Act, step 2 promotes the image of
-   Check, step 3 back.
+   The list holds every attempt, not every action: an action that failed and was retried, with
+   its stage, has one line for each attempt under the same execution. Only the latest attempt of
+   an action counts, the last line that names it. An earlier `Failed` line of an action whose last
+   line reads `Succeeded` is the attempt the retry replaced, not a failure of the execution.
+
+   The last line of every action reads `Succeeded`, `Verify` included. `Hold` reads `InProgress`
+   for as long as a session is active: the deployment waits for its end. An action whose last
+   line reads `Failed` is the runbook [a bad deployment](bad-deployment.md); for a machine image,
+   its Act, step 2 promotes the image of Check, step 3 back.
 
 2. **For the engine: the verification booked an instance of the coursework pool, and the release
    assertion passed on it.** A Verify that succeeded does not say it: Verify also succeeds when it
    ran no GPU test, and the commit's `verify/<stage>` status can describe another execution of the
-   same commit. Read the log of this execution's Verify. The ID of its build, `<build>`:
+   same commit. Read the log of this execution's Verify, at its latest attempt: when Verify was
+   retried, each attempt has a build of its own, and an earlier one is not the build that passed.
+   The ID of the build of the attempt that started last, `<build>`, between quotes:
 
    ```sh
    aws codepipeline list-action-executions --pipeline-name <pipeline> \
-       --filter pipelineExecutionId=<execution> \
-       --query "actionExecutionDetails[?actionName=='Verify'].output.executionResult.externalExecutionId" --output text
+       --filter pipelineExecutionId=<execution> --output json \
+       --query "sort_by(actionExecutionDetails[?actionName=='Verify'], &startTime)[-1].output.executionResult.externalExecutionId"
    ```
 
-   then its log, with the two commands of the introduction. A release that is verified reads, in
-   this order:
+   It prints one ID. Then read that build's log, with the two commands of the introduction. A
+   release that is verified reads, in this order:
 
    - `gpu-verification: the release of the pool coursework changed:` and the keys that differ,
      `engine_image` among them, one such line for each pool served by vLLM; then
@@ -388,9 +396,17 @@ release, the larger pools included, and the verification reads it on the coursew
      that deployed the change (Act, "The engine", step 3);
    - `verify: no test was run:` followed by `listener-off` or `canary-missing`: no test ran at all,
      and step 3 applies to every affected pool;
-   - `verify: the pool coursework did not read ready in 45 minutes: the tests run`, or a summary
-     with a test `failed` or `error`: an instance was launched and did not serve, or did not serve
-     the release. The verification failed, and the runbook [a bad deployment](bad-deployment.md)
+   - `verify: the pool coursework did not read ready in 45 minutes: the tests run`, in place of
+     the line that reads ready. This line is not a result. The wait ended before the pool read
+     `ready`, and the verification could not say that no instance was launched: one was, or the
+     heartbeats table could not tell, as when it was not read, which a line above then says. The
+     tests run all the same, and
+     the summary that follows decides. With tests `passed` and none `failed` or `error`, the
+     instance came into service as the wait ended and served the release: the release is
+     verified, as above. With a test `failed` or `error`, it is the next case;
+   - a summary of the run on the coursework pool with a test `failed` or `error`: an instance was
+     launched and did not serve, or did not serve the release. The verification failed, the
+     action Verify reads `Failed` in step 1, and the runbook [a bad deployment](bad-deployment.md)
      applies.
 
 3. **Every affected pool whose release the smoke tests did not read.** The affected pools are the
@@ -398,13 +414,46 @@ release, the larger pools included, and the verification reads it on the coursew
    smoke tests read only the coursework pool, and only when step 2 found its summary. Each other
    affected pool is checked here, at its next session, when its first instance launches on the new
    release: a pool other than coursework, and the coursework pool itself when step 2 ended
-   otherwise. Write down which pools these are. In Grafana, on the dashboard "Deployments and
-   releases", the panel "Release each instance serves: image digest and model revision" shows its
-   instances' image digest and model revision; they equal what the pool's release parameter holds:
+   otherwise. Write down which pools these are.
+
+   What the pool's instances must serve is what its release parameter holds: the digest that ends
+   its `engine_image`, after the `@`, and its `model_revision`. The command prints the two, one
+   on each line:
 
    ```sh
-   aws ssm get-parameter --name <release-parameter> --query Parameter.Value --output text
+   aws ssm get-parameter --name <release-parameter> --query Parameter.Value --output text | jq -r '.engine_image, .model_revision'
    ```
+
+   What they serve is what each instance writes about itself in its row of the heartbeats table,
+   which is where the smoke test `release-heartbeat` reads it. The table's name,
+   `<heartbeats-table>`:
+
+   ```sh
+   aws cloudformation describe-stacks --stack-name Rhi-Pools \
+       --query "Stacks[0].Outputs[?OutputKey=='HeartbeatsTable'].OutputValue" --output text
+   ```
+
+   and, once the pool's session has an instance in service, the rows of the pool's instances,
+   with `coursework` or the pool's name in its place: for each, the stage it reached, the image
+   digest and the model revision it serves, and when it wrote the row, in seconds:
+
+   ```sh
+   aws dynamodb query --table-name <heartbeats-table> --consistent-read \
+       --key-condition-expression '#pool = :pool AND begins_with(#source, :instance)' \
+       --expression-attribute-names '{"#pool": "pool", "#source": "source"}' \
+       --expression-attribute-values '{":pool": {"S": "coursework"}, ":instance": {"S": "instance#"}}' \
+       --query 'Items[].[stage.S,image_digest.S,model_revision.S,written_at.N]' --output text
+   ```
+
+   An instance in service writes its row every 5 seconds, with the stage `serving`. Read the rows
+   written in the last minute, `date -u +%s` being now in the same seconds: an older row is that
+   of an instance that has left. The pool is verified when it has such a row and every such row
+   carries the digest and the revision of the parameter. The command prints nothing while the pool
+   has no instance, and a row with another stage is an instance still starting: read again once
+   `rhi_admin session status` counts it in service.
+
+   In Grafana, the dashboard "Deployments and releases" shows the same over time, in its panel
+   "Release each instance serves: image digest and model revision".
 
    A pool whose first instance on the new release serves anything else is a bad deployment (runbook
    [a bad deployment](bad-deployment.md)). Until each such pool has had a session, its release is
