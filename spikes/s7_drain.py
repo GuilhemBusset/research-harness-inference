@@ -45,22 +45,26 @@ session, and nothing else: the scaler alone moves the instances. The steps, in o
    replaces that task. Then one `stream` line, `gateway_deployment`.
 2. **The departures** (`Run.departures`). It waits until the scaler's note asks for two instances
    and reads two in service, as does its in-service gauge (`instances`, the two that write). It
-   lowers its session to one, and watches the instance that leaves; once that departure is whole,
-   or its wait ran out, it stops its session and watches the last one leave. Each reading is kept
-   apart and read again at every poll, so that a gap in the workspace loses nothing it shows later:
+   lowers its session to one, and watches the instance that leaves; once that departure is whole
+   and the note reads the instance out of the group (`Watch.left`), or its wait ran out, it stops
+   its session and watches the last one leave. Each reading is kept apart and read again at every
+   poll, so that a gap in the workspace loses nothing it shows later:
    - `scale_in_asked`: each note that asks for fewer than the last (a decision), with its
      `written_at`, when it was read and how many fewer;
    - `out_of_service`: when the job first reads the scaler's in-service gauge, as fresh as the
-     note, below what it read before; each instance fewer is one owed to the decisions, in order;
+     note, below what it read before; each instance fewer is one owed to the decisions, in order,
+     and each decision given one has its line: a reading that shows the drops of two decisions
+     gives two lines, with the same times;
    - `gone`: when the job first reads an instance silent for `QUIET_SECONDS` that was writing as
      the watch began or since. Its node's collector writes the series `up` of each of its scrape
      targets every `SCRAPE_SECONDS` until the instance shuts down. Each stop is one departure; the
      departures, in the order their instances stopped, are given to the decisions in order. A
      decision takes no instance that stopped before its note was written (`Decision.may_take`):
      the line of such a stop names no decision;
-   - `gone_withdrawn`: a stop that a later read contradicts, a write within `QUIET_SECONDS` after it
-     that the workspace showed late: the instance never stopped, and the departures are given to
-     the decisions again;
+   - `gone_withdrawn`: a stop that a later read contradicts, with a write after it, which the
+     workspace showed late or which followed a time it shows no write for: an instance that left
+     never writes again, so this one never stopped, and the departures are given to the decisions
+     again;
    - `scale_in`: each departure whole, the instance with its three times, when the scaler asked
      for fewer, when it was read out of service and when it was gone. The summaries are written
      as the step ends, once for each departure read and not withdrawn, with what was read: a line
@@ -71,16 +75,19 @@ session, and nothing else: the scaler alone moves the instances. The steps, in o
    the session is lowered only once the stream is held open at the gateway. It holds the body
    open while it watches the pool. The gateway reads a body whole before it counts the request or
    forwards it, so the held stream keeps no instance busy. Its last byte is sent when the job
-   reads, after its own lowering, the scaler's note that asks for fewer, at once, without waiting
-   for the next byte of padding, and at no other moment: the gateway
+   reads, after its own lowering, the scaler's note that asks for fewer, for the one instance the
+   job lowered to, which is the scaler acting on the lowering; at once, without waiting for the
+   next byte of padding, and at no other moment: the gateway
    forwards the request to the pool while the group takes the departing instance out of service
    and before that instance stops, the window in which a request may meet a deregistering target
    (section 5.1), and the job reads the answer to its end, for at most `ANSWER_SECONDS`. Whether
    it finished, ended with an error event or was cut is what its `stream` line, `release`,
    records, with its times, among them `body_sent_at`, when it was forwarded, and the decision's
    number: the departures' lines hold theirs, so a reader places one against the other. When the
-   wait for that note runs out, the last byte is never sent: the line then has no `body_sent_at`
-   and ends `body_unsent`.
+   wait for that note runs out, or the first note that asks for fewer asks for another number,
+   the session having ended or been changed before the scaler acted on the lowering, the last
+   byte is never sent: the line then has no `body_sent_at` and no decision, and ends
+   `body_unsent`.
 4. **The starting instance** (`Run.starting_instance`), in a cycle of its own. It waits until the
    note reads the pool at zero, books two instances again, for what is left of its minutes, and
    polls the note: at the first one that reads one instance in service and one starting it lowers
@@ -97,14 +104,23 @@ session, and nothing else: the scaler alone moves the instances. The steps, in o
      the one in service left, the other is starting still. A note that reads one in service and
      none starting does not tell: the starting one left, or it entered service and the other left
      between two notes a minute apart, and a note counts instances without naming them;
-   - by the collectors (`left_by_collectors`), when a single instance had written as the note read
-     the state: it is the one in service, since an instance writes before it enters service. The
-     instance that stopped is that one, or the other; and when none stopped, though a stop had
-     the time to be read, and no other instance ever wrote, the starting one left before its
-     collector wrote.
+   - by the launches (`left_by_launches`), from what each instance's lifecycle agent says of its
+     own launch in the workspace (`Pool.launches`): that it started, and that its hook is
+     completed, before which no instance is in service. An instance whose agent was read, at the
+     lowering or after it, with its launch started and its hook not completed was the starting
+     one as the job lowered (`Starting.still_starting`); the other, the note having read one of
+     each, was the one in service. The instance that stopped is that one, or the other; and when
+     none stopped, though a stop had the time to be read, and the starting one alone ever wrote,
+     the one in service left before its collector wrote. When a collector first wrote tells
+     nothing: it starts apart from the agent, and either instance's may be the first.
    Where neither tells, `left` is null, `role_not_told`, and the line still names the instance that
-   left and its times; where both tell and differ, it is null, `readings_disagree`. The line holds
-   what each told. The session of this cycle is stopped as the job ends.
+   left and its times: so when the starting one's collector had not written, or its hook was
+   completed before the lowering, the instance not yet in service. Where both tell and differ, it
+   is null, `readings_disagree`. The line holds what each told, the instances read still
+   starting (`starting_when_lowered`), and when the hook of the instance that stopped was first
+   read completed (`hook_completed_at`), null when it never was: an instance that was starting
+   as the job lowered may have completed it before it left. The session of this cycle is stopped
+   as the job ends.
 
 **A stream's line** (`Read`): when the request was sent, its first part, and when its body was sent
 whole; when its first event and its last arrived, and the events it received. The gateway may write
@@ -182,6 +198,8 @@ from rhi import config
 from rhi_common.causes import Cause
 from rhi_common.records import NOTE_RECORD, ScalerNote, Session
 from rhi_gateway.sse import SseReader
+from rhi_lifecycle.stages import METRIC as STAGE_SECONDS
+from rhi_lifecycle.stages import Stage
 from rhi_scaler.metrics import INSTANCES_IN_SERVICE
 
 if TYPE_CHECKING:
@@ -394,16 +412,31 @@ class Pool:
             return None
         return found[-1][0], round(found[-1][1])
 
-    def writes(self, start: float, end: float) -> dict[str, set[float]]:
-        """Each instance of the pool that wrote from `start` to `end`, with the times of the writes
-        read in that time: at each step, the time of the collector's last write."""
-        query = f'max by (instance) (timestamp(up{{pool="{self.name}"}}))'
+    def _times(self, query: str, start: float, end: float) -> dict[str, set[float]]:
+        """For each instance, the times of the samples `query`, a `timestamp()` by instance, gives
+        from `start` to `end`: at each step, the time of the last sample."""
         found: dict[str, set[float]] = {}
         for one in self.workspace.read_series(query, start=start, end=end, step=STEP_SECONDS):
             instance = one.labels.get("instance")
             if instance and one.samples:
                 found.setdefault(instance, set()).update(one.values())
         return found
+
+    def writes(self, start: float, end: float) -> dict[str, set[float]]:
+        """Each instance of the pool that wrote from `start` to `end`, with the times of the writes
+        read in that time: at each step, the time of the collector's last write."""
+        return self._times(f'max by (instance) (timestamp(up{{pool="{self.name}"}}))', start, end)
+
+    def launches(self, start: float, end: float) -> tuple[dict[str, set[float]], dict[str, set[float]]]:
+        """What each instance's lifecycle agent said of its launch from `start` to `end`
+        (`rhi_lifecycle.stages`): the times of the scrapes that read the launch started, its
+        stage `boot` ended, and of those that read its hook completed, its stage `hook` ended."""
+
+        def stage(name: Stage) -> dict[str, set[float]]:
+            selector = f'{STAGE_SECONDS}{{pool="{self.name}",stage="{name.value}"}}'
+            return self._times(f"max by (instance) (timestamp({selector}))", start, end)
+
+        return stage(Stage.BOOT), stage(Stage.HOOK)
 
 
 
@@ -507,17 +540,13 @@ class Decision:
         return len(self.departures) < self.fewer and departure.last_write >= self.asked_at - 2 * SCRAPE_SECONDS
 
 
-def stops(writes: set[float], *, since: float, now: float) -> list[float]:
-    """The times an instance stopped, from the times of its writes read so far: a write followed by
-    none for `QUIET_SECONDS`, and that is not older than `since`. A later read that shows a write
-    within `QUIET_SECONDS` after it, a batch the workspace showed late, withdraws it."""
-    ordered = sorted(writes)
-    following = [*ordered[1:], math.inf]
-    return [
-        write
-        for write, after in zip(ordered, following, strict=True)
-        if write >= since and after - write > QUIET_SECONDS and now - write >= QUIET_SECONDS
-    ]
+def stopped_at(writes: set[float], *, since: float, now: float) -> float | None:
+    """When an instance stopped, from the times of its writes read so far: its last write, when
+    that is `QUIET_SECONDS` old and not older than `since`. An instance that left never writes
+    again, so a write after it, whenever a later read shows one, withdraws the stop: a time with
+    no write of an instance that goes on writing, however long, is no departure."""
+    last = max(writes)
+    return last if last >= since and now - last >= QUIET_SECONDS else None
 
 
 @dataclass
@@ -559,11 +588,27 @@ class Watch:
                 owing.departures.append(departure)
         return left
 
+    def left(self, decision: Decision) -> bool:
+        """Whether the instances `decision` asked fewer have left for good: each was read out of
+        service and gone, and the scaler's note, written since the last of them stopped, reads no
+        more instances in the group, draining ones included, than the decision asked for. While
+        the note still counts an instance more, a collector that seems to have stopped is not
+        taken for the departure: a later read may withdraw it."""
+        note = self.note
+        return (
+            decision.whole
+            and note is not None
+            and note.written_at >= max(one.last_write for one in decision.departures)
+            and note.starting + note.in_service + note.draining <= decision.asked
+        )
+
     def waiting_for(self) -> str:
         if any(len(one.departures) < one.fewer for one in self.decisions):
             return "gone"
         if any(len(one.drops) < one.fewer for one in self.decisions):
             return "out_of_service"
+        if not all(self.left(one) for one in self.decisions):
+            return "out_of_the_group"
         return "scale_in_asked"
 
 
@@ -616,32 +661,36 @@ def left_by_notes(after: Sequence[ScalerNote]) -> tuple[Left | None, Untold | No
     return None, Untold.NOTHING_LEFT
 
 
-def left_by_collectors(written: Iterable[str], later: Iterable[str], stopped: Sequence[str], *, waited: bool) -> Left | None:
-    """Which of the two left, from the collectors: `written` are the instances that had written
-    when the note read one in service and one starting, `later` those that first wrote after it,
-    `stopped` those whose collector stopped since. Told only when one instance alone had written
-    by that note: it is the one in service, since an instance writes before it enters service.
-    When one instance alone stopped, it is that one, or the other. When none stopped, no other
-    ever wrote and `waited`, a note read one of the two out of the group long enough ago for a
-    collector that stopped to be read so, the one in service is there still: the starting one
-    left before its collector wrote. Two instances that had both written by that note are not
-    told apart: the collectors do not say which was in service."""
-    written, later = set(written), set(later)
-    if len(written) != 1:
+def left_by_launches(
+    starting: Iterable[str], written: Iterable[str], stopped: Sequence[str], *, waited: bool
+) -> Left | None:
+    """Which of the two left, from what the instances' lifecycle agents said of their launches:
+    `starting` are the instances read still starting once the job had lowered
+    (`Starting.still_starting`), `written` those whose collector wrote in the cycle, `stopped`
+    those whose collector stopped since the state was read. Told only when one instance alone was
+    read still starting: the note read one in service and one starting, so the other is the one
+    in service. When that instance alone stopped, the starting one left. When another alone
+    stopped, the one in service left. So it did when none stopped, no other instance ever wrote
+    and `waited`, a note read one of the two out of the group long enough ago for a collector
+    that stopped to be read so: the starting one writes still, and the one in service left
+    before its collector wrote. An instance's role is never told by when its collector first
+    wrote: the collector and the agent start apart, and either instance's may be the first."""
+    starting = set(starting)
+    if len(starting) != 1 or len(stopped) > 1:
         return None
-    if len(stopped) == 1:
-        return Left.IN_SERVICE if stopped[0] in written else Left.STARTING
-    return Left.STARTING if not stopped and not later and waited else None
+    if stopped:
+        return Left.STARTING if stopped[0] in starting else Left.IN_SERVICE
+    return Left.IN_SERVICE if waited and set(written) == starting else None
 
 
-def which_left(by_notes: tuple[Left | None, Untold | None], by_collectors: Left | None) -> tuple[Left | None, Untold | None]:
+def which_left(by_notes: tuple[Left | None, Untold | None], by_launches: Left | None) -> tuple[Left | None, Untold | None]:
     """Which of the two left, and why it is not told when it is not: what the notes tell, or the
-    collectors where the notes do not, and neither when both tell and differ."""
+    launches where the notes do not, and neither when both tell and differ."""
     told, why = by_notes
-    if told is not None and by_collectors is not None and told is not by_collectors:
+    if told is not None and by_launches is not None and told is not by_launches:
         return None, Untold.READINGS_DISAGREE
-    if told is None and by_collectors is not None:
-        return by_collectors, None
+    if told is None and by_launches is not None:
+        return by_launches, None
     return told, why
 
 
@@ -649,8 +698,9 @@ def which_left(by_notes: tuple[Left | None, Untold | None], by_collectors: Left 
 class Starting:
     """What the cycle of the starting instance read: when the job booked; the note that read one
     instance in service and one starting, when the job read it and when it lowered its session;
-    the notes written after that one, each with when it was read; and the times of each instance's
-    writes read since the booking (by AWS identifier, never written)."""
+    the notes written after that one, each with when it was read; and, for each instance (by AWS
+    identifier, never written), the times read since the booking of its collector's writes, of
+    the scrapes that read its launch started and of those that read its hook completed."""
 
     booked_at: float | None = None
     state: ScalerNote | None = None
@@ -658,6 +708,8 @@ class Starting:
     lowered_at: float | None = None
     after: list[tuple[ScalerNote, float]] = field(default_factory=list)
     writes: dict[str, set[float]] = field(default_factory=dict)
+    launching: dict[str, set[float]] = field(default_factory=dict)
+    launched: dict[str, set[float]] = field(default_factory=dict)
 
     def see(self, note: ScalerNote, read_at: float) -> None:
         """Keeps a note written after the last one kept, once the state was read."""
@@ -678,11 +730,23 @@ class Starting:
         write, in the order they stopped."""
         if self.state is None:
             return []
-        return sorted(
-            (stop, instance)
-            for instance, times in self.writes.items()
-            for stop in stops(times, since=self.state.written_at, now=now)
-        )
+        since = self.state.written_at
+        last = {instance: stopped_at(times, since=since, now=now) for instance, times in self.writes.items()}
+        return sorted((stop, instance) for instance, stop in last.items() if stop is not None)
+
+    def still_starting(self) -> set[str]:
+        """The instances read still starting once the job had lowered: a scrape of its lifecycle
+        agent, at the time of the lowering or after it, read its launch started, and none up to
+        that scrape had read its hook completed. An instance is in service only once its launch's
+        hook is completed (`rhi_lifecycle.stages`), so such an instance was the starting one as
+        the job lowered, whatever its collector and the other instance's wrote, and when."""
+        if self.lowered_at is None:
+            return set()
+        return {
+            instance
+            for instance, scrapes in self.launching.items()
+            if any(self.lowered_at <= at < min(self.launched.get(instance, (math.inf,))) for at in scrapes)
+        }
 
     def _waited(self, now: float) -> bool:
         """Whether a note read one of the two out of the group long enough ago for its collector,
@@ -697,19 +761,22 @@ class Starting:
 
     def fields(self, names: Names, why: Untold | None, now: float) -> dict[str, object]:
         """The line: which of the two left, or `why` it was not looked for, and when."""
-        written = set() if self.state is None else {one for one, times in self.writes.items() if min(times) <= self.state.written_at}
+        starting = self.still_starting()
         stopped = self.stopped(now)
         out, gone = self._first(drained=False), self._first(drained=True)
         by_notes = left_by_notes([note for note, _ in self.after])
-        by_collectors = left_by_collectors(
-            written, set(self.writes) - written, [instance for _, instance in stopped], waited=self._waited(now)
+        by_launches = left_by_launches(
+            starting, self.writes, [instance for _, instance in stopped], waited=self._waited(now)
         )
-        left, reason = (None, why) if why is not None else which_left(by_notes, by_collectors)
+        left, reason = (None, why) if why is not None else which_left(by_notes, by_launches)
+        # When the hook of the instance that stopped was first read completed, if it ever was: an
+        # instance that was starting as the job lowered may have completed it before it left.
+        completed = self.launched.get(stopped[0][1]) if stopped else None
         return {
             "left": None if left is None else left.value,
             "reason": None if reason is None else reason.value,
             "left_by_notes": None if by_notes[0] is None else by_notes[0].value,
-            "left_by_collectors": None if by_collectors is None else by_collectors.value,
+            "left_by_launches": None if by_launches is None else by_launches.value,
             "state_written_at": None if self.state is None else utc(self.state.written_at),
             "state_read_at": utc(self.state_read_at),
             "lowered_at": utc(self.lowered_at),
@@ -718,9 +785,10 @@ class Starting:
             "in_service_after": None if out is None else out[0].in_service,
             "starting_after": None if out is None else out[0].starting,
             "gone_written_at": None if gone is None else utc(gone[0].written_at),
-            "written_at_state": names.ordered(written),
+            "starting_when_lowered": names.ordered(starting),
             "instance": names(stopped[0][1]) if stopped else None,
             "last_write_at": utc(stopped[0][0]) if stopped else None,
+            "hook_completed_at": utc(min(completed)) if completed else None,
         }
 
 
@@ -1004,6 +1072,9 @@ class Run:
     async def writes(self, start: float, end: float) -> dict[str, set[float]] | None:
         return await self.read("workspace", lambda: self.pool.writes(start, end))
 
+    async def launches(self, start: float, end: float) -> tuple[dict[str, set[float]], dict[str, set[float]]] | None:
+        return await self.read("workspace", lambda: self.pool.launches(start, end))
+
     def name_new(self, writes: Mapping[str, set[float]]) -> None:
         """Names each instance not named yet, in the order of its first write read: an instance is
         named as the job first reads it, and keeps its name for the run."""
@@ -1158,7 +1229,9 @@ class Run:
     async def _read_in_service(self, watch: Watch) -> None:
         """While a decision is owed an instance out of service, reads the scaler's in-service gauge,
         as fresh as the note: each instance fewer than the last reading is one decision's, in order,
-        with an `out_of_service` line."""
+        and each decision given one has its `out_of_service` line, with how many. One reading that
+        shows the drops of two decisions gives two lines, with the same times. An instance fewer
+        that no decision read so far is owed is kept for the next one, at a later reading."""
         if watch.note is None or not any(len(one.drops) < one.fewer for one in watch.decisions):
             return
         reading = await self.gauge(INSTANCES_IN_SERVICE, watch.note)
@@ -1166,29 +1239,31 @@ class Run:
         if reading is None:
             return
         reading_at, in_service = reading
-        if in_service < watch.in_service:
-            owed = [one for one in watch.decisions if len(one.drops) < one.fewer]
+        given: dict[int, int] = {}
+        fewer = max(0, watch.in_service - in_service)
+        for _ in range(fewer):
+            owing = next((one for one in watch.decisions if len(one.drops) < one.fewer), None)
+            if owing is None:
+                break
+            owing.drops.append((read_at, reading_at))
+            given[owing.number] = given.get(owing.number, 0) + 1
+        for number, instances in given.items():
             self.recorder.line(
                 "out_of_service",
-                decision=owed[0].number,
+                decision=number,
+                fewer=instances,
                 in_service=in_service,
                 reading_at=utc(reading_at),
                 read_at=utc(read_at),
             )
-            for _ in range(watch.in_service - in_service):
-                owing = next((one for one in watch.decisions if len(one.drops) < one.fewer), None)
-                if owing is None:
-                    break
-                owing.drops.append((read_at, reading_at))
-        watch.in_service = in_service
+        watch.in_service = in_service + fewer - sum(given.values())
 
     async def _read_writes(self, watch: Watch) -> None:
         """Reads every collector's writes since the watch began, kept with those read before, and
         names an instance new to the run. An instance that stopped since the watch began
-        (`stops`) has left, with a `gone` line. A stop that a later read contradicts, a write
-        within `QUIET_SECONDS` after it that the workspace showed late, is withdrawn, with a
-        `gone_withdrawn` line, and the departures are given to the decisions again
-        (`Watch.attribute`)."""
+        (`stopped_at`) has left, with a `gone` line. A stop that a later read contradicts, a
+        write after it that the workspace showed late, is withdrawn, with a `gone_withdrawn`
+        line, and the departures are given to the decisions again (`Watch.attribute`)."""
         now = self.clock.now()
         written = await self.writes(watch.since, now)
         read_at = self.clock.now()
@@ -1197,11 +1272,9 @@ class Run:
         self.name_new(written)
         for instance, times in written.items():
             watch.writes.setdefault(instance, set()).update(times)
-        stopped = {
-            (instance, write)
-            for instance, times in watch.writes.items()
-            for write in stops(times, since=watch.start - 2 * SCRAPE_SECONDS, now=now)
-        }
+        since = watch.start - 2 * SCRAPE_SECONDS
+        last = {instance: stopped_at(times, since=since, now=now) for instance, times in watch.writes.items()}
+        stopped = {(instance, write) for instance, write in last.items() if write is not None}
         for key in sorted(set(watch.departures) - stopped, key=lambda key: watch.departures[key].number):
             departure = watch.departures.pop(key)
             self.recorder.line(
@@ -1267,14 +1340,16 @@ class Run:
 
     async def _watched(self, watch: Watch, held: Held, whole: Callable[[], bool]) -> None:
         """Reads the pool into `watch` until `whole` says the departures waited for are; a `timeout`
-        line when `DEPARTURE_WAIT_SECONDS` pass first. The first decision read sends the last byte
-        of the stream across a release, at once (`slow_stream`), unless that stream was given
-        up."""
+        line when `DEPARTURE_WAIT_SECONDS` pass first. The first decision read, when its note asks
+        for the one instance the job lowered its session to, sends the last byte of the stream
+        across a release, at once (`slow_stream`), unless that stream was given up. A first
+        decision that asks for any other number is not the scaler acting on the lowering, the
+        session ended or was changed first: the stream is given up, its last byte unsent."""
         deadline = self.clock.now() + DEPARTURE_WAIT_SECONDS
         while self.clock.now() < deadline:
             await self._read_note(watch)
             if watch.decisions and not held.abandon.is_set():
-                held.release.set()
+                (held.release if watch.decisions[0].asked == LOWERED else held.abandon).set()
             await self._read_in_service(watch)
             await self._read_writes(watch)
             if held.task.done():
@@ -1288,10 +1363,12 @@ class Run:
         """Two instances in service; then the session lowered to one, and the departure of the
         instance that leaves; then the session stopped, and the departure of the last one. The
         stream across a release is opened before the lowering, its body held open, and its last
-        byte is sent when the job reads the first decision after the lowering (`_watched`). When
-        the wait for that decision runs out, or the session was not lowered, the stream is given
-        up before the session is stopped: a note that asks for fewer after the stop does not send
-        it. The session is stopped whatever was read."""
+        byte is sent when the job reads, as the first decision after the lowering, the note that
+        asks for one instance (`_watched`). When the wait for that decision runs out, the first
+        decision asks for another number or the session was not lowered, the stream is given up
+        before the session is stopped: a note that asks for fewer after the stop does not send
+        it. A departure is waited for until it is whole and the note reads the instance out of
+        the group (`Watch.left`). The session is stopped whatever was read."""
         if not await self.two_in_service():
             self.recorder.line("timeout", waiting_for="two_in_service")
             await self.stop()
@@ -1315,11 +1392,11 @@ class Run:
             lowered = await self.lower()
             watch = Watch(start=self.clock.now(), asked=INSTANCES, in_service=INSTANCES)
             if lowered:
-                await self._watched(watch, held, lambda: bool(watch.decisions) and watch.decisions[0].whole)
+                await self._watched(watch, held, lambda: bool(watch.decisions) and watch.left(watch.decisions[0]))
             held.abandon.set()
             await self.stop()
             await self._watched(
-                watch, held, lambda: watch.asked == 0 and all(one.whole for one in watch.decisions)
+                watch, held, lambda: watch.asked == 0 and all(watch.left(one) for one in watch.decisions)
             )
             self._scale_in_lines(watch)
         finally:
@@ -1331,20 +1408,27 @@ class Run:
     # The starting instance.
 
     async def _starting_writes(self, seen: Starting) -> None:
-        """Reads every collector's writes since the cycle's booking, kept with those read before,
-        and names an instance new to the run. The workspace repeats an instance's last write for
-        some minutes after it: a write from before the booking is not one of the cycle's."""
-        booked_at = seen.booked_at
-        if booked_at is None:
+        """Reads every collector's writes since the cycle's booking, and what the lifecycle agents
+        said of their launches, kept with what was read before, and names an instance new to the
+        run. The workspace repeats an instance's last sample for some minutes after it: one from
+        before the booking is not one of the cycle's."""
+        if seen.booked_at is None:
             return
-        written = await self.writes(booked_at, self.clock.now())
-        if written is None:
-            return
-        since = {instance: {time for time in times if time >= booked_at} for instance, times in written.items()}
-        self.name_new({instance: times for instance, times in since.items() if times})
-        for instance, times in since.items():
-            if times:
-                seen.writes.setdefault(instance, set()).update(times)
+        booked_at, now = seen.booked_at, self.clock.now()
+
+        def keep(read: Mapping[str, set[float]], kept: dict[str, set[float]]) -> None:
+            for instance, times in read.items():
+                if since := {time for time in times if time >= booked_at}:
+                    kept.setdefault(instance, set()).update(since)
+
+        written = await self.writes(booked_at, now)
+        if written is not None:
+            keep(written, seen.writes)
+            self.name_new(seen.writes)
+        launches = await self.launches(booked_at, now)
+        if launches is not None:
+            keep(launches[0], seen.launching)
+            keep(launches[1], seen.launched)
 
     async def _lowered_while_starting(self, seen: Starting) -> Untold | None:
         """From a pool at zero, books two instances, and lowers the session to one at the first

@@ -1,8 +1,9 @@
 """Spike S7's job (`spikes/s7_drain.py`): each step writes its lines, on stand-ins and a clock the
 test controls. The pool's session is an item of a table moto holds, so the conditions of
 `scripts/pipeline/booking.py` hold as DynamoDB holds them; a scripted scaler follows that session
-as the scaler does, once a minute, and answers for the note, its gauge and the instances'
-collectors; the gateway is a stub transport. No AWS, no network.
+as the scaler does, once a minute, and answers for the note, its gauge, the instances' collectors
+and what their lifecycle agents say of their launches; the gateway is a stub transport. No AWS,
+no network.
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ UTC_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
 # What an AWS error's text might hold: it must reach no line.
 AWS_TEXT = "an AWS message naming arn:aws:dynamodb:us-east-1:123456789012:table/pool-state"
 # For each instance the group launches, in order: the seconds after its launch at which its
-# collector first writes, None when it never does, and those after which it is in service.
+# collector first writes, None when it never does, and those after which it is in service; then,
+# when given, those after which its launch's hook is completed, ten seconds before it is in service
+# otherwise.
 PROMPT = (15.0, 70.0)
 
 
@@ -81,11 +84,14 @@ def session_of(stored: Any) -> Session | None:
 @dataclass
 class Machine:
     """One instance of the scripted pool, under an identifier of the shape AWS gives: when it is in
-    service, when its collector first writes, None if it never does, and when it is gone, once the
-    group released it. Its collector writes every 15 seconds until then."""
+    service, when its collector first writes, None if it never does, when its lifecycle agent
+    completed its launch's hook, and when it is gone, once the group released it. Its collector
+    writes every 15 seconds until then, and each write holds what the agent says of its launch:
+    that it started, and that its hook is completed once it is."""
 
     in_service_at: float
     first_write: float | None
+    hooked_at: float
     gone_at: float = math.inf
     name: str = field(default_factory=lambda: "i-" + secrets.token_hex(9)[:17])
 
@@ -109,7 +115,7 @@ class Scaler:
 
     clock: FakeClock
     stored: Any
-    launches: list[tuple[float | None, float]]
+    launches: list[tuple[float | None, ...]]
     leaves: s7.Left = s7.Left.STARTING
     follows_lowering: bool = True
     drain: float = 30.0
@@ -141,8 +147,10 @@ class Scaler:
             )
             # A run reads the pool as it was before it acted.
             for _ in range(asked - len(present)):
-                first, in_service = self.launches.pop(0)
-                self.machines.append(Machine(run + in_service, None if first is None else run + first))
+                first, in_service, *hooked = self.launches.pop(0)
+                assert in_service is not None
+                hooked_at = run + (hooked[0] if hooked and hooked[0] is not None else in_service - 10)
+                self.machines.append(Machine(run + in_service, None if first is None else run + first, hooked_at))
             ordered = starting + serving if self.leaves is s7.Left.STARTING else serving + starting
             for machine in ordered[: max(0, len(present) - asked)]:
                 machine.gone_at = run + self.drain
@@ -174,8 +182,10 @@ class Scaler:
         if query.startswith("max by (instance)"):
             series = []
             for machine in self.machines:
+                # The agent's series of the stage `hook` is in the writes from its completion on.
+                since = machine.hooked_at if 'stage="hook"' in query else -math.inf
                 last = [(at, machine.last_write(at)) for at in steps]
-                samples = tuple((at, write) for at, write in last if write is not None and at - write <= 300)
+                samples = tuple((at, write) for at, write in last if write is not None and since <= write >= at - 300)
                 series.append(common.Series({"instance": machine.name}, samples))
             return series
         assert s7.INSTANCES_IN_SERVICE in query
@@ -270,7 +280,7 @@ class Rig:
 
 def a_rig(
     stored: Any,
-    *launches: tuple[float | None, float],
+    *launches: tuple[float | None, ...],
     replies: list[Reply] | None = None,
     max_instances: int = 2,
     **scripted: Any,
@@ -339,9 +349,9 @@ def test_the_job_books_two_instances_before_its_steps_and_leaves_the_pool_with_n
     assert len(of(lines, "scale_in")) == 2
     # The cycle of the starting instance reads its own two instances, not those that left before.
     (starting,) = of(lines, "starting_instance")
-    assert (starting["left"], starting["written_at_state"], starting["instance"]) == (
+    assert (starting["left"], starting["starting_when_lowered"], starting["instance"]) == (
         "starting",
-        ["instance-3"],
+        ["instance-4"],
         "instance-4",
     )
     assert kinds[-2:] == ["run_ended", "session"]
@@ -664,23 +674,100 @@ def test_a_collector_batch_shown_late_withdraws_the_stop_it_seemed_to_be_and_giv
     ]
 
 
+def test_a_time_with_no_write_of_an_instance_that_goes_on_writing_is_no_departure(stored: Any) -> None:
+    # The workspace never shows two minutes of the writes of the instance that stays, from the
+    # scaler's decision on; the instance that leaves is held by the group for 200 seconds.
+    rig = a_rig(stored, PROMPT, (20.0, 70.0), drain=200.0)
+    read = rig.scaler.read_series
+
+    def holed(query: str, **window: float) -> list[common.Series]:
+        series = read(query, **window)
+        if not query.startswith("max by (instance)") or not any(note.capacity_asked == 1 for note in rig.scaler.notes):
+            return series
+        asked, staying = rig.scaler.asked_first(1), rig.scaler.machines[1].name
+        return [
+            common.Series(one.labels, tuple((at, write) for at, write in one.samples if not asked < write <= asked + 120))
+            if one.labels["instance"] == staying
+            else one
+            for one in series
+        ]
+
+    rig.scaler.read_series = holed
+    rig.booked(rig.run.departures)
+
+    lines = parsed(rig.out, *identifiers(rig))
+    leaving, staying = rig.scaler.machines
+    # The instance that stays seemed to have stopped, until its later writes were read.
+    (withdrawn,) = of(lines, "gone_withdrawn")
+    assert withdrawn["instance"] == rig.run.names(staying.name)
+    # Each step has the instance that left on it, and the session was not stopped on the seeming
+    # stop: the note still read an instance draining.
+    first, second = of(lines, "scale_in")
+    assert [(line["decision"], line["instance"], line["last_write_at"]) for line in (first, second)] == [
+        (1, rig.run.names(leaving.name), s7.utc(leaving.last_write())),
+        (2, rig.run.names(staying.name), s7.utc(staying.last_write())),
+    ]
+    (stopped,) = [line for line in of(lines, "session") if line["action"] == "stopped"]
+    assert withdrawn["at"] < first["gone_read_at"] <= stopped["at"] <= second["asked_at"]
+
+
+def test_a_reading_that_shows_the_drops_of_two_decisions_gives_each_its_line(stored: Any) -> None:
+    rig = a_rig(stored, PROMPT, PROMPT)
+    read = rig.scaler.read_series
+
+    def gapped(query: str, **window: float) -> list[common.Series]:
+        # The in-service gauge is not answered from the job's lowering until the pool reads none.
+        if s7.INSTANCES_IN_SERVICE in query and len(rig.scaler.written) >= 2 and rig.scaler.notes[-1].in_service > 0:
+            return []
+        return read(query, **window)
+
+    rig.scaler.read_series = gapped
+    rig.booked(rig.run.departures)
+
+    lines = parsed(rig.out)
+    assert [(line["decision"], line["capacity_asked"]) for line in of(lines, "scale_in_asked")] == [(1, 1), (2, 0)]
+    # One reading, none in service, is the drop of both decisions: a line for each, at the same times.
+    first, second = of(lines, "out_of_service")
+    assert [(line["decision"], line["fewer"], line["in_service"]) for line in (first, second)] == [(1, 1, 0), (2, 1, 0)]
+    assert (first["reading_at"], first["read_at"]) == (second["reading_at"], second["read_at"])
+    departures = of(lines, "scale_in")
+    assert [line["decision"] for line in departures] == [1, 2]
+    assert [line["out_of_service_read_at"] for line in departures] == [first["read_at"], second["read_at"]]
+
+
+def test_a_session_that_ends_before_the_scaler_acts_on_the_lowering_does_not_send_the_last_byte(stored: Any) -> None:
+    # The job's minutes end between the lowering and the scaler's next run: the note goes from two
+    # instances to none, and never asks for the one the job lowered to.
+    rig = a_rig(stored, PROMPT, PROMPT)
+    rig.run.run_minutes = 3
+    assert asyncio.run(rig.run.in_session())
+
+    lines = parsed(rig.out)
+    lowered = next(line for line in of(lines, "session") if line["action"] == "lowered")
+    (asked,) = of(lines, "scale_in_asked")
+    assert lowered["written"] and lowered["at"] < asked["written_at"]
+    assert (asked["capacity_asked"], asked["fewer"]) == (0, 2)
+    # The stream across a release was given up with its body unsent: the gateway read whole only
+    # the stream across the deployment.
+    release = next(line for line in of(lines, "stream") if line["stream"] == "release")
+    assert (release["decision"], release["body_sent_at"], release["ended"]) == (None, None, "body_unsent")
+    assert len(rig.gateway.received) == 1
+    # Both departures are recorded all the same, on the decision that asked for none.
+    assert [line["decision"] for line in of(lines, "scale_in")] == [1, 1]
+
+
 # The starting instance.
 
 
 @pytest.mark.parametrize(
-    ("left", "slow_collector"),
-    [("starting", None), ("starting", 200.0), ("in_service", None), ("in_service", 100.0)],
-    ids=[
-        "the_starting_one_that_never_wrote",
-        "the_starting_one",
-        "the_one_in_service",
-        "the_one_in_service_told_by_the_notes_alone",
-    ],
+    ("left", "slow_collector", "by_launches"),
+    [("starting", 200.0, True), ("in_service", 100.0, True), ("in_service", None, False)],
+    ids=["the_starting_one", "the_one_in_service", "the_one_in_service_told_by_the_notes_alone"],
 )
-def test_the_starting_instance(stored: Any, left: str, slow_collector: float | None) -> None:
-    # One instance is in service a minute after its launch; the other is still starting then, and
-    # its collector has not written, writes only after the note read the state, or has written.
-    # The group holds the instance it released for a hundred seconds more.
+def test_the_starting_instance(stored: Any, left: str, slow_collector: float | None, by_launches: bool) -> None:
+    # One instance is in service a minute after its launch; the other is still starting then, its
+    # hook not completed, and its collector writes only after the note read the state, has written
+    # by then, or never writes. The group holds the instance it released for a hundred seconds more.
     rig = a_rig(stored, PROMPT, (slow_collector, 400.0), leaves=s7.Left(left), drain=100.0)
     asyncio.run(rig.run.starting_instance())
 
@@ -704,48 +791,66 @@ def test_the_starting_instance(stored: Any, left: str, slow_collector: float | N
     assert line["lowered_at"] < line["left_written_at"] == s7.utc(after[0].written_at) <= line["left_read_at"]
     out_of_the_group = next(note for note in after if note.draining == 0)
     assert line["left_written_at"] < line["gone_written_at"] == s7.utc(out_of_the_group.written_at) <= line["at"]
-    # The notes tell it when the other is starting still; the collectors when the one in service
-    # alone had written as the state was read.
-    alone = slow_collector is None or slow_collector > 120
+    # The notes tell it when the other is starting still; the launches when the starting one's
+    # agent was read, once the job had lowered, with its hook not completed.
     assert line["left_by_notes"] == (left if left == "in_service" else None)
-    assert line["left_by_collectors"] == (left if alone else None)
-    assert line["written_at_state"] == (["instance-1"] if alone else ["instance-1", "instance-2"])
-    # The instance that left is named, with its collector's last write, when it ever wrote.
+    assert line["left_by_launches"] == (left if by_launches else None)
+    assert line["starting_when_lowered"] == (["instance-2"] if by_launches else [])
+    # The instance that left is named, with its collector's last write.
     serving, starting = rig.scaler.machines
     gone = starting if left == "starting" else serving
-    if gone.last_write() is None:
-        assert (line["instance"], line["last_write_at"]) == (None, None)
+    assert (line["instance"], line["last_write_at"]) == (rig.run.names(gone.name), s7.utc(gone.last_write()))
+    assert line["lowered_at"] < line["last_write_at"] < line["at"]
+    # The starting one left with its hook never completed; the one in service had completed its own.
+    if left == "starting":
+        assert line["hook_completed_at"] is None
     else:
-        assert (line["instance"], line["last_write_at"]) == (rig.run.names(gone.name), s7.utc(gone.last_write()))
-        assert line["lowered_at"] < line["last_write_at"] < line["at"]
+        assert s7.utc(gone.hooked_at) <= line["hook_completed_at"] < line["state_written_at"]
+
+
+def test_the_role_of_an_instance_is_not_told_by_which_collector_wrote_first(stored: Any) -> None:
+    # The collector of the instance in service starts late, and the instance leaves before it ever
+    # writes; the starting one's wrote from the first seconds, and it enters service meanwhile.
+    rig = a_rig(stored, (220.0, 65.0), (15.0, 195.0), leaves=s7.Left.IN_SERVICE)
+    asyncio.run(rig.run.starting_instance())
+
+    (line,) = of(parsed(rig.out, *identifiers(rig)), "starting_instance")
+    serving, starting = rig.scaler.machines
+    assert serving.last_write() is None and starting.gone_at == math.inf
+    # The notes do not tell: one in service and none starting. The instance that writes still was
+    # read with its hook not completed after the lowering: it was the starting one, so the one in
+    # service left, with no write to name it by.
+    assert (line["in_service_after"], line["starting_after"], line["left_by_notes"]) == (1, 0, None)
+    assert line["starting_when_lowered"] == [rig.run.names(starting.name)]
+    assert (line["left"], line["left_by_launches"], line["reason"]) == ("in_service", "in_service", None)
+    assert (line["instance"], line["last_write_at"]) == (None, None)
+    assert line["lowered_at"] < line["left_written_at"] <= line["gone_written_at"]
 
 
 @pytest.mark.parametrize(
-    ("launch", "leaves", "left"),
-    [
-        ((100.0, 400.0), "starting", None),
-        ((65.0, 195.0), "in_service", None),
-        ((130.0, 195.0), "in_service", "in_service"),
-    ],
-    ids=["the_starting_one_left", "the_one_in_service_left", "the_one_in_service_left_and_alone_had_written"],
+    ("launch", "leaves"),
+    [((None, 400.0), "starting"), ((100.0, 400.0, 90.0), "starting"), ((100.0, 195.0, 90.0), "in_service")],
+    ids=["the_starting_one_never_wrote", "the_starting_one_had_completed_its_hook", "the_one_in_service_left"],
 )
 def test_the_line_of_the_starting_instance_tells_no_role_the_readings_do_not_tell(
-    stored: Any, launch: tuple[float, float], leaves: str, left: str | None
+    stored: Any, launch: tuple[float | None, ...], leaves: str
 ) -> None:
     # In each run the note after the lowering reads one instance in service and none starting: the
     # starting one left, or it entered service between two notes and the one in service left. The
-    # notes read the same. The collectors tell the two apart only when one instance alone had
-    # written as the state was read.
+    # notes read the same, and no agent was read with its hook not completed once the job had
+    # lowered: the starting one's collector never wrote, or its hook was completed before, the
+    # instance not yet in service.
     rig = a_rig(stored, PROMPT, launch, leaves=s7.Left(leaves))
     asyncio.run(rig.run.starting_instance())
 
     (line,) = of(parsed(rig.out, *identifiers(rig)), "starting_instance")
     assert (line["in_service_after"], line["starting_after"], line["left_by_notes"]) == (1, 0, None)
-    assert (line["left"], line["reason"]) == (left, None if left else "role_not_told")
-    # Whatever the role, the line names the instance that left, and when.
+    assert (line["left"], line["reason"], line["starting_when_lowered"]) == (None, "role_not_told", [])
+    # Whatever the role, the line holds the times, and names the instance that left if it wrote.
     serving, starting = rig.scaler.machines
     gone = starting if leaves == "starting" else serving
-    assert (line["instance"], line["last_write_at"]) == (rig.run.names(gone.name), s7.utc(gone.last_write()))
+    last = gone.last_write()
+    assert (line["instance"], line["last_write_at"]) == (None if last is None else rig.run.names(gone.name), s7.utc(last))
     assert line["lowered_at"] < line["left_written_at"] <= line["gone_written_at"]
 
 
@@ -757,7 +862,7 @@ def test_the_line_of_the_starting_instance_says_why_it_tells_neither(stored: Any
     assert (line["left"], line["reason"], line["lowered_at"]) == (None, "state_not_read", None)
     assert [session.instances for _, session in rig.scaler.written] == [2]
 
-    # The notes and the collectors disagree: neither is believed. A single reading stands alone.
+    # The notes and the launches disagree: neither is believed. A single reading stands alone.
     starting, in_service = s7.Left.STARTING, s7.Left.IN_SERVICE
     assert s7.which_left((in_service, None), starting) == (None, s7.Untold.READINGS_DISAGREE)
     assert s7.which_left((None, s7.Untold.ROLE_NOT_TOLD), starting) == (starting, None)
@@ -770,6 +875,13 @@ def test_the_line_of_the_starting_instance_says_why_it_tells_neither(stored: Any
     assert s7.left_by_notes(notes((1, 1), (2, 0), (1, 0))) == (None, s7.Untold.BOTH_IN_SERVICE)
     assert s7.left_by_notes(notes((1, 1), (1, 1))) == (None, s7.Untold.NOTHING_LEFT)
     assert s7.left_by_notes(notes((1, 1), (0, 0))) == (None, s7.Untold.BOTH_LEFT)
+
+    # The launches tell nothing when both instances were read still starting, when both stopped, or
+    # when none stopped and the other instance wrote too: it is there still, by what was read.
+    assert s7.left_by_launches({"a", "b"}, {"a", "b"}, ["a"], waited=True) is None
+    assert s7.left_by_launches({"a"}, {"a", "b"}, ["a", "b"], waited=True) is None
+    assert s7.left_by_launches({"a"}, {"a", "b"}, [], waited=True) is None
+    assert s7.left_by_launches({"a"}, {"a"}, [], waited=False) is None
 
 
 # The streams, the errors and the job's start.
