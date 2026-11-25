@@ -40,8 +40,8 @@ or the endpoint's host is left is not written, unless wholly inside what a repla
 schema's property names are renamed the same way wherever they are named for the same instance (its
 `required`, its dependencies, its `allOf`, ...), and a name it only requires is given a neutral name
 distinct from those it declares.
-The keep-alives the gateway wrote while it held a stream are left out of the answer, since the
-engine never sent them. The usage is what the answer reports. Then the scrubber (`scrub.check`)
+The gateway writes nothing of its own into a stream (section 5.3), so the answer is recorded as
+the client received it. The usage is what the answer reports. Then the scrubber (`scrub.check`)
 reads the capture: a capture it refuses is not written, and the recorder prints the rule and where
 the scrubber found it, never the value.
 
@@ -116,7 +116,6 @@ from rhi_common.keys import KEY_PATTERN
 from rhi_gateway import routes
 from rhi_gateway.app import RequestBody
 from rhi_gateway.errors import GatewayError
-from rhi_gateway.hold import keep_alive
 from rhi_mock_engine import app as engine
 
 # The moment the mock's clock stands at while it is recorded: 2027-01-15, an invented one.
@@ -1023,15 +1022,6 @@ def profile_of(pool_name: str) -> dict[str, Any]:
     return stated
 
 
-def _without_keep_alives(route: routes.Route, answer: bytes) -> bytes:
-    """A stream without the keep-alives the gateway wrote before the engine's first event (section 5.3)."""
-    assert route.wire_format is not None
-    written = keep_alive(route.wire_format).data
-    while answer.startswith(written):
-        answer = answer[len(written) :]
-    return answer
-
-
 def _usage(route: routes.Route | None, answer: bytes) -> dict[str, int]:
     """The usage an answer reports, read as its route's answers write it."""
     if route == routes.COUNT_TOKENS:
@@ -1056,8 +1046,6 @@ async def capture_of(
     replayable = route is not None and route.wire_format is not None and exchange.status == 200
     content_type = next((value for name, value in exchange.answer_headers if name.lower() == "content-type"), "")
     answer = exchange.answer
-    if replayable and route is not None and content_type.split(";", 1)[0].strip().lower() == harness.STREAM_TYPE:
-        answer = _without_keep_alives(route, answer)
     request_body = neutral.body(exchange.body.decode("utf-8"))
     answer_body = neutral.body(answer.decode("utf-8"))
     headers = {"host": EXAMPLE_HOST}

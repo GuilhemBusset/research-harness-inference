@@ -350,6 +350,8 @@ def run_canary(
         return None, NOT_WAITED, 1
     stage = stage_settings(_client("ssm") if ssm is None else ssm, env)
     given = {**env, **stage, verify.KEY_VARIABLE: key, verify.POOL_VARIABLE: POOL}
+    # The canary's pool is booked: its run is never the verification's run on a pool nobody has booked.
+    given.pop(verify.UNBOOKED_VARIABLE, None)
     read = status or verify.status_reader(endpoint, key)
     if cloudformation is None or resource is None:
         import boto3

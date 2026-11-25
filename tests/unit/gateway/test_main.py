@@ -4,8 +4,8 @@ The gateway is built as `main` builds it, from an environment, over moto in plac
 Secrets Manager: the four tables are created with the keys of `rhi_common.tables`, and each pool
 has a secret whose value is drawn when the tests run, like the students' keys. Nothing reaches
 AWS: the credentials and the region are placeholders that moto never checks. The target groups'
-health and the scaler function are small doubles where a test needs a pool that is ready, and the
-engines are an `httpx.MockTransport`.
+health is a small double where a test needs a pool that is ready, and the engines are an
+`httpx.MockTransport`.
 
 The shutdown is tested on a real process: this file, run as a script, serves the gateway through
 `serve` on a Unix socket, over moto, and the test sends it SIGTERM. The Dockerfile is read, not
@@ -44,7 +44,7 @@ from moto import mock_aws
 from rhi_common import tables
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
-from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, Session
+from rhi_common.records import SESSION_RECORD, ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import main as entry
 from rhi_gateway import metrics
@@ -110,7 +110,7 @@ def as_logged(error: BaseException) -> str:
 def moto_aws(record: Callable[[str, Mapping[str, Any]], None] | None = None) -> Generator[None]:
     """moto in place of AWS, one call at a time, each told to `record` first.
 
-    The gateway calls the SDK from several threads (the readiness reads, the heartbeat's writes,
+    The gateway calls the SDK from several threads (the readiness reads, the ledger's writes,
     the lookups), and moto's tables are plain dictionaries that two threads cannot change at once.
     """
     one_at_a_time = threading.Lock()
@@ -201,17 +201,6 @@ class Targets:
         return {"TargetHealthDescriptions": [{"TargetHealth": {"State": state}}]}
 
 
-class Scaler:
-    """The Lambda client, in the test: it keeps the invocations it was asked for."""
-
-    def __init__(self) -> None:
-        self.invocations: list[dict[str, Any]] = []
-
-    def invoke(self, **arguments: Any) -> dict[str, Any]:
-        self.invocations.append(arguments)
-        return {"StatusCode": 202}
-
-
 @pytest.fixture
 def aws(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -237,10 +226,6 @@ def started(gateway: Gateway, scenario: Callable[[httpx.AsyncClient], Awaitable[
             await scenario(client)
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
-
-
-def heartbeat_rows() -> list[GatewayHeartbeat]:
-    return [GatewayHeartbeat.from_item(item) for item in items(HEARTBEAT_TABLE)]
 
 
 # --- The application, built from an environment ----------------------------------------------------
@@ -269,8 +254,8 @@ def test_the_application_built_from_an_environment_answers_from_the_tables_moto_
 
     started(gateway, scenario)
 
-    # The heartbeat is the heartbeats table's, under the task's ID: its last row is one of zeros.
-    assert [(row.task, row.pool, row.in_flight, row.held) for row in heartbeat_rows()] == [(TASK, "mock", 0, 0)]
+    # The gateway ran and stopped, and wrote no row to the heartbeats table.
+    assert items(HEARTBEAT_TABLE) == []
 
 
 @pytest.mark.usefixtures("aws")
@@ -311,7 +296,7 @@ def test_a_gateway_with_no_pool_and_no_default_pool_starts_and_answers_the_hello
 
     started(gateway, scenario)
 
-    assert heartbeat_rows() == []
+    assert items(HEARTBEAT_TABLE) == []
 
 
 @pytest.mark.usefixtures("aws")
@@ -320,21 +305,21 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
     environ |= {
         "RHI_BODY_LIMIT_BYTES": "512",
         "RHI_LONGEST_REQUEST_SECONDS": "900",
-        "RHI_KEEPALIVE_SECONDS": "7",
         "RHI_RETRY_AFTER_WARMING": "31",
         "RHI_TARGET_TTFT_P95_SECONDS": "6",
         "RHI_TARGET_STREAM_MEDIAN_TOKENS_PER_SECOND": "16.5",
     }
     key = issue_key()
-    scaler = Scaler()
     sent: list[httpx.Request] = []
 
     def engine(request: httpx.Request) -> httpx.Response:
         sent.append(request)
         return httpx.Response(200, json=ANSWER)
 
-    # The pool `mock` has a healthy target; `second` has none.
-    clients = replace(aws_clients(), elbv2=Targets(target_group("mock")), lambda_client=scaler)
+    # The pool `mock` has a healthy target; `second` has none, and the scaler's note counts one instance starting.
+    starting = ScalerNote("second", capacity_asked=1, no_capacity_at=None, written_at=int(time.time()), starting=1)
+    boto3.resource("dynamodb").Table(TABLES["RHI_POOL_STATE_TABLE"][1]).put_item(Item=starting.to_item())
+    clients = replace(aws_clients(), elbv2=Targets(target_group("mock")))
     gateway = build(read_settings(environ), clients, task=TASK, transport=httpx.MockTransport(engine))
 
     async def scenario(client: httpx.AsyncClient) -> None:
@@ -361,25 +346,22 @@ def test_a_request_is_forwarded_with_the_secret_read_at_start_and_the_settings_o
         assert (too_long.status_code, too_long.json()["error"]["type"]) == (400, "request_refused")
         assert len(sent) == 1
 
-        # The Retry-After of the environment: a token count for a pool that is not ready.
+        # The Retry-After of the environment: a request, and a token count, for a pool that is starting.
         count = {"model": "second", "messages": MESSAGE["messages"]}
-        warming = await client.post("/v1/messages/count_tokens", headers=bearer(key), json=count)
-        assert (warming.status_code, warming.json()["error"]["type"]) == (503, "warming")
-        assert warming.headers["Retry-After"] == "31"
+        for path, body in (("/v1/messages", {**MESSAGE, "model": "second"}), ("/v1/messages/count_tokens", count)):
+            warming = await client.post(path, headers=bearer(key), json=body)
+            assert (warming.status_code, warming.json()["error"]["type"]) == (503, "warming")
+            assert warming.headers["Retry-After"] == "31"
+        assert len(sent) == 1
 
-        # The waker asks the scaler function of the environment.
-        woken = await client.post("/wake", headers=bearer(key), json={"model": "second"})
-        assert (woken.status_code, woken.json()["state"]) == (200, "cold")
-        while not scaler.invocations:
-            await asyncio.sleep(0.01)
-        assert scaler.invocations[0]["FunctionName"] == SCALER
-        assert json.loads(scaler.invocations[0]["Payload"]) == {"pool": "second"}
+        # The gateway has no wake: the path is outside its table, with a key as without one.
+        wake = await client.post("/wake", headers=bearer(key), json={"model": "second"})
+        assert (wake.status_code, wake.json()["error"]["type"]) == (404, "not_found")
 
     started(gateway, scenario)
 
-    # The two settings no quick request shows are those of the parts they govern.
+    # The setting no quick request shows is that of the part it governs.
     assert gateway.forwarding.proxy.longest_request_seconds == 900
-    assert gateway.forwarding.holding.keepalive_seconds == 7
     assert gateway.forwarding.retry_after == {
         Cause.WARMING: 31,
         Cause.CAPACITY_UNAVAILABLE: 60,
@@ -422,7 +404,7 @@ def test_main_serves_the_application_on_port_8080_and_the_metrics_on_the_loopbac
 
     [(app, how)] = served["application"]
     assert (how["host"], how["port"]) == ("0.0.0.0", 8080)
-    # No deadline cuts a request in flight at SIGTERM, and the lifespan, where the heartbeat stops, runs.
+    # No deadline cuts a request in flight at SIGTERM, and the lifespan, where the pools are read, runs.
     assert how["timeout_graceful_shutdown"] is None
     assert how["lifespan"] == "on"
     # The metrics endpoint takes its port only: its address is the loopback one, and no caller's to give.
@@ -512,9 +494,6 @@ def serve_until_sigterm(folder: Path) -> None:
 
     def record(operation: str, arguments: Mapping[str, Any]) -> None:
         call: dict[str, Any] = {"operation": operation, "table": arguments.get("TableName")}
-        if (operation, call["table"]) == ("PutItem", HEARTBEAT_TABLE):
-            row = arguments["Item"]
-            call |= {"pool": row["pool"], "in_flight": int(row["in_flight"]), "held": int(row["held"])}
         calls.write(json.dumps(call) + "\n")
         calls.flush()
 
@@ -528,7 +507,7 @@ def serve_until_sigterm(folder: Path) -> None:
         create_tables()
         environ, _ = environment("mock", "second")
         issue_key(os.environ[KEY_VARIABLE])
-        clients = replace(aws_clients(), elbv2=Targets(target_group("mock")), lambda_client=Scaler())
+        clients = replace(aws_clients(), elbv2=Targets(target_group("mock")))
         gateway = build(read_settings(environ), clients, task=TASK, transport=httpx.MockTransport(engine))
         serve(gateway, metrics_port=int(os.environ[METRICS_PORT_VARIABLE]), uds=str(folder / SOCKET))
 
@@ -541,7 +520,7 @@ def until(condition: Callable[[], bool], child: subprocess.Popen[bytes], log: Pa
         time.sleep(0.02)
 
 
-def test_sigterm_stops_new_connections_finishes_the_request_in_flight_and_writes_the_rows_of_zeros() -> None:
+def test_sigterm_stops_new_connections_and_finishes_the_request_in_flight() -> None:
     key = generate_key()
     with socket.socket() as free:
         free.bind(("127.0.0.1", 0))
@@ -600,12 +579,10 @@ def test_sigterm_stops_new_connections_finishes_the_request_in_flight_and_writes
                 assert "rhi_gateway_student_requests_total" in scraped.text
 
                 def mock_is_ready() -> bool:
-                    return {"model": "mock", "state": "ready"} in before.get("/status").json()["pools"]
+                    states = {pool["model"]: pool["state"] for pool in before.get("/status").json()["pools"]}
+                    return states["mock"] == "ready"
 
                 until(mock_is_ready, child, log, "the pool was not read as ready")
-                # An explicit wake of the pool that is not ready: from now on, a row of the cadence
-                # counts it as held, and only the last rows have that pool at zero.
-                assert before.post("/wake", json={"model": "second"}).json()["state"] == "cold"
 
             in_flight.start()
             until((folder / FORWARDED).exists, child, log, "the request did not reach the engine")
@@ -633,14 +610,11 @@ def test_sigterm_stops_new_connections_finishes_the_request_in_flight_and_writes
     assert isinstance(answer, httpx.Response), logged
     assert (answer.status_code, answer.json()) == (200, ANSWER)
 
-    # The last rows are written once the request is settled, one per pool, with both counts at
-    # zero: the wake of `second` is still pending, so a row of the cadence would count it as held.
-    settled = max(index for index, call in enumerate(calls) if call["table"] == USAGE_TABLE)
-    rows = [call for call in calls[settled + 1 :] if (call["operation"], call["table"]) == ("PutItem", HEARTBEAT_TABLE)]
-    assert sorted((row["pool"], row["in_flight"], row["held"]) for row in rows[-2:]) == [
-        ("mock", 0, 0),
-        ("second", 0, 0),
-    ]
+    # From its start to its end the gateway served a request, and it called AWS for its tables, its
+    # secrets and nothing else: no row of the heartbeats table, and no call of the scaler function.
+    assert USAGE_TABLE in {call["table"] for call in calls}
+    assert HEARTBEAT_TABLE not in {call["table"] for call in calls if call["operation"] != "CreateTable"}
+    assert "Invoke" not in {call["operation"] for call in calls}
 
 
 # --- The image -----------------------------------------------------------------------------------

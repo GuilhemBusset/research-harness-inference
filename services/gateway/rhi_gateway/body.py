@@ -352,7 +352,7 @@ def _serialize(body: Mapping[str, Any]) -> bytes:
 
 
 def pool_named(model: Any, pools: tuple[Pool, ...], default_pool: Pool | None) -> Pool:
-    """The pool a `model` value names (step 3), or a refusal: the wake finds its pool the same way."""
+    """The pool a `model` value names (step 3), or a refusal."""
     if isinstance(model, str):
         for pool in pools:
             if pool.name == model:

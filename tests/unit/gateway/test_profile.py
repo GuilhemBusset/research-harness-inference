@@ -127,7 +127,7 @@ def environment(**profiles: list[str]) -> dict[str, str]:
 
 def filters(**profiles: list[str]) -> dict[routes.Route, Filter]:
     """The body filters of the gateway its entry point builds for these pools, over clients that reach nothing."""
-    aws = Clients(*(MagicMock() for _ in range(5)))
+    aws = Clients(*(MagicMock() for _ in range(4)))
     aws.secretsmanager.get_secret_value.return_value = {"SecretString": secrets.token_urlsafe(24)}
     built = build(read_settings(environment(**profiles)), aws).forwarding.filters
     # Each is a format's own filter, which a test gives a body with no server around it.
@@ -186,14 +186,14 @@ def test_a_profile_that_names_an_unknown_entry_stops_the_gateways_start(write: W
     untouched = MagicMock(spec_set=[])
 
     with pytest.raises(ProfileError) as refusal:
-        build(settings, Clients(*[untouched] * 5))
+        build(settings, Clients(*[untouched] * 4))
 
     assert (refusal.value.pool, refusal.value.entry) == ("coursework", "missing")
     assert "'coursework'" in str(refusal.value)
     assert "'missing'" in str(refusal.value)
     # A module anywhere else is no entry: the name is looked up in the profile package only.
     with pytest.raises(ProfileError):
-        build(read_settings(environment(coursework=["json"])), Clients(*[untouched] * 5))
+        build(read_settings(environment(coursework=["json"])), Clients(*[untouched] * 4))
 
 
 @pytest.mark.parametrize("route", FORWARDED, ids=lambda route: route.path)

@@ -84,7 +84,7 @@ def assert_replays(capture: Capture) -> None:
 
 
 def test_a_session_is_saved_in_order_and_replays(tmp_path: Path) -> None:
-    # A stack of its own, cold: its first stream is held, with the gateway's keep-alives.
+    # A stack of its own, booked and ready: its first stream is forwarded as any other.
     with smoke.local_stack(smoke.MOCK_POOL) as (address, key), recording(address, tmp_path) as (session, client):
         models = client.get("/v1/models", headers={"authorization": f"Bearer {key}"})
         stream = client.post("/v1/messages?beta=true", headers=anthropic(key), json=messages(stream=True))
@@ -101,13 +101,8 @@ def test_a_session_is_saved_in_order_and_replays(tmp_path: Path) -> None:
     assert listed.answer == models.content
     assert [capture.name for capture in harness.folder(tmp_path)] == ["002", "003"]
 
-    keep_alive = b'event: ping\ndata: {"type": "ping"}\n\n'
-    assert stream.content.startswith(keep_alive)
-    # What the client received before the engine's stream is keep-alives only, and none is in the capture.
-    assert stream.content.endswith(streamed.answer)
-    held = stream.content.removesuffix(streamed.answer)
-    assert streamed.streamed and held and held == keep_alive * (len(held) // len(keep_alive))
-    assert not streamed.answer.startswith(keep_alive)
+    # The gateway held nothing and wrote nothing of its own: the capture's answer is what the client received.
+    assert streamed.streamed and streamed.answer == stream.content
     assert count.usage == harness.Usage(counted.json()["input_tokens"], 0) and count.usage.input_tokens > 0
     for capture in (streamed, count):
         assert capture.headers["host"] == record.EXAMPLE_HOST

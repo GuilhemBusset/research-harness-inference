@@ -65,9 +65,9 @@ into it, and from then on they can only go. That rests on the clocks of the gate
 agreeing on the time: a reservation that a task whose clock is behind confirms in the old day,
 after another task has read that day, has no stand-in.
 
-**The lease.** A reservation is taken before the hold (section 6.2, steps 3 and 5), so a lease
-outlasts the longest hold and then the longest request: `lease_seconds` is the pool's
-`hold_seconds` plus the longest request plus 60 seconds, 2,280 seconds with the defaults of
+**The lease.** The gateway holds no request (section 5.3): a reservation is taken for a request
+that is forwarded at once, so a lease outlasts the longest request and nothing more:
+`lease_seconds` is the longest request plus 60 seconds, 1,860 seconds with the defaults of
 section 17. From its expiry on, a lease holds no slot, for every writer of the record:
 
 - a reservation that the record as written would refuse removes the expired leases in its own
@@ -138,7 +138,7 @@ from rhi_common.students import Lease, UsageDay, utc_day
 from rhi_common.tables import EXPIRES_AT
 from rhi_gateway.errors import GatewayError
 
-# What a lease lasts beyond the longest hold and the longest request.
+# What a lease lasts beyond the longest request.
 LEASE_MARGIN_SECONDS = 60
 # How long after midnight a reservation of the day before may still count without a stand-in in
 # the new day, when that day is not opened yet (see "Midnight" above).
@@ -150,11 +150,11 @@ _ATTEMPTS = 10
 _STAND_IN = re.compile(r"\d{4}-\d{2}-\d{2}/", re.ASCII)
 
 
-def lease_seconds(hold_seconds: int, longest_request_seconds: int) -> int:
-    """How long a lease lasts: the pool's hold, then the longest request, then 60 seconds."""
-    if hold_seconds < 0 or longest_request_seconds < 0:
+def lease_seconds(longest_request_seconds: int) -> int:
+    """How long a lease lasts: the longest request, then 60 seconds."""
+    if longest_request_seconds < 0:
         raise ValueError("a duration is negative")
-    return hold_seconds + longest_request_seconds + LEASE_MARGIN_SECONDS
+    return longest_request_seconds + LEASE_MARGIN_SECONDS
 
 
 class Student(Protocol):
@@ -204,15 +204,13 @@ class Ledger(Protocol):
         student: Student,
         request_id: str,
         *,
-        hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
     ) -> Reservation:
         """Take a slot for the request, or raise the refusal, `concurrency_limit`.
 
-        `request_id` is the gateway's own ID for the request, `hold_seconds` the pool's, and
-        `longest_request_seconds` the gateway's setting. An ID that is empty, that holds a
-        reservation already, or that reads as a stand-in (a date, then `/`) is a `ValueError`.
+        `request_id` is the gateway's own ID for the request, and `longest_request_seconds` the
+        gateway's setting. An ID that is empty, that holds a reservation already, or that reads as a stand-in (a date, then `/`) is a `ValueError`.
         `pool` is the name of the pool the request is for: the reservation returns the load
         balancer's cookie the record holds for it, and the last rebalance number the record has
         applied for it. Without one, it returns neither.
@@ -456,7 +454,6 @@ class InMemoryLedger:
         student: Student,
         request_id: str,
         *,
-        hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
     ) -> Reservation:
@@ -481,7 +478,7 @@ class InMemoryLedger:
             self._clock,
             student,
             request_id,
-            lease_seconds(hold_seconds, longest_request_seconds),
+            lease_seconds(longest_request_seconds),
             pool,
             write,
             self.day,
@@ -640,7 +637,6 @@ class DynamoDBLedger:
         student: Student,
         request_id: str,
         *,
-        hold_seconds: int,
         longest_request_seconds: int,
         pool: str | None = None,
     ) -> Reservation:
@@ -648,7 +644,7 @@ class DynamoDBLedger:
             self._clock,
             student,
             request_id,
-            lease_seconds(hold_seconds, longest_request_seconds),
+            lease_seconds(longest_request_seconds),
             pool,
             lambda reservation, now: self._write_reservation(student, reservation, now),
             self._read,

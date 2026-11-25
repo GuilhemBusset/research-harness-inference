@@ -1,18 +1,16 @@
 """`rhi status`, `rhi wait` and `rhi revoke`, with every key made at run time.
 
-The status and the wake are the gateway's own local routes, in process: the application
-(`rhi_gateway.app.build_app`) over the real readiness, waker and ledger, whose AWS clients are
-doubles. GitHub's device endpoint and the issuer's routes are stubs. One clock, which the test
-moves, is the CLI's and the gateway's.
+The status and the wake are answered by a stand-in for the endpoint these commands were written
+for (`Gateway`, below). The gateway itself no longer has a wake, a state `cold` or a pool's mode
+(system design, section 5.3), and the two commands follow it in their own change: until then they
+speak the earlier protocol, and these tests hold what they do with its answers. GitHub's device
+endpoint and the issuer's routes are stubs. One clock, which the test moves, is the CLI's and the
+stand-in's.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
-import contextlib
-import io
-import json
 import secrets
 import string
 import time
@@ -26,41 +24,19 @@ import keyring.backend
 import keyring.errors
 import pytest
 from keyring.backends import fail
-from starlette.types import Message
 
 from rhi_cli import login, main, revoke, store, wait
-from rhi_common.keys import generate_key, key_hash
-from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import Mode, PoolState, ScalerNote, Session
-from rhi_common.students import StudentKey
-from rhi_gateway.app import build_app
-from rhi_gateway.auth import Authenticator
-from rhi_gateway.keystore import InMemoryKeyStore
-from rhi_gateway.local import LocalRoutes
-from rhi_gateway.readiness import Readiness
-from rhi_gateway.waker import Waker
+from rhi_common.causes import Cause
+from rhi_common.keys import generate_key
 
 ENDPOINT = "https://example.com"
 NOW = 1_800_000_000
 INTERVAL = 7
 
 
-def pool(name: str, wake: str = "on-demand") -> Pool:
-    entry = {
-        "engine": "mock",
-        "instance_types": ["t4g.small"],
-        "prices": {"t4g.small": 0.0168},
-        "max_instances": 1,
-        "warm_instances": 0,
-        "wake": wake,
-        "target_concurrency": 64,
-        "context_length": 8192,
-        "largest_output": 1024,
-    }
-    return parse_pools({name: entry})[0]
-
-
-POOLS = (pool("coursework"), pool("mock"), pool("evening", wake="scheduled-only"))
+# The pools the stand-in lists, in its order: the first is the default one, and the last is one
+# that students could not start.
+POOLS = ("coursework", "mock", "evening")
 
 
 class Clock:
@@ -75,11 +51,13 @@ class Clock:
 
 @dataclass
 class Gateway:
-    """The gateway's local routes behind the CLI's transport, and the AWS clients its readiness and waker read.
+    """The endpoint behind the CLI's transport, as the commands were written for it.
 
-    A pool has a healthy target from the second `ready_at` gives it, and is disabled by the admin
-    from the second `disabled_at` gives it. The scaler's note for a pool says capacity was asked
-    for once a wake for it has reached the gateway.
+    `GET /status` gives each pool's record, and `POST /wake` the record of the pool its body's
+    `model` names (a `claude-` name is the default pool's), both to the stored key alone. A pool
+    is `ready` from the second `ready_at` gives it, and `unavailable` with `pool_disabled` from
+    the second `disabled_at` gives it; before that it is `cold`, and `warming` once a wake for it
+    has been answered. The pool `evening` is `unavailable` with `pool_scheduled_only`.
     """
 
     clock: Clock = field(default_factory=Clock)
@@ -90,88 +68,41 @@ class Gateway:
     def __post_init__(self) -> None:
         self.calls: list[tuple[str, str, float]] = []
         self.woken: set[str] = set()
-        self.student = StudentKey(
-            key_hash=key_hash(self.key),
-            github_id=4242,
-            alias="otter",
-            installation=None,
-            issued_at=NOW - 3600,
-            expires_at=NOW + 86400,
-            revoked_at=None,
-            concurrency_limit=4,
-        )
-        self.readiness = Readiness({p.name: p.name for p in POOLS}, elbv2=self, table=self, clock=self.time)
-        local = LocalRoutes(
-            Authenticator(InMemoryKeyStore(self.student), wall_clock=self.time),
-            POOLS,
-            self.readiness.views,
-            default_pool=POOLS[0],
-            clock=self.time,
-            waker=Waker(self.readiness, lambda_client=self, function_name="scaler", clock=self.time),
-        )
-        self.app = build_app(local=local)
 
-    def time(self) -> float:
-        return NOW + self.clock.now
+    def record(self, name: str) -> dict[str, str]:
+        """The pool's record now."""
+        now = self.clock.now
+        if now >= self.disabled_at.get(name, float("inf")):
+            return {"model": name, "state": "unavailable", "cause": Cause.POOL_DISABLED.value}
+        if now >= self.ready_at.get(name, float("inf")):
+            return {"model": name, "state": "ready"}
+        if name == "evening":
+            return {"model": name, "state": "unavailable", "cause": Cause.POOL_SCHEDULED_ONLY.value}
+        return {"model": name, "state": "warming" if name in self.woken else "cold"}
 
-    # The three AWS calls the gateway makes.
-    def describe_target_health(self, *, TargetGroupArn: str) -> dict[str, Any]:
-        healthy = self.clock.now >= self.ready_at.get(TargetGroupArn, float("inf"))
-        return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}] if healthy else []}
-
-    def get_item(self, *, Key: dict[str, str]) -> dict[str, Any]:
-        name = Key["pool"]
-        if Key["record"] == "session":
-            # Every pool is in a session, for 6 hours from the moment the clock starts at.
-            booked = Session(name, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
-            return {"Item": booked.to_item()}
-        if Key["record"] == "mode":
-            disabled = self.clock.now >= self.disabled_at.get(name, float("inf"))
-            record = PoolState(pool=name, mode=Mode.DISABLED, set_by="admin", set_at=NOW)
-            return {"Item": record.to_item()} if disabled else {}
-        if name in self.woken:
-            return {"Item": ScalerNote(pool=name, capacity_asked=1, no_capacity_at=None, written_at=NOW).to_item()}
-        return {}
-
-    def invoke(self, **arguments: Any) -> dict[str, Any]:
-        return {"StatusCode": 202}
+    @staticmethod
+    def refusal(status: int, cause: Cause) -> tuple[int, Any]:
+        return status, {"type": "error", "error": {"type": cause.value, "message": cause.sentence}}
 
     def __call__(self, call: login.Call) -> tuple[int, Any]:
-        """The CLI's transport: one readiness cycle, then the call through the application."""
+        """The CLI's transport: the status and the body the endpoint answers."""
         assert call.url.startswith(ENDPOINT + "/")
         path = call.url.removeprefix(ENDPOINT)
         self.calls.append((call.method, path, self.clock.now))
-        self.readiness.refresh()
-        if path == "/wake" and call.fields:
-            self.woken.add(call.fields["model"])
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "scheme": "http",
-            "server": ("gateway.example.com", 80),
-            "client": ("192.0.2.1", 50000),
-            "method": call.method,
-            "root_path": "",
-            "path": path,
-            "raw_path": path.encode("ascii"),
-            "query_string": b"",
-            "headers": [(name.lower().encode(), value.encode()) for name, value in (call.headers or {}).items()],
-            "state": {},
-        }
-        body = b"" if call.fields is None else json.dumps(call.fields).encode()
-        sent: list[Message] = []
-
-        async def receive() -> Message:
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        async def keep(message: Message) -> None:
-            sent.append(message)
-
-        # The gateway's request log goes to its own standard output, not to the CLI's.
-        with contextlib.redirect_stdout(io.StringIO()):
-            asyncio.run(self.app(scope, receive, keep))
-        return sent[0]["status"], json.loads(b"".join(message.get("body", b"") for message in sent[1:]))
+        if (call.headers or {}).get("Authorization") != f"Bearer {self.key}":
+            return self.refusal(401, Cause.INVALID_KEY)
+        if (call.method, path) == ("GET", "/status"):
+            return 200, {"pools": [self.record(name) for name in POOLS]}
+        if (call.method, path) == ("POST", "/wake"):
+            model = (call.fields or {}).get("model", "")
+            name = POOLS[0] if model.startswith("claude-") else model
+            if name not in POOLS:
+                return self.refusal(400, Cause.REQUEST_REFUSED)
+            # The record as it was when the wake arrived: the wake shows from the next call on.
+            answer = self.record(name)
+            self.woken.add(model)
+            return 200, answer
+        return self.refusal(404, Cause.NOT_FOUND)
 
     def wakes(self) -> list[float]:
         """When each wake reached the gateway, in seconds on the test's clock."""

@@ -6,7 +6,12 @@ lifecycle stage each instance of the tested pools reached, and nothing else of a
 When the decision on the coursework pool left that pool, the smoke tests run again on it, with the
 tests of that run only.
 
-Around each run the script books the run's pool, waits until the gateway's status reads it ready
+Before it books the mock pool, when that pool has no session, the script runs the one test of a
+pool nobody has booked, alone, and leaves it out of every other run, whatever the environment it
+was started in marks; on a mock pool that already has a session it does not run it, books nothing,
+also when that session ends a moment later, says so and exits 1: the verification is not complete.
+
+Around each other run the script books the run's pool, waits until the gateway's status reads it ready
 or the wait is over, and stops the session it booked, also when the tests fail; a pool that already
 has a session is neither booked nor stopped. On a pool the decision left, a wait that ends with the
 pool not ready and no instance's heartbeat row written since the booking runs no test: the script
@@ -139,11 +144,24 @@ class Clock:
         self.now += seconds
 
 
-def verification(environ: Mapping[str, str], clock: Clock | None = None, **given: Any) -> int:
+def verification(
+    environ: Mapping[str, str],
+    clock: Clock | None = None,
+    *,
+    unbooked: Callable[[Mapping[str, str]], int] | None = None,
+    **given: Any,
+) -> int:
     """`verify.main` in `environ` and the booking's variables, with moto's pool-state table behind
     the stand-in for CloudFormation, a status that reads every pool ready unless one is given,
-    and a clock that only its `sleep` moves."""
+    and a clock that only its `sleep` moves.
+
+    The run the script makes on the mock pool before it books it goes to `unbooked`, which passes
+    at once unless one is given, and every other run to `run`: a test of what the script does
+    around a pool's session counts the runs made in a session, and no other."""
     clock = clock or Clock()
+    if "run" in given:
+        in_a_session, before = given["run"], unbooked or (lambda environ: 0)
+        given["run"] = lambda environ: (before if environ.get(verify.UNBOOKED_VARIABLE) else in_a_session)(environ)
     stand_ins: dict[str, Any] = {
         "status": lambda pool, within: "ready",
         "cloudformation": Stacks(),
@@ -369,11 +387,19 @@ def test_each_pool_is_booked_for_its_own_run_and_its_session_stopped_also_when_t
         assert left is not None and left.starts_at == left.ends_at == at
 
 
+def never_read(pool: str, within: float) -> str:
+    raise AssertionError("the status is not waited for on a pool the step did not book")
+
+
+def never_run(environ: Mapping[str, str]) -> int:
+    raise AssertionError("a pool that has a session is not tested as one nobody has booked")
+
+
 @pytest.mark.parametrize(
     ("starts_in", "ends_in"), [(600, 4200), (-600, 600)], ids=["a session booked", "a session active"]
 )
-def test_a_pool_that_already_has_a_session_is_neither_booked_nor_stopped(
-    pool_state: Any, starts_in: int, ends_in: int
+def test_a_mock_pool_that_already_has_a_session_is_neither_booked_nor_stopped_and_the_verification_does_not_pass(
+    pool_state: Any, capsys: pytest.CaptureFixture[str], starts_in: int, ends_in: int
 ) -> None:
     theirs = Session(
         pool="mock", instances=2, starts_at=NOW + starts_in, ends_at=NOW + ends_in, set_by="admin", set_at=NOW - 900
@@ -382,14 +408,99 @@ def test_a_pool_that_already_has_a_session_is_neither_booked_nor_stopped(
     clock = Clock()
     run = Booked(pool_state, clock)
 
-    def never_read(pool: str, within: float) -> str:
-        raise AssertionError("the status is not waited for on a pool the step did not book")
-
-    assert verification(ENVIRON, clock, client=Secrets(a_key()), run=run, status=never_read) == 0
+    stand_ins = {"client": Secrets(a_key()), "run": run, "status": never_read, "unbooked": never_run}
+    # Every test that ran passed, and the one of a pool nobody has booked could not be made.
+    assert verification(ENVIRON, clock, **stand_ins) == 1
 
     # The tests ran at once, on the session that was there, which is as it was after them.
     assert run.sessions == [theirs] and run.started_at == [NOW]
     assert session_of(pool_state) == theirs
+    # The script's own line says what is missing.
+    assert "the verification is not complete" in capsys.readouterr().err
+
+
+class Ticking(Clock):
+    """A clock each reading of which comes a second after the one before it."""
+
+    def time(self) -> float:
+        self.now += 1
+        return self.now - 1
+
+
+def test_a_mock_pool_whose_session_ends_once_it_was_read_is_not_booked_without_the_test_of_the_unbooked_pool(
+    pool_state: Any,
+) -> None:
+    # Active at the script's first reading of the clock, and over at any later one.
+    theirs = Session(pool="mock", instances=1, starts_at=NOW - 600, ends_at=NOW + 1, set_by="admin", set_at=NOW - 900)
+    pool_state.put_item(Item=theirs.to_item())
+    clock = Ticking()
+    stand_ins = {"client": Secrets(a_key()), "run": Run(), "status": never_read, "unbooked": never_run}
+
+    # The reading that found the session decided: nothing is booked over it, and the verification
+    # that lacks the test does not pass.
+    assert verification(ENVIRON, clock, **stand_ins) == 1
+    assert session_of(pool_state) == theirs
+
+
+def test_a_pool_of_the_decision_s_file_that_already_has_a_session_is_tested_as_it_is(
+    tmp_path: Path, pool_state: Any
+) -> None:
+    named = tmp_path / "gpu-pools"
+    named.write_text("coursework\n", encoding="utf-8")
+    theirs = Session(
+        pool="coursework", instances=2, starts_at=NOW - 600, ends_at=NOW + 7200, set_by="admin", set_at=NOW - 900
+    )
+    pool_state.put_item(Item=theirs.to_item())
+    run = Run()
+
+    environ = {**ENVIRON, verify.GPU_POOLS_FILE_VARIABLE: str(named)}
+    assert verification(environ, client=Secrets(a_key()), run=run) == 0
+
+    # Its tests ran, on the session that was there: only the mock pool is tested unbooked.
+    assert [given.get(verify.POOL_VARIABLE) for given in run.environments] == [None, "coursework"]
+    assert session_of(pool_state, "coursework") == theirs
+
+
+@pytest.mark.parametrize(
+    "inherited", [{}, {verify.UNBOOKED_VARIABLE: verify.UNBOOKED_RUN}], ids=["no mark given", "the mark inherited"]
+)
+def test_the_test_of_an_unbooked_pool_runs_once_before_the_mock_pool_is_booked(
+    tmp_path: Path, pool_state: Any, inherited: dict[str, str]
+) -> None:
+    named = tmp_path / "gpu-pools"
+    named.write_text("coursework\n", encoding="utf-8")
+    # The mark of that run is the script's to give: one the step's environment carries marks no run.
+    environ = {**ENVIRON, **inherited, verify.GPU_POOLS_FILE_VARIABLE: str(named)}
+    runs: list[tuple[str | None, str | None, bool]] = []
+
+    def run(given: Mapping[str, str]) -> int:
+        # Which run it is, the pool it names, and whether the table holds a session of its pool then.
+        booked = session_of(pool_state, given.get(verify.POOL_VARIABLE) or "mock") is not None
+        runs.append((given.get(verify.UNBOOKED_VARIABLE), given.get(verify.POOL_VARIABLE), booked))
+        return 0
+
+    assert verification(environ, client=Secrets(a_key()), run=run, unbooked=run) == 0
+
+    # First, and once: on the mock pool, which names no pool, while the table holds no session of it.
+    # Then the mock pool's run in the session the script booked, and the coursework pool's in its own.
+    assert runs == [(verify.UNBOOKED_RUN, None, False), (None, None, True), (None, "coursework", True)]
+
+
+@pytest.mark.parametrize(("before", "after", "exit_code"), [(5, 0, 5), (5, 3, 5), (0, 3, 3)])
+def test_the_run_on_the_unbooked_pool_counts_like_any_other(
+    pool_state: Any, before: int, after: int, exit_code: int
+) -> None:
+    clock = Clock()
+    run = Booked(pool_state, clock, after)
+
+    result = verification(ENVIRON, clock, client=Secrets(a_key()), run=run, unbooked=lambda environ: before)
+
+    # Its failure is the script's exit, the first failed run's, and the mock pool is booked, tested
+    # and stopped all the same.
+    assert result == exit_code
+    assert len(run.sessions) == 1 and run.sessions[0] is not None
+    left = session_of(pool_state)
+    assert left is not None and left.ends_at == NOW + 300
 
 
 def test_a_session_someone_else_booked_meanwhile_is_not_stopped(pool_state: Any) -> None:
@@ -946,8 +1057,12 @@ def run_tests_in(tmp_path: Path, tests: list[str], *, more: Mapping[str, str] | 
     return verify.run_tests(environ, tests)
 
 
-@pytest.mark.parametrize("pool", [None, "coursework"], ids=["the mock pool's run", "the coursework pool's run"])
-def test_only_the_mock_pool_s_run_deselects_and_only_the_gpu_pass_tests(tmp_path: Path, pool: str | None) -> None:
+@pytest.mark.parametrize(
+    ("unbooked", "pool"),
+    [(True, None), (False, None), (False, "coursework")],
+    ids=["the unbooked mock pool's run", "the mock pool's run", "the coursework pool's run"],
+)
+def test_each_run_keeps_its_own_tests(tmp_path: Path, unbooked: bool, pool: str | None) -> None:
     (tmp_path / "recorder.py").write_text(RECORDER, encoding="utf-8")
     recorded = tmp_path / "recorded.json"
     # Collection only: nothing is run, so nothing is reached.
@@ -956,19 +1071,24 @@ def test_only_the_mock_pool_s_run_deselects_and_only_the_gpu_pass_tests(tmp_path
         "PYTEST_ADDOPTS": "-p recorder --collect-only -q -p no:cacheprovider",
         "RECORDED": str(recorded),
         **({verify.POOL_VARIABLE: pool} if pool else {}),
+        **({verify.UNBOOKED_VARIABLE: verify.UNBOOKED_RUN} if unbooked else {}),
     }
 
     assert run_tests_in(tmp_path, [verify.SMOKE_TESTS], more=more) == 0
 
     found = json.loads(recorded.read_text(encoding="utf-8"))
-    # The tests of the coursework pool's run are left out of the mock pool's run, and only there.
-    left_out = set() if pool else set(verify.GPU_PASS_ONLY)
-    assert "gpu-release-served" in verify.GPU_PASS_ONLY
-    assert sorted(found["deselected"]) == sorted(left_out)
-    # Every other smoke test is kept, the deployed-only ones and the forbidden routes at the
-    # gateway's hop among them, and on the coursework pool the first stream's wake and hold.
-    assert sorted(found["kept"]) == sorted(set(SMOKE_TEST_IDS) - left_out)
-    assert {"forbidden-invocations", "first-stream-wake", "metrics-pool", "release-served"} <= set(found["kept"])
+    assert verify.UNBOOKED_ONLY == ("no-session",) and "gpu-release-served" in verify.GPU_PASS_ONLY
+    if unbooked:
+        # The run before the booking keeps the test of a pool nobody has booked, and nothing else.
+        kept = set(verify.UNBOOKED_ONLY)
+    else:
+        # A run in a session leaves that test out, and the mock pool's run the tests of the
+        # coursework pool's run too. Every other smoke test is kept, the deployed-only ones and the
+        # forbidden routes at the gateway's hop among them.
+        kept = set(SMOKE_TEST_IDS) - set(verify.UNBOOKED_ONLY) - (set() if pool else set(verify.GPU_PASS_ONLY))
+        assert {"forbidden-invocations", "stream-messages", "metrics-pool", "release-served"} <= kept
+    assert sorted(found["kept"]) == sorted(kept)
+    assert sorted(found["deselected"]) == sorted(set(SMOKE_TEST_IDS) - kept)
 
 
 def test_a_failed_test_makes_the_script_exit_non_zero(tmp_path: Path) -> None:

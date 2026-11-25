@@ -342,6 +342,18 @@ def test_the_tests_ran_and_passed_in_a_session_the_canary_booked_and_stopped(poo
     assert arguments[-1] == "tests/smoke"
 
 
+def test_the_mark_of_the_verification_s_unbooked_run_never_reaches_the_canary_s_run(pool_state: Any) -> None:
+    clock = Clock()
+    tests = SmokeRun(pool_state, clock)
+    inherited = environ() | {verify.UNBOOKED_VARIABLE: verify.UNBOOKED_RUN}
+
+    canary(clock, tests, ready_after(clock, 0), environ=inherited)
+
+    # The canary's pool is booked: with the mark, its run would keep only the test of an unbooked pool.
+    ((env, _),) = tests.given
+    assert verify.UNBOOKED_VARIABLE not in env
+
+
 def test_a_failed_test_gives_fail_and_the_session_is_stopped_all_the_same(pool_state: Any) -> None:
     clock = Clock()
     tests = SmokeRun(pool_state, clock, ONE_FAILED, exit_code=1)
