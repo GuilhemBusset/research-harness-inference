@@ -662,10 +662,12 @@ def test_only_the_target_state_terminated_starts_a_drain(target: str, tmp_path: 
             world.target = target
             await world.ticks(4)
 
-            # No termination hook was completed and the engine runs: the serving duties go on.
+            # The serving duties go on, a heartbeat at each of the four ticks: a reading does not
+            # wait for the heartbeat of its tick, which a worker thread writes beside it.
+            await until(lambda: len(world.beats) == 5)
+            # No termination hook was completed, and the engine runs.
             assert world.completions == [completion("launch")]
             assert "stop" not in world.calls
-            assert len(world.beats) == 5
 
     run(scenario)
 
