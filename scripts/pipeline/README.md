@@ -46,11 +46,12 @@ deployment, with the folders of pytest's import path in `PYTHONPATH` for the boo
   `GET /status` reads the pool ready or `check_wait_minutes` have passed, and stops the session it
   booked whatever the tests' result; a pool that already has a session is neither booked nor
   stopped. When the wait for a pool of the decision's file ends with the pool not ready and no
-  instance's heartbeat row written since the booking, no instance was launched: it runs no test on
-  that pool, stops its session, leaves the one line `no-capacity` in the file
-  `RHI_VERIFY_GPU_REASON_FILE` names, which the post-build phase copies as the mark `gpu-not-run`,
-  and exits with the result of its other runs. With such a row, or when the table cannot tell, the
-  tests run and their failure is the script's.
+  instance's heartbeat row written since the booking, which it looks for through the wait and at
+  its end, no instance was launched: it runs no test on that pool, stops its session and exits with
+  the result of its other runs. When that is 0, it leaves the one line `no-capacity` in the file
+  `RHI_VERIFY_GPU_REASON_FILE` names, which the post-build phase copies as the mark `gpu-not-run`;
+  a script that fails leaves no reason, so that a retry's success says only what the retry ran.
+  With such a row, or when the table cannot tell, the tests run and their failure is the script's.
 - `booking.py` is what a check books a pool through: `book` writes a session of one instance, for
   the minutes and under the name it is given, with the rules of `rhi_common.sessions`, only on a
   pool that has no session booked or active; `stop` ends that session only while the item still

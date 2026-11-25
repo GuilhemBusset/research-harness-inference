@@ -18,8 +18,8 @@ in that order with `rhi_reporter.github`.
   logging `NO_NOT_RUN` and posts no such success, so that the event is invoked again: a
   verification that may have run nothing is not reported as one that passed.
 - A verification that ended in success and ran its tests is then asked whether its GPU tests ran:
-  the step leaves the mark `gpu-not-run` when it booked the coursework pool and no instance was
-  launched during its wait. With the mark, the status is a success whose description says that the
+  the step leaves the mark `gpu-not-run` when it booked the coursework pool, no instance was
+  launched during its wait and its script passed. With the mark, the status is a success whose description says that the
   mock pool's tests passed and that the GPU tests did not run for lack of capacity
   (`status.without_gpu_tests`), never `VERIFIED_DESCRIPTION`. It is read with the mark `not-run`,
   for the same statuses, and a mark that cannot be read posts no success in the same way.
@@ -100,8 +100,9 @@ an execution are the objects under `verification/<execution ID>/`, and the event
 - `not-run`: one line, the reason no test ran: `canary-missing` or `listener-off`, which the
   verification script leaves, or `parked`, which the step leaves while the system is parked;
 - `gpu-not-run`: one line, the reason the GPU tests did not run, `no-capacity`, which the
-  verification script leaves when no instance of the coursework pool was launched during its wait.
-  The mark alone says so: its line is not read into a status.
+  verification script leaves when no instance of the coursework pool was launched during its wait
+  and it exits 0: a failed attempt leaves none for the retry that passes, which has the same
+  execution ID. The mark alone says so: its line is not read into a status.
 
 A mark is first looked for by listing its key, then read: the function's role may list that
 prefix, so a mark that is not there is told from one that cannot be read. At most `MARK_BYTES` of

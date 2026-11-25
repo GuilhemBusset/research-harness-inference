@@ -24,14 +24,17 @@ the table's logical ID in the pools stack. When the decision's file names the co
 script then books that pool the same way, for its run of the tests on it. The pools the script may
 book are `BOOKED_POOLS`.
 
-**No capacity is not a failed release.** When the wait for the coursework pool ends with the pool
-not ready, the script reads the pool's rows of the heartbeats table: with no instance row written
-since the booking, no instance was launched. It then runs no test on that pool, stops its session,
-and leaves the one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names; its exit is
-that of the mock pool's run. The step's post-build phase copies the file, when there is one, to the
-object `verification/<execution ID>/gpu-not-run`, the mark by which the reporter gives the
-verification's success the description of one whose GPU tests did not run for lack of capacity
-(`rhi_reporter.status`). An instance that was launched and does not serve is a failed run, below.
+**No capacity is not a failed release.** Through the wait for the coursework pool and at its end,
+while the pool is not ready, the script reads the pool's rows of the heartbeats table: with no
+instance row written since the booking, no instance was launched. It then runs no test on that
+pool and stops its session; its exit is that of the mock pool's run, and when that run passed it
+leaves the one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names. The step's
+post-build phase copies the file, when there is one, to the object
+`verification/<execution ID>/gpu-not-run`, the mark by which the reporter gives the verification's
+success the description of one whose GPU tests did not run for lack of capacity
+(`rhi_reporter.status`). A script that fails leaves no such file: a retry of the stage keeps the
+execution's ID, the role may not delete a mark, and the retry's success must say what the retry
+ran. An instance that was launched and does not serve is a failed run, below.
 
 **How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, a refresh
 and two runs of the tests, and `check_wait_minutes` more for each pool of `BOOKED_POOLS`, the

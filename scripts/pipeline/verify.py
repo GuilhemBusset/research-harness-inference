@@ -57,24 +57,31 @@ release (`docs/design/evidence.md`, E32). So when the wait for a pool of the dec
 and the pool does not read ready, the script asks whether an instance was launched at all: the
 lifecycle agent writes its instance's heartbeat row from the first stage of a launch, so the script
 queries the pool's instance rows of the table `RHI_VERIFY_HEARTBEATS_TABLE` names for one written
-at the booking's time or after it, `written_at`, with a strongly consistent read, so that a row
-written as the wait ended is seen. Three cases:
+at the booking's time or after it, `written_at`. It reads every page of the answer, with a strongly
+consistent read, so that a row written as the wait ended is seen. A row does not outlast its
+instance by more than an hour, and a wait may be longer: so the script also asks through the wait,
+every `LAUNCH_POLL_SECONDS` while the pool does not read ready, and a launch it saw once stays
+seen. Three cases:
 
 - the pool reads ready: the tests run, and their result stands;
-- the pool does not read ready and the query, which read every instance row of the pool, found none
-  written since the booking: no instance was launched. No test runs on that pool, its session is
-  stopped, and the script leaves the one line `no-capacity` in the file
+- the pool does not read ready and no query, through the wait or at its end, found a row written
+  since the booking: no instance was launched. No test runs on that pool, its session is stopped,
+  and that pool adds nothing to the script's exit, which is that of its other runs. When that exit
+  is 0, the mock pool's tests passed, the script leaves the one line `no-capacity` in the file
   `RHI_VERIFY_GPU_REASON_FILE` names, which the step's post-build phase copies to where the
-  reporter reads that the GPU tests did not run. That pool adds nothing to the script's exit, which
-  is that of its other runs: 0 when the mock pool's tests passed;
+  reporter reads that the GPU tests did not run;
 - the pool does not read ready and a row was written since the booking: an instance was launched
   and does not serve. The tests run and fail, and the last stages are left, below.
 
-Only that query's own answer says that no instance was launched. Without the table's name, when
-the table cannot be read, or when the pool's rows are more than `ROW_PAGES` pages, the script
-cannot tell, says so in a line of its own, and runs the tests: a launched instance is never
-reported as a lack of capacity. Without `RHI_VERIFY_GPU_REASON_FILE`, the reason cannot be left,
-and the script fails.
+Only the queries' own answers say that no instance was launched. Without the table's name, or when
+one of them could not read the table, the script cannot tell, says so in a line of its own, and
+runs the tests: a launched instance is never reported as a lack of capacity. Without
+`RHI_VERIFY_GPU_REASON_FILE`, the reason cannot be left, and the script fails.
+
+The reason is the word of a script that passed, and of no other. The reporter reads it for a
+verification that succeeded, by the execution's ID, which a retry of the stage keeps, and the step
+may not remove what an earlier attempt copied. So a script that fails leaves no reason, whatever
+its pools had: the attempt that then passes says by itself whether its GPU tests ran.
 
 **When no test runs.** Two states of a correct deployment leave nothing to test: the endpoint has
 no HTTPS listener yet, which its address reading `none` says, or the canary's secret does not
@@ -195,8 +202,12 @@ SOURCE_ATTRIBUTE = "source"
 INSTANCE_SOURCE = "instance#"
 STAGE_ATTRIBUTE = "stage"
 WRITTEN_AT_ATTRIBUTE = "written_at"
-# At most this many pages of a pool's rows are read.
+# At most this many pages of a pool's rows are read for the instances' last stages.
 ROW_PAGES = 10
+# Between two queries for a launch while the script waits for a pool of the decision's file: far
+# less than a row lasts after its last writing (`rhi_common.records.EXPIRY_SECONDS`), so a row
+# written during the wait is seen before it expires.
+LAUNCH_POLL_SECONDS = 60.0
 
 # What the endpoint's output reads while there is no HTTPS listener (`rhi.gateway.stack`), and the
 # pools' output while there is no pool (`rhi.pools.stack`).
@@ -312,9 +323,8 @@ def launched_since(client: Any, table: str, pool: str, since: int) -> bool:
     """Whether an instance of `pool` wrote its heartbeat row at the time `since` or after it, in
     seconds since the epoch: the pool's instance rows of the heartbeats table `table`, counted with
     `client`, a DynamoDB client of the AWS SDK, in a strongly consistent read, so that a row
-    written a moment ago is counted. False only once every instance row of the pool was read and
-    none is that recent: an answer without a count, or rows of more than `ROW_PAGES` pages, read as
-    a launch."""
+    written a moment ago is counted. False only once every page of the pool's instance rows was
+    read and none is that recent; an answer without a count reads as a launch."""
     request: dict[str, Any] = {
         "TableName": table,
         "ConsistentRead": True,
@@ -332,14 +342,13 @@ def launched_since(client: Any, table: str, pool: str, since: int) -> bool:
             ":since": {"N": str(since)},
         },
     }
-    for _ in range(ROW_PAGES):
+    while True:
         answer = client.query(**request)
         if answer.get("Count") != 0:
             return True
         if "LastEvaluatedKey" not in answer:
             return False
         request["ExclusiveStartKey"] = answer["LastEvaluatedKey"]
-    return True
 
 
 def was_launched(env: Mapping[str, str], pool: str, since: int, client: Any = None) -> bool:
@@ -550,6 +559,32 @@ def wait_until_ready(
     return False
 
 
+class Launches:
+    """Whether an instance of a pool was launched since the time `since`, a booking's, asked of
+    `launched` through the wait for the pool and remembered: a heartbeat row may expire before a
+    long wait ends, and what it said must not. `launched` is given `since`, and says yes also when
+    it cannot tell; `clock` gives the time."""
+
+    def __init__(self, launched: Callable[[int], bool], since: int, clock: Callable[[], float]) -> None:
+        self._launched, self._since, self._clock = launched, since, clock
+        self._seen = False
+        self._asked_at: float | None = None
+
+    def look(self) -> None:
+        """During the wait: asks, unless a launch was seen already or the last asking is less than
+        `LAUNCH_POLL_SECONDS` old."""
+        now = self._clock()
+        if self._seen or (self._asked_at is not None and now - self._asked_at < LAUNCH_POLL_SECONDS):
+            return
+        self._asked_at = now
+        self._seen = self._launched(self._since)
+
+    def seen(self) -> bool:
+        """Once the wait is over: whether a launch was seen during it, or is seen now."""
+        self._seen = self._seen or self._launched(self._since)
+        return self._seen
+
+
 @dataclass(frozen=True)
 class Outcome:
     """What became of a pool's run of the tests: the run's exit, `None` when no run was made;
@@ -578,8 +613,10 @@ def run_in_a_session(
     already has a session is neither booked nor stopped, and the run is made at once. A pool that
     cannot be booked gets no run. `status` reads the pool's state in the seconds it is given. With
     `launched`, which says whether an instance of the pool was launched since the time it is
-    given: when the wait ends, the pool does not read ready and `launched` says none was since the
-    booking, no run is made, for lack of capacity. Without it, the run is made when the wait ends."""
+    given: it is asked through the wait, while the pool does not read ready, and once more when the
+    wait ends; when the pool does not read ready by then and `launched` never said that an instance
+    was launched since the booking, no run is made, for lack of capacity. Without it, the run is
+    made when the wait ends."""
     # Here and not at the top: the script's paths that book nothing, and the run of the tests that
     # loads this file as its plugin, need no import path.
     import booking
@@ -612,13 +649,22 @@ def run_in_a_session(
     # Flushed: the wait that follows may be long, and the log says what the step waits for.
     print(f"{NAME}: booked the pool {pool} for {minutes} minutes", flush=True)
     exit_code, no_capacity = None, False
+    launches = None if launched is None else Launches(launched, session.set_at, clock)
+
+    def read(within: float) -> str | None:
+        """The pool's state, and a look for a launch while it does not read ready."""
+        state = status(within)
+        if state != READY and launches is not None:
+            launches.look()
+        return state
+
     try:
         until = session.set_at + check.wait_minutes * MINUTE_SECONDS
-        if wait_until_ready(status, until=until, sleep=sleep, clock=clock):
+        if wait_until_ready(read, until=until, sleep=sleep, clock=clock):
             print(f"{NAME}: the pool {pool} reads ready")
             exit_code = run()
-        elif launched is not None and not launched(session.set_at):
-            # Only here: the query read every row of the pool and found none since the booking.
+        elif launches is not None and not launches.seen():
+            # Only here: every query read every row of the pool and found none since the booking.
             no_capacity = True
             waited = f"no instance of the pool {pool} was launched in {check.wait_minutes} minutes"
             print(f"{NAME}: {waited}: its tests are not run, for lack of capacity")
@@ -659,11 +705,11 @@ def main(
     build's own credentials and region make it. `run` runs the smoke tests in the environment it is
     given: once on the mock pool, then once on each pool the decision left, each in a session the
     script books and stops. A pool the decision left on which no instance was launched during the
-    wait gets no run: its reason is left for the step's post-build phase, and the exit is that of
-    the other runs. `status` reads the state of the pool it is given in the seconds it is given,
-    from the endpoint's `GET /status` when left out; `sleep` waits that many seconds and `clock`
-    gives the time, in seconds since the epoch. When a run fails, the last stage each instance of
-    the tested pools reached is left for the step's post-build phase."""
+    wait gets no run, and the exit is that of the other runs: when it is 0, the reason is left for
+    the step's post-build phase. `status` reads the state of the pool it is given in the seconds it
+    is given, from the endpoint's `GET /status` when left out; `sleep` waits that many seconds and
+    `clock` gives the time, in seconds since the epoch. When a run fails, the last stage each
+    instance of the tested pools reached is left for the step's post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
     if not endpoint:
@@ -718,21 +764,29 @@ def main(
     on_mock = in_a_session(MOCK_POOL, given, told_of_launches=False)
     if on_mock.exit_code is None:
         return 1
-    exits, in_order = [on_mock.exit_code], on_mock.in_order
+    exits, in_order, no_capacity = [on_mock.exit_code], on_mock.in_order, False
     for pool in passes:
         on_pool = in_a_session(pool, {**given, POOL_VARIABLE: pool}, told_of_launches=True)
         in_order = in_order and on_pool.in_order
         if on_pool.no_capacity:
-            # No instance was launched: the pool adds its reason, and nothing to the exit once it is left.
-            exits.append(gpu_not_run(NO_CAPACITY, env))
+            # No instance was launched: the pool adds nothing to the exit.
+            no_capacity = True
         else:
             # A pool that could not be booked got no run: that fails the script.
             exits.append(1 if on_pool.exit_code is None else on_pool.exit_code)
     exit_code = next((code for code in exits if code != 0), 0)
     if exit_code != 0:
         leave_last_stages(env, pools, dynamodb)
-    # A session the script booked and could not stop fails a verification whose tests passed.
-    return exit_code if exit_code != 0 or in_order else 1
+    elif not in_order:
+        # A session the script booked and could not stop fails a verification whose tests passed.
+        exit_code = 1
+    if not no_capacity:
+        return exit_code
+    if exit_code != 0:
+        # The reason is read for a verification that passed, and a retry would find this one's.
+        print(f"{NAME}: the script fails: it leaves no reason the GPU tests were not run")
+        return exit_code
+    return gpu_not_run(NO_CAPACITY, env)
 
 
 if __name__ == "__main__":

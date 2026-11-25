@@ -10,8 +10,9 @@ Around each run the script books the run's pool, waits until the gateway's statu
 or the wait is over, and stops the session it booked, also when the tests fail; a pool that already
 has a session is neither booked nor stopped. On a pool the decision left, a wait that ends with the
 pool not ready and no instance's heartbeat row written since the booking runs no test: the script
-leaves `no-capacity`, stops its session and exits with the result of its other runs; with such a
-row, or when it cannot tell, the tests run and their failure is the script's.
+stops its session and exits with the result of its other runs, and leaves `no-capacity` when that
+is a pass; with such a row, also one that expired before the wait ended, or when it cannot tell,
+the tests run and their failure is the script's.
 
 A stand-in for the Secrets Manager client replaces AWS, and moto holds the heartbeats table and
 the pool-state table in process: no account, no credentials, no network. A clock the test controls
@@ -146,8 +147,10 @@ def verification(environ: Mapping[str, str], clock: Clock | None = None, **given
         "status": lambda pool, within: "ready",
         "cloudformation": Stacks(),
         "resource": boto3.resource("dynamodb", region_name=REGION),
+        "sleep": clock.sleep,
+        "clock": clock.time,
     }
-    return verify.main({**BOOKING, **environ}, sleep=clock.sleep, clock=clock.time, **{**stand_ins, **given})
+    return verify.main({**BOOKING, **environ}, **{**stand_ins, **given})
 
 
 @pytest.mark.parametrize("held", [None, "", " \n"], ids=["no secret", "an empty secret", "a blank secret"])
@@ -685,12 +688,31 @@ class Asked:
 WAIT_ENDS = NOW + 45 * 60
 
 
+class Lifetimes(Clock):
+    """A clock whose `sleep` also puts each of `rows` in the heartbeats table when its `written_at`
+    comes, and removes it when its `expires_at` does: DynamoDB at its promptest."""
+
+    def __init__(self, *rows: dict[str, Any]) -> None:
+        super().__init__()
+        self.rows = rows
+
+    def sleep(self, seconds: float) -> None:
+        before = self.now
+        super().sleep(seconds)
+        table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+        for row in self.rows:
+            if before < row["written_at"] <= self.now:
+                table.put_item(Item=row)
+            if before < row["expires_at"] <= self.now:
+                table.delete_item(Key={"pool": row["pool"], "source": row["source"]})
+
+
 def on_a_pool_that_is_not_ready(
-    tmp_path: Path, run: PoolRuns, dynamodb: Any, **changes: str
+    tmp_path: Path, run: PoolRuns, dynamodb: Any, clock: Clock | None = None, /, **changes: str
 ) -> tuple[int, str | None, str | None]:
     """The script's exit once the decision left the coursework pool, whose state never reads ready
-    while the mock pool's does; what it left as the reason its GPU tests did not run, and as the
-    instances' last stages, None for no file."""
+    while the mock pool's does, on `clock` when one is given; what it left as the reason its GPU
+    tests did not run, and as the instances' last stages, None for no file."""
     named, reason, stages = tmp_path / "gpu-pools", tmp_path / "build" / "gpu-not-run", tmp_path / "last-stages"
     named.write_text("coursework\n", encoding="utf-8")
     for left in (reason, stages):
@@ -706,6 +728,7 @@ def on_a_pool_that_is_not_ready(
     }
     exited = verification(
         {name: value for name, value in environ.items() if value},
+        clock,
         client=Secrets(a_key()),
         run=run,
         dynamodb=dynamodb,
@@ -724,12 +747,10 @@ def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capa
 ) -> None:
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
     # What says nothing of a launch on the coursework pool since the booking: the rows of instances
-    # it had before, an instance another pool launched, and a gateway task's own heartbeat.
-    for _, item in (
-        instance_row("coursework", "serving", NOW - 1),
-        instance_row("coursework", "weights", NOW - 3600),
-        instance_row("mock", "boot", NOW + 60),
-    ):
+    # it had before, however many pages they fill, an instance another pool launched, and a gateway
+    # task's own heartbeat.
+    before = [instance_row("coursework", "serving", NOW - 1) for _ in range(verify.ROW_PAGES + 1)]
+    for _, item in (*before, instance_row("coursework", "weights", NOW - 3600), instance_row("mock", "boot", NOW + 60)):
         table.put_item(Item=item)
     task = GatewayHeartbeat(task="task-1", pool="coursework", in_flight=0, held=0, last_request_at=None, written_at=NOW)
     table.put_item(Item=task.to_item())
@@ -737,8 +758,10 @@ def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capa
 
     exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, OneRowAPage(heartbeats) if paged else heartbeats)
 
-    # The one line, no test on the pool, and the exit of the other run, the mock pool's.
-    assert (exited, reason) == (on_mock, "no-capacity\n")
+    # No test on the pool, and the exit of the other run, the mock pool's. The one line is the
+    # word of a script that passed: a failed attempt leaves none for the retry that passes, whose
+    # success would read as one whose GPU tests did not run.
+    assert (exited, reason) == (on_mock, "no-capacity\n" if on_mock == 0 else None)
     assert run.pools == [None]
     # The session the script booked on the pool is stopped when the wait ends.
     stopped = session_of(pool_state, "coursework")
@@ -746,15 +769,18 @@ def test_with_no_row_written_since_the_booking_no_gpu_test_runs_for_lack_of_capa
     assert stopped.set_by == "pipeline/verify"
 
 
-@pytest.mark.parametrize("written_at", [NOW, WAIT_ENDS - 1], ids=["at the booking", "as the wait ends"])
+@pytest.mark.parametrize("written_at", [NOW, WAIT_ENDS], ids=["at the booking", "as the wait ends"])
 def test_with_a_row_written_since_the_booking_the_gpu_tests_run_and_their_failure_is_the_exit(
     tmp_path: Path, pool_state: Any, heartbeats: Any, written_at: int
 ) -> None:
     table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
-    table.put_item(Item=instance_row("coursework", "weights", written_at)[1])
+    row = instance_row("coursework", "weights", written_at)[1]
+    # The row is there from the time it is written at: at the booking, or not before the wait's last moment.
+    if written_at == NOW:
+        table.put_item(Item=row)
     run, asked = PoolRuns(coursework=3), Asked(heartbeats)
 
-    exited, reason, stages = on_a_pool_that_is_not_ready(tmp_path, run, asked)
+    exited, reason, stages = on_a_pool_that_is_not_ready(tmp_path, run, asked, Lifetimes(row))
 
     # An instance was launched and does not serve: the tests run, fail, and say where it stopped.
     assert (exited, reason, stages) == (3, None, "weights\n")
@@ -766,26 +792,39 @@ def test_with_a_row_written_since_the_booking_the_gpu_tests_run_and_their_failur
     assert stopped is not None and (stopped.starts_at, stopped.ends_at) == (NOW, WAIT_ENDS)
 
 
+def test_a_launch_is_not_forgotten_when_its_row_expires_before_the_wait_ends(
+    tmp_path: Path, pool_state: Any, heartbeats: Any
+) -> None:
+    # A wait of two hours. An instance is launched a minute after the booking, writes its row once
+    # and never serves; the row expires an hour later, before the wait ends.
+    row = instance_row("coursework", "boot", NOW + 60)[1]
+    assert row["expires_at"] < NOW + 120 * 60
+    run, clock = PoolRuns(coursework=3), Lifetimes(row)
+
+    exited, reason, _ = on_a_pool_that_is_not_ready(
+        tmp_path, run, heartbeats, clock, **{verify.CHECK_WAIT_MINUTES_VARIABLE: "120"}
+    )
+
+    # The table holds no row of the pool when the wait ends, and the launch still counts.
+    assert heartbeats.scan(TableName=TABLE)["Items"] == [] and clock.now >= NOW + 120 * 60
+    assert (exited, reason) == (3, None)
+    assert run.pools == [None, "coursework"]
+
+
 class RefusesQueries:
     def query(self, **_request: Any) -> dict[str, Any]:
         raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "said by AWS"}}, "Query")
 
 
-@pytest.mark.parametrize("cannot_tell", ["a table that cannot be read", "no table named", "more rows than are read"])
+@pytest.mark.parametrize("cannot_tell", ["a table that cannot be read", "no table named"])
 def test_only_the_table_s_own_answer_says_that_no_instance_was_launched(
     tmp_path: Path, pool_state: Any, heartbeats: Any, capsys: pytest.CaptureFixture[str], cannot_tell: str
 ) -> None:
     dynamodb, changes = heartbeats, {}
     if cannot_tell == "a table that cannot be read":
         dynamodb = RefusesQueries()
-    elif cannot_tell == "no table named":
-        changes = {verify.HEARTBEATS_TABLE_VARIABLE: ""}
     else:
-        # Rows from before the booking, one a page, on more pages than the script reads.
-        table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
-        for _ in range(verify.ROW_PAGES + 1):
-            table.put_item(Item=instance_row("coursework", "serving", NOW - 60)[1])
-        dynamodb = OneRowAPage(heartbeats)
+        changes = {verify.HEARTBEATS_TABLE_VARIABLE: ""}
     run = PoolRuns(coursework=4)
 
     exited, reason, _ = on_a_pool_that_is_not_ready(tmp_path, run, dynamodb, **changes)
