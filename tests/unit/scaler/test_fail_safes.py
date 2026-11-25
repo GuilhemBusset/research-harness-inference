@@ -1,16 +1,17 @@
-"""The scaler's fail-safes (`rhi_scaler.decide`): a silent gateway, and a launch that fails every time."""
+"""The scaler's launch loop (`rhi_scaler.decide`): a launch that fails every time."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
+from rhi_common.records import Mode, Session
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
 NOW = 1_800_000_000
 MINUTE = 60
+HOUR = 3600
 
 POOL = parse_pools(
     {
@@ -31,80 +32,68 @@ AT_ZERO = Supply(desired=0)
 ONE = Supply(desired=1, in_service=("instance-a",), draining=("instance-w",), running=("instance-a", "instance-w"))
 
 
-def gateway(now: int, *, held: int = 0, in_flight: int = 0) -> GatewayHeartbeat:
-    return GatewayHeartbeat("task-1", POOL.name, in_flight, held, now, now)
+def session(instances: int = 1) -> Session:
+    """A session of the pool, active through every run below."""
+    return Session(POOL.name, instances, NOW - HOUR, NOW + 6 * HOUR, set_by="instructor", set_at=NOW - 2 * HOUR)
 
 
-def busy(now: int) -> InstanceHeartbeat:
-    return InstanceHeartbeat("instance-a", POOL.name, 3, 0, "sha256:" + "ab" * 32, "rev-1", "serving", now)
-
-
-def run(supply: Supply, now: int = NOW, *gateways: GatewayHeartbeat, **fields: object) -> PoolDecision:
-    pool = replace(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=supply, gateway_heartbeats=gateways), **fields)
+def run(supply: Supply, now: int = NOW, **fields: object) -> PoolDecision:
+    """One run at `now` of a pool whose session asks for one instance, unless `fields` give another."""
+    pool = replace(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=supply, session=session()), **fields)
     return decide(Inputs(now=now, pools=(pool,))).pools[0]
 
 
-def test_a_silent_gateway_takes_the_pool_to_zero() -> None:
-    # The last gateway heartbeat was seen at NOW and kept in the memory; none is fresh after it.
-    seen = run(ONE, NOW, gateway(NOW, in_flight=3))
-    assert seen.memory.last_gateway_at == NOW
-    for mode in (Mode.ENABLED, Mode.DISABLED):
-        later = NOW + 10 * MINUTE
-        silent = run(ONE, later, mode=mode, instance_heartbeats=(busy(later),), memory=seen.memory)
-        # Zero even with an instance busy, every instance named.
-        assert (silent.desired, silent.reason) == (0, Reason.GATEWAY_SILENT)
-        assert silent.lift_protection == ("instance-a", "instance-w")
-        assert silent.memory.last_gateway_at == NOW
-        sooner = NOW + 10 * MINUTE - 1
-        kept = run(ONE, sooner, mode=mode, instance_heartbeats=(busy(sooner),), memory=seen.memory)
-        assert kept.desired == 1
-    # A pool at zero already is left alone.
-    assert run(AT_ZERO, NOW + 60 * MINUTE, memory=seen.memory).reason is Reason.UNCHANGED
-
-
 def test_two_abandoned_launches_change_nothing_and_the_third_suspends() -> None:
-    demand = gateway(NOW, in_flight=1)
-    unchanged = run(ONE, NOW, demand)
-    assert run(ONE, NOW, demand, abandoned_launches=2) == unchanged
+    unchanged = run(ONE, NOW)
+    assert run(ONE, NOW, abandoned_launches=2) == unchanged
     assert not unchanged.suspend_launches
 
-    third = run(ONE, NOW, demand, abandoned_launches=3)
+    third = run(ONE, NOW, abandoned_launches=3)
     assert (third.desired, third.suspend_launches, third.reason) == (1, True, Reason.LAUNCH_SUSPENDED)
     assert (third.memory.launch_suspended, third.memory.suspended_at) == (True, NOW)
-    # A suspended pool that is full does not grow either.
-    full = run(
-        ONE, NOW + MINUTE, gateway(NOW + MINUTE, in_flight=8), memory=replace(third.memory, above_target_since=NOW)
-    )
-    assert (full.desired, full.suspend_launches, full.reason) == (1, True, Reason.LAUNCH_SUSPENDED)
+    # A suspended pool whose session asks for more is not raised, in that run or after it.
+    more = run(ONE, NOW, session=session(3), abandoned_launches=3)
+    assert (more.requested, more.desired, more.suspend_launches, more.reason) == (3, 1, True, Reason.LAUNCH_SUSPENDED)
+    later = run(ONE, NOW + MINUTE, session=session(3), memory=third.memory)
+    assert (later.desired, later.suspend_launches, later.reason) == (1, True, Reason.LAUNCH_SUSPENDED)
+    # Nor is it when more instances are in service than the session asks for: the one beyond its
+    # number is named (none reports its load, so the first by name), and the reason is still that
+    # the pool is not raised.
+    names = ("instance-a", "instance-b", "instance-c")
+    above = run(Supply(desired=1, in_service=names, running=names), NOW + MINUTE, session=session(2), memory=third.memory)
+    assert (above.desired, above.lift_protection, above.reason) == (1, ("instance-a",), Reason.LAUNCH_SUSPENDED)
 
 
 def test_a_suspended_pool_stays_suspended() -> None:
     memory = run(AT_ZERO, NOW, abandoned_launches=3).memory
     assert memory.launch_suspended
-    # Held requests, run after run, with the abandon count back to zero: nothing wakes the pool.
+    # The session asks for an instance, run after run, with the abandon count back to zero: the
+    # pool is not raised.
     for minutes in (1, 5, 60):
         now = NOW + minutes * MINUTE
-        asleep = run(AT_ZERO, now, gateway(now, held=4), memory=memory)
+        asleep = run(AT_ZERO, now, memory=memory)
         assert (asleep.desired, asleep.suspend_launches, asleep.reason) == (0, True, Reason.LAUNCH_SUSPENDED)
         memory = asleep.memory
         assert memory.launch_suspended
+    # A size that goes down still does: the session is over, and the instance in service leaves.
+    over = run(ONE, NOW + 61 * MINUTE, session=None, memory=memory)
+    assert (over.desired, over.lift_protection, over.reason) == (0, ("instance-a",), Reason.RELEASE)
+    assert over.suspend_launches and over.memory.launch_suspended
 
     # The admin clears the mark. The edge still counts the three old abandons.
     now = NOW + 90 * MINUTE
-    woken = run(
-        AT_ZERO, now, gateway(now, held=1), abandoned_launches=3, memory=replace(memory, launch_suspended=False)
-    )
-    assert (woken.desired, woken.suspend_launches, woken.reason) == (1, False, Reason.WAKE)
-    assert woken.memory.abandons_counted_from == now
-    assert not woken.memory.launch_suspended
+    raised = run(AT_ZERO, now, abandoned_launches=3, memory=replace(memory, launch_suspended=False))
+    assert (raised.desired, raised.suspend_launches, raised.reason) == (1, False, Reason.PROVISION)
+    assert raised.memory.abandons_counted_from == now
+    assert not raised.memory.launch_suspended
 
 
 def test_only_three_new_abandons_suspend_again() -> None:
     cleared_at = NOW + 90 * MINUTE
-    memory = Memory(abandons_counted_from=cleared_at, last_gateway_at=NOW)
-    two = run(ONE, NOW + 100 * MINUTE, gateway(NOW + 100 * MINUTE), abandoned_launches=2, memory=memory)
+    memory = Memory(abandons_counted_from=cleared_at)
+    two = run(ONE, NOW + 100 * MINUTE, abandoned_launches=2, memory=memory)
     assert not two.suspend_launches
     assert two.memory.abandons_counted_from == cleared_at
-    three = run(ONE, NOW + 110 * MINUTE, gateway(NOW + 110 * MINUTE), abandoned_launches=3, memory=two.memory)
+    three = run(ONE, NOW + 110 * MINUTE, abandoned_launches=3, memory=two.memory)
     assert three.suspend_launches
     assert three.memory.launch_suspended

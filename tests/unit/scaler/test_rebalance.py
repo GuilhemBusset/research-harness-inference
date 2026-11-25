@@ -10,7 +10,7 @@ from boto3.dynamodb.types import TypeSerializer
 from botocore.stub import ANY, Stubber
 
 from rhi_common.pool_config import Pool, parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, Session
 from rhi_scaler.aws_io import (
     Clients,
     PoolSettings,
@@ -45,20 +45,26 @@ BELOW_HALF, AT_HALF = ("instance-b", 3, 0), ("instance-b", 4, 0)
 Report = tuple[str, int, int]
 
 
+def session(instances: int = 2) -> Session:
+    """A session of the pool, active through every run below."""
+    return Session(POOL.name, instances, T - 3600, T + 3600, set_by="instructor", set_at=T - 7200)
+
+
 def instance_heartbeat(report: Report, now: int) -> InstanceHeartbeat:
     name, running, waiting = report
     return InstanceHeartbeat(name, POOL.name, running, waiting, "sha256:" + "ab" * 32, "rev-1", "serving", now)
 
 
-def run(now: int, supply: Supply, *reports: Report, memory: Memory, in_flight: int = 13, pool: Pool = POOL) -> PoolDecision:
-    """One run at `now`: one gateway task and the instances' reports (name, running, waiting), written at `now`."""
+def run(now: int, supply: Supply, *reports: Report, memory: Memory, instances: int = 2, pool: Pool = POOL) -> PoolDecision:
+    """One run at `now` of a pool whose session asks for `instances`: the instances' reports
+    (name, running, waiting), written at `now`."""
     inputs = PoolInputs(
         config=pool,
         mode=Mode.ENABLED,
         supply=supply,
-        gateway_heartbeats=(GatewayHeartbeat("task-0", pool.name, in_flight, 0, now, now),),
         instance_heartbeats=tuple(instance_heartbeat(report, now) for report in reports),
         memory=memory,
+        session=session(instances),
     )
     (decision,) = decide(Inputs(now=now, pools=(inputs,))).pools
     return decision
@@ -96,12 +102,10 @@ def test_one_instance_queues_while_another_has_room() -> None:
     # A run that sees no waiting starts the 60 seconds again.
     paused = numbers({0: lopsided, 30: (("instance-a", 8, 0), BELOW_HALF), 60: lopsided, 119: lopsided, 120: lopsided})
     assert [paused[seconds][0] for seconds in (60, 119, 120)] == [0, 0, 1]
-    # The other instance is another one, and what it reports waiting does not matter. The pool is
-    # at its largest here, so that no other rule gives these runs a reason.
-    largest = parse_pools({"coursework": {**ENTRY, "max_instances": 2}})[0]
+    # The other instance is another one, and what it reports waiting does not matter.
     alone, both_wait = (("instance-a", 3, 1),), (WAITS, ("instance-b", 3, 1))
-    assert numbers({0: alone, 60: alone}, largest)[60] == (0, Reason.UNCHANGED, 2)
-    assert numbers({0: both_wait, 60: both_wait}, largest)[60] == (1, Reason.REBALANCE, 2)
+    assert numbers({0: alone, 60: alone})[60] == (0, Reason.UNCHANGED, 2)
+    assert numbers({0: both_wait, 60: both_wait})[60] == (1, Reason.REBALANCE, 2)
 
     # The least time between two numbers is the pool's setting.
     slow = parse_pools({"coursework": {**ENTRY, "rebalance_interval_seconds": 90}})[0]
@@ -110,28 +114,29 @@ def test_one_instance_queues_while_another_has_room() -> None:
 
 
 def test_the_other_rules_decide_the_capacity() -> None:
-    # 17 in flight on two instances is above the target, and instance a waits beside one below
-    # half: after 60 seconds the pool grows as it would without the rule, and the number goes up.
+    # Instance a waits beside one below half, and after 60 seconds the session asks for a third
+    # instance: the pool is raised as it would be without the rule, and the number goes up.
     crowded, roomy = ("instance-a", 8, 6), BELOW_HALF
-    first = run(T, TWO, crowded, roomy, memory=Memory(), in_flight=17)
-    both = run(T + 60, TWO, crowded, roomy, memory=first.memory, in_flight=17)
-    assert (both.desired, both.reason, both.rebalance_number) == (3, Reason.SCALE_OUT, 1)
-    first = run(T, TWO, crowded, AT_HALF, memory=Memory(), in_flight=17)
-    without = run(T + 60, TWO, crowded, AT_HALF, memory=first.memory, in_flight=17)
-    assert (without.desired, without.reason, without.rebalance_number) == (3, Reason.SCALE_OUT, 0)
+    first = run(T, TWO, crowded, roomy, memory=Memory())
+    both = run(T + 60, TWO, crowded, roomy, memory=first.memory, instances=3)
+    assert (both.desired, both.reason, both.rebalance_number) == (3, Reason.PROVISION, 1)
+    first = run(T, TWO, crowded, AT_HALF, memory=Memory())
+    without = run(T + 60, TWO, crowded, AT_HALF, memory=first.memory, instances=3)
+    assert (without.desired, without.reason, without.rebalance_number) == (3, Reason.PROVISION, 0)
 
 
 def test_a_pool_that_has_just_grown() -> None:
     one = Supply(desired=1, in_service=("instance-a",), running=("instance-a",))
-    first = run(T, one, WAITS, memory=Memory(), in_flight=10)
-    grown = run(T + 60, one, WAITS, memory=first.memory, in_flight=10)
-    assert (grown.desired, grown.reason, grown.rebalance_number) == (2, Reason.SCALE_OUT, 0)
+    first = run(T, one, WAITS, memory=Memory(), instances=1)
+    # The session is raised to two.
+    grown = run(T + 60, one, WAITS, memory=first.memory)
+    assert (grown.desired, grown.reason, grown.rebalance_number) == (2, Reason.PROVISION, 0)
     # The new instance starts: nothing to move students to yet.
     starting = Supply(desired=2, in_service=("instance-a",), starting=("instance-b",), running=("instance-a", "instance-b"))
-    pending = run(T + 120, starting, WAITS, memory=grown.memory, in_flight=10)
+    pending = run(T + 120, starting, WAITS, memory=grown.memory)
     assert (pending.desired, pending.reason, pending.rebalance_number) == (2, Reason.UNCHANGED, 0)
     # The first run that sees it in service with nothing running: instance a has waited all along.
-    joined = run(T + 180, TWO, WAITS, ("instance-b", 0, 0), memory=pending.memory, in_flight=10)
+    joined = run(T + 180, TWO, WAITS, ("instance-b", 0, 0), memory=pending.memory)
     assert (joined.desired, joined.lift_protection, joined.reason, joined.rebalance_number) == (2, (), Reason.REBALANCE, 1)
 
 
@@ -175,8 +180,8 @@ def test_the_number_reaches_the_note() -> None:
             autoscaling.add_response("describe_auto_scaling_groups", {"AutoScalingGroups": [group]}, {"AutoScalingGroupNames": ["group"]})
             autoscaling.add_response("describe_scaling_activities", {"Activities": []}, name)
             elbv2.add_response("describe_target_health", {"TargetHealthDescriptions": health}, {"TargetGroupArn": "targets"})
-            # The pool-state table holds what the run before stored.
-            for table, items in ((tables.pool_state, stored), (tables.heartbeats, heartbeats)):
+            # The pool-state table holds what the run before stored, and the pool's session of two.
+            for table, items in ((tables.pool_state, [*stored, session().to_item()]), (tables.heartbeats, heartbeats)):
                 dynamodb.add_response("query", {"Items": [serialize(item) for item in items]}, {"TableName": table, **query})
             # No session switch.
             dynamodb.add_response("get_item", {}, {"TableName": tables.pool_state, "Key": ANY, "ConsistentRead": True})
@@ -184,7 +189,7 @@ def test_the_number_reaches_the_note() -> None:
             decision = decide(read_run.inputs)
             # The two items the table must receive, exactly. No Auto Scaling call is queued: one would fail.
             note = {"pool": "coursework", "record": "note", "capacity_asked": 2, "written_at": now}
-            note |= {"requested": 0, "starting": 0, "in_service": 2, "draining": 0, "waiting": 0}
+            note |= {"requested": 2, "starting": 0, "in_service": 2, "draining": 0, "waiting": 0}
             note.update({} if number is None else {"rebalance_number": number})
             before = read_run.inputs.pools[0].memory
             stored = [note, memory_to_item("coursework", decision.pools[0].memory)]

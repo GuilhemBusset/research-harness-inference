@@ -31,7 +31,9 @@ The supply, from the lifecycle states and target health:
 | `Terminating*`, `Detaching` | draining |
 
 `running` is every instance of the group's list but one `Terminated` or `Detached`. The group keeps
-no stopped instance (section 4.5), so its list is every instance it has.
+no stopped instance (section 4.5), so its list is every instance it has. `not_serving` is every
+instance `InService` whose target is not `healthy`, which the table lists as starting or draining:
+the group protects it from scale-in as it does one that serves, so a release can name it.
 
 Abandoned launches (section 5.4). An abandoned launch is a launch activity that failed or was
 cancelled because its launch hook was abandoned. A launch that found
@@ -255,6 +257,7 @@ def _supply(group: Mapping[str, Any], health: Mapping[str, str]) -> Supply:
     starting: list[str] = []
     draining: list[str] = []
     running: list[str] = []
+    not_serving: list[str] = []
     for instance in group.get("Instances", []):
         name, state = instance["InstanceId"], instance["LifecycleState"]
         if state in ("Terminated", "Detached"):
@@ -263,6 +266,8 @@ def _supply(group: Mapping[str, Any], health: Mapping[str, str]) -> Supply:
         if state == "InService":
             target = health.get(name)
             (in_service if target == "healthy" else draining if target == "draining" else starting).append(name)
+            if target != "healthy":
+                not_serving.append(name)
         elif state.startswith("Pending"):
             starting.append(name)
         elif state.startswith(("Terminating", "Detaching")):
@@ -273,6 +278,7 @@ def _supply(group: Mapping[str, Any], health: Mapping[str, str]) -> Supply:
         starting=tuple(sorted(starting)),
         draining=tuple(sorted(draining)),
         running=tuple(sorted(set(running))),
+        not_serving=tuple(sorted(not_serving)),
     )
 
 
