@@ -1,7 +1,9 @@
 """The admin's session switch (`rhi_admin.session`), through the CLI.
 
-The pool-state table and STS are moto's; CloudFormation is stubbed and answers for the deployed
-stack's tables by logical ID.
+The pool-state table, STS and SSM, which holds the example configuration, are moto's.
+CloudFormation is stubbed and answers for the deployed stack's resources by logical ID. `status`
+prints the pools' sessions after the switch's line (`test_sessions.py`): Lambda is stubbed for it,
+and its scaler has no pool.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import pytest
 from botocore.stub import Stubber
 from moto import mock_aws
 
+from rhi import config
 from rhi_admin import main
 from rhi_admin import session as admin_session
 from rhi_common.records import SessionSwitch
@@ -22,6 +25,7 @@ from rhi_common.tables import SESSION_SWITCH_KEY
 
 NOW = 1_800_000_000
 TABLE = "deployed-pool-state"
+SCALER = "deployed-scaler"
 # moto's caller: its account, the placeholder one, is not part of who switched the session.
 WHO = "user/moto"
 
@@ -29,13 +33,13 @@ type Run = Callable[..., tuple[int, str]]
 
 
 class _Session:
-    """The caller's session, with CloudFormation stubbed."""
+    """The caller's session, with CloudFormation and Lambda stubbed."""
 
-    def __init__(self, real: Any, cloudformation: Any) -> None:
-        self.real, self.cloudformation = real, cloudformation
+    def __init__(self, real: Any, stubbed: dict[str, Any]) -> None:
+        self.real, self.stubbed = real, stubbed
 
     def client(self, name: str) -> Any:
-        return self.cloudformation if name == "cloudformation" else self.real.client(name)
+        return self.stubbed.get(name) or self.real.client(name)
 
     def resource(self, name: str) -> Any:
         return self.real.resource(name)
@@ -66,30 +70,41 @@ def run(monkeypatch: pytest.MonkeyPatch) -> Iterator[Run]:
             AttributeDefinitions=[{"AttributeName": name, "AttributeType": "S"} for name, _ in keys],
             KeySchema=[{"AttributeName": name, "KeyType": kind} for name, kind in keys],
         )
-        cloudformation = real.client("cloudformation")
-        with Stubber(cloudformation) as stub:
+        config.write_ssm(config.load({"RHI_CONFIG": "example"}), real.client("ssm"))
+        cloudformation, functions = real.client("cloudformation"), real.client("lambda")
+        with Stubber(cloudformation) as stub, Stubber(functions) as functions_stub:
             for logical_id in (main.ROSTER_LOGICAL_ID, main.KEYS_LOGICAL_ID):
                 expected = {"StackName": main.STACK_NAME, "LogicalResourceId": logical_id}
                 stub.add_response("describe_stack_resource", _detail(logical_id, f"deployed-{logical_id}"), expected)
-            admin = main.connect(_Session(real, cloudformation))
+            admin = main.connect(_Session(real, {"cloudformation": cloudformation, "lambda": functions}))
 
             def session(command: str, now: int = NOW) -> tuple[int, str]:
-                expected = {"StackName": main.POOLS_STACK_NAME, "LogicalResourceId": main.POOL_STATE_LOGICAL_ID}
-                stub.add_response("describe_stack_resource", _detail(main.POOL_STATE_LOGICAL_ID, TABLE), expected)
+                # The switch's table; then, for `status`, what the pools' sessions are read from.
+                found = [(main.POOL_STATE_LOGICAL_ID, TABLE)]
+                if command == "status":
+                    found += [(main.POOL_STATE_LOGICAL_ID, TABLE), (main.SCALER_FUNCTION_LOGICAL_ID, SCALER)]
+                    settings = {"FunctionName": SCALER, "Environment": {"Variables": {"RHI_SCALER_SETTINGS": '{"pools": {}}'}}}
+                    functions_stub.add_response("get_function_configuration", settings, {"FunctionName": SCALER})
+                for logical_id, physical_id in found:
+                    expected = {"StackName": main.POOLS_STACK_NAME, "LogicalResourceId": logical_id}
+                    stub.add_response("describe_stack_resource", _detail(logical_id, physical_id), expected)
                 out = io.StringIO()
                 status = main.run(["session", command], admin, now=now, out=out)
                 stub.assert_no_pending_responses()
+                functions_stub.assert_no_pending_responses()
                 return status, out.getvalue()
 
             yield session
 
 
 def rows(out: str) -> list[list[str]]:
-    return [line.split("\t") for line in out.splitlines()[1:]]
+    """The switch's line of `status`: the one after its header, before the pools' lines."""
+    return [line.split("\t") for line in out.splitlines()[1:2]]
 
 
 def test_the_switch_reads_off_until_switched_on_then_reads_back_who_and_when(run: Run) -> None:
-    assert rows(run("status")[1]) == [["off", "-", "-"]]
+    status, out = run("status")
+    assert (status, rows(out)) == (0, [["off", "-", "-"]])
 
     assert run("on")[0] == 0
     assert rows(run("status")[1]) == [["on", WHO, str(NOW)]]

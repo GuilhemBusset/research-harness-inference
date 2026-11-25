@@ -1,5 +1,6 @@
-"""The admin CLI: the roster, direct keys, revocation, the canary, the spikes' students and the
-pools' operating state and the session switch (system design, sections 5.6, 6.4 and 11.3).
+"""The admin CLI: the roster, direct keys, revocation, the canary, the spikes' students, the pools'
+operating state, the pools' sessions and the session switch (system design, sections 5.6, 6.4 and
+11.3).
 
 There is no public admin API: the admin runs this with their own AWS credentials, from the
 repository, and it reaches the tables directly.
@@ -21,7 +22,11 @@ repository, and it reaches the tables directly.
     pool run                                                    one run of the scaler, now
     session on                                                  the session on: the gateway serves students
     session off                                                 the session off: each pool falls to zero when idle
-    session status                                              whether a session is on, who switched it and when
+    session start <instances> (--until T | --for D)             a pool booked, from now or from --from T
+    session set [--instances N] [--from T] [--until T | --for D]
+                                                                the pool's session changed: what is given, the rest kept
+    session stop [--all]                                        the pool's session ended now, or every pool's
+    session status                                              the switch, then each pool's session and its instances
     privacy export <github-id>                                  everything kept of a student, as one JSON document
     privacy erase <github-id>                                   a student's entry, keys and usage rows deleted
 
@@ -40,7 +45,14 @@ either. Each change they make carries who made it, the caller's identity from ST
 account, and when (`rhi_admin.pools`).
 
 The commands `session` (`rhi_admin.session`) reach, once one of them runs, the same pool-state
-table, where the session switch is one item, and record who switched it the same way.
+table, where the session switch is one item and each pool's session another, and record who wrote
+them the same way. `start`, `set` and `stop` take `--pool`, and act on the configuration's default
+pool without it. A time `T` is `HH:MM`, the next time the clock of the configuration's `time_zone`
+shows it, or `YYYY-MM-DDTHH:MM` in that zone; a length `D` is a whole number followed by `m` or
+`h`, as `90m` or `6h`. The zone, the default pool and `session_max_hours` are read from the
+configuration in SSM, as the course end is, and a pool's `max_instances` from the scaler's
+function, as the commands `pool` read the deployed pools. After a write the command asks the
+scaler for a run; when one is under way it says so, and the next run is within a minute.
 
 The commands `privacy` (`rhi_admin.privacy`) reach, once one of them runs, the usage table by its
 logical ID, the gateway's log group by its logical ID in the gateway stack, and the Prometheus
@@ -63,7 +75,7 @@ from typing import Any, TextIO
 
 import boto3
 
-from rhi.config import ConfigError, read_ssm
+from rhi.config import Config, ConfigError, read_ssm
 from rhi_admin import keys as admin_keys
 from rhi_admin import pools as admin_pools
 from rhi_admin import privacy as admin_privacy
@@ -72,6 +84,7 @@ from rhi_admin import session as admin_session
 from rhi_admin.canary import CANARY_SECRET, run_canary
 from rhi_admin.roster import AdminError
 from rhi_admin.spikes import run_spike_keys
+from rhi_common.records import Session
 from rhi_common.spike_keys import SPIKE_KEYS_SECRET
 
 # The deployed stack that holds the students' tables, and their logical IDs in it.
@@ -94,7 +107,8 @@ SCALER_FUNCTION_LOGICAL_ID = "ScalerFunction8891241E"
 @dataclass(frozen=True)
 class Admin:
     """What the commands act on: the two tables, a Secrets Manager client, the course end, and
-    what the commands `pool`, `privacy` and `session` act on, each made when one of them runs."""
+    what the commands `pool`, `privacy` and `session` act on, each made when one of them runs:
+    `switch` for the session switch, `sessions` for the pools' sessions."""
 
     roster: Any
     keys: Any
@@ -103,6 +117,7 @@ class Admin:
     pools: Callable[[], admin_pools.Pools]
     privacy: Callable[[], admin_privacy.Stores]
     switch: Callable[[], admin_session.Switch]
+    sessions: Callable[[], admin_session.Sessions]
 
 
 def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -> str:
@@ -121,11 +136,14 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
     dynamodb = session.resource("dynamodb")
     ssm = session.client("ssm")
 
-    def course_end() -> datetime.date:
+    def configuration() -> Config:
         try:
-            return read_ssm(ssm).course_end
+            return read_ssm(ssm)
         except ConfigError as error:
             raise AdminError(str(error)) from None
+
+    def course_end() -> datetime.date:
+        return configuration().course_end
 
     def pools() -> admin_pools.Pools:
         sts = session.client("sts")
@@ -141,6 +159,15 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
         return admin_session.Switch(
             table=dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME)),
             caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
+        )
+
+    def sessions() -> admin_session.Sessions:
+        read = configuration()
+        return admin_session.Sessions(
+            pools=pools(),
+            time_zone=read.time_zone,
+            session_max_hours=read.session_max_hours,
+            default_pool=read.default_pool,
         )
 
     def privacy() -> admin_privacy.Stores:
@@ -162,6 +189,7 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
         pools=pools,
         privacy=privacy,
         switch=switch,
+        sessions=sessions,
     )
 
 
@@ -199,12 +227,28 @@ def parser() -> argparse.ArgumentParser:
     pool.add_parser("clear-suspension", help="clear the mark launch_suspended of a pool").add_argument("pool")
     pool.add_parser("run", help="ask the scaler to run now")
 
-    switch = commands.add_parser(
-        "session", help="the session switch: whether the endpoint serves students"
+    session = commands.add_parser(
+        "session", help="the pools' sessions, and the session switch: whether the endpoint serves students"
     ).add_subparsers(dest="command", required=True)
-    switch.add_parser("on", help="switch the session on: the gateway serves students")
-    switch.add_parser("off", help="switch the session off: each pool falls to zero by its idle rule")
-    switch.add_parser("status", help="whether a session is on, who switched it and when")
+    session.add_parser("on", help="switch the session on: the gateway serves students")
+    session.add_parser("off", help="switch the session off: each pool falls to zero by its idle rule")
+    session.add_parser("status", help="the switch, then each pool's session and what arrived of its instances")
+    a_time = "HH:MM, the next time the configured zone's clock shows it, or YYYY-MM-DDTHH:MM"
+    a_length = "a whole number followed by m or h, as 90m or 6h"
+    start = session.add_parser("start", help="book a pool: a number of instances, to an end")
+    start.add_argument("instances", type=int, help="from 1 to the pool's max_instances")
+    change = session.add_parser("set", help="change a pool's session: what is given, the rest kept")
+    change.add_argument("--instances", type=int, help="from 1 to the pool's max_instances")
+    starts = ((start, f"the start, now unless given: {a_time}"), (change, f"a start that has not passed: {a_time}"))
+    for command, start_help in starts:
+        command.add_argument("--pool", help="the pool, the configuration's default pool unless given")
+        command.add_argument("--from", dest="starts", metavar="T", help=start_help)
+        end = command.add_mutually_exclusive_group(required=command is start)
+        end.add_argument("--until", metavar="T", help=f"the end: {a_time}")
+        end.add_argument("--for", dest="length", metavar="D", help=f"the end, as a length from the start: {a_length}")
+    stop = session.add_parser("stop", help="end a pool's session now").add_mutually_exclusive_group()
+    stop.add_argument("--pool", help="the pool, the configuration's default pool unless given")
+    stop.add_argument("--all", action="store_true", help="every pool's session")
 
     privacy = commands.add_parser("privacy", help="one student's data").add_subparsers(dest="command", required=True)
     privacy.add_parser("export", help="export what is kept of a student, as JSON").add_argument("github_id", type=int)
@@ -250,12 +294,98 @@ def _session_command(command: str, switch: admin_session.Switch, now: int, out: 
         print(f"The session is already {command}, switched by {state.set_by} at {state.set_at}.", file=out)
 
 
+def _booking(session: Session, sessions: admin_session.Sessions) -> str:
+    """A session as a command says it: its instances, its start and its end in the configured zone, and who wrote it."""
+    starts, ends = (admin_session.show_time(at, time_zone=sessions.time_zone) for at in (session.starts_at, session.ends_at))
+    return f"{session.instances} instance(s) from {starts} to {ends} ({sessions.time_zone}), set by {session.set_by}"
+
+
+def _pool_session_command(
+    command: str, arguments: argparse.Namespace, sessions: admin_session.Sessions, now: int, out: TextIO
+) -> None:
+    """The commands on the pools' sessions: the pools' lines of `status`, and `start`, `set` and `stop`."""
+
+    def time(text: str | None) -> int | None:
+        return None if text is None else admin_session.read_time(text, time_zone=sessions.time_zone, now=now)
+
+    def shown(at: int | None) -> str:
+        return "-" if at is None else admin_session.show_time(at, time_zone=sessions.time_zone)
+
+    if command == "status":
+        print(
+            "pool\tsession\tinstances\tstarts_at\tends_at\tset_by\tset_at"
+            "\trequested\tasked\twaiting\twaiting_since\tstarting\tin_service\tcause",
+            file=out,
+        )
+        for line in admin_session.supply(sessions, now=now):
+            booked, note = line.session, line.note
+            if booked is None:
+                session = ["none", "-", "-", "-", "-", "-"]
+            else:
+                state = "active" if line.active else "booked"
+                written = (booked.set_by, shown(booked.set_at))
+                session = [state, str(booked.instances), shown(booked.starts_at), shown(booked.ends_at), *written]
+            # The cause is one of the scaler's four words, never text of AWS.
+            cause = "-" if note.launch_failure is None else note.launch_failure.value
+            waiting = (note.waiting, shown(note.waiting_since))
+            arrived = (note.requested, note.capacity_asked, *waiting, note.starting, note.in_service, cause)
+            print("\t".join([line.pool, *session, *map(str, arrived)]), file=out)
+        return
+    if command == "stop":
+        if arguments.all:
+            stopped = admin_session.stop_all(sessions=sessions, now=now)
+        else:
+            pool = admin_session.pool_of(arguments.pool, sessions)
+            stopped = {pool: admin_session.stop(pool, sessions=sessions, now=now)}
+        for pool, session in stopped.items():
+            if session is None:
+                print(f"The pool {pool} has no session booked or active: nothing to stop.", file=out)
+            else:
+                print(f"The session of the pool {pool} is stopped, by {session.set_by}.", file=out)
+        if not any(stopped.values()):
+            return
+    else:
+        pool = admin_session.pool_of(arguments.pool, sessions)
+        starts_at, until = time(arguments.starts), time(arguments.until)
+        length = None if arguments.length is None else admin_session.read_length(arguments.length)
+        if command == "start":
+            starts_at = now if starts_at is None else starts_at
+            # The command line requires one of --until and --for. A length counts from the start,
+            # as the longest a session may last does.
+            ends_at = starts_at + (length or 0) if until is None else until
+            session = admin_session.start(
+                pool, instances=arguments.instances, starts_at=starts_at, ends_at=ends_at, sessions=sessions, now=now
+            )
+            print(f"The pool {pool} is booked: {_booking(session, sessions)}.", file=out)
+        else:
+            if arguments.instances is None and starts_at is None and until is None and length is None:
+                raise AdminError("nothing to change: give --instances, --from, --until or --for")
+            session = admin_session.change(
+                pool,
+                sessions=sessions,
+                now=now,
+                instances=arguments.instances,
+                starts_at=starts_at,
+                ends_at=until,
+                length=length,
+            )
+            print(f"The session of the pool {pool} is changed: {_booking(session, sessions)}.", file=out)
+    if admin_session.applied(sessions):
+        print("The scaler has run: the change applies now.", file=out)
+    else:
+        print("The scaler is already running: its next run, within a minute, applies the change.", file=out)
+
+
 def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO) -> None:
     command = (arguments.group, getattr(arguments, "command", None))
     if arguments.group == "pool":
         _pool_command(arguments.command, arguments, admin.pools(), now, out)
     elif arguments.group == "session":
-        _session_command(arguments.command, admin.switch(), now, out)
+        # `on`, `off` and the first line of `status` are the switch's; the rest is the pools' sessions.
+        if arguments.command in ("on", "off", "status"):
+            _session_command(arguments.command, admin.switch(), now, out)
+        if arguments.command not in ("on", "off"):
+            _pool_session_command(arguments.command, arguments, admin.sessions(), now, out)
     elif command == ("privacy", "export"):
         document = admin_privacy.export(
             arguments.github_id, roster=admin.roster, keys=admin.keys, stores=admin.privacy(), now=now
