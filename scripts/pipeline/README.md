@@ -20,10 +20,12 @@ The scripts of the verification step (`src/rhi/pipeline/verify.py`), which runs 
 deployment, with the folders of pytest's import path in `PYTHONPATH` for the booking:
 
 - `gpu_verification.py` runs first and decides whether the execution verifies on the coursework
-  pool: yes when an instance refresh of a GPU pool's group, found by its tags `rhi-pool` and
-  `rhi-engine`, began after the execution started, which it reads from the pipeline CodeBuild
-  names in `CODEBUILD_INITIATOR`. It waits for such a refresh to end, fails when it did not end
-  `Successful`, and leaves `coursework`, or nothing, in the file `RHI_VERIFY_GPU_POOLS_FILE` names.
+  pool: yes when the release parameter of a pool whose engine is not the mock differs, in its
+  `engine_image`, `model_revision` or `engine_flags`, from its last version written before the
+  execution started, or has no such version. It reads the start from the pipeline CodeBuild names
+  in `CODEBUILD_INITIATOR`, and an earlier version of a parameter as `<name>:<version>`. It waits
+  for nothing, a deployment starts no instance refresh, and leaves `coursework`, or nothing, in
+  the file `RHI_VERIFY_GPU_POOLS_FILE` names.
 
 - `verify.py` reads the canary's key from the secret `rhi/canary-key` and runs the smoke tests of
   `tests/smoke` against the deployed endpoint, in a process of their own that takes the key from
@@ -74,7 +76,7 @@ Sundays at 04:00 UTC, with the repository's package roots in `PYTHONPATH`:
   the deployed endpoint, on the coursework pool, through `verify.py`'s runner, and stops the
   session it booked, after a failure too. A pool that already has a session is neither booked nor
   stopped: the tests run on the instances that are there. The tests are every test the
-  verification runs on that pool after a refresh, `release-heartbeat` included, whose query of the
+  verification runs on that pool after a release, `release-heartbeat` included, whose query of the
   heartbeats table the canary's role may make for the coursework pool's rows alone. It then sends
   the measurement `gpu-canary` (the verdict, `wait_seconds`, `smoke_tests_passed`,
   `smoke_tests_failed`, `no_capacity`) on the measurement bus, on the commit the job ran from,

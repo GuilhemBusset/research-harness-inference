@@ -6,12 +6,13 @@ image and runs outside the private network. A failed test fails the step, and wi
 execution (section 8.5).
 
 **The coursework pool.** Before the smoke tests, the step runs the decision of
-`scripts/pipeline/gpu_verification.py`: whether this execution deployed a GPU pool's release,
-which an instance refresh of a GPU pool's group that began after the execution started says
-(sections 4.3 and 8.2, step 6). The decision waits for such a refresh to end, and fails the step
-when it did not end well; its answer is a file, `RHI_VERIFY_GPU_POOLS_FILE`, that names
+`scripts/pipeline/gpu_verification.py`: whether this execution changed what a GPU pool serves,
+which the pool's release parameter says, compared with its last version written before the
+execution started (sections 4.3 and 8.2, step 6). A deployment starts no instance refresh, so the
+decision waits for nothing; its answer is a file, `RHI_VERIFY_GPU_POOLS_FILE`, that names
 `coursework` or nothing. Its command ends before the verification's begins, so the smoke tests
-then run on the mock pool and, when the file names it, on the coursework pool, after the refresh.
+then run on the mock pool and, when the file names it, on the coursework pool, on the instance of
+the session the script books there.
 
 **The session on each pool.** The script books the mock pool before its run of the tests on it,
 one instance under the name `pipeline/verify` for twice the configuration's `check_wait_minutes`,
@@ -42,8 +43,8 @@ reporter takes the mark for a verification's success only when it was written si
 action that succeeded started (`rhi_reporter.handler`). A retry that finds no capacity again writes
 the mark again.
 
-**How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, a refresh
-and two runs of the tests, and `check_wait_minutes` more for each pool of `BOOKED_POOLS`, the
+**How long the step runs.** Its timeout is `timeout`: `TIMEOUT`, which covers the set-up, the
+decision and two runs of the tests, and `check_wait_minutes` more for each pool of `BOOKED_POOLS`, the
 longest the script waits for the instance of each session. So the build is not cut before the waits
 are over, the tests have run and the sessions are stopped. A wait that would take the timeout beyond
 CodeBuild's limit for one build is refused at synthesis.
@@ -59,7 +60,8 @@ reference to each output, never its value:
   while the endpoint has no HTTPS listener.
 - `RHI_SMOKE_WORKSPACE_URL`: the Prometheus workspace's query address, the observability stack's.
 - `RHI_VERIFY_RELEASE_PARAMETERS`: each pool's name and the name of its release parameter, the
-  pools stack's. The script hands it to the smoke tests as the JSON they read.
+  pools stack's. The decision reads those parameters, and the script hands the names to the smoke
+  tests as the JSON they read.
 - `RHI_VERIFY_HEARTBEATS_TABLE`: the name of the stage's heartbeats table, the pools stack's too.
 
 of the stage itself, read at synthesis as text, as the hold's step reads them:
@@ -132,7 +134,8 @@ text. A logical ID holds no hyphen, so the pattern matches that one table
 **The role** may read the canary's secret, `rhi/canary-key`; query the workspace of the stage it
 verifies, which it names by the workspace's tag, since the workspace has no ID when the role is
 written (`rhi.observability.stack`); read the release parameter of each pool the stage deploys, by
-its name; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
+its name, with `ssm:GetParameter` and no other action of SSM: the decision reads an earlier version
+of a parameter with that same action, as `<name>:<version>`; read the items of the stage's heartbeats table by pool, `dynamodb:Query` and no other
 action on it; read the one stack resource that names the stage's pool-state table,
 `cloudformation:DescribeStackResource` on the pools stack; read and write, `dynamodb:GetItem` and
 `dynamodb:PutItem`, the items of that table whose partition key is the mock pool's name or the
@@ -141,9 +144,9 @@ in the form the canary's role has for the heartbeats table (`rhi.pipeline.canary
 every record of those two partitions, their sessions among them, and neither a third pool's records
 nor the session switch; and write under `verification/` of the artifact bucket. Beside that it
 holds what CDK Pipelines gives every project of the pipeline: its own logs, its own test reports
-and a read of its input in the artifact bucket. For the decision, it may also describe Auto Scaling groups and
-their instance refreshes, which AWS grants on every resource only, and list the executions of this
-pipeline, by its ARN, and of no other. Nothing else: `tests/policy/test_pipeline.py` holds it to that.
+and a read of its input in the artifact bucket. For the decision, it may also list the executions
+of this pipeline, by its ARN, and of no other. It holds no action of Auto Scaling. Nothing else:
+`tests/policy/test_pipeline.py` holds it to that.
 
 The step is a step, not a construct: CDK Pipelines creates its project and role inside the
 pipeline construct of `rhi.pipeline.stack`, whose acknowledgement file covers them.
@@ -223,11 +226,9 @@ EXECUTION_ID = "#{codepipeline.PipelineExecutionId}"
 
 INSTALL_COMMANDS = [f"python3 -m pip install uv=={UV_VERSION}"]
 COMMANDS = ["uv sync --locked", f"uv run --locked python {DECISION}", f"uv run --locked python {SCRIPT}"]
-# What the decision reads of Auto Scaling, which grants it on every resource only.
-DESCRIBES_REFRESHES = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeInstanceRefreshes"]
 # The longest the step runs beside its waits for the instances of the sessions it booked: the
-# set-up, the decision's wait for a refresh, an hour at most, and the smoke tests on the mock pool
-# and on the coursework pool, each with the workspace's lag.
+# set-up, the decision, and the smoke tests on the mock pool and on the coursework pool, each with
+# the workspace's lag.
 TIMEOUT = cdk.Duration.hours(3)
 
 
@@ -314,8 +315,7 @@ def verify_step(
     statements = [
         iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[secret]),
         iam.PolicyStatement(actions=["s3:PutObject"], resources=[artifacts.arn_for_objects(f"{PREFIX}/*")]),
-        # The decision: the groups and their refreshes, and when this pipeline's execution started.
-        iam.PolicyStatement(actions=DESCRIBES_REFRESHES, resources=["*"]),
+        # The decision: when this pipeline's execution started.
         iam.PolicyStatement(actions=["codepipeline:ListPipelineExecutions"], resources=[pipeline.pipeline_arn]),
     ]
     if isinstance(stage, EndpointStage):
@@ -328,7 +328,8 @@ def verify_step(
         workspaces = scope.format_arn(service="aps", resource="workspace", resource_name="*")
         tagged = {"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": stage.observability.stage_name}}
         statements.append(iam.PolicyStatement(actions=["aps:QueryMetrics"], resources=[workspaces], conditions=tagged))
-        # The release parameter of each pool the stage deploys, by its name, and no other.
+        # The release parameter of each pool the stage deploys, by its name, and no other: the
+        # smoke tests read it, and the decision reads it and its earlier versions.
         parameters = [
             scope.format_arn(service="ssm", resource="parameter", resource_name=name.lstrip("/"))
             for name in stage.pools.release_parameters.values()

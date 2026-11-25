@@ -10,7 +10,7 @@ heartbeats table by its name (`rhi_lifecycle.release`). It runs the smoke tests 
 once, with `RHI_SMOKE_POOL` naming the coursework pool, through the verification's own runner
 (`verify.run_tests`): in a process of their own, the key in its environment and nowhere else, what
 they print in the log without the key, and the tests that must reach the internal load balancer
-left out. The run makes every test the verification makes on the coursework pool after a refresh,
+left out. The run makes every test the verification makes on the coursework pool after a release,
 and no other: the workspace's query address and the heartbeats table are given as the verification
 gives them, `RHI_SMOKE_WORKSPACE_URL` and `RHI_VERIFY_HEARTBEATS_TABLE`, so the release each
 instance serves is compared with the deployed one both through the workspace (`release-served`,

@@ -64,9 +64,10 @@ its own, never in a message of AWS, and does not check that the instance leaves 
 stopped.
 
 **The coursework pool.** Before this script, the step runs the decision of `gpu_verification.py`,
-which waits for the instance refresh a GPU pool's release started and leaves, in the file
-`RHI_VERIFY_GPU_POOLS_FILE` names, the pools the smoke tests must also run on: `coursework` when
-this execution deployed a GPU pool's release, nothing otherwise. After the run on the mock pool,
+which compares each GPU pool's release parameter with its last version from before the execution
+and leaves, in the file `RHI_VERIFY_GPU_POOLS_FILE` names, the pools the smoke tests must also run
+on: `coursework` when this execution changed a GPU pool's engine image, model revision or engine
+flags, nothing otherwise. After the run on the mock pool,
 and once that pool's session is stopped, the script books each pool of that file in turn, as it
 booked the mock pool, and runs the same smoke tests on it, with `RHI_SMOKE_POOL` naming it: the
 streams of each format, the pool's metrics and the release its lifecycle agents report as a metric

@@ -1,16 +1,18 @@
 """The decision whether an execution verifies on the coursework pool (scripts/pipeline/gpu_verification.py):
-yes when an instance refresh of a GPU pool's group began after the execution started, once that
-refresh has ended well; it waits for a refresh that is running and fails on one that ended any
-other way. Stand-ins for the Auto Scaling and CodePipeline clients replace AWS, and a fake clock
-replaces time: no account, no credentials, no network, no wait.
+yes when a GPU pool's release parameter differs, in its engine image, model revision or engine
+flags, from its last version written before the execution started, or has no such version; no for
+any other change, for a parameter not written since the start, and for the mock pool. Stand-ins
+for the SSM and CodePipeline clients replace AWS: no account, no credentials, no network.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from botocore.exceptions import ClientError
 
 import gpu_verification as decision
 
@@ -19,143 +21,161 @@ if TYPE_CHECKING:
 
 STARTED = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
 AFTER, BEFORE = STARTED + timedelta(minutes=5), STARTED - timedelta(minutes=5)
+LONG_BEFORE = STARTED - timedelta(days=1)
+
+COURSEWORK, MOCK = "/rhi/pools/coursework/release", "/rhi/pools/mock/release"
+PARAMETERS = {"mock": MOCK, "coursework": COURSEWORK}
 
 
-def group(name: str, pool: str, engine: str) -> dict[str, Any]:
-    return {
-        "AutoScalingGroupName": name,
-        "Tags": [{"Key": "rhi-pool", "Value": pool}, {"Key": "rhi-engine", "Value": engine}],
+def release(engine: str = "vllm", **changed: Any) -> str:
+    """A release parameter's value for a pool of the engine `engine`, with `changed` in place of
+    its keys; `settings` and `files` are merged into those the release has."""
+    document: dict[str, Any] = {
+        "engine_image": "registry.example.com/engine@sha256:" + "a" * 64,
+        "model_revision": "revision-1",
+        "engine_flags": ["--max-model-len", "8192"],
+        "files": {"bucket": "assets", "key": "release.tar", "sha256": "b" * 64},
+        "measured_start_seconds": 300,
+        "settings": {"pool": "coursework", "log_group": "/rhi/pools/coursework", "engine": engine},
     }
+    for key, value in changed.items():
+        document[key] = document[key] | value if key in ("files", "settings") else value
+    return json.dumps(document)
 
 
-GROUPS = [group("coursework-group", "coursework", "vllm"), group("mock-group", "mock", "mock")]
+class Ssm:
+    """An SSM client as far as the decision uses one: for each parameter's name its versions, the
+    first being version `first`, as `(when it was written, its value)`. It offers `get_parameter`
+    and no other call, and holds no version below `first`."""
+
+    def __init__(self, versions: dict[str, list[tuple[datetime, str]]], first: int = 1) -> None:
+        self.versions, self.first = versions, first
+        self.read: list[str] = []
+
+    def get_parameter(self, **request: Any) -> dict[str, Any]:
+        assert list(request) == ["Name"]
+        self.read.append(request["Name"])
+        name, _, selector = request["Name"].partition(":")
+        held = self.versions.get(name)
+        if not held:
+            raise ClientError({"Error": {"Code": "ParameterNotFound"}}, "GetParameter")
+        number = int(selector) if selector else self.first + len(held) - 1
+        if not self.first <= number < self.first + len(held):
+            raise ClientError({"Error": {"Code": "ParameterVersionNotFound"}}, "GetParameter")
+        written, value = held[number - self.first]
+        return {"Parameter": {"Name": name, "Value": value, "Version": number, "LastModifiedDate": written}}
 
 
-class AutoScaling:
-    """An Auto Scaling client as far as the decision uses one: `groups`, and for each group's name
-    its refreshes, as `(ID, start time)`. A refresh's status is read from `statuses`, one status a
-    read, the last one repeated."""
-
-    def __init__(
-        self,
-        refreshes: dict[str, list[tuple[str, datetime]]],
-        statuses: dict[str, list[str]] | None = None,
-        groups: list[dict[str, Any]] = GROUPS,
-    ) -> None:
-        self.groups, self.refreshes, self.statuses = groups, refreshes, statuses or {}
-        self.reads: list[str] = []
-
-    def describe_auto_scaling_groups(self, **request: Any) -> dict[str, Any]:
-        assert request["Filters"] == [{"Name": "tag-key", "Values": ["rhi-engine"]}]
-        return {"AutoScalingGroups": self.groups}
-
-    def describe_instance_refreshes(self, **request: Any) -> dict[str, Any]:
-        held = self.refreshes.get(request["AutoScalingGroupName"], [])
-        if "InstanceRefreshIds" not in request:
-            return {"InstanceRefreshes": [{"InstanceRefreshId": rid, "StartTime": at} for rid, at in held]}
-        (refresh_id,) = request["InstanceRefreshIds"]
-        self.reads.append(refresh_id)
-        statuses = self.statuses.get(refresh_id, [decision.SUCCESSFUL])
-        status = statuses.pop(0) if len(statuses) > 1 else statuses[0]
-        return {"InstanceRefreshes": [{"InstanceRefreshId": refresh_id, "Status": status}]}
-
-
-class Clock:
-    """Time that passes only when the decision sleeps."""
-
-    def __init__(self) -> None:
-        self.now, self.slept = 0.0, []
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.now += seconds
-
-
-def decide(autoscaling: AutoScaling, clock: Clock | None = None) -> list[str]:
-    clock = clock or Clock()
-    return decision.decide(autoscaling, STARTED, sleep=clock.sleep, clock=clock)
-
-
-def test_a_refresh_of_the_coursework_group_begun_after_the_start_asks_for_the_coursework_pool() -> None:
-    assert decide(AutoScaling({"coursework-group": [("r-1", AFTER)]})) == ["coursework"]
+def decide(versions: list[tuple[datetime, str]], **more: list[tuple[datetime, str]]) -> list[str]:
+    """The decision for the coursework pool's parameter with `versions`, beside a mock pool's that
+    the execution left alone."""
+    held = {MOCK: [(BEFORE, release("mock"))], COURSEWORK: versions, **more}
+    return decision.decide(Ssm(held), PARAMETERS, STARTED)
 
 
 @pytest.mark.parametrize(
-    "refreshes",
+    "changed",
     [
-        {"coursework-group": [("r-1", BEFORE)]},
-        {"mock-group": [("r-1", AFTER)]},
-        {},
+        {"engine_image": "registry.example.com/engine@sha256:" + "c" * 64},
+        {"model_revision": "revision-2"},
+        {"engine_flags": ["--max-model-len", "16384"]},
     ],
-    ids=["a refresh begun before the start", "a refresh of the mock pool's group", "no refresh"],
+    ids=["engine_image", "model_revision", "engine_flags"],
 )
-def test_no_gpu_refresh_since_the_start_asks_for_nothing(refreshes: dict[str, list[tuple[str, datetime]]]) -> None:
-    autoscaling = AutoScaling(refreshes)
-    assert decide(autoscaling) == []
-    # Nothing is waited for.
-    assert autoscaling.reads == []
+def test_a_gpu_pool_s_release_rewritten_with_another_engine_names_the_coursework_pool(changed: dict[str, Any]) -> None:
+    assert decide([(BEFORE, release()), (AFTER, release(**changed))]) == ["coursework"]
 
 
-def test_another_gpu_pool_s_refresh_still_verifies_on_the_coursework_pool() -> None:
-    groups = [*GROUPS, group("upgrade-group", "upgrade", "vllm")]
-    assert decide(AutoScaling({"upgrade-group": [("r-2", AFTER)]}, groups=groups)) == ["coursework"]
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"files": {"sha256": "d" * 64}},
+        {"settings": {"log_group": "/rhi/pools/other"}},
+        {"measured_start_seconds": 240},
+    ],
+    ids=["files", "a setting", "the measured start"],
+)
+def test_a_release_rewritten_with_only_other_files_or_settings_names_nothing(changed: dict[str, Any]) -> None:
+    assert decide([(BEFORE, release()), (AFTER, release(**changed))]) == []
 
 
-def test_a_refresh_in_progress_is_waited_for() -> None:
-    statuses = {"r-1": ["Pending", "InProgress", "Baking", "RollbackInProgress", "Successful"]}
-    autoscaling, clock = AutoScaling({"coursework-group": [("r-1", AFTER)]}, statuses), Clock()
-    assert decide(autoscaling, clock) == ["coursework"]
-    assert autoscaling.reads == ["r-1"] * 5
-    assert clock.slept == [decision.POLL_SECONDS] * 4
+def test_a_release_not_written_since_the_start_names_nothing() -> None:
+    # Its last two versions differ, and both were written before the execution started.
+    versions = [(LONG_BEFORE, release()), (BEFORE, release(model_revision="revision-2"))]
+    ssm = Ssm({COURSEWORK: versions})
+    assert decision.decide(ssm, {"coursework": COURSEWORK}, STARTED) == []
+    # The current version says so: no earlier one is read.
+    assert ssm.read == [COURSEWORK]
 
 
-@pytest.mark.parametrize("ended", ["Failed", "Cancelled", "RollbackSuccessful", "RollbackFailed"])
-def test_a_refresh_that_did_not_end_successful_fails_the_decision(ended: str) -> None:
-    autoscaling = AutoScaling({"coursework-group": [("r-1", AFTER)]}, {"r-1": ["InProgress", ended]})
-    with pytest.raises(decision.DecisionError, match=f"coursework ended {ended}"):
-        decide(autoscaling)
+def test_a_release_is_compared_with_its_last_version_from_before_the_start() -> None:
+    # Written twice since the start, once after a failed deployment's rollback: what counts is the
+    # version the execution found, not the one just below the current one.
+    back, new = release(), release(model_revision="revision-2")
+    assert decide([(LONG_BEFORE, new), (BEFORE, back), (AFTER, new), (AFTER, back)]) == []
+    assert decide([(LONG_BEFORE, back), (BEFORE, back), (AFTER, back), (AFTER, new)]) == ["coursework"]
 
 
-class PendingAutoScaling(AutoScaling):
-    """A coursework refresh listed while pending, with no start time: each read of it gives the
-    next of `reads`, as `(status, start time or None)`, the last one repeated."""
-
-    def __init__(self, reads: list[tuple[str, datetime | None]]) -> None:
-        super().__init__({})
-        self.pending = reads
-
-    def describe_instance_refreshes(self, **request: Any) -> dict[str, Any]:
-        if "InstanceRefreshIds" not in request:
-            listed = [{"InstanceRefreshId": "r-1", "Status": "Pending"}]
-            return {"InstanceRefreshes": listed if request["AutoScalingGroupName"] == "coursework-group" else []}
-        status, began = self.pending.pop(0) if len(self.pending) > 1 else self.pending[0]
-        return {"InstanceRefreshes": [{"InstanceRefreshId": "r-1", "Status": status, "StartTime": began}]}
+def test_a_version_written_at_the_start_is_not_one_from_before_it() -> None:
+    # The version written at the very time of the start is compared with the one before it,
+    assert decide([(BEFORE, release()), (STARTED, release(model_revision="revision-2"))]) == ["coursework"]
+    assert decide([(BEFORE, release()), (STARTED, release())]) == []
+    # and is no baseline for a later one.
+    new = release(model_revision="revision-2")
+    assert decide([(BEFORE, release()), (STARTED, new), (AFTER, new)]) == ["coursework"]
 
 
-def test_a_pending_refresh_is_waited_for_and_counts_once_it_has_begun() -> None:
-    reads: list[tuple[str, datetime | None]] = [("Pending", None), ("InProgress", AFTER), ("Successful", AFTER)]
-    assert decide(PendingAutoScaling(reads)) == ["coursework"]
+@pytest.mark.parametrize(
+    ("versions", "first"),
+    [
+        ([(AFTER, release())], 1),
+        ([(STARTED, release()), (AFTER, release())], 1),
+        ([(AFTER, release()), (AFTER, release())], 7),
+    ],
+    ids=["a first version", "every version since the start", "the earlier versions no longer held"],
+)
+def test_a_release_with_no_version_from_before_the_start_names_the_coursework_pool(
+    versions: list[tuple[datetime, str]], first: int
+) -> None:
+    assert decision.decide(Ssm({COURSEWORK: versions}, first), {"coursework": COURSEWORK}, STARTED) == ["coursework"]
 
 
-def test_a_refresh_seen_begun_while_polled_fails_even_when_its_last_read_omits_its_start() -> None:
-    reads: list[tuple[str, datetime | None]] = [("Pending", None), ("InProgress", AFTER), ("Failed", None)]
-    with pytest.raises(decision.DecisionError, match="coursework ended Failed"):
-        decide(PendingAutoScaling(reads))
+def test_the_mock_pool_s_release_alone_names_nothing() -> None:
+    rewritten = release("mock", engine_image="registry.example.com/mock@sha256:" + "c" * 64)
+    for versions in ([(BEFORE, release("mock")), (AFTER, rewritten)], [(AFTER, rewritten)]):
+        ssm = Ssm({MOCK: versions, COURSEWORK: [(BEFORE, release())]})
+        assert decision.decide(ssm, PARAMETERS, STARTED) == []
+        # The mock pool's earlier versions are not read.
+        assert ssm.read == [MOCK, COURSEWORK]
 
 
-@pytest.mark.parametrize("ended", ["Cancelled", "Failed"])
-def test_a_refresh_that_ends_without_having_begun_asks_for_nothing(ended: str) -> None:
-    assert decide(PendingAutoScaling([("Pending", None), (ended, None)])) == []
+def test_another_gpu_pool_s_release_still_verifies_on_the_coursework_pool() -> None:
+    upgrade = "/rhi/pools/upgrade/release"
+    ssm = Ssm(
+        {
+            COURSEWORK: [(BEFORE, release())],
+            upgrade: [(BEFORE, release()), (AFTER, release(model_revision="revision-2"))],
+        }
+    )
+    assert decision.decide(ssm, {"coursework": COURSEWORK, "upgrade": upgrade}, STARTED) == ["coursework"]
 
 
-def test_a_refresh_still_running_after_the_wait_fails_the_decision() -> None:
-    autoscaling, clock = AutoScaling({"coursework-group": [("r-1", AFTER)]}, {"r-1": ["InProgress"]}), Clock()
-    with pytest.raises(decision.DecisionError, match="still InProgress"):
-        decide(autoscaling, clock)
-    assert clock.now >= decision.WAIT_SECONDS
+def test_no_pool_names_nothing() -> None:
+    assert decision.decide(Ssm({}), decision.release_parameters("none"), STARTED) == []
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [[], [(AFTER, "not a release")], [(AFTER, json.dumps(["a", "list"]))]],
+    ids=["no parameter", "a value that is not JSON", "a value that is no object"],
+)
+def test_a_release_that_cannot_be_read_fails_the_decision(versions: list[tuple[datetime, str]]) -> None:
+    with pytest.raises(decision.DecisionError, match="the pool coursework"):
+        decision.decide(Ssm({COURSEWORK: versions}), {"coursework": COURSEWORK}, STARTED)
+
+
+def test_an_earlier_version_that_holds_no_release_counts_as_another() -> None:
+    assert decide([(BEFORE, "not a release"), (AFTER, release())]) == ["coursework"]
 
 
 class CodePipeline:
@@ -175,36 +195,38 @@ class CodePipeline:
         return {"pipelineExecutionSummaries": [{"pipelineExecutionId": "e-1", "startTime": STARTED}]}
 
 
-def run_main(tmp_path: Path, autoscaling: AutoScaling, **more: str) -> tuple[int, str | None]:
-    """The decision's exit, for the execution `e-1` of the pipeline `a-pipeline`, and the file it
-    left, None for none."""
+def run_main(tmp_path: Path, versions: list[tuple[datetime, str]], **more: str) -> tuple[int, str | None]:
+    """The decision's exit, for the execution `e-1` of the pipeline `a-pipeline` and a coursework
+    pool whose parameter has `versions`, and the file it left, None for none."""
     left = tmp_path / "build" / "gpu-pools"
     environ = {
         "CODEBUILD_INITIATOR": "codepipeline/a-pipeline",
         decision.EXECUTION_VARIABLE: "e-1",
         decision.GPU_POOLS_FILE_VARIABLE: str(left),
+        decision.RELEASE_PARAMETERS_VARIABLE: f"mock={MOCK},coursework={COURSEWORK}",
         **more,
     }
-    clock = Clock()
-    exit_code = decision.main(
-        environ, autoscaling=autoscaling, codepipeline=CodePipeline("a-pipeline"), sleep=clock.sleep, clock=clock
-    )
+    ssm = Ssm({MOCK: [(BEFORE, release("mock"))], COURSEWORK: versions})
+    exit_code = decision.main(environ, ssm=ssm, codepipeline=CodePipeline("a-pipeline"))
     return exit_code, left.read_text(encoding="utf-8") if left.exists() else None
 
 
 def test_the_execution_s_start_is_read_from_the_pipeline_codebuild_names(tmp_path: Path) -> None:
-    # A refresh begun after the execution `e-1` started, and before the next one did: its start
+    # A release written after the execution `e-1` started, and before the next one did: its start
     # is that of `e-1`, on the second page, not the first execution's.
     between = STARTED + timedelta(minutes=1)
-    assert run_main(tmp_path, AutoScaling({"coursework-group": [("r-1", between)]})) == (0, "coursework\n")
-    assert run_main(tmp_path, AutoScaling({})) == (0, "")
+    changed = [(BEFORE, release()), (between, release(model_revision="revision-2"))]
+    assert run_main(tmp_path, changed) == (0, "coursework\n")
+    assert run_main(tmp_path, [(BEFORE, release())]) == (0, "")
+    # With no pool, as the pools stack's output reads then, there is nothing to compare.
+    assert run_main(tmp_path, changed, **{decision.RELEASE_PARAMETERS_VARIABLE: "none"}) == (0, "")
 
 
 def test_a_failed_decision_leaves_no_file_and_exits_non_zero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    failed = AutoScaling({"coursework-group": [("r-1", AFTER)]}, {"r-1": ["Failed"]})
-    assert run_main(tmp_path, failed) == (1, None)
-    assert run_main(tmp_path, AutoScaling({}), CODEBUILD_INITIATOR="someone") == (1, None)
-    assert run_main(tmp_path, AutoScaling({}), **{decision.EXECUTION_VARIABLE: "e-unknown"}) == (1, None)
-    assert "coursework ended Failed" in capsys.readouterr().err
+    assert run_main(tmp_path, []) == (1, None)
+    assert "the pool coursework" in capsys.readouterr().err
+    kept = [(BEFORE, release())]
+    assert run_main(tmp_path, kept, CODEBUILD_INITIATOR="someone") == (1, None)
+    assert run_main(tmp_path, kept, **{decision.EXECUTION_VARIABLE: "e-unknown"}) == (1, None)

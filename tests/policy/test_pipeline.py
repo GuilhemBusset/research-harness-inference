@@ -73,12 +73,13 @@ Rules hold those two, and every action:
   with those names, one or both and no other, alone, so the role reaches no third pool's items,
   not every item, and no other table; write objects under
   `verification/` of the pipeline's artifact bucket; and, for the decision whether the execution
-  verifies on the coursework pool, describe Auto Scaling groups and their instance refreshes, which
-  AWS grants on every resource only, and list the executions of the pipeline the action is in, by
-  its ARN, and of no other pipeline. Beside those it holds what CDK Pipelines gives every project:
-  a read of the artifact bucket, and its own log group and report groups. Nothing else: every
-  action it is allowed is one of `VERIFICATION_MAY`, each on resources of its kind only, read as
-  the reporter's are, so no other action of Auto Scaling or CodePipeline, on any resource;
+  verifies on the coursework pool, which compares each release parameter with an earlier version
+  of itself, list the executions of the pipeline the action is in, by its ARN, and of no other
+  pipeline. Beside those it holds what CDK Pipelines gives every project: a read of the artifact
+  bucket, and its own log group and report groups. Nothing else: every action it is allowed is one
+  of `VERIFICATION_MAY`, each on resources of its kind only, read as the reporter's are, so no
+  action of Auto Scaling, the describing of groups and of instance refreshes included, no action
+  of SSM but `ssm:GetParameter` and no other action of CodePipeline, on any resource;
 - the role of the hold, the project of a CodeBuild action named `Hold` (sections 5.6 and 8.2), which
   passes once the session switch reads off, may read the one stack resource that names the stage's
   pool-state table, `cloudformation:DescribeStackResource` on a stack that the stage the action is
@@ -324,8 +325,6 @@ VERIFICATION_MAY = {
     "dynamodb:GetItem": "pool-state",
     "dynamodb:PutItem": "pool-state",
     "s3:PutObject": "verification",
-    "autoscaling:DescribeAutoScalingGroups": "every",
-    "autoscaling:DescribeInstanceRefreshes": "every",
     "codepipeline:ListPipelineExecutions": "own pipeline",
     "s3:GetBucket*": "artifacts",
     "s3:GetObject*": "artifacts",
@@ -408,7 +407,7 @@ VERIFIES_MORE = (
     "a verification's role that may do more than read the canary's secret, query its stage's workspace,"
     " read its stage's release parameters, query its stage's heartbeats table, read its stage's pools stack's"
     " resources, read and write the mock pool's items of its pool-state table, write under verification/,"
-    " describe groups and their refreshes, and list its own pipeline's executions"
+    " and list its own pipeline's executions"
 )
 HOLDS_MORE = (
     "a hold's role that may do more than read the stage's pools stack's resources and the session switch of its"
@@ -1032,11 +1031,10 @@ def verification_resources(
     account and region, the release parameters the stage's stacks hold, the heartbeats table the
     stage's verification is told of (`heartbeat_tables`), the stacks of the stage that hold its
     pool-state table and that table (`stage_pool_state`), the objects under
-    `verification/` of the pipeline's artifact bucket, every resource for the describing of groups
-    and their refreshes, the pipeline the stage is in, that bucket and its objects, and the
-    project's own log group and report groups. With them, the values of the tag `rhi-stage` that
-    name the stage's workspace: those a workspace of a stack the stage deploys carries, and no
-    workspace of any other template."""
+    `verification/` of the pipeline's artifact bucket, the pipeline the stage is in, that bucket
+    and its objects, and the project's own log group and report groups. With them, the values of
+    the tag `rhi-stage` that name the stage's workspace: those a workspace of a stack the stage
+    deploys carries, and no workspace of any other template."""
     deployed = deployed_by(actions, templates)
     parameters = sorted(
         {
@@ -1076,7 +1074,6 @@ def verification_resources(
             for stack, logical_id in tables
         ],
         "verification": [re.compile(rf"\$\{{{store}\.Arn\}}/{VERIFICATION_PREFIX}/\*") for store in stores],
-        "every": [re.compile(r"\*")],
         "own pipeline": [
             re.compile(rf"{PARTITION}:codepipeline:{HERE}:\$\{{{re.escape(pipeline_id)}\}}")
             for pipeline_id in pipeline_ids
@@ -2329,9 +2326,8 @@ def test_the_verification_s_role_is_the_one_held(templates: dict[str, dict[str, 
     ]
     assert describe["Action"] == "cloudformation:DescribeStackResource"
     assert stacks.fullmatch(arn_text(describe["Resource"]) or "")
-    # And, for the decision on the coursework pool, the describing of groups and their refreshes on
-    # every resource, and the listing of the executions of the pipeline it is in, and nothing else
-    # of Auto Scaling or CodePipeline.
+    # And, for the decision on the coursework pool, the listing of the executions of the pipeline
+    # it is in and nothing else of CodePipeline, one action of SSM, and nothing of Auto Scaling.
     (own,) = allowed["own pipeline"]
 
     def of(service: str) -> list[tuple[Any, str]]:
@@ -2341,9 +2337,8 @@ def test_the_verification_s_role_is_the_one_held(templates: dict[str, dict[str, 
             if any(str(action).lower().startswith(f"{service}:") for action in as_list(s.get("Action")))
         ]
 
-    assert of("autoscaling") == [
-        (["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeInstanceRefreshes"], "*")
-    ]
+    assert of("autoscaling") == []
+    assert {action for held, _ in of("ssm") for action in as_list(held)} == {"ssm:GetParameter"}
     ((action, resource),) = of("codepipeline")
     assert action == "codepipeline:ListPipelineExecutions" and own.fullmatch(resource)
 
@@ -2416,8 +2411,6 @@ VERIFIES: list[More] = [
     ("dynamodb:GetItem", the_pool_state(), of_pool(MOCK_POOL)),
     ("dynamodb:PutItem", the_pool_state(), of_pool(MOCK_POOL, COURSEWORK_POOL)),
     ("s3:PutObject", under(VERIFICATION_PREFIX), None),
-    ("autoscaling:DescribeAutoScalingGroups", every_resource, None),
-    ("autoscaling:DescribeInstanceRefreshes", every_resource, None),
     ("codepipeline:ListPipelineExecutions", the_pipeline, None),
 ]
 
@@ -2597,6 +2590,18 @@ ON_EVERY_RESOURCE = a_verification(("s3:PutObject", every_resource, None))
             id="another action under verification/",
         ),
         pytest.param(ON_EVERY_RESOURCE, id="every resource"),
+        pytest.param(
+            a_verification(("autoscaling:DescribeInstanceRefreshes", every_resource, None)),
+            id="the describing of instance refreshes",
+        ),
+        pytest.param(
+            a_verification(("autoscaling:DescribeAutoScalingGroups", every_resource, None)),
+            id="the describing of groups",
+        ),
+        pytest.param(
+            a_verification(("ssm:GetParameterHistory", the_parameter("rhi/pools/mock/release"), None)),
+            id="the history of a release parameter",
+        ),
         pytest.param(
             a_verification(("autoscaling:UpdateAutoScalingGroup", every_resource, None)),
             id="a change of a group",
