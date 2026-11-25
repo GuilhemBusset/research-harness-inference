@@ -1,9 +1,9 @@
 """The stages of an instance's start, and the seconds each took (system design, section 5.2).
 
-Cold-start time is the central number of the design, and nobody has published it for a stopped GPU
-instance. The lifecycle agent sees every stage of a start, so it measures them: `Stage` names the
-stages, and a `Timings` holds what each took in one launch, under that launch's `Transition`.
-`rhi_lifecycle.launch` marks the stages where they happen.
+Cold-start time is the central number of the design. The lifecycle agent sees every stage of a
+start, so it measures them: `Stage` names the stages, and a `Timings` holds what each took in one
+launch, under the one `Transition` a launch has. `rhi_lifecycle.launch` marks the stages where they
+happen.
 
 **What a stage covers**, as the agent sees it, in the order a launch goes through them:
 
@@ -18,27 +18,29 @@ stages, and a `Timings` holds what each took in one launch, under that launch's 
 | hook | then | when Auto Scaling has answered the completion of the launch hook |
 
 Each stage ends where the next starts, so the stages of a launch sum to the time from the kernel's
-start to the completed hook. An entry to the warm pool starts no engine: it has the boot, the image,
-the release check and the hook, and no duration for the three others.
+start to the completed hook.
 
 Two limits of what the agent can see. The time between Auto Scaling's decision and the kernel's
 start is in no stage. And the agent cannot tell the load of the weights from the engine's own
 initialization: both end when the health route answers.
 
 **The metric.** `rhi_lifecycle_stage_seconds`, with the labels `transition` and `stage`, is what a
-stage took in the agent's last launch, set when the stage ends. A stage that did not end, or that
-the transition does not have, has no series. A launch that was abandoned keeps the stages it went
-through, the one it was abandoned in included. The node's collector scrapes the metric from the
-agent's endpoint (`rhi_lifecycle.metrics`), with the instance's own labels.
+stage took in the agent's last launch, set when the stage ends. A stage that did not end has no
+series. A launch that was abandoned keeps the stages it went through, the one it was abandoned in
+included. The node's collector scrapes the metric from the agent's endpoint
+(`rhi_lifecycle.metrics`), with the instance's own labels.
+
+**The label `transition`.** An instance has one way into service, a launch, so the label has one
+value, `cold-launch`: the fleet dashboard selects its series by it, and the label stays so that the
+dashboard reads the launches of this agent as it read the ones before.
 
 **The launches completed.** `rhi_lifecycle_launch_seconds`, a histogram with the label
 `transition`, observes once each launch whose hook Auto Scaling took with `CONTINUE`: the seconds
 its stages took in all, from the kernel's start to the completed hook. A launch that was abandoned,
 or whose completion did not reach Auto Scaling, is not observed. So its count is the launches
-completed, two of them two even when they took the same seconds, and the objective of section 7.3
-reads the share of promotions under 5 minutes from it (`rhi_dashboards.objectives`). 300 seconds is
-a boundary, and a launch is observed one step of the float above its seconds, so the bucket of 300
-counts the launches strictly under 5 minutes.
+completed, two of them two even when they took the same seconds. 300 seconds is a boundary, and a
+launch is observed one step of the float above its seconds, so the bucket of 300 counts the
+launches strictly under 5 minutes.
 
 **The heartbeat.** A launch also names the stage it has reached in the instance's row of the
 heartbeats table (`rhi_lifecycle.launch`), by the stage's value here. Once the instance serves,
@@ -82,14 +84,10 @@ class Stage(enum.Enum):
 
 
 class Transition(enum.Enum):
-    """The launch transitions of `rhi_lifecycle.launch`."""
+    """The transition of `rhi_lifecycle.launch`. The value is its name in the metrics' label."""
 
-    # A new instance enters the warm pool.
-    ENTRY = "entry"
-    # A warm instance, with the image on its disk, is promoted to service.
-    PROMOTION = "promotion"
-    # An instance is launched straight into service: the cold launch of section 5.2.
-    COLD_LAUNCH = "cold-launch"
+    # An instance is launched into service: the cold launch of section 5.2.
+    LAUNCH = "cold-launch"
 
 
 SECONDS = Gauge(
@@ -122,31 +120,17 @@ class Timings:
 
     def __init__(
         self,
-        transition: Transition,
         clock: Callable[[], float],
         gauge: Gauge = SECONDS,
         launches: Histogram = LAUNCHES,
     ) -> None:
         self.seconds: dict[Stage, float] = {}
-        self._transition = transition
         self._clock = clock
         self._gauge = gauge
         self._launches = launches
         # The stage under way, and when it started.
         self._under_way: tuple[Stage, float] | None = None
         gauge.clear()
-
-    @property
-    def transition(self) -> Transition:
-        return self._transition
-
-    @transition.setter
-    def transition(self, transition: Transition) -> None:
-        # A launch into service is taken for a promotion until the host says its disk has no
-        # image: what was exposed under the first name moves to the second.
-        self._transition = transition
-        self._gauge.clear()
-        self._expose()
 
     def start(self, stage: Stage, at: float | None = None) -> None:
         """Mark the start of `stage`, now or at the moment `at` of the clock. The stage under way
@@ -163,7 +147,7 @@ class Timings:
         """The launch's hook was completed with `CONTINUE`: observe, once, the seconds its stages
         took, strictly above themselves so that a boundary's bucket holds what is under it."""
         total = math.nextafter(sum(self.seconds.values()), math.inf)
-        self._launches.labels(transition=self._transition.value).observe(total)
+        self._launches.labels(transition=Transition.LAUNCH.value).observe(total)
 
     def _end(self, moment: float) -> None:
         if self._under_way is None:
@@ -175,4 +159,4 @@ class Timings:
 
     def _expose(self) -> None:
         for stage, seconds in self.seconds.items():
-            self._gauge.labels(transition=self._transition.value, stage=stage.value).set(seconds)
+            self._gauge.labels(transition=Transition.LAUNCH.value, stage=stage.value).set(seconds)

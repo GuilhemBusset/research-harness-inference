@@ -23,24 +23,26 @@ one. What a reading calls for:
 
 | The instance | Target state | What the program does |
 | --- | --- | --- |
-| not in service | `InService` or a warm-pool state, not yet acted on | runs the launch transition (`rhi_lifecycle.launch`), once |
+| not in service | `InService`, and no launch run yet | runs the launch (`rhi_lifecycle.launch`), once |
 | in service | `InService` | runs the serving duties (`rhi_lifecycle.serving`) |
 | in service | any other | hands the instance to the termination handling (`rhi_lifecycle.termination`) |
 | not in service | none: the metadata says the instance has no such item | runs the canary (`rhi_lifecycle.canary`), once |
 
-Any other reading calls for nothing. An instance that was never in service and whose target state
-is a terminated one is among them: no engine runs there to drain, and the program leaves it alone.
+Any other reading calls for nothing. An instance that is not in service and whose target state is
+`Terminated` is among them: its launch was abandoned, or it has drained, and the program leaves it
+alone.
 
-The instance is in service once a launch into service, a promotion or a launch straight there, has
-completed its hook: the serving duties start then. They run until the target state leaves service,
-and on while the termination handling waits for the engine to drain. A hook that could not be
-completed leaves the instance in service, and the next reading hands it over again.
+The instance is in service once its launch has completed the launch hook: the serving duties start
+then. They run until the target state leaves service, and on while the termination handling waits
+for the engine to drain. A hook that could not be completed leaves the instance in service, and the
+next reading hands it over again. An instance that has drained is out of service for good: the
+program runs no launch on it again.
 
 **An instance in no group.** The metadata of an instance that belongs to no Auto Scaling group has
 no target lifecycle state, and says so: that is an answer, not a reading that failed. Such an
 instance is a canary, which the promotion job started from the pool's launch template to try a
 machine image. The program hands it to `rhi_lifecycle.canary`, which starts the engine as a launch
-straight into service does and writes its outcome on the instance's console. That run completes no
+does and writes its outcome on the instance's console. That run completes no
 hook and writes no heartbeat, and the program starts no serving duty after it, whatever its
 outcome. It is run once in the life of the program. It decides nothing about later readings: one
 that gives a target state is acted on as on any instance.
@@ -60,15 +62,22 @@ termination handling stops the engine's unit through a host that first brings th
 (`_Host`): once the termination hook is completed they are cancelled, and what they have in a
 worker thread is waited for. Only then is the unit stopped, and nothing of the duties runs after.
 
-After an entry to the warm pool the program runs no serving duty: the group stops the instance. An
-instance that has left service is not taken for one that enters the pool: the state it left for
-counts as acted on.
-
-**A restart of its unit.** The launch transition writes a file before it completes a hook into
-service (`launch.SERVED_FILE`, in `/run/rhi`, which is emptied at every stop). A program that
-starts and finds the file is on an instance that already serves: it runs no launch transition, and
-takes the instance as in service. The serving duties end only by failing, and the program then
+**A restart of its unit.** The program keeps what it knows of the instance in memory, and its unit
+starts it again when it has failed. So a program that starts asks the host, once, whether the
+engine's unit has been started and not stopped since (`Host.engine_started`). Only the agent starts
+that unit, in a launch, and only the termination handling stops it, once the instance has drained.
+So a program that finds the unit started was restarted on an instance that serves, or that is
+leaving service with its engine still to drain. It runs no launch there, and takes the instance as
+in service: with the target state `InService` the serving duties resume, and with any other the
+instance is handed to the termination handling. A host that cannot be asked ends the program, and
+the next start of its unit asks again. The serving duties end only by failing, and the program then
 ends with them, so that its unit restarts it and they resume.
+
+A program that failed in the middle of a launch, once the engine's unit was started, also finds the
+unit started when it starts again. It takes the instance as in service and completes no launch
+hook: the hook's timeout abandons that instance, and the termination handling then drains it. The
+same holds for a canary, whose run also starts the unit: the program does not make the run again,
+and the promotion job, which reads no line, fails the candidate at its own time limit.
 
 Every call that waits (the instance metadata, a transition) runs in a worker thread, so the
 readings and the serving duties keep their own cadence beside it.
@@ -207,6 +216,9 @@ class _Host(Host):
     def restart_engine(self) -> None:
         self._host.restart_engine()
 
+    def engine_started(self) -> bool:
+        return self._host.engine_started()
+
     def stop_engine(self) -> None:
         self._rest()
         self._host.stop_engine()
@@ -215,11 +227,11 @@ class _Host(Host):
 class Agent:
     """The agent of one instance. `autoscaling`, `ssm` and `secrets` are the AWS SDK's clients for
     Auto Scaling, Systems Manager and Secrets Manager, and `dynamodb` is boto3's DynamoDB resource.
-    `held` is the record of the release on disk, and `served` the file that says the instance has
-    served since its start. The metrics of `registry` are served on `port`. `clock` gives the
-    moments of the readings and of a launch, and `wall` the seconds since the epoch; `sleep` waits
-    in the event loop, for the readings and the serving duties, and `wait` in a worker thread, for
-    the transitions. A test gives its own, and its own `fetch` in place of the network."""
+    `held` is the record of the release on disk. The metrics of `registry` are served on `port`.
+    `clock` gives the moments of the readings and of a launch, and `wall` the seconds since the
+    epoch; `sleep` waits in the event loop, for the readings and the serving duties, and `wait` in
+    a worker thread, for the transitions. A test gives its own, and its own `fetch` in place of
+    the network."""
 
     def __init__(
         self,
@@ -232,7 +244,6 @@ class Agent:
         host: Host,
         fetch: launch.Fetch = launch.fetch,
         held: Path = release.HELD_RELEASE_FILE,
-        served: Path = launch.SERVED_FILE,
         registry: CollectorRegistry = metrics.REGISTRY,
         port: int = metrics.PORT,
         clock: Callable[[], float] = time.monotonic,
@@ -260,9 +271,7 @@ class Agent:
             dynamodb=dynamodb,
             host=host,
             engine=launch.Engine(fetch),
-            termination=self._termination,
             held=held,
-            served=served,
             clock=clock,
             sleep=wait,
             wall=wall,
@@ -297,7 +306,7 @@ class Agent:
 
         self._make_serving = serving
         self._held = held
-        self._served = served
+        self._host = host
         self._registry = registry
         self._port = port
         self._clock = clock
@@ -305,10 +314,11 @@ class Agent:
         # The metrics endpoint, while the program runs.
         self.server: WSGIServer | None = None
         self._instance: str | None = None
-        # Whether a hook into service was completed, and no termination hook since.
+        # Whether the launch hook was completed, and no termination hook since.
         self._in_service = False
-        # The target state of the last transition: the same state calls for nothing more.
-        self._acted: str | None = None
+        # Whether the instance's launch was run, or is over because the instance serves or has
+        # served: it is run once.
+        self._launched = False
         # Whether the canary was run: it is run once.
         self._tried = False
         # The serving duties: made once, because their metrics are registered once, and running
@@ -328,9 +338,9 @@ class Agent:
         self._loop = asyncio.get_running_loop()
         self._loop.set_default_executor(self._workers)
         self.server = server = metrics.serve(self._registry, port=self._port)
-        # A unit restarted on an instance that serves: no launch transition is run on it.
-        self._in_service = self._served.exists()
         try:
+            # A unit restarted on an instance whose engine was started: no launch is run on it.
+            self._in_service = self._launched = await asyncio.to_thread(self._host.engine_started)
             next_at = self._clock()
             while True:
                 await self.tick()
@@ -370,7 +380,7 @@ class Agent:
             return
         target, instance = reading
         if target is None:
-            # The instance belongs to no group: a canary, unless the program found it serving.
+            # The instance belongs to no group: a canary, unless its engine was started before the program.
             if not self._in_service and not self._tried:
                 self._tried = True
                 self._begin(self._try())
@@ -379,9 +389,9 @@ class Agent:
                 if self._duties is None:
                     self._serve(instance)
             else:
-                self._begin(self._leave(target, instance))
-        elif target != self._acted and (target == launch.IN_SERVICE or target in launch.WARM_STATES):
-            self._begin(self._enter(target, instance))
+                self._begin(self._leave(instance))
+        elif target == launch.IN_SERVICE and not self._launched:
+            self._begin(self._enter(instance))
 
     def _begin(self, transition: Coroutine[Any, Any, None]) -> None:
         """Run `transition` beside the readings."""
@@ -422,13 +432,11 @@ class Agent:
             _LOG.warning("the instance metadata did not give %s", error)  # the item's name
             return None
 
-    async def _enter(self, target: str, instance: str) -> None:
-        self._acted = target
+    async def _enter(self, instance: str) -> None:
+        self._launched = True
         outcome = await asyncio.to_thread(self._launch.run)
-        _LOG.info("the launch transition ended: %s", outcome.value)
-        # The transition reads the target state itself. One that went into service has written
-        # the file that says so before it completed its hook; an entry to the warm pool has not.
-        if outcome is Outcome.CONTINUED and self._served.exists():
+        _LOG.info("the launch ended: %s", outcome.value)
+        if outcome is Outcome.CONTINUED:
             self._in_service = True
             self._serve(instance)
 
@@ -436,14 +444,12 @@ class Agent:
         outcome = await asyncio.to_thread(self._canary.run)
         _LOG.info("the canary ended: %s", outcome.value)
 
-    async def _leave(self, target: str, instance: str) -> None:
+    async def _leave(self, instance: str) -> None:
         outcome = await asyncio.to_thread(self._termination.drain, instance)
         _LOG.info("the termination handling ended: %s", outcome.value)
         if outcome is Outcome.DRAINED:
             # The duties are at rest: the engine's unit was stopped only once they were.
             self._in_service = False
-            # A return to the warm pool is not an entry to it.
-            self._acted = target
 
     def _serve(self, instance: str) -> None:
         """Start the serving duties, with the release the instance holds."""

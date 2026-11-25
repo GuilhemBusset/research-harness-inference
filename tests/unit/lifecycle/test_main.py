@@ -4,7 +4,7 @@ against stand-ins for everything around it.
 One `World` is the instance metadata and the engine, where the agent opens a URL; Auto Scaling,
 the release parameter and the pool's secret, as SDK clients; the host module, with the console; and
 the heartbeats table. The engine is the mock engine, in process, once the host module has started its unit. The
-state folder is the test's own, and the clock is moved only by the test: the program's sleep, the
+record of the release is in the test's own folder, and the clock is moved only by the test: the program's sleep, the
 duties' and the transitions' all wait on it, so no test waits for a tick. The one socket is the
 agent's own metrics endpoint, on a free port of the loopback interface.
 """
@@ -77,7 +77,6 @@ ENVIRON = {
 }
 
 IN_SERVICE = "InService"
-WARM = "Warmed:Stopped"
 TERMINATED = "Terminated"
 # The instance belongs to no group: its metadata answers that it has no target lifecycle state.
 NO_STATE = ""
@@ -127,8 +126,6 @@ class World(Host):
         self.target = target
         self.held = folder / "release.json"
         self.held.write_text(json.dumps(VALUE))
-        # The state folder: /run/rhi on an instance.
-        self.served = folder / "run" / "served"
         self.calls: list[str] = []
         self.completions: list[dict[str, str]] = []
         self.console: list[str] = []
@@ -146,9 +143,7 @@ class World(Host):
         self.closed = False
 
     def serves_already(self) -> None:
-        """The instance has served since its start: the record is there, and the engine runs."""
-        self.served.parent.mkdir()
-        self.served.touch()
+        """The instance was launched by an agent that ran before this one: its engine was started, and runs."""
         self.app = self.mock()
 
     def mock(self) -> Starlette:
@@ -169,7 +164,6 @@ class World(Host):
             host=self,
             fetch=self.fetch,
             held=self.held,
-            served=self.served,
             registry=CollectorRegistry(),
             port=0,
             clock=self.clock.time,
@@ -232,6 +226,9 @@ class World(Host):
 
     def restart_engine(self) -> None:
         self.calls.append("restart")
+
+    def engine_started(self) -> bool:
+        return self.app is not None
 
     def stop_engine(self) -> None:
         self.calls.append("stop")
@@ -361,16 +358,15 @@ def completion(hook: str) -> dict[str, str]:
     }
 
 
-def test_a_launch_straight_into_service_serves_then_drains_once_it_is_terminated(tmp_path: Path) -> None:
+def test_a_launch_serves_then_drains_once_the_instance_is_terminated(tmp_path: Path) -> None:
     async def scenario() -> None:
-        world = World(tmp_path, IN_SERVICE)  # no record of having served, and no image on its disk
+        world = World(tmp_path, IN_SERVICE)  # a new instance: no engine runs, and its disk has no image
         async with world.running():
             # The transition, with its warm-up request, then the duties: a first heartbeat, and a
             # first completion that the engine answers.
             await until(lambda: world.calls.count("completion") == 2 and len(world.beats) == 1)
             assert world.calls[:6] == ["pull", "check", "start", "health", "completion", "launch hook"]
             assert world.completions == [completion("launch")]
-            assert world.served.exists()  # the record a restarted agent looks for
 
             # The group terminates the instance while a student's request runs on it.
             student = await world.student()
@@ -403,7 +399,7 @@ def test_a_launch_straight_into_service_serves_then_drains_once_it_is_terminated
     run(scenario)
 
 
-def test_an_entry_to_the_warm_pool_completes_its_hook_and_starts_no_serving_duty(tmp_path: Path) -> None:
+def test_the_target_state_is_read_every_5_seconds_and_the_launch_is_run_once(tmp_path: Path) -> None:
     async def scenario() -> None:
         world = World(tmp_path, None)  # the instance metadata does not answer yet
         async with world.running() as agent:
@@ -415,19 +411,43 @@ def test_an_entry_to_the_warm_pool_completes_its_hook_and_starts_no_serving_duty
             assert scrape is not None  # the metrics endpoint is up before anything else is done
             assert scrape[0] == 200
 
-            # A reading that failed is followed by the next, and that one says where the instance goes.
-            world.target = WARM
+            # A reading that failed is followed by the next, and that one says the instance launches.
+            world.target = IN_SERVICE
             await world.clock.advance(5)
             await until(lambda: "launch hook" in world.calls)
             await world.ticks(13)
 
-        # The target state was read every 5 seconds, and the entry was run once: the group stops the instance.
+        # The target state was read every 5 seconds, and the launch was run once.
         assert sorted(set(world.readings)) == [NOW + 5 * tick for tick in range(15)]
-        assert world.calls == ["pull", "check", "launch hook"]
+        assert world.calls[:6] == ["pull", "check", "start", "health", "completion", "launch hook"]
+        assert world.calls.count("pull") == 1
         assert world.completions == [completion("launch")]
+
+    run(scenario)
+
+
+class AnotherRelease(World):
+    """An instance whose pool has moved to another release since the instance was prepared."""
+
+    def get_parameter(self, **request: Any) -> dict[str, Any]:
+        value = VALUE | {"engine_flags": ["--max-model-len", "32768"]}
+        return {"Parameter": {"Name": NAME, "Value": json.dumps(value)}}
+
+
+def test_an_abandoned_launch_is_not_run_again_and_the_instance_is_left_alone(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        world = AnotherRelease(tmp_path, IN_SERVICE)
+        async with world.running():
+            await until(lambda: world.completions != [])
+            await world.ticks(3)
+            # The group terminates the instance it was told to abandon: no engine runs there to drain.
+            world.target = TERMINATED
+            await world.ticks(3)
+
+        assert world.calls == ["pull", "check", "launch hook"]
+        assert world.completions == [completion("launch") | {"LifecycleActionResult": "ABANDON"}]
         assert world.asked == 0
         assert world.beats == []
-        assert not world.served.exists()
 
     run(scenario)
 
@@ -452,40 +472,19 @@ def test_a_restarted_agent_resumes_serving(tmp_path: Path) -> None:
     run(scenario)
 
 
-@pytest.mark.parametrize("target", [TERMINATED, WARM])
-def test_a_restarted_agent_hands_an_instance_that_left_service_to_the_termination_handling(
-    tmp_path: Path, target: str
-) -> None:
+def test_a_restarted_agent_hands_an_instance_that_left_service_to_the_termination_handling(tmp_path: Path) -> None:
     async def scenario() -> None:
-        world = World(tmp_path, target)
+        world = World(tmp_path, TERMINATED)
         world.serves_already()
         async with world.running():
             await until(lambda: world.calls[-1:] == ["stop"])
             await world.ticks(3)
 
         # The engine was idle: the termination hook was completed at once. Nothing of a launch was
-        # run, also for the warm-pool state a new instance enters the pool by, and no serving duty.
+        # run, and no serving duty.
         assert world.calls == ["termination hook", "stop"]
         assert world.completions == [completion("termination")]
         assert world.beats == []
-
-    run(scenario)
-
-
-def test_an_instance_that_returns_to_the_warm_pool_drains_and_is_not_taken_for_an_entry(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        world = World(tmp_path, IN_SERVICE)
-        async with world.running():
-            await until(lambda: world.calls.count("completion") == 2 and len(world.beats) == 1)
-            launched = len(world.calls)
-
-            world.target = WARM
-            await world.clock.advance(5)
-            await until(lambda: world.calls[-1] == "stop")
-            await world.ticks(3)
-
-        assert world.calls[launched:] == ["termination hook", "stop"]
-        assert world.completions == [completion("launch"), completion("termination")]
 
     run(scenario)
 
@@ -500,15 +499,14 @@ def test_an_instance_in_no_group_is_handed_to_the_canary_and_does_nothing_of_a_g
             asked = world.asked
             await world.ticks(13)
 
-        # The steps of a launch straight into service, once, then the line on the console.
+        # The steps of a launch, once, then the line on the console.
         assert world.calls == ["pull", "check", "start", "health", "completion", "console"]
         assert world.console == [f"rhi-canary served image_digest=sha256:{'a' * 64} model_revision=none"]
         # No hook was completed and no row written, by the canary or by a serving duty: over a
-        # minute of readings the engine was asked nothing more, and nothing says the instance served.
+        # minute of readings the engine was asked nothing more.
         assert world.completions == []
         assert world.items == []
         assert world.asked == asked
-        assert not world.served.exists()
 
     run(scenario)
 

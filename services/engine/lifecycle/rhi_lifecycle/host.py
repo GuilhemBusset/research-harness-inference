@@ -17,8 +17,10 @@ console output. A line is written there on the host's own console device, and re
 on its standard input: reading it back needs no permission of the instance role.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
-nothing the command or AWS printed. So does a command that is still running when the time its
-caller gave it has passed: it is stopped, because a transition has a deadline (section 4.3).
+nothing the command or AWS printed. One answer is read: the state systemd gives the engine's unit,
+a word of systemd's own vocabulary, which is compared and never repeated. So does a command that is still running when the time its
+caller gave it has passed: it is stopped, because the run of a canary has a deadline
+(`rhi_lifecycle.canary`).
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ _REGISTRY = re.compile(r"([A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?)/\S+", re.ASCII)
 
 class HostError(Exception):
     """An action on the host failed. `action` is `login`, `pull`, `inspect`, `start`, `restart`,
-    `stop` or `console`; `returncode` is the command's exit status, or None when no command ran to its end."""
+    `stop`, `state` or `console`; `returncode` is the command's exit status, or None when no command ran to its end."""
 
     def __init__(self, action: str, returncode: int | None = None) -> None:
         how = "could not be run" if returncode is None else f"exited with status {returncode}"
@@ -66,9 +68,9 @@ class Host:
         self._nsenter = nsenter
 
     def holds(self, image: str, timeout: float | None = None) -> bool:
-        """Whether the host's docker holds `image`: an instance that went through the warm pool
-        pulled it there, and one launched straight into service has not. A docker that has not
-        answered within `timeout` seconds, when one is given, has not said no: `HostError`."""
+        """Whether the host's docker holds `image`: a launch pulls it only when the disk lacks it.
+        A docker that has not answered within `timeout` seconds, when one is given, has not said
+        no: `HostError`."""
         end = None if timeout is None else time.monotonic() + timeout
         try:
             self._run("inspect", ("docker", "image", "inspect", image), end=end, quiet=True)
@@ -96,6 +98,26 @@ class Host:
 
     def restart_engine(self) -> None:
         self._run("restart", ("systemctl", "restart", ENGINE_UNIT))
+
+    def engine_started(self) -> bool:
+        """Whether the engine's unit has been started on the host and not stopped since: systemd
+        gives it any state but `inactive`. A unit that is starting, or that systemd is about to
+        start again after a failure, counts: only the agent starts the unit
+        (`services/engine/units/rhi-engine.service`), and only the agent stops it. A systemd that
+        gave no state has not said no: `HostError`."""
+        # The state is systemd's one word on the standard output. The exit status tells only a
+        # unit that is active from every other.
+        command = (self._nsenter, *HOST_NAMESPACES, "--", "systemctl", "is-active", ENGINE_UNIT)
+        try:
+            done = subprocess.run(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+            )
+        except OSError:
+            raise HostError("state") from None
+        state = done.stdout.decode("ascii", errors="replace").strip()
+        if not state:
+            raise HostError("state", done.returncode)
+        return state != "inactive"
 
     def stop_engine(self) -> None:
         self._run("stop", ("systemctl", "stop", ENGINE_UNIT))

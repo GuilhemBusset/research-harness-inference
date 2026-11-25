@@ -1,4 +1,4 @@
-"""The launch transitions (`rhi_lifecycle.launch`; system design, section 4.3), on one stand-in
+"""The launch of an instance (`rhi_lifecycle.launch`; system design, section 4.3), on one stand-in
 for everything around the agent: the instance metadata and the engine, where the agent opens a
 URL; Auto Scaling, the release parameter and the pool's secret, as SDK clients; the host module;
 and a clock that only the stand-in moves. No test here needs AWS, docker or a wait, and the one
@@ -18,11 +18,9 @@ import httpx
 import pytest
 from botocore.exceptions import ClientError
 
-from rhi_common.engine_metrics import MOCK
 from rhi_lifecycle import release
 from rhi_lifecycle.host import Host, HostError
 from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, Engine, Launch, Metadata, Outcome, fetch
-from rhi_lifecycle.termination import Termination
 from rhi_mock_engine.app import Settings, create_app
 
 if TYPE_CHECKING:
@@ -53,9 +51,9 @@ VALUE: dict[str, Any] = {
     },
 }
 
-WARM = "Warmed:Stopped"
 IN_SERVICE = "InService"
-# A hook with no timeout of its own waits this long (evidence E10): the test's clock stops there.
+# A hook with no timeout of its own waits this long (evidence E10), four times what the launch
+# hook has: the test's clock stops there.
 AN_HOUR = 3600
 
 
@@ -71,18 +69,17 @@ class World(Host):
     """An instance prepared with the release of `VALUE`, and everything around its agent. `calls`
     holds the steps in the order they happened; `completions` what reached Auto Scaling."""
 
-    def __init__(self, folder: Path, target: str, *, on_disk: bool, measured: int | None = None) -> None:
+    def __init__(self, folder: Path, *, on_disk: bool, measured: int | None = None) -> None:
         super().__init__(ecr=object())
         self.now = 0.0
         self.calls: list[str] = []
         self.completions: list[dict[str, str]] = []
-        self.target: str | None = target
+        self.target: str | None = IN_SERVICE
         self.parameter: dict[str, Any] | None = copy.deepcopy(VALUE)
         if self.parameter is not None and measured is not None:
             self.parameter["measured_start_seconds"] = measured
         self.held = folder / "release.json"
         self.held.write_text(json.dumps(VALUE))
-        self.served = folder / "run" / "served"
         # The host: whether its docker holds the image, and how a pull and a start go.
         self.on_disk = on_disk
         self.pull_seconds = 120.0
@@ -96,22 +93,16 @@ class World(Host):
         self.warm_up: tuple[int, bytes] | None = (200, b'{"choices": []}')
 
     def launch(self) -> Launch:
-        metadata = Metadata(self.fetch)
         return Launch(
             NAME,
-            metadata=metadata,
+            metadata=Metadata(self.fetch),
             autoscaling=self,
             ssm=self,
             secrets=self,
             dynamodb=self,
             host=self,
             engine=Engine(self.fetch),
-            # An instance that leaves service is handed over: tests/unit/lifecycle/test_termination.py.
-            termination=Termination(
-                NAME, metadata, autoscaling=self, ssm=self, host=self, engine=MOCK, fetch=self.fetch, sleep=self.sleep
-            ),
             held=self.held,
-            served=self.served,
             clock=lambda: self.now,
             sleep=self.sleep,
         )
@@ -192,6 +183,8 @@ class World(Host):
         if (url, method) == (f"{ENGINE_URL}/v1/chat/completions", "POST"):
             self.calls.append("warm-up")
             if self.warm_up is None:
+                # The agent gives the request no time limit: it would wait on, as the test's world cannot.
+                assert timeout is None
                 raise StillWaiting
             if request.get_header("Authorization") != f"Bearer {SECRET}":
                 return 401, b""
@@ -225,51 +218,68 @@ def completion(result: str) -> dict[str, str]:
     }
 
 
-def test_an_entry_to_the_warm_pool_pulls_the_image_checks_the_release_and_completes(tmp_path: Path) -> None:
-    world = World(tmp_path, WARM, on_disk=False)
-
-    assert world.launch().run() is Outcome.CONTINUED
-
-    assert world.calls == ["pull", "check", "complete"]
-    assert world.completions == [completion("CONTINUE")]
-    assert world.started_at is None  # the group stops the instance: no engine is started
-
-
-def test_a_promotion_checks_starts_waits_warms_up_and_only_then_completes(tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
+def test_a_launch_pulls_checks_starts_waits_warms_up_and_only_then_completes(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=False)
     world.start_seconds = 4.0  # not healthy at once: the agent asks again
 
     assert world.launch().run() is Outcome.CONTINUED
 
-    assert world.calls == ["check", "start", "health", "health", "health", "warm-up", "complete"]
+    assert world.calls == ["pull", "check", "start", "health", "health", "health", "warm-up", "complete"]
     assert world.completions == [completion("CONTINUE")]
 
 
-def test_a_promotion_is_not_completed_while_the_warm_up_request_is_unanswered(tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
-    world.warm_up = None
+def test_a_launch_pulls_no_image_its_disk_holds(tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=True)
 
-    with pytest.raises(StillWaiting):
-        world.launch().run()
+    assert world.launch().run() is Outcome.CONTINUED
 
-    assert world.calls == ["check", "start", "health", "warm-up"]
-    assert world.completions == []
+    assert world.calls == ["check", "start", "health", "warm-up", "complete"]
+    assert world.completions == [completion("CONTINUE")]
 
 
-def test_a_launch_straight_into_service(tmp_path: Path) -> None:
-    # The warm pool never held this instance: its disk has no image. The pull alone outlasts twice
-    # the measured start, and only the hook's own timeout bounds this launch.
-    world = World(tmp_path, IN_SERVICE, on_disk=False, measured=200)
-    world.pull_seconds = 500.0
+def test_a_launch_keeps_no_deadline_of_its_own(tmp_path: Path) -> None:
+    # The pull alone outlasts the hook's 15 minutes, and twice the pool's measured start: the agent
+    # gives it no time limit and abandons nothing. Only the hook's own timeout bounds the launch.
+    world = World(tmp_path, on_disk=False, measured=200)
+    world.pull_seconds = 1000.0
     world.start_seconds = 100.0
 
     assert world.launch().run() is Outcome.CONTINUED
 
-    steps = [step for step in world.calls if step != "health"]
-    assert steps == ["pull", "check", "start", "warm-up", "complete"]
     assert world.pull_limits == [None]
     assert world.completions == [completion("CONTINUE")]
-    assert world.now >= 600
+    assert world.now >= 1100
+
+
+def never_healthy(world: World) -> None:
+    world.start_seconds = None
+
+
+def unanswered_warm_up(world: World) -> None:
+    world.warm_up = None
+
+
+@pytest.mark.parametrize(
+    ("silence", "steps"),
+    [
+        pytest.param(never_healthy, ["check", "start", "health"], id="health-route-never-answers"),
+        pytest.param(unanswered_warm_up, ["check", "start", "health", "warm-up"], id="warm-up-request-unanswered"),
+    ],
+)
+def test_an_engine_that_never_answers_is_left_to_the_hooks_timeout(
+    silence: Callable[[World], None], steps: list[str], tmp_path: Path
+) -> None:
+    world = World(tmp_path, on_disk=True, measured=200)
+    silence(world)
+
+    # The agent still waits when the test stops the world, far past the hook's timeout.
+    with pytest.raises(StillWaiting):
+        world.launch().run()
+
+    # It completed nothing, so the instance never entered service: the launch hook's timeout
+    # abandons it, by the hook's default result (tests/synth/test_pool_hooks.py).
+    assert list(dict.fromkeys(world.calls)) == steps
+    assert world.completions == []
 
 
 def another_release(world: World) -> None:
@@ -285,93 +295,42 @@ def failed_start(world: World) -> None:
     world.start_fails = True
 
 
-def never_healthy(world: World) -> None:
-    world.start_seconds = None
-
-
 def failed_warm_up(world: World) -> None:
     world.warm_up = (500, b"")
 
 
 @pytest.mark.parametrize(
-    ("target", "on_disk", "failure", "steps"),
+    ("on_disk", "failure", "steps"),
     [
-        pytest.param(WARM, False, another_release, ["pull", "check"], id="entry-release-differs"),
-        pytest.param(IN_SERVICE, True, another_release, ["check"], id="promotion-release-differs"),
-        pytest.param(WARM, False, failed_pull, ["pull"], id="entry-pull-fails"),
-        pytest.param(IN_SERVICE, False, failed_pull, ["pull"], id="straight-launch-pull-fails"),
-        pytest.param(IN_SERVICE, True, failed_start, ["check", "start"], id="engine-does-not-start"),
-        pytest.param(IN_SERVICE, True, never_healthy, ["check", "start", "health"], id="engine-never-healthy"),
-        pytest.param(
-            IN_SERVICE, True, failed_warm_up, ["check", "start", "health", "warm-up"], id="warm-up-request-fails"
-        ),
+        pytest.param(False, another_release, ["pull", "check"], id="release-differs"),
+        pytest.param(False, failed_pull, ["pull"], id="pull-fails"),
+        pytest.param(True, failed_start, ["check", "start"], id="engine-does-not-start"),
+        pytest.param(True, failed_warm_up, ["check", "start", "health", "warm-up"], id="warm-up-request-fails"),
     ],
 )
-def test_failures_abandon(
-    target: str, on_disk: bool, failure: Callable[[World], None], steps: list[str], tmp_path: Path
-) -> None:
-    world = World(tmp_path, target, on_disk=on_disk, measured=200)
+def test_failures_abandon(on_disk: bool, failure: Callable[[World], None], steps: list[str], tmp_path: Path) -> None:
+    world = World(tmp_path, on_disk=on_disk, measured=200)
     failure(world)
 
     assert world.launch().run() is Outcome.ABANDONED
 
-    # The steps up to the one that failed, each once but for the health route, then one completion.
-    assert list(dict.fromkeys(world.calls)) == [*steps, "complete"]
+    # The steps up to the one that failed, then one completion.
+    assert world.calls == [*steps, "complete"]
     assert world.completions == [completion("ABANDON")]
-    assert not world.served.exists()
 
 
-def test_each_transition_keeps_its_own_deadline(tmp_path: Path) -> None:
-    def world(name: str, target: str, measured: int | None) -> World:
-        folder = tmp_path / name
-        folder.mkdir()
-        return World(folder, target, on_disk=target == IN_SERVICE, measured=measured)
-
-    # An entry to the warm pool has 15 minutes, whatever the pool's measured start.
-    entry = world("entry-in-time", WARM, 200)
-    entry.pull_seconds = 899.0
-    assert entry.launch().run() is Outcome.CONTINUED
-
-    entry = world("entry-too-long", WARM, 200)
-    entry.pull_seconds = 5000.0
-    assert entry.launch().run() is Outcome.ABANDONED
-    assert entry.now == 900
-    assert entry.completions == [completion("ABANDON")]
-
-    # A promotion has twice the measured start: 400 seconds for a start of 200.
-    promotion = world("promotion-in-time", IN_SERVICE, 200)
-    promotion.start_seconds = 397.0
-    assert promotion.launch().run() is Outcome.CONTINUED
-    assert 397 <= promotion.now < 400
-
-    promotion = world("promotion-too-long", IN_SERVICE, 200)
-    promotion.start_seconds = None
-    assert promotion.launch().run() is Outcome.ABANDONED
-    assert promotion.now == 400
-    assert promotion.completions == [completion("ABANDON")]
-
-    # With no measured start the agent sets no deadline: it still waits when the test stops, far
-    # past the 400 seconds and the 15 minutes.
-    unmeasured = world("promotion-unmeasured", IN_SERVICE, None)
-    unmeasured.start_seconds = None
-    with pytest.raises(StillWaiting):
-        unmeasured.launch().run()
-    assert unmeasured.now >= AN_HOUR
-    assert unmeasured.completions == []
-
-
-@pytest.mark.parametrize("target", ["Terminated", "Warmed:Terminated", None])
+@pytest.mark.parametrize("target", ["Terminated", "Warmed:Stopped", None])
 def test_nothing_is_done_outside_a_launch(target: str | None, tmp_path: Path) -> None:
-    world = World(tmp_path, IN_SERVICE, on_disk=True)
+    world = World(tmp_path, on_disk=True)
     world.target = target
 
-    # Without a target state the agent does not know its transition.
+    # Without a target state the agent does not know that the instance is launching.
     assert world.launch().run() is (Outcome.NOT_COMPLETED if target is None else Outcome.NOT_A_LAUNCH)
     assert world.calls == []
 
 
 def test_without_the_parameter_no_hook_is_named_and_nothing_is_completed(tmp_path: Path) -> None:
-    world = World(tmp_path, WARM, on_disk=False)
+    world = World(tmp_path, on_disk=False)
     world.parameter = None
 
     assert world.launch().run() is Outcome.NOT_COMPLETED

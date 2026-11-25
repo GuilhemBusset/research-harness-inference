@@ -1,11 +1,11 @@
 """The transition out of service: the termination hook, completed once the engine is idle (system
 design, section 4.3).
 
-When an instance leaves service, for the warm pool or for good, a request may still be running on
-it. So the agent asks the engine's `/metrics` on localhost every `POLL_SECONDS`, under the names of
-the engine's row in `rhi_common.engine_metrics`, until one answer gives nothing running and nothing
-waiting. Then it completes the termination hook the settings of the release parameter name, with
-`CONTINUE`, and the instance may leave: Auto Scaling terminates it, or stops it into the warm pool.
+An instance leaves service for good: its group terminates it. A request may still be running on it
+then. So the agent asks the engine's `/metrics` on localhost every `POLL_SECONDS`, under the names
+of the engine's row in `rhi_common.engine_metrics`, until one answer gives nothing running and
+nothing waiting. Then it completes the termination hook the settings of the release parameter name,
+with `CONTINUE`, and the instance may leave: Auto Scaling terminates it.
 
 **Only what the engine reports ends the wait.** An engine that does not answer, or whose answer
 does not give both counts, has not reported that it is idle, and the wait goes on. The agent sets
@@ -17,10 +17,9 @@ never while the engine may hold a request. A hook that could not be completed le
 running.
 
 **Which instance drains.** `Termination.run` reads the target lifecycle state in the instance
-metadata and drains an instance whose target is `Terminated`. An instance that returns from service
-to the warm pool arrives in the wait state a new instance enters the pool by (evidence E10), and
-only the file that says it has served tells the two apart: `rhi_lifecycle.launch` reads it, and
-hands the instance that has served to `Termination.drain`.
+metadata and drains an instance whose target is `Terminated`. The agent's program, which reads the
+target state itself and knows whether the instance is in service, hands one that leaves it to
+`Termination.drain` (`rhi_lifecycle.__main__`).
 
 **What cannot be completed.** The hook is named in the settings of the release parameter, and the
 instance by its metadata. Without one of them there is nothing to call: the result is
@@ -49,7 +48,7 @@ from rhi_lifecycle.serving import METRICS_SECONDS, read_load
 # instance bills until its hook is completed, and a question to localhost costs nothing.
 POLL_SECONDS = 2.0
 
-# The target lifecycle state of an instance that leaves service for good.
+# The target lifecycle state of an instance that leaves service.
 TERMINATED = "Terminated"
 
 
@@ -73,8 +72,7 @@ class Termination:
         metric_names(self.engine)  # an engine with no row is refused here, not at every question
 
     def run(self) -> Outcome:
-        """Drain the instance if it is terminated. An instance that returns to the warm pool is
-        `Launch.run`'s to tell from one that enters it."""
+        """Drain the instance if it is terminated."""
         try:
             target = self.metadata.target_state()
             instance = self.metadata.instance_id()

@@ -7,14 +7,14 @@ the same agent, and the agent knows such an instance by its metadata: an instanc
 its target lifecycle state there, and one that belongs to no group finds none
 (`launch.NoSuchItemError`). The agent's program hands that instance to `Canary.run`.
 
-**What the run does** is what a launch straight into service does, by the same steps
-(`launch.Steps`): pull the engine image, check the release, start the engine, wait for its health
-route, send the real warm-up request.
+**What the run does** is what a launch does, by the same steps (`launch.Steps`): pull the engine
+image, check the release, start the engine, wait for its health route, send the real warm-up
+request.
 
 **What it leaves out.** No lifecycle hook exists for the instance, so none is completed: a canary
 is given no Auto Scaling client. It is given no heartbeats table either, and keeps the stage it has
-reached in memory only: a row there would be read as one of the pool's instances. It does not write
-the file that says an instance has served, and the program starts no serving duty after it.
+reached in memory only: a row there would be read as one of the pool's instances. The program
+starts no serving duty after it.
 
 **The outcome** is one line on the instance's serial console, which the promotion job reads with
 EC2's console output. Writing it needs no permission of the instance role and leaves the stage's
@@ -30,10 +30,10 @@ for a pool that serves no model. `<stage>` is the last stage the run reached, by
 image stage starts with the run, so a pool's parameter that cannot be read fails there. The line
 holds nothing that AWS, docker or the engine answered.
 
-**The deadline.** Only the launch hook's own timeout bounds a launch straight into service: 15
-minutes, or twice the pool's measured start when that is longer (`rhi.pools.hooks`). A canary has
-no hook, so the run keeps that time itself, and an engine that never becomes healthy fails at it,
-in the weights stage. Every step takes what is left of it as its time limit.
+**The deadline.** Only the launch hook's own timeout bounds a launch: 15 minutes, or twice the
+pool's measured start when that is longer (`rhi.pools.hooks`). A canary has no hook, so the run
+keeps that time itself, and an engine that never becomes healthy fails at it, in the weights stage.
+Every step takes what is left of it as its time limit.
 """
 
 from __future__ import annotations
@@ -98,8 +98,7 @@ class Canary:
     sleep: Callable[[float], object] = time.sleep
 
     def run(self) -> Outcome:
-        """Do the steps of a launch straight into service, then write the outcome's line on the
-        console."""
+        """Do the steps of a launch, then write the outcome's line on the console."""
         started = self.clock()
         steps = launch.Steps(
             self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep
