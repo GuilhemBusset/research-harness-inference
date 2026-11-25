@@ -10,10 +10,11 @@ names its image by its sha256 digest, whichever registry serves it.
 The Dockerfiles are those git lists, tracked or untracked but not ignored: the pipeline's synth
 step runs the tests in a work tree with no commit, where every file is untracked. A file is read
 the way BuildKit's parser reads it (`frontend/dockerfile/parser`), as far as FROM lines and the
-directive go: what a comment, a continued line or a byte-order mark does there, it does here. A
-here-document is not read as one. Under the first instruction that may open one, a line that
-starts with FROM is taken for an instruction, and no FROM line there names a stage a later one
-may take: both can only refuse more.
+directive go: what a comment, a continued line, a byte-order mark or a here-document does there,
+it does here. A line of a here-document is no instruction, so a FROM written there pulls nothing
+and names no stage. Where a here-document ends is read as the parser's lexer reads its word
+(`frontend/dockerfile/shell`), but for a word beside a `${...}`, which that lexer expands: an
+instruction written so is refused.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ ALLOWED = {
 ON_DOCKER_HUB = "an image on Docker Hub, outside the allowed list"
 NO_DIGEST = "an image without its sha256 digest"
 NOT_READ = "an image written with a variable, a quote or an escape, which hides where it comes from"
+NO_END = "a here-document opened beside a ${...}, which hides where it ends"
 
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 # What an image reference is written with. The builder expands a FROM line's image as a shell
@@ -56,6 +58,17 @@ BYTE_ORDER_MARK = "﻿"
 # directives like any other comment.
 DIRECTIVE = re.compile(r"([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$", re.ASCII)
 DIRECTIVES = {"syntax", "escape", "check"}
+# The instructions that may open a here-document, alone or under ONBUILD, and the word that opens
+# one: `<<EOF`, `<<-EOF` when tabs may come before the line that ends it, a file descriptor before.
+OPENS_A_DOCUMENT = {"RUN", "COPY", "ADD"}
+BLANKS = re.compile(r"[\t\v\f\r ]+")
+HERE_DOCUMENT = re.compile(r"[0-9]*<<(-?)[\t\n\f\r ]*([^<]*)")
+# What the lexer reads in one piece: a quoted text, where `\` escapes only `"`, `$` and itself,
+# `<<` with the blanks after it, an escaped character.
+PIECE = re.compile(
+    r"""(?P<single>'[^']*')|(?P<double>"(?:\\["$\\]|[^"])*+")|(?P<opens><<[\t\r ]*)|(?P<escaped>\\.)|(?P<other>.)""",
+    re.DOTALL,
+)
 
 
 def docker_hub_repository(image: str) -> str | None:
@@ -124,44 +137,102 @@ def instruction_at(lines: list[str], start: int, continues: re.Pattern[str]) -> 
         piece = lines[at]
 
 
-def instructions(dockerfile: str) -> list[tuple[str, bool]]:
-    """A Dockerfile's instructions, each as one line, and whether it is one for sure. The escape
-    character is `\\` unless the `escape` directive names the other. A comment is no instruction
-    and never continues. Under an instruction that may open a here-document, one written with
-    `<<`, a line may be the document's and no instruction, and where the document ends is not
-    read: there, every line is read as the start of an instruction, and none is one for sure."""
+def first_word(text: str) -> tuple[str, str]:
+    """The first word of a text, and what follows the blanks after it."""
+    word, *rest = BLANKS.split(text.strip(), maxsplit=1)
+    return word, rest[0].strip() if rest else ""
+
+
+def shell_words(text: str, raw: bool) -> list[str] | None:
+    """The words of a text as BuildKit's lexer splits them, on the blanks that are neither quoted
+    nor escaped: with their quotes and escape characters when `raw`, without them otherwise. None
+    when a quote has no end. A `$` is read as any other character, which it is to the lexer but
+    before a `{`."""
+    words, word = [], ""
+    for piece in PIECE.finditer(text):
+        kind, written = piece.lastgroup, piece[0]
+        if kind == "other" and written in ("'", '"'):
+            return None
+        if kind == "other" and written.isspace():
+            words, word = [*words, word], ""
+        elif kind == "other" and written == "\\":
+            word += written if raw else ""
+        elif raw or kind in ("opens", "other"):
+            word += written
+        elif kind == "double":
+            word += re.sub(r'\\(["$\\])', r"\1", written[1:-1])
+        else:
+            word += written[1:-1] if kind == "single" else written[1:]
+    return [word for word in [*words, word] if word]
+
+
+def here_documents(instruction: str) -> list[tuple[str, bool]] | None:
+    """The here-documents an instruction opens, each as the line that ends it and whether tabs may
+    come before that line. RUN, COPY and ADD open them, alone or under ONBUILD, and not when their
+    arguments are a JSON list. None when the instruction also has a `${`: the lexer expands it, an
+    expansion may split a word or fail, and then no here-document is opened."""
+    name, arguments = first_word(instruction)
+    if name.upper() == "ONBUILD":
+        name, arguments = first_word(arguments)
+    while arguments.startswith("--"):
+        arguments = first_word(arguments)[1]
+    if name.upper() not in OPENS_A_DOCUMENT or "<<" not in instruction:
+        return []
+    try:
+        listed = json.loads(arguments) if arguments.startswith("[") else None
+    except ValueError:
+        listed = None
+    if isinstance(listed, list) and all(isinstance(argument, str) for argument in listed):
+        return []
+    if "${" in instruction:
+        return None
+    found = []
+    for word in shell_words(instruction, raw=True) or []:
+        opens = HERE_DOCUMENT.fullmatch(word)
+        ends = shell_words(opens[2], raw=False) if opens else None
+        if opens and ends and len(ends) == 1:
+            found.append((ends[0], opens[1] == "-"))
+    return found
+
+
+def instructions(dockerfile: str) -> list[str]:
+    """A Dockerfile's instructions, each as one line. The escape character is `\\` unless the
+    `escape` directive names the other. A comment is no instruction and never continues. The lines
+    of a here-document are none either: those under the instruction that opens it, up to the line
+    that ends it, or to the end of the file."""
     lines = lines_of(dockerfile)
     escape = directives([line.lstrip() for line in lines]).get("escape", "\\")
     escape = re.escape(escape if escape == "`" else "\\")
     continues = re.compile(rf"(?<!{escape}){escape}[ \t]*$")
     found = []
-    sure, at = True, 0
+    at = 0
     while at < len(lines):
         if lines[at].lstrip().startswith("#"):
             at += 1
             continue
-        instruction, after = instruction_at(lines, at, continues)
-        if instruction.strip():
-            found.append((instruction, sure))
-        sure = sure and "<<" not in instruction
-        at = after if sure else at + 1
+        instruction, at = instruction_at(lines, at, continues)
+        if not instruction.strip():
+            continue
+        found.append(instruction)
+        for ends, after_tabs in here_documents(instruction) or []:
+            written = [line.lstrip("\t") if after_tabs else line for line in lines[at:]]
+            at += written.index(ends) + 1 if ends in written else len(written)
     return found
 
 
 def bases(dockerfile: str) -> list[str]:
     """The images a Dockerfile's FROM lines make the builder pull. `FROM scratch` pulls nothing,
-    and neither does a FROM that names an earlier stage of the same file, one that a FROM line
-    which is an instruction for sure names."""
+    and neither does a FROM that names an earlier stage of the same file."""
     found = []
     stages: set[str] = set()
-    for instruction, sure in instructions(dockerfile):
+    for instruction in instructions(dockerfile):
         words = instruction.split()
         if words[0].upper() != "FROM":
             continue
         arguments = list(dropwhile(lambda word: word.startswith("--"), words[1:]))
         if arguments and arguments[0] != "scratch" and arguments[0].lower() not in stages:
             found.append(arguments[0])
-        if sure and len(arguments) == 3 and arguments[1].upper() == "AS":
+        if len(arguments) == 3 and arguments[1].upper() == "AS":
             stages.add(arguments[2].lower())
     return found
 
@@ -174,8 +245,9 @@ def refused_on_docker_hub(image: str) -> bool:
 def findings(dockerfile: str) -> list[tuple[str, str]]:
     """What a Dockerfile's text names that it may not, as (image, what is wrong with it): the image
     of the syntax directive or of a FROM line on Docker Hub and not allowed, and the image of a
-    FROM line without its digest, or written so that its name cannot be read."""
-    found = []
+    FROM line without its digest, or written so that its name cannot be read, and an instruction
+    whose here-document ends where this cannot read."""
+    found = [(instruction, NO_END) for instruction in instructions(dockerfile) if here_documents(instruction) is None]
     syntax = syntax_image(dockerfile)
     if syntax is not None and refused_on_docker_hub(syntax):
         found.append((syntax, ON_DOCKER_HUB))
@@ -301,6 +373,36 @@ ECR_PUBLIC = f"public.ecr.aws/docker/library/python:3.13{SHA}"
             id="a FROM under a here-document whose last line ends with the escape character",
         ),
         pytest.param(
+            f"FROM scratch\nRUN cat<<EOF\nFROM python{SHA}\nEOF\n",
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under a << in a longer word, which opens no here-document",
+        ),
+        pytest.param(
+            f'FROM scratch\nRUN ["sh", "-c", "cat", "<<EOF"]\nFROM python{SHA}\n',
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under a << in a JSON list, which opens no here-document",
+        ),
+        pytest.param(
+            f"FROM scratch\nRUN echo it's <<EOF\nFROM python{SHA}\n",
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under a << after a quote with no end, which opens no here-document",
+        ),
+        pytest.param(
+            f"FROM scratch\nRUN <<-EOF\n\techo built\n\tEOF\nFROM python{SHA}\n",
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under a here-document that ends after tabs",
+        ),
+        pytest.param(
+            f"FROM scratch\nCOPY <<ONE <<TWO /srv/\nONE\nTWO\nFROM python{SHA}\n",
+            [(f"python{SHA}", ON_DOCKER_HUB)],
+            id="a FROM under two here-documents",
+        ),
+        pytest.param(
+            "FROM scratch\nRUN <<${END:-EOF}\nFROM scratch\nEOF\n",
+            [("RUN <<${END:-EOF}", NO_END)],
+            id="a here-document opened beside a ${...}",
+        ),
+        pytest.param(
             f'ARG BASE=python\nFROM "docker.io"/library/python{SHA}\nFROM ${{BASE}}{SHA}\n',
             [(f'"docker.io"/library/python{SHA}', NOT_READ), (f"${{BASE}}{SHA}", NOT_READ)],
             id="an image written with a quote, and one with a variable",
@@ -329,6 +431,19 @@ def test_an_image_on_docker_hub_or_without_its_digest_is_refused(
         pytest.param(
             f"FROM {ECR_PUBLIC} AS build\nRUN <<EOF\necho built\nEOF\nFROM build\n",
             id="a stage named above a here-document",
+        ),
+        pytest.param(
+            "FROM scratch AS source\nCOPY <<EOF /Dockerfile\nFROM python:3.13\nEOF\nFROM source AS packaged\n"
+            "FROM packaged\n",
+            id="a FROM line in a here-document, and stages named under it",
+        ),
+        pytest.param(
+            "FROM scratch\nONBUILD RUN --network=none sh << 'E O F'\nFROM python:3.13\n\tE O F\nEOF\nE O F\n",
+            id="a FROM line in a here-document under ONBUILD, whose end is quoted",
+        ),
+        pytest.param(
+            "FROM scratch\nRUN echo $((1<<2)) && cat <<EOF\nFROM python:3.13\nEOF\n",
+            id="a FROM line in a here-document opened beside a $",
         ),
         pytest.param(f"# syntax=ghcr.io/example/dockerfile:1{SHA}\nFROM localhost/base{SHA}\n", id="other hosts"),
         pytest.param("FROM scratch\n# syntax=docker/dockerfile:1\n", id="a comment like the directive, under a FROM"),

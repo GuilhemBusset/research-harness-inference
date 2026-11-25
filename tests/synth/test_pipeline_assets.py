@@ -47,10 +47,10 @@ EMULATORS = re.compile(rf"(?P<release>{EMULATOR_RELEASE})/qemu_v(?P=qemu)_linux-
 # it too.
 DOCKER_HUB = ("docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com")
 NAMES_DOCKER_HUB = re.compile(rf"(?<![\w.-])({'|'.join(map(re.escape, DOCKER_HUB))})(?![\w.-])", re.IGNORECASE)
-# The Docker commands whose first operand is an image the daemon runs or pulls, or reads from its
-# registry, each written alone or under its management command, with its options that take no
-# value. Any other option takes one, in its own word after `=` or in the next word: a word after
-# such an option is its value, and no image.
+# The Docker commands whose first operand is an image the daemon runs or pulls, each written alone
+# or under its management command, and those whose every operand is an image read from its
+# registry, each with its options that take no value. Any other option takes one, in its own word
+# after `=` or in the next word: a word after such an option is its value, and no image.
 RUNS = frozenset(
     {
         *("-d", "--detach", "--disable-content-trust", "--help", "--init", "-i", "--interactive"),
@@ -59,8 +59,6 @@ RUNS = frozenset(
     }
 )
 PULLS = frozenset({"-a", "--all-tags", "--disable-content-trust", "--help", "-q", "--quiet"})
-INSPECTS_A_MANIFEST = frozenset({"--help", "--insecure", "-v", "--verbose"})
-INSPECTS_AN_IMAGE = frozenset({"--help", "--raw"})
 TAKES_AN_IMAGE = {
     ("run",): RUNS,
     ("create",): RUNS,
@@ -68,8 +66,13 @@ TAKES_AN_IMAGE = {
     ("container", "run"): RUNS,
     ("container", "create"): RUNS,
     ("image", "pull"): PULLS,
-    ("manifest", "inspect"): INSPECTS_A_MANIFEST,
-    ("buildx", "imagetools", "inspect"): INSPECTS_AN_IMAGE,
+}
+TAKES_IMAGES = {
+    ("manifest", "inspect"): frozenset({"--help", "--insecure", "-v", "--verbose"}),
+    ("manifest", "create"): frozenset({"-a", "--amend", "--help", "--insecure"}),
+    ("manifest", "annotate"): frozenset({"--help"}),
+    ("buildx", "imagetools", "inspect"): frozenset({"--help", "--raw"}),
+    ("buildx", "imagetools", "create"): frozenset({"--append", "--dry-run", "--help", "--prefer-index"}),
 }
 # The options of `docker` itself and of a management command, before its command, that take no
 # value.
@@ -217,12 +220,21 @@ def under(call: list[str], names: tuple[str, ...]) -> list[str] | None:
     return words
 
 
+def operands(words: list[str], take_no_value: frozenset[str]) -> list[str]:
+    """The words of a command that are neither its options nor their values."""
+    found = []
+    while words := after_options(words, take_no_value):
+        found.append(words[0])
+        words = words[1:]
+    return found
+
+
 def images_of(command: str) -> list[str]:
     """The container images a command names: the first operand of each Docker command that takes
-    an image, after its options and their values, the value of each option or key that names an
-    image, and each image a build is given as a context (`docker-image://`). A call that names its
-    image nowhere this can read is given whole: it is no reference to another registry, and no
-    image by its digest."""
+    an image, after its options and their values, every operand of one that takes several, the
+    value of each option or key that names an image, and each image a build is given as a context
+    (`docker-image://`). A call that names its image nowhere this can read is given whole: it is
+    no reference to another registry, and no image by its digest."""
     found = []
     for line in command_lines(command):
         for index, word in enumerate(line):
@@ -235,10 +247,10 @@ def images_of(command: str) -> list[str]:
             if option in NAMES_AN_IMAGE and "=" not in value:  # With keys, `ref=` names the image.
                 found.append(value or word)
     for call in docker_calls(command):
-        for names, take_no_value in TAKES_AN_IMAGE.items():
+        for names, take_no_value in (TAKES_AN_IMAGE | TAKES_IMAGES).items():
             if (words := under(call, names)) is not None:
-                operands = after_options(words, take_no_value)
-                found.append(operands[0] if operands else " ".join(["docker", *call]))
+                images = operands(words, take_no_value)
+                found += (images if names in TAKES_IMAGES else images[:1]) or [" ".join(["docker", *call])]
     return found
 
 
@@ -264,9 +276,10 @@ def on_docker_hub(commands: list[str]) -> list[str]:
 
 
 def selects_a_builder(commands: list[str]) -> list[str]:
-    """The commands that build with another builder than the Docker daemon's own, buildx's default:
-    one that creates a builder or selects one, by `docker buildx create` or `use`, by `--builder`
-    or by `BUILDX_BUILDER`."""
+    """The commands that build with another builder than the Docker daemon's own, buildx's default,
+    with BuildKit: one that creates a builder or selects one, by `docker buildx create` or `use`,
+    by `--builder` or by `BUILDX_BUILDER`, and one that names `DOCKER_BUILDKIT`, which the project
+    gives as 1 and a command could only set otherwise."""
     found = []
     for command in commands:
         calls = docker_calls(command)
@@ -275,6 +288,7 @@ def selects_a_builder(commands: list[str]) -> list[str]:
             any(under(call, ("buildx", name)) is not None for call in calls for name in ("create", "use"))
             or any(word == "--builder" or word.startswith("--builder=") for word in words)
             or "BUILDX_BUILDER" in command
+            or "DOCKER_BUILDKIT" in command
         ):
             found.append(command)
     return found
@@ -299,8 +313,9 @@ def environment(action: dict[str, Any], project: dict[str, Any]) -> list[tuple[s
 
 def other_builders(action: dict[str, Any], project: dict[str, Any]) -> list[str]:
     """What makes an action's project build with another builder than the Docker daemon's own with
-    BuildKit: a command that creates or selects one, a variable that selects one wherever it is
-    given, and `DOCKER_BUILDKIT` when it is not given, or given as anything but 1."""
+    BuildKit: a command that creates or selects one or names `DOCKER_BUILDKIT`, in any phase, a
+    variable that selects one wherever it is given, and `DOCKER_BUILDKIT` when it is not given, or
+    given as anything but 1."""
     given = environment(action, project)
     found = selects_a_builder(every_command(project))
     found += [name for name, _ in given if name == "BUILDX_BUILDER"]
@@ -413,6 +428,15 @@ def test_a_variable_that_replaces_the_default_builder_is_refused(
     assert other_builders(action, project) == [name]
 
 
+def test_a_command_that_turns_buildkit_off_is_refused_in_any_phase(template: dict[str, Any]) -> None:
+    for phase in ("install", "build"):
+        action, project = copy.deepcopy(image_actions(template)[0])
+        spec = build_spec(project)
+        spec["phases"][phase]["commands"].insert(0, "export DOCKER_BUILDKIT=0")
+        project["Source"]["BuildSpec"] = json.dumps(spec)
+        assert other_builders(action, project) == ["export DOCKER_BUILDKIT=0"]
+
+
 def test_no_command_of_an_image_project_runs_pulls_or_names_an_image_on_docker_hub(template: dict[str, Any]) -> None:
     projects = image_projects(template)
     assert len(projects) == 2
@@ -456,6 +480,16 @@ SHA = "@sha256:" + "0" * 64
         ),
         pytest.param(
             f"docker buildx imagetools inspect moby/buildkit{SHA}", [f"moby/buildkit{SHA}"], id="a read of a manifest"
+        ),
+        pytest.param(
+            f"docker buildx imagetools create --dry-run python:3.13 -t example.com/python ghcr.io/example/python{SHA}",
+            ["python:3.13"],
+            id="a manifest made from a source with no host",
+        ),
+        pytest.param(
+            f"docker manifest create --amend example.com/python:3.13 docker.io/library/python{SHA}",
+            [f"docker.io/library/python{SHA}"],
+            id="a manifest list made from a manifest on docker.io",
         ),
         pytest.param(
             'docker run --rm -v "$PWD:/work" python:3.13 python --version',
@@ -530,6 +564,10 @@ def test_an_image_on_docker_hub_is_refused(command: str, expected: list[str]) ->
             "docker build --cache-from type=registry,ref=public.ecr.aws/example/cache --cache-to type=inline .",
             id="a build with a cache from another registry",
         ),
+        pytest.param(
+            f"docker buildx imagetools create --tag example.com/python:3.13 public.ecr.aws/docker/library/python{SHA}",
+            id="a manifest made from a source on another registry",
+        ),
         pytest.param("docker buildx version", id="a Docker command that takes no image"),
         pytest.param("curl -fsSL -o tool https://example.com/docker.io.tar.gz", id="a file named like the host"),
     ],
@@ -554,6 +592,8 @@ def test_what_names_no_image_on_docker_hub_is_accepted(command: str) -> None:
         pytest.param("docker builder create --use", id="a builder created under buildx's other name"),
         pytest.param("docker buildx build --builder=rhi-assets .", id="a builder given to one build"),
         pytest.param("export BUILDX_BUILDER=rhi-assets", id="a builder selected by the variable"),
+        pytest.param("export DOCKER_BUILDKIT=0", id="no BuildKit, by an exported variable"),
+        pytest.param("DOCKER_BUILDKIT=0 npx cdk-assets publish", id="no BuildKit, for one command"),
     ],
 )
 def test_another_builder_than_the_default_is_refused(command: str) -> None:
