@@ -1,6 +1,6 @@
-"""A pool's launch template, Auto Scaling group, warm pool and nightly stop (system design, sections
-4.2, 4.3, 5.1 and 5.4): the mock pool of the example configuration, a pool with a fallback instance
-type, and a pool with no warm instance.
+"""A pool's launch template, Auto Scaling group and warm pool (system design, sections 4.2, 4.3, 5.1
+and 5.4): the mock pool of the example configuration, a pool with a fallback instance type, and a
+pool with no warm instance.
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
 """
@@ -132,19 +132,13 @@ def test_the_mock_pool_warm_pool(pools: dict[str, Any], group: tuple[str, dict[s
     assert warm_pool["InstanceReusePolicy"] == {"ReuseOnScaleIn": True}
 
 
-def test_the_mock_pool_nightly_stop(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
-    name, _ = group
-    (action,) = of_mock(pools, "AWS::AutoScaling::ScheduledAction").values()
-    assert action["AutoScalingGroupName"] == {"Ref": name}
-    assert EXAMPLE.nightly_stop == "02:00"
-    assert action["Recurrence"] == "0 2 * * *"
-    assert action["TimeZone"] == EXAMPLE.time_zone
-    assert action["DesiredCapacity"] == 0
-    assert "MinSize" not in action
-    assert "MaxSize" not in action
+def test_no_pool_has_a_scheduled_action(pools: dict[str, Any]) -> None:
+    """No nightly stop, and nothing else on a schedule: a session may cross any hour (section 5.1)."""
+    assert len(of_type(pools, "AWS::AutoScaling::AutoScalingGroup")) == len(EXAMPLE.pools) == 2
+    assert of_type(pools, "AWS::AutoScaling::ScheduledAction") == {}
 
 
-def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00") -> Mapping[str, Any]:
+def standalone(app_module: ModuleType, pool: Pool) -> Mapping[str, Any]:
     """The template of a stack that holds only this pool's group, in a VPC of its own."""
     from aws_cdk import assertions
     from aws_cdk import aws_ec2 as ec2
@@ -167,8 +161,6 @@ def standalone(app_module: ModuleType, pool: Pool, *, nightly_stop: str = "02:00
         security_group=ec2.SecurityGroup(stack, "Instances", vpc=vpc),
         target_group=target_group,
         role=role,
-        nightly_stop=nightly_stop,
-        time_zone="Europe/Paris",
     )
     return assertions.Template.from_stack(stack).to_json()
 
@@ -188,12 +180,10 @@ def test_types_in_order(app_module: ModuleType) -> None:
 
 
 def test_no_warm_pool_at_zero(app_module: ModuleType) -> None:
-    template = standalone(app_module, dataclasses.replace(MOCK, warm_instances=0), nightly_stop="23:05")
+    template = standalone(app_module, dataclasses.replace(MOCK, warm_instances=0))
     assert len(of_type(template, "AWS::AutoScaling::AutoScalingGroup")) == 1
     assert of_type(template, "AWS::AutoScaling::WarmPool") == {}
-    # The nightly stop does not depend on a warm pool, and follows the configured time.
-    (action,) = of_type(template, "AWS::AutoScaling::ScheduledAction").values()
-    assert (action["Recurrence"], action["TimeZone"], action["DesiredCapacity"]) == ("5 23 * * *", "Europe/Paris", 0)
+    assert of_type(template, "AWS::AutoScaling::ScheduledAction") == {}
 
 
 def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(

@@ -276,8 +276,6 @@ def standalone(
             stack, "Targets", vpc=vpc, port=8000, target_type=elbv2.TargetType.INSTANCE
         ),
         role=role,
-        nightly_stop="02:00",
-        time_zone="Etc/UTC",
     )
     key = dynamodb.Attribute(name="pool", type=dynamodb.AttributeType.STRING)
     if unrelated:

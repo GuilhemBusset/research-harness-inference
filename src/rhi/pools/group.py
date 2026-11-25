@@ -1,11 +1,12 @@
-"""A pool's Auto Scaling group, its launch template, its warm pool and its nightly stop (system design,
-sections 4.2, 4.3, 5.1 and 5.4).
+"""A pool's Auto Scaling group, its launch template and its warm pool (system design, sections 4.2,
+4.3, 5.1 and 5.4).
 
 A pool becomes one group, whose instances register with the pool's target group (`rhi.pools.routing`).
 The group holds to the fleet cap (`tests/policy/test_fleet_cap.py`): a minimum of zero, the pool's
-`max_instances` as its maximum, no desired capacity in the template and no scaling policy. The
-scaler is the one writer of the desired capacity, and the group protects every new instance from
-scale-in, so that only the scaler, which lifts the protection, chooses which instance leaves.
+`max_instances` as its maximum, no desired capacity in the template, no scaling policy and no
+scheduled action. The scaler is the one writer of the desired capacity, and the group protects every
+new instance from scale-in, so that only the scaler, which lifts the protection, chooses which
+instance leaves.
 
 The group spans the private subnets it is given and no other, those of its pool's zones
 (`rhi.pools.stack`): an instance type is not offered in every zone, and a group that spans a zone
@@ -20,10 +21,9 @@ the group keeps, is `warm_instances`, and its minimum is zero, since a minimum a
 launch a fresh instance to refill the pool on every wake (section 4.2; evidence E10). Instances
 return to it on scale-in. A pool whose `warm_instances` is zero has no warm pool.
 
-What stays outside the scaler, so that a broken scaler cannot cost money, includes a scheduled
-action that sets the group's desired capacity to zero every night, at the configuration's
-`nightly_stop` in its `time_zone` (sections 5.1 and 17). It sets neither the minimum nor the
-maximum, which the fleet cap checks, and leaves the warm pool as it is.
+The group has no scheduled action, and so no nightly stop: a session may cross any hour, and a stop
+at a fixed hour would take from it the instances still starting (section 5.1; evidence E32). What
+ends a forgotten session is its own end, which the scaler applies.
 
 The group publishes its group metrics to CloudWatch every minute, the warm pool's among them,
 whether or not the pool has a warm pool: the alarms that guard money from outside the scaler read
@@ -170,8 +170,6 @@ class PoolGroup(Construct):
         security_group: ec2.ISecurityGroup,
         target_group: elbv2.IApplicationTargetGroup,
         role: iam.Role,
-        nightly_stop: str,
-        time_zone: str,
     ) -> None:
         super().__init__(scope, construct_id)
         pool_image, root_device = machine_image(pool)
@@ -260,17 +258,6 @@ class PoolGroup(Construct):
             )
         else:
             self.warm_pool = None
-
-        # The desired capacity alone: "HH:MM" becomes the cron "MM HH * * *" in the time zone.
-        hours, minutes = nightly_stop.split(":")
-        self.nightly_stop = autoscaling.CfnScheduledAction(
-            self,
-            "NightlyStop",
-            auto_scaling_group_name=self.group.ref,
-            desired_capacity=0,
-            recurrence=f"{int(minutes)} {int(hours)} * * *",
-            time_zone=time_zone,
-        )
 
         stack = cdk.Stack.of(self)
         # Every group, by the pattern of its ARN, narrowed to the pool's by the group's tag.
