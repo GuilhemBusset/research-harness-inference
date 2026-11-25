@@ -4,10 +4,12 @@
 `Inputs.now`. Every rule is therefore tested without AWS, and a run that acts is judged on what
 that run read, which is the re-check "at the moment of acting".
 
-The rules here take a pool from zero, grow it, even its load out, and take it back:
+The rules here take a pool from zero, grow it, even its load out, and take it back, and a pool's
+session is a floor under them:
 
 | Transition | Rule |
 | --- | --- |
+| session | The pool's session asks for more than the other rules give, and the launches are not suspended: the session's number, the reason `provision`. While it asks for anything, a rule that would take the pool below its number does not apply |
 | 0 to 1 | A held request for a pool in mode `enabled` at zero asks for one instance, however many are held |
 | 1 to n | The instances in service full for 60 seconds, in a pool nobody stopped: one more instance, up to `max_instances`, and none while one asked for is still starting |
 | rebalance | An instance in service that has reported waiting requests for 60 seconds, while another instance in service runs fewer requests than half of `target_concurrency`: the pool's rebalance number goes up by one, at most once every `rebalance_interval_seconds`. The size is what the other rules make it |
@@ -27,6 +29,22 @@ instance of the pool has room: fewer requests running than `target_concurrency` 
 in a fresh heartbeat. An instance that waits while another has room is not a reason to grow (the
 rebalance transition moves students to the emptier one), and the time it spends so does not count.
 The 60 seconds are counted in the memory, from one run to the next.
+
+A pool's session is a floor (section 5.6). What it asks for at the time of the run is `requested`,
+by `rhi_common.sessions.requested` and nothing else: the session's number of instances, at most
+`max_instances`, from its start to its end, and 0 otherwise. The other rules decide first, as for a
+pool with no session. Then, while `requested` is above zero, the rule among them that lowers the
+capacity (gateway silent, the idle rule, a stop, a scale-in) does not apply if it would set the
+capacity below `requested`: the capacity stays what the group had, no protection is lifted, and the
+memory is as if the rule had not fired. It does not apply in part either: a pool above its
+session's number that the idle rule would take to zero stays where it is, since which instances
+leave when a session asks for fewer is not decided here. A rule whose result is at or above
+`requested` applies as it does without a session. Last, when `requested` is above the capacity
+this leaves, the capacity is `requested` and the reason is `provision`, whatever reason another rule
+gave: in any mode, since the design gives a session no mode, and all at once. Suspended launches are
+the one thing that keeps a session from raising a pool; they do not let a rule take it below.
+A pool with no session, or whose session has not started or has ended, is decided by the other
+rules alone.
 
 The rebalance rule sets no size: it stands apart from the others, which decide the capacity as
 if it were not there. For each new number the gateway moves a share of the pool's
@@ -69,6 +87,7 @@ held request wakes it. Only three abandons counted from that time suspend it aga
 from __future__ import annotations
 
 from rhi_common.records import Mode, is_fresh
+from rhi_common.sessions import requested
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
 # The modes of a pool somebody stopped: the admin's `disabled`, and nothing else.
@@ -85,6 +104,8 @@ AFTER_SCALE_OUT_SECONDS = 15 * 60
 GATEWAY_SILENT_SECONDS = 10 * 60
 # How many launches abandoned in a row suspend the group's launches.
 ABANDONED_LAUNCHES_LIMIT = 3
+# The reasons of the rules that lower a pool's capacity, which a session's number is a floor under.
+LOWERING_REASONS = frozenset({Reason.GATEWAY_SILENT, Reason.IDLE, Reason.STOPPED, Reason.SCALE_IN})
 
 
 def _every_instance(supply: Supply) -> tuple[str, ...]:
@@ -102,7 +123,7 @@ def _lasted(since: int | None, seconds: int, now: int) -> bool:
     return since is not None and now - since >= seconds
 
 
-def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
+def _decide_pool(pool: PoolInputs, now: int, session_max_hours: int) -> PoolDecision:
     gateways = [heartbeat for heartbeat in pool.gateway_heartbeats if is_fresh(heartbeat, now)]
     in_flight = sum(heartbeat.in_flight for heartbeat in gateways)
     held = sum(heartbeat.held for heartbeat in gateways)
@@ -238,6 +259,14 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         desired, lift, reason = n - 1, (unused[0],), Reason.SCALE_IN
         # The next scale-in is judged on the smaller pool: its 10 minutes start again.
         low_load_since = None
+    # The session, a floor under the rules above. One of them that would take the pool below what
+    # the session asks for does not apply: the capacity stays, and nothing is released.
+    asked = requested(pool.session, now, max_instances=pool.config.max_instances, session_max_hours=session_max_hours)
+    if reason in LOWERING_REASONS and desired < asked:
+        desired, lift, reason = supply.desired, (), Reason.UNCHANGED
+        low_load_since = memory.low_load_since
+    if asked > desired and not suspended:
+        desired, reason = asked, Reason.PROVISION
     # The rebalance, whatever the rules above decided: it changes no size. A rule that gave the
     # run its reason keeps it.
     rebalance_number, last_rebalance_at = before.rebalance_number, before.last_rebalance_at
@@ -270,9 +299,12 @@ def _decide_pool(pool: PoolInputs, now: int) -> PoolDecision:
         ),
         reason=reason,
         rebalance_number=rebalance_number,
+        requested=asked,
     )
 
 
 def decide(inputs: Inputs) -> Decision:
     """The decision for every pool of the inputs, in their order."""
-    return Decision(pools=tuple(_decide_pool(pool, inputs.now) for pool in inputs.pools))
+    return Decision(
+        pools=tuple(_decide_pool(pool, inputs.now, inputs.session_max_hours) for pool in inputs.pools)
+    )

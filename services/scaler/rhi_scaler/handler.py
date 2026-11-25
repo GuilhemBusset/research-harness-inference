@@ -3,7 +3,8 @@
 The gateway calls it when a request needs a cold pool, a one-minute schedule calls it, and so does
 the admin CLI. Whoever calls, a run does the same thing, and the event is never read:
 
-1. read the settings (`rhi_scaler.settings`) and the inputs (`rhi_scaler.aws_io.read`);
+1. read the settings (`rhi_scaler.settings`) and the inputs (`rhi_scaler.aws_io.read`), each
+   pool's session among them, with the longest a session may last as the settings give it;
 2. decide (`rhi_scaler.decide`), from the inputs alone, and note in each pool's memory how long it
    has been in service outside a session (`rhi_scaler.outside_sessions`), which only reports;
 3. apply: the Auto Scaling calls that change something, then each pool's note and memory record;
@@ -97,7 +98,7 @@ def run_cycle(
     """
     milliseconds = now * 1000 if milliseconds is None else milliseconds
     try:
-        run = aws_io.read(clients, settings.tables, settings.pools, now)
+        run = aws_io.read(clients, settings.tables, settings.pools, now, settings.session_max_hours)
     except Exception:
         try:
             switch, read_at = aws_io.read_session_at(clients, settings.tables)

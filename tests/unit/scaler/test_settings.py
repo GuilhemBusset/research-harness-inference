@@ -81,6 +81,15 @@ def test_a_pool_whose_entry_does_not_parse_is_refused_naming_it() -> None:
     assert refused.value.field == "pools.mock.target_group"
 
 
+def test_the_longest_session_is_the_one_given_and_12_when_the_settings_hold_none() -> None:
+    assert read(settings(session_max_hours=6)).session_max_hours == 6
+    assert read(settings()).session_max_hours == 12
+    for value in ("6", 0, 1.5, True):
+        with pytest.raises(SettingsError) as refused:
+            read(settings(session_max_hours=value))
+        assert refused.value.field == "session_max_hours"
+
+
 def test_no_settings_is_refused() -> None:
     with pytest.raises(SettingsError, match="RHI_SCALER_SETTINGS"):
         read_settings({"AWS_REGION": "us-east-1"})
