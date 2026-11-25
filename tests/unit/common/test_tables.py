@@ -8,14 +8,30 @@ from collections.abc import Mapping
 import pytest
 
 from rhi_common import records, students, tables
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, PoolState, ScalerNote, SessionSwitch
+from rhi_common.records import (
+    GatewayHeartbeat,
+    InstanceHeartbeat,
+    Mode,
+    PoolState,
+    ScalerNote,
+    Session,
+    SessionSwitch,
+)
 from rhi_common.students import Lease, RosterEntry, StudentKey, UsageDay
 from rhi_common.tables import HEARTBEATS, KEYS, POOL_STATE, ROSTER, USAGE, AttributeType, KeyAttribute, Table
 
 NOW = 1_800_000_000
 
 type Record = (
-    StudentKey | RosterEntry | UsageDay | PoolState | ScalerNote | SessionSwitch | GatewayHeartbeat | InstanceHeartbeat
+    StudentKey
+    | RosterEntry
+    | UsageDay
+    | PoolState
+    | ScalerNote
+    | Session
+    | SessionSwitch
+    | GatewayHeartbeat
+    | InstanceHeartbeat
 )
 
 # One of every item of `rhi_common.students` and `rhi_common.records`, with the table it goes to.
@@ -55,6 +71,10 @@ ITEMS: list[tuple[Table, Record]] = [
     ),
     (POOL_STATE, PoolState(pool="mock", mode=Mode.ENABLED, set_by="admin", set_at=NOW)),
     (POOL_STATE, ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=None, written_at=NOW)),
+    (
+        POOL_STATE,
+        Session(pool="mock", instances=1, starts_at=NOW, ends_at=NOW + 3600, set_by="instructor", set_at=NOW),
+    ),
     (POOL_STATE, SessionSwitch(on=True, set_by="admin", set_at=NOW)),
     (
         HEARTBEATS,
@@ -116,7 +136,7 @@ def test_the_tables_are_the_five_of_the_design() -> None:
 
 
 def test_the_pool_state_records_and_the_mark_of_the_memory() -> None:
-    assert set(tables.POOL_STATE_RECORDS) == {"mode", "note", "memory"}
+    assert set(tables.POOL_STATE_RECORDS) == {"mode", "note", "memory", "session"}
     assert tables.MEMORY_RECORD == "memory"
     assert tables.LAUNCH_SUSPENDED == "launch_suspended"
 
