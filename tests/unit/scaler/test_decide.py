@@ -154,7 +154,7 @@ def test_an_instance_still_in_service_after_the_capacity_was_lowered_is_named() 
     assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.RELEASE)
 
 
-def test_an_instance_the_group_holds_in_service_that_does_not_serve_is_released_first() -> None:
+def test_an_instance_the_group_holds_in_service_that_does_not_serve_can_be_released() -> None:
     # Instance c is in service for the group, so it is protected, and its target is not healthy:
     # the supply lists it as starting. Instance d is still being launched.
     names = ("instance-a", "instance-b", "instance-c", "instance-d")
@@ -166,16 +166,34 @@ def test_an_instance_the_group_holds_in_service_that_does_not_serve_is_released_
         not_serving=("instance-c",),
     )
     reports = (instance("instance-a"), instance("instance-b", running=3))
-    # It counts against the session's number, and leaves before an instance that serves, even an idle one.
+    # It counts against the session's number.
     three = decide_one(supply, session=session(3), instance_heartbeats=reports)
     assert (three.desired, three.lift_protection, three.reason) == (3, (), Reason.RELEASE)
+    # It reports nothing: it leaves after the instance that reports itself idle, before the busy one.
     two = decide_one(supply, session=session(2), instance_heartbeats=reports)
-    assert (two.desired, two.lift_protection, two.reason) == (2, ("instance-c",), Reason.RELEASE)
+    assert (two.desired, two.lift_protection, two.reason) == (2, ("instance-a",), Reason.RELEASE)
     one = decide_one(supply, session=session(1), instance_heartbeats=reports)
     assert one.lift_protection == ("instance-a", "instance-c")
     # The session is over: every instance the group protects, and never the one it still launches.
     ended = decide_one(supply, session=session(2, ends_at=NOW), instance_heartbeats=reports)
     assert (ended.desired, ended.lift_protection, ended.reason) == (0, names[:3], Reason.RELEASE)
+
+
+def test_what_an_instance_reports_comes_before_the_health_of_its_target() -> None:
+    # The group holds both in service. The one whose target is not healthy still has requests.
+    names = ("instance-a", "instance-b")
+    supply = Supply(desired=2, in_service=names[:1], starting=names[1:], running=names, not_serving=names[1:])
+    reports = (instance("instance-a"), instance("instance-b", running=1, waiting=2))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert (decision.desired, decision.lift_protection, decision.reason) == (1, ("instance-a",), Reason.RELEASE)
+    # The other way round, the idle one is the one that does not serve.
+    reports = (instance("instance-a", running=1, waiting=2), instance("instance-b"))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert decision.lift_protection == ("instance-b",)
+    # Among those that report requests, the fewest first, whichever serves.
+    reports = (instance("instance-a", running=2), instance("instance-b", running=1, waiting=2))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert decision.lift_protection == ("instance-a",)
 
 
 def test_a_raise_keeps_its_reason_in_a_run_that_names_instances() -> None:

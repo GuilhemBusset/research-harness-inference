@@ -35,10 +35,14 @@ starts: the instances that serve (`Supply.in_service`), and those whose target i
 (`Supply.not_serving`), which the supply lists as starting or as draining. They are chosen in this
 order:
 
-1. those that do not serve, which the load balancer sends nothing;
-2. those that serve and whose fresh heartbeat reports nothing running and nothing waiting;
-3. those that serve, the fewest requests running and waiting first, by their fresh heartbeat;
-4. those that serve with no fresh heartbeat, whose load is not known.
+1. those whose fresh heartbeat reports nothing running and nothing waiting;
+2. those with the fewest requests running and waiting, by their fresh heartbeat;
+3. those that serve with no fresh heartbeat, whose load is not known.
+
+What an instance reports comes before the health of its target: one that reports nothing running
+and nothing waiting leaves before one that reports requests, whichever of the two serves. An
+instance that does not serve and reports nothing fresh counts in the second place as one with no
+request, after those that report none: the load balancer sends it nothing.
 
 Within each, by name. An instance still starting, one the group has not put in service, is never
 named: it has no protection to lift. Lowering the capacity is what stops asking for it. If the
@@ -130,15 +134,22 @@ def _decide_pool(pool: PoolInputs, now: int, session_max_hours: int) -> PoolDeci
         else:
             reason = Reason.PROVISION
     # The release: as many of the instances the group holds in service as there are beyond what
-    # the session asks for. Those that do not serve, then among those that serve the ones that
-    # report nothing running and nothing waiting, then the fewest requests, then those that report
-    # nothing fresh; an instance the group has not put in service is not among them.
-    load = {heartbeat.instance: heartbeat.running + heartbeat.waiting for heartbeat in serving}
+    # the session asks for; an instance the group has not put in service is not among them. What
+    # each reports in a fresh heartbeat, whether or not its target is healthy.
     held = {*supply.in_service, *supply.not_serving}
-    order = sorted(
-        held, key=lambda name: (name in supply.in_service, name not in load, load.get(name, 0), name)
-    )
-    lift = tuple(sorted(order[: max(0, len(held) - asked)]))
+    load = {
+        heartbeat.instance: heartbeat.running + heartbeat.waiting
+        for heartbeat in pool.instance_heartbeats
+        if heartbeat.instance in held and is_fresh(heartbeat, now)
+    }
+
+    def release_order(name: str) -> tuple[bool, bool, int, str]:
+        # Those that report nothing running and nothing waiting, then the fewest requests, where
+        # one that does not serve and reports nothing counts as having none, then those that
+        # serve and report nothing fresh.
+        return load.get(name) != 0, name not in load and name in supply.in_service, load.get(name, 0), name
+
+    lift = tuple(sorted(sorted(held, key=release_order)[: max(0, len(held) - asked)]))
     # A raise, or a pool kept from one, keeps its reason.
     if reason is Reason.UNCHANGED and (lift or desired < supply.desired):
         reason = Reason.RELEASE
