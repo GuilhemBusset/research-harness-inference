@@ -136,7 +136,11 @@ Rules hold those two, and every action:
 - a spike job's role may do what `SPIKES_MAY` lists, each action on resources of its kind only,
   and nothing else: read the parameters under /rhi/config/ by path; read the records of the stage's
   pool-state table, an unnamed table of a stack a pipeline deploys whose logical ID is the pool
-  tables' `PoolState`, by the name CloudFormation gives it; read the spikes' one secret,
+  tables' `PoolState`, by the name CloudFormation gives it; write, with `dynamodb:PutItem` and no
+  other action, the items of that table whose partition key is the mock pool's name, `mock`, for
+  the session a job books on that pool (section 12): the statement's condition is
+  `OF_THE_MOCK_POOL`, alone, as on the verification's role, so the role writes no other pool's
+  items, not every item, and no other table; read the spikes' one secret,
   `rhi/spike-keys`; query the workspace of a stage a pipeline deploys, by the condition on its tag
   alone, as the verification's role does; put events on the measurement bus; use the connection of
   its own template; write to the log group its project names and use the key its project is
@@ -427,14 +431,17 @@ STARTS_INSTANCES = "a role other than the promotion job's that may start an inst
 # A spike job: a command of its project's build specification runs a script under `spikes/`. The
 # spikes' one secret, the construct ID of the pool-state table, which its logical ID begins with
 # after its parents' (`src/rhi/pools/tables.py`), and the actions a spike job's role may be allowed,
-# each with the kind of resource it may be allowed on.
+# each with the kind of resource it may be allowed on. `MOCK_POOL_ITEMS` is the pool-state table
+# again, for the one write: only under the condition `OF_THE_MOCK_POOL`.
 RUNS_A_SPIKE = re.compile(r"(^|\s)spikes/[\w./-]+")
 SPIKE_SECRET = "rhi/spike-keys"
 POOL_STATE = "PoolState"
+MOCK_POOL_ITEMS = "mock pool's items"
 SPIKES_MAY = {
     "ssm:GetParametersByPath": "configuration",
     "dynamodb:GetItem": "pool-state",
     "dynamodb:Query": "pool-state",
+    "dynamodb:PutItem": MOCK_POOL_ITEMS,
     "secretsmanager:GetSecretValue": "secret",
     "aps:QueryMetrics": "workspaces",
     "events:PutEvents": "bus",
@@ -459,7 +466,8 @@ CANARY_UNSCHEDULED = "a canary's job without its one schedule"
 CANARY_STARTS_PIPELINES = "a canary's job whose role may start a pipeline's execution"
 SPIKES_MORE = (
     "a spike job's role that may do more than read the configuration, the pool-state records and the spikes'"
-    " secret, query its stage's workspace, send a measurement, read the repository and write its logs"
+    " secret, write the mock pool's items of the pool-state table, query its stage's workspace, send a"
+    " measurement, read the repository and write its logs"
 )
 
 
@@ -1316,11 +1324,13 @@ def spike_resources(
     own_logs = group.get("Ref") if isinstance(group, dict) else None
     own_key = key["Fn::GetAtt"][0] if isinstance(key, dict) and "Fn::GetAtt" in key else None
     connections = [logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::CodeConnections::Connection")]
+    pool_state = [
+        re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}") for name in pool_state_tables(templates)
+    ]
     return {
         "configuration": [CONFIGURATION],
-        "pool-state": [
-            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}") for name in pool_state_tables(templates)
-        ],
+        "pool-state": pool_state,
+        MOCK_POOL_ITEMS: pool_state,
         "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(SPIKE_SECRET)}-\?{{6}}")],
         "workspaces": [re.compile(rf"{PARTITION}:aps:{HERE}:workspace/\*")],
         "bus": [re.compile(rf"{PARTITION}:events:{HERE}:event-bus/{MEASUREMENT_BUS}")],
@@ -1332,12 +1342,18 @@ def spike_resources(
 
 def spikes_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]) -> bool:
     """Whether an allowed statement of a spike job's role reaches an action it is not given, a
-    resource beyond those of the action's kind, or, where it queries workspaces, any workspace but
-    its stage's: its condition must be the one that admits a workspace by the stage's tag, alone."""
+    resource beyond those of the action's kind, where it writes items of the pool-state table, any
+    item but the mock pool's: its condition must be `OF_THE_MOCK_POOL`, alone, or, where it queries
+    workspaces, any workspace but its stage's: its condition must be the one that admits a workspace
+    by the stage's tag, alone."""
     if reports_more(statement, allowed, SPIKES_MAY):
         return True
+    named = {action.lower() for action in as_list(statement.get("Action", []))}
+    writes = {action.lower() for action, kind in SPIKES_MAY.items() if kind == MOCK_POOL_ITEMS}
+    if named & writes and not of_the_mock_pool(statement.get("Condition")):
+        return True
     queries = {action.lower() for action, kind in SPIKES_MAY.items() if kind == "workspaces"}
-    if not any(action.lower() in queries for action in as_list(statement.get("Action", []))):
+    if not named & queries:
         return False
     return statement.get("Condition") not in [{"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": tag}} for tag in tags]
 
@@ -3113,6 +3129,10 @@ def here(service: str, resource: str) -> str:
     return HERE_ARN.replace("{}", service, 1).replace("{}", resource, 1)
 
 
+# The stage's pool-state table, as the spike jobs' role names it.
+POOL_STATE_TABLE = here("dynamodb", "table/Rhi-Pools-TablesPoolState68A872F7-*")
+
+
 @pytest.mark.parametrize(
     ("change", "expected"),
     [
@@ -3145,9 +3165,27 @@ def here(service: str, resource: str) -> str:
             id="every action on the spikes' secret",
         ),
         pytest.param(
-            a_statement("dynamodb:PutItem", here("dynamodb", "table/Rhi-Pools-TablesPoolState68A872F7-*")),
+            a_statement("dynamodb:PutItem", POOL_STATE_TABLE, of_pool("coursework")),
             {SPIKES_MORE},
-            id="writing a pool-state record",
+            id="writing the coursework pool's items",
+        ),
+        pytest.param(
+            a_statement("dynamodb:PutItem", POOL_STATE_TABLE), {SPIKES_MORE}, id="a write that names no partition key"
+        ),
+        pytest.param(
+            a_statement("dynamodb:PutItem", POOL_STATE_TABLE, of_pool(MOCK_POOL, "coursework")),
+            {SPIKES_MORE},
+            id="writing the mock pool's items and another's",
+        ),
+        pytest.param(
+            a_statement("dynamodb:DeleteItem", POOL_STATE_TABLE, of_pool(MOCK_POOL)),
+            {SPIKES_MORE},
+            id="deleting the mock pool's items",
+        ),
+        pytest.param(
+            a_statement("dynamodb:PutItem", here("dynamodb", "table/*"), of_pool(MOCK_POOL)),
+            {SPIKES_MORE},
+            id="writing the mock pool's items of every table",
         ),
         pytest.param(
             a_statement("dynamodb:Query", here("dynamodb", "table/*")), {SPIKES_MORE}, id="reading every table"

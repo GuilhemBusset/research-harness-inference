@@ -1,6 +1,7 @@
-"""What a check books a pool through (scripts/pipeline/booking.py): one instance, for the minutes
-and under the name it is given, only on a pool that has no session booked or active; and a stop
-that ends the session only while the item still reads as the booking that was made.
+"""What a check books a pool through (scripts/pipeline/booking.py): one instance, or the number it
+asks for, for the minutes and under the name it is given, only on a pool that has no session booked
+or active; and a change of that number and a stop, each written only while the item still reads as
+the booking that was made.
 
 moto holds the pool-state table in process: no account, no credentials, no network.
 """
@@ -116,6 +117,58 @@ def test_a_booking_longer_than_a_session_may_last_is_refused_and_nothing_is_writ
     assert book(table, minutes=HOURS * 60) is not None
 
 
+def test_a_booking_of_more_instances_is_within_the_pool_s_bound(table: Any) -> None:
+    def two(max_instances: int) -> Session | None:
+        return booking.book(
+            table,
+            "mock",
+            minutes=90,
+            set_by=NAME,
+            now=NOW,
+            session_max_hours=HOURS,
+            instances=2,
+            max_instances=max_instances,
+        )
+
+    with pytest.raises(SessionError):
+        two(1)
+    assert stored(table) is None
+    booked = two(2)
+    assert booked is not None and booked.instances == 2 and stored(table) == booked
+
+
+def change(table: Any, booked: Session, instances: int, *, now: int = NOW + 300) -> Session | None:
+    return booking.changed(table, booked, instances=instances, max_instances=2, now=now, session_max_hours=HOURS)
+
+
+def test_the_booking_is_changed_to_another_number_of_instances_and_then_stopped(table: Any) -> None:
+    booked = booking.book(
+        table, "mock", minutes=90, set_by=NAME, now=NOW, session_max_hours=HOURS, instances=2, max_instances=2
+    )
+    assert booked is not None
+
+    lowered = change(table, booked, 1)
+
+    # The same start, end and name, with the number asked for, written at the time of the change.
+    assert lowered == dataclasses.replace(booked, instances=1, set_at=NOW + 300)
+    assert stored(table) == lowered
+    # The booking is from then on the session that was written: the first no longer stops it.
+    assert booking.stop(table, booked, now=NOW + 600, session_max_hours=HOURS) is None
+    assert stored(table) == lowered
+    ended = booking.stop(table, lowered, now=NOW + 600, session_max_hours=HOURS)
+    assert ended is not None and stored(table) == ended
+    assert not is_active(ended, NOW + 600, session_max_hours=HOURS)
+
+
+def test_a_change_to_more_instances_than_the_pool_allows_is_refused_and_nothing_is_written(table: Any) -> None:
+    booked = book(table)
+    assert booked is not None
+    for instances in (0, 3):
+        with pytest.raises(SessionError):
+            change(table, booked, instances)
+    assert stored(table) == booked
+
+
 def test_the_booking_is_stopped_at_the_time_of_the_stop(table: Any) -> None:
     booked = book(table)
     assert booked is not None
@@ -130,7 +183,7 @@ def test_the_booking_is_stopped_at_the_time_of_the_stop(table: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "change",
+    "theirs",
     [
         {"instances": 2},
         {"starts_at": NOW + 60},
@@ -138,30 +191,38 @@ def test_the_booking_is_stopped_at_the_time_of_the_stop(table: Any) -> None:
         {"set_by": "admin"},
         {"set_at": NOW + 1},
     ],
-    ids=lambda change: next(iter(change)),
+    ids=lambda theirs: next(iter(theirs)),
 )
-def test_a_session_that_no_longer_reads_as_the_booking_is_not_stopped(table: Any, change: dict[str, Any]) -> None:
+def test_a_session_that_no_longer_reads_as_the_booking_is_neither_changed_nor_stopped(
+    table: Any, theirs: dict[str, Any]
+) -> None:
     booked = book(table)
     assert booked is not None
-    theirs = dataclasses.replace(booked, **change)
-    table.put_item(Item=theirs.to_item())
+    other = dataclasses.replace(booked, **theirs)
+    table.put_item(Item=other.to_item())
 
+    assert change(table, booked, 1) is None
     assert booking.stop(table, booked, now=NOW + 300, session_max_hours=HOURS) is None
-    assert stored(table) == theirs
-    # Nor when the change comes between the stop's read and its write: the write's own condition
-    # compares every one of them.
+    assert stored(table) == other
+    # Nor when the change comes between the read and the write: the write's own condition compares
+    # every one of them.
     table.put_item(Item=booked.to_item())
-    assert booking.stop(BookedMeanwhile(table, theirs), booked, now=NOW + 300, session_max_hours=HOURS) is None
-    assert stored(table) == theirs
+    assert change(BookedMeanwhile(table, other), booked, 1) is None
+    assert stored(table) == other
+    table.put_item(Item=booked.to_item())
+    assert booking.stop(BookedMeanwhile(table, other), booked, now=NOW + 300, session_max_hours=HOURS) is None
+    assert stored(table) == other
 
 
 def test_a_booking_that_is_gone_or_has_ended_is_not_written(table: Any) -> None:
     booked = book(table, minutes=10)
     assert booked is not None
-    # Its end has come: there is nothing to stop.
+    # Its end has come: there is nothing to change or to stop.
+    assert change(table, booked, 1, now=NOW + 600) is None
     assert booking.stop(table, booked, now=NOW + 600, session_max_hours=HOURS) is None
     assert stored(table) == booked
     table.delete_item(Key={"pool": "mock", "record": SESSION_RECORD})
+    assert change(table, booked, 1, now=NOW + 60) is None
     assert booking.stop(table, booked, now=NOW + 60, session_max_hours=HOURS) is None
     assert stored(table) is None
 
