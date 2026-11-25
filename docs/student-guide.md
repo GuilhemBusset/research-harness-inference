@@ -202,14 +202,16 @@ script, give the model's name as `model`.
 The model serves students only during class sessions. A session is a booking of one pool, with a
 start, an end and a number of GPU machines, and the instructor books each one ahead of the class.
 The machines are asked for when the session starts, so that they are there when you arrive. The
-endpoint has no timetable of the sessions to come: while a session is on, `rhi status` shows when
-it ends.
+endpoint has no timetable of the sessions to come: while a pool's session is on, `rhi status`
+shows when it ends.
 
-Outside a session, a request to the model gets its answer at once: an error with the cause
-`no_session`. `rhi status` lists each pool as unavailable with that cause, and
-`rhi wait coursework` stops with it. Nothing you send starts a session or a machine. The rest of
-`rhi` works at any time: log in before your first session, check `rhi status`, and revoke a key
-whenever you need to. A request already running when the session ends is allowed to finish.
+Sessions are booked pool by pool, so one pool can have a session on while another has none. A
+request to a pool that has no session on gets its answer at once: an error with the cause
+`no_session`. `rhi status` shows that pool as unavailable with that cause, whatever the other
+pools show. When the coursework pool is the one with no session on, `rhi wait coursework` stops
+with the same cause. Nothing you send starts a session or a machine. The rest of `rhi` works at
+any time: log in before your first session, check `rhi status`, and revoke a key whenever you need
+to. A request already running when its pool's session ends is allowed to finish.
 
 For homework, between sessions, and whenever the endpoint is down or not ready, use your own
 subscriptions to hosted models. The endpoint does not stand in for them.
@@ -240,8 +242,8 @@ rhi wait coursework
 
 The command reads the pool's state every 10 seconds, prints it each time it changes, and returns
 when the pool is ready. It starts nothing: it only waits. It keeps waiting while the pool is
-`warming` or waits for a machine, stops with the cause `no_session` when no session is on, and
-gives up after 20 minutes. Pass `--timeout` with a number of minutes to change that:
+`warming` or waits for a machine, stops with the cause `no_session` when the pool has no session
+on, and gives up after 20 minutes. Pass `--timeout` with a number of minutes to change that:
 
 ```sh
 rhi wait coursework --timeout 45
@@ -254,7 +256,7 @@ session ends:
 | --- | --- |
 | `ready` | The session is on and a machine is in service: the pool answers now |
 | `warming` | The session is on and a machine is starting |
-| `unavailable` | The pool cannot answer, and `rhi status` prints the cause (section 8): `capacity_unavailable` when the session is on and the pool waits for a GPU machine, `no_session` when no session is on |
+| `unavailable` | The pool cannot answer, and `rhi status` prints the cause (section 8): `capacity_unavailable` when the session is on and the pool waits for a GPU machine, `no_session` when the pool has no session on |
 
 ## 7. What the coursework model cannot do here
 
