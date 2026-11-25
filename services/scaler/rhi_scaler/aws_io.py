@@ -13,7 +13,7 @@ What is read, for each pool:
 | Which instances serve | `DescribeTargetHealth` on the pool's target group |
 | Launches abandoned in a row, the last launch that found no capacity | `DescribeScalingActivities` |
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
-| Mode (the configured mode when no record exists) and the scaler's memory | the pool-state table, by pool |
+| Mode (the configured mode when no record exists), the scaler's memory, and the pool's session (none when no record exists) | the pool-state table, by pool |
 
 And once for the whole run, the session switch (`rhi_common.records.SessionSwitch`), from its item
 in the pool-state table. It only reports (`rhi_scaler.outside_sessions`, and the session gauge of
@@ -80,17 +80,19 @@ from rhi_common.records import (
     GATEWAY_SOURCE,
     INSTANCE_SOURCE,
     MODE_RECORD,
+    SESSION_RECORD,
     GatewayHeartbeat,
     InstanceHeartbeat,
     Mode,
     PoolState,
     RecordError,
     ScalerNote,
+    Session,
     SessionSwitch,
     is_fresh,
 )
 from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD, SESSION_SWITCH_KEY
-from rhi_scaler.model import Decision, Inputs, Memory, PoolInputs, Supply
+from rhi_scaler.model import SESSION_MAX_HOURS, Decision, Inputs, Memory, PoolInputs, Supply
 
 # The process a launch loop suspends, and the only one this module ever names.
 LAUNCH_PROCESS = "Launch"
@@ -390,6 +392,9 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
     mode_item = records.get(MODE_RECORD)
     mode = settings.configured_mode if mode_item is None else PoolState.from_item(mode_item).mode
     memory = memory_from_item(records.get(MEMORY_RECORD))
+    # The pool's session, read on every run with the rest of the pool's records.
+    session_item = records.get(SESSION_RECORD)
+    session = None if session_item is None else Session.from_item(session_item)
 
     activities = _pages(clients.autoscaling, "describe_scaling_activities", "Activities", AutoScalingGroupName=settings.group)
     history = launch_history(activities, memory.abandons_counted_from)
@@ -403,6 +408,7 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
         instance_heartbeats=instances,
         abandoned_launches=history.abandoned_in_a_row,
         memory=memory,
+        session=session,
     )
     own = group.get("Instances", [])
     state = GroupState(
@@ -431,9 +437,15 @@ def read_session_at(clients: Clients, tables: TableNames) -> tuple[SessionSwitch
     return switch, int(time.time() * 1000)
 
 
-def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], now: int) -> Run:
-    """Everything one run decides from, at the time `now`, for each pool in the order given, and the
-    session switch."""
+def read(
+    clients: Clients,
+    tables: TableNames,
+    pools: Iterable[PoolSettings],
+    now: int,
+    session_max_hours: int = SESSION_MAX_HOURS,
+) -> Run:
+    """Everything one run decides from, at the time `now`, for each pool in the order given, with
+    the longest a session may last as the settings give it, and the session switch."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
     session, session_error, session_read_at = None, None, None
     try:
@@ -442,7 +454,9 @@ def read(clients: Clients, tables: TableNames, pools: Iterable[PoolSettings], no
         # It only reports: a wake that demand calls for must not wait on it.
         session_error = error
     return Run(
-        inputs=Inputs(now=now, pools=tuple(inputs for inputs, _ in read_pools)),
+        inputs=Inputs(
+            now=now, pools=tuple(inputs for inputs, _ in read_pools), session_max_hours=session_max_hours
+        ),
         groups={inputs.config.name: state for inputs, state in read_pools},
         session=session,
         session_error=session_error,

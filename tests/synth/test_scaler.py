@@ -182,6 +182,7 @@ def test_the_settings_name_every_pool_s_group_and_target_group_and_read(
     assert settings.tables.pool_state.startswith("ref:TablesPoolState")
     assert settings.tables.pool_state.removeprefix("ref:") in tables
     assert settings.workspace_url == ENDPOINT + "api/v1/remote_write"
+    assert settings.session_max_hours == EXAMPLE.session_max_hours
 
 
 def test_the_role_may_do_what_a_run_does_and_nothing_else(pools: Template, templates: dict[str, Template]) -> None:
@@ -273,21 +274,23 @@ def test_the_admin_finds_the_function_and_the_pool_state_table_by_their_logical_
     assert (function, table) == (main.SCALER_FUNCTION_LOGICAL_ID, main.POOL_STATE_LOGICAL_ID)
 
 
-def test_the_settings_read_when_a_pool_is_priced_between_the_default_and_the_configured_limit(
-    app_module: Any, tmp_path: Path
-) -> None:
+@pytest.fixture(scope="module")
+def changed(app_module: Any, tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """The scaler's settings in a stage whose configuration is the example's with two values
+    changed: a pool priced between the default limit and the configured one, and a longest session
+    that is not the default."""
     import json
     import tomllib
 
     import aws_cdk as cdk
     from aws_cdk.assertions import Template as Assertions
 
-    # The deployment holds an on-demand pool's prices to the configuration's limit, which the
-    # settings do not carry: the scaler must read the pool the deployment accepted.
     source = tomllib.loads((REPO / "config.example.toml").read_text(encoding="utf-8"))
     source["on_demand_price_limit"] = 8.0
     mock = source["pools"]["mock"]
     mock["prices"] = dict.fromkeys(mock["instance_types"], 6.0)
+    source["session_max_hours"] = 6
+    tmp_path = tmp_path_factory.mktemp("changed")
     context = json.loads((REPO / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
     app = cdk.App(outdir=str(tmp_path), context=context, analytics_reporting=False)
     stage = app_module.EndpointStage(app, "Rhi", config=config.parse(source, "example"))
@@ -297,7 +300,16 @@ def test_the_settings_read_when_a_pool_is_priced_between_the_default_and_the_con
         if isinstance(child, cdk.Stack)
     }
     _, function = scaler_function(templates["Rhi-Pools"])
-    settings = parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
-    (mock_pool,) = [pool for pool in settings.pools if pool.config.name == "mock"]
+    return parse_settings(resolve(function["Environment"]["Variables"][SETTINGS_VARIABLE], templates), "eu-west-1")
+
+
+def test_the_settings_read_when_a_pool_is_priced_between_the_default_and_the_configured_limit(changed: Any) -> None:
+    # The deployment holds an on-demand pool's prices to the configuration's limit, which the
+    # settings do not carry: the scaler must read the pool the deployment accepted.
+    (mock_pool,) = [pool for pool in changed.pools if pool.config.name == "mock"]
     assert mock_pool.config.wake == "on-demand"
     assert set(mock_pool.config.prices.values()) == {6.0}
+
+
+def test_the_settings_hold_the_configuration_s_longest_session(changed: Any) -> None:
+    assert changed.session_max_hours == 6

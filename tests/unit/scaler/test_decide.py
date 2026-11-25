@@ -209,7 +209,8 @@ def test_stopped_pools_are_not_woken() -> None:
 
 
 def test_the_decision_is_a_function_of_its_inputs_alone() -> None:
-    # The module imports the shapes it works on and nothing that could call out or tell the time.
+    # The module imports the shapes it works on and nothing that could call out or tell the time:
+    # the shared sessions module, which says what a session asks for, calls nothing either.
     tree = ast.parse(Path(rhi_scaler.decide.__file__).read_text(encoding="utf-8"))
     imported = {
         node.module if isinstance(node, ast.ImportFrom) else alias.name
@@ -217,7 +218,7 @@ def test_the_decision_is_a_function_of_its_inputs_alone() -> None:
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    assert imported == {"__future__", "rhi_common.records", "rhi_scaler.model"}
+    assert imported == {"__future__", "rhi_common.records", "rhi_common.sessions", "rhi_scaler.model"}
 
     # Every pool of the inputs gets its decision, in order, and the same inputs get the same one.
     inputs = Inputs(

@@ -188,7 +188,7 @@ class Config:
     # (`rhi.guardrails.alarms_fleet`; sections 11.3 and 17). Only synthesis reads it.
     outside_sessions_alarm_hours: int
     # The longest a session may last, in whole hours after the later of its start and the moment it
-    # was last written (`rhi_common.sessions`; sections 5.6 and 17). Nothing reads it yet.
+    # was last written (`rhi_common.sessions`; sections 5.6 and 17). The scaler's settings carry it.
     session_max_hours: int
     # The share of the gateway's requests, in percent, that may fail for its own fault over the whole
     # minutes of the period before its alarm fires (`rhi.guardrails.alarms_gateway`; sections 7.3

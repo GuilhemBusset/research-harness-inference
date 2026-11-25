@@ -14,7 +14,8 @@ without a reference to this stack.
 **Its settings** are one JSON object in `RHI_SCALER_SETTINGS`, in the shape `rhi_scaler.settings`
 reads: every pool's entry as the stage loaded it, without the zones of its group
 (`rhi.config.deployed_entry`), the name of the pool's group and the ARN of its target group, the
-names of the heartbeat and pool-state tables, and the workspace's remote-write address.
+names of the heartbeat and pool-state tables, the workspace's remote-write address, and the
+configuration's `session_max_hours`, the bound the function reads every pool's session under.
 
 **Its role** is the only one of the stage that may set a group's capacity
 (`tests/policy/test_single_writer.py`). It has no AWS managed policy. What it may do, each with its
@@ -132,6 +133,7 @@ class Scaler(Construct):
         heartbeats: dynamodb.ITable,
         pool_state: dynamodb.ITable,
         workspace: PrometheusWorkspace,
+        session_max_hours: int,
     ) -> None:
         super().__init__(scope, construct_id)
         stack = cdk.Stack.of(self)
@@ -197,6 +199,7 @@ class Scaler(Construct):
             "heartbeat_table": heartbeats.table_name,
             "pool_state_table": pool_state.table_name,
             "workspace_url": cdk.Fn.join("", [workspace.workspace.attr_prometheus_endpoint, REMOTE_WRITE_PATH]),
+            "session_max_hours": session_max_hours,
         }
 
         self.function = lambda_.Function(

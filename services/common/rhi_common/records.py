@@ -37,7 +37,7 @@ A pool's session (section 5.6) is the record `session` under the pool's name: a 
 pool, with a number of instances, a start and an end. A pool has one at a time, and a pool with no
 such item has none. `set_by` and `set_at` say who last wrote it and when. The record is only the
 shape of the item: the bounds every reader and writer holds a session to are in
-`rhi_common.sessions`. Nothing reads the record yet.
+`rhi_common.sessions`. The scaler reads it on every run.
 """
 
 from __future__ import annotations

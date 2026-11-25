@@ -14,7 +14,7 @@ from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, RecordError, SessionSwitch
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, RecordError, Session, SessionSwitch
 from rhi_scaler.aws_io import (
     Clients,
     PoolSettings,
@@ -227,6 +227,18 @@ def test_the_mode_record_and_the_memory_record_are_read(aws: Aws) -> None:
     assert pool.mode is Mode.DISABLED
     assert pool.memory == memory
     assert memory_from_item(None) == Memory()
+
+
+def test_the_pool_s_session_is_read_with_its_records_and_a_pool_with_no_item_has_none(aws: Aws) -> None:
+    session = Session("coursework", 2, NOW - 600, NOW + 3600, set_by="instructor", set_at=NOW - 900)
+    aws.queue_read(records=[memory_to_item("coursework", EMPTY), session.to_item()])
+    run = read(aws.clients, TABLES, [SETTINGS], NOW, 6)
+    assert run.inputs.pools[0].session == session
+    # The longest session of the settings goes with it, for the decision to read the session under.
+    assert run.inputs.session_max_hours == 6
+
+    aws.queue_read(records=[memory_to_item("coursework", EMPTY)])
+    assert read_one(aws).inputs.pools[0].session is None
 
 
 @pytest.mark.parametrize(

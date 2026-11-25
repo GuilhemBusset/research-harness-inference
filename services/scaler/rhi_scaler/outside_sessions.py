@@ -18,7 +18,7 @@ A run that could not read the switch still sees the pool's instances: one that s
 ends the stretch all the same, and one that sees some leaves the stretch where it stood.
 
 The scaler reads the switch only to report: `decide` never sees it, and what a run decides stays a
-function of demand (sections 5.1 and 5.6).
+function of demand and of each pool's own session (sections 5.1 and 5.6).
 """
 
 from __future__ import annotations
