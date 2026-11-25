@@ -3,8 +3,10 @@
 
 The app's stage holds no image yet, so these tests give the pipeline stack a stage of their own:
 one image for each platform and one file. CodeBuild's build hosts are x86_64, so a project that
-publishes an image installs an emulator for arm64 and a builder that can target either platform,
-each pinned by a digest or by a version and its checksum, and its publishing builds with them.
+publishes an image registers an emulator for arm64, from the binfmt project's release on GitHub,
+and builds with the Docker daemon's own builder under it. What it installs is pinned by a version
+and its checksum, and nothing it runs is an image on Docker Hub, which limits anonymous pulls by
+address: the build hosts share theirs.
 """
 
 from __future__ import annotations
@@ -32,6 +34,28 @@ INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@\S+")
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}")
 EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+")
 CHECKSUM = re.compile(r"\b[0-9a-f]{64}\b")
+
+# The two files of one release of the binfmt project, for the x86_64 build host: the tool, and the
+# emulators of the QEMU version the release is named after.
+EMULATOR_RELEASE = r"https://github\.com/tonistiigi/binfmt/releases/download/deploy/v(?P<qemu>\d+\.\d+\.\d+)-\d+"
+EMULATOR_TOOL = re.compile(rf"(?P<release>{EMULATOR_RELEASE})/binfmt_linux-amd64\.tar\.gz")
+EMULATORS = re.compile(rf"(?P<release>{EMULATOR_RELEASE})/qemu_v(?P=qemu)_linux-amd64\.tar\.gz")
+
+# The names Docker Hub's registry answers to. An image reference with no host names it too.
+DOCKER_HUB = ("docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com")
+NAMES_DOCKER_HUB = re.compile(rf"(?<![\w.-])({'|'.join(map(re.escape, DOCKER_HUB))})(?![\w.-])", re.IGNORECASE)
+# The Docker commands whose first operand is an image the daemon runs or pulls, or reads from its
+# registry, each written alone or under its management command.
+TAKES_AN_IMAGE = [
+    ["run"],
+    ["create"],
+    ["pull"],
+    ["container", "run"],
+    ["container", "create"],
+    ["image", "pull"],
+    ["manifest", "inspect"],
+    ["buildx", "imagetools", "inspect"],
+]
 
 
 def synthesize(folder: Path) -> dict[str, Any]:
@@ -91,11 +115,52 @@ def installed(template: dict[str, Any]) -> list[str]:
 
 
 def images_of(words: list[str]) -> list[str]:
-    """The container images a command names: what `docker run` or `docker pull` starts or pulls
-    (options written as one word), and an `image=` option."""
+    """The container images a command names: the first operand of each Docker command that takes
+    an image (options written as one word), wherever in the line `docker` is called, and each
+    `image=` option."""
     found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
-    if words[:2] in (["docker", "run"], ["docker", "pull"]):
-        found += [next(word for word in words[2:] if not word.startswith("-"))]
+    for index in [index for index, word in enumerate(words) if word.rsplit("/", 1)[-1] == "docker"]:
+        operands = [word for word in words[index + 1 :] if not word.startswith("-")]
+        for command in TAKES_AN_IMAGE:
+            if operands[: len(command)] == command and len(operands) > len(command):
+                found.append(operands[len(command)])
+    return found
+
+
+def on_docker_hub(commands: list[str]) -> list[str]:
+    """What commands run, pull or name of Docker Hub: each image whose reference names one of
+    Docker Hub's hosts or no host, and any other word that names one of Docker Hub's hosts. A
+    reference names a host when its first path component, of several, has a `.` or a `:` or is
+    `localhost`."""
+    found = []
+    for command in commands:
+        words = shlex.split(command)
+        images = images_of(words)
+        for image in images:
+            first, slash, _ = image.partition("/")
+            hosted = slash and ("." in first or ":" in first or first == "localhost")
+            if not hosted or first.lower() in DOCKER_HUB:
+                found.append(image)
+        named = [word for word in words if NAMES_DOCKER_HUB.search(word)]
+        found += [word for word in named if not any(image in word for image in images)]
+    return found
+
+
+def selects_a_builder(commands: list[str]) -> list[str]:
+    """The commands that build with another builder than the Docker daemon's own, buildx's default:
+    one that creates a builder or selects one, by `docker buildx create` or `use`, by `--builder`
+    or by `BUILDX_BUILDER`."""
+    found = []
+    for command in commands:
+        words = shlex.split(command)
+        calls = [index for index, word in enumerate(words) if word.rsplit("/", 1)[-1] == "docker"]
+        buildx = [words[index + 1 : index + 3] for index in calls]
+        if (
+            any(following in (["buildx", "create"], ["buildx", "use"]) for following in buildx)
+            or any(word == "--builder" or word.startswith("--builder=") for word in words)
+            or "BUILDX_BUILDER" in command
+        ):
+            found.append(command)
     return found
 
 
@@ -118,25 +183,130 @@ def unpinned(commands: list[str]) -> list[str]:
     return found
 
 
-def test_each_image_project_installs_the_emulator_and_the_builder_and_builds_with_them(
-    template: dict[str, Any],
-) -> None:
+def every_command(project: dict[str, Any]) -> list[str]:
+    """The commands of every phase of a project, those of its `finally` blocks among them."""
+    phases = build_spec(project)["phases"].values()
+    return [command for phase in phases for key in ("commands", "finally") for command in phase.get(key, [])]
+
+
+def test_each_image_project_registers_the_emulator_from_the_release(template: dict[str, Any]) -> None:
     projects = image_projects(template)
     assert len(projects) == 2
     for project in projects:
         spec = build_spec(project)
         install, build = spec["phases"]["install"]["commands"], spec["phases"]["build"]["commands"]
         words = [shlex.split(command) for command in install]
-        # The emulator: QEMU's arm64 handler, registered with the build host's kernel.
-        assert any(images_of(w) and "binfmt" in images_of(w)[0] and w[-2:] == ["--install", "arm64"] for w in words)
-        # The builder: BuildKit in a container, loading what it builds into Docker, and selected.
-        (create,) = [w for w in words if w[:3] == ["docker", "buildx", "create"]]
-        assert {"--driver", "docker-container", "--use"} <= set(create)
-        assert "default-load=true" in create
-        assert spec["env"]["variables"]["BUILDX_BUILDER"] == create[create.index("--name") + 1]
-        # Installed before the build phase, which publishes, and so builds the image.
+        # The tool and the emulators: one file each, of the same release, each written where a
+        # checksum is checked (`test_tools_are_pinned`) and extracted from there, after the check.
+        folders = []
+        for file in (EMULATOR_TOOL, EMULATORS):
+            ((download, url),) = [(i, url) for i, w in enumerate(words) if (url := file.fullmatch(w[-1]))]
+            written = words[download][words[download].index("-o") + 1]
+            (check,) = [i for i, command in enumerate(install) if "sha256sum -c" in command and written in command]
+            (extract,) = [i for i, w in enumerate(words) if w[0] == "tar" and written in w]
+            assert download < check < extract
+            folders.append((url["release"], words[extract][words[extract].index("-C") + 1], extract))
+        (tool_release, tool_folder, tool_extracted), (qemu_release, qemu_folder, qemu_extracted) = folders
+        assert tool_release == qemu_release
+        # The registration: the extracted tool, told where the extracted emulators are, for arm64.
+        ((register, registration),) = [(i, w) for i, w in enumerate(words) if w[-2:] == ["--install", "arm64"]]
+        assert registration[:-2] == [f"QEMU_BINARY_PATH={qemu_folder}", f"{tool_folder}/binfmt"]
+        assert register > max(tool_extracted, qemu_extracted)
+        # Registered before the build phase, which publishes, and so builds the image.
         assert build and all(PUBLISHES.fullmatch(command) for command in build)
         assert not any(PUBLISHES.fullmatch(command) for command in install)
+
+
+def test_each_image_project_builds_with_the_default_builder(template: dict[str, Any]) -> None:
+    projects = image_projects(template)
+    assert len(projects) == 2
+    for project in projects:
+        variables = build_spec(project)["env"]["variables"]
+        # BuildKit, through the pinned plugin, on the builder no command and no variable replaces.
+        assert variables["DOCKER_BUILDKIT"] == "1"
+        assert "BUILDX_BUILDER" not in variables
+        assert any("docker-buildx" in command for command in build_spec(project)["phases"]["install"]["commands"])
+        assert selects_a_builder(every_command(project)) == []
+
+
+def test_no_command_of_an_image_project_runs_pulls_or_names_an_image_on_docker_hub(template: dict[str, Any]) -> None:
+    projects = image_projects(template)
+    assert len(projects) == 2
+    for project in projects:
+        commands = every_command(project)
+        assert commands
+        assert on_docker_hub(commands) == []
+
+
+# The emulator image and the BuildKit builder as the stack had them, each pinned by digest.
+BINFMT = "tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+BUILDKIT = "moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
+RAN_THE_EMULATOR_IMAGE = f"docker run --privileged --rm {BINFMT} --install arm64"
+CREATED_THE_BUILDER = (
+    f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image={BUILDKIT}"
+    " --driver-opt default-load=true --bootstrap --use"
+)
+SHA = "@sha256:" + "0" * 64
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        pytest.param(RAN_THE_EMULATOR_IMAGE, [BINFMT], id="the docker run of tonistiigi/binfmt, by digest"),
+        pytest.param(CREATED_THE_BUILDER, [BUILDKIT], id="the docker buildx create with image=moby/buildkit, by digest"),
+        pytest.param(f"docker pull python{SHA}", [f"python{SHA}"], id="a pull with no host"),
+        pytest.param(
+            f"docker image pull docker.io/library/python{SHA}",
+            [f"docker.io/library/python{SHA}"],
+            id="a pull under its management command, from docker.io",
+        ),
+        pytest.param(
+            f"true && docker container run --rm index.docker.io/library/busybox{SHA} true",
+            [f"index.docker.io/library/busybox{SHA}"],
+            id="a run under its management command, after another command",
+        ),
+        pytest.param(
+            f"docker create --name=emulator tonistiigi/binfmt{SHA}", [f"tonistiigi/binfmt{SHA}"], id="a create"
+        ),
+        pytest.param(
+            f"docker buildx imagetools inspect moby/buildkit{SHA}", [f"moby/buildkit{SHA}"], id="a read of a manifest"
+        ),
+        pytest.param(
+            "curl -fsSL https://registry-1.docker.io/v2/library/python/manifests/3.13",
+            ["https://registry-1.docker.io/v2/library/python/manifests/3.13"],
+            id="a word that names a host of Docker Hub",
+        ),
+    ],
+)
+def test_an_image_on_docker_hub_is_refused(command: str, expected: list[str]) -> None:
+    assert on_docker_hub([command]) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"docker pull public.ecr.aws/docker/library/python{SHA}", id="a pull from another registry"),
+        pytest.param(f"docker run --rm localhost:5000/tool{SHA} --install arm64", id="a run from a local registry"),
+        pytest.param("docker buildx version", id="a Docker command that takes no image"),
+        pytest.param("curl -fsSL -o tool https://example.com/docker.io.tar.gz", id="a file named like the host"),
+    ],
+)
+def test_what_names_no_image_on_docker_hub_is_accepted(command: str) -> None:
+    assert on_docker_hub([command]) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(CREATED_THE_BUILDER, id="the docker buildx create with image=moby/buildkit, by digest"),
+        pytest.param("docker buildx use rhi-assets", id="a builder selected by name"),
+        pytest.param("docker buildx build --builder=rhi-assets .", id="a builder given to one build"),
+        pytest.param("export BUILDX_BUILDER=rhi-assets", id="a builder selected by the variable"),
+    ],
+)
+def test_another_builder_than_the_default_is_refused(command: str) -> None:
+    assert selects_a_builder(["docker buildx version", "docker build ."]) == []
+    assert selects_a_builder([command]) == [command]
 
 
 def test_the_file_project_is_left_as_cdk_pipelines_writes_it(template: dict[str, Any]) -> None:
@@ -186,7 +356,10 @@ def test_tools_are_pinned_fails_on_the_stack_with_an_unpinned_tool(
 ) -> None:
     from rhi.pipeline import stack
 
-    by_tag = [re.sub(r"(tonistiigi/binfmt):\S+", r"\1:latest", command) for command in stack.IMAGE_BUILDER]
-    assert by_tag != stack.IMAGE_BUILDER
-    monkeypatch.setattr(stack, "IMAGE_BUILDER", by_tag)
-    assert unpinned(installed(synthesize(tmp_path))) == ["tonistiigi/binfmt:latest"] * 2
+    release = re.compile(r"(tonistiigi/binfmt/releases)/download/deploy/[^/]+")
+    latest = [release.sub(r"\1/latest/download", command) for command in stack.IMAGE_BUILDER]
+    assert latest != stack.IMAGE_BUILDER
+    monkeypatch.setattr(stack, "IMAGE_BUILDER", latest)
+    found = unpinned(installed(synthesize(tmp_path)))
+    assert len(found) == 4
+    assert all("tonistiigi/binfmt/releases/latest/download/" in url for url in found)
