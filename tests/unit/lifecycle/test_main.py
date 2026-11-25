@@ -595,10 +595,20 @@ class RecordStays(World):
         assert self.passed
         self.readings.clear()
 
+    async def asks_again(self, seconds: float) -> None:
+        """Move the clock, then wait until the termination handling has asked the engine and gone
+        to wait: a wait that starts after the clock has moved is ended only by its next move."""
+        waits = self.waits
+        await self.clock.advance(seconds)
+        await until(lambda: self.waits > waits)
+
     async def drains(self, student: asyncio.Future[httpx.Response]) -> None:
         """The program, with the target state `Terminated`, waits for the student's request, then
         completes the termination hook and stops the engine."""
-        await self.ticks(3)
+        # A reading of the target state, then two more questions to the engine.
+        await self.asks_again(5)
+        await self.asks_again(POLL_SECONDS)
+        await self.asks_again(POLL_SECONDS)
         assert self.completions == [completion("launch")]
         assert "stop" not in self.calls
 
@@ -641,8 +651,9 @@ def test_an_agent_restarted_in_service_with_its_launch_still_on_record_resumes_s
             await until(lambda: world.throttled == 0)
             assert (world.refused, world.beats) == (0, [])
             # Auto Scaling answers that no launch hook waits: the instance serves, as it did.
+            # The duties start: a first heartbeat, and a first completion that the engine answers.
             await world.ticks(1)
-            await until(lambda: len(world.beats) == 1)
+            await until(lambda: len(world.beats) == 1 and world.calls.count("completion") == 2)
             assert world.refused == 1
 
             # No step of the launch was run again, and no row names a launch's stage after the
@@ -685,11 +696,12 @@ def test_only_the_target_state_terminated_starts_a_drain(target: str, tmp_path: 
             await until(lambda: len(world.beats) == 1)
 
             world.target = target
-            await world.ticks(4)
-
-            # The serving duties go on, a heartbeat at each of the four ticks: a reading does not
-            # wait for the heartbeat of its tick, which a worker thread writes beside it.
-            await until(lambda: len(world.beats) == 5)
+            # The serving duties go on, a heartbeat at each of the four ticks. A worker thread
+            # writes it beside the reading, and the clock moves on only once it is written: a
+            # heartbeat that still waits for the engine's answer then would be cut off.
+            for beats in (2, 3, 4, 5):
+                await world.ticks(1)
+                await until(lambda: len(world.beats) == beats)  # noqa: B023 - called before the next turn
             # No termination hook was completed, and the engine runs.
             assert world.completions == [completion("launch")]
             assert "stop" not in world.calls
