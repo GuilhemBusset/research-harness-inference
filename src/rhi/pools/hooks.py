@@ -4,19 +4,20 @@ A hook holds an instance in a wait state until the lifecycle agent on it complet
 the hook's timeout passes. Left to its default, a hook waits an hour, and a dead agent bills an
 hour of GPU per attempt: both timeouts are set here.
 
-**The launch hook**, `rhi-launch`, holds an instance that enters the warm pool and one that is
-promoted from it to service. Entry to the warm pool has 15 minutes and promotion has twice the
-measured start. One hook serves both, so it carries the longer of the two, and the agent keeps
-each transition's own deadline (`rhi_lifecycle`). Until a start has been measured for the pool
-(`measured_start_seconds`, absent from the configuration until then), the timeout is the 15
-minutes. The design gives its figure for the coursework pool and none for the mock pool, which
-follows the same rule. When the timeout passes the instance is abandoned: an instance whose agent
-never answered does not enter service, and the group replaces it.
+**The launch hook**, `rhi-launch`, holds a launching instance until the agent on it has pulled the
+engine image, checked the release, started the engine and had a warm-up request answered. Its
+timeout is 15 minutes, or twice the pool's measured start when that is longer. Until a start has
+been measured for the pool (`measured_start_seconds`, absent from the configuration until then),
+the timeout is the 15 minutes. The design gives its figure for the coursework pool and none for the
+mock pool, which follows the same rule. The agent keeps no deadline of its own (`rhi_lifecycle`):
+this timeout alone bounds a launch. When it passes the instance is abandoned: an instance whose
+agent never answered, or whose engine never did, does not enter service, and the group launches
+another.
 
-**The termination hook**, `rhi-termination`, holds an instance that leaves service, for the warm
-pool or for good, while its engine drains. Its timeout is the pool's `drain_seconds` plus a margin
-of 60 seconds. When it passes the instance goes on its way: a dead agent does not keep an instance
-that the group has already chosen to remove.
+**The termination hook**, `rhi-termination`, holds an instance that leaves service while its engine
+drains. Its timeout is the pool's `drain_seconds` plus a margin of 60 seconds. When it passes the
+instance goes on its way: a dead agent does not keep an instance that the group has already chosen
+to remove.
 
 The hooks have no notification target: the agent on the instance sees the wait state itself and
 completes the hook by its name, which the pool's release parameter gives it (`rhi.pools.release`),
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from rhi_common.pool_config import Pool
 
 # The launch hook's timeout while no start has been measured, and its floor afterwards: the time
-# an instance has to enter the warm pool.
+# a launching instance has to enter service.
 LAUNCH_TIMEOUT_SECONDS = 15 * 60
 # What the termination hook adds to the pool's drain.
 DRAIN_MARGIN_SECONDS = 60

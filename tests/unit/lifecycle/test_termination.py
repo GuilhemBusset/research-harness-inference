@@ -1,11 +1,10 @@
-"""The transition out of service (`rhi_lifecycle.termination`, and the hand-over to it in
-`rhi_lifecycle.launch`; system design, section 4.3).
+"""The transition out of service (`rhi_lifecycle.termination`; system design, section 4.3).
 
 The engine is the mock engine, in process: the agent reads its `/metrics` as a loopback client,
 and a stream is held in flight by the mock's own `sleep`. The instance metadata, Auto Scaling, the
-release parameter, the pool's secret and the host module are stand-ins. The agent's sleep moves the
-test's clock, and the event loop the mock runs on turns only when the agent asks something or
-sleeps: no test here needs AWS, a socket, a thread or a wait.
+release parameter and the host module are stand-ins. The agent's sleep moves the test's clock, and
+the event loop the mock runs on turns only when the agent asks something or sleeps: no test here
+needs AWS, a socket, a thread or a wait.
 """
 
 from __future__ import annotations
@@ -20,15 +19,13 @@ import pytest
 from botocore.exceptions import ClientError
 
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
-from rhi_lifecycle import release
 from rhi_lifecycle.host import Host
-from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, Engine, Launch, Metadata, Outcome
+from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, Metadata, Outcome
 from rhi_lifecycle.termination import POLL_SECONDS, Termination
 from rhi_mock_engine.app import Settings, create_app
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 NAME = "/rhi/pools/coursework/release"
 IMAGE = f"registry.example.com/rhi/engine@sha256:{'a' * 64}"
@@ -54,7 +51,6 @@ VALUE: dict[str, Any] = {
 }
 
 TERMINATED = "Terminated"
-WARM = "Warmed:Stopped"
 IN_SERVICE = "InService"
 # Twice the termination hook's own timeout, `drain_seconds` plus 60 (section 17): the test's clock
 # stops there.
@@ -75,7 +71,7 @@ class World(Host):
     to the host, to the release and to Auto Scaling, in order; `completions` what reached Auto
     Scaling, each with the moment it did."""
 
-    def __init__(self, folder: Path) -> None:
+    def __init__(self) -> None:
         super().__init__(ecr=object())
         self.loop = asyncio.new_event_loop()
         self.now = 0.0
@@ -84,9 +80,6 @@ class World(Host):
         self.target = TERMINATED
         self.parameter: dict[str, Any] | None = VALUE
         self.completion_fails = False
-        self.held = folder / "release.json"
-        self.held.write_text(json.dumps(VALUE))
-        self.served = folder / "run" / "served"
         self.engine = create_app(Settings(secret=SECRET), clock=lambda: self.now, sleep=self.pace)
         # While the gate is closed, a stream stops after its second token and stays in flight.
         self.gate = asyncio.Event()
@@ -104,23 +97,6 @@ class World(Host):
             host=self,
             engine=MOCK,
             fetch=self.fetch,
-            sleep=self.sleep,
-        )
-
-    def launch(self) -> Launch:
-        return Launch(
-            NAME,
-            metadata=Metadata(self.fetch),
-            autoscaling=self,
-            ssm=self,
-            secrets=self,
-            dynamodb=self,
-            host=self,
-            engine=Engine(self.fetch),
-            termination=self.termination(),
-            held=self.held,
-            served=self.served,
-            clock=lambda: self.now,
             sleep=self.sleep,
         )
 
@@ -179,15 +155,6 @@ class World(Host):
 
     # The host module.
 
-    def holds(self, image: str, timeout: float | None = None) -> bool:
-        return image == IMAGE
-
-    def pull(self, image: str, timeout: float | None = None) -> None:
-        self.calls.append("pull")
-
-    def start_engine(self, timeout: float | None = None) -> None:
-        self.calls.append("start")
-
     def stop_engine(self) -> None:
         self.calls.append("stop")
 
@@ -197,17 +164,6 @@ class World(Host):
         if request != {"Name": NAME} or self.parameter is None:
             raise ClientError({"Error": {"Code": "ParameterNotFound", "Message": "no"}}, "GetParameter")
         return {"Parameter": {"Name": NAME, "Value": json.dumps(self.parameter)}}
-
-    def get_secret_value(self, **request: Any) -> dict[str, Any]:
-        return {"SecretString": SECRET}
-
-    # The heartbeats table, where a launch names the stage it has reached: tests/unit/lifecycle/test_stages.py.
-
-    def Table(self, name: str) -> World:
-        return self
-
-    def put_item(self, **request: Any) -> dict[str, Any]:
-        return {}
 
     def complete_lifecycle_action(self, **request: str) -> dict[str, Any]:
         if self.completion_fails:
@@ -230,16 +186,8 @@ class World(Host):
 
 
 @pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
-    # The release check stays the real one, and is written down among the steps.
-    real = release.check
-
-    def check(ssm: Any, name: str, path: Path) -> release.Verdict:
-        ssm.calls.append("check")
-        return real(ssm, name, path)
-
-    monkeypatch.setattr(release, "check", check)
-    world = World(tmp_path)
+def world() -> Iterator[World]:
+    world = World()
     yield world
     world.close()
 
@@ -277,27 +225,6 @@ def test_the_hook_is_completed_within_one_poll_of_the_streams_end(world: World) 
     assert world.calls == ["complete", "stop"]
 
 
-def test_a_return_to_the_warm_pool_drains(world: World) -> None:
-    # The instance is promoted, and serves.
-    world.target = IN_SERVICE
-    assert world.launch().run() is Outcome.CONTINUED
-    assert world.calls == ["check", "start", "complete"]
-    assert [request for _, request in world.completions] == [completion("launch")]
-
-    # It returns to the warm pool with a stream in flight: the wait state and the target state of a
-    # new instance that enters the pool (evidence E10).
-    world.target = WARM
-    world.stream(ends_at=ENDS_AT)
-    assert world.launch().run() is Outcome.DRAINED
-
-    # No pull and no check of the release, as an entry would do: the stream is waited for, then the
-    # termination hook is completed, once.
-    assert world.calls[3:] == ["complete", "stop"]
-    [(completed_at, request)] = world.completions[1:]
-    assert request == completion("termination")
-    assert ENDS_AT <= completed_at <= ENDS_AT + POLL_SECONDS
-
-
 def test_only_an_engine_that_reports_nothing_running_and_nothing_waiting_is_idle(world: World) -> None:
     def idle(answer: tuple[int, bytes] | None) -> bool:
         return Termination(
@@ -317,11 +244,8 @@ def test_only_an_engine_that_reports_nothing_running_and_nothing_waiting_is_idle
 
 
 def test_an_instance_that_is_not_terminated_is_left_alone(world: World) -> None:
-    # A warm-pool target is the launch's to read: only the file that says the instance has served
-    # tells a return from an entry.
-    for target in (IN_SERVICE, WARM):
-        world.target = target
-        assert world.termination().run() is Outcome.NOT_A_TERMINATION
+    world.target = IN_SERVICE
+    assert world.termination().run() is Outcome.NOT_A_TERMINATION
     assert world.calls == []
 
 

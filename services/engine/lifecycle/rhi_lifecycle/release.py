@@ -1,10 +1,10 @@
 """A pool's release: what its parameter says, what the instance holds, and whether they are equal.
 
 AWS leaves an existing instance alone when a launch template changes, and user data runs only on
-an instance's first boot (system design, section 4.3). So at every start, including a restart from
-the warm pool, the lifecycle agent reads its pool's current release from the pool's one parameter
-and compares it with the release the instance holds on disk. `check` gives the verdict: the agent
-abandons the instance unless the two are equal.
+an instance's first boot (system design, section 4.3). So at every launch the lifecycle agent reads
+its pool's current release from the pool's one parameter and compares it with the release the
+instance holds on disk. `check` gives the verdict: the agent abandons the instance unless the two
+are equal.
 
 **The parameter.** Its value is one JSON object, which the pipeline writes and the boot program
 also reads, so its keys are fixed:

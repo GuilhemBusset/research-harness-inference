@@ -1,41 +1,79 @@
-"""The two launch transitions of an instance, each completed or abandoned (system design, section 4.3).
+"""The launch of an instance, completed or abandoned (system design, section 4.3).
 
 Without an answer a lifecycle hook waits, and a GPU bills while it does. So when an instance
-starts, the agent finds which transition it is in, does that transition's steps, and completes the
-launch hook: with `CONTINUE` when every step passed, with `ABANDON` otherwise, and Auto Scaling
-then replaces the instance.
+starts, the agent does the steps of a launch and completes the launch hook: with `CONTINUE` when
+every step passed, with `ABANDON` when one failed, and Auto Scaling then replaces the instance.
 
-**The transition.** One launch hook, and one wait state, serve every case (evidence E10), so the
-agent chooses by the target lifecycle state in the instance metadata:
+**The launch.** An instance of a group has one way into service, and the agent knows it by the
+target lifecycle state in the instance metadata, `InService`. Its steps, in order:
 
-| Target state | Case | Steps, in order | The agent's own deadline |
-| --- | --- | --- | --- |
-| a warm-pool state | entry to the warm pool | pull the engine image, check the release | 15 minutes |
-| `InService`, image on disk | promotion from the warm pool | check the release, start the engine, wait for its health route, send one warm-up request | twice the measured start, or none |
-| `InService`, no image on disk | launch straight into service | pull the engine image, then the steps of a promotion | none |
+1. pull the engine image, if the host's disk lacks it;
+2. check the release: the disk holds the pool's current one;
+3. start the engine;
+4. wait for the engine's health route;
+5. send one warm-up request, a real one;
+6. complete the launch hook.
 
-An instance launched straight into service never entered the warm pool: the pool was empty, or
-keeps no warm instance. Its start is not the one that was measured, so only the hook's own timeout
-bounds it. The same holds for a promotion while the parameter gives no measured start.
+Any other target state is no launch: `run` does nothing and returns `NOT_A_LAUNCH`.
 
-An instance that returns from service to the warm pool has a warm-pool target state too, and meets
-the same wait state. It is leaving service, not entering the pool: `Launch.run` hands an instance
-that has served since its start to `rhi_lifecycle.termination`, which waits for the engine to drain
-and completes the termination hook, and does none of an entry's steps. It knows one by a file it
-writes before it completes a hook into service, in a folder the host empties at every start
-(`SERVED_FILE`).
+**Abandon.** A release that differs, and a step that fails (a pull, the engine's start, a warm-up
+request the engine refuses or drops), end the same way: the hook is completed with `ABANDON`.
 
-**Abandon.** A release that differs, a step that fails and the transition's deadline all end the
-same way. Every step takes what is left of the deadline as its time limit, so a pull that hangs, or
-a health route that is slow to answer, is abandoned at the deadline and not when it returns.
-
-Whether the disk holds the image is the first question of a launch into service, and until the
-host has answered it the launch may be a promotion. So where a start was measured, the question is
-asked within the promotion's deadline, and a docker that does not answer in that time is abandoned.
+**No deadline of the agent's.** The launch hook's own timeout bounds a launch: 15 minutes, or twice
+the pool's measured start when that is longer (`rhi.pools.hooks`). The agent keeps no time of its
+own beside it, and gives its steps no time limit. So an engine whose health route never answers
+200, or a warm-up request that stays unanswered, is waited for: the agent completes nothing, the
+hook's timeout passes, and Auto Scaling abandons the instance as it does when the agent is gone.
 
 **What cannot be completed.** The hook is named in the settings of the release parameter, and the
 instance by its metadata. Without one of them there is nothing to call: `run` returns
 `NOT_COMPLETED`, and the hook's own timeout abandons the instance.
+
+**A launch under way is on record.** The agent's unit starts the agent again when it has failed,
+and the agent that starts then finds the engine's unit started: by a launch that was interrupted,
+or by one that let the instance into service. So a launch puts itself on record on the host before
+its first step (`Host.begin_launch`), and removes the record once Auto Scaling has taken the
+completion with `CONTINUE` (`Host.end_launch`), not before: an instance whose launch hook still
+waits is never taken for one that serves. A launch that is abandoned stays on record, and so does
+one whose completion did not reach Auto Scaling. A launch that cannot be put on record is
+abandoned before the engine starts. A record that cannot be removed is logged, and the instance
+serves: Auto Scaling has let it in. So a record that is there says a launch may not have ended in
+service, never that it did not: an agent that starts and finds one drains the instance when its
+group terminates it, as it drains one that served (`rhi_lifecycle.__main__`).
+
+**Its last step is on record too.** A record that stayed cannot tell a launch that was interrupted
+from one that Auto Scaling let into service. So once the engine has answered the warm-up request,
+and before the completion is sent, the launch puts on record that its steps have all passed
+(`Host.pass_launch`); one that cannot is abandoned. `CONTINUE` is therefore sent only for a launch
+with that record, and the record is removed with the launch's own.
+
+**An interrupted launch is run again.** The agent that finds a launch on record, and no record
+that its steps passed, runs the launch again (`rhi_lifecycle.__main__`): its hook still waits. Every
+step can be repeated: the image is on disk, the release is checked again, a unit that is started
+stays so, and the engine answers one more warm-up request. The hook's timeout is counted from the
+instance's start, not from the second run.
+
+**A launch whose steps passed is resumed, not run again** (`Launch.resume`). Only the answer to
+its completion is missing, so the agent checks the release once more and sends the completion
+again: with `CONTINUE`, or with `ABANDON` when the release differs by now, as at any launch. It
+does nothing else: no other step is repeated, and no row of a launch's stage is written over the
+row of an instance that serves. The instance is let into service only when Auto Scaling takes
+`CONTINUE`: the records are removed then, and the launch is counted among the launches completed,
+with the seconds since the kernel's start.
+
+**A completion Auto Scaling refuses lets no instance in.** Auto Scaling answers a resumed launch
+that no lifecycle action waits for the instance under the names the settings give (`NO_ACTION`)
+in three cases, and the answer does not say which: the completion sent before was taken, and the
+instance serves; the hook's timeout has passed, and the group terminates the instance; or the
+settings misname the hook or the group, and the hook still waits. The instance role may complete a
+lifecycle action and may not ask Auto Scaling for an instance's state (`rhi.pools.role`), so
+nothing on the instance tells the three apart. `resume` therefore returns `REFUSED`: the instance
+is not taken as in service, the launch stays on record, and the completion is not sent again,
+because the answer would be the same. What that costs: an instance that a completion let in, and
+whose agent stopped before it removed the records or could not remove them, writes no serving
+heartbeat once its agent has restarted. It is drained when its group terminates it, like any
+instance that may have served. Any other failure of the call says nothing either: the launch stays
+on record, and the completion is sent again later.
 
 **The stages.** A launch marks where each stage of the start begins and ends
 (`rhi_lifecycle.stages`, which says what each stage covers), so the agent's metrics give the
@@ -44,7 +82,7 @@ heartbeats table, with the stage it has reached and the release it is starting. 
 instance yet, so the row's counts are zero. An abandoned launch does not reach the hook stage: its
 row keeps the stage it was abandoned in. The boot is over when the agent starts, so no row names
 it. A row that cannot be written changes nothing else: the launch goes on. The time a write takes
-is its stage's, and counts toward the transition's deadline as any step's does.
+is its stage's.
 
 Every action on the host goes through `rhi_lifecycle.host`. Nothing here repeats what AWS, docker
 or the engine answered.
@@ -62,23 +100,15 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import release, stages
 from rhi_lifecycle.host import Host, HostError
-from rhi_lifecycle.stages import Stage, Transition
+from rhi_lifecycle.stages import Stage
 
-if TYPE_CHECKING:
-    from rhi_lifecycle.termination import Termination
-
-# The deadline of an entry to the warm pool (section 4.3; section 17 gives the same 15 minutes to
-# the hook itself until a start is measured).
-ENTRY_DEADLINE_SECONDS = 15 * 60
-# A promotion's deadline is this many times the pool's measured start.
-PROMOTION_DEADLINE_STARTS = 2
 # The wait between two questions to the engine's health route.
 HEALTH_INTERVAL_SECONDS = 2.0
 # How long one answer of the instance metadata, or of the health route, may take.
@@ -88,14 +118,13 @@ ANSWER_SECONDS = 5.0
 CONTINUE = "CONTINUE"
 ABANDON = "ABANDON"
 
-# The target lifecycle states of a launch. The others (`Terminated`, `Warmed:Terminated`, ...) are
-# not launches.
+# The target lifecycle state of a launch. The others (`Terminated`, ...) are not launches.
 IN_SERVICE = "InService"
-WARM_STATES = frozenset({"Warmed:Stopped", "Warmed:Running", "Warmed:Hibernated"})
 
-# Written when the instance is about to enter service. `/run` is in memory, so the file is gone
-# when the instance stops: the agent's unit gives the agent the host's folder.
-SERVED_FILE = Path("/run/rhi/served")
+# The error code of Auto Scaling's answer to the completion of a lifecycle action that does not
+# wait under the names given: the hook was completed before, its timeout has passed, or the names
+# are not the hook's and the group's.
+NO_ACTION = "ValidationError"
 
 # The model revision of a pool that serves no model: the heartbeat's row takes no empty value.
 NO_MODEL = "none"
@@ -217,23 +246,27 @@ class Engine:
 class Outcome(enum.Enum):
     """How `Launch.run`, or `Termination.run`, ended."""
 
-    # The launch hook was completed with `CONTINUE`.
+    # The launch hook was completed with `CONTINUE`: Auto Scaling took the completion.
     CONTINUED = "continued"
     # The launch hook was completed with `ABANDON`.
     ABANDONED = "abandoned"
     # The engine was idle, and the termination hook was completed: the instance may leave service.
     DRAINED = "drained"
-    # The instance is in no launch transition: nothing was done.
+    # The instance is not being launched: nothing was done.
     NOT_A_LAUNCH = "not-a-launch"
     # The instance is not being terminated: nothing was done.
     NOT_A_TERMINATION = "not-a-termination"
-    # No completion reached Auto Scaling: the transition, the instance or the hook is unknown, or
+    # No completion reached Auto Scaling: the target state, the instance or the hook is unknown, or
     # the call failed. The hook's own timeout ends the wait.
     NOT_COMPLETED = "not-completed"
+    # Auto Scaling refused the completion of a launch resumed: no lifecycle action waits for the
+    # instance under the names the settings give. Whether the instance serves is not known.
+    REFUSED = "refused"
 
 
 class Abandon(Exception):
-    """A step did not pass, or the deadline did: a launch completes its hook with `ABANDON`."""
+    """A step did not pass, or its caller's deadline did: a launch completes its hook with
+    `ABANDON`."""
 
 
 def identity(served: release.Release) -> tuple[str, str]:
@@ -245,11 +278,11 @@ def identity(served: release.Release) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class Steps:
-    """The steps of a start, as a launch transition and the run of a canary do them
-    (`rhi_lifecycle.canary`): the two share them, so they cannot differ. `parameter`, `ssm`,
-    `secrets`, `host`, `engine`, `held`, `clock` and `sleep` are `Launch`'s. A step takes what is
-    left before `deadline` as its time limit (None: no limit), and raises `Abandon` when it does
-    not pass or the deadline has."""
+    """The steps of a start, as a launch and the run of a canary do them (`rhi_lifecycle.canary`):
+    the two share them, so they cannot differ. `parameter`, `ssm`, `secrets`, `host`, `engine`,
+    `held`, `clock` and `sleep` are `Launch`'s. A step takes what is left before `deadline` as its
+    time limit, and raises `Abandon` when it does not pass or the deadline has. The deadline is the
+    canary's: a launch gives None, no limit, and its hook's timeout is the bound."""
 
     parameter: str
     ssm: Any
@@ -339,11 +372,10 @@ class _Start:
 class Launch:
     """One instance's launch. `parameter` is the name of its pool's release parameter;
     `autoscaling`, `ssm` and `secrets` are the AWS SDK's clients for Auto Scaling, Systems Manager
-    and Secrets Manager, and `dynamodb` is boto3's DynamoDB resource. `termination` is what an
-    instance that leaves service is handed to. `held` is the record of the release on disk,
-    `served` the file that says the instance has served since its start. `clock` and `sleep` are
-    arguments so that a test waits for nothing. `wall` gives the seconds since the epoch, for the
-    heartbeat's row, and `uptime` the seconds since the kernel started, which are the boot stage."""
+    and Secrets Manager, and `dynamodb` is boto3's DynamoDB resource. `held` is the record of the
+    release on disk. `clock` and `sleep` are arguments so that a test waits for nothing. `wall`
+    gives the seconds since the epoch, for the heartbeat's row, and `uptime` the seconds since the
+    kernel started, which are the boot stage."""
 
     parameter: str
     metadata: Metadata
@@ -353,44 +385,27 @@ class Launch:
     dynamodb: Any
     host: Host
     engine: Engine
-    termination: Termination
     held: Path = release.HELD_RELEASE_FILE
-    served: Path = SERVED_FILE
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], object] = time.sleep
     wall: Callable[[], float] = time.time
     uptime: Callable[[], float | None] = stages.uptime
 
     def run(self) -> Outcome:
-        """Do the steps of the transition the instance is in, and complete its hook: the launch
-        hook, or the termination hook for an instance that returns to the warm pool."""
+        """Do the steps of a launch, and complete the launch hook."""
         started = self.clock()
         # The boot ends where the launch starts: both are read now, before anything takes time.
         booted = self.uptime()
-        try:
-            target = self.metadata.target_state()
-            instance = self.metadata.instance_id()
-        except MetadataError:
-            return Outcome.NOT_COMPLETED
-        into_service = target == IN_SERVICE
-        if not into_service and target not in WARM_STATES:
-            return Outcome.NOT_A_LAUNCH
-        if not into_service and self.served.exists():
-            # The instance has served: it is leaving service for the warm pool, not entering it.
-            return self.termination.drain(instance)
-        current = release.read_current(self.ssm, self.parameter)
-        if current is None:
-            return Outcome.NOT_COMPLETED
-        # A launch into service may be a promotion until the host says its disk has no image.
-        start = self._start(current, instance, Transition.PROMOTION if into_service else Transition.ENTRY)
+        launching = self._launching()
+        if isinstance(launching, Outcome):
+            return launching
+        current, instance = launching
+        start = self._start(current, instance)
         if booted is not None:
             start.timings.start(Stage.BOOT, at=started - booted)
         start.reach(Stage.IMAGE, at=started)
         try:
-            if into_service:
-                self._enter_service(current, started, start)
-            else:
-                self._enter_the_warm_pool(current, started + ENTRY_DEADLINE_SECONDS, start)
+            self._steps(current, start)
         except Abandon:
             result = ABANDON
             # The stage the launch was in ends here, and the instance's row keeps naming it.
@@ -398,12 +413,7 @@ class Launch:
         else:
             result = CONTINUE
         try:
-            self.autoscaling.complete_lifecycle_action(
-                AutoScalingGroupName=current.settings.group,
-                LifecycleHookName=current.settings.launch_hook,
-                InstanceId=instance,
-                LifecycleActionResult=result,
-            )
+            self._complete(current.settings, instance, result)
         except (BotoCoreError, ClientError):
             return Outcome.NOT_COMPLETED
         finally:
@@ -411,11 +421,75 @@ class Launch:
             start.timings.end()
         if result != CONTINUE:
             return Outcome.ABANDONED
-        # Auto Scaling took the completion: the launch is one completed.
+        # Auto Scaling took the completion: the launch is one completed, and no longer under way.
         start.timings.completed()
+        self._off_record()
         return Outcome.CONTINUED
 
-    def _start(self, current: release.Current, instance: str, transition: Transition) -> _Start:
+    def resume(self) -> Outcome:
+        """Send again the completion of a launch whose steps have all passed, as the host has on
+        record: `CONTINUE` when the disk still holds the pool's current release, `ABANDON` when it
+        does not. Nothing else of a launch is done. `CONTINUED` only when Auto Scaling takes
+        `CONTINUE`; `REFUSED` when it answers that no lifecycle action waits."""
+        launching = self._launching()
+        if isinstance(launching, Outcome):
+            return launching
+        current, instance = launching
+        try:
+            self._steps_of().check(current)
+        except Abandon:
+            result = ABANDON
+        else:
+            result = CONTINUE
+        try:
+            self._complete(current.settings, instance, result)
+        except ClientError as refusal:
+            if refusal.response.get("Error", {}).get("Code") == NO_ACTION:
+                return Outcome.REFUSED
+            return Outcome.NOT_COMPLETED
+        except BotoCoreError:
+            return Outcome.NOT_COMPLETED
+        if result != CONTINUE:
+            return Outcome.ABANDONED
+        # The stages of this launch were timed by the agent that ran it. The launch itself ends
+        # here, this long after the kernel's start: a host that does not say how long counts none.
+        launched = self.uptime()
+        if launched is not None:
+            stages.completed(launched)
+        self._off_record()
+        return Outcome.CONTINUED
+
+    def _launching(self) -> tuple[release.Current, str] | Outcome:
+        """The pool's current release, whose settings name the launch hook, and the instance; or
+        how the call ends when the instance is not being launched or one of them is unknown."""
+        try:
+            target = self.metadata.target_state()
+            instance = self.metadata.instance_id()
+        except MetadataError:
+            return Outcome.NOT_COMPLETED
+        if target != IN_SERVICE:
+            return Outcome.NOT_A_LAUNCH
+        current = release.read_current(self.ssm, self.parameter)
+        if current is None:
+            return Outcome.NOT_COMPLETED
+        return current, instance
+
+    def _complete(self, settings: release.Settings, instance: str, result: str) -> None:
+        self.autoscaling.complete_lifecycle_action(
+            AutoScalingGroupName=settings.group,
+            LifecycleHookName=settings.launch_hook,
+            InstanceId=instance,
+            LifecycleActionResult=result,
+        )
+
+    def _off_record(self) -> None:
+        """Remove the launch's records from the host: Auto Scaling has let the instance in."""
+        try:
+            self.host.end_launch()
+        except HostError as error:
+            _LOG.error("the record of the launch was not removed (%s)", error)
+
+    def _start(self, current: release.Current, instance: str) -> _Start:
         digest, revision = identity(current.release)
         row = InstanceHeartbeat(
             instance=instance,
@@ -428,39 +502,28 @@ class Launch:
             written_at=0,
         )
         table = self.dynamodb.Table(current.settings.heartbeat_table)
-        return _Start(stages.Timings(transition, self.clock), table, row, self.wall)
+        return _Start(stages.Timings(self.clock), table, row, self.wall)
 
-    def _steps(self) -> Steps:
+    def _steps_of(self) -> Steps:
         return Steps(self.parameter, self.ssm, self.secrets, self.host, self.engine, self.held, self.clock, self.sleep)
 
-    def _enter_the_warm_pool(self, current: release.Current, deadline: float, start: _Start) -> None:
-        steps = self._steps()
-        steps.pull(current, deadline)
-        start.reach(Stage.RELEASE_CHECK)
-        steps.check(current)
-        steps.left(deadline)
-        start.reach(Stage.HOOK)
-
-    def _enter_service(self, current: release.Current, started: float, start: _Start) -> None:
-        steps = self._steps()
-        measured = current.measured_start_seconds
-        # A promotion's deadline. The launch may be one until the host says the disk has no image.
-        deadline = None if measured is None else started + PROMOTION_DEADLINE_STARTS * measured
+    def _steps(self, current: release.Current, start: _Start) -> None:
+        """The steps before the hook's completion, none with a time limit."""
+        steps = self._steps_of()
         try:
-            warm = self.host.holds(current.release.engine_image, timeout=steps.left(deadline))
+            # On record before the engine's unit can be started: an agent that starts and finds the
+            # unit started knows by the record that the launch hook still waits.
+            self.host.begin_launch()
+            on_disk = self.host.holds(current.release.engine_image)
         except HostError:
             raise Abandon from None
-        if not warm:
-            # Straight into service: this start is not the measured one, and has no deadline here.
-            deadline = None
-            start.timings.transition = Transition.COLD_LAUNCH
-            steps.pull(current, deadline)
-        steps.serve(current, deadline, start.reach)
-        start.reach(Stage.HOOK)
+        if not on_disk:
+            steps.pull(current, None)
+        steps.serve(current, None, start.reach)
         try:
-            self.served.parent.mkdir(parents=True, exist_ok=True)
-            self.served.touch()
-        except OSError:
-            # An instance that could not say it has served would be taken for a new one on its way
-            # back to the warm pool.
+            # On record before the completion is sent: an agent that starts and finds this record
+            # sends the completion again, and repeats no step.
+            self.host.pass_launch()
+        except HostError:
             raise Abandon from None
+        start.reach(Stage.HOOK)

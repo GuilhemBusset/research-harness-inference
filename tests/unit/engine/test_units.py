@@ -23,7 +23,7 @@ from typing import NamedTuple
 import pytest
 import yaml
 
-from rhi_lifecycle import launch, metrics, release
+from rhi_lifecycle import metrics, release
 from rhi_mock_engine import app
 
 ENGINE_FOLDER = Path(__file__).resolve().parents[3] / "services/engine"
@@ -295,13 +295,11 @@ def test_the_agent_runs_its_program_from_the_release() -> None:
     assert agent.options["--workdir"] == ["/opt/rhi/release/agent"]
     mounts = agent.mounts()
     assert mounts["/opt/rhi/release/agent"] == ("/opt/rhi/release/agent", "ro")
-    assert mounts["/run/rhi"] == ("/run/rhi", "rw")
     assert agent.options["--env-file"] == [SETTINGS]
     # Privileged, in the host's process namespace: the agent enters the host's namespaces.
     assert agent.options["--pid"] == ["host"]
     assert "--privileged" in agent.options
-    # The files its program names are the host's.
-    assert launch.SERVED_FILE.parent.as_posix() in mounts
+    # The file its program names is the host's.
     assert release.HELD_RELEASE_FILE.parent.as_posix() in mounts
 
 

@@ -31,8 +31,9 @@ COUNTS = (
 SESSION_WINDOW = (scaler.SESSION_STARTS_AT, scaler.SESSION_ENDS_AT)
 # The GPU's fields of the table: utilization, memory used and power.
 GPU_FIELDS = (gpu.COMPUTE, gpu.MEMORY_USED, gpu.POWER)
-# The two transitions that put an instance in service, as the lifecycle agent names them.
-STARTS = {stages.Transition.PROMOTION.value, stages.Transition.COLD_LAUNCH.value}
+# The values of the label `transition` the dashboard has a panel for: the one the lifecycle agent
+# gives a launch, and the one the agents before it gave a promotion.
+STARTS = {"promotion", stages.Transition.LAUNCH.value}
 
 
 @pytest.fixture
@@ -189,7 +190,7 @@ def test_a_row_shows_each_launchs_stage_seconds_with_promotions_and_cold_launche
         shown = []
         for panel in panels:
             (expression,) = queries(panel)
-            (transition,) = [one.value for one in stages.Transition if f'"{one.value}"' in expression]
+            (transition,) = [one for one in STARTS if f'"{one}"' in expression]
             # The pool's launches of one transition: a series for each instance, a launch, and stage.
             assert rules.selector(stages.METRIC, {rules.POOL: pool.name, "transition": transition}) in expression
             assert "by (pool, instance, stage)" in expression

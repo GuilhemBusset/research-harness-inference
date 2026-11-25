@@ -76,6 +76,8 @@ class World(Host):
         # answer to the warm-up request.
         self.started = False
         self.healthy = True
+        # Whether a launch is on record on the host.
+        self.on_record = False
         self.warm_up: tuple[int, bytes] = (200, b'{"choices": []}')
 
     def canary(self) -> Canary:
@@ -106,6 +108,9 @@ class World(Host):
         if self.start_fails:
             raise HostError("start", 1)
         self.started = True
+
+    def begin_launch(self) -> None:
+        self.on_record = True
 
     def write_console(self, line: str, timeout: float | None = None) -> None:
         self.calls.append("console")
@@ -183,6 +188,9 @@ def test_a_canary_starts_the_engine_as_a_launch_does_and_says_served_once_the_wa
 
     assert world.calls == ["pull", "start", "health", "warm-up", "console"]
     assert world.console == [SERVED]
+    # The run is on record still: an agent restarted here takes the started engine for no instance
+    # that serves, and makes the run again.
+    assert world.on_record
     # No hook is completed, and no heartbeat row is written.
     assert world.completions == []
     assert world.items == []
