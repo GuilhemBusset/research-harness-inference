@@ -21,7 +21,27 @@ else, the health route included, are asserted on the synthesized template
 (`tests/synth/test_internal_routing.py`): only the gateway may reach that load balancer (section
 6.5), and this step runs outside the private network. So the only tests left out are those of
 `GPU_PASS_ONLY`, in the run on the mock pool, the one that names no pool: they belong to the run
-on the coursework pool. A run that names a pool leaves none out.
+on the coursework pool. A run that names a pool leaves none out but the test of the unbooked pool,
+below.
+
+**The pool nobody has booked.** A request starts no machine, and a pool without a session answers
+`no_session` (section 5.3). The tests of `UNBOOKED_ONLY`, the one with the ID `no-session`, assert
+that, and they can only be made on a pool that has no session. So the script runs them once, alone,
+on the mock pool, when it finds that pool with no session booked or active and before it books it:
+a run of its own, which `RHI_VERIFY_UNBOOKED_RUN` marks for the plugin below, and whose exit counts
+like any other run's. Every other run, the mock pool's in its session and each pool's of the
+decision's file, leaves those tests out: its pool is booked. Only the script marks that run: the
+variable is taken out of the environment the step gives before any run is made.
+
+**A verification without that test does not pass.** The script reads the mock pool's session once,
+and that reading decides: with no session, the test runs and the script then books the pool; with
+a session booked or active, someone else's, the script neither books nor stops it, as below, and
+cannot make the pool unbooked. It never books the mock pool without having run that test first,
+also when the session it read ends a moment later. On a mock pool that has a session, the tests of
+the pool's session run on the instances that are there, as do those of the decision's pools, the
+test of the pool nobody has booked is not run, the script says so in a line of its own, and it
+exits 1 whatever the other tests gave: the verification is not complete, and the stage is to be
+retried once the mock pool is free.
 
 **The session on a pool.** Before each of its runs of the tests, the script books the pool the run
 is on through `booking.py`: a session of one instance, under the name `BOOKED_BY`, for twice
@@ -34,8 +54,10 @@ either case; on a pool of the decision's file, see below. No reading starts once
 and each is given no longer than what is left of it. Whatever became of the run, the script then
 stops the session, only while the session still reads as the booking it made. A pool that already
 has a session booked or active is neither booked nor stopped: the tests run at once, on the
-instances that are there. A mock pool that cannot be booked fails the script before any test, and
-so does a booking longer than `RHI_VERIFY_SESSION_MAX_HOURS` allows; a pool of the decision's file
+instances that are there, and on the mock pool the verification is then not complete, above. A
+mock pool whose session cannot be read fails the script before any
+test, and one that cannot be booked, or whose booking is longer than
+`RHI_VERIFY_SESSION_MAX_HOURS` allows, before any test of its session; a pool of the decision's file
 that cannot be booked gets no run and fails the script. A session that could not be stopped fails a
 script whose tests passed: it ends by itself. The script says which of these happened in a line of
 its own, never in a message of AWS, and does not check that the instance leaves once the session is
@@ -235,6 +257,12 @@ NO_CAPACITY = "no-capacity"
 # (`tests/smoke/ids.py`): a run that names no pool, the mock pool's, leaves them out, and they are
 # the only tests the verification leaves out.
 GPU_PASS_ONLY: tuple[str, ...] = ("gpu-release-served",)
+# The tests that can only be made on a pool nobody has booked, by their IDs: the script runs them
+# alone, on the mock pool before it books it, and every other run leaves them out.
+UNBOOKED_ONLY: tuple[str, ...] = ("no-session",)
+# Set, to `UNBOOKED_RUN`, in the environment of that run alone: it tells the plugin which run it is in.
+UNBOOKED_VARIABLE = "RHI_VERIFY_UNBOOKED_RUN"
+UNBOOKED_RUN = "1"
 # The marker a smoke test carries its ID in.
 ID_MARKER = "smoke_id"
 
@@ -249,11 +277,19 @@ _left: set[str] = set()
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """As a plugin of the run of the smoke tests: in a run that names no pool, deselects the tests
-    whose ID is one of `GPU_PASS_ONLY`, and none in a run that names one; keeps the IDs of the
-    others for `pytest_runtest_logreport`."""
-    deselected = set() if os.environ.get(POOL_VARIABLE) else set(GPU_PASS_ONLY)
-    left_out = [item for item in items if any(set(marker.args) & deselected for marker in item.iter_markers(ID_MARKER))]
+    """As a plugin of the run of the smoke tests: in the run on the unbooked mock pool, keeps the
+    tests whose ID is one of `UNBOOKED_ONLY` and deselects every other; in any other run, deselects
+    those, and in one that names no pool the tests whose ID is one of `GPU_PASS_ONLY` too; keeps
+    the IDs of the tests left for `pytest_runtest_logreport`."""
+
+    def carries(item: pytest.Item, ids: tuple[str, ...]) -> bool:
+        return any(set(marker.args) & set(ids) for marker in item.iter_markers(ID_MARKER))
+
+    if os.environ.get(UNBOOKED_VARIABLE):
+        left_out = [item for item in items if not carries(item, UNBOOKED_ONLY)]
+    else:
+        deselected = UNBOOKED_ONLY + (() if os.environ.get(POOL_VARIABLE) else GPU_PASS_ONLY)
+        left_out = [item for item in items if carries(item, deselected)]
     if left_out:
         config.hook.pytest_deselected(items=left_out)
         items[:] = [item for item in items if item not in left_out]
@@ -637,19 +673,31 @@ class Launches:
         answer came too long after the one before it."""
         return self._ask() and not self._launched and not self._gap
 
+    @property
+    def launched(self) -> bool:
+        """Whether an answer held a row: an instance was launched since the booking."""
+        return self._launched
+
 
 @dataclass(frozen=True)
 class Outcome:
     """What became of a pool's run of the tests: the run's exit, `None` when no run was made;
     whether the session was stopped or was not the script's to stop; whether no run was made
     because no instance was launched during the wait, and not because the pool was not booked;
-    and the stage the script last saw, during the wait, of each instance launched in it, by
-    instance."""
+    the stage the script last saw, during the wait, of each instance launched in it, by
+    instance; the seconds the script waited for the instance of the session it booked, from the
+    booking to the reading of ready, or to the wait's end when none came, and `None` when it
+    booked nothing; whether that wait ended on a pool that did not read ready although an
+    instance was launched since the booking: one that was launched and did not serve; and the exit
+    code of the run made on the pool before it was booked, `None` when that run was not made."""
 
     exit_code: int | None
     in_order: bool
     no_capacity: bool = False
     stages: Mapping[str, str] = field(default_factory=dict)
+    waited: float | None = None
+    unserved: bool = False
+    unbooked_exit: int | None = None
 
 
 def run_in_a_session(
@@ -663,8 +711,11 @@ def run_in_a_session(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     launched: Callable[[int], Mapping[str, str | None] | None] | None = None,
+    set_by: str = BOOKED_BY,
+    unbooked: Callable[[], int] | None = None,
 ) -> Outcome:
-    """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool and
+    """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool,
+    under the name `set_by`, the verification's unless another check gives its own, and
     stops after the run, whatever its result, or after its wait when no run is made. A pool that
     already has a session is neither booked nor stopped, and the run is made at once. A pool that
     cannot be booked gets no run. `status` reads the pool's state in the seconds it is given. With
@@ -672,7 +723,11 @@ def run_in_a_session(
     given, or `None` when it cannot tell: it is asked through the wait, while the pool does not
     read ready, and once more when the wait ends; when the pool does not read ready by then and its
     answers say that no instance was launched since the booking (`Launches`), no run is made, for
-    lack of capacity. Without it, the run is made when the wait ends."""
+    lack of capacity. Without it, the run is made when the wait ends. With `unbooked`, the run of
+    what can only be tested on a pool nobody has booked: one reading of the pool's session decides.
+    When the pool has no session booked or active, that run is made first, and the pool is booked
+    after it. When it has one, that run is not made and the pool is not booked, also when that
+    session ends a moment later: `run` is made at once, and `Outcome.unbooked_exit` stays `None`."""
     # Here and not at the top: the script's paths that book nothing, and the run of the tests that
     # loads this file as its plugin, need no import path.
     import booking
@@ -680,31 +735,52 @@ def run_in_a_session(
     from rhi_common.sessions import SessionError
 
     minutes = 2 * check.wait_minutes
+    unbooked_exit = None
     try:
         table = resource.Table(booking.table_name(cloudformation, check.stack, check.logical_id))
-        session = booking.book(
-            table,
-            pool,
-            minutes=minutes,
-            set_by=BOOKED_BY,
-            now=int(clock()),
-            session_max_hours=check.session_max_hours,
+        # The one reading that decides whether the pool is tested as one nobody has booked.
+        occupied = unbooked is not None and booking.booked(
+            table, pool, now=int(clock()), session_max_hours=check.session_max_hours
+        )
+    except (BotoCoreError, ClientError, KeyError, RecordError) as error:
+        print(f"{NAME}: the pool {pool} was not booked ({type(error).__name__}): no test was run", file=sys.stderr)
+        return Outcome(None, in_order=False)
+    if unbooked is not None and not occupied:
+        print(f"{NAME}: the pool {pool} has no session: the test of a pool nobody has booked runs first", flush=True)
+        unbooked_exit = unbooked()
+    try:
+        # A pool read as occupied is not booked, whatever became of its session since: the script
+        # books no pool it was to test unbooked without having run that test.
+        session = (
+            None
+            if occupied
+            else booking.book(
+                table,
+                pool,
+                minutes=minutes,
+                set_by=set_by,
+                now=int(clock()),
+                session_max_hours=check.session_max_hours,
+            )
         )
     except SessionError:
         problem = (
             f"a session of {minutes} minutes, twice {CHECK_WAIT_MINUTES_VARIABLE}, is longer than a session may last"
         )
         print(f"{NAME}: the pool {pool} was not booked: {problem}", file=sys.stderr)
-        return Outcome(None, in_order=False)
+        return Outcome(None, in_order=False, unbooked_exit=unbooked_exit)
     except (BotoCoreError, ClientError, KeyError, RecordError) as error:
         print(f"{NAME}: the pool {pool} was not booked ({type(error).__name__}): no test was run", file=sys.stderr)
-        return Outcome(None, in_order=False)
+        return Outcome(None, in_order=False, unbooked_exit=unbooked_exit)
     if session is None:
         print(f"{NAME}: the pool {pool} already has a session: it is neither booked nor stopped")
-        return Outcome(run(), in_order=True)
+        if occupied:
+            # Someone's session: it stays, and so the pool cannot be tested as one nobody has booked.
+            print(f"{NAME}: the test of a pool nobody has booked is not run: the pool {pool} has a session")
+        return Outcome(run(), in_order=True, unbooked_exit=unbooked_exit)
     # Flushed: the wait that follows may be long, and the log says what the step waits for.
     print(f"{NAME}: booked the pool {pool} for {minutes} minutes", flush=True)
-    exit_code, no_capacity = None, False
+    exit_code, no_capacity, unserved, took = None, False, False, None
     launches = None if launched is None else Launches(launched, session.set_at, clock)
 
     def read(within: float) -> str | None:
@@ -716,7 +792,9 @@ def run_in_a_session(
 
     try:
         until = session.set_at + check.wait_minutes * MINUTE_SECONDS
-        if wait_until_ready(read, until=until, sleep=sleep, clock=clock):
+        ready = wait_until_ready(read, until=until, sleep=sleep, clock=clock)
+        took = max(0.0, clock() - session.set_at)
+        if ready:
             print(f"{NAME}: the pool {pool} reads ready")
             exit_code = run()
         elif launches is not None and launches.none():
@@ -725,6 +803,8 @@ def run_in_a_session(
             waited = f"no instance of the pool {pool} was launched in {check.wait_minutes} minutes"
             print(f"{NAME}: {waited}: its tests are not run, for lack of capacity")
         else:
+            # A row seen since the booking: an instance was launched, and the wait ended before it served.
+            unserved = launches is not None and launches.launched
             print(f"{NAME}: the pool {pool} did not read ready in {check.wait_minutes} minutes: the tests run")
             exit_code = run()
     finally:
@@ -741,7 +821,15 @@ def run_in_a_session(
             else:
                 print(f"{NAME}: stopped the session it booked on the pool {pool}")
     stages = {} if launches is None else launches.stages
-    return Outcome(exit_code, in_order=stopped, no_capacity=no_capacity, stages=stages)
+    return Outcome(
+        exit_code,
+        in_order=stopped,
+        no_capacity=no_capacity,
+        stages=stages,
+        waited=took,
+        unserved=unserved,
+        unbooked_exit=unbooked_exit,
+    )
 
 
 def main(
@@ -756,17 +844,20 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
-    """Verifies the deployment the environment names; 0 when every test that ran passed, or none
-    could run. `client` is a Secrets Manager client of the AWS SDK, `dynamodb` a DynamoDB one,
-    `cloudformation` a CloudFormation one and `resource` a DynamoDB resource; without one, the
-    build's own credentials and region make it. `run` runs the smoke tests in the environment it is
-    given: once on the mock pool, then once on each pool the decision left, each in a session the
-    script books and stops. A pool the decision left on which no instance was launched during the
-    wait gets no run, the reason is left for the step's post-build phase, and the exit is that of
-    the other runs. `status` reads the state of the pool it is given in the seconds it
-    is given, from the endpoint's `GET /status` when left out; `sleep` waits that many seconds and
-    `clock` gives the time, in seconds since the epoch. When a run fails, the last stage each
-    instance of the tested pools reached is left for the step's post-build phase."""
+    """Verifies the deployment the environment names; 0 when every test that ran passed and the
+    test of a pool nobody has booked was among them, or when none could run. `client` is a Secrets
+    Manager client of the AWS SDK, `dynamodb` a DynamoDB one, `cloudformation` a CloudFormation one
+    and `resource` a DynamoDB resource; without one, the build's own credentials and region make
+    it. `run` runs the smoke tests in the environment it is given: once on the mock pool before it
+    is booked, marked by `UNBOOKED_VARIABLE`, when that pool has no session; then once on the mock
+    pool and once on each pool the decision left, each in a session the script books and stops. On
+    a mock pool that has a session that first run is not made, and the exit is 1 whatever the
+    others gave. A pool the decision left on which no instance was launched during the wait gets no
+    run, the reason is left for the step's post-build phase, and the exit is that of the other
+    runs. `status` reads the state of the pool it is given in the seconds it is given, from the
+    endpoint's `GET /status` when left out; `sleep` waits that many seconds and `clock` gives the
+    time, in seconds since the epoch. When a run fails, the last stage each instance of the tested
+    pools reached is left for the step's post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
     if not endpoint:
@@ -796,7 +887,9 @@ def main(
         return 1
     pools = release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, ""))
     given = {**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)}
+    # The script alone says which pool a run is on, and which run is the unbooked pool's.
     given.pop(POOL_VARIABLE, None)
+    given.pop(UNBOOKED_VARIABLE, None)
     if cloudformation is None or resource is None:
         import boto3
 
@@ -804,8 +897,11 @@ def main(
         resource = resource or boto3.resource("dynamodb")
     read = status or status_reader(endpoint, key)
 
-    def in_a_session(pool: str, environ: Mapping[str, str], *, told_of_launches: bool) -> Outcome:
-        """The run of the tests on `pool`, in `environ`, in a session booked for it."""
+    def in_a_session(
+        pool: str, environ: Mapping[str, str], *, told_of_launches: bool, unbooked_first: bool = False
+    ) -> Outcome:
+        """The run of the tests on `pool`, in `environ`, in a session booked for it; with
+        `unbooked_first`, after the run of the test of a pool nobody has booked, if the pool is one."""
         return run_in_a_session(
             check,
             pool,
@@ -816,12 +912,15 @@ def main(
             sleep=sleep,
             clock=clock,
             launched=(lambda since: launched_rows(env, pool, since, dynamodb)) if told_of_launches else None,
+            unbooked=(lambda: run({**environ, UNBOOKED_VARIABLE: UNBOOKED_RUN})) if unbooked_first else None,
         )
 
-    on_mock = in_a_session(MOCK_POOL, given, told_of_launches=False)
+    on_mock = in_a_session(MOCK_POOL, given, told_of_launches=False, unbooked_first=True)
     if on_mock.exit_code is None:
         return 1
-    exits, in_order, no_capacity = [on_mock.exit_code], on_mock.in_order, False
+    # The run on the unbooked mock pool counts first, when it was made.
+    exits = [code for code in (on_mock.unbooked_exit, on_mock.exit_code) if code is not None]
+    in_order, no_capacity = on_mock.in_order, False
     seen: dict[str, Mapping[str, str]] = {}
     for pool in passes:
         on_pool = in_a_session(pool, {**given, POOL_VARIABLE: pool}, told_of_launches=True)
@@ -834,10 +933,15 @@ def main(
             # A pool that could not be booked got no run: that fails the script.
             exits.append(1 if on_pool.exit_code is None else on_pool.exit_code)
     exit_code = next((code for code in exits if code != 0), 0)
+    if on_mock.unbooked_exit is None:
+        # The mock pool had a session: what a pool nobody has booked answers was not tested.
+        problem = "the test of a pool nobody has booked was not run"
+        print(f"{NAME}: the verification is not complete: {problem}", file=sys.stderr)
     if exit_code != 0:
         leave_last_stages(env, pools, dynamodb, seen)
-    elif not in_order:
-        # A session the script booked and could not stop fails a verification whose tests passed.
+    elif not in_order or on_mock.unbooked_exit is None:
+        # A session the script booked and could not stop fails a verification whose tests passed,
+        # and so does one that could not make the test of the unbooked pool.
         exit_code = 1
     if no_capacity:
         # Left whatever the exit: a reason that cannot be left fails a script that passed.

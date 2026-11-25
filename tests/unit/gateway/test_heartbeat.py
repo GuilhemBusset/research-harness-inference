@@ -1,9 +1,9 @@
-"""The demand a gateway task reports to the scaler (`rhi_gateway.heartbeat`; system design, section 5.1).
+"""This task's count of requests in flight (`rhi_gateway.heartbeat`; system design, sections 5.3 and 7.2).
 
-The heartbeat writes to a table double that keeps every item it is given. Its clock and its sleep
-are the test's. The gateway runs whole, with the in-memory key store and ledger and a real
-`Readiness` and `Waker` whose AWS clients are doubles. The engine is an `httpx.MockTransport`
-handler that answers when the test lets it. Every key is generated when the tests run.
+The count has no table: it is read through `Heartbeat.rows`, as the gateway's gauge reads it. The
+gateway runs whole, with the in-memory key store and ledger and a real `Readiness` whose AWS
+clients are doubles. The engine is an `httpx.MockTransport` handler that answers when the test
+lets it. Every key is generated when the tests run.
 """
 
 from __future__ import annotations
@@ -20,10 +20,10 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import GatewayHeartbeat
+from rhi_common.records import SESSION_RECORD, GatewayHeartbeat, Session
 from rhi_common.students import StudentKey
 from rhi_gateway import proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -33,7 +33,6 @@ from rhi_gateway.heartbeat import Heartbeat
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
 from rhi_gateway.readiness import Readiness
-from rhi_gateway.waker import EXPLICIT_WAKE_SECONDS, Waker
 
 NOW = 1_800_000_000
 # The course end the ledger's rows expire by.
@@ -62,50 +61,11 @@ STREAM = (
 ANSWER = json.dumps({"type": "message", "usage": {"input_tokens": 3, "output_tokens": 2}}).encode()
 
 
-class Clock:
-    """Seconds since the epoch, moved only by the test; `sleep` waits on it."""
-
-    def __init__(self) -> None:
-        self.now = float(NOW)
-        self._sleepers: list[tuple[float, asyncio.Future[None]]] = []
-
-    def time(self) -> float:
-        return self.now
-
-    async def sleep(self, seconds: float) -> None:
-        if seconds <= 0:
-            await asyncio.sleep(0)
-            return
-        wake = asyncio.get_running_loop().create_future()
-        self._sleepers.append((self.now + seconds, wake))
-        await wake
-
-    async def advance(self, seconds: float) -> None:
-        """Move the clock and wake every sleeper whose time has come."""
-        self.now += seconds
-        while due := [wake for at, wake in self._sleepers if at <= self.now and not wake.done()]:
-            for wake in due:
-                wake.set_result(None)
-            for _ in range(50):
-                await asyncio.sleep(0)
-
-
-class Table:
-    """The heartbeats table: every item put, in order."""
-
-    def __init__(self) -> None:
-        self.items: list[dict[str, Any]] = []
-
-    def put_item(self, Item: dict[str, Any]) -> None:
-        self.items.append(Item)
-
-    @property
-    def rows(self) -> list[GatewayHeartbeat]:
-        return [GatewayHeartbeat.from_item(item) for item in self.items]
-
-
 class AWS:
-    """`describe_target_health` (healthy once `healthy`), the pool-state table (no records) and the scaler's `invoke`."""
+    """`describe_target_health` (healthy once `healthy`) and the pool-state table.
+
+    The table holds one record, the pool's session, active for 6 hours from the moment the test's clock starts at.
+    """
 
     def __init__(self) -> None:
         self.healthy = False
@@ -114,10 +74,10 @@ class AWS:
         return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy" if self.healthy else "initial"}}]}
 
     def get_item(self, Key: dict[str, str]) -> dict[str, Any]:
-        return {}
-
-    def invoke(self, **_: Any) -> None:
-        return None
+        if Key["record"] != SESSION_RECORD:
+            return {}
+        session = Session(Key["pool"], instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+        return {"Item": session.to_item()}
 
 
 async def until(condition: Callable[[], bool]) -> None:
@@ -130,8 +90,9 @@ async def until(condition: Callable[[], bool]) -> None:
     await asyncio.wait_for(polled(), timeout=10)
 
 
-def counts(row: GatewayHeartbeat) -> tuple[int, int, int | None]:
-    return row.in_flight, row.held, row.last_request_at
+def counts(row: GatewayHeartbeat) -> tuple[int, int]:
+    """The requests in flight, and those held: none ever is."""
+    return row.in_flight, row.held
 
 
 class Engine:
@@ -140,7 +101,7 @@ class Engine:
     def __init__(self, heartbeat: Heartbeat) -> None:
         self._heartbeat = heartbeat
         self.release = asyncio.Event()
-        self.seen: list[tuple[int, int, int | None]] = []
+        self.seen: list[tuple[int, int]] = []
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(await request.aread())
@@ -154,18 +115,15 @@ class Engine:
 
 
 class Gateway:
-    """The whole gateway, local routes included, with one heartbeat; its pool is not ready until the test says so."""
+    """The whole gateway, local routes included, with one count; its pool is not ready until the test says so."""
 
     def __init__(self) -> None:
-        self.clock = Clock()
         self.aws = AWS()
-        self.readiness = Readiness({POOL: "coursework-targets"}, elbv2=self.aws, table=self.aws, clock=self.clock.time)
-        self.readiness.refresh()
-        self.waker = Waker(self.readiness, lambda_client=self.aws, function_name="scaler", clock=self.clock.time)
-        self.table = Table()
-        self.heartbeat = Heartbeat(
-            self.table, TASK, [POOL], waker=self.waker, clock=self.clock.time, sleep=self.clock.sleep
+        self.readiness = Readiness(
+            {POOL: "coursework-targets"}, elbv2=self.aws, table=self.aws, clock=lambda: float(NOW)
         )
+        self.readiness.refresh()
+        self.heartbeat = Heartbeat(TASK, [POOL], clock=lambda: float(NOW))
         self.engine = Engine(self.heartbeat)
         self.key = generate_key()
         student = StudentKey(
@@ -193,21 +151,20 @@ class Gateway:
                 proxy.upstream_client(httpx.MockTransport(self.engine)),
                 "http://pools.example.com:8080",
                 {POOL: "secret"},
-                sleep=self.clock.sleep,
             ),
-            holding=Holding(
-                views=self.readiness.views, wake=lambda pool: None, clock=self.clock.time, sleep=self.clock.sleep
-            ),
+            pools=Pools(views=self.readiness.views, clock=lambda: float(NOW)),
             heartbeat=self.heartbeat,
         )
-        local = LocalRoutes(authenticator=authenticator, pools=POOLS, views=self.readiness.views, clock=self.clock.time)
+        local = LocalRoutes(
+            authenticator=authenticator, pools=POOLS, views=self.readiness.views, clock=lambda: float(NOW)
+        )
         self.app = build_app(forwarding_handlers(forwarding), local=local, heartbeat=self.heartbeat)
 
     def ready(self) -> None:
         self.aws.healthy = True
         self.readiness.refresh()
 
-    def row(self) -> tuple[int, int, int | None]:
+    def row(self) -> tuple[int, int]:
         return counts(self.heartbeat.rows()[0])
 
 
@@ -252,48 +209,21 @@ class Call:
         await asyncio.wait_for(self.task, timeout=10)
 
 
-def test_two_in_flight_and_one_held_are_rewritten_every_five_seconds() -> None:
-    async def scenario() -> None:
-        clock, table = Clock(), Table()
-        heartbeat = Heartbeat(table, TASK, [POOL, "other"], clock=clock.time, sleep=clock.sleep)
-        heartbeat.received(POOL, held=False)
-        clock.now += 1
-        heartbeat.received(POOL, held=False)
-        clock.now += 1
-        heartbeat.received(POOL, held=True)
-        writing = asyncio.ensure_future(heartbeat.run())
-
-        await until(lambda: len(table.items) == 2)
-        await clock.advance(4.5)
-        await asyncio.sleep(0.01)
-        assert len(table.items) == 2  # Nothing before the 5 seconds are up.
-        await clock.advance(0.5)
-        await until(lambda: len(table.items) == 4)
-        await clock.advance(5)
-        await until(lambda: len(table.items) == 6)
-        writing.cancel()
-
-        rows = [row for row in table.rows if row.pool == POOL]
-        assert {item["source"] for item in table.items} == {"gateway#" + TASK}
-        assert [counts(row) for row in rows] == [(2, 1, NOW + 2)] * 3
-        assert [row.written_at for row in rows] == [NOW + 2, NOW + 7, NOW + 12]
-        assert {counts(row) for row in table.rows if row.pool == "other"} == {(0, 0, None)}
-
-    asyncio.run(scenario())
-
-
 def test_a_request_counts_until_it_ends() -> None:
-    heartbeat = Heartbeat(Table(), TASK, [POOL], clock=lambda: float(NOW))
-    demand = heartbeat.received(POOL, held=True)
-    demand.forwarded()
-    assert counts(heartbeat.rows()[0]) == (1, 0, NOW)
-    demand.end()
-    demand.end()
-    demand.forwarded()
-    assert counts(heartbeat.rows()[0]) == (0, 0, NOW)
+    heartbeat = Heartbeat(TASK, [POOL, "other"], clock=lambda: float(NOW))
+    first, second = heartbeat.received(POOL), heartbeat.received(POOL)
+    assert [(row.task, row.pool, *counts(row)) for row in heartbeat.rows()] == [
+        (TASK, POOL, 2, 0),
+        (TASK, "other", 0, 0),
+    ]
+    first.end()
+    first.end()
+    assert counts(heartbeat.rows()[0]) == (1, 0)
+    second.end()
+    assert counts(heartbeat.rows()[0]) == (0, 0)
 
 
-def test_cheap_calls_are_not_demand() -> None:
+def test_cheap_calls_are_not_counted() -> None:
     async def scenario() -> None:
         gateway = Gateway()
         gateway.ready()
@@ -307,96 +237,47 @@ def test_cheap_calls_are_not_demand() -> None:
         for call in calls:
             await call.ended()
         assert [call.status for call in calls] == [200, 200, 200, 200]
-        assert gateway.engine.seen == [(0, 0, None)]  # Token counting, while it was with the engine.
-        assert gateway.row() == (0, 0, None)
+        assert gateway.engine.seen == [(0, 0)]  # Token counting, while it was with the engine.
+        assert gateway.row() == (0, 0)
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "not a stream"])
-def test_a_request_is_held_then_in_flight_until_its_end(stream: bool) -> None:
+def test_a_request_is_in_flight_until_its_end(stream: bool) -> None:
     async def scenario() -> None:
         gateway = Gateway()
-        call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": [], "stream": stream})
-        await until(lambda: gateway.row()[1] == 1)
-        assert gateway.row() == (0, 1, NOW)
-
-        await gateway.clock.advance(3)
         gateway.ready()
-        await gateway.clock.advance(1)
+        call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": [], "stream": stream})
         await until(lambda: bool(gateway.engine.seen))
-        assert gateway.engine.seen == [(1, 0, NOW)]
+        assert gateway.engine.seen == [(1, 0)]
 
         gateway.engine.release.set()
         await call.ended()
-        assert gateway.row() == (0, 0, NOW)
+        assert (call.status, gateway.row()) == (200, (0, 0))
 
     asyncio.run(scenario())
 
 
-def test_a_hold_the_client_leaves_stops_counting() -> None:
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "not a stream"])
+def test_a_request_the_pool_cannot_serve_is_never_counted(stream: bool) -> None:
+    async def scenario() -> None:
+        gateway = Gateway()  # Its session is active, and no target is healthy.
+        call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": [], "stream": stream})
+        await call.ended()
+        assert (call.status, gateway.engine.seen, gateway.row()) == (503, [], (0, 0))
+
+    asyncio.run(scenario())
+
+
+def test_a_request_the_client_leaves_stops_counting() -> None:
     async def scenario() -> None:
         gateway = Gateway()
+        gateway.ready()
         call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": []})
-        await until(lambda: gateway.row()[1] == 1)
+        await until(lambda: gateway.row() == (1, 0))
         call.leave()
         await call.ended()
-        assert gateway.row() == (0, 0, NOW)
-
-    asyncio.run(scenario())
-
-
-def test_a_cancelled_hold_stops_counting() -> None:
-    async def scenario() -> None:
-        gateway = Gateway()
-        call = Call(gateway, routes.MESSAGES, {"model": POOL, "max_tokens": 10, "messages": []})
-        await until(lambda: gateway.row()[1] == 1)
-        call.task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await call.ended()
-        await until(lambda: gateway.row() == (0, 0, NOW))
-
-    asyncio.run(scenario())
-
-
-def test_an_explicit_wake_is_demand() -> None:
-    gateway = Gateway()
-    gateway.waker.record(POOL)
-    assert gateway.row() == (0, 1, None)
-
-    gateway.clock.now += 40
-    gateway.ready()
-    assert gateway.row() == (0, 0, NOW + 40)
-
-
-def test_an_explicit_wake_that_runs_out_records_nothing() -> None:
-    gateway = Gateway()
-    gateway.waker.record(POOL)
-    gateway.clock.now += EXPLICIT_WAKE_SECONDS
-    assert gateway.row() == (0, 0, None)
-    gateway.ready()
-    assert gateway.row() == (0, 0, None)
-
-
-def test_shutdown_writes_a_row_of_zeros() -> None:
-    async def scenario() -> None:
-        table = Table()
-        heartbeat = Heartbeat(table, TASK, [POOL], clock=lambda: float(NOW))
-        heartbeat.received(POOL, held=False)
-        events: asyncio.Queue[Message] = asyncio.Queue()
-        sent: list[str] = []
-
-        async def send(message: Message) -> None:
-            sent.append(message["type"])
-
-        await events.put({"type": "lifespan.startup"})
-        app = build_app(heartbeat=heartbeat)
-        running = asyncio.ensure_future(app({"type": "lifespan", "asgi": {"version": "3.0"}}, events.get, send))
-        await until(lambda: bool(table.items))  # Started with the application.
-        await events.put({"type": "lifespan.shutdown"})
-        await asyncio.wait_for(running, timeout=10)
-        assert sent == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
-        assert counts(table.rows[0]) == (1, 0, NOW)
-        assert counts(table.rows[-1]) == (0, 0, NOW)
+        assert gateway.row() == (0, 0)
 
     asyncio.run(scenario())

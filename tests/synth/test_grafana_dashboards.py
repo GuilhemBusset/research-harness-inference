@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 IMAGE_FOLDER = REPO / "services" / "grafana"
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
 FLEET = "dashboards/fleet.json"
-OBJECTIVES_ROW = "Objectives, while a session is on"
+OBJECTIVES_ROW = "Objectives, each pool's while its session is active"
 
 
 @dataclass(frozen=True)

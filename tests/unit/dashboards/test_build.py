@@ -260,29 +260,38 @@ def test_every_dashboard_follows_the_rules(
         over_a_sum = f"{function}(sum by (pool) (rhi_gateway_student_requests_total)[5m:])"
         assert rules_broken(check.violations(document(graph(over_a_sum)), [requests], pools)) == {"rate"}
 
-    # An engine panel without the pool's in-service count: the bare query, the query kept to the
-    # pool in service with nothing to read asleep, and the helper's panel less its state query.
+    # An engine panel that does not take the pool's state from the scaler: the bare query, the query
+    # kept to the pool while it serves with nothing to read its state, and the helper's panel less
+    # either of its two state queries.
     engine = [rules.FromEngineTable(Quantity.OUTPUT_TOKENS)]
     assert check.violations(document(rules.engine_timeseries(pool, "Output", {"tokens": tokens})), engine, pools) == []
-    assert rules_broken(check.violations(document(graph(tokens)), engine, pools)) == {"asleep"}
-    assert rules_broken(check.violations(document(graph(rules.awake(pool.name, tokens))), engine, pools)) == {"asleep"}
-    without_state = engines.document()
-    for panel in without_state["panels"]:
-        panel["targets"] = [target for target in panel.get("targets", []) if target["refId"] != rules.ASLEEP_REF]
-    found = check.violations(without_state, engines.metrics, pools)
-    assert rules_broken(found) == {"asleep"}
-    assert len(found) == len([panel for panel in without_state["panels"] if panel["type"] != "row"])
-    # A state query that is disabled is on no panel: nothing reads asleep.
-    state_disabled = engines.document()
-    for panel in state_disabled["panels"]:
-        for target in panel.get("targets", []):
-            target["hide"] = target["refId"] == rules.ASLEEP_REF
-    found = check.violations(state_disabled, engines.metrics, pools)
-    assert rules_broken(found) == {"asleep"}
-    assert len(found) == len([panel for panel in state_disabled["panels"] if panel["type"] != "row"])
-    # The other pool's count is not this pool's.
-    other = graph(rules.awake("second", tokens), rules.asleep("second"))
-    assert rules_broken(check.violations(document(other), engine, pools)) == {"asleep"}
+    assert rules_broken(check.violations(document(graph(tokens)), engine, pools)) == {"pool-state"}
+    kept = rules.serving(pool.name, tokens)
+    assert rules_broken(check.violations(document(graph(kept)), engine, pools)) == {"pool-state"}
+    # Kept by the count of instances in service alone, it would be shown outside the pool's session.
+    in_service_alone = document(rules.engine_timeseries(pool, "Output", {"tokens": tokens}))
+    in_service_alone["panels"][0]["targets"][0]["expr"] = f"({tokens}) and on (pool) ({rules.in_service(pool.name)} > 0)"
+    assert [one.rule for one in check.violations(in_service_alone, engine, pools)] == ["pool-state"]
+    panels = [panel for panel in engines.document()["panels"] if panel["type"] != "row"]
+    for state in rules.STATES:
+        without_state = engines.document()
+        for panel in without_state["panels"]:
+            panel["targets"] = [target for target in panel.get("targets", []) if target["refId"] != state.ref]
+        found = check.violations(without_state, engines.metrics, pools)
+        assert rules_broken(found) == {"pool-state"}
+        assert len(found) == len(panels)
+        assert all(state.text in one.detail for one in found)
+        # A state query that is disabled is on no panel: nothing reads the state.
+        state_disabled = engines.document()
+        for panel in state_disabled["panels"]:
+            for target in panel.get("targets", []):
+                target["hide"] = target["refId"] == state.ref
+        found = check.violations(state_disabled, engines.metrics, pools)
+        assert rules_broken(found) == {"pool-state"}
+        assert len(found) == len(panels)
+    # The other pool's state is not this pool's.
+    other = graph(rules.serving("second", tokens), *rules.state_queries("second").values())
+    assert rules_broken(check.violations(document(other), engine, pools)) == {"pool-state"}
 
     # A percentile without its count, or with a count over another window.
     alone = graph(rules.quantile(0.95, "sample_request_seconds", window="5m"))

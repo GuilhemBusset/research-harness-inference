@@ -18,10 +18,10 @@ import pytest
 import common
 import dry_run_class as dry
 import loadgen
+from loadgen import HELD_HEADER
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key
 from rhi_gateway.errors import WireFormat, render_stream_event
-from rhi_gateway.hold import HELD_HEADER
 from s5_capacity import Shape
 from s7_drain import Recorder
 

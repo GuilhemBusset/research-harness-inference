@@ -12,6 +12,7 @@ import asyncio
 import datetime
 import json
 import secrets
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -25,9 +26,10 @@ from starlette.applications import Starlette
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import metrics, proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -71,6 +73,13 @@ TURNS = {entry.wire_format: entry for entry in (routes.MESSAGES, routes.RESPONSE
 INPUT, STREAMED, ANSWERED = 90_000, 401, 500
 
 
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
+
+
 def sse(name: str | None, data: dict[str, Any] | str) -> bytes:
     text = data if isinstance(data, str) else json.dumps(data)
     return (f"event: {name}\n" if name else "").encode() + f"data: {text}\n\n".encode()
@@ -106,13 +115,6 @@ STREAMS = {
 }
 
 
-class Table:
-    """The heartbeats table: nothing is written here, the rows are read as they would be."""
-
-    def put_item(self, Item: dict[str, Any]) -> None:
-        pass
-
-
 @dataclass
 class Gateway:
     """The gateway with its heartbeat and its metrics; the key of each student, by alias."""
@@ -122,7 +124,6 @@ class Gateway:
     heartbeat: Heartbeat
     keys: dict[str, str]
     now: float = 0.0  # The clock the token times are read on: the engine's streams move it.
-    ready: bool = True  # Whether the pools are: a request for one that is not is held.
     broken: bool = False  # Whether the engine fails.
 
 
@@ -131,7 +132,7 @@ def student() -> tuple[str, int]:
     return "s" + secrets.token_hex(6), 10**17 + secrets.randbits(56)
 
 
-def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
+def gateway(*students: tuple[str, int]) -> Gateway:
     keys = {alias: generate_key() for alias, _ in students}
     items = [
         StudentKey(
@@ -147,8 +148,8 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
         for alias, github_id in students
     ]
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
-    heartbeat = Heartbeat(Table(), "task", [pool.name for pool in POOLS], clock=lambda: float(NOW))
-    made = Gateway(Starlette(), metrics.Metrics(), heartbeat, keys, ready=ready)
+    heartbeat = Heartbeat("task", [pool.name for pool in POOLS], clock=lambda: float(NOW))
+    made = Gateway(Starlette(), metrics.Metrics(), heartbeat, keys)
 
     async def engine(request: httpx.Request) -> httpx.Response:
         body = json.loads(await request.aread())
@@ -173,11 +174,6 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
 
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())
 
-    async def sleep(seconds: float) -> None:
-        # The pool turns ready during the first wait of a hold; a later wait is given up when the engine answers.
-        turned, made.ready = made.ready, True
-        await asyncio.sleep(seconds if turned else 0)
-
     forwarding = Forwarding(
         authenticator=Authenticator(InMemoryKeyStore(*items), wall_clock=lambda: float(NOW)),
         ledger=ledger,
@@ -192,11 +188,7 @@ def gateway(*students: tuple[str, int], ready: bool = True) -> Gateway:
             "http://pools.example.com:8080",
             {pool.name: "secret" for pool in POOLS},
         ),
-        holding=Holding(
-            views=lambda: {pool.name: PoolView(ready=made.ready) for pool in POOLS},
-            wake=lambda pool: None,
-            sleep=sleep,
-        ),
+        pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
         heartbeat=heartbeat,
     )
     made.app = build_app(forwarding_handlers(forwarding), heartbeat=heartbeat, metrics=made.metrics)
@@ -247,20 +239,19 @@ def value(made: Gateway, name: str, **labels: str) -> float | None:
     return found[0] if found else None
 
 
-@pytest.mark.parametrize("held", [False, True], ids=["warm", "held"])
 @pytest.mark.parametrize("wire_format", list(WireFormat))
-def test_speed_per_request(wire_format: WireFormat, held: bool) -> None:
-    made = gateway(student(), ready=not held)
+def test_speed_per_request(wire_format: WireFormat) -> None:
+    made = gateway(student())
     assert post(made, TURNS[wire_format], stream=True) == 200
 
     labels = {"pool": POOL, "wire_format": wire_format.value}
-    # A request that waited for its pool is apart from those of a warm pool.
-    speed = {**labels, "start": "held" if held else "warm"}
+    # No request waits for its pool: each is a warm one.
+    speed = {**labels, "start": "warm"}
     # 401 tokens, the first sent at 2 seconds and the last at 22: the 400 after the first, over 20
     # seconds, observed one step of the float above (`rhi_gateway.experience`).
     assert value(made, SPEED + "_sum", **speed) == pytest.approx(20, rel=1e-12)
     assert value(made, SPEED + "_count", **speed) == 1
-    assert value(made, SPEED + "_count", **labels, start="warm" if held else "held") is None
+    assert value(made, SPEED + "_count", **labels, start="held") is None
     assert value(made, OUTPUT_TOKENS + "_sum", **labels) == STREAMED
 
 
@@ -312,9 +303,8 @@ def test_every_request_that_settles_is_observed_once() -> None:
 
 def test_in_flight_and_held_match_the_heartbeat() -> None:
     made = gateway(student())
-    first = made.heartbeat.received(POOL, held=False)
-    made.heartbeat.received(POOL, held=False)
-    waiting = made.heartbeat.received(POOL, held=True)
+    first = made.heartbeat.received(POOL)
+    made.heartbeat.received(POOL)
 
     def reported() -> dict[str, tuple[float, float]]:
         return {row.pool: (row.in_flight, row.held) for row in made.heartbeat.rows()}
@@ -324,11 +314,11 @@ def test_in_flight_and_held_match_the_heartbeat() -> None:
             pool.name: (value(made, IN_FLIGHT, pool=pool.name), value(made, HELD, pool=pool.name)) for pool in POOLS
         }
 
-    assert served_counts() == reported() == {POOL: (2, 1), "research": (0, 0)}
-    # They are read at each scrape: the held request is forwarded, and one in flight ends.
-    waiting.forwarded()
-    first.end()
+    # No request is held, so that count is zero.
     assert served_counts() == reported() == {POOL: (2, 0), "research": (0, 0)}
+    # They are read at each scrape: one in flight ends.
+    first.end()
+    assert served_counts() == reported() == {POOL: (1, 0), "research": (0, 0)}
 
 
 def test_no_student_label() -> None:

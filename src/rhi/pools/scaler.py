@@ -27,7 +27,7 @@ reason:
   conditions narrow it to a group that CloudFormation created in this stack (the tag
   `aws:cloudformation:stack-id`, which only CloudFormation sets) and that carries a pool's tag
   `rhi-pool`. These are the calls `rhi_scaler.aws_io.apply` makes.
-- `autoscaling:DescribeAutoScalingGroups`, `DescribeWarmPool`, `DescribeScalingActivities` and
+- `autoscaling:DescribeAutoScalingGroups`, `DescribeScalingActivities` and
   `elasticloadbalancing:DescribeTargetHealth`, on every resource, the only way AWS grants them:
   what `rhi_scaler.aws_io.read` reads of each group and its target group.
 - reading and writing the items of the heartbeat and pool-state tables, by their ARNs.
@@ -95,7 +95,6 @@ WRITE_GROUP_ACTIONS = [
 DESCRIBE_ACTIONS = [
     "autoscaling:DescribeAutoScalingGroups",
     "autoscaling:DescribeScalingActivities",
-    "autoscaling:DescribeWarmPool",
     "elasticloadbalancing:DescribeTargetHealth",
 ]
 # Granted on every resource only, and narrowed by its condition to the scaler's namespace.

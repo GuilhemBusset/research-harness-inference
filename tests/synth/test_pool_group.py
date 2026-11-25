@@ -1,6 +1,5 @@
-"""A pool's launch template, Auto Scaling group and warm pool (system design, sections 4.2, 4.3, 5.1
-and 5.4): the mock pool of the example configuration, a pool with a fallback instance type, and a
-pool with no warm instance.
+"""A pool's launch template and Auto Scaling group (system design, sections 4.2, 4.3, 4.5, 5.1 and
+5.4): the mock pool of the example configuration, and a pool with a fallback instance type.
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
 """
@@ -122,14 +121,17 @@ def test_rebalancing_is_suspended_when_the_group_is_created_or_replaced(
         assert call["parameters"] == {"AutoScalingGroupName": "NAME", "ScalingProcesses": ["AZRebalance"]}
 
 
-def test_the_mock_pool_warm_pool(pools: dict[str, Any], group: tuple[str, dict[str, Any]]) -> None:
-    name, _ = group
-    (warm_pool,) = of_mock(pools, "AWS::AutoScaling::WarmPool").values()
-    assert warm_pool["AutoScalingGroupName"] == {"Ref": name}
-    assert warm_pool["PoolState"] == "Stopped"
-    assert warm_pool["MaxGroupPreparedCapacity"] == MOCK.warm_instances == 1
-    assert warm_pool["MinSize"] == 0
-    assert warm_pool["InstanceReusePolicy"] == {"ReuseOnScaleIn": True}
+def test_no_pool_has_a_warm_pool_whatever_its_entry_gives(pools: dict[str, Any]) -> None:
+    """A stopped instance can start only in its own zone and as its own type (section 4.5): no group
+    keeps one, and none publishes a metric of a warm pool."""
+    assert {pool.name: pool.warm_instances for pool in EXAMPLE.pools} == {"coursework": 2, "mock": 1}
+    assert of_type(pools, "AWS::AutoScaling::WarmPool") == {}
+    groups = of_type(pools, "AWS::AutoScaling::AutoScalingGroup")
+    assert len(groups) == len(EXAMPLE.pools)
+    for properties in groups.values():
+        (collection,) = properties["MetricsCollection"]
+        assert collection["Metrics"]
+        assert not [name for name in collection["Metrics"] if "WarmPool" in name]
 
 
 def test_no_pool_has_a_scheduled_action(pools: dict[str, Any]) -> None:
@@ -177,13 +179,6 @@ def test_types_in_order(app_module: ModuleType) -> None:
         "OnDemandBaseCapacity": 0,
         "OnDemandPercentageAboveBaseCapacity": 100,
     }
-
-
-def test_no_warm_pool_at_zero(app_module: ModuleType) -> None:
-    template = standalone(app_module, dataclasses.replace(MOCK, warm_instances=0))
-    assert len(of_type(template, "AWS::AutoScaling::AutoScalingGroup")) == 1
-    assert of_type(template, "AWS::AutoScaling::WarmPool") == {}
-    assert of_type(template, "AWS::AutoScaling::ScheduledAction") == {}
 
 
 def test_every_configured_pool_synthesizes_with_its_findings_acknowledged(

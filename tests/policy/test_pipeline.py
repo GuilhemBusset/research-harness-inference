@@ -154,7 +154,25 @@ Rules hold those two, and every action:
   not hold are taken as reaching more;
 - the canary's job tests what is deployed and starts no deployment: its project's role may not
   start an execution of any pipeline, `codepipeline:StartPipelineExecution` on any CodePipeline
-  ARN, read as above. A role its template does not hold is taken as one that may.
+  ARN, read as above. A role its template does not hold is taken as one that may;
+- the canary's job role may do what `CANARY_MAY` lists, each action on resources of its kind only,
+  and nothing else: read the canary's one secret, `rhi/canary-key`; query the workspace of a stage
+  a pipeline deploys, by the condition on its tag alone, as the verification's role does; read the
+  release parameters, `/rhi/pools/<pool>/release`, that the stacks hold which the pipelines of its
+  own template deploy, each by its name; read by pool, with `dynamodb:Query`, the heartbeats table
+  a verification of those pipelines is told of, as the verification's role names it; for the
+  session it books on the coursework pool, read the one stack resource that names the pool-state
+  table, `cloudformation:DescribeStackResource` on a stack those pipelines deploy and whose
+  template holds the pool-state table, and read and write, with `dynamodb:GetItem` and
+  `dynamodb:PutItem` and no other action, the items of that table, named as the hold's role names
+  it; put events on the measurement bus; use the connection of its own template; and write to the
+  log group its project names. Every statement that reads or writes items of either table carries
+  the condition `OF_THE_COURSEWORK_POOL`, alone: `ForAllValues:StringEquals` on
+  `dynamodb:LeadingKeys` with the coursework pool's name, `coursework`, as its only value, so the
+  role reaches no other pool's items, the mock pool's among them, not every item, and no other
+  table. So no action of CodePipeline, Auto Scaling, EC2 or IAM, and no other secret. A wildcard
+  action, `NotAction`, `NotResource`, a role its template does not hold and a managed policy the
+  template does not hold are taken as reaching more.
 
 The list is that of the app's pipeline, `src/rhi/pipeline/stack.py`. The checks are shown on
 pipelines built here with CDK Pipelines, against `BUILT`, the list of the pipeline `built` makes.
@@ -447,6 +465,31 @@ PIPELINE_ARN = f"arn:{FIELD}:codepipeline:{FIELD}:{FIELD}:*"
 CANARY_STARTS_MORE = "a canary's schedule that starts anything but the canary's job"
 CANARY_UNSCHEDULED = "a canary's job without its one schedule"
 CANARY_STARTS_PIPELINES = "a canary's job whose role may start a pipeline's execution"
+# What the canary's job role may be allowed, each action with the kind of resource it may be
+# allowed on, and the one condition under which it may read or write items of the heartbeats table
+# and of the pool-state table: every partition key of the request is the coursework pool's name.
+OF_THE_COURSEWORK_POOL = {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [COURSEWORK_POOL]}}
+CANARY_MAY = {
+    "secretsmanager:GetSecretValue": "secret",
+    "aps:QueryMetrics": "workspaces",
+    "ssm:GetParameter": "parameters",
+    "dynamodb:Query": "heartbeats",
+    "cloudformation:DescribeStackResource": "pools stack",
+    "dynamodb:GetItem": "pool-state",
+    "dynamodb:PutItem": "pool-state",
+    "events:PutEvents": "bus",
+    "codeconnections:GetConnection": "connection",
+    "codeconnections:GetConnectionToken": "connection",
+    "logs:CreateLogStream": "logs",
+    "logs:PutLogEvents": "logs",
+}
+# The kinds whose statements must carry `OF_THE_COURSEWORK_POOL`.
+CANARY_BY_POOL = ("heartbeats", "pool-state")
+CANARY_MORE = (
+    "a canary's job whose role may do more than read the canary's secret and the release parameters, query its"
+    " stage's workspace and the coursework pool's heartbeat rows, find the pool-state table and read and write"
+    " the coursework pool's items of it, send a measurement, read the repository and write its logs"
+)
 SPIKES_MORE = (
     "a spike job's role that may do more than read the configuration, the pool-state records and the spikes'"
     " secret, write the mock pool's items of the pool-state table, query its stage's workspace, send a"
@@ -1096,6 +1139,19 @@ def of_the_mock_pool(condition: Any) -> bool:
     )
 
 
+def of_the_coursework_pool(condition: Any) -> bool:
+    """Whether a statement's condition is `OF_THE_COURSEWORK_POOL` and nothing else: that one
+    operator on that one key, with the coursework pool's name as its only value."""
+    if not isinstance(condition, dict) or list(condition) != list(OF_THE_COURSEWORK_POOL):
+        return False
+    (keys,) = condition.values()
+    return (
+        isinstance(keys, dict)
+        and list(keys) == ["dynamodb:LeadingKeys"]
+        and as_list(keys["dynamodb:LeadingKeys"]) == [COURSEWORK_POOL]
+    )
+
+
 def holds(template: Mapping[str, Any]) -> list[tuple[list[dict[str, Any]], Mapping[str, Any], str, str | None]]:
     """The CodeBuild actions named `Hold` of the pipelines of a template, each as `verifications`
     gives the actions named `Verify`."""
@@ -1427,10 +1483,82 @@ def starts_more_than(template: Mapping[str, Any], role: Any, project: str) -> bo
     return False
 
 
+def canary_resources(
+    templates: Templates, template: Mapping[str, Any], project: str
+) -> dict[str, list[re.Pattern[str]]]:
+    """For each kind of resource of `CANARY_MAY`, what the role of the canary's job `project` of
+    `template` may name, as `arn_text` writes it: the canary's secret, every workspace of the
+    deploying account and region, the release parameters held by the stacks that the pipelines of
+    the template deploy, the heartbeats table a verification of those pipelines is told of
+    (`heartbeat_tables`), the stacks they deploy that hold a pool-state table and that table
+    (`stage_pool_state`), the measurement bus, the connection of the template and the log group
+    the project names."""
+    properties = template["Resources"][project].get("Properties", {})
+    group = properties.get("LogsConfig", {}).get("CloudWatchLogs", {}).get("GroupName")
+    own_logs = group.get("Ref") if isinstance(group, dict) else None
+    connections = [logical_id for _, logical_id, _, _ in resources({"": template}, "AWS::CodeConnections::Connection")]
+    stages = [
+        actions
+        for _, _, pipeline, _ in resources({"": template}, "AWS::CodePipeline::Pipeline")
+        for _, actions in stages_of(pipeline)
+    ]
+    parameters = sorted(
+        {
+            parameter["Name"]
+            for actions in stages
+            for deployed in deployed_by(actions, templates)
+            for _, _, parameter, _ in resources({"": deployed}, "AWS::SSM::Parameter")
+            if isinstance(parameter.get("Name"), str) and RELEASE_PARAMETER.fullmatch(parameter["Name"])
+        }
+    )
+    heartbeats = sorted({name for actions in stages for name in heartbeat_tables(templates, actions)})
+    tables = sorted({table for actions in stages for table in stage_pool_state(templates, actions)})
+    return {
+        "secret": [re.compile(rf"{PARTITION}:secretsmanager:{HERE}:secret:{re.escape(CANARY_SECRET)}-\?{{6}}")],
+        "workspaces": [re.compile(rf"{PARTITION}:aps:{HERE}:workspace/\*")],
+        "parameters": [re.compile(rf"{PARTITION}:ssm:{HERE}:parameter{re.escape(name)}") for name in parameters],
+        "heartbeats": [re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(name)}") for name in heartbeats],
+        "pools stack": [
+            re.compile(rf"{PARTITION}:cloudformation:{HERE}:stack/{re.escape(stack)}/\*")
+            for stack in sorted({stack for stack, _ in tables})
+        ],
+        "pool-state": [
+            re.compile(rf"{PARTITION}:dynamodb:{HERE}:table/{re.escape(f'{stack}-{logical_id}')}-\*")
+            for stack, logical_id in tables
+        ],
+        "bus": [re.compile(rf"{PARTITION}:events:{HERE}:event-bus/{MEASUREMENT_BUS}")],
+        "connection": [re.compile(rf"\$\{{{re.escape(found)}\.ConnectionArn\}}") for found in connections],
+        "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
+    }
+
+
+def canary_does_more(
+    statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]
+) -> bool:
+    """Whether an allowed statement of the canary's job role reaches an action it is not given, a
+    resource beyond those of the action's kind, where it reads or writes items of the heartbeats
+    table or of the pool-state table, any item but the coursework pool's: its condition must be
+    `OF_THE_COURSEWORK_POOL`, alone, or, where it queries workspaces, any workspace but its stage's:
+    its condition must be the one that admits a workspace by the stage's tag, alone."""
+    if reports_more(statement, allowed, CANARY_MAY):
+        return True
+    named = {action.lower() for action in as_list(statement.get("Action", []))}
+    condition = statement.get("Condition")
+    by_pool = {action.lower() for action, kind in CANARY_MAY.items() if kind in CANARY_BY_POOL}
+    if named & by_pool and not of_the_coursework_pool(condition):
+        return True
+    queries = {action.lower() for action, kind in CANARY_MAY.items() if kind == "workspaces"}
+    if not named & queries:
+        return False
+    return condition not in [{"StringEquals": {f"aws:ResourceTag/{STAGE_TAG}": tag}} for tag in tags]
+
+
 def canary_breaches(templates: Templates) -> list[tuple[str, str, str]]:
     """What the rules on the canary refuse: a schedule that starts anything but the canary's job, a
-    job without its one schedule, and a job whose role may start a pipeline's execution."""
+    job without its one schedule, a job whose role may start a pipeline's execution, and a job
+    whose role may do more than the canary does."""
     found = []
+    tags = stage_tags(templates)
     for path, template in sorted(templates.items()):
         projects = canaries(template)
         schedules = canary_schedules(template)
@@ -1439,6 +1567,10 @@ def canary_breaches(templates: Templates) -> list[tuple[str, str, str]]:
                 found.append((path, project, CANARY_UNSCHEDULED))
             if role is None or may(template, role, PIPELINE_STARTS, PIPELINE_ARN):
                 found.append((path, role or project, CANARY_STARTS_PIPELINES))
+            allowed = canary_resources(templates, template, project)
+            statements = statements_of(template, role) if role is not None else None
+            if statements is None or any(canary_does_more(statement, allowed, tags) for statement in statements):
+                found.append((path, role or project, CANARY_MORE))
         for schedule, targets in schedules:
             starts_the_canary = len(projects) == 1 and len(targets) == 1
             if starts_the_canary:
@@ -3121,6 +3253,15 @@ def test_the_canary_is_held_by_its_rules(templates: dict[str, dict[str, Any]]) -
     # Its role sends measurement events, and starts no pipeline's execution.
     assert may(template, role, PUTS_EVENTS, BUS_ARN)
     assert not may(template, role, PIPELINE_STARTS, PIPELINE_ARN)
+    # The rules know what each kind of resource is in the app, and the role is allowed every action
+    # of the list, the three grants of its session among them: the list admits no more than the
+    # job has.
+    assert all(canary_resources(templates, template, project).values())
+    statements = statements_of(template, role)
+    assert statements is not None
+    assert {action for statement in statements for action in as_list(statement["Action"])} == set(CANARY_MAY)
+    by_pool = [s for s in statements if set(as_list(s["Action"])) & {"dynamodb:GetItem", "dynamodb:PutItem"}]
+    assert [s["Condition"] for s in by_pool] == [OF_THE_COURSEWORK_POOL]
     assert canary_breaches(templates) == []
 
 
@@ -3167,13 +3308,43 @@ def a_schedule_statement(action: str, resource: Any) -> Callable[[Templates], No
     return change
 
 
+def the_job_s_statements(templates: Templates) -> list[dict[str, Any]]:
+    """The statements of the one policy of the canary's job role, to change in place."""
+    template, _, role, _, _ = the_canary(templates)
+    (policy,) = [p for _, _, p, _ in resources({"": template}, "AWS::IAM::Policy") if {"Ref": role} in p["Roles"]]
+    return policy["PolicyDocument"]["Statement"]
+
+
 def a_job_statement(action: str, resource: Any) -> Callable[[Templates], None]:
     """Allows the canary's job role one more action on one resource."""
 
     def change(templates: Templates) -> None:
-        template, _, role, _, _ = the_canary(templates)
-        (policy,) = [p for _, _, p, _ in resources({"": template}, "AWS::IAM::Policy") if {"Ref": role} in p["Roles"]]
-        policy["PolicyDocument"]["Statement"].append({"Effect": "Allow", "Action": action, "Resource": resource})
+        the_job_s_statements(templates).append({"Effect": "Allow", "Action": action, "Resource": resource})
+
+    return change
+
+
+def on_what_it_names(
+    like: str, action: str, condition: dict[str, Any] | None = None, resource: Any = None
+) -> Callable[[Templates], None]:
+    """Allows the canary's job role one more action, under `condition` when one is given, on what
+    its own statement that allows `like` names, or on `resource` when one is given."""
+
+    def change(templates: Templates) -> None:
+        statements = the_job_s_statements(templates)
+        (own,) = [statement for statement in statements if like in as_list(statement["Action"])]
+        statement = {"Effect": "Allow", "Action": action, "Resource": resource or own["Resource"]}
+        statements.append(statement | ({"Condition": condition} if condition is not None else {}))
+
+    return change
+
+
+def no_condition_on(action: str) -> Callable[[Templates], None]:
+    """Takes the condition off the statement of the canary's job role that allows `action`."""
+
+    def change(templates: Templates) -> None:
+        (own,) = [statement for statement in the_job_s_statements(templates) if action in as_list(statement["Action"])]
+        del own["Condition"]
 
     return change
 
@@ -3206,11 +3377,89 @@ EVERY_PIPELINE = {"Fn::Sub": here("codepipeline", "*")}
         ),
         pytest.param(
             a_job_statement("codepipeline:StartPipelineExecution", EVERY_PIPELINE),
-            {CANARY_STARTS_PIPELINES},
+            {CANARY_STARTS_PIPELINES, CANARY_MORE},
             id="a job's role that starts a pipeline",
         ),
         pytest.param(
-            a_job_statement("codepipeline:*", "*"), {CANARY_STARTS_PIPELINES}, id="every action of CodePipeline"
+            a_job_statement("codepipeline:*", "*"),
+            {CANARY_STARTS_PIPELINES, CANARY_MORE},
+            id="every action of CodePipeline",
+        ),
+        # The session's grants: the coursework pool's items of the pool-state table, and no other's.
+        pytest.param(
+            on_what_it_names("dynamodb:PutItem", "dynamodb:PutItem", of_pool(MOCK_POOL)),
+            {CANARY_MORE},
+            id="writing another pool's items",
+        ),
+        pytest.param(
+            on_what_it_names("dynamodb:PutItem", "dynamodb:PutItem", of_pool(COURSEWORK_POOL, MOCK_POOL)),
+            {CANARY_MORE},
+            id="writing the coursework pool's items and another's",
+        ),
+        pytest.param(
+            on_what_it_names("dynamodb:PutItem", "dynamodb:PutItem"),
+            {CANARY_MORE},
+            id="a write that names no partition key",
+        ),
+        pytest.param(no_condition_on("dynamodb:PutItem"), {CANARY_MORE}, id="the session's grant with no condition"),
+        pytest.param(
+            on_what_it_names(
+                "dynamodb:PutItem", "dynamodb:PutItem", of_pool(COURSEWORK_POOL, operator="ForAnyValue:StringEquals")
+            ),
+            {CANARY_MORE},
+            id="a write where any key, not every key, is the coursework pool's",
+        ),
+        pytest.param(
+            on_what_it_names("dynamodb:PutItem", "dynamodb:GetItem", of_pool(MOCK_POOL)),
+            {CANARY_MORE},
+            id="reading another pool's items",
+        ),
+        pytest.param(
+            on_what_it_names("dynamodb:PutItem", "dynamodb:DeleteItem", of_pool(COURSEWORK_POOL)),
+            {CANARY_MORE},
+            id="deleting the coursework pool's items",
+        ),
+        pytest.param(
+            on_what_it_names(
+                "dynamodb:PutItem",
+                "dynamodb:PutItem",
+                of_pool(COURSEWORK_POOL),
+                {"Fn::Sub": here("dynamodb", "table/*")},
+            ),
+            {CANARY_MORE},
+            id="writing the coursework pool's items of every table",
+        ),
+        pytest.param(
+            on_what_it_names("dynamodb:Query", "dynamodb:Query", of_pool(MOCK_POOL)),
+            {CANARY_MORE},
+            id="another pool's heartbeat rows",
+        ),
+        pytest.param(
+            a_job_statement("cloudformation:DescribeStackResource", {"Fn::Sub": here("cloudformation", "stack/*")}),
+            {CANARY_MORE},
+            id="describing the resources of every stack",
+        ),
+        pytest.param(
+            on_what_it_names("cloudformation:DescribeStackResource", "cloudformation:DescribeStacks"),
+            {CANARY_MORE},
+            id="another action on the pools stack",
+        ),
+        # The grants the role had: each is held too, the workspace's tag among them.
+        pytest.param(no_condition_on("aps:QueryMetrics"), {CANARY_MORE}, id="every workspace"),
+        pytest.param(
+            on_what_it_names("aps:QueryMetrics", "aps:QueryMetrics", tagged("another-stage")),
+            {CANARY_MORE},
+            id="another stage's workspace",
+        ),
+        pytest.param(
+            a_job_statement(
+                "secretsmanager:GetSecretValue", {"Fn::Sub": here("secretsmanager", f"secret:{SPIKE_SECRET}-??????")}
+            ),
+            {CANARY_MORE},
+            id="another secret",
+        ),
+        pytest.param(
+            a_job_statement("autoscaling:SetDesiredCapacity", "*"), {CANARY_MORE}, id="an action of Auto Scaling"
         ),
     ],
 )
@@ -3225,4 +3474,4 @@ def test_each_rule_on_the_canary_refuses_its_breach(
 def test_a_canary_role_with_a_managed_policy_may_start_a_pipeline(templates: dict[str, dict[str, Any]]) -> None:
     changed = json.loads(json.dumps(templates))
     a_managed_job_policy(changed)
-    assert CANARY_STARTS_PIPELINES in refused(changed)
+    assert {CANARY_STARTS_PIPELINES, CANARY_MORE} <= refused(changed)

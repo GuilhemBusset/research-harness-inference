@@ -121,7 +121,7 @@ def _student() -> StudentKey:
 
 def _reserve(ledger: Ledger, request: str) -> Reservation:
     return ledger.reserve(
-        _student(), request, hold_seconds=420, longest_request_seconds=1800, pool="mock"
+        _student(), request, longest_request_seconds=1800, pool="mock"
     )
 
 

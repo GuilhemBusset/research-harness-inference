@@ -12,6 +12,7 @@ import contextlib
 import datetime
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -22,9 +23,10 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey, utc_day
 from rhi_gateway import proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -53,6 +55,13 @@ MOCK = {
     "largest_output": 8000,
 }
 POOLS = parse_pools({"coursework": MOCK, "upgrade": MOCK})
+
+
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
 
 
 def sse(*events: tuple[str | None, dict[str, Any] | str]) -> bytes:
@@ -153,8 +162,8 @@ def gateway(upstream: Upstream, store: InMemoryKeyStore | None = None) -> tuple[
         ledger=ledger,
         filters=filters,
         proxy=proxy.Proxy(client, UPSTREAM, SECRETS),
-        # Every pool is ready: these requests are forwarded at once, with no hold.
-        holding=Holding(views=lambda: {pool.name: PoolView(ready=True) for pool in POOLS}, wake=lambda pool: None),
+        # Every pool is ready: these requests are forwarded.
+        pools=Pools(views=lambda: {pool.name: in_session(pool.name) for pool in POOLS}),
     )
     return build_app(forwarding_handlers(forwarding)), key, ledger
 
@@ -224,7 +233,7 @@ def test_a_key_that_fails_its_second_read_keeps_no_reservation(monkeypatch: pyte
     # A request of the day already settled: what it wrote is no request's to take back.
     student = store.lookup(key_hash(key))
     assert student is not None
-    settled = ledger.reserve(student, "settled", hold_seconds=1, longest_request_seconds=1, pool="coursework")
+    settled = ledger.reserve(student, "settled", longest_request_seconds=1, pool="coursework")
     ledger.settle(settled, cookie="kept-cookie")
 
     def unreadable(_: str) -> None:

@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import json
 import secrets
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,9 +26,10 @@ from starlette.applications import Starlette
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import metrics, proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -61,6 +63,13 @@ POOLS = parse_pools(
 TURNS = {entry.wire_format: entry for entry in (routes.MESSAGES, routes.RESPONSES, routes.CHAT_COMPLETIONS)}
 
 MESSAGES, RESPONSES, CHAT = WireFormat.MESSAGES, WireFormat.RESPONSES, WireFormat.CHAT_COMPLETIONS
+
+
+def in_session(pool: str, *, ready: bool = True) -> PoolView:
+    """The pool's view, in a session that is active now on the clock the gateway reads, the machine's."""
+    now = int(time.time())
+    booked = Session(pool, instances=1, starts_at=now - 60, ends_at=now + 3600, set_by="owner", set_at=now - 60)
+    return PoolView(ready=ready, session=booked)
 
 
 def sse(name: str | None, data: dict[str, Any] | str) -> bytes:
@@ -143,7 +152,6 @@ class Gateway:
     metrics: metrics.Metrics
     keys: dict[str, str]
     now: float = 0.0  # The clock the waits are read on: 0 when a request arrives, then moved by the engine's stream.
-    ready: bool = True  # Whether the pool is: a request for one that is not is held.
     sends: list[tuple[float, bytes]] = field(default_factory=list)  # The engine's stream, and when each part is sent.
 
 
@@ -184,11 +192,6 @@ def gateway(*students: tuple[str, int]) -> Gateway:
 
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=parts())
 
-    async def sleep(seconds: float) -> None:
-        # The pool turns ready during the first wait of a hold; a later wait is given up when the engine answers.
-        turned, made.ready = made.ready, True
-        await asyncio.sleep(seconds if turned else 0)
-
     forwarding = Forwarding(
         authenticator=Authenticator(InMemoryKeyStore(*items), wall_clock=lambda: float(NOW)),
         ledger=ledger,
@@ -203,7 +206,7 @@ def gateway(*students: tuple[str, int]) -> Gateway:
             "http://pools.example.com:8080",
             {POOL: "secret"},
         ),
-        holding=Holding(views=lambda: {POOL: PoolView(ready=made.ready)}, wake=lambda pool: None, sleep=sleep),
+        pools=Pools(views=lambda: {POOL: in_session(POOL)}),
     )
     made.app = build_app(forwarding_handlers(forwarding), metrics=made.metrics)
     # The series are the application's own, on the metrics' registry; only their clock is the test's.
@@ -216,7 +219,6 @@ def turn(
     wire_format: WireFormat,
     *sends: tuple[float, str],
     said: list[dict[str, Any]] | None = None,
-    held: bool = False,
     stream: bool = True,
     alias: str | None = None,
 ) -> None:
@@ -224,7 +226,7 @@ def turn(
     events = EVENTS[wire_format]
     last = max((at for at, _ in sends), default=0.0)
     made.sends = [(0.0, events["opening"]), *((at, events[name]) for at, name in sends), (last + 1, events["closing"])]
-    made.now, made.ready = 0.0, not held
+    made.now = 0.0
     body: dict[str, Any] = {"model": POOL, "stream": stream}
     body["input" if wire_format is RESPONSES else "messages"] = [HELLO] if said is None else said
     if wire_format is MESSAGES:
@@ -252,7 +254,7 @@ def served(made: Gateway, name: str) -> list[Sample]:
 def waits(made: Gateway, name: str) -> dict[tuple[str, str, str], list[float]]:
     """What one histogram holds: the requests and the sum of their seconds, for each series it serves.
 
-    A series is named by its wire format, `warm` or `held`, and `first` or `later`. The sum is
+    A series is named by its wire format, `warm` (no request is held), and `first` or `later`. The sum is
     rounded: each wait is observed one step of the float above itself.
     """
     found: dict[tuple[str, str, str], list[float]] = {}
@@ -267,13 +269,13 @@ def waits(made: Gateway, name: str) -> dict[tuple[str, str, str], list[float]]:
     return found
 
 
-def test_held_stream_waits_for_its_first_token_then_its_first_answer() -> None:
+def test_a_stream_waits_for_its_first_token_then_its_first_answer() -> None:
     made = gateway()
-    turn(made, MESSAGES, (12, "reasoning"), (20, "text"), (25, "text"), held=True)
+    turn(made, MESSAGES, (12, "reasoning"), (20, "text"), (25, "text"))
 
-    # One request in each histogram, under `held` and under nothing else: 12 seconds, and 20.
-    assert waits(made, FIRST_TOKEN) == {("messages", "held", "first"): [1, 12]}
-    assert waits(made, FIRST_ANSWER) == {("messages", "held", "first"): [1, 20]}
+    # One request in each histogram, under `warm` and under nothing else: 12 seconds, and 20.
+    assert waits(made, FIRST_TOKEN) == {("messages", "warm", "first"): [1, 12]}
+    assert waits(made, FIRST_ANSWER) == {("messages", "warm", "first"): [1, 20]}
 
 
 @pytest.mark.parametrize(
@@ -342,7 +344,7 @@ def test_five_seconds_is_a_boundary_and_no_label_is_a_student() -> None:
     for alias, _ in students:
         for wire_format in WireFormat:
             turn(made, wire_format, (4, "reasoning"), (6, "text"), alias=alias)
-            turn(made, wire_format, (4, "reasoning"), (6, "text"), alias=alias, held=True, said=ANSWERED[wire_format])
+            turn(made, wire_format, (4, "reasoning"), (6, "text"), alias=alias, said=ANSWERED[wire_format])
 
     names = [str(name) for alias, github_id in students for name in (alias, github_id, made.keys[alias])]
     for histogram in (FIRST_TOKEN, FIRST_ANSWER):
@@ -356,8 +358,9 @@ def test_five_seconds_is_a_boundary_and_no_label_is_a_student() -> None:
         }
         for sample in samples:
             assert not any(name in " ".join([sample.name, *sample.labels.values()]) for name in names)
-        # The objective's 5 seconds is read exactly. Each warm stream sent its first token at 4 seconds
-        # and its first answer at 6: the two students' are within the boundary in one histogram only.
+        # The objective's 5 seconds is read exactly. Each stream sent its first token at 4 seconds and
+        # its first answer at 6: the two students' are within the boundary in one histogram only, in
+        # the series of each format's first turns and in that of its later ones.
         at_five = [
             sample.value
             for sample in samples
@@ -365,4 +368,4 @@ def test_five_seconds_is_a_boundary_and_no_label_is_a_student() -> None:
             and sample.labels["le"] == "5.0"
             and sample.labels["start"] == "warm"
         ]
-        assert at_five == [2 if histogram == FIRST_TOKEN else 0] * len(WireFormat)
+        assert at_five == [2 if histogram == FIRST_TOKEN else 0] * (2 * len(WireFormat))

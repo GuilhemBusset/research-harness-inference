@@ -8,7 +8,7 @@ port 8080. A deployment starts new tasks before it stops old ones.
 
 **How it is reached.** One rule of the public load balancer's HTTPS listener, at priority
 `PRIORITY`, forwards the paths of the gateway's route table (`PATH_PATTERNS`: everything under
-`/v1/`, and `/status`, `/wake` and `/api/hello`) to the service's target group, on port 8080. The
+`/v1/`, and `/status` and `/api/hello`) to the service's target group, on port 8080. The
 issuer's rule is at 20 and Grafana's at 30; the load balancer answers every other path with its
 fixed 404, and the gateway's own table is still the control. The listener exists only while the
 configuration's `https_listener` is true (`rhi.network.edge`), and ECS refuses a service whose
@@ -45,7 +45,9 @@ their hashes. The pipeline's asset step builds it for linux/arm64.
 - `RHI_SCALER_FUNCTION`: the scaler function's name;
 - `RHI_COURSE_END`: the configuration's course end date, YYYY-MM-DD, by which every usage row
   the gateway writes expires (section 6.6);
-- the six numeric variables, each from its configuration key (`NUMERIC`).
+- the seven numeric variables, each from its configuration key (`NUMERIC`): the last,
+  `RHI_SESSION_MAX_HOURS`, is the longest a session may last, under which the gateway reads every
+  pool's session (section 5.6);
 - the three floors of the objectives, each from its configuration key (`FLOORS`), which the
   gateway's histograms take among their boundaries.
 
@@ -170,6 +172,7 @@ NUMERIC = {
     "RHI_RETRY_AFTER_WARMING": "retry_after_warming_seconds",
     "RHI_RETRY_AFTER_CAPACITY_UNAVAILABLE": "retry_after_capacity_unavailable_seconds",
     "RHI_RETRY_AFTER_CONCURRENCY_LIMIT": "retry_after_concurrency_limit_seconds",
+    "RHI_SESSION_MAX_HOURS": "session_max_hours",
 }
 # Each floor of the objectives, and the configuration key it is written from: the gateway takes
 # it among its histograms' boundaries (`rhi_gateway.settings`).
@@ -185,7 +188,7 @@ GATEWAY_CONTAINER = "Gateway"
 PRIORITY = 10
 # The paths of the gateway's route table (`rhi_gateway.routes`): the forwarded and local routes
 # under /v1/, and the three others.
-PATH_PATTERNS = ["/v1/*", "/status", "/wake", "/api/hello"]
+PATH_PATTERNS = ["/v1/*", "/status", "/api/hello"]
 # How long a deregistering task keeps its requests: the longest request, 30 minutes.
 DEREGISTRATION_SECONDS = 1800
 # What the health check asks, with no key, and the status the gateway answers it with.

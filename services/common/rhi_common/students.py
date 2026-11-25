@@ -37,9 +37,9 @@ On a key it is the course end, and the key is refused after it whatever the tabl
 **The owner's own entries** are on the roster under GitHub IDs no GitHub account has, which GitHub
 numbers upward from 1 and is far below 10^18: the canary of the pipeline's verification
 (`CANARY_GITHUB_ID`, `rhi_admin.canary`) and the spikes' students, from `SPIKE_GITHUB_ID_BASE` on
-(`rhi_admin.spikes`). The gateway serves them whether or not a session is on (section 5.6), so that
-the verification, the weekly canary and the spikes run between sessions: `is_owner_entry` says
-whether a GitHub ID is one of them.
+(`rhi_admin.spikes`). The gateway serves them as it serves every key, on a pool whose session is
+active (section 5.6): the verification, the weekly canary and the spikes book a session, or run
+inside one. `is_owner_entry` says whether a GitHub ID is one of them.
 """
 
 from __future__ import annotations

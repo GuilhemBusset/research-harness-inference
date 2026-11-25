@@ -16,7 +16,7 @@ The stack declares two outputs, which the pipeline's verification takes as input
   verification reads there the last lifecycle stage each instance reached.
 
 **Parked** (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no internal load
-balancer, no group, warm pool or lifecycle hook, no release and no scaler or its schedule: nothing
+balancer, no group or lifecycle hook, no release and no scaler or its schedule: nothing
 runs. The tables, the model bucket, each pool's instance role with its log group, each pool's
 secret and the scaler's log group, whose name is fixed (`rhi.pools.scaler.log_group`), stay, and
 `ReleaseParameters` reads `NO_POOL`. The stack still deploys after the network stack and the

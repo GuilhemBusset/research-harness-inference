@@ -1,6 +1,6 @@
 """The closed route table and the application built from it (`rhi_gateway.routes`, `rhi_gateway.app`).
 
-The eight routes and the four upstream paths are written here from the system design (sections
+The seven routes and the four upstream paths are written here from the system design (sections
 4.1 and 6.2, step 1), and not read from the table. Requests are given to the application in the
 scope the pinned server, uvicorn, builds from a request line: the path as it was sent in
 `raw_path`, its decoded form in `path`. An HTTP client is not used, because it would normalize dot
@@ -29,13 +29,14 @@ FORWARDED = {
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/responses"),
 }
-LOCAL = {("GET", "/v1/models"), ("GET", "/status"), ("POST", "/wake"), ("HEAD", "/api/hello")}
+LOCAL = {("GET", "/v1/models"), ("GET", "/status"), ("HEAD", "/api/hello")}
 BASE = "http://engine.example.com:8000"
 UPSTREAM_URLS = {BASE + path for _, path in FORWARDED}
 METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
-# The routes the issue names: the engine answers the first six, some of them without its key.
-NAMED = ["/invocations", "/pause", "/tokenize", "/metrics", "/health", "/v1/completions", "/v1/messages%2F"]
+# The routes the issue names: the engine answers the first six, some of them without its key. The
+# wake is no route of the gateway: a request starts no machine (section 5.3).
+NAMED = ["/invocations", "/pause", "/tokenize", "/metrics", "/health", "/v1/completions", "/v1/messages%2F", "/wake"]
 # Other spellings of a path of the table, and paths that walk to or from one.
 SPELLINGS = [
     "/v1/messages/",
@@ -115,14 +116,14 @@ def assert_not_found(answer: tuple[int, bytes]) -> None:
 
 
 def test_the_table_is_the_designs() -> None:
-    assert len(routes.TABLE) == 8
+    assert len(routes.TABLE) == 7
     by_kind = {kind: {(r.method, r.path) for r in routes.TABLE if r.kind is kind} for kind in routes.Kind}
     assert by_kind == {routes.Kind.FORWARDED: FORWARDED, routes.Kind.LOCAL: LOCAL}
 
 
 def test_the_application_is_built_from_the_table() -> None:
     app, _ = recording_app()
-    assert len(app.routes) == 8
+    assert len(app.routes) == 7
     assert [route.entry for route in app.routes if isinstance(route, TableRoute)] == list(routes.TABLE)
 
     # Nothing but an entry of the table gets a slot.
@@ -141,7 +142,7 @@ def test_the_application_is_built_from_the_table() -> None:
 
 
 @pytest.mark.parametrize(("method", "path"), sorted(FORWARDED | LOCAL))
-def test_the_eight_entries_answer(method: str, path: str) -> None:
+def test_the_seven_entries_answer(method: str, path: str) -> None:
     app, called = recording_app()
     # With and without a query string: Claude Code sends `POST /v1/messages?beta=true`.
     for query in QUERIES:

@@ -21,9 +21,6 @@ the one Lambda sets in `AWS_REGION`. `session_max_hours` is the configuration's:
 session may last, in hours, a whole number from 1 up, which is the bound every pool's session is
 read under (`rhi_common.sessions`). Settings that hold none read as 12, the configuration's default.
 
-A pool's mode when the pool-state table holds no mode record follows its `wake`: `enabled` for an
-`on-demand` pool, `scheduled-only` for a `scheduled-only` one (section 11.3).
-
 A refusal is a `SettingsError` that names the field, never its value. A key this reader does not
 know is ignored: later issues add fields, each with a default, so that an older construct's
 settings still read.
@@ -37,7 +34,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rhi_common.pool_config import PoolConfigError, parse_pools
-from rhi_common.records import CONFIGURED_MODE
 from rhi_scaler.aws_io import PoolSettings, TableNames
 from rhi_scaler.model import SESSION_MAX_HOURS
 
@@ -99,7 +95,6 @@ def _pool(name: str, value: object) -> PoolSettings:
         config=config,
         group=_text(value, "group", where),
         target_group=_text(value, "target_group", where),
-        configured_mode=CONFIGURED_MODE[config.wake],
     )
 
 

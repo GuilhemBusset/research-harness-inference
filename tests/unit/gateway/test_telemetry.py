@@ -27,10 +27,11 @@ from starlette.types import Message
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import app as gateway_app
 from rhi_gateway import proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter, Forwarded
 from rhi_gateway.budget import InMemoryLedger
@@ -38,11 +39,9 @@ from rhi_gateway.errors import WireFormat
 from rhi_gateway.experience import FIRST_TOKEN, Experience
 from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
-from rhi_gateway.hold import HELD_HEADER
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
-from rhi_gateway.readiness import PoolView, Readiness
-from rhi_gateway.waker import Waker
+from rhi_gateway.readiness import PoolView
 
 NOW = 1_800_000_000
 # The course end the ledger's rows expire by.
@@ -103,32 +102,23 @@ BODIES: dict[routes.Route, dict[str, Any]] = {
     routes.COUNT_TOKENS: {"model": "coursework", "messages": [{"role": "user", "content": MARKER}]},
     routes.CHAT_COMPLETIONS: {"model": "coursework", "messages": [{"role": "user", "content": MARKER}]},
     routes.RESPONSES: {"model": "coursework", "input": MARKER},
-    routes.WAKE: {"model": "coursework", "note": MARKER},
 }
 
 
-class Aws:
-    """The AWS clients the readiness and the waker are given; none is reached by these tests' assertions."""
-
-    def describe_target_health(self, **_: Any) -> dict[str, Any]:
-        return {"TargetHealthDescriptions": []}
-
-    def get_item(self, **_: Any) -> dict[str, Any]:
-        return {}
-
-    def invoke(self, **_: Any) -> dict[str, Any]:
-        return {"StatusCode": 202}
+def booked(pool: str) -> Session:
+    """A session on the pool, active for 6 hours from the moment the gateway's clocks stand at."""
+    return Session(pool, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
 
 
 def gateway(
     engine: httpx.MockTransport | None = None,
-    holding: Holding | None = None,
+    pools: Pools | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> tuple[Starlette, str]:
     """The whole gateway, every route served; and the key of its one student.
 
     By default the engine answers whole and the coursework pool is ready; a test may give its own
-    engine, hold, and clock of a request's waits.
+    engine, views of the pools, and clock of a request's waits.
     """
     key = generate_key()
     item = StudentKey(
@@ -143,8 +133,11 @@ def gateway(
     )
     authenticator = Authenticator(InMemoryKeyStore(item), wall_clock=lambda: float(NOW))
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
-    # The coursework pool is ready; the evening pool, scheduled only, is not.
-    ready = lambda: {"coursework": PoolView(ready=True)}
+    # The coursework pool is ready; the evening pool, whose session is active too, has no healthy target.
+    ready = lambda: {
+        "coursework": PoolView(ready=True, session=booked("coursework")),
+        "evening": PoolView(session=booked("evening")),
+    }
     if engine is None:
         engine = httpx.MockTransport(lambda request: httpx.Response(200, json=json.loads(ENGINE_ANSWER)))
     forwarding = Forwarding(
@@ -157,17 +150,15 @@ def gateway(
             routes.RESPONSES: BodyFilter(responses.RESPONSES, POOLS),
         },
         proxy=proxy.Proxy(proxy.upstream_client(engine), "http://pools.example.com:8080", {"coursework": "secret"}),
-        holding=Holding(views=ready, wake=lambda pool: None) if holding is None else holding,
+        pools=Pools(views=ready, clock=lambda: float(NOW)) if pools is None else pools,
         clock=clock,
     )
-    readiness = Readiness({"coursework": "tg-coursework"}, elbv2=Aws(), table=Aws(), clock=lambda: float(NOW))
     local = LocalRoutes(
         authenticator,
         POOLS,
         ready,
         default_pool=POOLS[0],
         clock=lambda: float(NOW),
-        waker=Waker(readiness, lambda_client=Aws(), function_name="scaler", clock=lambda: float(NOW)),
     )
     return build_app(forwarding_handlers(forwarding), local=local), key
 
@@ -317,11 +308,9 @@ CUT = [(0.0, sse("ping", {"type": "ping"}))]
 
 @dataclass
 class Waits:
-    """The test's clocks: the gateway's (0 when a request is accepted, moved by the engine's stream) and the hold's."""
+    """The test's clock: the gateway's, 0 when a request is accepted and moved by the engine's stream."""
 
     now: float = 0.0
-    hold_clock: float = float(NOW)
-    ready: bool = True  # Whether the pool is: a request for one that is not is held until the hold's first wait.
     sends: list[tuple[float, bytes]] = field(default_factory=list)
 
 
@@ -336,36 +325,21 @@ def streaming(waits: Waits) -> tuple[Starlette, str]:
 
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=parts())
 
-    async def sleep(seconds: float) -> None:
-        # The hold's first wait passes on the hold's clock, and the pool is ready at its end.
-        if not waits.ready and seconds > 0:
-            waits.hold_clock += seconds
-            waits.ready = True
-        await asyncio.sleep(0)
-
-    holding = Holding(
-        views=lambda: {"coursework": PoolView(ready=waits.ready)},
-        wake=lambda pool: None,
-        clock=lambda: waits.hold_clock,
-        sleep=sleep,
-    )
-    return gateway(httpx.MockTransport(engine), holding, clock=lambda: waits.now)
+    return gateway(httpx.MockTransport(engine), clock=lambda: waits.now)
 
 
-def streamed(waits: Waits, *, ready: bool, sends: list[tuple[float, bytes]]) -> str:
-    """One streamed Messages request, held when the pool is not `ready`, its body and headers carrying the marker; its key."""
+def streamed(waits: Waits, *, sends: list[tuple[float, bytes]]) -> str:
+    """One streamed Messages request, its body and headers carrying the marker; its key."""
     app, key = streaming(waits)
-    waits.ready, waits.sends = ready, sends
+    waits.sends = sends
     body = {**BODIES[routes.MESSAGES], "stream": True}
-    status, headers, _ = call(app, "POST", "/v1/messages", key=key, body=body, marker=True)
+    status, _, _ = call(app, "POST", "/v1/messages", key=key, body=body, marker=True)
     assert status == 200
-    assert any(name == HELD_HEADER.encode() for name, _ in headers) is not ready
     return key
 
 
-def test_a_held_stream_logs_its_route_tokens_and_waits(capsys: pytest.CaptureFixture[str]) -> None:
-    waits = Waits()
-    key = streamed(waits, ready=False, sends=STREAM)
+def test_a_stream_logs_its_route_tokens_and_waits(capsys: pytest.CaptureFixture[str]) -> None:
+    key = streamed(Waits(), sends=STREAM)
     logged = capsys.readouterr().out
     [record] = [json.loads(line) for line in logged.splitlines()]
     assert set(record) == FIELDS
@@ -373,17 +347,11 @@ def test_a_held_stream_logs_its_route_tokens_and_waits(capsys: pytest.CaptureFix
     # The tokens as the Messages parser gives them: the whole input, its cached part apart, and the output.
     assert (record["input_tokens"], record["cached_input_tokens"], record["output_tokens"]) == (1000, 900, 40)
     assert record["time_to_first_token_ms"] == 2500
-    assert record["held_ms"] == round((waits.hold_clock - NOW) * 1000) > 0
+    # No request is held.
+    assert record["held_ms"] == 0
     # Nothing of the request: not the marker of its body and headers, not its key, its hash or the GitHub ID.
     for secret in (MARKER, key, key_hash(key), str(GITHUB_ID)):
         assert secret not in logged
-
-
-def test_a_warm_stream_was_not_held(capsys: pytest.CaptureFixture[str]) -> None:
-    streamed(Waits(), ready=True, sends=STREAM)
-    [record] = records(capsys)
-    assert record["held_ms"] == 0
-    assert record["time_to_first_token_ms"] == 2500
 
 
 def test_the_log_and_the_histogram_read_the_same_wait(
@@ -410,45 +378,8 @@ def test_the_log_and_the_histogram_read_the_same_wait(
     assert record["time_to_first_token_ms"] == round(seconds * 1000) == 2500
 
 
-def test_a_held_stream_whose_client_leaves_before_its_hold_ran_logs_the_time_held(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    waits = Waits(ready=False, sends=STREAM)
-    app, key = streaming(waits)
-    body = json.dumps({**BODIES[routes.MESSAGES], "stream": True}).encode()
-    request: list[Message] = [{"type": "http.request", "body": body, "more_body": False}]
-
-    async def scenario() -> None:
-        started, left = asyncio.Event(), asyncio.Event()
-
-        async def receive() -> Message:
-            if request:
-                return request.pop()
-            await left.wait()
-            return {"type": "http.disconnect"}
-
-        async def send(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                # The held answer's headers are never written: the client leaves 3 seconds into the hold.
-                assert (HELD_HEADER.encode(), b"true") in message["headers"]
-                started.set()
-                await asyncio.get_running_loop().create_future()
-
-        headers = [(b"content-type", b"application/json"), (b"x-api-key", key.encode())]
-        served = asyncio.ensure_future(app(_scope("POST", "/v1/messages", headers), receive, send))
-        await asyncio.wait_for(started.wait(), timeout=5)
-        waits.hold_clock += 3.0
-        left.set()
-        await asyncio.wait_for(served, timeout=5)
-
-    asyncio.run(scenario())
-    [record] = records(capsys)
-    assert record["held_ms"] == 3000
-    assert (record["input_tokens"], record["time_to_first_token_ms"]) == (0, None)
-
-
 def test_a_stream_cut_before_any_usage_logs_no_tokens_and_no_first_token(capsys: pytest.CaptureFixture[str]) -> None:
-    streamed(Waits(), ready=True, sends=CUT)
+    streamed(Waits(), sends=CUT)
     [record] = records(capsys)
     assert record["route"] == "/v1/messages"
     assert (record["input_tokens"], record["cached_input_tokens"], record["output_tokens"]) == (0, 0, 0)
@@ -495,13 +426,13 @@ def test_an_answer_of_500_or_above_that_names_no_cause_is_a_fault(
     assert (record["status"], record["cause"]) == (500, "none")
 
 
-def test_the_cause_a_wake_answers_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_cause_a_pool_that_cannot_serve_is_answered_with_is_logged(capsys: pytest.CaptureFixture[str]) -> None:
     app, key = gateway()
-    status, _, body = call(app, "POST", "/wake", key=key, body={"model": "evening"})
-    assert status == 200
-    assert json.loads(body)["cause"] == "pool_scheduled_only"
+    status, _, body = call(app, "POST", "/v1/messages", key=key, body={**BODIES[routes.MESSAGES], "model": "evening"})
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "capacity_unavailable"
     [record] = records(capsys)
-    assert (record["pool"], record["status"], record["cause"]) == ("evening", 200, "pool_scheduled_only")
+    assert (record["pool"], record["status"], record["cause"]) == ("evening", 503, "capacity_unavailable")
 
 
 def _keys(value: object) -> set[str]:

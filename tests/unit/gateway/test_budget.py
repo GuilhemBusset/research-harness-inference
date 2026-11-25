@@ -16,7 +16,6 @@ import pytest
 
 from rhi_common import retention
 from rhi_common.causes import Cause
-from rhi_common.pool_config import DEFAULT_HOLD_SECONDS
 from rhi_common.students import Lease, StudentKey, UsageDay
 from rhi_gateway.budget import InMemoryLedger, Reservation, lease_seconds
 from rhi_gateway.errors import GatewayError
@@ -55,7 +54,6 @@ def reserve(ledger: InMemoryLedger, who: StudentKey, request: str, *, pool: str 
     return ledger.reserve(
         who,
         request,
-        hold_seconds=DEFAULT_HOLD_SECONDS,
         longest_request_seconds=LONGEST_REQUEST_SECONDS,
         pool=pool,
     )
@@ -92,7 +90,7 @@ def test_a_reservation_takes_a_slot_and_writes_a_lease_of_its_expiry() -> None:
 
     reservation = reserve(ledger, student(), "request-1")
 
-    lease = Lease(expires=NOON + 2280)
+    lease = Lease(expires=NOON + 1860)
     assert reservation == Reservation(github_id=7, day="2026-11-15", request_id="request-1", lease=lease)
     record = written(ledger)
     assert (record.alias, record.leases) == ("student-07", {"request-1": lease})
@@ -208,7 +206,7 @@ def test_a_cookie_is_kept_per_pool_and_only_a_settlement_stores_one() -> None:
     # The reservation that removes an expired lease leaves the cookies as they are, and so does
     # the settlement that then finds its lease gone.
     fifth = reserve(ledger, who, "request-5", pool="coursework")
-    clock.now = NOON + 2280
+    clock.now = NOON + 1860
     reserve(ledger, who, "request-6", pool="coursework")
     assert ledger.settle(fifth, cookie="too-late") is False
     assert cookies() == {"coursework": "coursework-cookie", "upgrade": "upgrade-cookie"}
@@ -261,25 +259,25 @@ def test_a_rebalance_number_is_kept_per_pool_and_only_a_settlement_stores_one() 
     # The reservation that removes an expired lease stores nothing, and neither does the
     # settlement that then finds its lease gone.
     late = reserve(ledger, who, "request-7", pool="coursework")
-    clock.now = NOON + 2280
+    clock.now = NOON + 1860
     assert reserve(ledger, who, "request-8", pool="coursework").rebalance_applied == 10
     assert settle(ledger, late, rebalance_number=11, cookie_dropped=True) is False
     record = written(ledger)
     assert (record.affinity_cookies, record.rebalance_applied["coursework"]) == ({"coursework": "moved"}, 10)
 
 
-def test_a_lease_expires_after_2280_seconds() -> None:
+def test_a_lease_expires_after_1860_seconds() -> None:
     clock = Clock()
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock)
     who = student(limit=1)
     first = reserve(ledger, who, "request-1")
-    assert first.lease.expires - NOON == lease_seconds(DEFAULT_HOLD_SECONDS, LONGEST_REQUEST_SECONDS) == 2280
+    assert first.lease.expires - NOON == lease_seconds(LONGEST_REQUEST_SECONDS) == 1860
 
-    clock.now = NOON + 2279
+    clock.now = NOON + 1859
     assert refusal(ledger, who, "request-2") is Cause.CONCURRENCY_LIMIT
 
     # Expired, the lease holds no slot: the reservation that needs it removes it in its own write.
-    clock.now = NOON + 2281
+    clock.now = NOON + 1861
     reserve(ledger, who, "request-2")
     record = written(ledger)
     assert set(record.leases) == {"request-2"}
@@ -294,7 +292,7 @@ def test_a_settlement_after_the_expiry_removes_the_lease() -> None:
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=clock)
     reservation = reserve(ledger, student(), "request-1")
 
-    clock.now = NOON + 2280
+    clock.now = NOON + 1860
     assert settle(ledger, reservation) is True
     record = written(ledger)
     assert record.leases == {}

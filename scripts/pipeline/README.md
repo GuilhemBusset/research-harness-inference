@@ -45,7 +45,10 @@ deployment, with the folders of pytest's import path in `PYTHONPATH` for the boo
   through `booking.py`, for twice the configuration's `check_wait_minutes`, waits until
   `GET /status` reads the pool ready or `check_wait_minutes` have passed, and stops the session it
   booked whatever the tests' result; a pool that already has a session is neither booked nor
-  stopped. When the wait for a pool of the decision's file ends with the pool not ready and no
+  stopped. Before it books the mock pool, it runs the one test of a pool nobody has booked,
+  `no-session`, alone, and leaves it out of every other run. On a mock pool that already has a
+  session it cannot make that test: the other tests run, and it exits 1, because the verification
+  is not complete; retry the stage once the mock pool is free. When the wait for a pool of the decision's file ends with the pool not ready and no
   instance's heartbeat row written since the booking, which it looks for through the wait and at
   its end, no instance was launched: it runs no test on that pool, stops its session, leaves the
   one line `no-capacity` in the file `RHI_VERIFY_GPU_REASON_FILE` names and exits with the result
@@ -64,17 +67,25 @@ The script of the weekly GPU canary (`src/rhi/pipeline/canary.py`), a job its sc
 Sundays at 04:00 UTC, with the repository's package roots in `PYTHONPATH`:
 
 - `canary_result.py` reads the canary's key as `verify.py` does, and the stage's workspace and
-  heartbeats table from the settings of the coursework pool's release parameter, and runs the
-  smoke tests of `tests/smoke` once against the deployed endpoint, on the coursework pool, through
-  `verify.py`'s runner: every test the verification runs on that pool after a refresh,
-  `release-heartbeat` included, whose query of the heartbeats table the canary's role may make for
-  the coursework pool's rows alone. While they
-  run, it reads the pool's state from `GET /status` to time the wake, from the pool's last `cold`
-  to its first `ready`. It then sends the measurement `gpu-canary` (the verdict, `wake_seconds`,
-  `smoke_tests_passed`, `smoke_tests_failed`) on the measurement bus, on the commit the job ran
-  from, with the run's UTC date, YYYY-MM-DD, as its run label. It passes only when the run ended,
-  no test failed and the wake was measured; no test run, a run pytest did not finish, or no wake
-  is sent as not measured, and an event the bus refuses fails the job.
+  heartbeats table from the settings of the coursework pool's release parameter. When the
+  coursework pool has no session, it books one instance on it with `booking.py`, under the name
+  `pipeline/canary`, through `verify.py`'s routine: it waits until `GET /status` reads the pool
+  ready or `check_wait_minutes` have passed, runs the smoke tests of `tests/smoke` once against
+  the deployed endpoint, on the coursework pool, through `verify.py`'s runner, and stops the
+  session it booked, after a failure too. A pool that already has a session is neither booked nor
+  stopped: the tests run on the instances that are there. The tests are every test the
+  verification runs on that pool after a refresh, `release-heartbeat` included, whose query of the
+  heartbeats table the canary's role may make for the coursework pool's rows alone. It then sends
+  the measurement `gpu-canary` (the verdict, `wait_seconds`, `smoke_tests_passed`,
+  `smoke_tests_failed`, `no_capacity`) on the measurement bus, on the commit the job ran from,
+  with the run's UTC date, YYYY-MM-DD, as its run label. One of three results: pass when the
+  tests ran and passed; fail when a test failed, or an instance was launched and did not serve by
+  the end of the wait; and error, not measured, with `no_capacity` 1 and no test run, when no
+  instance was launched during the wait, read from the coursework pool's heartbeat rows as the
+  verification reads it. `wait_seconds` is the time from the booking to the pool's first `ready`,
+  and 0 on a pool that was ready when the job began. A run that could not measure for another
+  reason, no test run or a run pytest did not finish, is sent as not measured with `no_capacity`
+  0, and an event the bus refuses fails the job.
 
 The rule for model weights (system design, section 4.4), which the job that copies each pool's
 model into the model bucket follows:

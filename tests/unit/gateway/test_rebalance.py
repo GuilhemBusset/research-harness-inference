@@ -23,11 +23,11 @@ import httpx
 
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import DEFAULT_REBALANCE_SHARE, parse_pools
-from rhi_common.records import ScalerNote
+from rhi_common.records import ScalerNote, Session
 from rhi_common.students import StudentKey, UsageDay, utc_day
 from rhi_gateway import proxy, routes
 from rhi_gateway.affinity import COOKIE_NAME, Affinity, selects
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger, Reservation
@@ -70,10 +70,16 @@ def student(github_id: int, key: str | None = None) -> StudentKey:
 
 
 class Scaler:
-    """The pool-state table, and the scaler's note in it: `get_item`, the one call the reader makes."""
+    """The pool-state table, and the scaler's note in it: `get_item`, the one call the reader makes.
+
+    Every pool's session is in it, active for 6 hours from the moment the gateway's clocks stand at.
+    """
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
+        for pool in POOLS:
+            session = Session(pool, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+            self.items[pool, "session"] = dict(session.to_item())
 
     def raises(self, number: int, pool: str = "coursework") -> None:
         """Write the pool's note with this rebalance number."""
@@ -140,7 +146,6 @@ class Instance:
         reservation = self.ledger.reserve(
             who,
             uuid.uuid4().hex,
-            hold_seconds=POOLS[pool].hold_seconds,
             longest_request_seconds=1800,
             pool=pool,
         )
@@ -358,7 +363,7 @@ def test_the_gateway_judges_each_request_on_the_number_its_reader_holds() -> Non
             "http://pools.example.com:8080",
             {name: f"{name}-secret" for name in POOLS},
         ),
-        holding=Holding(views=readiness.views, wake=lambda pool: None),
+        pools=Pools(views=readiness.views, clock=lambda: float(NOW)),
     )
     app = build_app(forwarding_handlers(forwarding))
 

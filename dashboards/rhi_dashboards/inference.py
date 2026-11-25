@@ -50,9 +50,8 @@ the gateway cannot know which instance serves a student (section 5.5). No series
 alias.
 
 **The cost is the cost dashboard's** (`rhi_dashboards.cost`): Auto Scaling's count of the pool's
-running instances, warm-pool preparation included, summed over the window and times the pool's
-configured hourly price, over the output tokens the gateway settled for the pool in that same
-window, in millions. It is an estimate, and its title says so. The panel reads the dashboard's
+running instances, summed over the window and times the pool's configured hourly price, over the
+output tokens the gateway settled for the pool in that same window, in millions. It is an estimate, and its title says so. The panel reads the dashboard's
 range, a past session's fixed dates included, as the cost dashboard's companion does. The month's
 estimate, from the start of the month to now, in UTC, as AWS bills, is the cost dashboard's own,
 and the panel links to it: CloudWatch answers only inside a panel's range, and on fixed dates
@@ -61,7 +60,9 @@ panel of a dashboard with a time picker can hold the month. The dashboard is in 
 
 Every panel follows the rules of `rhi_dashboards.rules`: a rate is taken per series and then
 summed, a percentile comes with the count of requests behind it over the same window and labels,
-and an engine series is kept to the pool in service, the panel reading "asleep" without one. So
+and an engine series is kept to the pool while it serves, the panel reading the pool's state
+otherwise: "no session" while its session is not active, "waiting for capacity" while it is active
+and no instance is in service. So
 is every series of an instance: the capacity its lifecycle agent reports, its GPUs' energy. The
 gateway's series are never drawn by student, and are drawn as they are: the gateway runs whether
 or not the pool has an instance.
@@ -111,7 +112,7 @@ CACHE_CAPACITY = "rhi_lifecycle_engine_cache_capacity_tokens"
 # The labels of the gateway's two waits: warm or held, and first turn or later.
 WAIT_LABELS = ("start", "turn")
 # The label the collector gives every series of an instance: the instance's ID.
-INSTANCE = "instance"
+INSTANCE = rules.INSTANCE
 
 # The panels' titles, in the row's order.
 SPEED = "Output speed per stream: tokens a second"
@@ -206,8 +207,8 @@ METRICS: tuple[rules.Declared, ...] = (
     *cost.METRICS,
 )
 
-# The colour of the cached-share panel's "asleep": neither the flag's red nor its green.
-ASLEEP_COLOR = "grey"
+# The colour of the pool's state on the cached-share panel: neither the flag's red nor its green.
+STATE_COLOR = "grey"
 
 # A row is 24 columns wide: two panels to a line.
 HALF = 12
@@ -431,28 +432,31 @@ def cost_panel(pool: Pool) -> stat_builders.Panel:
 def _flag(panel: timeseries_builders.Panel, threshold: float) -> timeseries_builders.Panel:
     """Red below the threshold, green from it: the line, and the area under it, are drawn.
 
-    The "asleep" series is zero, below any threshold: it is drawn in grey, with no threshold of its
-    own, so a pool with no instance does not read as a cache that fails.
+    A series of the pool's state, "no session" or "waiting for capacity", is zero, below any
+    threshold: it is drawn in grey, with no threshold of its own, so a pool that does not serve
+    does not read as a cache that fails.
     """
     steps = [models.Threshold(value=None, color="red"), models.Threshold(value=threshold, color="green")]
-    return (
+    panel = (
         panel.thresholds(dashboard_builders.ThresholdsConfig().mode(models.ThresholdsMode.ABSOLUTE).steps(steps))
         .color_scheme(dashboard_builders.FieldColor().mode(models.FieldColorModeId.THRESHOLDS))
         .thresholds_style(
             common_builders.GraphThresholdsStyleConfig().mode(common.GraphThresholdsStyleMode.LINE_AND_AREA)
         )
-        .override_by_query(
-            rules.ASLEEP_REF,
+    )
+    for state in rules.STATES:
+        panel.override_by_query(
+            state.ref,
             [
-                models.DynamicConfigValue(id_val="color", value={"mode": "fixed", "fixedColor": ASLEEP_COLOR}),
+                models.DynamicConfigValue(id_val="color", value={"mode": "fixed", "fixedColor": STATE_COLOR}),
                 models.DynamicConfigValue(
                     id_val="thresholds",
-                    value={"mode": "absolute", "steps": [{"value": None, "color": ASLEEP_COLOR}]},
+                    value={"mode": "absolute", "steps": [{"value": None, "color": STATE_COLOR}]},
                 ),
                 models.DynamicConfigValue(id_val="custom.thresholdsStyle", value={"mode": "off"}),
             ],
         )
-    )
+    return panel
 
 
 def panels(pool: Pool, config: Config) -> list[timeseries_builders.Panel | stat_builders.Panel]:

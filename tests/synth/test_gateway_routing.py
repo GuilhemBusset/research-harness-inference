@@ -28,7 +28,7 @@ Template = dict[str, Any]
 
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLE = config.load({"RHI_CONFIG": "example"})
-PATTERNS = ["/v1/*", "/status", "/wake", "/api/hello"]
+PATTERNS = ["/v1/*", "/status", "/api/hello"]
 ELB = "AWS::ElasticLoadBalancingV2::"
 
 
@@ -157,6 +157,15 @@ def test_the_health_check_gets_v1_models_and_counts_401_as_healthy(stage: Stage)
     assert routes.match("GET", group["HealthCheckPath"].encode()) is routes.MODELS
 
 
+def patterns_of(rule: dict[str, Any]) -> list[str]:
+    """The path patterns of a listener rule's conditions."""
+    return [
+        value
+        for condition in rule.get("Conditions", [])
+        for value in condition.get("PathPatternConfig", {}).get("Values", [])
+    ]
+
+
 def test_one_rule_of_the_public_listener_at_priority_10_forwards_the_gateway_s_paths(stage: Stage) -> None:
     (group_id,) = of_type(stage.gateway, ELB + "TargetGroup")
     forward = [{"Type": "forward", "TargetGroupArn": {"Ref": group_id}}]
@@ -173,6 +182,9 @@ def test_one_rule_of_the_public_listener_at_priority_10_forwards_the_gateway_s_p
 
     for route in routes.TABLE:
         assert [pattern for pattern in PATTERNS if takes(pattern, route.path)], route
+    # The wake's path is no route of the gateway, and no rule of the load balancer forwards it.
+    forwarded = [value for _, _, other in stage.everywhere(ELB + "ListenerRule") for value in patterns_of(other)]
+    assert not [pattern for pattern in forwarded if takes(pattern, "/wake")]
 
     # The listener is the public load balancer's one listener, on 443, and each of its rules has
     # its own priority.

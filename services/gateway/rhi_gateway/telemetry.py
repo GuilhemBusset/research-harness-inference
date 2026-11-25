@@ -14,7 +14,7 @@ configuration sends that output to the gateway's log group. A record holds exact
 | `input_tokens`, `output_tokens` | what the request's settlement observed; 0 when nothing was forwarded |
 | `cached_input_tokens` | the part of `input_tokens` the engine reported read from its cache, as the usage parsers give it; 0 when it reported none |
 | `time_to_first_token_ms` | from the request accepted to its first token sent, in milliseconds, as the time-to-first-token histogram counts it (`rhi_gateway.experience`); `null` when no token was sent |
-| `held_ms` | how long the request was held while its pool started (`rhi_gateway.hold`), in milliseconds; 0 when it was not held |
+| `held_ms` | how long the request was held while its pool started, in milliseconds: 0 on every request, since the gateway holds none (system design, section 5.3) |
 | `latency_ms` | from the request's arrival to its end, in milliseconds |
 | `status` | the HTTP status sent; `null` if none was |
 | `cause` | the cause the gateway gave (`rhi_common.causes`), `none` for its own fault, else `null` |

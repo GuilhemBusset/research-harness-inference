@@ -14,11 +14,10 @@ from rhi import config as rhi_config
 from rhi_dashboards import build, check, cost
 
 REPO = Path(__file__).resolve().parents[3]
-# Today's count: both metrics of the group of that name exactly, added in CloudWatch.
+# Today's count: the group's total instances, of the group of that name exactly, and no other metric.
 SEARCH = re.compile(
     r"SUM\(SEARCH\('\{AWS/AutoScaling,AutoScalingGroupName\} "
-    r'AutoScalingGroupName="(?P<group>[^"]+)" '
-    r'\(MetricName="GroupTotalInstances" OR MetricName="WarmPoolPendingCapacity"\)\', \'Sum\', 3600\)\)'
+    r'AutoScalingGroupName="(?P<group>[^"]+)" MetricName="GroupTotalInstances"\', \'Sum\', 3600\)\)'
 )
 
 
@@ -82,7 +81,7 @@ def groups_read(panel: dict[str, Any]) -> set[str]:
 
 
 def read_exactly(panel: dict[str, Any], suffix: str = "") -> dict[str, str]:
-    """The group each count of the month is read from, by the count's name; each is read whole."""
+    """The group the month's count is read from, by the count's name; it is read whole."""
     reads = {one["metricName"]: one for one in counts(panel) if one["refId"].endswith(suffix)}
     for one in reads.values():
         assert (one["matchExact"], one["statistic"], one["period"], one["region"]) == (True, "Sum", "3600", "default")
@@ -128,7 +127,7 @@ def test_a_fixed_session_never_replaces_the_calendar_windows(example: rhi_config
     assert titles and not [title for title in titles if re.search(r"today|month", title)]
 
 
-def test_the_gpu_hours_read_both_counts_of_each_pools_group(example: rhi_config.Config) -> None:
+def test_the_gpu_hours_read_the_total_instances_of_each_pools_group_and_no_other_count(example: rhi_config.Config) -> None:
     for pool in example.pools:
         group = f"rhi-pool-{pool.name}"
         for panel in rows(example)[pool.name][:4]:
@@ -136,11 +135,12 @@ def test_the_gpu_hours_read_both_counts_of_each_pools_group(example: rhi_config.
             if "today" in panel["title"]:
                 (day,) = counts(panel)
                 assert searched(day["expression"])["group"] == group
+                assert re.findall(r'MetricName="([^"]+)"', day["expression"]) == ["GroupTotalInstances"] * 3
             else:
-                assert read_exactly(panel) == {"GroupTotalInstances": group, "WarmPoolPendingCapacity": group}
+                assert read_exactly(panel) == {"GroupTotalInstances": group}
         hours = [panel for panel in rows(example)[pool.name] if panel["title"].startswith("GPU-hours")]
         assert [panel["title"] for panel in hours] == ["GPU-hours today, estimate", "GPU-hours this month, estimate"]
-        assert [shown(panel) for panel in hours] == [{"H": "$S / 60"}, {"H": "($SN + $SW) / 60"}]
+        assert [shown(panel) for panel in hours] == [{"H": "$S / 60"}, {"H": "$S / 60"}]
 
 
 def test_pools_of_similar_names_read_only_their_own_groups(example: rhi_config.Config) -> None:
@@ -150,8 +150,8 @@ def test_pools_of_similar_names_read_only_their_own_groups(example: rhi_config.C
         assert all(groups_read(panel) == {f"rhi-pool-{pool.name}"} for panel in rows(similar)[pool.name])
     (bill,) = rows(similar)[cost.BILLING_ROW]
     assert [read_exactly(bill, suffix) for suffix in "01"] == [
-        dict.fromkeys(cost.INSTANCE_COUNTS, "rhi-pool-mock"),
-        dict.fromkeys(cost.INSTANCE_COUNTS, "rhi-pool-mo-ck"),
+        {cost.INSTANCE_COUNT: "rhi-pool-mock"},
+        {cost.INSTANCE_COUNT: "rhi-pool-mo-ck"},
     ]
 
 
@@ -162,12 +162,12 @@ def test_the_months_hours_never_rest_on_a_search(example: rhi_config.Config) -> 
     assert len(monthly) == 3 * len(example.pools) + 1 + len(example.pools)
     for panel in monthly:
         assert all("SEARCH" not in one.get("expression", "") for one in counts(panel))
-        assert {one["metricName"] for one in counts(panel)} == set(cost.INSTANCE_COUNTS)
+        assert {one["metricName"] for one in counts(panel)} == {"GroupTotalInstances"}
 
 
-def test_a_count_with_no_point_adds_nothing_to_the_other(example: rhi_config.Config) -> None:
-    # Grafana gives no number for a sum one of whose terms is no data: each count is reduced on its
-    # own, and a read whole gives a series, with no point for a group without a warm pool.
+def test_a_count_with_no_point_adds_nothing_to_another_pools(example: rhi_config.Config) -> None:
+    # Grafana gives no number for a sum one of whose terms is no data: each pool's count is reduced on
+    # its own, and a read whole gives a series, with no point for a group that published none.
     for panel in every_panel(example):
         reduced = {one["refId"]: one["expression"] for one in panel["targets"] if one.get("type") == "reduce"}
         for read in counts(panel):
@@ -216,7 +216,7 @@ def test_the_price_is_the_example_configurations(example: rhi_config.Config) -> 
                 (expression,) = shown(panel).values()
                 assert f" / 60 * {example_price(pool.name)!r}" in expression
     (bill,) = rows(example)[cost.BILLING_ROW]
-    assert shown(bill)["D"] == "(($SN0 + $SW0) / 60 * 3.36) + (($SN1 + $SW1) / 60 * 0.02)"
+    assert shown(bill)["D"] == "($S0 / 60 * 3.36) + ($S1 / 60 * 0.02)"
 
 
 def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_millions(
@@ -232,7 +232,7 @@ def test_the_cost_per_million_is_the_dollars_over_the_settled_output_tokens_in_m
         for panel in per_million:
             assert panel["datasource"] == {"type": "datasource", "uid": "-- Mixed --"}
             by_ref = {target["refId"]: target for target in panel["targets"]}
-            assert shown(panel) == {"E": f"($SN + $SW) / 60 * {example_price(pool.name)!r} / ($D / 1000000)"}
+            assert shown(panel) == {"E": f"$S / 60 * {example_price(pool.name)!r} / ($D / 1000000)"}
             assert (by_ref["D"]["expression"], by_ref["D"]["reducer"]) == ("$B", "last")
             assert (by_ref["B"]["expr"], by_ref["B"]["instant"]) == (cost.output_tokens(pool), True)
 

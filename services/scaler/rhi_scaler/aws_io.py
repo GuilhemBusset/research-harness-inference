@@ -9,18 +9,18 @@ What is read, for each pool:
 | What | From |
 | --- | --- |
 | Desired capacity, instances by lifecycle state and their scale-in protection, suspended processes | `DescribeAutoScalingGroups` |
-| The warm pool's instances | `DescribeWarmPool` |
 | Which instances serve | `DescribeTargetHealth` on the pool's target group |
 | Launches abandoned in a row, the last launch that found no capacity, the last launch that failed and its cause | `DescribeScalingActivities` |
-| Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
-| Mode (the configured mode when no record exists), the scaler's memory, and the pool's session (none when no record exists) | the pool-state table, by pool |
+| Engine load: the fresh heartbeats of the pool's instances | the heartbeat table, by pool, the rows whose source is an instance |
+| The scaler's memory, and the pool's session (none when no record exists) | the pool-state table, those two items by their keys |
 
-And once for the whole run, the session switch (`rhi_common.records.SessionSwitch`), from its item
-in the pool-state table. It only reports (`rhi_scaler.outside_sessions`, and the session gauge of
-`rhi_scaler.metrics`) and `decide` never sees it.
-A missing item reads as no record. A read that fails, or an item that is not a switch, is not taken
-for no record: the run keeps the error (`Run.session_error`), decides and applies from what it read
-of demand, and the handler fails it only after that.
+Nothing else is read of the two tables. The heartbeat rows that another source wrote are not asked
+for: the query's key condition takes the pool's rows whose source starts with
+`rhi_common.records.INSTANCE_SOURCE`. Of a pool's partition of the pool-state table the read names
+the memory record and the session record by their keys, in one `BatchGetItem`, so any other item
+the partition holds stays in the table. A key DynamoDB leaves unprocessed is asked for again, and a
+run that still lacks one after `RECORD_READS` requests fails (`RecordsNotRead`): a record that was
+not read is never taken for one that does not exist, which would read as a pool with no session.
 
 The supply, from the lifecycle states and target health:
 
@@ -29,14 +29,15 @@ The supply, from the lifecycle states and target health:
 | `InService`, its target `healthy` | in service |
 | `InService`, its target `draining` | draining |
 | `InService` otherwise (not registered yet, initial, unhealthy), and `Pending*` | starting |
-| `Terminating*`, `Detaching`, and a `Warmed:*` state in the group's own list (going back to the warm pool) | draining |
-| In the warm pool, any state but `Warmed:Terminating*` and `Warmed:Terminated` | warm |
+| `Terminating*`, `Detaching` | draining |
 
-`running` is every instance of the group's own list but one `Terminated` or `Detached`, and every
-instance of the warm pool that is `Warmed:Running` or `Warmed:Pending*` (being prepared).
+`running` is every instance of the group's list but one `Terminated` or `Detached`. The group keeps
+no stopped instance (section 4.5), so its list is every instance it has. `not_serving` is every
+instance `InService` whose target is not `healthy`, which the table lists as starting or draining:
+the group protects it from scale-in as it does one that serves, so a release can name it.
 
-Abandoned launches (section 5.4). An abandoned launch is a launch activity, into service or into the
-warm pool, that failed or was cancelled because its launch hook was abandoned. A launch that found
+Abandoned launches (section 5.4). An abandoned launch is a launch activity that failed or was
+cancelled because its launch hook was abandoned. A launch that found
 no capacity is not one, whatever else it says: it is only the time the note carries (section 5.3).
 The count reads the whole history the group returns and goes by the time each activity completed:
 Auto Scaling orders activities by the time they started, and launches that run side by side can
@@ -44,10 +45,13 @@ complete in the other order. Only an abandon that completed after the later of t
 reached service and `Memory.abandons_counted_from` counts, since the group's history still holds
 the abandons that set the mark the admin cleared. A launch that failed for any other reason neither
 counts nor ends the row. The time of the last launch that found no capacity is read from the whole
-history too, whatever came after it.
+history too, whatever came after it. The history Auto Scaling retains may still hold activities of
+the stopped instances a group kept before (section 4.5): an instance moved from them into service
+is a launch that reached service, and a launch that prepared one to be stopped reached none, so it
+ends no row.
 
-The last launch that failed (section 5.4) is the launch activity, into service or into the warm
-pool, that failed or was cancelled and completed last, by the time AWS gives and not by its whole
+The last launch that failed (section 5.4) is the launch activity that failed or was cancelled and
+completed last, by the time AWS gives and not by its whole
 second; of two that completed at the same instant, the one that started last. Its cause is one of
 three words (`rhi_common.records.LaunchFailure`): `insufficient-capacity` for a launch that found
 no capacity, `quota` for one the account's quota of running instances, which EC2 counts in vCPUs,
@@ -60,10 +64,10 @@ told the same way.
 `apply` makes, for each pool, these calls and only those that change something, in this order:
 
 1. protect from scale-in every instance `InService` that is unprotected and that the decision does
-   not name: whether an instance back from the warm pool keeps its protection is not settled, and
-   an unprotected one could be chosen by AWS in place of the one the scaler picked (section 4.3);
+   not name (one whose protection an earlier run lifted and that stayed): an unprotected one could
+   be chosen by AWS in place of the one the scaler picked (section 4.3);
 2. lift the protection of each instance the decision names that is protected;
-3. set the desired capacity, which is absolute and draws from the warm pool (evidence E10);
+3. set the desired capacity, which is absolute;
 4. suspend the `Launch` process, or resume `Launch` alone: zone rebalancing, `AZRebalance`, stays
    suspended for good, so no call here names it.
 
@@ -86,15 +90,15 @@ rule:
 | `launch_failure` | Absent while nothing waits. Otherwise `launches-suspended` when the decision suspends the pool's launches, or else the cause of the last launch that failed, if it failed since `waiting_since` |
 
 The time the wait began is kept from one run to the next in the pool's memory record, under the
-attribute `short_since`: the name `waiting_since` is taken there by the instances whose requests
-wait. `apply` stores it with the decision's memory, and removes it once nothing waits. It returns
+attribute `short_since`: an earlier version kept another thing under the name `waiting_since`
+there. `apply` stores it with the decision's memory, and removes it once nothing waits. It returns
 the notes it wrote, by pool, so that the metrics send the same numbers (`rhi_scaler.metrics`).
 """
 
 from __future__ import annotations
 
 import dataclasses
-import time
+import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -102,26 +106,19 @@ from decimal import Decimal
 from typing import Any
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
-from botocore.exceptions import BotoCoreError, ClientError
 
 from rhi_common.pool_config import Pool
 from rhi_common.records import (
-    GATEWAY_SOURCE,
     INSTANCE_SOURCE,
-    MODE_RECORD,
     SESSION_RECORD,
-    GatewayHeartbeat,
     InstanceHeartbeat,
     LaunchFailure,
-    Mode,
-    PoolState,
     RecordError,
     ScalerNote,
     Session,
-    SessionSwitch,
     is_fresh,
 )
-from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD, SESSION_SWITCH_KEY
+from rhi_common.tables import LAUNCH_SUSPENDED, MEMORY_RECORD
 from rhi_scaler.model import SESSION_MAX_HOURS, Decision, Inputs, Memory, PoolDecision, PoolInputs, Supply
 
 # The process a launch loop suspends, and the only one this module ever names.
@@ -146,6 +143,9 @@ QUOTA_SIGNS = (
 )
 # How many instances one SetInstanceProtection call may name.
 PROTECTION_BATCH = 50
+# How many requests a run makes for a pool's records before it fails: the first, and one more for
+# each time DynamoDB leaves a key unprocessed.
+RECORD_READS = 3
 
 _DESERIALIZER = TypeDeserializer()
 _SERIALIZER = TypeSerializer()
@@ -153,13 +153,12 @@ _SERIALIZER = TypeSerializer()
 
 @dataclass(frozen=True)
 class PoolSettings:
-    """One pool as the scaler's settings give it: its configuration, its group, its target group,
-    and the mode it is in when the pool-state table holds no mode record."""
+    """One pool as the scaler's settings give it: its configuration, its group and its target
+    group."""
 
     config: Pool
     group: str
     target_group: str
-    configured_mode: Mode
 
 
 @dataclass(frozen=True)
@@ -199,15 +198,10 @@ class GroupState:
 
 @dataclass(frozen=True)
 class Run:
-    """What one run read: the decision's inputs, each pool's group by pool name, and the session
-    switch, `None` when it has no record. `session_error` is why the switch could not be read, and
-    then `session` is `None` too. `session_read_at` is when its read returned, in milliseconds."""
+    """What one run read: the decision's inputs, and each pool's group by pool name."""
 
     inputs: Inputs
     groups: Mapping[str, GroupState]
-    session: SessionSwitch | None = None
-    session_error: Exception | None = None
-    session_read_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -234,26 +228,51 @@ def _plain(item: Mapping[str, Any]) -> dict[str, Any]:
     return {name: _DESERIALIZER.deserialize(value) for name, value in item.items()}
 
 
-def _query_pool(clients: Clients, table: str, pool: str) -> Iterator[dict[str, Any]]:
+class RecordsNotRead(Exception):
+    """DynamoDB left a pool's record unprocessed on every request for it: the run does not know
+    what the record holds, or whether there is one."""
+
+    def __init__(self, pool: str) -> None:
+        super().__init__(f"the records of the pool {pool!r} were not all read")
+
+
+def _pool_records(clients: Clients, table: str, pool: str, records: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """The items of the pool's partition of the pool-state table that the records named have, by
+    record, read by their keys: no other item of the partition is asked for."""
+    keys: list[dict[str, Any]] = [{"pool": {"S": pool}, "record": {"S": record}} for record in records]
+    found: dict[str, dict[str, Any]] = {}
+    for _ in range(RECORD_READS):
+        answer = clients.dynamodb.batch_get_item(RequestItems={table: {"Keys": keys, "ConsistentRead": True}})
+        for item in answer.get("Responses", {}).get(table, []):
+            plain = _plain(item)
+            found[plain["record"]] = plain
+        keys = answer.get("UnprocessedKeys", {}).get(table, {}).get("Keys", [])
+        if not keys:
+            return found
+    raise RecordsNotRead(pool)
+
+
+def _instance_rows(clients: Clients, table: str, pool: str) -> Iterator[dict[str, Any]]:
+    """The pool's rows of the heartbeat table that an instance wrote, and no other source's."""
     for item in _pages(
         clients.dynamodb,
         "query",
         "Items",
         TableName=table,
-        KeyConditionExpression="#pool = :pool",
-        ExpressionAttributeNames={"#pool": "pool"},
-        ExpressionAttributeValues={":pool": {"S": pool}},
+        KeyConditionExpression="#pool = :pool AND begins_with(#source, :instance)",
+        ExpressionAttributeNames={"#pool": "pool", "#source": "source"},
+        ExpressionAttributeValues={":pool": {"S": pool}, ":instance": {"S": INSTANCE_SOURCE}},
         ConsistentRead=True,
     ):
         yield _plain(item)
 
 
-def _supply(group: Mapping[str, Any], warm_pool: Iterable[Mapping[str, Any]], health: Mapping[str, str]) -> Supply:
+def _supply(group: Mapping[str, Any], health: Mapping[str, str]) -> Supply:
     in_service: list[str] = []
     starting: list[str] = []
     draining: list[str] = []
-    warm: list[str] = []
     running: list[str] = []
+    not_serving: list[str] = []
     for instance in group.get("Instances", []):
         name, state = instance["InstanceId"], instance["LifecycleState"]
         if state in ("Terminated", "Detached"):
@@ -262,24 +281,19 @@ def _supply(group: Mapping[str, Any], warm_pool: Iterable[Mapping[str, Any]], he
         if state == "InService":
             target = health.get(name)
             (in_service if target == "healthy" else draining if target == "draining" else starting).append(name)
+            if target != "healthy":
+                not_serving.append(name)
         elif state.startswith("Pending"):
             starting.append(name)
-        elif state.startswith(("Terminating", "Detaching", "Warmed:")):
+        elif state.startswith(("Terminating", "Detaching")):
             draining.append(name)
-    for instance in warm_pool:
-        name, state = instance["InstanceId"], instance["LifecycleState"]
-        if state.startswith(("Warmed:Terminating", "Warmed:Terminated")):
-            continue
-        warm.append(name)
-        if state == "Warmed:Running" or state.startswith("Warmed:Pending"):
-            running.append(name)
     return Supply(
         desired=int(group["DesiredCapacity"]),
         in_service=tuple(sorted(in_service)),
         starting=tuple(sorted(starting)),
         draining=tuple(sorted(draining)),
-        warm=tuple(sorted(warm)),
         running=tuple(sorted(set(running))),
+        not_serving=tuple(sorted(not_serving)),
     )
 
 
@@ -287,14 +301,21 @@ def _seconds(moment: datetime) -> int:
     return int(moment.timestamp())
 
 
+# Auto Scaling keeps a group's activities for weeks, so the history still holds those of the stopped
+# instances the group kept before section 4.5 dropped them. They are read as they were while the
+# history holds them: an instance moved from the stopped ones into service is a launch, and one
+# launched to be stopped reached no service. Each pattern takes the two words of AWS's name for the
+# stopped instances with any white space between them.
+_FROM_STOPPED = re.compile(r"\b(?:from|out of)\s+warm\s+pool\b")
+_TO_STOPPED = re.compile(r"to\s+warm\s+pool\b")
+
+
 def _is_launch(description: str) -> bool:
-    return description.startswith("launching") or (
-        "warm pool" in description and ("from warm pool" in description or "out of warm pool" in description)
-    )
+    return description.startswith("launching") or _FROM_STOPPED.search(description) is not None
 
 
-def _into_warm_pool(description: str) -> bool:
-    return "into warm pool" in description or "to warm pool" in description
+def _to_stopped(description: str) -> bool:
+    return _TO_STOPPED.search(description) is not None
 
 
 def _failure_cause(message: str) -> LaunchFailure:
@@ -336,7 +357,7 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
         completed: datetime = activity.get("EndTime") or activity["StartTime"]
         moment = _seconds(completed)
         if status == "Successful":
-            if not _into_warm_pool(description):
+            if not _to_stopped(description):
                 reached_service = moment if reached_service is None else max(reached_service, moment)
             continue
         if status not in ("Failed", "Cancelled"):
@@ -354,25 +375,15 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
     return LaunchHistory(abandoned, no_capacity_at, last_failed)
 
 
-def _heartbeats(
-    items: Iterable[Mapping[str, Any]], now: int
-) -> tuple[tuple[GatewayHeartbeat, ...], tuple[InstanceHeartbeat, ...]]:
-    gateways: list[GatewayHeartbeat] = []
+def _heartbeats(items: Iterable[Mapping[str, Any]], now: int) -> tuple[InstanceHeartbeat, ...]:
     instances: list[InstanceHeartbeat] = []
     for item in items:
-        source = item.get("source")
         try:
-            if isinstance(source, str) and source.startswith(GATEWAY_SOURCE):
-                gateways.append(GatewayHeartbeat.from_item(item))
-            elif isinstance(source, str) and source.startswith(INSTANCE_SOURCE):
-                instances.append(InstanceHeartbeat.from_item(item))
+            instances.append(InstanceHeartbeat.from_item(item))
         except RecordError:
             # A row nobody can read is no heartbeat.
             continue
-    return (
-        tuple(heartbeat for heartbeat in gateways if is_fresh(heartbeat, now)),
-        tuple(heartbeat for heartbeat in instances if is_fresh(heartbeat, now)),
-    )
+    return tuple(heartbeat for heartbeat in instances if is_fresh(heartbeat, now))
 
 
 def _time(item: Mapping[str, Any], name: str) -> int | None:
@@ -388,12 +399,6 @@ def _time(item: Mapping[str, Any], name: str) -> int | None:
 
 # The times of the memory record, each left out of it while it is `None`.
 _MEMORY_TIMES = (
-    "last_request_at",
-    "last_in_flight_at",
-    "above_target_since",
-    "last_scale_out_at",
-    "low_load_since",
-    "last_gateway_at",
     "suspended_at",
     "abandons_counted_from",
     "last_rebalance_at",
@@ -402,16 +407,26 @@ _MEMORY_TIMES = (
 )
 # The attributes of the memory record that the scaler alone writes: all of them but the keys and
 # `launch_suspended`, which the admin clears.
-MEMORY_ATTRIBUTES = ("waiting_since", "queuing_since", "rebalance_number", *_MEMORY_TIMES)
+MEMORY_ATTRIBUTES = ("queuing_since", "rebalance_number", *_MEMORY_TIMES)
+# What an earlier version kept in the memory record of a pool's load, of its idleness and of the
+# gateway. Nothing reads them, and an item stored then may still hold them: every update of the
+# record removes them.
+FORMER_MEMORY_ATTRIBUTES = (
+    "last_request_at",
+    "last_in_flight_at",
+    "above_target_since",
+    "waiting_since",
+    "last_scale_out_at",
+    "low_load_since",
+    "last_gateway_at",
+)
 
 
 def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
-    """The memory record as `Memory`; an empty one when the pool has no record yet."""
+    """The memory record as `Memory`; an empty one when the pool has no record yet. An attribute
+    the memory does not have, such as one an earlier version stored, is not looked at."""
     if item is None:
         return Memory()
-    waiting = item.get("waiting_since") or {}
-    if not isinstance(waiting, Mapping):
-        raise RecordError("`waiting_since` of the memory record is not a map")
     queuing = item.get("queuing_since") or {}
     if not isinstance(queuing, Mapping):
         raise RecordError("`queuing_since` of the memory record is not a map")
@@ -419,13 +434,6 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
     if not isinstance(suspended, bool):
         raise RecordError(f"`{LAUNCH_SUSPENDED}` of the memory record is not a boolean")
     return Memory(
-        last_request_at=_time(item, "last_request_at"),
-        last_in_flight_at=_time(item, "last_in_flight_at"),
-        above_target_since=_time(item, "above_target_since"),
-        waiting_since=tuple(sorted((str(name), _time(waiting, name) or 0) for name in waiting)),
-        last_scale_out_at=_time(item, "last_scale_out_at"),
-        low_load_since=_time(item, "low_load_since"),
-        last_gateway_at=_time(item, "last_gateway_at"),
         launch_suspended=suspended,
         suspended_at=_time(item, "suspended_at"),
         abandons_counted_from=_time(item, "abandons_counted_from"),
@@ -441,12 +449,7 @@ def memory_from_item(item: Mapping[str, Any] | None) -> Memory:
 def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
     """The memory record of a pool, in plain values; a time that is `None` is left out, and so
     are the instances that wait when there are none and the rebalance number while it is 0."""
-    item: dict[str, Any] = {
-        "pool": pool,
-        "record": MEMORY_RECORD,
-        LAUNCH_SUSPENDED: memory.launch_suspended,
-        "waiting_since": dict(memory.waiting_since),
-    }
+    item: dict[str, Any] = {"pool": pool, "record": MEMORY_RECORD, LAUNCH_SUSPENDED: memory.launch_suspended}
     for name in _MEMORY_TIMES:
         value = getattr(memory, name)
         if value is not None:
@@ -461,29 +464,24 @@ def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
 def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now: int) -> tuple[PoolInputs, GroupState]:
     groups = clients.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[settings.group])
     group = groups["AutoScalingGroups"][0]
-    warm_pool = list(_pages(clients.autoscaling, "describe_warm_pool", "Instances", AutoScalingGroupName=settings.group))
     targets = clients.elbv2.describe_target_health(TargetGroupArn=settings.target_group)
     health = {
         target["Target"]["Id"]: target["TargetHealth"]["State"] for target in targets.get("TargetHealthDescriptions", [])
     }
 
-    records = {item.get("record"): item for item in _query_pool(clients, tables.pool_state, settings.config.name)}
-    mode_item = records.get(MODE_RECORD)
-    mode = settings.configured_mode if mode_item is None else PoolState.from_item(mode_item).mode
+    # The pool's memory and its session, read on every run, and nothing else of its partition.
+    records = _pool_records(clients, tables.pool_state, settings.config.name, (MEMORY_RECORD, SESSION_RECORD))
     memory = memory_from_item(records.get(MEMORY_RECORD))
-    # The pool's session, read on every run with the rest of the pool's records.
     session_item = records.get(SESSION_RECORD)
     session = None if session_item is None else Session.from_item(session_item)
 
     activities = _pages(clients.autoscaling, "describe_scaling_activities", "Activities", AutoScalingGroupName=settings.group)
     history = launch_history(activities, memory.abandons_counted_from)
-    gateways, instances = _heartbeats(_query_pool(clients, tables.heartbeats, settings.config.name), now)
+    instances = _heartbeats(_instance_rows(clients, tables.heartbeats, settings.config.name), now)
 
     inputs = PoolInputs(
         config=settings.config,
-        mode=mode,
-        supply=_supply(group, warm_pool, health),
-        gateway_heartbeats=gateways,
+        supply=_supply(group, health),
         instance_heartbeats=instances,
         abandoned_launches=history.abandoned_in_a_row,
         memory=memory,
@@ -502,21 +500,6 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
     return inputs, state
 
 
-def read_session(clients: Clients, tables: TableNames) -> SessionSwitch | None:
-    """The session switch; `None` when it has no record. An item that is not a switch raises
-    `RecordError`."""
-    key = {name: {"S": value} for name, value in SESSION_SWITCH_KEY.items()}
-    item = clients.dynamodb.get_item(TableName=tables.pool_state, Key=key, ConsistentRead=True).get("Item")
-    return None if item is None else SessionSwitch.from_item(_plain(item))
-
-
-def read_session_at(clients: Clients, tables: TableNames) -> tuple[SessionSwitch | None, int]:
-    """The session switch, as `read_session` reads it, and when the read returned, in milliseconds:
-    whatever change it reads was written by then (`rhi_scaler.metrics.session_series`)."""
-    switch = read_session(clients, tables)
-    return switch, int(time.time() * 1000)
-
-
 def read(
     clients: Clients,
     tables: TableNames,
@@ -525,22 +508,13 @@ def read(
     session_max_hours: int = SESSION_MAX_HOURS,
 ) -> Run:
     """Everything one run decides from, at the time `now`, for each pool in the order given, with
-    the longest a session may last as the settings give it, and the session switch."""
+    the longest a session may last as the settings give it."""
     read_pools = [_read_pool(clients, tables, settings, now) for settings in pools]
-    session, session_error, session_read_at = None, None, None
-    try:
-        session, session_read_at = read_session_at(clients, tables)
-    except (ClientError, BotoCoreError, RecordError) as error:
-        # It only reports: a wake that demand calls for must not wait on it.
-        session_error = error
     return Run(
         inputs=Inputs(
             now=now, pools=tuple(inputs for inputs, _ in read_pools), session_max_hours=session_max_hours
         ),
         groups={inputs.config.name: state for inputs, state in read_pools},
-        session=session,
-        session_error=session_error,
-        session_read_at=session_read_at,
     )
 
 
@@ -566,7 +540,8 @@ def memory_update(table: str, pool: str, before: Memory, after: Memory) -> dict[
     """The UpdateItem call, as the low-level client takes it, that stores `after` as the pool's
     memory record, given the memory `before` that the run read.
 
-    Each of the scaler's own attributes is set, or removed while it has no value. The mark
+    Each of the scaler's own attributes is set, or removed while it has no value, and so is every
+    attribute an earlier version kept there (`FORMER_MEMORY_ATTRIBUTES`), which has none. The mark
     `launch_suspended` is the admin's to clear: the call sets it only in the run that raises it, and
     otherwise leaves it as it stands. An admin who clears it while a run that read it set is under
     way therefore keeps it cleared, and the next run finds it so. Any other attribute that is not
@@ -575,18 +550,22 @@ def memory_update(table: str, pool: str, before: Memory, after: Memory) -> dict[
     item = memory_to_item(pool, after)
     raised = after.launch_suspended and not before.launch_suspended
     present = [name for name in MEMORY_ATTRIBUTES if name in item] + ([LAUNCH_SUSPENDED] if raised else [])
-    absent = [name for name in MEMORY_ATTRIBUTES if name not in item]
+    absent = [name for name in MEMORY_ATTRIBUTES if name not in item] + list(FORMER_MEMORY_ATTRIBUTES)
     names = {f"#s{n}": name for n, name in enumerate(present)} | {f"#r{n}": name for n, name in enumerate(absent)}
-    expression = "SET " + ", ".join(f"#s{n} = :s{n}" for n in range(len(present)))
-    if absent:
-        expression += " REMOVE " + ", ".join(f"#r{n}" for n in range(len(absent)))
-    return {
+    # There is always an attribute to remove, and there may be none to set: DynamoDB takes neither
+    # a clause with nothing in it nor an empty map of values.
+    expression = "REMOVE " + ", ".join(f"#r{n}" for n in range(len(absent)))
+    update: dict[str, Any] = {
         "TableName": table,
         "Key": {"pool": {"S": pool}, "record": {"S": MEMORY_RECORD}},
-        "UpdateExpression": expression,
         "ExpressionAttributeNames": names,
-        "ExpressionAttributeValues": {f":s{n}": _SERIALIZER.serialize(item[name]) for n, name in enumerate(present)},
     }
+    if present:
+        expression = "SET " + ", ".join(f"#s{n} = :s{n}" for n in range(len(present))) + " " + expression
+        update["ExpressionAttributeValues"] = {
+            f":s{n}": _SERIALIZER.serialize(item[name]) for n, name in enumerate(present)
+        }
+    return update | {"UpdateExpression": expression}
 
 
 def supply_note(pool: PoolDecision, read: PoolInputs, state: GroupState, now: int) -> ScalerNote:

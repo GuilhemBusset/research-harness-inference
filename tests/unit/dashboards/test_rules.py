@@ -11,12 +11,14 @@ from typing import Any
 import pytest
 import yaml
 from grafana_foundation_sdk.builders import stat as sdk_stat
+from grafana_foundation_sdk.builders import table as sdk_table
 from grafana_foundation_sdk.builders import timeseries as sdk_timeseries
 from grafana_foundation_sdk.cog.encoder import JSONEncoder
 
 from rhi_common.engine_metrics import ENGINES, Further, Kind, Quantity, further_names, metric_names
 from rhi_common.pool_config import Pool, parse_pools
 from rhi_dashboards import check, rules
+from rhi_scaler import metrics as scaler
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -36,12 +38,16 @@ MOCK = parse_pools(
     }
 )[0]
 
-# The scaler's count of the pool's instances in service, as PromQL: what keeps an engine query
-# (`A and on (pool) (count > 0)` has A's series only while the count is above zero), and the
-# series that stands for the pool's state (`count == 0` has one series, of value zero, only while
-# the count is zero).
-KEPT_WHILE_IN_SERVICE = ') and on (pool) (rhi_scaler_instances_in_service{pool="mock"} > 0)'
-ONLY_AT_ZERO = 'rhi_scaler_instances_in_service{pool="mock"} == 0'
+# The scaler's two gauges of the pool, as PromQL: its session, 1 while it is active, and its count
+# of instances in service. What keeps an engine query (`A and on (pool) (B > 0) and on (pool)
+# (C == 1)` has A's series only while both hold), and the two series that stand for the pool's
+# state, each of value zero while the pool is in that state and absent otherwise.
+SESSION = 'rhi_scaler_session_active{pool="mock"}'
+IN_SERVICE = 'rhi_scaler_instances_in_service{pool="mock"}'
+KEPT_WHILE_SERVING = f") and on (pool) ({IN_SERVICE} > 0) and on (pool) ({SESSION} == 1)"
+NO_SESSION = f"{SESSION} == 0"
+WAITING_FOR_CAPACITY = f"({IN_SERVICE} == 0) and on (pool) ({SESSION} == 1)"
+STATES = [NO_SESSION, WAITING_FOR_CAPACITY]
 
 
 def as_json(panel: Any) -> dict[str, Any]:
@@ -59,8 +65,9 @@ def counter_arguments(expression: str) -> list[str]:
     return plain
 
 
-def shown(panel: dict[str, Any], in_service: int, last_reported: float) -> list[str]:
-    """What the panel displays, one text per series, for a pool with `in_service` instances.
+def shown(panel: dict[str, Any], *, active: bool, in_service: int, last_reported: float) -> list[str]:
+    """What the panel displays, one text per series, for a pool whose session is `active` or not,
+    with `in_service` instances.
 
     `last_reported` is what every engine expression still returns: with no instance in service it
     is what an instance last said, which Prometheus keeps for some minutes.
@@ -68,16 +75,23 @@ def shown(panel: dict[str, Any], in_service: int, last_reported: float) -> list[
     texts = []
     for target in panel["targets"]:
         expression = target["expr"]
-        if expression == ONLY_AT_ZERO:
-            values = [0.0] if in_service == 0 else []
-        elif expression.startswith("(") and expression.endswith(KEPT_WHILE_IN_SERVICE):
-            values = [last_reported] if in_service > 0 else []
+        if expression == NO_SESSION:
+            values = [] if active else [0.0]
+        elif expression == WAITING_FOR_CAPACITY:
+            values = [0.0] if active and in_service == 0 else []
+        elif expression.startswith("(") and expression.endswith(KEPT_WHILE_SERVING):
+            values = [last_reported] if active and in_service > 0 else []
         else:
             values = [last_reported]
+        # A value is matched by its query, or, in a table, by the name Grafana gives it.
+        matchers = (
+            {"id": "byFrameRefID", "options": target["refId"]},
+            {"id": "byName", "options": f"Value #{target['refId']}"},
+        )
         mapped = {
             value: result["text"]
             for override in panel["fieldConfig"]["overrides"]
-            if override["matcher"] == {"id": "byFrameRefID", "options": target["refId"]}
+            if override["matcher"] in matchers
             for one in override["properties"]
             if one["id"] == "mappings"
             for mapping in one["value"]
@@ -112,8 +126,8 @@ def test_no_helper_takes_a_rate_or_an_increase_over_a_sum() -> None:
 
     taken_of = [argument for expression in written for argument in counter_arguments(expression)]
 
-    # Every expression takes one, but the pool's state.
-    assert [expression for expression in written if not counter_arguments(expression)] == [ONLY_AT_ZERO]
+    # Every expression takes one, but the pool's two states.
+    assert [expression for expression in written if not counter_arguments(expression)] == STATES
     for argument in taken_of:
         # One metric's series over a range: no aggregation and no subquery inside the function.
         assert re.fullmatch(r"[A-Za-z_:][A-Za-z0-9_:]*(\{[^{}]*\})?\[[^\[\]:]+\]", argument), argument
@@ -160,37 +174,77 @@ def engine_panels(pool: Pool) -> dict[str, Any]:
         "tokens a second": rules.engine_rate(pool, Quantity.OUTPUT_TOKENS),
         "running": f"sum by (pool) ({rules.engine_selector(pool, Quantity.RUNNING_REQUESTS)})",
     }
+    columns = [rules.Column(header, expression, "short") for header, expression in queries.items()]
     return {
         "graph": rules.engine_timeseries(pool, "Output", queries),
         "stat": rules.engine_stat(pool, "Output now", queries),
         "percentile": rules.engine_percentile_timeseries(pool, "First token", Quantity.TIME_TO_FIRST_TOKEN),
+        "mixed": rules.pool_timeseries(pool, "Output", [rules.Series(*one, engine=True) for one in queries.items()]),
+        "table": rules.engine_table(pool, "Output of each instance", columns),
     }
 
 
-@pytest.mark.parametrize("kind", ["graph", "stat", "percentile"])
-def test_an_engine_panel_reads_asleep_when_the_scaler_counts_no_instance(kind: str) -> None:
+KINDS = {
+    "graph": sdk_timeseries.Panel,
+    "stat": sdk_stat.Panel,
+    "percentile": sdk_timeseries.Panel,
+    "mixed": sdk_timeseries.Panel,
+    "table": sdk_table.Panel,
+}
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_an_engine_panel_reads_the_pools_state_while_the_pool_does_not_serve(kind: str) -> None:
     built = engine_panels(MOCK)[kind]
     panel = as_json(built)
 
-    assert isinstance(built, sdk_stat.Panel if kind == "stat" else sdk_timeseries.Panel)
-    assert ONLY_AT_ZERO in expressions(panel)
-    engine = [expression for expression in expressions(panel) if expression != ONLY_AT_ZERO]
+    assert isinstance(built, KINDS[kind])
+    # The state is the scaler's: its gauge of the pool's session, and its count of instances in service.
+    assert (rules.SESSION_ACTIVE, rules.IN_SERVICE) == (scaler.SESSION_ACTIVE, scaler.INSTANCES_IN_SERVICE)
+    assert [expression for expression in expressions(panel) if expression in STATES] == STATES
+    engine = [expression for expression in expressions(panel) if expression not in STATES]
     assert engine
-    assert all(expression.startswith("(") and expression.endswith(KEPT_WHILE_IN_SERVICE) for expression in engine)
+    assert all(expression.startswith("(") and expression.endswith(KEPT_WHILE_SERVING) for expression in engine)
 
-    # At zero the panel reads asleep and nothing else, whatever an instance last reported.
-    assert shown(panel, in_service=0, last_reported=17.0) == ["asleep"]
-    # In service it shows the engine's numbers, and an engine's own zero stays a number.
-    assert shown(panel, in_service=2, last_reported=17.0) == ["17"] * len(engine)
-    assert shown(panel, in_service=1, last_reported=0.0) == ["0"] * len(engine)
+    # While the pool's session is not active the panel reads "no session" and nothing else,
+    # whatever an instance last reported, and whatever is still in service after the session's end.
+    assert shown(panel, active=False, in_service=0, last_reported=17.0) == ["no session"]
+    assert shown(panel, active=False, in_service=2, last_reported=17.0) == ["no session"]
+    # While it is active and no instance is in service, it reads "waiting for capacity" and nothing else.
+    assert shown(panel, active=True, in_service=0, last_reported=17.0) == ["waiting for capacity"]
+    # In service in its session it shows the engine's numbers, and an engine's own zero stays a number.
+    assert shown(panel, active=True, in_service=2, last_reported=17.0) == ["17"] * len(engine)
+    assert shown(panel, active=True, in_service=1, last_reported=0.0) == ["0"] * len(engine)
 
 
-def test_a_stat_asks_for_the_value_now_and_a_graph_for_the_range() -> None:
+def test_a_stat_and_a_table_ask_for_the_value_now_and_a_graph_for_the_range() -> None:
     panels = engine_panels(MOCK)
 
-    # A stat over the range would show the last value an instance reported before the pool slept.
-    assert all(target["instant"] and not target["range"] for target in as_json(panels["stat"])["targets"])
+    # A stat over the range would show the last value an instance reported before the pool stopped serving.
+    for kind in ("stat", "table"):
+        assert all(target["instant"] and not target["range"] for target in as_json(panels[kind])["targets"])
     assert all(target["range"] and not target["instant"] for target in as_json(panels["graph"])["targets"])
+
+
+def test_a_table_has_one_column_for_each_query_under_its_header() -> None:
+    panel = as_json(engine_panels(MOCK)["table"])
+
+    assert panel["type"] == "table"
+    # Every query answers as a table, and the lines of one instance are merged into one.
+    assert all(target["format"] == "table" for target in panel["targets"])
+    assert [one["id"] for one in panel["transformations"]][0] == "merge"
+    headers = {
+        override["matcher"]["options"]: one["value"]
+        for override in panel["fieldConfig"]["overrides"]
+        if override["matcher"]["id"] == "byName"
+        for one in override["properties"]
+        if one["id"] == "displayName"
+    }
+    by_reference = {target["refId"]: target["expr"] for target in panel["targets"]}
+    named = {by_reference[name.removeprefix("Value #")]: header for name, header in headers.items()}
+    assert {header for expression, header in named.items() if expression not in STATES} == {"tokens a second", "running"}
+    # Each state is read in a column of its own, named apart from the others.
+    assert len({*named.values()}) == len(panel["targets"])
 
 
 @pytest.mark.parametrize("window", ["5m", "$__rate_interval"])
@@ -271,24 +325,30 @@ def test_the_check_reads_a_query_kept_to_the_session() -> None:
         declared = [rules.FromEngineTable(Quantity.INPUT_TOKENS), rules.FromEngineTable(Quantity.RUNNING_REQUESTS)]
         return {one.rule for one in check.violations({"panels": [as_json(panel)]}, declared, (MOCK,))}
 
-    # An engine counter read as what each of its samples added in the session has no "now" to read
-    # asleep at, and counts nothing an instance last reported: a series no instance updates adds
-    # nothing. Read so, it needs no "asleep".
+    # An engine counter read as what each of its samples added in its pool's session has no "now"
+    # to read the pool's state at, and counts nothing an instance last reported: a series no
+    # instance updates adds nothing. Read so, it needs no state.
     tokens = rules.engine_step_increase(MOCK, Quantity.INPUT_TOKENS)
     assert broken(rules.over_sessions(tokens)) == set()
+    # Read in any pool's session, or in another pool's, it is not read in its own.
+    name, matchers = rules.engine_series(MOCK, Quantity.INPUT_TOKENS), rules.engine_matchers(MOCK, Quantity.INPUT_TOKENS)
+    for session in (rules.ANY_POOL, "another"):
+        assert broken(rules.over_sessions(rules.step_increase(name, matchers, session=session))) == {"pool-state"}
     # A gauge read the same way still does: it falls as requests finish, which is no restart.
     running = rules.step_increase(
-        rules.engine_series(MOCK, Quantity.RUNNING_REQUESTS), rules.engine_matchers(MOCK, Quantity.RUNNING_REQUESTS)
+        rules.engine_series(MOCK, Quantity.RUNNING_REQUESTS),
+        rules.engine_matchers(MOCK, Quantity.RUNNING_REQUESTS),
+        session=MOCK.name,
     )
-    assert broken(rules.over_sessions(running)) == {"asleep"}
+    assert broken(rules.over_sessions(running)) == {"pool-state"}
     # Read as its value over the session's steps, not its increment, it does.
     series = rules.engine_selector(MOCK, Quantity.INPUT_TOKENS)
-    value = f"sum_over_time((sum by (pool) ({series} and on () ({rules.SESSION_ON} == 1)))[{rules.SESSION_RANGE}:{rules.SESSION_STEP}])"
-    assert broken(value) == {"asleep"}
+    value = f"sum_over_time((sum by (pool) ({series} and on () ({SESSION} == 1)))[{rules.SESSION_RANGE}:{rules.SESSION_STEP}])"
+    assert broken(value) == {"pool-state"}
     # A stat read over the session asks for its one value at the range's end: a query over the
     # range would show, at its last point, a session from before the dashboard's range.
     assert broken(rules.over_sessions(tokens), instant=False) == {"session"}
-    windowed = rules.awake(MOCK.name, rules.engine_increase(MOCK, Quantity.INPUT_TOKENS, window="1m"))
-    assert "session" in broken(f"sum_over_time(({windowed} and on () ({rules.SESSION_ON} == 1))[1h:1m])", instant=False)
+    windowed = rules.serving(MOCK.name, rules.engine_increase(MOCK, Quantity.INPUT_TOKENS, window="1m"))
+    assert "session" in broken(f"sum_over_time(({windowed})[1h:1m])", instant=False)
 
 

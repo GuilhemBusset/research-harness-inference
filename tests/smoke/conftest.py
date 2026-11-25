@@ -16,9 +16,40 @@ and in CI with no account. The environment says which:
 - its tables and the pool's secret in moto, with the canary's key and the secret drawn when the
   tests run;
 - the mock engine (`rhi_mock_engine.app`) as the transport of the gateway's hop to its pool;
-- `Targets` for the target group's health, and `Scaler` for the scaler function: the pool has no
-  target until the gateway asks for a wake, and its target is healthy `START_SECONDS` later. So
-  the local stack's pool always starts cold.
+- `Targets` for the target group's health: the pool has no target until its session is booked,
+  and its target is healthy `START_SECONDS` later.
+
+**The session.** The gateway serves a pool only in its session, the canary's key like any other
+(section 5.6), and a request starts nothing (section 5.3). So the local stack starts as a deployed
+one does, with a pool nobody has booked: `unbooked_stack` gives it so, and its `book` does what
+the verification's booking and the scaler do on a deployed stack. It writes a session on the pool
+for the hour that starts then, and the scaler's note of one instance starting; the target is
+healthy a moment later, and `book` returns once the gateway reads the pool ready. `local_stack`
+gives the stack booked and ready, to whoever needs only to send it requests.
+
+The fixture `stack` gives the stack as the environment names it, and the fixture `booked` the
+same stack with the pool under test in a session: on the local stack it books the pool, and on a
+deployed stack it does nothing, because the verification booked the pool before the run
+(`scripts/pipeline/verify.py`). The one test of a pool nobody has booked takes `stack` alone, and
+runs before any test that takes `booked`.
+
+**A stream that one task does not serve yet.** A deployed gateway is several tasks, and each reads
+its pools on its own, every 5 seconds: the target group's health, then the scaler's note, then the
+session (`rhi_gateway.readiness`). `GET /status` is one task's answer: when it first reads the pool
+ready, which is when whoever booked the pool starts the tests, another task may still hold an older
+view, and answers a request 503 from it until its next read, with any of the three causes of a pool
+that cannot serve (`NOT_READY`, the causes of `PoolView.refusal`):
+
+- `warming`: it has read neither the healthy target nor a newer note;
+- `capacity_unavailable`: its read of the health came before the target was healthy, and its read
+  of the note after the scaler counted the instance in service, so none starting;
+- `no_session`: it has not read the session yet, on a pool whose target was healthy when the
+  session was booked.
+
+So `Stack.stream` makes a request again while the answer is one of those, for `SETTLE_SECONDS` at
+most, three of those reads. It gives the answer it ends on: a stream test still needs a whole
+stream, and a pool that cannot serve by then fails it. No other answer is asked again, and only a
+stream is: the test of the pool nobody has booked makes one request and reads its answer.
 
 The stack is one test file's: the fixture `stack` is built for a module and taken down after it,
 so moto and its placeholder credentials never outlive the smoke tests in a run of every test.
@@ -40,7 +71,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -52,11 +83,13 @@ import uvicorn
 from botocore.client import BaseClient
 from moto import mock_aws
 
-from rhi_common import tables
+from rhi_common import sessions, tables
+from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
+from rhi_common.records import ScalerNote, Session
 from rhi_common.students import StudentKey
 from rhi_gateway.main import aws_clients, build
-from rhi_gateway.settings import read_settings
+from rhi_gateway.settings import Settings, read_settings
 from rhi_gateway.sse import SseEvent, SseReader
 from rhi_mock_engine.app import Settings as MockSettings
 from rhi_mock_engine.app import create_app
@@ -66,14 +99,22 @@ KEY_VARIABLE = "RHI_SMOKE_KEY"
 POOL_VARIABLE = "RHI_SMOKE_POOL"
 MOCK_POOL = "mock"
 
-# How long after the first wake the local pool's target is healthy.
+# How long after its session is booked the local pool's target is healthy.
 START_SECONDS = 1.0
-# The interval of the local gateway's keep-alives: several fit in the time its pool takes to turn
-# ready, which is the next of the gateway's readiness reads, 5 seconds apart.
-KEEPALIVE_SECONDS = 1
-# How long the client waits for the next bytes of an answer. A held stream is kept alive every 10
-# seconds on a deployed stack, and the engine's own start is covered by the hold.
+# How long the local stack's booking waits for its gateway to read the pool ready: the gateway
+# reads its pools every 5 seconds.
+READY_SECONDS = 30.0
+# How long the client waits for the next bytes of an answer: an engine is silent while it computes
+# a long transcript.
 READ_SECONDS = 120.0
+# What a gateway task answers, each as a 503, for a pool its view says cannot serve
+# (`rhi_gateway.readiness.PoolView.refusal`).
+NOT_READY = frozenset({Cause.NO_SESSION, Cause.WARMING, Cause.CAPACITY_UNAVAILABLE})
+# How long a stream is asked again while its answer is one of those, since the first such answer,
+# and between two requests: the gateway's tasks do not read a pool at the same moment, and are at
+# most one read of 5 seconds apart.
+SETTLE_SECONDS = 15.0
+AGAIN_SECONDS = 1.0
 
 # Placeholders, which moto never checks.
 _ACCOUNT = "123456789012"
@@ -84,7 +125,7 @@ _TABLES = {
     "RHI_HEARTBEAT_TABLE": (tables.HEARTBEATS, "smoke-heartbeats"),
     "RHI_POOL_STATE_TABLE": (tables.POOL_STATE, "smoke-pool-state"),
 }
-# The local pool: the mock engine, woken on demand.
+# The local pool: the mock engine.
 _POOL = {
     "engine": "mock",
     "instance_types": ["t4g.small"],
@@ -103,8 +144,8 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """The deployed-only tests run after the others, whatever their folder's name: they send the
-    pool a stream, and the first stream of a run must be the one whose wake and hold are asserted."""
+    """The deployed-only tests run after the others, whatever their folder's name: what both stacks
+    answer is asserted first."""
     deployed = Path(__file__).resolve().parent / "deployed"
     items.sort(key=lambda item: deployed in item.path.parents)
 
@@ -147,35 +188,52 @@ class Stream:
 
 @dataclass(frozen=True)
 class Stack:
-    """The stack under test, and how a test reaches it. `deployed` is whether an endpoint was given."""
+    """The stack under test, and how a test reaches it. `deployed` is whether an endpoint was given.
+
+    `book` books the pool under test and returns once it reads ready; it is the local stack's, and
+    does nothing on a deployed stack, whose pool the verification books.
+    """
 
     endpoint: str
     key: str
     pool: str
     deployed: bool
     http: httpx.Client
+    book: Callable[[], None] = field(default=lambda: None, repr=False, compare=False)
 
     def request(self, method: str, path: str, *, keyed: bool = True, **arguments: Any) -> httpx.Response:
         """One request to the endpoint, with the canary's key unless `keyed` is false."""
         headers = {"Authorization": f"Bearer {self.key}"} if keyed else {}
         return self.http.request(method, self.endpoint + path, headers=headers, **arguments)
 
-    def pool_state(self) -> str:
-        """The state `GET /status` gives the pool under test now."""
-        answer = self.request("GET", "/status")
-        assert answer.status_code == 200, f"GET /status answered {answer.status_code}"
-        states = {record["model"]: record["state"] for record in answer.json()["pools"]}
-        assert self.pool in states, f"GET /status lists no pool {self.pool!r}"
-        return states[self.pool]
-
     def stream(self, path: str, body: Mapping[str, Any]) -> Stream:
-        """A streamed request with the canary's key, read to the end of its answer."""
-        reader, events = SseReader(), []
+        """A streamed request with the canary's key, read to the end of its answer. While the
+        answer is 503 with a cause of `NOT_READY`, the request is made again every `AGAIN_SECONDS`,
+        for `SETTLE_SECONDS` at most since the first such answer: the answer given is the last."""
+        until: float | None = None
+        while True:
+            answer, cause = self._streamed(path, body)
+            if answer.status != 503 or cause not in NOT_READY:
+                return answer
+            until = time.monotonic() + SETTLE_SECONDS if until is None else until
+            if time.monotonic() + AGAIN_SECONDS > until:
+                return answer
+            time.sleep(AGAIN_SECONDS)
+
+    def _streamed(self, path: str, body: Mapping[str, Any]) -> tuple[Stream, str | None]:
+        """One streamed request, read to the end of its answer, and the cause the answer names when
+        it is an error and no stream: its `error.type`, in every wire format."""
+        reader, events, read = SseReader(), [], b""
         headers = {"Authorization": f"Bearer {self.key}"}
         with self.http.stream("POST", self.endpoint + path, headers=headers, json=body) as answer:
             for chunk in answer.iter_bytes():
                 events += reader.feed(chunk)
-        return Stream(status=answer.status_code, events=tuple(events))
+                read += b"" if answer.status_code == 200 else chunk
+        try:
+            cause = json.loads(read)["error"]["type"]
+        except (ValueError, KeyError, TypeError):
+            cause = None
+        return Stream(status=answer.status_code, events=tuple(events)), cause if isinstance(cause, str) else None
 
 
 class Targets:
@@ -194,17 +252,6 @@ class Targets:
             return {"TargetHealthDescriptions": []}
         state = "healthy" if time.monotonic() >= self._healthy_at else "initial"
         return {"TargetHealthDescriptions": [{"TargetHealth": {"State": state}}]}
-
-
-class Scaler:
-    """The Lambda client, for the local stack: an invocation of the scaler starts the pool's target."""
-
-    def __init__(self, targets: Targets) -> None:
-        self._targets = targets
-
-    def invoke(self, **_arguments: Any) -> dict[str, Any]:
-        self._targets.start()
-        return {"StatusCode": 202}
 
 
 @contextmanager
@@ -248,9 +295,32 @@ def _gateway_environment(pool: str) -> dict[str, str]:
         "RHI_POOL_SECRETS": json.dumps({pool: secret["ARN"]}),
         "RHI_SCALER_FUNCTION": "smoke-scaler",
         "RHI_COURSE_END": "2027-01-15",
-        "RHI_KEEPALIVE_SECONDS": str(KEEPALIVE_SECONDS),
         **{variable: name for variable, (_, name) in _TABLES.items()},
     }
+
+
+def book(pool: str, settings: Settings) -> Session:
+    """A session of one instance booked on the pool for the hour that starts now, written to the
+    pool-state table as every writer writes one (`rhi_common.sessions.started`), with the note the
+    scaler writes once it has asked for that instance: one starting."""
+    now = int(time.time())
+    session = sessions.started(
+        None,
+        pool=pool,
+        instances=1,
+        starts_at=now,
+        ends_at=now + sessions.HOUR_SECONDS,
+        set_by="smoke",
+        now=now,
+        max_instances=next(configured for configured in settings.pools if configured.name == pool).max_instances,
+        session_max_hours=settings.session_max_hours,
+    )
+    table = boto3.resource("dynamodb").Table(settings.pool_state_table)
+    table.put_item(Item=session.to_item())
+    # What the scaler's next run writes of a pool it has just asked an instance for (section 5.4).
+    starting = ScalerNote(pool, capacity_asked=1, no_capacity_at=None, written_at=now, requested=1, starting=1)
+    table.put_item(Item=starting.to_item())
+    return session
 
 
 def enrol(github_id: int = 0, alias: str = "canary") -> str:
@@ -272,9 +342,20 @@ def enrol(github_id: int = 0, alias: str = "canary") -> str:
     return key
 
 
+@dataclass(frozen=True)
+class Local:
+    """The local stack while it is served: its address, the canary's key, and `book`, which books
+    the pool and returns once the gateway reads it ready. Booking it again does nothing."""
+
+    address: str
+    key: str
+    book: Callable[[], None]
+
+
 @contextmanager
-def local_stack(pool: str) -> Generator[tuple[str, str]]:
-    """The local stack of the one pool, served while the context lasts: its address and the canary's key."""
+def unbooked_stack(pool: str) -> Generator[Local]:
+    """The local stack of the one pool, served while the context lasts, with the pool unbooked: a
+    request for it is answered `no_session` until `Local.book` is called."""
     with _moto():
         environ = _gateway_environment(pool)
         key = enrol()
@@ -284,11 +365,24 @@ def local_stack(pool: str) -> Generator[tuple[str, str]]:
         targets = Targets()
         gateway = build(
             settings,
-            replace(clients, elbv2=targets, lambda_client=Scaler(targets)),
+            replace(clients, elbv2=targets),
             transport=httpx.ASGITransport(app=create_app(MockSettings(secret=pool_secret))),
         )
-        # The lifespan runs the readiness reads and the heartbeat: without it there is no gateway.
+        # The lifespan runs the readiness reads: without it there is no gateway.
         server = uvicorn.Server(uvicorn.Config(gateway.app, lifespan="on", access_log=False, log_level="warning"))
+        booked: list[Session] = []
+
+        def book_the_pool() -> None:
+            if booked:
+                return
+            booked.append(book(pool, settings))
+            # The instance the session asks for: in service a moment later.
+            targets.start()
+            deadline = time.monotonic() + READY_SECONDS
+            while not ((view := gateway.readiness.pool(pool)).session == booked[0] and view.ready):
+                assert serving.is_alive() and time.monotonic() < deadline, "the local pool did not turn ready"
+                time.sleep(0.01)
+
         with socket.socket() as listening:
             listening.bind(("127.0.0.1", 0))
             address = f"http://127.0.0.1:{listening.getsockname()[1]}"
@@ -296,13 +390,23 @@ def local_stack(pool: str) -> Generator[tuple[str, str]]:
             serving.start()
             try:
                 deadline = time.monotonic() + 30
-                while not server.started:
+                # Started, and its first read of the pool done.
+                while not (server.started and gateway.readiness.pool(pool).observed_at is not None):
                     assert serving.is_alive() and time.monotonic() < deadline, "the local gateway did not start"
                     time.sleep(0.01)
-                yield address, key
+                yield Local(address, key, book_the_pool)
             finally:
                 server.should_exit = True
                 serving.join(timeout=30)
+
+
+@contextmanager
+def local_stack(pool: str) -> Generator[tuple[str, str]]:
+    """The local stack of the one pool, booked and ready, served while the context lasts: its
+    address and the canary's key. A request for the pool is forwarded from the first."""
+    with unbooked_stack(pool) as local:
+        local.book()
+        yield local.address, local.key
 
 
 @pytest.fixture(scope="session")
@@ -313,7 +417,8 @@ def read_stack_target() -> Callable[[Mapping[str, str]], Target]:
 
 @pytest.fixture(scope="module")
 def stack() -> Generator[Stack]:
-    """The stack under test: the endpoint the environment gives, or the local stack."""
+    """The stack under test: the endpoint the environment gives, or the local stack, whose pool
+    nobody has booked until a test takes `booked`."""
     target = read_target(os.environ)
     timeout = httpx.Timeout(connect=10.0, read=READ_SECONDS, write=30.0, pool=10.0)
     # Nothing of the machine's own configuration, a proxy among it, takes part in a request.
@@ -321,5 +426,15 @@ def stack() -> Generator[Stack]:
         if target.endpoint is not None and target.key is not None:
             yield Stack(endpoint=target.endpoint, key=target.key, pool=target.pool, deployed=True, http=http)
             return
-        with local_stack(target.pool) as (address, key):
-            yield Stack(endpoint=address, key=key, pool=target.pool, deployed=False, http=http)
+        with unbooked_stack(target.pool) as local:
+            yield Stack(
+                endpoint=local.address, key=local.key, pool=target.pool, deployed=False, http=http, book=local.book
+            )
+
+
+@pytest.fixture(scope="module")
+def booked(stack: Stack) -> Stack:
+    """The stack with the pool under test in a session. The local stack's pool is booked here, and
+    is ready a moment later; a deployed stack's pool was booked by whoever runs the tests."""
+    stack.book()
+    return stack

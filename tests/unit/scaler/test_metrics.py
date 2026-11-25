@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from rhi_common.pool_config import parse_pools
-from rhi_common.records import LaunchFailure, Mode, ScalerNote, Session
+from rhi_common.records import LaunchFailure, ScalerNote, Session
 from rhi_scaler.metrics import DECISIONS, LAUNCH_FAILURE, SUPPLY_GAUGES, DecisionCounts, decode, encode, fleet_series
 from rhi_scaler.model import Decision, Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
@@ -52,7 +52,7 @@ def run(
 ) -> dict[tuple[str, ...], list[tuple[float, int]]]:
     """The series of one run, by their label values in the order of the label names: the series'
     name, then the cause if it has one, the pool, and the reason if it has one."""
-    pool = PoolInputs(config=POOL, mode=Mode.ENABLED, supply=Supply(desired=1, in_service=("i-a",)), session=session)
+    pool = PoolInputs(config=POOL, supply=Supply(desired=1, in_service=("i-a",)), session=session)
     inputs = Inputs(now=now, pools=(pool,))
     decision = Decision(pools=(PoolDecision("mock", 1, (), False, Memory(), reason),))
     out = {}
@@ -71,12 +71,12 @@ def last(now: int, note: ScalerNote = QUIET, session: Session | None = None) -> 
 
 def test_the_decisions_counter_counts_from_zero_and_keeps_counting() -> None:
     counts = DecisionCounts()
-    first = run(NOW, Reason.WAKE, counts)
+    first = run(NOW, Reason.PROVISION, counts)
     # A series the process sends for the first time starts at zero, so the first decision counts.
-    assert first[(DECISIONS, "mock", "wake")] == [(0.0, NOW * 1000 - 1), (1.0, NOW * 1000)]
+    assert first[(DECISIONS, "mock", "provision")] == [(0.0, NOW * 1000 - 1), (1.0, NOW * 1000)]
     second = run(NOW + 60, Reason.UNCHANGED, counts)
     third = run(NOW + 120, Reason.UNCHANGED, counts)
-    assert second[(DECISIONS, "mock", "wake")] == [(1.0, (NOW + 60) * 1000)]
+    assert second[(DECISIONS, "mock", "provision")] == [(1.0, (NOW + 60) * 1000)]
     assert third[(DECISIONS, "mock", "unchanged")] == [(2.0, (NOW + 120) * 1000)]
     assert third[("rhi_scaler_instances_in_service", "mock")] == [(1.0, (NOW + 120) * 1000)]
 

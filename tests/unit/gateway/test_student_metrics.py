@@ -31,9 +31,10 @@ from starlette.types import Message
 from rhi_common.causes import Cause
 from rhi_common.keys import generate_key, key_hash
 from rhi_common.pool_config import parse_pools
+from rhi_common.records import Session
 from rhi_common.students import StudentKey
 from rhi_gateway import metrics, proxy, routes
-from rhi_gateway.app import Forwarding, Holding, build_app, forwarding_handlers
+from rhi_gateway.app import Forwarding, Pools, build_app, forwarding_handlers
 from rhi_gateway.auth import Authenticator
 from rhi_gateway.body import BodyFilter
 from rhi_gateway.budget import InMemoryLedger
@@ -41,9 +42,8 @@ from rhi_gateway.formats import messages, responses
 from rhi_gateway.formats.chat import ChatBodyFilter
 from rhi_gateway.keystore import InMemoryKeyStore
 from rhi_gateway.local import LocalRoutes
-from rhi_gateway.readiness import PoolView, Readiness
+from rhi_gateway.readiness import PoolView
 from rhi_gateway.telemetry import RequestRecord, Telemetry, note_cause
-from rhi_gateway.waker import Waker
 
 ROOT = Path(__file__).resolve().parents[3]
 NOW = 1_800_000_000
@@ -71,6 +71,11 @@ REQUESTS, INPUT, OUTPUT, ERRORS = (
 CACHED, COUNTED = (f"{name}_total" for name in (metrics.CACHED_INPUT_TOKENS, metrics.COUNTED_TOKENS))
 
 
+def booked(pool: str) -> Session:
+    """A session on the pool, active for 6 hours from the moment the gateway's clocks stand at."""
+    return Session(pool, instances=1, starts_at=NOW, ends_at=NOW + 6 * 3600, set_by="owner", set_at=NOW)
+
+
 def body(entry: routes.Route, pool: str = "coursework") -> dict[str, Any] | None:
     """A body the route accepts, for that pool; none for a route that reads none."""
     said = [{"role": "user", "content": "hello"}]
@@ -79,27 +84,7 @@ def body(entry: routes.Route, pool: str = "coursework") -> dict[str, Any] | None
         routes.COUNT_TOKENS: {"model": pool, "messages": said},
         routes.CHAT_COMPLETIONS: {"model": pool, "messages": said},
         routes.RESPONSES: {"model": pool, "input": "hello"},
-        routes.WAKE: {"model": pool},
     }.get(entry)
-
-
-class Aws:
-    """The AWS clients the readiness and the waker are given. It answers these three calls and has no other."""
-
-    def __init__(self) -> None:
-        self.calls: set[str] = set()
-
-    def describe_target_health(self, **_: Any) -> dict[str, Any]:
-        self.calls.add("describe_target_health")
-        return {"TargetHealthDescriptions": []}
-
-    def get_item(self, **_: Any) -> dict[str, Any]:
-        self.calls.add("get_item")
-        return {}
-
-    def invoke(self, **_: Any) -> dict[str, Any]:
-        self.calls.add("invoke")
-        return {"StatusCode": 202}
 
 
 @dataclass
@@ -109,7 +94,6 @@ class Gateway:
     app: Starlette
     metrics: metrics.Metrics
     keys: dict[str, str]
-    aws: Aws
     # The usage the engine reports for the next request: input and output tokens.
     usage: list[int] = field(default_factory=lambda: [5000, 7])
     # The part of that input the engine reports read from the cache, in the formats of OpenAI.
@@ -134,7 +118,7 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
     ]
     ledger = InMemoryLedger(course_end=COURSE_END_DATE, clock=lambda: float(NOW))
     store = InMemoryKeyStore(*items)
-    made = Gateway(Starlette(), metrics.Metrics(store), keys, Aws(), store=store)
+    made = Gateway(Starlette(), metrics.Metrics(store), keys, store=store)
 
     def engine(request: httpx.Request) -> httpx.Response:
         # One answer every forwarded route reads as whole, with the usage under each format's names.
@@ -150,7 +134,7 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
         return httpx.Response(200, json={"type": "message", "input_tokens": used_in, "usage": usage})
 
     authenticator = Authenticator(store, wall_clock=lambda: float(NOW))
-    ready = lambda: {pool.name: PoolView(ready=True) for pool in POOLS}
+    ready = lambda: {pool.name: PoolView(ready=True, session=booked(pool.name)) for pool in POOLS}
     forwarding = Forwarding(
         authenticator=authenticator,
         ledger=ledger,
@@ -165,10 +149,7 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
             "http://pools.example.com:8080",
             {pool.name: "secret" for pool in POOLS},
         ),
-        holding=Holding(views=ready, wake=lambda pool: None),
-    )
-    readiness = Readiness(
-        {pool.name: f"tg-{pool.name}" for pool in POOLS}, elbv2=made.aws, table=made.aws, clock=lambda: float(NOW)
+        pools=Pools(views=ready, clock=lambda: float(NOW)),
     )
     local = LocalRoutes(
         authenticator,
@@ -176,7 +157,6 @@ def gateway(*students: tuple[str, int, int]) -> Gateway:
         ready,
         default_pool=POOLS[0],
         clock=lambda: float(NOW),
-        waker=Waker(readiness, lambda_client=made.aws, function_name="scaler", clock=lambda: float(NOW)),
     )
     made.app = build_app(forwarding_handlers(forwarding), local=local, metrics=made.metrics)
     return made
@@ -463,8 +443,6 @@ def test_the_gateway_publishes_no_cloudwatch_metric() -> None:
     made = gateway(OTTER)
     for entry in routes.TABLE:
         assert call(made.app, entry.method, entry.path, key=made.keys["otter"], body=body(entry)) == 200
-    # Counting a request calls AWS for nothing: the doubles were asked what the wake asks, and they have no other call.
-    assert made.aws.calls <= {"describe_target_health", "get_item", "invoke"}
     # No module of the gateway names the call that writes a CloudWatch metric, or the log format that makes one.
     writes_a_metric = re.compile(r"put_metric_data|PutMetricData|CloudWatchMetrics|[\"']_aws[\"']")
     sources = sorted((ROOT / "services" / "gateway" / "rhi_gateway").rglob("*.py"))

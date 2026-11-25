@@ -1,20 +1,18 @@
-"""What the gateway knows of each pool (`rhi_gateway.readiness`) and the wakes it asks for (`rhi_gateway.waker`).
+"""What the gateway knows of each pool (`rhi_gateway.readiness`).
 
-Doubles stand in for the load-balancing API, the pool-state table and the scaler: each exposes only
-the one call the modules may make and records every call. The clock is fake, and `run` is given a
+Doubles stand in for the load-balancing API and the pool-state table: each exposes only
+the one call the module may make and records every call. The clock is fake, and `run` is given a
 sleep that moves it. Target groups are opaque names.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import threading
 from typing import Any
 
-from rhi_common.records import Mode, PoolState, ScalerNote
+from rhi_common.causes import Cause
+from rhi_common.records import Mode, PoolState, ScalerNote, Session
 from rhi_gateway.readiness import Readiness
-from rhi_gateway.waker import Waker
 
 POOLS = {"coursework": "group-coursework", "upgrade": "group-upgrade", "mock": "group-mock"}
 START = 1_800_000_000.0
@@ -53,7 +51,7 @@ class PoolStateTable:
         self.failing = False
         self.reads: list[tuple[str, str]] = []
 
-    def put(self, record: PoolState | ScalerNote) -> None:
+    def put(self, record: PoolState | ScalerNote | Session) -> None:
         item = record.to_item()
         self.items[str(item["pool"]), str(item["record"])] = item
 
@@ -63,19 +61,6 @@ class PoolStateTable:
             raise ConnectionError("unreachable")
         item = self.items.get((Key["pool"], Key["record"]))
         return {} if item is None else {"Item": item}
-
-
-class Scaler:
-    """`invoke` on the scaler function; it blocks until `release` is set."""
-
-    def __init__(self) -> None:
-        self.release = threading.Event()
-        self.calls: list[dict[str, Any]] = []
-
-    def invoke(self, **arguments: Any) -> dict[str, Any]:
-        self.release.wait(10)
-        self.calls.append(arguments)
-        return {"StatusCode": 202}
 
 
 def build() -> tuple[Clock, LoadBalancing, PoolStateTable, Readiness]:
@@ -139,27 +124,94 @@ def test_ready_with_one_healthy_target_not_ready_with_none_or_a_failed_read() ->
     assert not readiness.pool("coursework").ready
 
 
-def test_the_records_are_kept_and_a_failed_read_keeps_the_previous_ones() -> None:
+def test_the_note_is_kept_and_a_failed_read_keeps_the_previous_one() -> None:
     _, elbv2, table, readiness = build()
-    mode = PoolState("coursework", Mode.ENABLED, set_by="admin", set_at=1)
-    note = ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=2)
-    table.put(mode)
+    note = ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=2, starting=1)
     table.put(note)
     readiness.refresh()
-    assert (readiness.pool("coursework").mode, readiness.pool("coursework").note) == (mode, note)
-    assert (readiness.pool("upgrade").mode, readiness.pool("upgrade").note) == (None, None)
+    assert (readiness.pool("coursework").note, readiness.pool("upgrade").note) == (note, None)
 
     table.failing = True
     elbv2.states = {"group-coursework": ["healthy"]}
     readiness.refresh()
     view = readiness.pool("coursework")
-    assert (view.ready, view.mode, view.note) == (True, mode, note)
+    assert (view.ready, view.note) == (True, note)
 
+    # An item that is not a note keeps the note last read, and the next note read replaces it.
     table.failing = False
-    disabled = PoolState("coursework", Mode.DISABLED, set_by="admin", set_at=3)
-    table.put(disabled)
+    table.items["coursework", "note"] = {"pool": "coursework", "record": "note"}
     readiness.refresh()
-    assert readiness.pool("coursework").mode == disabled
+    assert readiness.pool("coursework").note == note
+    newer = ScalerNote("coursework", capacity_asked=0, no_capacity_at=5, written_at=6)
+    table.put(newer)
+    readiness.refresh()
+    assert readiness.pool("coursework").note == newer
+
+
+def test_whether_a_pool_can_serve_is_its_session_its_health_and_the_note_s_count_of_instances_starting() -> None:
+    _, elbv2, table, readiness = build()
+    now = int(START)
+
+    def refusal(pool: str, at: int = now) -> Cause | None:
+        readiness.refresh()
+        return readiness.pool(pool).refusal(at, session_max_hours=12)
+
+    assert refusal("coursework") is Cause.NO_SESSION
+    table.put(Session("coursework", instances=1, starts_at=now, ends_at=now + 3600, set_by="owner", set_at=now))
+    # No note, a note stored without the count, and a note that counts none starting: none is starting.
+    assert refusal("coursework") is Cause.CAPACITY_UNAVAILABLE
+    table.items["coursework", "note"] = {"pool": "coursework", "record": "note", "capacity_asked": 1, "written_at": now}
+    assert refusal("coursework") is Cause.CAPACITY_UNAVAILABLE
+    table.put(ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=now, starting=0, waiting=1))
+    assert refusal("coursework") is Cause.CAPACITY_UNAVAILABLE
+    table.put(ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=now, starting=1))
+    assert refusal("coursework") is Cause.WARMING
+    elbv2.states = {"group-coursework": ["healthy"]}
+    assert refusal("coursework") is None
+    # Once the session has ended the pool serves no one, healthy or not.
+    assert refusal("coursework", at=now + 3600) is Cause.NO_SESSION
+
+    # The admin's mode record is not read: whatever it holds, the pool serves by the rule above.
+    for mode in (Mode.DISABLED, Mode.SCHEDULED_ONLY):
+        table.put(PoolState("coursework", mode, set_by="admin", set_at=now))
+        assert refusal("coursework") is None
+    assert ("coursework", "mode") not in table.reads
+
+
+def test_each_pool_keeps_its_own_session_and_a_failed_read_keeps_the_session_last_read() -> None:
+    _, _, table, readiness = build()
+    now = int(START)
+    booked = Session("coursework", instances=2, starts_at=now, ends_at=now + 3600, set_by="owner", set_at=now)
+    table.put(booked)
+    table.failing = True
+    readiness.refresh()
+    # In the table, and not read yet: the pool has no session until a first read succeeds.
+    assert readiness.pool("coursework").session is None
+    table.failing = False
+    readiness.refresh()
+    assert {pool: readiness.pool(pool).session for pool in POOLS} == {
+        "coursework": booked,
+        "upgrade": None,
+        "mock": None,
+    }
+
+    # Stopped in the table, behind a read that fails, and then an item that is no session: the session last read is kept.
+    stopped = Session("coursework", instances=2, starts_at=now, ends_at=now + 60, set_by="owner", set_at=now + 60)
+    table.put(stopped)
+    table.failing = True
+    readiness.refresh()
+    assert readiness.pool("coursework").session == booked
+    table.failing = False
+    table.items["coursework", "session"] = {"pool": "coursework", "record": "session"}
+    readiness.refresh()
+    assert readiness.pool("coursework").session == booked
+    table.put(stopped)
+    readiness.refresh()
+    assert readiness.pool("coursework").session == stopped
+    # No item is an answer: the pool has no session.
+    del table.items["coursework", "session"]
+    readiness.refresh()
+    assert readiness.pool("coursework").session is None
 
 
 def test_each_pool_gives_the_rebalance_number_of_the_note_last_read() -> None:
@@ -188,127 +240,14 @@ def test_read_every_5_seconds_for_every_pool() -> None:
     assert slept == [5.0] * 6
     for pool, group in POOLS.items():
         assert [at for read, at in elbv2.reads if read == group] == [START + 5 * n for n in range(6)]
-        assert table.reads.count((pool, "mode")) == 6
         assert table.reads.count((pool, "note")) == 6
-    # The session switch, once a cycle with the pools' records.
-    assert table.reads.count(("_session", "switch")) == 6
+        # The pool's session, once a cycle with its note.
+        assert table.reads.count((pool, "session")) == 6
+    # Nothing but the pools' own two records: no pool's mode and no session switch is ever read.
+    assert set(table.reads) == {(pool, record) for pool in POOLS for record in ("note", "session")}
     alone = (len(elbv2.reads), len(table.reads))
 
     clock, elbv2, table, readiness = build()
     _, asked = run_for(readiness, clock, cycles=6, callers=100)
     assert asked >= 100 * len(POOLS)
     assert (len(elbv2.reads), len(table.reads)) == alone
-
-
-def test_ask_returns_before_the_scaler_answers() -> None:
-    _, _, _, readiness = build()
-    scaler = Scaler()
-    waker = Waker(readiness, lambda_client=scaler, function_name="scaler-function")
-    future = waker.ask("coursework")
-    assert not future.done()
-    assert scaler.calls == []
-    scaler.release.set()
-    future.result(timeout=10)
-    [call] = scaler.calls
-    assert call["FunctionName"] == "scaler-function"
-    assert call["InvocationType"] == "Event"
-    assert json.loads(call["Payload"]) == {"pool": "coursework"}
-
-
-def test_an_explicit_wake_is_pending_for_10_minutes_or_until_ready() -> None:
-    clock, elbv2, _, readiness = build()
-    waker = Waker(readiness, lambda_client=Scaler(), function_name="scaler-function", clock=clock)
-    readiness.refresh()
-    waker.record("coursework")
-    waker.record("upgrade")
-    for _ in range(10):
-        clock.now += 5
-        readiness.refresh()
-        assert (waker.pending("coursework"), waker.pending("upgrade")) == (1, 1)
-
-    clock.now += 5
-    turned_healthy = clock.now
-    elbv2.states["group-coursework"] = ["healthy"]
-    readiness.refresh()
-    assert waker.pending("coursework") == 0
-    assert waker.ended_ready_at("coursework") == turned_healthy
-    assert waker.pending("upgrade") == 1
-
-    clock.now = START + 600 - 1
-    readiness.refresh()
-    assert waker.pending("upgrade") == 1
-    clock.now = START + 600
-    assert waker.pending("upgrade") == 0
-    assert waker.ended_ready_at("upgrade") is None
-
-    waker.record("coursework")  # on a ready pool, it ends at once
-    assert waker.pending("coursework") == 0
-    assert waker.ended_ready_at("coursework") == START + 600
-
-
-def test_each_record_keeps_its_previous_value_when_only_its_read_fails() -> None:
-    _, _, table, readiness = build()
-    mode = PoolState("coursework", Mode.ENABLED, set_by="admin", set_at=1)
-    table.put(mode)
-    table.put(ScalerNote("coursework", capacity_asked=1, no_capacity_at=None, written_at=2))
-    readiness.refresh()
-    newer = ScalerNote("coursework", capacity_asked=0, no_capacity_at=5, written_at=6)
-    table.put(newer)
-    table.items["coursework", "mode"] = {"pool": "coursework", "record": "mode"}  # not a mode record
-    readiness.refresh()
-    assert (readiness.pool("coursework").mode, readiness.pool("coursework").note) == (mode, newer)
-
-
-def test_a_wake_ends_ready_only_at_what_a_read_observed_while_the_clock_moved(monkeypatch: Any) -> None:
-    clock, elbv2, table, readiness = build()
-    waker = Waker(readiness, lambda_client=Scaler(), function_name="scaler-function", clock=clock)
-    read_health, read_record = elbv2.describe_target_health, table.get_item
-
-    def health_answers_after(during: Any) -> None:
-        def slow(**arguments: Any) -> dict[str, Any]:
-            during()
-            return read_health(**arguments)
-
-        monkeypatch.setattr(elbv2, "describe_target_health", slow)
-
-    # A wake recorded while the read is in flight ends when the answer comes back, not before.
-    def request_arrives() -> None:
-        clock.now = START + 1
-        waker.record("coursework")
-        clock.now = START + 2
-
-    elbv2.states["group-coursework"] = ["healthy"]
-    health_answers_after(request_arrives)
-    readiness.refresh()
-    assert (waker.pending("coursework"), waker.ended_ready_at("coursework")) == (0, START + 2)
-
-    # Health first seen ready after a wake's 10 minutes: that wake expired, it did not end ready.
-    waker.record("mock")
-
-    def turns_healthy_after_expiry() -> None:
-        clock.now = START + 2 + 601
-        elbv2.states["group-mock"] = ["healthy"]
-
-    clock.now = START + 2 + 599
-    health_answers_after(turns_healthy_after_expiry)
-    readiness.refresh()
-    assert (waker.pending("mock"), waker.ended_ready_at("mock")) == (0, None)
-
-    # Seen ready before expiry, published after it: a caller asking in between erases nothing.
-    monkeypatch.setattr(elbv2, "describe_target_health", read_health)
-    clock.now = START + 1000
-    elbv2.states["group-upgrade"] = []
-    readiness.refresh()
-    waker.record("upgrade")
-    elbv2.states["group-upgrade"] = ["healthy"]
-    clock.now = START + 1000 + 599
-
-    def slow_record(**arguments: Any) -> dict[str, Any]:
-        if arguments["Key"]["pool"] == "upgrade":
-            clock.now = START + 1000 + 601
-            waker.pending("upgrade")
-        return read_record(**arguments)
-
-    monkeypatch.setattr(table, "get_item", slow_record)
-    readiness.refresh()
-    assert (waker.pending("upgrade"), waker.ended_ready_at("upgrade")) == (0, START + 1000 + 599)
