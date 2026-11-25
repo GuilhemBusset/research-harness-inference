@@ -294,6 +294,23 @@ def test_with_no_session_at_all_a_request_is_refused_before_its_body_is_read(
     assert gateway.nothing_was_asked()
 
 
+@ROUTES
+def test_a_request_for_a_pool_without_a_session_is_answered_no_session_whatever_else_its_body_holds(
+    entry: routes.Route,
+) -> None:
+    # An object where the route's allow-list describes an array: the filter refuses such a body.
+    gateway = Gateway(session("coursework"))
+    field = "input" if entry == routes.RESPONSES else "messages"
+
+    def refused_body(pool: str) -> dict[str, Any]:
+        return body(entry, pool) | {field: {"role": "user", "content": "hello"}}
+
+    assert no_session(gateway.call("POST", entry.path, content=refused_body("mock")))
+    # The same body for the pool in session is judged on its fields.
+    assert gateway.call("POST", entry.path, content=refused_body("coursework")).status_code == 400
+    assert gateway.nothing_was_asked()
+
+
 @pytest.mark.parametrize(
     ("booked", "session_max_hours", "served"),
     [

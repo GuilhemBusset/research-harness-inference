@@ -57,10 +57,11 @@ is answered `warming` at once, before any reservation.
 **The session** (sections 5.6 and 6.2, step 5): a pool is served while its session is active, and at
 no other time, for every key, whoever booked the session. A request names its pool in its body, so
 the check is made twice. As the handler's first step, while no pool's session is active, the
-request ends with the cause `no_session`, in its wire format, before its body is read. Then, once
-the body filter has named the pool, a request for a pool whose session is not active ends with
-`no_session`: before the hold's first step and before the reservation, so no slot is taken, nothing
-is held or woken and the scaler sees no demand from it. Whether a session is active is the shared
+request ends with the cause `no_session`, in its wire format, before its body is read. Then, as
+soon as the body filter has named the pool (`rhi_gateway.body.Admit`), a request for a pool whose
+session is not active ends with `no_session`: before the filter judges any other field, before the
+hold's first step and before the reservation, so no slot is taken, nothing is held or woken and
+the scaler sees no demand from it. Whether a session is active is the shared
 rule (`rhi_common.sessions.is_active`) on the session the gateway last read for the pool
 (`rhi_gateway.readiness.PoolView.session`), at the time of the task's own clock (`Holding.clock`)
 and under the longest session of the configuration (`Holding.session_max_hours`).
@@ -130,7 +131,7 @@ from rhi_common.pool_config import Pool
 from rhi_common.records import Mode
 from rhi_gateway import routes, telemetry
 from rhi_gateway.affinity import Affinity
-from rhi_gateway.body import BodySource, Forwarded
+from rhi_gateway.body import Admit, BodySource, Forwarded
 from rhi_gateway.budget import Ledger, Reservation
 from rhi_gateway.errors import GatewayError, WireFormat, render_json
 from rhi_gateway.experience import Experience
@@ -306,9 +307,15 @@ class RequestBody:
 
 
 class Filter(Protocol):
-    """The body filter of one route: `rhi_gateway.body.BodyFilter` or a format's own."""
+    """The body filter of one route: `rhi_gateway.body.BodyFilter` or a format's own.
 
-    async def read(self, source: BodySource, *, student: str, request_id: str) -> Forwarded: ...
+    It calls `admit` with the pool as soon as the body has named it, before it judges any other
+    field, and what `admit` raises ends the read.
+    """
+
+    async def read(
+        self, source: BodySource, *, student: str, request_id: str, admit: Admit | None = None
+    ) -> Forwarded: ...
 
 
 # How often a held request reads the kept view of its pool, in seconds, besides the moments the
@@ -588,17 +595,21 @@ def _forward(forwarding: Forwarding, body_filter: Filter) -> Callable[[Request, 
         request_id = uuid.uuid4().hex
         holding = forwarding.holding
         held: _Held | None = None
+
+        def admit(pool: Pool) -> None:
+            # The body has named the pool: a request for one with no active session ends here, whatever
+            # else its body holds, and nothing is reserved, held or woken for it (section 6.2, step 5).
+            telemetry.note_pool(pool.name)
+            if not holding.in_session(pool):
+                raise GatewayError(Cause.NO_SESSION)
+
         try:
             if not holding.any_session():
                 # No pool is served: the request is refused before its body is read (section 6.2, step 5).
                 raise GatewayError(Cause.NO_SESSION)
             forwarded = await body_filter.read(
-                RequestBody(request.receive), student=str(student.github_id), request_id=request_id
+                RequestBody(request.receive), student=str(student.github_id), request_id=request_id, admit=admit
             )
-            telemetry.note_pool(forwarded.pool.name)
-            if not holding.in_session(forwarded.pool):
-                # The body has named the pool: nothing is reserved, held or woken for one with no active session.
-                raise GatewayError(Cause.NO_SESSION)
             if entry == routes.COUNT_TOKENS:
                 # A cheap call: never held, never a wake, never demand (section 5.3).
                 if not holding.view(forwarded.pool).ready:
