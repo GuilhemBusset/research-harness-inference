@@ -1,28 +1,31 @@
-"""The scaler's decision (`rhi_scaler.decide`): wake, stop and scale to zero."""
+"""The scaler's decision (`rhi_scaler.decide`): each pool at the size its session asks for."""
 
 from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 from pathlib import Path
 
+import pytest
+
 import rhi_scaler.decide
-from rhi_common.pool_config import DEFAULT_IDLE_MINUTES, parse_pools
-from rhi_common.records import FRESH_SECONDS, GatewayHeartbeat, InstanceHeartbeat, Mode
+from rhi_common.pool_config import parse_pools
+from rhi_common.records import FRESH_SECONDS, GatewayHeartbeat, InstanceHeartbeat, Mode, Session
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Reason, Supply
 
 NOW = 1_800_000_000
 MINUTE = 60
+HOUR = 3600
 
-# A pool that leaves `idle_minutes` out, so it has the default: 20.
 POOL = parse_pools(
     {
         "coursework": {
             "engine": "mock",
             "instance_types": ["g6e.xlarge"],
             "prices": {"g6e.xlarge": 1.86},
-            "max_instances": 2,
+            "max_instances": 5,
             "warm_instances": 1,
             "wake": "on-demand",
             "target_concurrency": 8,
@@ -35,21 +38,16 @@ AT_ZERO = Supply(desired=0)
 TWO_IN_SERVICE = Supply(desired=2, in_service=("instance-a", "instance-b"), running=("instance-a", "instance-b"))
 
 
+def session(instances: int = 2, *, starts_at: int = NOW - HOUR, ends_at: int = NOW + HOUR) -> Session:
+    """A session of the pool, active at `NOW` unless its times say otherwise."""
+    return Session(POOL.name, instances, starts_at, ends_at, set_by="instructor", set_at=starts_at - HOUR)
+
+
 def gateway(
-    task: str = "task-1",
-    *,
-    in_flight: int = 0,
-    held: int = 0,
-    last_request_at: int | None = None,
-    written_at: int = NOW,
+    task: str = "task-1", *, in_flight: int = 0, held: int = 0, last_request_at: int | None = None
 ) -> GatewayHeartbeat:
     return GatewayHeartbeat(
-        task=task,
-        pool=POOL.name,
-        in_flight=in_flight,
-        held=held,
-        last_request_at=last_request_at,
-        written_at=written_at,
+        task=task, pool=POOL.name, in_flight=in_flight, held=held, last_request_at=last_request_at, written_at=NOW
     )
 
 
@@ -66,145 +64,221 @@ def instance(name: str, *, running: int = 0, waiting: int = 0, written_at: int =
     )
 
 
-def pool_inputs(
-    supply: Supply,
-    *gateways: GatewayHeartbeat,
-    mode: Mode = Mode.ENABLED,
-    instances: tuple[InstanceHeartbeat, ...] = (),
-    memory: Memory = Memory(),  # noqa: B008 - a frozen value, never changed
-) -> PoolInputs:
-    return PoolInputs(
-        config=POOL,
-        mode=mode,
-        supply=supply,
-        gateway_heartbeats=gateways,
-        instance_heartbeats=instances,
-        memory=memory,
-    )
-
-
-def decide_one(pool: PoolInputs, now: int = NOW) -> PoolDecision:
-    (decision,) = decide(Inputs(now=now, pools=(pool,))).pools
+def decide_one(supply: Supply, *, session_max_hours: int = 12, **fields: object) -> PoolDecision:
+    """The decision of one run at `NOW` for the pool with that supply, and the inputs `fields` give."""
+    pool = dataclasses.replace(PoolInputs(config=POOL, mode=Mode.ENABLED, supply=supply), **fields)
+    (decision,) = decide(Inputs(now=NOW, pools=(pool,), session_max_hours=session_max_hours)).pools
     assert decision.pool == POOL.name
     assert isinstance(decision.reason, Reason)
     assert decision.suspend_launches is False
     return decision
 
 
-def test_twenty_held_requests_ask_for_exactly_one_instance() -> None:
-    held = (
-        gateway("task-1", held=12, last_request_at=NOW),
-        gateway("task-2", held=8, last_request_at=NOW - 3),
+@pytest.mark.parametrize(
+    ("record", "session_max_hours", "requested"),
+    [
+        (None, 12, 0),
+        (session(2, starts_at=NOW + 1), 12, 0),
+        (session(2, starts_at=NOW), 12, 2),
+        (session(2), 12, 2),
+        # More than the pool's `max_instances`: the pool's.
+        (session(9), 12, 5),
+        # The end is excluded.
+        (session(2, ends_at=NOW), 12, 0),
+        # An end later than the longest session: the session ended `session_max_hours` after its start.
+        (session(2, starts_at=NOW - 2 * HOUR, ends_at=NOW + HOUR), 3, 2),
+        (session(2, starts_at=NOW - 2 * HOUR, ends_at=NOW + HOUR), 2, 0),
+    ],
+)
+def test_the_size_is_what_the_session_asks_for(record: Session | None, session_max_hours: int, requested: int) -> None:
+    # A group asked for nothing, one that holds two, and one asked for four that has two.
+    for supply in (AT_ZERO, TWO_IN_SERVICE, dataclasses.replace(TWO_IN_SERVICE, desired=4)):
+        decision = decide_one(supply, session=record, session_max_hours=session_max_hours)
+        assert (decision.requested, decision.desired) == (requested, requested)
+        # All of it at once, whatever the group was asked for before.
+        if requested > supply.desired:
+            assert (decision.reason, decision.lift_protection) == (Reason.PROVISION, ())
+        elif requested == supply.desired:
+            assert (decision.reason, decision.lift_protection) == (Reason.UNCHANGED, ())
+        else:
+            assert decision.reason is Reason.RELEASE
+            assert decision.lift_protection == supply.in_service[requested:]
+
+
+def test_release_order() -> None:
+    # Four in service, and one still starting whose agent already reports nothing running.
+    names = ("instance-a", "instance-b", "instance-c", "instance-d")
+    supply = Supply(desired=5, in_service=names, starting=("instance-e",), running=(*names, "instance-e"))
+    reports = (
+        # By the requests running alone, instance a would leave before instance c.
+        instance("instance-a", running=1, waiting=3),
+        instance("instance-b"),
+        instance("instance-c", running=2),
+        instance("instance-d"),
+        instance("instance-e"),
     )
 
-    woken = decide_one(pool_inputs(AT_ZERO, *held))
+    def released(instances: int) -> tuple[str, ...]:
+        decision = decide_one(supply, session=session(instances), instance_heartbeats=reports)
+        assert (decision.desired, decision.reason) == (instances, Reason.RELEASE)
+        return decision.lift_protection
 
-    assert (woken.desired, woken.lift_protection, woken.reason) == (1, (), Reason.WAKE)
-    # Once the instance is asked for, the requests still held ask for no other.
-    starting = Supply(desired=1, starting=("instance-a",), running=("instance-a",))
-    waiting = decide_one(pool_inputs(starting, *held))
-    assert (waiting.desired, waiting.lift_protection, waiting.reason) == (1, (), Reason.UNCHANGED)
-    # A row that is no longer fresh is not demand.
-    stale = gateway(held=20, last_request_at=NOW, written_at=NOW - FRESH_SECONDS - 1)
-    assert decide_one(pool_inputs(AT_ZERO, stale)).desired == 0
-
-
-def test_an_idle_pool_goes_to_zero_at_idle_minutes_naming_both_instances() -> None:
-    assert POOL.idle_minutes == DEFAULT_IDLE_MINUTES == 20
-
-    def at(minutes: int) -> PoolDecision:
-        # The same request, judged by a run that many minutes after it was received.
-        now = NOW + minutes * MINUTE
-        return decide_one(pool_inputs(TWO_IN_SERVICE, gateway(last_request_at=NOW, written_at=now)), now)
-
-    kept, released = at(19), at(20)
-
-    assert (kept.desired, kept.lift_protection, kept.reason) == (2, (), Reason.UNCHANGED)
-    assert (released.desired, released.reason) == (0, Reason.IDLE)
-    assert released.lift_protection == ("instance-a", "instance-b")
-    assert kept.memory.last_request_at == released.memory.last_request_at == NOW
+    # Four asked for and four in service: the starting one is no longer asked for, and nobody is named.
+    assert released(4) == ()
+    # The two that report nothing running and nothing waiting leave before a busy one.
+    assert released(3) == ("instance-b",)
+    assert released(2) == ("instance-b", "instance-d")
+    # Then the busy ones, the fewest requests running and waiting first.
+    assert released(1) == ("instance-b", "instance-c", "instance-d")
+    # No session: every instance in service, and never the one that is starting.
+    ended = decide_one(supply, session=session(2, ends_at=NOW), instance_heartbeats=reports)
+    assert (ended.desired, ended.lift_protection, ended.reason) == (0, names, Reason.RELEASE)
 
 
-def test_going_to_zero_names_every_instance_of_the_pool_in_any_state() -> None:
+def test_an_instance_that_reports_nothing_fresh_is_released_last() -> None:
+    stale = NOW - FRESH_SECONDS - 1
+    reports = (instance("instance-a", written_at=stale), instance("instance-b", running=6, waiting=2))
+    # Instance a reported nothing running, too long ago: what it runs now is not known.
+    one = decide_one(TWO_IN_SERVICE, session=session(1), instance_heartbeats=reports)
+    assert (one.desired, one.lift_protection) == (1, ("instance-b",))
+    silent = decide_one(TWO_IN_SERVICE, session=session(1), instance_heartbeats=reports[1:])
+    assert silent.lift_protection == ("instance-b",)
+
+
+def test_an_instance_still_in_service_after_the_capacity_was_lowered_is_named() -> None:
+    # The capacity is already two, and a third instance came into service all the same.
+    names = ("instance-a", "instance-b", "instance-c")
+    supply = Supply(desired=2, in_service=names, running=names)
+    reports = (instance("instance-a", running=2), instance("instance-b", running=1), instance("instance-c"))
+    decision = decide_one(supply, session=session(2), instance_heartbeats=reports)
+    assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.RELEASE)
+
+
+def test_an_instance_the_group_holds_in_service_that_does_not_serve_can_be_released() -> None:
+    # Instance c is in service for the group, so it is protected, and its target is not healthy:
+    # the supply lists it as starting. Instance d is still being launched.
+    names = ("instance-a", "instance-b", "instance-c", "instance-d")
     supply = Supply(
-        desired=1,
-        in_service=("instance-a",),
-        starting=("instance-b",),
-        draining=("instance-c",),
-        # One in a state the supply does not list (in standby) is in none of the three.
-        running=("instance-a", "instance-b", "instance-c", "instance-d"),
+        desired=4,
+        in_service=names[:2],
+        starting=names[2:],
+        running=names,
+        not_serving=("instance-c",),
     )
+    reports = (instance("instance-a"), instance("instance-b", running=3))
+    # It counts against the session's number.
+    three = decide_one(supply, session=session(3), instance_heartbeats=reports)
+    assert (three.desired, three.lift_protection, three.reason) == (3, (), Reason.RELEASE)
+    # It reports nothing: it leaves after the instance that reports itself idle, before the busy one.
+    two = decide_one(supply, session=session(2), instance_heartbeats=reports)
+    assert (two.desired, two.lift_protection, two.reason) == (2, ("instance-a",), Reason.RELEASE)
+    one = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert one.lift_protection == ("instance-a", "instance-c")
+    # The session is over: every instance the group protects, and never the one it still launches.
+    ended = decide_one(supply, session=session(2, ends_at=NOW), instance_heartbeats=reports)
+    assert (ended.desired, ended.lift_protection, ended.reason) == (0, names[:3], Reason.RELEASE)
 
-    released = decide_one(pool_inputs(supply, gateway(last_request_at=NOW - 20 * MINUTE)))
 
-    assert released.desired == 0
-    assert released.lift_protection == ("instance-a", "instance-b", "instance-c", "instance-d")
-    # A pool that is at zero already is left alone.
-    resting = decide_one(pool_inputs(Supply(desired=0)))
-    assert (resting.desired, resting.lift_protection, resting.reason) == (0, (), Reason.UNCHANGED)
+def test_what_an_instance_reports_comes_before_the_health_of_its_target() -> None:
+    # The group holds both in service. The one whose target is not healthy still has requests.
+    names = ("instance-a", "instance-b")
+    supply = Supply(desired=2, in_service=names[:1], starting=names[1:], running=names, not_serving=names[1:])
+    reports = (instance("instance-a"), instance("instance-b", running=1, waiting=2))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert (decision.desired, decision.lift_protection, decision.reason) == (1, ("instance-a",), Reason.RELEASE)
+    # The other way round, the idle one is the one that does not serve.
+    reports = (instance("instance-a", running=1, waiting=2), instance("instance-b"))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert decision.lift_protection == ("instance-b",)
+    # Among those that report requests, the fewest first, whichever serves.
+    reports = (instance("instance-a", running=2), instance("instance-b", running=1, waiting=2))
+    decision = decide_one(supply, session=session(1), instance_heartbeats=reports)
+    assert decision.lift_protection == ("instance-a",)
 
 
-def test_a_request_in_flight_keeps_the_pool() -> None:
-    long_ago = NOW - 25 * MINUTE
+def test_a_raise_keeps_its_reason_in_a_run_that_names_instances() -> None:
+    # An earlier run lowered the capacity to one and the two instances it named have not left yet;
+    # the session now asks for two.
+    names = ("instance-a", "instance-b", "instance-c")
+    supply = Supply(desired=1, in_service=names, running=names)
+    reports = (instance("instance-a", running=2), instance("instance-b", running=1), instance("instance-c"))
+    decision = decide_one(supply, session=session(2), instance_heartbeats=reports)
+    assert (decision.desired, decision.lift_protection, decision.reason) == (2, ("instance-c",), Reason.PROVISION)
 
-    busy = decide_one(pool_inputs(TWO_IN_SERVICE, gateway(in_flight=1, last_request_at=long_ago)))
 
-    assert (busy.desired, busy.lift_protection, busy.reason) == (2, (), Reason.UNCHANGED)
-    # One request on two instances is a low load too: its 10 minutes start.
-    assert busy.memory == Memory(
-        last_request_at=long_ago, last_in_flight_at=NOW, low_load_since=NOW, last_gateway_at=NOW
+def test_no_rule_reads_demand() -> None:
+    long_ago = NOW - 6 * HOUR
+    gateways: tuple[tuple[GatewayHeartbeat, ...], ...] = (
+        (),
+        (gateway(held=12, last_request_at=NOW), gateway("task-2", held=8, last_request_at=NOW)),
+        (gateway(in_flight=40, last_request_at=NOW),),
+        (gateway(last_request_at=long_ago),),
     )
+    memories = (
+        Memory(),
+        # What the rules of load, of idleness and of the silent gateway kept.
+        Memory(
+            last_request_at=long_ago,
+            last_in_flight_at=long_ago,
+            above_target_since=NOW - 10 * MINUTE,
+            waiting_since=(("instance-a", NOW - 10 * MINUTE),),
+            last_scale_out_at=long_ago,
+            low_load_since=long_ago,
+            last_gateway_at=NOW - HOUR,
+        ),
+    )
+    # Both instances run as many requests as the target, and more wait on each.
+    full = (instance("instance-a", running=8, waiting=4), instance("instance-b", running=8, waiting=4))
+    idle = (instance("instance-a"), instance("instance-b"))
+    # Each pool: its supply, its session and what its instances report.
+    pools: dict[str, tuple[Supply, Session | None, tuple[InstanceHeartbeat, ...]]] = {
+        "at zero, no session": (AT_ZERO, None, ()),
+        "full, at its session's number": (TWO_IN_SERVICE, session(2), full),
+        "idle, at its session's number": (TWO_IN_SERVICE, session(2), idle),
+        "above its session's number": (TWO_IN_SERVICE, session(1), idle),
+    }
 
-    # The request has ended: the pool is idle from the last run that saw it, not from its arrival.
-    def after(minutes: int) -> PoolDecision:
-        now = NOW + minutes * MINUTE
-        quiet = gateway(last_request_at=long_ago, written_at=now)
-        return decide_one(pool_inputs(TWO_IN_SERVICE, quiet, memory=busy.memory), now)
+    decisions: dict[str, PoolDecision] = {}
+    for name, (supply, record, reports) in pools.items():
+        # The same decision, whatever the gateways' heartbeats, the mode and the old memory say.
+        seen = {
+            decide_one(
+                supply,
+                session=record,
+                instance_heartbeats=reports,
+                gateway_heartbeats=heartbeats,
+                mode=mode,
+                memory=memory,
+            )
+            for heartbeats, mode, memory in itertools.product(gateways, Mode, memories)
+        }
+        assert len(seen) == 1, name
+        (decisions[name],) = seen
+        # And the memory's attributes of load, of idleness and of the gateway are left empty: it
+        # holds what the rebalance counts, and nothing else.
+        assert dataclasses.replace(decisions[name].memory, queuing_since=()) == Memory(), name
 
-    assert after(19).desired == 2
-    assert (after(20).desired, after(20).lift_protection) == (0, ("instance-a", "instance-b"))
+    def outcome(name: str) -> tuple[int, tuple[str, ...], Reason]:
+        return decisions[name].desired, decisions[name].lift_protection, decisions[name].reason
+
+    # Held requests wake nothing.
+    assert outcome("at zero, no session") == (0, (), Reason.UNCHANGED)
+    # A full pool does not grow.
+    assert outcome("full, at its session's number") == (2, (), Reason.UNCHANGED)
+    # An idle pool stays at its session's number, in any mode, and a silent gateway releases nothing.
+    assert outcome("idle, at its session's number") == (2, (), Reason.UNCHANGED)
+    # What is released is what the session no longer asks for, and nothing else decides it.
+    assert outcome("above its session's number") == (1, ("instance-a",), Reason.RELEASE)
 
 
-def test_a_replaced_gateway_task_is_not_idleness() -> None:
-    one = Supply(desired=1, in_service=("instance-a",), running=("instance-a",))
-    memory = Memory(last_request_at=NOW - 5 * MINUTE)
-    # The rows of the tasks that replaced the old ones: no request in them yet.
-    new_tasks = (gateway("task-3"), gateway("task-4"))
-
-    kept = decide_one(pool_inputs(one, *new_tasks, memory=memory))
-
-    assert (kept.desired, kept.lift_protection, kept.reason) == (1, (), Reason.UNCHANGED)
-    assert kept.memory.last_request_at == NOW - 5 * MINUTE
-    # Without the memory the same rows are an idle pool.
-    assert decide_one(pool_inputs(one, *new_tasks)).desired == 0
-
-
-def test_stopped_pools_are_not_woken() -> None:
-    held = gateway(held=3, last_request_at=NOW)
-    for mode in (Mode.DISABLED, Mode.SCHEDULED_ONLY):
-        asleep = decide_one(pool_inputs(AT_ZERO, held, mode=mode))
-        assert (asleep.desired, asleep.lift_protection, asleep.reason) == (0, (), Reason.NOT_WOKEN)
-
-    # One busy and one idle instance, and a request received this second.
-    busy, idle = instance("instance-a", running=1), instance("instance-b")
-    demand = gateway(in_flight=1, last_request_at=NOW)
-    for mode in (Mode.DISABLED,):
-        stopped = decide_one(pool_inputs(TWO_IN_SERVICE, demand, mode=mode, instances=(busy, idle)))
-        assert (stopped.desired, stopped.lift_protection, stopped.reason) == (1, ("instance-b",), Reason.STOPPED)
-        # Waiting requests, or a report that is no longer fresh, keep an instance.
-        for unsure in (
-            instance("instance-b", waiting=1),
-            instance("instance-b", written_at=NOW - FRESH_SECONDS - 1),
-        ):
-            kept = decide_one(pool_inputs(TWO_IN_SERVICE, demand, mode=mode, instances=(busy, unsure)))
-            assert (kept.desired, kept.lift_protection, kept.reason) == (2, (), Reason.UNCHANGED)
-    # Nobody asked to stop a scheduled-only pool: only idleness lowers it.
-    scheduled = pool_inputs(TWO_IN_SERVICE, demand, mode=Mode.SCHEDULED_ONLY, instances=(busy, idle))
-    assert (decide_one(scheduled).desired, decide_one(scheduled).lift_protection) == (2, ())
-    # The disabled mode is the only one that stops a pool.
-    for mode in Mode:
-        reason = decide_one(pool_inputs(TWO_IN_SERVICE, demand, mode=mode, instances=(busy, idle))).reason
-        assert (reason is Reason.STOPPED) == (mode is Mode.DISABLED), mode
+def test_the_reasons() -> None:
+    assert {reason.value for reason in Reason} == {
+        "provision",
+        "release",
+        "rebalance",
+        "launch-suspended",
+        "unchanged",
+    }
 
 
 def test_the_decision_is_a_function_of_its_inputs_alone() -> None:
@@ -218,15 +292,18 @@ def test_the_decision_is_a_function_of_its_inputs_alone() -> None:
         for alias in node.names
     }
     assert imported == {"__future__", "rhi_common.records", "rhi_common.sessions", "rhi_scaler.model"}
+    # It reads neither the gateways' heartbeats nor the pool's mode, which the inputs still carry.
+    read = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not read & {"gateway_heartbeats", "mode"}
 
     # Every pool of the inputs gets its decision, in order, and the same inputs get the same one.
     inputs = Inputs(
         now=NOW,
         pools=(
-            pool_inputs(AT_ZERO, gateway(held=1, last_request_at=NOW)),
-            pool_inputs(TWO_IN_SERVICE, gateway(last_request_at=NOW - 20 * MINUTE)),
+            PoolInputs(config=POOL, mode=Mode.ENABLED, supply=AT_ZERO, session=session(3)),
+            PoolInputs(config=POOL, mode=Mode.ENABLED, supply=TWO_IN_SERVICE),
         ),
     )
     decision = decide(inputs)
-    assert [(pool.desired, pool.reason) for pool in decision.pools] == [(1, Reason.WAKE), (0, Reason.IDLE)]
+    assert [(pool.desired, pool.reason) for pool in decision.pools] == [(3, Reason.PROVISION), (0, Reason.RELEASE)]
     assert decide(dataclasses.replace(inputs)) == decision

@@ -71,12 +71,12 @@ def last(now: int, note: ScalerNote = QUIET, session: Session | None = None) -> 
 
 def test_the_decisions_counter_counts_from_zero_and_keeps_counting() -> None:
     counts = DecisionCounts()
-    first = run(NOW, Reason.WAKE, counts)
+    first = run(NOW, Reason.PROVISION, counts)
     # A series the process sends for the first time starts at zero, so the first decision counts.
-    assert first[(DECISIONS, "mock", "wake")] == [(0.0, NOW * 1000 - 1), (1.0, NOW * 1000)]
+    assert first[(DECISIONS, "mock", "provision")] == [(0.0, NOW * 1000 - 1), (1.0, NOW * 1000)]
     second = run(NOW + 60, Reason.UNCHANGED, counts)
     third = run(NOW + 120, Reason.UNCHANGED, counts)
-    assert second[(DECISIONS, "mock", "wake")] == [(1.0, (NOW + 60) * 1000)]
+    assert second[(DECISIONS, "mock", "provision")] == [(1.0, (NOW + 60) * 1000)]
     assert third[(DECISIONS, "mock", "unchanged")] == [(2.0, (NOW + 120) * 1000)]
     assert third[("rhi_scaler_instances_in_service", "mock")] == [(1.0, (NOW + 120) * 1000)]
 

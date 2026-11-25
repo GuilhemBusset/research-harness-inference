@@ -28,6 +28,12 @@ class Supply:
     `desired` is the group's desired capacity. The three states each list their instances: in
     service, starting (launched and not yet in service) and draining (leaving service). `running`
     lists every running instance of the group in any state.
+
+    An instance is in service here when it serves: the group holds it in service and its target is
+    healthy. `not_serving` lists the instances the group holds in service that do not serve, since
+    their target is not healthy: each is also listed as starting or as draining. Scale-in
+    protection starts when the group puts an instance in service (`docs/design/evidence.md`, E32),
+    so these have one to lift, which an instance the group still launches has not.
     """
 
     desired: int
@@ -35,48 +41,33 @@ class Supply:
     starting: tuple[str, ...] = ()
     draining: tuple[str, ...] = ()
     running: tuple[str, ...] = ()
+    not_serving: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Memory:
     """What the scaler keeps about a pool from one run to the next, in the pool-state table.
 
-    `last_request_at` is the time of the last request received. A gateway task that is replaced
-    starts a heartbeat row with no request in it, so the heartbeats alone would make a gateway
-    deployment look like an idle pool. `last_in_flight_at` is the time of the last run that saw a
-    request in flight or held: a request can outlast `idle_minutes`, and the pool is not idle the
-    moment it ends.
+    Three attributes serve the launch loop (section 5.1). `launch_suspended` is its mark, the
+    attribute `rhi_common.tables.LAUNCH_SUSPENDED` of the pool's memory item: a run sets it when
+    three launches were abandoned in a row, and only the admin sets it back to false.
+    `suspended_at` is the time of the run that set it, and `None` while no mark stands: a mark that
+    is false while `suspended_at` is set is a mark the admin has cleared. `abandons_counted_from`
+    is the time of the run that found the mark cleared, and `None` before any did: the edge counts
+    no abandoned launch before it, since the group's activity history still holds the ones that set
+    the mark.
 
-    The other two time how long a pool has been measurably full, which is what makes it grow.
-    `above_target_since` is the time of the first of the runs in a row that saw the requests in
-    flight, averaged over the instances in service, above `target_concurrency`, and `None` when the
-    last run did not. `waiting_since` pairs, in sorted order, each instance in service that reports
-    waiting requests while no instance of the pool has room with the time of the first of the runs
-    in a row that saw it so. It is empty as soon as an instance has room.
+    Three serve the rebalance (sections 5.1 and 5.5). `queuing_since` pairs, in sorted order, each
+    instance in service that reports waiting requests with the time of the first of the runs in a
+    row that saw it so, whether or not another instance has room. `rebalance_number` is the pool's
+    rebalance number, 0 until a run first raises it. `last_rebalance_at` is the time of the run
+    that last raised it, and `None` when none has.
 
-    The last two time how long a pool of two instances or more has been light, which is what makes
-    it shrink. `last_scale_out_at` is the time of the last run that grew the pool, and `None` when
-    no run is known to have. `low_load_since` is the time of the first of the runs in a row that
-    saw two instances or more in service and the requests in flight at most (n - 1) times half of
-    `target_concurrency`, and `None` when the last run did not, or when it removed an instance.
-
-    The next four serve the fail-safes (section 5.1). `last_gateway_at` is the time of the last fresh
-    gateway heartbeat seen (when it was written), and `None` when no run has seen one: nobody can
-    reach the fleet without the gateway, so a pool none has reported on for 10 minutes goes to
-    zero. `launch_suspended` is the mark of the launch loop, the attribute
-    `rhi_common.tables.LAUNCH_SUSPENDED` of the pool's memory item: a run sets it when three
-    launches were abandoned in a row, and only the admin sets it back to false. `suspended_at` is
-    the time of the run that set it, and `None` while no mark stands: a mark that is false while
-    `suspended_at` is set is a mark the admin has cleared. `abandons_counted_from` is the time of the
-    run that found the mark cleared, and `None` before any did: the edge counts no abandoned launch
-    before it, since the group's activity history still holds the ones that set the mark.
-
-    The last three serve the rebalance (sections 5.1 and 5.5). `queuing_since` pairs, in sorted
-    order, each instance in service that reports waiting requests with the time of the first of
-    the runs in a row that saw it so, whether or not another instance has room: unlike
-    `waiting_since`, it goes on while the pool grows. `rebalance_number` is the pool's rebalance
-    number, 0 until a run first raises it. `last_rebalance_at` is the time of the run that last
-    raised it, and `None` when none has.
+    Seven are from the rules that sized a pool by its load, by its idleness and by what the gateway
+    reported: `last_request_at`, `last_in_flight_at`, `above_target_since`, `waiting_since`,
+    `last_scale_out_at`, `low_load_since` and `last_gateway_at`. No rule reads demand any more:
+    `decide` reads none of them and leaves each at its empty value, so a run removes what an
+    earlier one stored.
 
     `outside_sessions_since` only reports (`rhi_scaler.outside_sessions`, sections 11.3 and 17): it
     is the time of the first of the runs in a row that saw an instance of the pool in service while
@@ -86,7 +77,7 @@ class Memory:
     that saw the pool wait for capacity, with fewer instances starting and in service than were
     asked of AWS, and `None` when the last run did not. The edge sets it when it writes the pool's
     note (`rhi_scaler.aws_io.apply`), and `decide` neither reads nor sets it. It is not
-    `waiting_since`, which times the instances whose requests wait.
+    `waiting_since`.
     """
 
     last_request_at: int | None = None
@@ -111,7 +102,9 @@ class PoolInputs:
     """One pool, as a run sees it.
 
     `gateway_heartbeats` and `instance_heartbeats` are the pool's fresh rows of the heartbeats
-    table (`rhi_common.records.is_fresh`); the decision counts no other. `abandoned_launches` is
+    table (`rhi_common.records.is_fresh`). The decision reads the instances' rows, to order a
+    release and for the rebalance, and counts no other. It reads neither `gateway_heartbeats` nor
+    `mode`: the edge still fills them, and no rule sizes a pool by them. `abandoned_launches` is
     the number of launches abandoned in a row, counted by the edge from the group's activity
     history from `Memory.abandons_counted_from`: a launch that reaches service ends a row, and one
     that found no capacity is not abandoned. `session` is the pool's session as its record gives
@@ -142,31 +135,20 @@ class Inputs:
 class Reason(StrEnum):
     """Why a pool's decision is what it is. A decision names one."""
 
-    # The pool's session asks for more instances than the other rules give: the pool goes to the
-    # session's number.
+    # The pool's session asks for more instances than the group was asked for: the pool goes to
+    # the session's number, all at once. A run that also names instances keeps this reason.
     PROVISION = "provision"
-    # A held request asked a pool at zero for one instance.
-    WAKE = "wake"
-    # No request received and none in flight for `idle_minutes`: the pool goes to zero.
-    IDLE = "idle"
-    # The pool is stopped (`disabled`) and releases its idle instances.
-    STOPPED = "stopped"
-    # The instances in service have been full for 60 seconds: the pool grows by one instance.
-    SCALE_OUT = "scale-out"
-    # The load has fit in one instance fewer at half of `target_concurrency` for 10 minutes, 15
-    # minutes after the last scale-out: one instance that reports nothing running leaves.
-    SCALE_IN = "scale-in"
-    # Requests are held for a pool at zero whose mode does not let them wake it.
-    NOT_WOKEN = "not-woken"
-    # No fresh gateway heartbeat for 10 minutes: nobody can reach the fleet, the pool goes to zero.
-    GATEWAY_SILENT = "gateway-silent"
-    # Three launches abandoned in a row: the group's launches are suspended and nothing wakes or
-    # grows the pool until the admin clears the mark.
+    # The pool's session asks for fewer instances than the pool holds, or for none: the capacity
+    # goes down, and the instances in service beyond the session's number are named for release.
+    RELEASE = "release"
+    # Three launches abandoned in a row: the group's launches are suspended and the pool is not
+    # raised until the admin clears the mark. A run that does not raise the pool for it keeps this
+    # reason, even when it names instances.
     LAUNCH_SUSPENDED = "launch-suspended"
     # An instance has waited for 60 seconds while another runs below half of `target_concurrency`:
     # the pool's rebalance number goes up by one, in a run where no other rule acts.
     REBALANCE = "rebalance"
-    # No rule asks for another size, or for another rebalance number.
+    # The pool is at the size its session asks for, and its rebalance number stays.
     UNCHANGED = "unchanged"
 
 
