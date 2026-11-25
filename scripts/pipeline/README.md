@@ -148,7 +148,8 @@ beside the pipeline, `rhi-promote-image`, which the owner starts by hand and not
   `rhi-canary served ...` does it write the candidate's ID to `/rhi/images/<pool>`, and only after
   that write does it start an execution of the pipeline that `RHI_PROMOTE_PIPELINE` names. Any
   other end writes nothing and exits non-zero with a cause of its enumeration `Cause`. It never
-  changes a group's capacity.
+  changes a group's capacity and books no session: its canary start is the one GPU instance that
+  runs outside a session (section 4.3).
 
 The owner starts a promotion with the pool, the candidate's ID and the families its release notes
 list, comma-separated (AWS's base GPU image with the open-source NVIDIA driver on Ubuntu 22.04,
@@ -160,7 +161,9 @@ evidence E10):
         {"name": "RHI_PROMOTE_FAMILIES", "value": "G6e,G7e,P5,P5e,P5en,P6"}]'
 
 The build succeeds once the canary served, the parameter holds the candidate and the pipeline's
-execution has started; the deployment that execution makes refreshes the pool, after which the
-pool's warm instances run the new image (`aws ec2 describe-instances` on the instances tagged
-`rhi-pool=coursework` shows its ID). The pool's first image is written by hand before the pool
-enters the configuration: the job serves every later one.
+execution has started. The deployment that execution makes writes the candidate into the pool's
+launch template and replaces no instance: no instance refresh follows a promotion, and there is
+none to wait for. The instances of the pool's next session launch on the new image
+(`aws ec2 describe-instances` on the instances tagged `rhi-pool=coursework` then shows its ID).
+The pool's first image is written by hand before the pool enters the configuration: the job
+serves every later one.

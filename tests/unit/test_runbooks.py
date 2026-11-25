@@ -28,6 +28,7 @@ RUNBOOKS = [
     "sessions.md",
     "capacity-failure.md",
     "suspended-launches.md",
+    "scaler-not-running.md",
     "leaked-key.md",
     "bad-deployment.md",
     "secret-rotation.md",

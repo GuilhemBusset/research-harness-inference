@@ -2,11 +2,12 @@
 
 Over a term, a student will probably leak a key: pushed in a homework branch, pasted in a chat,
 left in a harness's settings file (system design, section 13). A leaked key gives inference in
-that student's name, and nothing else: a key carries no other privilege. Once the gateway enforces
-the session switch (issue E4-41, see the runbook `sessions.md`), it serves a key only
-while a session is on; until that gateway is deployed, it serves the key at any hour. Either way
-the key keeps working until it is revoked, or until it expires at the course end, so revoke it at
-once, whether a session is on or not. Revoking it is the fix. A revoked key stops working within
+that student's name, and nothing else: a key carries no other privilege. The gateway serves a key
+only on a pool whose session is active (section 5.6; runbook
+[a session booked, changed and stopped](sessions.md)), and a request never starts an instance, so
+outside a session a leaked key gets `no_session` and costs nothing. During every session it works
+like any other key, until it is revoked or until it expires at the course end: revoke it at once,
+whether a session is active or not. Revoking it is the fix. A revoked key stops working within
 60 seconds, which is the gateway's lookup cache (section 6.4).
 
 This runbook shows no key, not even an invented one: the hygiene scanner refuses anything shaped

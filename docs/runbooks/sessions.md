@@ -110,11 +110,12 @@ Do these the day before the class.
 3. **Every change has landed, and no deployment is under way.** A deployment waits while a session
    is active on any pool (section 5.6), so that a release changes nothing under a class. The wait
    is a check before each stage's deployment, not a pause of one: a deployment that has passed it
-   runs to its end, also when a session starts meanwhile, and one that touches a pool replaces its
-   instances, as one of the gateway drains its tasks. A session that is booked and has not started
-   holds nothing. So, before a session starts, no execution is in progress on the pipeline's page
-   in the CodePipeline console; if one is, wait for it to end. And what is merged or edited while a
-   session is active is deployed only after its end.
+   runs to its end, also when a session starts meanwhile. Such a deployment replaces no instance
+   (section 4.3): an instance that starts while it runs may read the release of before or the new
+   one, and keeps what it started with; one of the gateway drains its tasks. A session that is
+   booked and has not started holds nothing. So, before a session starts, no execution is in
+   progress on the pipeline's page in the CodePipeline console; if one is, wait for it to end. And
+   what is merged or edited while a session is active is deployed only after its end.
 
 4. **What is booked already.** A pool has one session at a time, and `session start` is refused
    while one is booked or active: `set_by` says who booked it, an admin or one of the pipeline's
@@ -188,7 +189,7 @@ Do these the day before the class.
 
    - `waiting` above zero, with no cause or the cause `insufficient-capacity`: AWS has no instance
      yet. Nothing gives up, and Auto Scaling keeps asking by itself: wait. If the class starts
-     before the instances, it is the runbook [capacity failure](capacity-failure.md);
+     before the instances, it is the runbook [a session short of capacity](capacity-failure.md);
    - the cause `quota`: the account's quota refuses the launches (Check, step 1);
    - the cause `launches-suspended`, or `requested` above `asked`: the scaler has suspended the
      pool's launches, the runbook [a pool whose launches are suspended](suspended-launches.md);
@@ -269,7 +270,9 @@ Do these the day before the class.
    runbook [a pool whose launches are suspended](suspended-launches.md).
 
    When the command said that a run was already under way, both may still read the numbers of
-   before: read the status again a minute later.
+   before: read the status again a minute later. Numbers that still do not follow, or a command
+   that ends by saying that the scaler's run failed, are the runbook
+   [a scaler that does not run](scaler-not-running.md).
 
 2. **What students see at each moment.** The gateway reads the sessions every 5 seconds, so a
    command shows here within seconds. `rhi status` lists each pool with a state and, when it is
