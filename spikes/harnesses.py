@@ -3,8 +3,7 @@
 The student guide names the harness versions the endpoint was tried with (section 13), so a spike
 that runs a harness runs a pinned one and says which. This module holds the pins of the four
 harnesses installed from npm, each one's npm package at one exact version, and installs them into
-the job: spike S2 (`spikes/s2_client_hold.py`) runs Claude Code and Codex, and spike S3 runs all
-four at the versions from here.
+the job: spike S3 runs all four at the versions from here.
 
 **The pins.** Each is the newest release of its package that had been published for at least 7
 days when the pin was chosen, the cooling-off section 17 asks before an update is adopted, read

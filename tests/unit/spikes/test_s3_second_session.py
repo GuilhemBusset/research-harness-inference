@@ -314,7 +314,7 @@ def test_an_answer_after_the_pdf_needs_the_pdf_sent_or_its_text_returned() -> No
     # Read sends the PDF as a document block: the reply after it counts, even one saying it cannot read it.
     sent = {"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "base64"}}]}]}
     read = calls("m1", ("Read", {"file_path": job.PDF_FILE}))
-    exchange = job.s2.Exchange("POST", "/v1/messages", json.dumps(sent).encode(), 0.5)
+    exchange = job.forwarder.Exchange("POST", "/v1/messages", json.dumps(sent).encode(), 0.5)
     assert present(read, answer("It cannot be read here."), exchanges=[exchange])
     # Its text returned by any command, which the PDF's word shows, counts.
     convert = calls("m1", ("Bash", {"command": "pdftotext ./*.pdf -"}))

@@ -108,7 +108,7 @@ window, are read again for `FRESH_SECONDS` before the path is told without them.
 
 | Variable | What it is |
 | --- | --- |
-| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`s4_weights.gateway_address`) |
+| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`common.gateway_address`) |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S7_WAKES` | The wakes it sends; `DEFAULT_WAKES` unless given |
@@ -144,7 +144,6 @@ import httpx
 
 import common
 import loadgen
-import s4_weights
 from rhi import config
 from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.causes import Cause
@@ -1322,7 +1321,7 @@ def main(environ: Mapping[str, str] = os.environ, clock: Clock | None = None) ->
             recorder.line("refused", reason="wakes_or_hold_out_of_range")
             return 1
         # The gateway stack's output is a host name: every request goes to it over HTTPS.
-        endpoint = s4_weights.gateway_address(environ[ENDPOINT_VARIABLE])
+        endpoint = common.gateway_address(environ[ENDPOINT_VARIABLE])
         step = "clients"
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
