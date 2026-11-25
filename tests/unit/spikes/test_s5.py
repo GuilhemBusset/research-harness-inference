@@ -10,7 +10,6 @@ import importlib.util
 import itertools
 import json
 import re
-import shutil
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -236,6 +235,15 @@ def test_a_session_compacts_at_the_window() -> None:
     assert s5.load_of(s5.Planned(s5.Shape.SEVERAL_AGENTS, 3, 2), "coursework", 0, 100_000).sessions_per_student == 2
 
 
+def blank_record(path: Path) -> Path:
+    """The record at `path` with none of its runs: a run the real record holds would join a
+    test's runs in the record's verdict."""
+    tool = s5.record_tool()
+    record, prose = tool.read(s5.RECORD.read_text(encoding="utf-8"))
+    path.write_text(tool.written({**record, "verdict": "pending", "runs": [], "rows": []}) + prose, encoding="utf-8")
+    return path
+
+
 def test_the_record_holds_the_matrix(tmp_path: Path) -> None:
     form = measurement_format()
     assert form.file_problems(s5.RECORD.read_text(encoding="utf-8"), "s5.md") == []
@@ -252,8 +260,7 @@ def test_the_record_holds_the_matrix(tmp_path: Path) -> None:
              "created_at": "2026-11-20T10:00:00Z"}
             for one in read_event(event)
         ]  # fmt: skip
-    path = tmp_path / "s5.md"
-    shutil.copy(s5.RECORD, path)
+    path = blank_record(tmp_path / "s5.md")
 
     assert s5.record_statuses(statuses, COMMIT, pool="coursework", instance_type="g7e.2xlarge", path=path) == [
         "8bit-baseline-1",

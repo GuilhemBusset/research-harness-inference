@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import shutil
 import tomllib
 from itertools import count
 from pathlib import Path
@@ -19,7 +18,7 @@ import pytest
 import s5_capacity as s5
 from rhi_common.keys import generate_key
 from rhi_reporter.measure import Verdict, decode, read_event
-from test_s5 import COMMIT, job, settings, verdict  # the recorded runs of the verdict's own tests
+from test_s5 import COMMIT, blank_record, job, settings, verdict  # the recorded runs of the verdict's own tests
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -65,8 +64,7 @@ def listed(*postings: list[Any], at: str = "2026-11-20T10:00:00Z") -> list[dict[
 
 
 def recorded(tmp_path: Path, statuses: list[dict[str, Any]]) -> dict[str, Any]:
-    path = tmp_path / "s5.md"
-    shutil.copy(s5.RECORD, path)
+    path = blank_record(tmp_path / "s5.md")
     s5.record_statuses(statuses, COMMIT, pool="coursework", instance_type="g7e.2xlarge", path=path)
     return tomllib.loads(path.read_text(encoding="utf-8").split("+++")[1])
 
