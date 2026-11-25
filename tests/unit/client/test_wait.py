@@ -213,6 +213,21 @@ def test_a_wait_reads_only_the_status_every_10_seconds_until_the_pool_is_ready(
     assert all(line[0].startswith("mock") for line in printed)
 
 
+def test_the_10_seconds_run_from_one_status_call_to_the_next_whatever_an_answer_takes() -> None:
+    gateway = Gateway({"mock": {0: "warming", 20: "ready"}})
+    logged_in(gateway.key)
+
+    def slow(call: login.Call) -> tuple[int, Any]:
+        # Each answer takes 2 seconds, and the one asked for at second 10 takes 13.
+        answer = gateway(call)
+        gateway.clock.now += 13 if gateway.clock.now == 10 else 2
+        return answer
+
+    assert wait.wait("mock", transport=slow, sleep=gateway.clock.sleep, clock=lambda: gateway.clock.now) == 0
+    # Second 10 follows second 0 by the interval; the next call follows the slow answer at once.
+    assert [at for _, _, at in gateway.calls] == [0, 10, 23]
+
+
 def test_a_wait_gives_up_at_its_timeout(capsys: pytest.CaptureFixture[str]) -> None:
     gateway = Gateway({"mock": {0: "capacity_unavailable"}})
     logged_in(gateway.key)

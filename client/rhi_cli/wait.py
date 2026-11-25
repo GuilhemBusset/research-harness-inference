@@ -12,8 +12,8 @@ of the student's machine.
 
 `rhi wait <model>` is how a student who arrives before a session's instances waits for them:
 
-1. It reads the status at once and then every 10 seconds, and prints the pool's line each time its
-   state or its cause changes.
+1. It reads the status at once and then every 10 seconds, counted from one call to the next
+   whatever the answer took, and prints the pool's line each time its state or its cause changes.
 2. It exits 0 when the state is `ready`.
 3. It keeps waiting while the pool is `warming`, and while it is `unavailable` with
    `capacity_unavailable`: both mean that the session is on and its instances are not there yet.
@@ -157,7 +157,8 @@ def _wait(
         )
 
     while True:
-        if clock() >= deadline:
+        asked = clock()
+        if asked >= deadline:
             raise late()
         listed = [record for record in gateway.records() if record.model == model]
         if not listed:
@@ -174,7 +175,8 @@ def _wait(
             raise login.LoginError(
                 f"{model} is {record.state}, and no instance is coming: {record.cause or 'no cause was given'}"
             )
-        sleep(max(0.0, min(POLL_SECONDS, deadline - clock())))
+        # Ten seconds from one call to the next, whatever the answer took; at once after a slower one.
+        sleep(max(0.0, min(asked + POLL_SECONDS, deadline) - clock()))
 
 
 def wait(

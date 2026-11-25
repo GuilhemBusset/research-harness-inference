@@ -211,11 +211,22 @@ def _value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _key(name: str) -> str:
+    """A pattern for one key as TOML lets a file write it: bare, or between quotes of either kind."""
+    name = re.escape(name)
+    return rf"""(?:{name}|"{name}"|'{name}')"""
+
+
+def _setting(key: str) -> re.Pattern[str]:
+    """A pattern for the start of a line that sets that key."""
+    return re.compile(rf"\s*{_key(key)}\s*=")
+
+
 def _section(lines: list[str], table: Table) -> tuple[int, int] | None:
     """Where one table's section is in the file's lines: its header's line (-1 for the top level,
     whose section is the lines before the first table) and the line after its last; None when the
     file has no such section."""
-    name = r"\s*\.\s*".join(rf"""(?:{part}|"{part}"|'{part}')""" for part in map(re.escape, table))
+    name = r"\s*\.\s*".join(map(_key, table))
     header = re.compile(rf"\s*\[\s*{name}\s*\]\s*(?:#.*)?")
     start = next((index for index, line in enumerate(lines) if header.fullmatch(line)), None) if table else -1
     if start is None:
@@ -227,7 +238,7 @@ def _section(lines: list[str], table: Table) -> tuple[int, int] | None:
 def _remove(lines: list[str], table: Table, keys: Iterable[str]) -> None:
     """Take the lines that set those keys out of one table's section."""
     start, end = _section(lines, table) or (0, 0)
-    settings = [re.compile(rf"\s*{re.escape(key)}\s*=") for key in keys]
+    settings = [_setting(key) for key in keys]
     lines[start + 1 : end] = [
         line for line in lines[start + 1 : end] if not any(setting.match(line) for setting in settings)
     ]
@@ -246,7 +257,7 @@ def _set(lines: list[str], table: Table, values: Mapping[str, Any]) -> None:
         return
     added = []
     for key, value in values.items():
-        setting = re.compile(rf"\s*{re.escape(key)}\s*=")
+        setting = _setting(key)
         at = next((index for index in range(start + 1, end) if setting.match(lines[index])), None)
         if at is None:
             added.append(f"{key} = {_value(value)}")

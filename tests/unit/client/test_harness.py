@@ -167,7 +167,14 @@ def test_both_files_are_made_when_a_harness_has_none(home: Path) -> None:
     assert "stream_idle_timeout_ms" not in profile["model_providers"]["rhi"]
 
 
-def test_a_login_removes_the_stream_timeout_an_earlier_login_wrote_and_keeps_a_student_s_own(home: Path) -> None:
+# A key as TOML lets a file write it: bare, or between quotes of either kind.
+WRITTEN = ("{}", '"{}"', "'{}'")
+
+
+@pytest.mark.parametrize("key", [form.format("stream_idle_timeout_ms") for form in WRITTEN])
+def test_a_login_removes_the_stream_timeout_an_earlier_login_wrote_and_keeps_a_student_s_own(
+    home: Path, key: str
+) -> None:
     endpoint = Endpoint()
     log_in(endpoint)
     path = home / ".codex" / "rhi.config.toml"
@@ -175,7 +182,7 @@ def test_a_login_removes_the_stream_timeout_an_earlier_login_wrote_and_keeps_a_s
     assert written.count('wire_api = "responses"\n') == 1
 
     def with_timeout(milliseconds: int) -> str:
-        line = f"stream_idle_timeout_ms = {milliseconds}\n"
+        line = f"{key} = {milliseconds}\n"
         return written.replace('wire_api = "responses"\n', 'wire_api = "responses"\n' + line)
 
     # The profile as an earlier login left it, with the 15 minutes in the provider's table.
@@ -223,12 +230,14 @@ def test_the_login_prints_each_file_it_changed(home: Path) -> None:
     assert [path in third for path in files] == [False, True]
 
 
-def test_a_new_default_model_changes_that_setting_and_keeps_what_the_student_added(home: Path) -> None:
+@pytest.mark.parametrize("key", [form.format("model") for form in WRITTEN])
+def test_a_new_default_model_changes_that_setting_and_keeps_what_the_student_added(home: Path, key: str) -> None:
     endpoint = Endpoint()
     log_in(endpoint)
     path = home / ".codex" / "rhi.config.toml"
     text = path.read_text(encoding="utf-8")
-    assert "[model_providers.rhi]\n" in text
+    assert "[model_providers.rhi]\n" in text and text.count("\nmodel = ") == 1
+    text = text.replace("\nmodel = ", f"\n{key} = ")
     path.write_text(
         text.replace("[model_providers.rhi]\n", "[model_providers.rhi]  # mine\nrequest_max_retries = 2\n"),
         encoding="utf-8",
