@@ -9,7 +9,6 @@ What is read, for each pool:
 | What | From |
 | --- | --- |
 | Desired capacity, instances by lifecycle state and their scale-in protection, suspended processes | `DescribeAutoScalingGroups` |
-| The warm pool's instances | `DescribeWarmPool` |
 | Which instances serve | `DescribeTargetHealth` on the pool's target group |
 | Launches abandoned in a row, the last launch that found no capacity, the last launch that failed and its cause | `DescribeScalingActivities` |
 | Demand and engine load: the fresh heartbeats | the heartbeat table, by pool |
@@ -29,14 +28,13 @@ The supply, from the lifecycle states and target health:
 | `InService`, its target `healthy` | in service |
 | `InService`, its target `draining` | draining |
 | `InService` otherwise (not registered yet, initial, unhealthy), and `Pending*` | starting |
-| `Terminating*`, `Detaching`, and a `Warmed:*` state in the group's own list (going back to the warm pool) | draining |
-| In the warm pool, any state but `Warmed:Terminating*` and `Warmed:Terminated` | warm |
+| `Terminating*`, `Detaching` | draining |
 
-`running` is every instance of the group's own list but one `Terminated` or `Detached`, and every
-instance of the warm pool that is `Warmed:Running` or `Warmed:Pending*` (being prepared).
+`running` is every instance of the group's list but one `Terminated` or `Detached`. The group keeps
+no stopped instance (section 4.5), so its list is every instance it has.
 
-Abandoned launches (section 5.4). An abandoned launch is a launch activity, into service or into the
-warm pool, that failed or was cancelled because its launch hook was abandoned. A launch that found
+Abandoned launches (section 5.4). An abandoned launch is a launch activity that failed or was
+cancelled because its launch hook was abandoned. A launch that found
 no capacity is not one, whatever else it says: it is only the time the note carries (section 5.3).
 The count reads the whole history the group returns and goes by the time each activity completed:
 Auto Scaling orders activities by the time they started, and launches that run side by side can
@@ -46,8 +44,8 @@ the abandons that set the mark the admin cleared. A launch that failed for any o
 counts nor ends the row. The time of the last launch that found no capacity is read from the whole
 history too, whatever came after it.
 
-The last launch that failed (section 5.4) is the launch activity, into service or into the warm
-pool, that failed or was cancelled and completed last, by the time AWS gives and not by its whole
+The last launch that failed (section 5.4) is the launch activity that failed or was cancelled and
+completed last, by the time AWS gives and not by its whole
 second; of two that completed at the same instant, the one that started last. Its cause is one of
 three words (`rhi_common.records.LaunchFailure`): `insufficient-capacity` for a launch that found
 no capacity, `quota` for one the account's quota of running instances, which EC2 counts in vCPUs,
@@ -60,10 +58,10 @@ told the same way.
 `apply` makes, for each pool, these calls and only those that change something, in this order:
 
 1. protect from scale-in every instance `InService` that is unprotected and that the decision does
-   not name: whether an instance back from the warm pool keeps its protection is not settled, and
-   an unprotected one could be chosen by AWS in place of the one the scaler picked (section 4.3);
+   not name (one whose protection an earlier run lifted and that stayed): an unprotected one could
+   be chosen by AWS in place of the one the scaler picked (section 4.3);
 2. lift the protection of each instance the decision names that is protected;
-3. set the desired capacity, which is absolute and draws from the warm pool (evidence E10);
+3. set the desired capacity, which is absolute;
 4. suspend the `Launch` process, or resume `Launch` alone: zone rebalancing, `AZRebalance`, stays
    suspended for good, so no call here names it.
 
@@ -248,11 +246,10 @@ def _query_pool(clients: Clients, table: str, pool: str) -> Iterator[dict[str, A
         yield _plain(item)
 
 
-def _supply(group: Mapping[str, Any], warm_pool: Iterable[Mapping[str, Any]], health: Mapping[str, str]) -> Supply:
+def _supply(group: Mapping[str, Any], health: Mapping[str, str]) -> Supply:
     in_service: list[str] = []
     starting: list[str] = []
     draining: list[str] = []
-    warm: list[str] = []
     running: list[str] = []
     for instance in group.get("Instances", []):
         name, state = instance["InstanceId"], instance["LifecycleState"]
@@ -264,21 +261,13 @@ def _supply(group: Mapping[str, Any], warm_pool: Iterable[Mapping[str, Any]], he
             (in_service if target == "healthy" else draining if target == "draining" else starting).append(name)
         elif state.startswith("Pending"):
             starting.append(name)
-        elif state.startswith(("Terminating", "Detaching", "Warmed:")):
+        elif state.startswith(("Terminating", "Detaching")):
             draining.append(name)
-    for instance in warm_pool:
-        name, state = instance["InstanceId"], instance["LifecycleState"]
-        if state.startswith(("Warmed:Terminating", "Warmed:Terminated")):
-            continue
-        warm.append(name)
-        if state == "Warmed:Running" or state.startswith("Warmed:Pending"):
-            running.append(name)
     return Supply(
         desired=int(group["DesiredCapacity"]),
         in_service=tuple(sorted(in_service)),
         starting=tuple(sorted(starting)),
         draining=tuple(sorted(draining)),
-        warm=tuple(sorted(warm)),
         running=tuple(sorted(set(running))),
     )
 
@@ -288,13 +277,7 @@ def _seconds(moment: datetime) -> int:
 
 
 def _is_launch(description: str) -> bool:
-    return description.startswith("launching") or (
-        "warm pool" in description and ("from warm pool" in description or "out of warm pool" in description)
-    )
-
-
-def _into_warm_pool(description: str) -> bool:
-    return "into warm pool" in description or "to warm pool" in description
+    return description.startswith("launching")
 
 
 def _failure_cause(message: str) -> LaunchFailure:
@@ -336,8 +319,7 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
         completed: datetime = activity.get("EndTime") or activity["StartTime"]
         moment = _seconds(completed)
         if status == "Successful":
-            if not _into_warm_pool(description):
-                reached_service = moment if reached_service is None else max(reached_service, moment)
+            reached_service = moment if reached_service is None else max(reached_service, moment)
             continue
         if status not in ("Failed", "Cancelled"):
             continue
@@ -461,7 +443,6 @@ def memory_to_item(pool: str, memory: Memory) -> dict[str, Any]:
 def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now: int) -> tuple[PoolInputs, GroupState]:
     groups = clients.autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[settings.group])
     group = groups["AutoScalingGroups"][0]
-    warm_pool = list(_pages(clients.autoscaling, "describe_warm_pool", "Instances", AutoScalingGroupName=settings.group))
     targets = clients.elbv2.describe_target_health(TargetGroupArn=settings.target_group)
     health = {
         target["Target"]["Id"]: target["TargetHealth"]["State"] for target in targets.get("TargetHealthDescriptions", [])
@@ -482,7 +463,7 @@ def _read_pool(clients: Clients, tables: TableNames, settings: PoolSettings, now
     inputs = PoolInputs(
         config=settings.config,
         mode=mode,
-        supply=_supply(group, warm_pool, health),
+        supply=_supply(group, health),
         gateway_heartbeats=gateways,
         instance_heartbeats=instances,
         abandoned_launches=history.abandoned_in_a_row,

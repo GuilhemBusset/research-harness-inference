@@ -8,9 +8,8 @@ statistic the most of its one-minute period:
 
 - **Wanted with nothing in service**, per pool: the group's `GroupDesiredCapacity` above 0 and its
   `GroupInServiceInstances` at 0, in each of 10 one-minute periods.
-- **Running with nothing in service**, per pool: `GroupTotalInstances` plus
-  `WarmPoolPendingCapacity` above 0 (an instance being prepared for the warm pool runs before it is
-  stopped; a group without a warm pool has no such point, which counts as 0) and
+- **Running with nothing in service**, per pool: the group's `GroupTotalInstances` above 0 (the
+  group keeps no stopped instance, so every instance it counts runs) and its
   `GroupInServiceInstances` at 0, in each of 20 one-minute periods.
 - **The scaler has completed no run** for 5 one-minute periods: no `RunCompleted` data point, which
   the scaler publishes after each completed run (`rhi_scaler.cloudwatch`). Missing data is what it
@@ -189,12 +188,8 @@ class AlarmsFleet(Construct):
                 f"Running-{pool}",
                 f"The group of the pool {pool} has had instances running for 20 minutes with none in service.",
                 RUNNING_PERIODS,
-                [
-                    _metric("total", AUTO_SCALING_NAMESPACE, "GroupTotalInstances", group, "Maximum"),
-                    _metric("warm_pending", AUTO_SCALING_NAMESPACE, "WarmPoolPendingCapacity", group, "Maximum"),
-                    in_service,
-                ],
-                "IF(total + FILL(warm_pending, 0) > 0 AND in_service == 0, 1, 0)",
+                [_metric("total", AUTO_SCALING_NAMESPACE, "GroupTotalInstances", group, "Maximum"), in_service],
+                "IF(total > 0 AND in_service == 0, 1, 0)",
             )
             self.launches_suspended[pool] = scaler_alarm(
                 f"LaunchesSuspended-{pool}",

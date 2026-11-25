@@ -110,7 +110,7 @@ LOWERING_REASONS = frozenset({Reason.GATEWAY_SILENT, Reason.IDLE, Reason.STOPPED
 
 def _every_instance(supply: Supply) -> tuple[str, ...]:
     """Every instance of the pool, in whatever state the supply lists it."""
-    return tuple(sorted({*supply.in_service, *supply.starting, *supply.draining, *supply.warm, *supply.running}))
+    return tuple(sorted({*supply.in_service, *supply.starting, *supply.draining, *supply.running}))
 
 
 def _older_than(time: int | None, seconds: int, now: int) -> bool:

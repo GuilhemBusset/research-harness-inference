@@ -131,17 +131,16 @@ def test_going_to_zero_names_every_instance_of_the_pool_in_any_state() -> None:
         in_service=("instance-a",),
         starting=("instance-b",),
         draining=("instance-c",),
-        warm=("instance-d",),
-        # One being prepared for the warm pool is in none of the four states.
-        running=("instance-a", "instance-b", "instance-c", "instance-e"),
+        # One in a state the supply does not list (in standby) is in none of the three.
+        running=("instance-a", "instance-b", "instance-c", "instance-d"),
     )
 
     released = decide_one(pool_inputs(supply, gateway(last_request_at=NOW - 20 * MINUTE)))
 
     assert released.desired == 0
-    assert released.lift_protection == ("instance-a", "instance-b", "instance-c", "instance-d", "instance-e")
-    # A pool that is at zero already is left alone, whatever its warm pool holds.
-    resting = decide_one(pool_inputs(Supply(desired=0, warm=("instance-d",))))
+    assert released.lift_protection == ("instance-a", "instance-b", "instance-c", "instance-d")
+    # A pool that is at zero already is left alone.
+    resting = decide_one(pool_inputs(Supply(desired=0)))
     assert (resting.desired, resting.lift_protection, resting.reason) == (0, (), Reason.UNCHANGED)
 
 

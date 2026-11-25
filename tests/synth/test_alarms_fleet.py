@@ -40,10 +40,7 @@ def test_the_fleet_alarms_read_auto_scaling_over_10_and_20_whole_minutes(templat
     assert POOLS and len(groups) == len(POOLS)
     expected = {
         "GroupDesiredCapacity": (10, {"desired": "GroupDesiredCapacity", "in_service": "GroupInServiceInstances"}),
-        "GroupTotalInstances": (
-            20,
-            {"total": "GroupTotalInstances", "warm_pending": "WarmPoolPendingCapacity", "in_service": "GroupInServiceInstances"},
-        ),
+        "GroupTotalInstances": (20, {"total": "GroupTotalInstances", "in_service": "GroupInServiceInstances"}),
     }
     for first, (periods, reads) in expected.items():
         found = by_metric(alarms, first)

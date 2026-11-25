@@ -2,11 +2,10 @@
 sections 5.1, 8.5 and 12).
 
 AWS's documentation does not settle whether a group waits the whole deregistration delay for a
-target that has no connections, nor whether it drains at all before stopping an instance into the
-warm pool (evidence E13). This job runs the scenario on the mock pool and **records what it
-observed, with times, and judges nothing**: the pass condition (an idle instance gone within a
-minute or two, in-flight requests finished, no wake lost) is read later, from the first real run's
-lines, by an issue written then (section 12).
+target that has no connections (evidence E13). This job runs the scenario on the mock pool and
+**records what it observed, with times, and judges nothing**: the pass condition (an idle instance
+gone within a minute or two, in-flight requests finished, no wake lost) is read later, from the
+first real run's lines, by an issue written then (section 12).
 
 **What it records.** One JSON object per line on standard output, which the spike jobs' log group
 keeps (`Recorder`). Each has `at`, the UTC time to the millisecond, and `kind`; every other time in
@@ -27,7 +26,7 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    one byte of white space every `TRICKLE_SECONDS`, which JSON allows before the closing brace, and
    the last byte when the hold is over: the stream's connection stays on the gateway task that took
    it while the deployment replaces that task. Then one `stream` line.
-2. **The scale-in paths** (`Run.cycle`). It holds twice the pool's `target_concurrency` of short
+2. **The scale-in** (`Run.cycle`). It holds twice the pool's `target_concurrency` of short
    streams until the scaler asks for two instances and reads two in service (`load_started`,
    `instances`, `load_stopped`), then lets the pool go idle and watches the scaler take it to none,
    from two to one and then, after its idle period, to none, or from two to none at once. Each
@@ -38,19 +37,19 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    - `out_of_service`: when the job first reads the scaler's in-service gauge, as fresh as the
      note, below what it read before; each instance fewer is one owed to the decisions, in order;
    - `gone`: when the job first reads an instance silent for `QUIET_SECONDS` that was writing as
-     the watch began or since, the instance stopped, terminated or stopped into the warm pool. Its
-     node's collector writes the series `up` of each of its scrape targets every `SCRAPE_SECONDS`
-     until the instance shuts down. Each stop is one departure; the departures, in the order their
-     instances stopped, are given to the decisions in order. An instance that returns from the warm
-     pool and stops again leaves again;
+     the watch began or since, the instance stopped: the group keeps no stopped instance (section
+     4.5), so it was terminated. Its node's collector writes the series `up` of each of its scrape
+     targets every `SCRAPE_SECONDS` until the instance shuts down. Each stop is one departure; the
+     departures, in the order their instances stopped, are given to the decisions in order. An
+     instance that writes again and stops again leaves again;
    - `gone_withdrawn`: a stop that a later read contradicts, a write within `QUIET_SECONDS` after it
      that the workspace showed late: the instance never stopped, and the departures are given to
      the decisions again;
-   - `scale_in`: each departure whole, with its path (`path_of`), once every decision has its
-     instances out of service and gone and the warm count has been read `WARM_SETTLE_SECONDS`
-     past the last stop.
-   A cycle in which both paths were not seen is run again, up to `CYCLES` times; once both were,
-   the job goes on to the wakes.
+   - `scale_in`: each departure whole, with what its readings do not tell when they do not agree
+     (`unknown_of`), once the scaler asks for none and every decision has its instances out of
+     service and gone.
+   A cycle that read no departure whole, or not the stream across a scale-in, is run again, up to
+   `CYCLES` times in all; then the job goes on to the wakes.
 3. **The stream across a scale-in**, in the first cycle. As the load stops, before the scaler acts,
    it opens one slow stream, as across the deployment, and holds its body open at the gateway while
    it watches the pool. The gateway reads a body whole before it counts the request as demand or
@@ -61,7 +60,7 @@ scaler alone does, by load and by idleness (section 5.1). The steps, in order (`
    reads the answer to its end, as the pool sends it, through the departure when it lasts that long.
    Whether it finished, ended with an error event or was cut is what the line records. When that
    decision asked for none, the stream is held to the cycle's end instead, so that it wakes no
-   instance while the paths are told. Its `stream` line holds its times, among them `body_sent_at`,
+   instance while the departures are read. Its `stream` line holds its times, among them `body_sent_at`,
    when it was forwarded, and its end, with the first decision's number; the departures' lines hold
    theirs, so a reader places one against the other.
 4. **The wakes** (`Run.send_wakes`). As many times as `RHI_S7_WAKES` gives, it waits for a fresh
@@ -83,26 +82,12 @@ closing event, `message_stop`; with an error event; with the connection closed, 
 without either or the read failing; with a status other than 200; or, for a wake, at the job's own
 bound, the pool's hold and `WAKE_MARGIN_SECONDS`.
 
-**Which path a departure took** (`path_of`) is told only when the readings agree on it within that
-one decision, and is `unknown`, with the reason, otherwise. The in-service and the warm gauges are
-pool totals, so the departure's instance is the one whose collector stopped, the in-service
-reading must have dropped, and the warm count is compared between the reading the scaler decided on
-(`decided_on`) and every reading after it up to the scaler's next decision (`warm_bound`), that
-decision's own reading included: the scaler read it before it acted (`in_window`). The path is told once `WARM_SETTLE_SECONDS` have passed
-since the decision's last stop, or at the next decision, whichever comes first, from every reading
-of the window the workspace then shows. An instance stopped into the warm pool may be counted there
-a while after its collector falls silent, so the count may rise late but never fall, not even
-before the instance stopped (a slot emptied then may be refilled by it). Either path is told only
-from readings that cover the window (below): once every instance of the decision has stopped,
-ending as many more as left, `warm_pool`; the same all along a window that ran at least
-`WARM_SETTLE_SECONDS`, `terminated`. A
-new instance writing, a decision whose instances the count does not tell apart, no reading on
-either side, readings that end early, a window the next decision cut short, or readings that
-differ, leave it `unknown`. The readings cover the window (`covers`) when they reach its end, the
-settle time or the next decision's run, and no two that follow each other in it are further apart
-than `COVER_SECONDS`, one run of the scaler and a step: a later reading the workspace has not shown
-yet may hold the rise. A reading missing from the workspace, or readings that do not cover the
-window, are read again for `FRESH_SECONDS` before the path is told without them.
+**A departure's line** gives the times of one scale-in only when the readings agree within its
+decision (`unknown_of`), and says why in `unknown` otherwise. The in-service gauge is a pool total,
+so the departure's instance is the one whose collector stopped: it must have stopped after the
+scaler asked for fewer, and the in-service reading must have dropped. A stop before the decision it
+was given to, a drop the job did not read, or a departure no decision asked for, leave it
+`unknown`, with that reason.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s7_drain`):
 
@@ -124,7 +109,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import itertools
 import json
 import math
 import os
@@ -149,7 +133,7 @@ from rhi_admin.roster import DEFAULT_CONCURRENCY_LIMIT
 from rhi_common.causes import Cause
 from rhi_common.records import NOTE_RECORD, ScalerNote
 from rhi_gateway.sse import SseReader
-from rhi_scaler.metrics import INSTANCES_IN_SERVICE, WARM_INSTANCES
+from rhi_scaler.metrics import INSTANCES_IN_SERVICE
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable, Mapping, Sequence
@@ -191,18 +175,8 @@ SCALE_OUT_WAIT_SECONDS = 20 * 60
 SCALE_IN_WAIT_SECONDS = 30 * 60
 # Seconds the job waits for an instance to stop once the scaler asked for fewer.
 LEAVE_WAIT_SECONDS = 15 * 60
-# Seconds after an instance stops over which the warm count is read at least before its path is
-# told: an instance stopped into the warm pool may be counted there some time after its collector
-# falls silent.
-WARM_SETTLE_SECONDS = 5 * 60
-# Seconds: the most two warm readings that follow each other may be apart and still cover the time
-# between them, one run of the scaler and a step of the query; otherwise the workspace has not shown
-# a reading between them yet.
-COVER_SECONDS = 60 + STEP_SECONDS
-# Seconds a reading may take to show in the workspace once the scaler has written it.
-INGEST_SECONDS = 30
 # The instances the job brings the pool to (`max_instances` of the mock pool), and how many times
-# it does, to see both paths.
+# it does at most, until it has read a departure whole and the stream across a scale-in.
 INSTANCES = 2
 CYCLES = 2
 # Seconds between two bytes of a slow stream's body: the edge's idle timeout is far longer.
@@ -383,161 +357,28 @@ class Pool:
         return found
 
 
-# The paths.
-
-
-class Path(StrEnum):
-    """How an instance left service, as the job read it."""
-
-    TERMINATED = "terminated"
-    WARM_POOL = "warm_pool"
-    UNKNOWN = "unknown"
+# The departures.
 
 
 class Unknown(StrEnum):
-    """Why a departure's path is `unknown`."""
+    """Why a departure's line does not give the times of one scale-in."""
 
     STOPPED_BEFORE_ASK = "stopped_before_ask"
     NOT_READ_OUT_OF_SERVICE = "not_read_out_of_service"
     NOT_ASKED = "not_asked"
-    ANOTHER_INSTANCE_STOPPED = "another_instance_stopped"
-    NEW_INSTANCE = "new_instance"
-    NO_DECISION_READING = "no_decision_reading"
-    NO_READING_AFTER_STOP = "no_reading_after_stop"
-    NOT_SETTLED = "not_settled"
-    WARM_COUNT_DIFFERS = "warm_count_differs"
-    WARM_READINGS_END_EARLY = "warm_readings_end_early"
 
 
-# The reasons that say a reading was missing: the job reads the warm count again before it gives one.
-MISSING = frozenset({Unknown.NO_DECISION_READING, Unknown.NO_READING_AFTER_STOP, Unknown.WARM_READINGS_END_EARLY})
-
-
-def decided_on(samples: Sequence[tuple[float, float]], at: float) -> tuple[float, int] | None:
-    """The warm count the scaler decided on in its run of `at`, a note's `written_at`, and when it
-    was read: that run's own reading, stamped within `NOTE_SECOND` of `at`. When that run's reading
-    was not written, the last one before stands for it only if it read zero: a warm instance read
-    then may have left the warm pool before the decision and the departing one taken its place, but
-    an empty warm pool has none to lose. None otherwise."""
-    own = [(moment, value) for moment, value in samples if at <= moment < at + NOTE_SECOND]
-    if own:
-        return own[-1][0], round(own[-1][1])
-    earlier = [(moment, value) for moment, value in samples if moment < at]
-    if earlier and round(earlier[-1][1]) == 0:
-        return earlier[-1][0], 0
-    return None
-
-
-def warm_bound(asked: int, notes: Sequence[ScalerNote], decided_at: float) -> tuple[float, float | None]:
-    """The time before which the scaler's readings of the warm count belong to the departure it
-    decided at `decided_at`, asking for `asked`, from the notes the job read since, in order; and
-    the `written_at` of the next decision, a note that asks for another number, or None. The next
-    decision acts on the pool too, so the readings end with the last run seen to ask for `asked`
-    before it; with none, they do not end. The next decision's own reading was made before it acted
-    (`in_window`)."""
-    confirmed = decided_at
-    for note in notes:
-        if note.capacity_asked != asked:
-            return confirmed + NOTE_SECOND, float(note.written_at)
-        confirmed = max(confirmed, float(note.written_at))
-    return math.inf, None
-
-
-def covers(readings: Sequence[tuple[float, float]], *, since: float, until: float) -> bool:
-    """Whether the warm readings, each with its time, cover the window from `since`, the reading the
-    scaler decided on, to `until`: one of them made at `until` or after, and none of those from
-    `since` on further from the next than `COVER_SECONDS`."""
-    moments = [moment for moment, _ in readings if moment >= since]
-    if not moments or moments[-1] < until:
-        return False
-    return all(later - earlier <= COVER_SECONDS for earlier, later in itertools.pairwise(moments))
-
-
-def in_window(
-    samples: Sequence[tuple[float, float]], end: float, next_at: float | None
-) -> list[tuple[float, float]]:
-    """The warm readings that belong to a decision whose readings end at `end`: those before it,
-    and the next decision's own reading, made at `next_at` before that run acted, when no run came
-    between the two that the job did not read (no reading between them): such a run could have been
-    the next decision."""
-    kept = [(moment, value) for moment, value in samples if moment < end]
-    if next_at is not None and not any(end <= moment < next_at for moment, _ in samples):
-        kept += [(moment, value) for moment, value in samples if next_at <= moment < next_at + NOTE_SECOND]
-    return kept
-
-
-@dataclass(frozen=True)
-class Told:
-    """A decision's path, why it is unknown when it is, and the warm counts it was told from."""
-
-    path: Path
-    unknown: Unknown | None = None
-    warm_before: int | None = None
-    warm_after: tuple[int, ...] = ()
-
-
-def path_of(
-    *,
-    asked_at: float,
-    stops: Sequence[float],
-    leaving: int,
-    out_of_service: bool,
-    warm: Sequence[tuple[float, float]],
-    end: float,
-    settled: bool,
-    newcomer: bool,
-    next_at: float | None = None,
-) -> Told:
-    """The path of the instances that left on the decision the scaler made at `asked_at`, asking for
-    `leaving` fewer, whose collectors last wrote at `stops`, from the warm readings `warm`, each
-    with its time, read up to `end`, and the next decision's own reading, made at `next_at`
-    (`in_window`): `settled` when `end` is `WARM_SETTLE_SECONDS` after the last stop rather than
-    another decision's, and has passed. `out_of_service` says whether the in-service reading
-    dropped, `newcomer` whether an instance new to the pool wrote meanwhile.
-
-    The warm count is a pool total that may rise some time after an instance stops. From the
-    decision's reading, those made before the instances stopped included, it must never fall and
-    never pass `leaving` more: a slot that empties and fills again may have been filled by the
-    departing instance or by a new one, so the readings cannot tell. Before either path is told,
-    the readings must cover the window (`covers`) up to `WARM_SETTLE_SECONDS` past the last stop,
-    or up to the last run that asked for as many before the next decision when `end` comes first:
-    otherwise the workspace has not shown the rest yet, and a reading it misses may hold a fall.
-    Then, once every instance has stopped, a last reading `leaving` more is `warm_pool`, and every
-    reading since the decision's the same, over a settled window, is `terminated`. Anything else is `unknown`, with its reason: the same count over a window another
-    decision cut short cannot tell a terminated instance from a late return, and a count between the
-    two, after more than one stop, cannot tell which went where."""
+def unknown_of(*, asked_at: float, stops: Sequence[float], out_of_service: bool) -> Unknown | None:
+    """Why the instances that left on the decision the scaler made at `asked_at`, whose collectors
+    last wrote at `stops`, cannot be read as that decision's, or None when they can: every one
+    stopped after the scaler asked for fewer, and the in-service reading dropped for each
+    (`out_of_service`). The group keeps no stopped instance, so an instance that stopped was
+    terminated: there is no other path to tell."""
     if not stops or min(stops) < asked_at:
-        return Told(Path.UNKNOWN, Unknown.STOPPED_BEFORE_ASK)
+        return Unknown.STOPPED_BEFORE_ASK
     if not out_of_service:
-        return Told(Path.UNKNOWN, Unknown.NOT_READ_OUT_OF_SERVICE)
-    if newcomer:
-        return Told(Path.UNKNOWN, Unknown.NEW_INSTANCE)
-    readings = in_window(warm, end, next_at)
-    decided = decided_on(readings, asked_at)
-    if decided is None:
-        return Told(Path.UNKNOWN, Unknown.NO_DECISION_READING)
-    before = decided[1]
-    # Every count from the decision's reading on, those made while the instance still wrote
-    # included: a warm slot emptied then may have been refilled by the departing instance.
-    counts = tuple(round(value) for moment, value in readings if moment >= decided[0])
-    after = tuple(round(value) for moment, value in readings if moment >= min(stops) + SCRAPE_SECONDS)
-    last = [round(value) for moment, value in readings if moment >= max(stops) + SCRAPE_SECONDS]
-    if not after or not last:
-        return Told(Path.UNKNOWN, Unknown.NO_READING_AFTER_STOP, before)
-    # Either path is told only from readings that cover the window: a gap may hide a fall, a slot
-    # that emptied and was filled again, and readings that end early a fall after them.
-    if not covers(readings, since=decided[0], until=min(max(stops) + WARM_SETTLE_SECONDS, end - NOTE_SECOND)):
-        return Told(Path.UNKNOWN, Unknown.WARM_READINGS_END_EARLY, before, after)
-    steady = all(earlier <= later <= before + leaving for earlier, later in itertools.pairwise((before, *counts)))
-    if steady and last[-1] == before + leaving:
-        return Told(Path.WARM_POOL, None, before, after)
-    if set(counts) == {before} and settled:
-        return Told(Path.TERMINATED, None, before, after)
-    if len(stops) > 1 or leaving > 1:
-        return Told(Path.UNKNOWN, Unknown.ANOTHER_INSTANCE_STOPPED, before, after)
-    if set(counts) == {before}:
-        return Told(Path.UNKNOWN, Unknown.NOT_SETTLED, before, after)
-    return Told(Path.UNKNOWN, Unknown.WARM_COUNT_DIFFERS, before, after)
+        return Unknown.NOT_READ_OUT_OF_SERVICE
+    return None
 
 
 @dataclass
@@ -550,14 +391,15 @@ class Departure:
     last_write: float
     gone_read_at: float
     decision: Decision | None = None
-    path: Path | None = None
+    # Once its `scale_in` line is written: what its readings do not tell, or None when they agree.
+    unknown: Unknown | None = None
 
 
 @dataclass
 class Decision:
     """One note of the scaler asking for `fewer` instances fewer, and what the job read of it: the
-    notes read since, the in-service drops it read for it (when each was read, and the reading's
-    time), and the departures it read for it, in order."""
+    in-service drops it read for it (when each was read, and the reading's time), and the
+    departures it read for it, in order."""
 
     number: int
     asked: int
@@ -565,22 +407,8 @@ class Decision:
     asked_at: float
     asked_read_at: float
     in_service_before: int
-    notes: list[ScalerNote] = field(default_factory=list)
     drops: list[tuple[float, float]] = field(default_factory=list)
     departures: list[Departure] = field(default_factory=list)
-
-    def window(self, now: float) -> tuple[float, float, bool]:
-        """Up to when the warm readings belong to this decision's departures, the scaler's next
-        decision (`warm_bound`); when the job may tell their path, `WARM_SETTLE_SECONDS` past the
-        last stop or that next decision, whichever comes first; and whether the window ran its
-        whole `WARM_SETTLE_SECONDS` and the readings of it can have reached the workspace
-        (`path_of`). A reading made after the settle time, before the next decision, still belongs
-        to this one: a return to the warm pool may be counted late."""
-        if not self.departures:
-            return math.inf, math.inf, False
-        settle = max(departure.last_write for departure in self.departures) + WARM_SETTLE_SECONDS
-        bound, _ = warm_bound(self.asked, self.notes, self.asked_at)
-        return bound, min(settle, bound), settle <= bound and now >= settle + INGEST_SECONDS
 
 
 def stops(writes: set[float], *, since: float, now: float) -> list[float]:
@@ -610,7 +438,6 @@ class Watch:
     writes: dict[str, set[float]] = field(default_factory=dict)
     decisions: list[Decision] = field(default_factory=list)
     departures: dict[tuple[str, float], Departure] = field(default_factory=dict)
-    ready_at: float | None = None
 
     @property
     def since(self) -> float:
@@ -635,14 +462,15 @@ class Watch:
                 owing.departures.append(departure)
         return left
 
-    def waiting_for(self) -> str:
+    def waiting_for(self) -> str | None:
+        """The reading the cycle still waits for, or None once it has every one."""
         if not self.decisions or self.asked != 0:
             return "scale_in_asked"
         if any(len(one.departures) < one.fewer for one in self.decisions):
             return "gone"
         if any(len(one.drops) < one.fewer for one in self.decisions):
             return "out_of_service"
-        return "warm_readings"
+        return None
 
 
 # The requests.
@@ -957,8 +785,6 @@ class Run:
             return
         now = self.clock.now()
         watch.note = note
-        for decision in watch.decisions:
-            decision.notes.append(note)
         if note.capacity_asked < watch.asked:
             decision = Decision(
                 number=len(self.decisions) + 1,
@@ -1060,62 +886,44 @@ class Run:
                 read_at=utc(read_at),
             )
 
-    async def _settled(self, watch: Watch) -> bool:
-        """Whether the cycle is over: the scaler asks for none, every decision has its instances out
-        of service and gone, and the warm readings of each are whole; then its `scale_in` lines."""
-        now = self.clock.now()
-        if watch.waiting_for() != "warm_readings":
+    def _settled(self, watch: Watch) -> bool:
+        """Whether the cycle is over: the scaler asks for none, and every decision has its instances
+        out of service and gone; then its `scale_in` lines."""
+        if watch.waiting_for() is not None:
             return False
-        if any(now < decision.window(now)[1] + INGEST_SECONDS for decision in watch.decisions):
-            return False
-        watch.ready_at = now if watch.ready_at is None else watch.ready_at
-        return await self._tell(watch, final=now >= watch.ready_at + FRESH_SECONDS)
-
-    async def _tell(self, watch: Watch, *, final: bool) -> bool:
-        """Tells the path of each departure of the watch from the warm readings and writes its
-        `scale_in` line. Unless `final`, writes nothing and says False when a reading was missing:
-        the workspace may show it a moment later."""
-        now = self.clock.now()
-        warm = await self.read("workspace", lambda: self.pool.readings(WARM_INSTANCES, watch.since, now)) or []
-        told: dict[int, Told] = {}
-        for decision in watch.decisions:
-            if not decision.departures:
-                continue
-            end, _, settled = decision.window(now)
-            newcomer = any(decision.asked_at < min(times) < end for times in watch.writes.values())
-            told[decision.number] = path_of(
-                asked_at=decision.asked_at,
-                stops=[departure.last_write for departure in decision.departures],
-                leaving=decision.fewer,
-                out_of_service=len(decision.drops) >= len(decision.departures),
-                warm=warm,
-                end=end,
-                settled=settled,
-                newcomer=newcomer,
-                next_at=warm_bound(decision.asked, decision.notes, decision.asked_at)[1],
-            )
-        if not final and any(one.unknown in MISSING for one in told.values()):
-            return False
-        left = watch.attribute()
-        for decision in watch.decisions:
-            for index, departure in enumerate(sorted(decision.departures, key=lambda one: one.last_write)):
-                drop = decision.drops[index] if index < len(decision.drops) else (None, None)
-                self._scale_in_line(departure, told[decision.number], decision, drop)
-        for departure in left:
-            self._scale_in_line(departure, Told(Path.UNKNOWN, Unknown.NOT_ASKED), None, (None, None))
+        self._tell(watch)
         return True
 
+    def _tell(self, watch: Watch) -> None:
+        """Writes the `scale_in` line of each departure of the watch, with what its decision's
+        readings do not tell when they do not agree (`unknown_of`)."""
+        left = watch.attribute()
+        for decision in watch.decisions:
+            unknown = unknown_of(
+                asked_at=decision.asked_at,
+                stops=[departure.last_write for departure in decision.departures],
+                out_of_service=len(decision.drops) >= len(decision.departures),
+            )
+            for index, departure in enumerate(sorted(decision.departures, key=lambda one: one.last_write)):
+                drop = decision.drops[index] if index < len(decision.drops) else (None, None)
+                self._scale_in_line(departure, unknown, decision, drop)
+        for departure in left:
+            self._scale_in_line(departure, Unknown.NOT_ASKED, None, (None, None))
+
     def _scale_in_line(
-        self, departure: Departure, told: Told, decision: Decision | None, drop: tuple[float | None, float | None]
+        self,
+        departure: Departure,
+        unknown: Unknown | None,
+        decision: Decision | None,
+        drop: tuple[float | None, float | None],
     ) -> None:
-        departure.path = told.path
+        departure.unknown = unknown
         self.departures.append(departure)
         self.recorder.line(
             "scale_in",
             departure=departure.number,
             decision=None if decision is None else decision.number,
-            path=told.path.value,
-            unknown=None if told.unknown is None else told.unknown.value,
+            unknown=None if unknown is None else unknown.value,
             instance=self.names(departure.instance),
             asked_at=None if decision is None else utc(decision.asked_at),
             asked_read_at=None if decision is None else utc(decision.asked_read_at),
@@ -1123,8 +931,6 @@ class Run:
             out_of_service_reading_at=utc(drop[1]),
             last_write_at=utc(departure.last_write),
             gone_read_at=utc(departure.gone_read_at),
-            warm_before=told.warm_before,
-            warm_after=list(told.warm_after),
         )
 
     async def cycle(self) -> None:
@@ -1157,11 +963,11 @@ class Run:
                     release.set()
                 if streaming is not None and streaming.done() and not self.scale_in_streamed:
                     stream_line(streaming.result())
-                if await self._settled(watch):
+                if self._settled(watch):
                     return
                 await self.clock.sleep(NOTE_POLL_SECONDS)
             self.recorder.line("timeout", waiting_for=watch.waiting_for())
-            await self._tell(watch, final=True)
+            self._tell(watch)
         finally:
             release.set()
             if streaming is not None and not self.scale_in_streamed:
@@ -1172,8 +978,8 @@ class Run:
         """Whether the stream across a scale-in is sent whole: the job has read the scaler's first
         decision, and that decision leaves an instance in service, so the gateway forwards the
         request to the pool while the departing instance drains. A first decision that asked for
-        none holds it to the cycle's end, when the paths are told: sent before, it would wake the
-        pool and change the warm count the paths are told from."""
+        none holds it to the cycle's end, when the departures are read: sent before, it would wake
+        the pool the job watches go to none."""
         return bool(watch.decisions) and watch.decisions[0].asked > 0
 
     async def _across_scale_in(self, release: asyncio.Event, hold: float) -> Read:
@@ -1295,8 +1101,8 @@ class Run:
         for number in range(1, CYCLES + 1):
             self.recorder.line("cycle_started", cycle=number)
             await self.cycle()
-            paths = {departure.path for departure in self.departures}
-            if {Path.TERMINATED, Path.WARM_POOL} <= paths and self.scale_in_streamed:
+            # `departures` holds those whose line is written: one read whole is enough.
+            if any(departure.unknown is None for departure in self.departures) and self.scale_in_streamed:
                 break
         await self.send_wakes()
         self.recorder.line("run_ended")

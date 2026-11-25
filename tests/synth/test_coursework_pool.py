@@ -1,5 +1,5 @@
 """The coursework pool's group on the app with the example configuration (system design, sections
-4.2, 4.3 and 5.2): its maximum, its one instance type, its warm pool of stopped instances and its
+4.2, 4.3 and 4.5): its maximum, its one instance type, no warm pool whatever its entry gives and its
 150 GB volume, and the mock pool's volume left at its image's size.
 
 The CDK is imported inside the tests, after `app_module` has started jsii (see conftest.py).
@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+
+from rhi import config
 
 if TYPE_CHECKING:
     import aws_cdk as cdk
@@ -37,18 +39,19 @@ def volume(pools: dict[str, Any], pool: str) -> dict[str, Any]:
 
 
 def test_the_coursework_group(pools: dict[str, Any]) -> None:
-    ((name, group),) = of_pool(pools, "AWS::AutoScaling::AutoScalingGroup", "coursework").items()
+    (group,) = of_pool(pools, "AWS::AutoScaling::AutoScalingGroup", "coursework").values()
     assert group["MinSize"] == "0"
     assert group["MaxSize"] == "2"
     assert "DesiredCapacity" not in group
     assert [tag["Value"] for tag in group["Tags"] if tag["Key"] == "rhi-pool"] == ["coursework"]
     overrides = group["MixedInstancesPolicy"]["LaunchTemplate"]["Overrides"]
     assert overrides == [{"InstanceType": "g7e.2xlarge"}]
-    (warm_pool,) = of_pool(pools, "AWS::AutoScaling::WarmPool", "coursework").values()
-    assert warm_pool["AutoScalingGroupName"] == {"Ref": name}
-    assert warm_pool["PoolState"] == "Stopped"
-    assert warm_pool["MaxGroupPreparedCapacity"] == 2
-    assert warm_pool["MinSize"] == 0
+
+
+def test_the_pools_stack_holds_no_warm_pool_though_the_coursework_entry_gives_two(pools: dict[str, Any]) -> None:
+    (coursework,) = [pool for pool in config.load({"RHI_CONFIG": "example"}).pools if pool.name == "coursework"]
+    assert coursework.warm_instances == 2
+    assert [r for r in pools["Resources"].values() if r["Type"] == "AWS::AutoScaling::WarmPool"] == []
 
 
 def test_the_coursework_volume_is_150_gb(pools: dict[str, Any]) -> None:

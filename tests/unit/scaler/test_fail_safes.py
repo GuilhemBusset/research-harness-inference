@@ -28,7 +28,7 @@ POOL = parse_pools(
     }
 )[0]
 AT_ZERO = Supply(desired=0)
-ONE = Supply(desired=1, in_service=("instance-a",), warm=("instance-w",), running=("instance-a",))
+ONE = Supply(desired=1, in_service=("instance-a",), draining=("instance-w",), running=("instance-a", "instance-w"))
 
 
 def gateway(now: int, *, held: int = 0, in_flight: int = 0) -> GatewayHeartbeat:

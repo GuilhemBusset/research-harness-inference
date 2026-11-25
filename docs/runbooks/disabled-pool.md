@@ -122,7 +122,7 @@ only when the admin asks for its capacity, which is not part of this runbook.
    idle, so it is kept until the pool's idle rule takes it: `idle_minutes` after the pool's last
    request (20 for the example's coursework), plus a few minutes for the scaler to act (section
    5.1). The check is the capacity: in Grafana, on the dashboard "Fleet and scaling", in the pool's
-   row, the panel "Instances: desired, in service, warm" reads zero for desired and for in service,
+   row, the panel "Instances: desired, in service" reads zero for desired and for in service,
    within those minutes. The panel "Engine requests: running and waiting, per instance" of the same
    row says why an instance is still kept: one that reports requests running or waiting is still
    serving them. It is not a step the disable must pass through: an instance released at once, or

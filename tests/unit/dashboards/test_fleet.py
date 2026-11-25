@@ -18,7 +18,7 @@ from rhi_scaler import metrics as scaler
 
 SCALER_FILE = "services/scaler/rhi_scaler/metrics.py"
 LIFECYCLE_FILE = "services/engine/lifecycle/rhi_lifecycle/stages.py"
-# The two transitions that put an instance in service: from the warm pool, and with none to promote.
+# The two transitions that put an instance in service, as the lifecycle agent names them.
 STARTS = {stages.Transition.PROMOTION.value, stages.Transition.COLD_LAUNCH.value}
 
 
@@ -74,7 +74,7 @@ def test_a_row_shows_the_fleet_the_scale_decisions_and_each_instances_engine_loa
         row = rows(example)[pool.name]
         matchers = {rules.POOL: pool.name}
 
-        # The desired, in-service and warm counts, as the scaler sends them.
+        # The desired and in-service counts, as the scaler sends them, and no other.
         (counts,) = panels_on(row, scaler.DESIRED_CAPACITY)
         assert set(queries(counts)) == {rules.selector(gauge, matchers) for gauge in scaler.GAUGES}
 
