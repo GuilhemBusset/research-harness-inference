@@ -17,7 +17,7 @@ pytest's import path in `PYTHONPATH`:
   run when that file lies inside the tree it searches.
 
 The scripts of the verification step (`src/rhi/pipeline/verify.py`), which runs after the stage's
-deployment and needs no import path:
+deployment, with the folders of pytest's import path in `PYTHONPATH` for the booking:
 
 - `gpu_verification.py` runs first and decides whether the execution verifies on the coursework
   pool: yes when an instance refresh of a GPU pool's group, found by its tags `rhi-pool` and
@@ -41,7 +41,16 @@ deployment and needs no import path:
   any piece of it. When the decision's file names a pool, it then runs the same smoke tests once
   more with `RHI_SMOKE_POOL` naming that pool, `gpu-release-served` among them, which the mock
   pool's run leaves out, and `release-heartbeat`, which compares the release the pool's instances
-  write in their heartbeat rows with the deployed one.
+  write in their heartbeat rows with the deployed one. Around its run on the mock pool it books
+  that pool through `booking.py`, for twice the configuration's `check_wait_minutes`, waits until
+  `GET /status` reads the pool ready or `check_wait_minutes` have passed, and stops the session it
+  booked whatever the tests' result; a pool that already has a session is neither booked nor
+  stopped.
+- `booking.py` is what a check books a pool through: `book` writes a session of one instance, for
+  the minutes and under the name it is given, with the rules of `rhi_common.sessions`, only on a
+  pool that has no session booked or active; `stop` ends that session only while the item still
+  reads as the booking. It is a module, not a script: the canary and the spike jobs of the mock
+  pool book the same way.
 
 The script of the weekly GPU canary (`src/rhi/pipeline/canary.py`), a job its schedule starts on
 Sundays at 04:00 UTC, with the repository's package roots in `PYTHONPATH`:

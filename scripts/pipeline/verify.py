@@ -23,6 +23,22 @@ else, the health route included, are asserted on the synthesized template
 `GPU_PASS_ONLY`, in the run on the mock pool, the one that names no pool: they belong to the run
 on the coursework pool. A run that names a pool leaves none out.
 
+**The session on the mock pool.** Before its run of the tests on the mock pool, the script books
+that pool through `booking.py`: a session of one instance, under the name `BOOKED_BY`, for twice
+`RHI_VERIFY_CHECK_WAIT_MINUTES`, the wait below and as long again for the tests, so that a step
+that dies leaves a session that ends by itself. It finds the stage's pool-state table by its
+logical ID in the pools stack, as the deployment hold does. It then reads the gateway's
+`GET /status`, with the canary's key, every `POLL_SECONDS`, until the pool reads `ready` or
+`RHI_VERIFY_CHECK_WAIT_MINUTES` have passed since the booking, and runs the tests in either case.
+No reading starts once the wait is over, and each is given no longer than what is left of it.
+Whatever the run's result, it then stops the session, only while the session still reads as the
+booking it made. A pool that already has a session booked or active is neither booked nor stopped:
+the tests run at once, on the instances that are there. A pool that cannot be booked fails the
+script before any test, and so does a booking longer than `RHI_VERIFY_SESSION_MAX_HOURS` allows. A
+session that could not be stopped fails a run whose tests passed: it ends by itself. The script
+says which of these happened in a line of its own, never in a message of AWS, and does not check
+that the instance leaves once the session is stopped. The coursework pool's runs book nothing.
+
 **The coursework pool.** Before this script, the step runs the decision of `gpu_verification.py`,
 which waits for the instance refresh a GPU pool's release started and leaves, in the file
 `RHI_VERIFY_GPU_POOLS_FILE` names, the pools the smoke tests must also run on: `coursework` when
@@ -70,12 +86,17 @@ What the step gives, in the environment:
 | `RHI_VERIFY_HEARTBEATS_TABLE` | The name of the heartbeats table of the stage |
 | `RHI_VERIFY_LAST_STAGES_FILE` | The file the instances' last stages are left in |
 | `RHI_VERIFY_GPU_POOLS_FILE` | The file the decision left the pools to verify on in, one per line |
+| `RHI_VERIFY_POOLS_STACK` | The name of the pools stack of the stage |
+| `RHI_VERIFY_POOL_STATE_LOGICAL_ID` | The logical ID of the pool-state table in that stack |
+| `RHI_VERIFY_CHECK_WAIT_MINUTES` | The configuration's `check_wait_minutes`, a whole number above zero |
+| `RHI_VERIFY_SESSION_MAX_HOURS` | The configuration's `session_max_hours`, a whole number above zero |
 
 The pools' parameters come from a stack's output through the pipeline, which puts the value into
 JSON as it is, so they arrive without a quote; the smoke tests read them as JSON, in
 `RHI_SMOKE_RELEASE_PARAMETERS`, which the script writes for them.
 
-Run by the verification step, from the checkout:
+Run by the verification step, from the checkout, with PYTHONPATH holding the import path of
+`pyproject.toml`, which the booking needs (`rhi_common`) and no earlier path of the script does:
 
     uv run --locked python scripts/pipeline/verify.py
 
@@ -89,6 +110,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -97,6 +121,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
+    import httpx
     import pytest
 
 NAME = "verify"
@@ -116,6 +141,22 @@ HEARTBEATS_TABLE_VARIABLE = "RHI_VERIFY_HEARTBEATS_TABLE"
 LAST_STAGES_FILE_VARIABLE = "RHI_VERIFY_LAST_STAGES_FILE"
 GPU_POOLS_FILE_VARIABLE = "RHI_VERIFY_GPU_POOLS_FILE"
 POOL_VARIABLE = "RHI_SMOKE_POOL"
+POOLS_STACK_VARIABLE = "RHI_VERIFY_POOLS_STACK"
+POOL_STATE_LOGICAL_ID_VARIABLE = "RHI_VERIFY_POOL_STATE_LOGICAL_ID"
+CHECK_WAIT_MINUTES_VARIABLE = "RHI_VERIFY_CHECK_WAIT_MINUTES"
+SESSION_MAX_HOURS_VARIABLE = "RHI_VERIFY_SESSION_MAX_HOURS"
+
+# The pool the run that names no pool tests (`tests/smoke/conftest.py`), which the script books
+# for that run, and the name it books it under.
+MOCK_POOL = "mock"
+BOOKED_BY = "pipeline/verify"
+# The state `GET /status` gives a pool that serves (section 5.3).
+READY = "ready"
+# Between two readings of the pool's state while the script waits for it, and the longest one may
+# take: less when less is left of the wait.
+POLL_SECONDS = 10.0
+READ_SECONDS = 10.0
+MINUTE_SECONDS = 60
 
 # The heartbeats table as far as the script reads it: its partition key, its sort key, what comes
 # before an instance's ID in the sort key, and the attribute that holds the last stage the
@@ -328,17 +369,173 @@ def gpu_pools(env: Mapping[str, str]) -> list[str] | None:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+@dataclass(frozen=True)
+class Check:
+    """What the step gives for the session on the mock pool: the pools stack and the pool-state
+    table's logical ID in it, the minutes the script waits for the session's instance, and the
+    longest a session lasts, in hours."""
+
+    stack: str
+    logical_id: str
+    wait_minutes: int
+    session_max_hours: int
+
+
+def _whole(text: str | None) -> int | None:
+    """The whole number above zero the variable holds, `None` when it is missing or holds anything else."""
+    return int(text) if text is not None and text.isascii() and text.isdigit() and int(text) > 0 else None
+
+
+def check_of(env: Mapping[str, str]) -> Check | None:
+    """What the environment gives for the session on the mock pool, `None` when a variable is
+    missing or a number is not a whole number above zero."""
+    stack, logical_id = env.get(POOLS_STACK_VARIABLE), env.get(POOL_STATE_LOGICAL_ID_VARIABLE)
+    wait_minutes, hours = _whole(env.get(CHECK_WAIT_MINUTES_VARIABLE)), _whole(env.get(SESSION_MAX_HOURS_VARIABLE))
+    if not stack or not logical_id or wait_minutes is None or hours is None:
+        return None
+    return Check(stack=stack, logical_id=logical_id, wait_minutes=wait_minutes, session_max_hours=hours)
+
+
+def status_reader(
+    endpoint: str, key: str, transport: httpx.BaseTransport | None = None
+) -> Callable[[float], str | None]:
+    """What reads the mock pool's state from `GET /status` of `endpoint`, with the canary's key,
+    through `transport` when one is given: None for a reading that failed. A reading is given the
+    seconds it may take, and `READ_SECONDS` when that is more: one that has no answer by then is
+    given up, and reads as None. Nothing of the machine's own configuration, a proxy among it,
+    takes part in a reading."""
+    import httpx
+
+    address = (endpoint if "://" in endpoint else f"https://{endpoint}").rstrip("/")
+
+    def read(within: float) -> str | None:
+        # A time-out of httpx is for each step of a request, the connection then each wait for the
+        # answer, not for the whole of it: the request is made aside, and left when its seconds
+        # are over. Its own time-outs end it soon after.
+        seconds = min(READ_SECONDS, within)
+        states: list[str | None] = []
+        request = threading.Thread(target=lambda: states.append(answered(seconds)), daemon=True)
+        request.start()
+        request.join(seconds)
+        return states[0] if states else None
+
+    def answered(seconds: float) -> str | None:
+        try:
+            with httpx.Client(timeout=seconds, trust_env=False, transport=transport) as http:
+                answer = http.get(f"{address}/status", headers={"Authorization": f"Bearer {key}"})
+            states = {record["model"]: record["state"] for record in answer.json()["pools"]}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return None
+        state = states.get(MOCK_POOL) if answer.status_code == 200 else None
+        return state if isinstance(state, str) else None
+
+    return read
+
+
+def wait_until_ready(
+    status: Callable[[float], str | None], *, until: float, sleep: Callable[[float], None], clock: Callable[[], float]
+) -> bool:
+    """Reads the pool's state with `status` every `POLL_SECONDS` until it reads `READY`, or until
+    the time `until` has come; whether it read ready. No reading starts at that time or after it,
+    and each is given what is left until then as the seconds it may take."""
+    while (left := until - clock()) > 0:
+        if status(left) == READY:
+            return True
+        sleep(max(0.0, min(POLL_SECONDS, until - clock())))
+    return False
+
+
+def run_in_a_session(
+    check: Check,
+    run: Callable[[], int],
+    *,
+    cloudformation: Any,
+    resource: Any,
+    status: Callable[[float], str | None],
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> tuple[int | None, bool]:
+    """Makes `run`, the mock pool's run of the tests, in a session the script books on that pool
+    and stops after the run, whatever its result: the run's exit, and whether the session was
+    stopped or was not the script's to stop. A pool that already has a session is neither booked
+    nor stopped, and the run is made at once. A pool that cannot be booked gets no run: `None`."""
+    # Here and not at the top: the script's paths that book nothing, and the run of the tests that
+    # loads this file as its plugin, need no import path.
+    import booking
+    from rhi_common.records import RecordError
+    from rhi_common.sessions import SessionError
+
+    minutes = 2 * check.wait_minutes
+    try:
+        table = resource.Table(booking.table_name(cloudformation, check.stack, check.logical_id))
+        session = booking.book(
+            table,
+            MOCK_POOL,
+            minutes=minutes,
+            set_by=BOOKED_BY,
+            now=int(clock()),
+            session_max_hours=check.session_max_hours,
+        )
+    except SessionError:
+        problem = (
+            f"a session of {minutes} minutes, twice {CHECK_WAIT_MINUTES_VARIABLE}, is longer than a session may last"
+        )
+        print(f"{NAME}: the pool {MOCK_POOL} was not booked: {problem}", file=sys.stderr)
+        return None, False
+    except (BotoCoreError, ClientError, KeyError, RecordError) as error:
+        print(f"{NAME}: the pool {MOCK_POOL} was not booked ({type(error).__name__}): no test was run", file=sys.stderr)
+        return None, False
+    if session is None:
+        print(f"{NAME}: the pool {MOCK_POOL} already has a session: it is neither booked nor stopped")
+        return run(), True
+    # Flushed: the wait that follows may be long, and the log says what the step waits for.
+    print(f"{NAME}: booked the pool {MOCK_POOL} for {minutes} minutes", flush=True)
+    try:
+        until = session.set_at + check.wait_minutes * MINUTE_SECONDS
+        if wait_until_ready(status, until=until, sleep=sleep, clock=clock):
+            print(f"{NAME}: the pool {MOCK_POOL} reads ready")
+        else:
+            print(f"{NAME}: the pool {MOCK_POOL} did not read ready in {check.wait_minutes} minutes: the tests run")
+        exit_code = run()
+    finally:
+        try:
+            ended = booking.stop(table, session, now=int(clock()), session_max_hours=check.session_max_hours)
+        except (BotoCoreError, ClientError, RecordError) as error:
+            stopped = False
+            reason = f"({type(error).__name__}): it ends by itself"
+            print(f"{NAME}: the session on the pool {MOCK_POOL} was not stopped {reason}", file=sys.stderr)
+        else:
+            stopped = True
+            if ended is None:
+                print(
+                    f"{NAME}: the session on the pool {MOCK_POOL} no longer reads as the booking: it is left as it is"
+                )
+            else:
+                print(f"{NAME}: stopped the session it booked on the pool {MOCK_POOL}")
+    return exit_code, stopped
+
+
 def main(
     environ: Mapping[str, str] | None = None,
     client: Any = None,
     run: Callable[[Mapping[str, str]], int] = run_tests,
     dynamodb: Any = None,
+    *,
+    cloudformation: Any = None,
+    resource: Any = None,
+    status: Callable[[float], str | None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
 ) -> int:
     """Verifies the deployment the environment names; 0 when every test passed or none could run.
-    `client` is a Secrets Manager client of the AWS SDK and `dynamodb` a DynamoDB one; without one,
-    the build's own credentials and region make it. `run` runs the smoke tests in the environment
-    it is given: once on the mock pool, then once on each pool the decision left. When a run
-    fails, the last stage each instance of the tested pools reached is left for the step's
+    `client` is a Secrets Manager client of the AWS SDK, `dynamodb` a DynamoDB one, `cloudformation`
+    a CloudFormation one and `resource` a DynamoDB resource; without one, the build's own
+    credentials and region make it. `run` runs the smoke tests in the environment it is given: once
+    on the mock pool, in a session the script books and stops, then once on each pool the decision
+    left. `status` reads the mock pool's state in the seconds it is given, from the endpoint's
+    `GET /status` when left out;
+    `sleep` waits that many seconds and `clock` gives the time, in seconds since the epoch. When a
+    run fails, the last stage each instance of the tested pools reached is left for the step's
     post-build phase."""
     env = os.environ if environ is None else environ
     endpoint = env.get(ENDPOINT_VARIABLE)
@@ -359,14 +556,39 @@ def main(
     if passes is None:
         print(f"{NAME}: {GPU_POOLS_FILE_VARIABLE} names no file: the decision did not run", file=sys.stderr)
         return 1
+    check = check_of(env)
+    if check is None:
+        print(
+            f"{NAME}: {POOLS_STACK_VARIABLE} and {POOL_STATE_LOGICAL_ID_VARIABLE} name the pool-state table, and "
+            f"{CHECK_WAIT_MINUTES_VARIABLE} and {SESSION_MAX_HOURS_VARIABLE} are whole numbers above zero",
+            file=sys.stderr,
+        )
+        return 1
     pools = release_parameters(env.get(RELEASE_PARAMETERS_VARIABLE, ""))
     given = {**env, KEY_VARIABLE: key, SMOKE_RELEASE_PARAMETERS_VARIABLE: json.dumps(pools)}
     given.pop(POOL_VARIABLE, None)
-    exits = [run(given)] + [run({**given, POOL_VARIABLE: pool}) for pool in passes]
+    if cloudformation is None or resource is None:
+        import boto3
+
+        cloudformation = cloudformation or boto3.client("cloudformation")
+        resource = resource or boto3.resource("dynamodb")
+    on_mock, in_order = run_in_a_session(
+        check,
+        lambda: run(given),
+        cloudformation=cloudformation,
+        resource=resource,
+        status=status or status_reader(endpoint, key),
+        sleep=sleep,
+        clock=clock,
+    )
+    if on_mock is None:
+        return 1
+    exits = [on_mock] + [run({**given, POOL_VARIABLE: pool}) for pool in passes]
     exit_code = next((code for code in exits if code != 0), 0)
     if exit_code != 0:
         leave_last_stages(env, pools, dynamodb)
-    return exit_code
+    # A session the script booked and could not stop fails a verification whose tests passed.
+    return exit_code if exit_code != 0 or in_order else 1
 
 
 if __name__ == "__main__":
