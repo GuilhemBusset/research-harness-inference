@@ -230,7 +230,6 @@ def test_a_missing_key_raises(tmp_path: Path, key: str) -> None:
         ("cached_share_flag_percent", f"100.{MARK}"),
         ("target_failed_requests_percent", f"100.{MARK}"),
         *(("pipeline_events_retention_days", value) for value in ("0", "91", f'"{MARK}"', "90.5", "true")),
-        *(("nightly_stop", value) for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", f'"{MARK}"')),
     ],
 )
 def test_a_value_of_the_wrong_type_raises(tmp_path: Path, key: str, value: str) -> None:
@@ -256,6 +255,21 @@ def test_the_retired_session_windows_load_only_as_an_empty_list(tmp_path: Path) 
         message = refusal(tmp_path, text)
         assert repr("session_windows") in message
         assert MARK not in message
+
+
+def test_the_retired_nightly_stop_loads_only_as_a_time_of_day(tmp_path: Path) -> None:
+    # The deployed configuration still holds the key, though no group has a nightly stop (section
+    # 5.1): a time of day loads as if the source did not hold it, and nothing else does.
+    assert not hasattr(config.load({"RHI_CONFIG": "example"}), "nightly_stop")
+    assert "nightly_stop" not in config.KEYS
+    assert "nightly_stop" not in tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    without = load_text(tmp_path, example_with())
+    for time_of_day in ("02:00", "23:30"):
+        assert load_text(tmp_path, f'nightly_stop = "{time_of_day}"\n' + example_with()) == without
+    for value in ('"2am"', '"2:00"', '"24:00"', '"02:60"', '"02:00:00"', "2", "02:00:00", f'"{MARK}"'):
+        message = refusal(tmp_path, f"nightly_stop = {value}\n" + example_with())
+        assert repr("nightly_stop") in message
+        assert "'file'" in message
 
 
 def test_a_default_fills_a_missing_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,13 +363,6 @@ def test_the_issuer_s_two_keys_read_5_when_left_out(tmp_path: Path) -> None:
     assert (example["issuer_reserved_concurrency"], example["key_issuances_per_day"]) == (5, 5)
     given = load_text(tmp_path, example_with(issuer_reserved_concurrency="2", key_issuances_per_day="3"))
     assert (given.issuer_reserved_concurrency, given.key_issuances_per_day) == (2, 3)
-
-
-def test_nightly_stop_reads_02_00_when_left_out(tmp_path: Path) -> None:
-    # Section 17: the nightly stop is at 02:00; the example gives that, and a given time is kept.
-    assert load_text(tmp_path, example_with(nightly_stop=None)).nightly_stop == "02:00"
-    assert tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))["nightly_stop"] == "02:00"
-    assert load_text(tmp_path, example_with(nightly_stop='"23:30"')).nightly_stop == "23:30"
 
 
 def test_the_gateway_s_seven_keys_read_their_defaults_when_left_out(tmp_path: Path) -> None:

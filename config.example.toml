@@ -76,10 +76,6 @@ zones = ["example-zone-a", "example-zone-b", "example-zone-c", "example-zone-d"]
 issuer_reserved_concurrency = 5
 key_issuances_per_day = 5
 
-# The time of day, in the time zone above, at which a scheduled action sets every pool's desired
-# capacity to zero (sections 5.1 and 17). Left out, it is 02:00.
-nightly_stop = "02:00"
-
 # How many gateway tasks the service runs (sections 2 and 11.2). Left out, it is 2.
 gateway_tasks = 2
 

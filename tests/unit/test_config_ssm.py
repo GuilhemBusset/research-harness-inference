@@ -160,6 +160,24 @@ def test_the_retired_session_windows_parameter_loads_only_as_an_empty_list() -> 
     assert not any("session_windows" in name for name in written.parameters)
 
 
+def test_the_retired_nightly_stop_parameter_loads_only_as_a_time_of_day() -> None:
+    # The deployed prefix still holds the parameter, which the writer never deletes: a time of day
+    # loads as if it were not there, any other text is refused, and no writing puts it.
+    stand_in = StandIn(example_parameters())
+    assert "/rhi/config/nightly_stop" not in stand_in.parameters
+    stand_in.parameters["/rhi/config/nightly_stop"] = ("String", "02:00")
+    assert config.read_ssm(stand_in) == EXAMPLE
+    stand_in.parameters["/rhi/config/nightly_stop"] = ("String", f"2am{MARK}")
+    with pytest.raises(config.ConfigError) as raised:
+        config.read_ssm(stand_in)
+    assert "'nightly_stop'" in str(raised.value)
+    assert MARK not in as_logged(raised.value)
+
+    written = StandIn()
+    config.write_ssm(EXAMPLE, written)
+    assert not any("nightly_stop" in name for name in written.parameters)
+
+
 def test_a_written_configuration_reads_back_as_the_same_object(tmp_path: Path) -> None:
     other = dataclasses.replace(
         EXAMPLE,

@@ -149,9 +149,6 @@ class Config:
     # day, which reaches the issuer as RHI_ISSUANCES_PER_DAY (sections 6.4 and 17).
     issuer_reserved_concurrency: int
     key_issuances_per_day: int
-    # The time of day, HH:MM in `time_zone`, at which each pool's group is set to no instance
-    # (sections 5.1 and 17). Only synthesis reads it: it reaches no service.
-    nightly_stop: str
     # How many gateway tasks the service runs (sections 2 and 11.2). Only the deployment reads it.
     gateway_tasks: int
     # The gateway's numeric settings (section 17), each of which the deployment writes into the
@@ -467,7 +464,6 @@ KEYS: dict[str, Key] = {
     ),
     "issuer_reserved_concurrency": _WHOLE_NUMBER,
     "key_issuances_per_day": _WHOLE_NUMBER,
-    "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
     "gateway_tasks": _WHOLE_NUMBER,
     "request_body_limit_bytes": _WHOLE_NUMBER,
     "longest_request_seconds": _WHOLE_NUMBER,
@@ -500,10 +496,12 @@ KEYS: dict[str, Key] = {
 
 # Keys a source may still hold though the configuration has none: each is checked with its old
 # parser and then dropped, so that a source holding it loads as if it did not, and any other value
-# is refused as before. `session_windows` (ADR 0003, decision 2) stays until the owner has deleted
+# is refused as before. `session_windows` (ADR 0003, decision 2) and `nightly_stop`, the time of day
+# of the nightly stop that sessions replaced (section 5.1), each stay until the owner has deleted
 # its parameter in SSM; a later change then removes the entry.
 RETIRED_KEYS: dict[str, Key] = {
     "session_windows": _EMPTY_LIST,
+    "nightly_stop": Key('a time of day in hours and minutes, written "HH:MM" on a 24-hour clock', _time_of_day),
 }
 
 # The one table of defaults: the value a key takes when a source leaves it out. An entry is the
@@ -522,8 +520,6 @@ DEFAULTS: dict[str, object] = {
     # Section 17: the issuer's reserved concurrency is 5, and so are a student's issuances a day.
     "issuer_reserved_concurrency": 5,
     "key_issuances_per_day": 5,
-    # Section 17: the nightly stop is at 02:00 in the configured time zone.
-    "nightly_stop": "02:00",
     # Sections 2 and 11.2: the gateway runs two tasks.
     "gateway_tasks": 2,
     # Section 17: a request body of 8 MB at most, a request of 30 minutes at most, a keep-alive
