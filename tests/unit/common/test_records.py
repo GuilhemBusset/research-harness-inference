@@ -13,6 +13,7 @@ from rhi_common.records import (
     PoolState,
     RecordError,
     ScalerNote,
+    Session,
     SessionSwitch,
     is_fresh,
     session_is_on,
@@ -36,6 +37,9 @@ INSTANCE = InstanceHeartbeat(
 )
 STATE = PoolState(pool="coursework", mode=Mode.SCHEDULED_ONLY, set_by="admin", set_at=NOW - 500)
 NOTE = ScalerNote(pool="mock", capacity_asked=1, no_capacity_at=NOW - 90, written_at=NOW)
+SESSION = Session(
+    pool="coursework", instances=2, starts_at=NOW + 3600, ends_at=NOW + 18000, set_by="instructor", set_at=NOW
+)
 
 RECORDS = [
     GATEWAY,
@@ -46,12 +50,13 @@ RECORDS = [
     NOTE,
     ScalerNote(pool="mock", capacity_asked=0, no_capacity_at=None, written_at=NOW),
     ScalerNote(pool="mock", capacity_asked=2, no_capacity_at=None, written_at=NOW, rebalance_number=7),
+    SESSION,
 ]
 
 
 @pytest.mark.parametrize("record", RECORDS)
 def test_each_record_survives_a_round_trip(
-    record: GatewayHeartbeat | InstanceHeartbeat | PoolState | ScalerNote,
+    record: GatewayHeartbeat | InstanceHeartbeat | PoolState | ScalerNote | Session,
 ) -> None:
     item = record.to_item()
     # A time that is unknown is absent from the item; every other value is a string or a whole number.
@@ -67,9 +72,12 @@ def test_item_keys() -> None:
     assert (note["pool"], note["record"]) == ("mock", "note")
     state = STATE.to_item()
     assert (state["pool"], state["record"]) == ("coursework", "mode")
+    session = SESSION.to_item()
+    assert (session["pool"], session["record"]) == ("coursework", "session")
     # The pool-state items must survive: they carry no expiry.
     assert "expires_at" not in note
     assert "expires_at" not in state
+    assert "expires_at" not in session
 
     gateway = GATEWAY.to_item()
     assert (gateway["pool"], gateway["source"]) == ("coursework", "gateway#0f3a9c")
@@ -123,6 +131,9 @@ def test_an_item_of_another_record_is_refused() -> None:
     for read, item in [
         (PoolState.from_item, NOTE.to_item()),
         (ScalerNote.from_item, STATE.to_item()),
+        (Session.from_item, NOTE.to_item()),
+        (Session.from_item, SessionSwitch(on=True, set_by="admin", set_at=NOW).to_item()),
+        (PoolState.from_item, SESSION.to_item()),
         (GatewayHeartbeat.from_item, INSTANCE.to_item()),
         (InstanceHeartbeat.from_item, GATEWAY.to_item()),
         (GatewayHeartbeat.from_item, {**GATEWAY.to_item(), "source": "gateway#"}),
@@ -142,6 +153,18 @@ def test_a_time_that_is_not_a_whole_number_of_seconds_is_refused(written_at: obj
             read({**item, "written_at": written_at})
     with pytest.raises(RecordError):
         PoolState.from_item({**STATE.to_item(), "set_at": written_at})
+
+
+@pytest.mark.parametrize("name", ["pool", "instances", "starts_at", "ends_at", "set_by", "set_at"])
+def test_a_session_with_a_missing_or_mistyped_attribute_is_refused(name: str) -> None:
+    item: dict[str, object] = dict(SESSION.to_item())
+    is_text = isinstance(item[name], str)
+    for wrong in ("", 7) if is_text else ("2", Decimal("1.5"), 1.0, True, -1):
+        with pytest.raises(RecordError):
+            Session.from_item({**item, name: wrong})
+    del item[name]
+    with pytest.raises(RecordError):
+        Session.from_item(item)
 
 
 @pytest.mark.parametrize("on", [True, False])
