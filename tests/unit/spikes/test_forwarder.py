@@ -149,20 +149,22 @@ def test_an_sdk_reaches_the_gateway_through_its_forwarder(refusing_gateway: Gate
         if client is Client.OPENAI_SDK:
             route = "/v1/chat/completions"
             chat = openai.OpenAI(api_key=key, base_url=f"{through.url}/v1").chat.completions
-            with pytest.raises(openai.APIStatusError):
+            with pytest.raises(openai.APIStatusError) as refusal:
                 for _ in chat.create(model="gpt-5", messages=[{"role": "user", "content": prompt}], stream=True):
                     pass
         else:
             route = "/v1/messages"
             messages = anthropic.Anthropic(api_key=key, base_url=through.url).messages
             with (
-                pytest.raises(anthropic.APIStatusError),
+                pytest.raises(anthropic.APIStatusError) as refusal,
                 messages.stream(
                     model="claude-opus", max_tokens=256, messages=[{"role": "user", "content": prompt}]
                 ) as stream,
             ):
                 for _ in stream.text_stream:
                     pass
+    # The gateway's refusal reached the SDK in the gateway's own words.
+    assert Cause.REQUEST_REFUSED.sentence in refusal.value.message
     # The SDK's request reached the gateway, naming the mock pool, and its refusal is recorded.
     assert {sent["model"] for sent in refusing_gateway.bodies} == {"mock"}
     (request,) = [
