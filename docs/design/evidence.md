@@ -131,7 +131,7 @@ Prices are US East list prices unless stated. Where a decision rests on a claim 
 | AWS's base GPU image with the open-source NVIDIA driver (Ubuntu 22.04), release 20261110, lists G7e among its supported instances, with G6e, P5, P5e, P5en and P6. Its family page carries a known issue for multi-node work on `g7e.8xlarge`, which this design does not do, and gives the public SSM parameter for the latest image ID | L | https://docs.aws.amazon.com/dlami/latest/devguide/aws-deep-learning-ami-gpubaseoss-ul2204-2026-11-10.html ; https://docs.aws.amazon.com/dlami/latest/devguide/aws-deep-learning-x86-base-gpu-ami-ubuntu-22-04.html |
 | The "single CUDA" variant of the base image is a different image: its release notes list G6e, G7, P5 and P6 and not G7e. It is not the one this design uses | P | https://docs.aws.amazon.com/dlami/latest/devguide/aws-deep-learning-ami-gpubasesinglecuda-ul2204-2026-10-09.html |
 | The instance store of a GPU instance is wiped when it stops | P | Same image page and instance documentation; where Docker keeps its data on that image was not confirmed: spike S1 |
-| No published measurement of a stopped GPU instance returning to service | — | Gap: spike S1 |
+| No published measurement of a stopped GPU instance returning to service | — | Gap. The design stops no instance: E32 |
 
 ## E11. Cold start and model loading
 
@@ -153,7 +153,7 @@ Prices are US East list prices unless stated. Where a decision rests on a claim 
 | Codex CLI's idle timer waits for the next parsed SSE event, and its parser discards comments, so comment keep-alives do not reset it | P | Codex CLI's source |
 | OpenAI Python SDK: 2 retries, 10-minute timeout | P | https://raw.githubusercontent.com/openai/openai-python/main/README.md |
 | Anthropic SDKs: 2 retries, 10-minute timeout | T | Search summary |
-| How each client behaves through a full hold | — | Gap: spike S2 |
+| How each client behaves through a full hold | — | Gap. The design holds no request (section 5.3) |
 
 ## E13. Application Load Balancer
 
@@ -394,12 +394,37 @@ Prices are US East list prices unless stated. Where a decision rests on a claim 
 | Definitions used in section 4.7: time to first token from submission to first token; time per output token as decode time over output tokens minus one; system throughput as output tokens over elapsed time | P | https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html ; vLLM's source (E3) |
 | Students' sessions will be lighter than those traces | M | Assumption; spike S5 and the first session's dashboard will show |
 
+## E32. GPU capacity for the coursework pool
+
+Observed in the owner's account between 2026-11-23 and 2026-11-25, in the region the endpoint runs in, which this file does not name. The AWS pages were read on 2026-11-24 and 2026-11-25.
+
+| Claim | Level | Source |
+| --- | --- | --- |
+| Over about 23 hours, the coursework pool's group (one type, `g7e.2xlarge`, On-Demand, three zones) made 121 launch attempts: 9 succeeded, 77 found insufficient capacity in the two zones that offer the type, and 35 were placed in the third zone, which does not offer it | L | The group's scaling activities, read with describe calls on 2026-11-24 |
+| The pool needed an instance 9 times. It got one at once 3 times, and waited 21, 25, 29, 29, 29 and 37 minutes the 6 other times; the waits began at every time of day | L | Same |
+| The pool's stopped warm-pool instance was started 5 times, once for each wake from zero. All 5 starts failed for insufficient capacity; each time the group terminated the instance and launched a new one, which arrived 25 to 37 minutes later | L | Same |
+| The scaler applied each of its decisions within seconds: 5 wakes, and 5 returns to zero after the idle time. The pool's maximum was 1, so growth beyond one instance was never exercised | L | Same, and the scaler's log |
+| Three of the pipeline's verifications failed only because the instance arrived 1 to 7 minutes after the check stopped waiting | L | The pipeline's executions of the same day |
+| With the group spanning only the zones that offer its type, and with the next sizes of the same GPU and a single-GPU type of another family listed as fallbacks, a gap of about 30 minutes still found no capacity for any listed type in any zone | P | The same activities on 2026-11-25, as the operator reported them; not read again |
+| AWS's Spot placement score, from 1 to 10, in that region: 4 for one `g7e.2xlarge`, 1 for three, and 8 for one when the request also accepts the two next sizes. Three other regions that offer the type scored 2, 6 and 8 for one instance | L | `ec2 get-spot-placement-scores`, 2026-11-24 |
+| The score is a recommendation for Spot requests, which "does not provide any guarantees in terms of available capacity"; AWS documents no such signal for On-Demand | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-placement-score.html |
+| After a launch finds no capacity, Auto Scaling looks for it in the group's other zones, and "continues to automatically make the launch request until capacity becomes available". The time between two requests is not documented | L | https://docs.aws.amazon.com/autoscaling/ec2/userguide/ts-as-capacity.html |
+| A group fills its On-Demand capacity with its instance types in the order of its overrides (`prioritized`). That it goes on to the next type when the first has no capacity follows from AWS's advice to list several types; no page states it for this strategy | P | https://docs.aws.amazon.com/autoscaling/ec2/userguide/allocation-strategies.html ; https://docs.aws.amazon.com/autoscaling/ec2/userguide/mixed-instances-groups-set-up-overview.html |
+| "Amazon EC2 Auto Scaling can also suspend processes for Auto Scaling groups that repeatedly fail to launch instances", most commonly groups "that have been trying to launch instances for over 24 hours but have not succeeded in launching any instances"; such processes can be resumed | L | https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-suspend-resume-processes.html |
+| Scale-in protection "starts when the instance state is `InService`". When every instance of a group is protected and a scale-in occurs, the desired capacity is decremented and no instance is terminated until its protection is lifted | L | https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-instance-protection.html |
+| A stopped instance keeps no claim on hardware: at its start it is usually placed on another host, and insufficient capacity is a documented result of starting one. It can start only in the zone of its volume | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/how-ec2-instance-stop-start-works.html ; https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/troubleshooting-launch.html ; the zone follows from https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volumes.html |
+| An On-Demand Capacity Reservation is charged at the On-Demand rate from its creation to its cancellation, by the second, whether or not an instance runs in it. It has no commitment. It is for one zone, one instance type, one platform and one tenancy. Creating one "could fail if ... Amazon EC2 does not have sufficient capacity" | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-pricing-billing.html ; https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-reservations.html ; https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-create.html |
+| An instance with the default preference runs in a matching open reservation, also when it is started from stopped. A group can be told to use reservations first, or only | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-modify-instance.html ; https://docs.aws.amazon.com/autoscaling/ec2/userguide/target-capacity-reservations.html |
+| A reservation for a future date is requested 5 to 120 days ahead, for at least 32 vCPUs and, for the G family, a commitment of 14 days; AWS may decline it | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-create.html |
+| Capacity Blocks exist for P and Trainium types and for no G type, and a group whose launch template targets one cannot have a warm pool | P | https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-blocks.html ; https://docs.aws.amazon.com/autoscaling/ec2/userguide/capacity-reservation-create-asg-procedure.html |
+| How often, and for how long, the type is without capacity on another day, or in another region | — | Gap: one day in one account. The design does not depend on the figure (section 5.4) |
+
 ## Known gaps
 
 Stated once more, because they are where the design could be wrong:
 
-1. No one has published how long a stopped GPU instance takes to return to service, or how often it fails to (S1).
-2. How each client behaves through a full hold, seven minutes for a stream and four for a non-streaming call, is untested (S2).
+1. How long an instance that is asked for waits for capacity is known from one day in one account (E32). The design does not depend on the figure, only on the instructor booking ahead of it: on a day with a longer gap, a session starts short (section 5.4).
+2. How long a launch takes on the coursework pool's instance type, from launch to serving, is an estimate from published stage timings (E11). Every launch records its stages, and S1 reads them.
 3. Claude Code on open-weight models is unsupported by its vendor and has known engine-side defects. The two that stop the coursework model are worked around in the gateway, on the strength of one reporter's measurement (S3).
 4. What one instance serves is arithmetic, not a measurement: no one has published a benchmark of the coursework model on its GPU, or of the upgrade model on its instance (S5, S6).
 5. The upgrade model has an upstream recipe verified on four of its GPU, but nobody has run it on the AWS instance type named here (S6). The coursework model's 8-bit build is verified on its GPU's generation, not on its GPU (S3, S5).
@@ -412,3 +437,4 @@ Stated once more, because they are where the design could be wrong:
 12. What the second session's research packs need behind vLLM is known from one upstream issue and from memory: PDFs are refused, tools and skills added mid-session pass through a rewrite nobody has tested, and built-in web search is believed absent (E28, S3).
 13. Which build of the coursework model to serve is open: the publisher's 8-bit build has not been run on its GPU, and what 4 bits cost in tool-call accuracy is unmeasured (E28, S3, S5).
 14. Students per instance rests on assumed gaps between turns and an assumed share of students with an agent running (E29, S5).
+15. What Auto Scaling does with an instance still starting when desired capacity is lowered, and how often it repeats a launch that found no capacity, are not documented (E32, S7).
