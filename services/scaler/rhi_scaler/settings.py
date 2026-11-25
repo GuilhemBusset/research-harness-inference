@@ -9,14 +9,17 @@ The function's construct writes one JSON object to `RHI_SCALER_SETTINGS` (`SETTI
   },
   "heartbeat_table": "<table name>",
   "pool_state_table": "<table name>",
-  "workspace_url": "https://.../api/v1/remote_write"
+  "workspace_url": "https://.../api/v1/remote_write",
+  "session_max_hours": 12
 }
 ```
 
 `entry` is the pool's entry as the configuration gives it, parsed again here with
 `rhi_common.pool_config.parse_pools`, so the scaler holds the same typed pool as every other
 reader. `workspace_url` is the Managed Prometheus workspace's remote-write address. The region is
-the one Lambda sets in `AWS_REGION`.
+the one Lambda sets in `AWS_REGION`. `session_max_hours` is the configuration's: the longest a
+session may last, in hours, a whole number from 1 up, which is the bound every pool's session is
+read under (`rhi_common.sessions`). Settings that hold none read as 12, the configuration's default.
 
 A pool's mode when the pool-state table holds no mode record follows its `wake`: `enabled` for an
 `on-demand` pool, `scheduled-only` for a `scheduled-only` one (section 11.3).
@@ -36,6 +39,7 @@ from dataclasses import dataclass
 from rhi_common.pool_config import PoolConfigError, parse_pools
 from rhi_common.records import CONFIGURED_MODE
 from rhi_scaler.aws_io import PoolSettings, TableNames
+from rhi_scaler.model import SESSION_MAX_HOURS
 
 SETTINGS_VARIABLE = "RHI_SCALER_SETTINGS"
 REGION_VARIABLE = "AWS_REGION"
@@ -51,12 +55,14 @@ class SettingsError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
-    """One run's settings: every pool, the two tables, the workspace and the region."""
+    """One run's settings: every pool, the two tables, the workspace, the region, and the longest
+    a session may last, in hours."""
 
     pools: tuple[PoolSettings, ...]
     tables: TableNames
     workspace_url: str
     region: str
+    session_max_hours: int = SESSION_MAX_HOURS
 
 
 def _text(data: Mapping[str, object], field: str, where: str = "") -> str:
@@ -66,6 +72,13 @@ def _text(data: Mapping[str, object], field: str, where: str = "") -> str:
     value = data[field]
     if not isinstance(value, str) or not value:
         raise SettingsError(name, "must be a string that is not empty")
+    return value
+
+
+def _session_max_hours(data: Mapping[str, object]) -> int:
+    value = data.get("session_max_hours", SESSION_MAX_HOURS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SettingsError("session_max_hours", "must be a whole number from 1 up")
     return value
 
 
@@ -110,6 +123,7 @@ def parse_settings(text: str, region: str) -> Settings:
         tables=tables,
         workspace_url=workspace_url,
         region=region,
+        session_max_hours=_session_max_hours(data),
     )
 
 

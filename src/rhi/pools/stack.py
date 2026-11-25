@@ -218,6 +218,7 @@ class PoolsStack(cdk.Stack):
             heartbeats=self.tables.heartbeats,
             pool_state=self.tables.pool_state,
             workspace=observability.prometheus,
+            session_max_hours=config.session_max_hours,
         )
         # One release per pool, by the pool's name: its engine image, the parameter its instances
         # read at every start, and the refresh of its group when the release changes. The pools

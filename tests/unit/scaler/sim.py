@@ -27,7 +27,8 @@ held, the task rewrites its row and calls the scaler, and it repeats the call ev
 it holds. A held request is forwarded once an instance is in service, and fails after the pool's
 `hold_seconds`. An instance's lifecycle agent writes its row every 5 seconds while it serves.
 
-The schedule calls the scaler at every whole minute.
+The schedule calls the scaler at every whole minute. A pool may be given a session, which every
+run then reads as the pool's record; a simulated pool has none unless a scenario gives it one.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from rhi_common.pool_config import Pool
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, is_fresh
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, Session, is_fresh
 from rhi_scaler.decide import decide
 from rhi_scaler.model import Inputs, Memory, PoolDecision, PoolInputs, Supply
 
@@ -111,8 +112,10 @@ class Sim:
         cold_start_seconds: int = 300,
         healthy: bool = True,
         mode: Mode = Mode.ENABLED,
+        session: Session | None = None,
     ) -> None:
         self.pool, self.mode, self.now = pool, mode, start
+        self.session = session
         self.warm_start_seconds, self.cold_start_seconds = warm_start_seconds, cold_start_seconds
         self.healthy = healthy  # whether a launch ever becomes healthy
         self.instances: dict[str, Instance] = {}
@@ -189,6 +192,7 @@ class Sim:
             instance_heartbeats=tuple(row for row in self.instance_rows.values() if is_fresh(row, self.now)),
             abandoned_launches=self._abandoned_in_a_row(),
             memory=self.memory,
+            session=self.session,
         )
         (decision,) = decide(Inputs(now=self.now, pools=(pool,))).pools
         self.runs.append(Run(self.now, caller, decision))

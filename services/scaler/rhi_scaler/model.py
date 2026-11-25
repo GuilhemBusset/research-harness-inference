@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from rhi_common.pool_config import Pool
-from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode
+from rhi_common.records import GatewayHeartbeat, InstanceHeartbeat, Mode, Session
+
+# The longest session, in hours, for a run whose settings give none: the configuration's default.
+SESSION_MAX_HOURS = 12
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,9 @@ class PoolInputs:
     table (`rhi_common.records.is_fresh`); the decision counts no other. `abandoned_launches` is
     the number of launches abandoned in a row, counted by the edge from the group's activity
     history from `Memory.abandons_counted_from`: a launch that reaches service ends a row, and one
-    that found no capacity is not abandoned.
+    that found no capacity is not abandoned. `session` is the pool's session as its record gives
+    it (`rhi_common.records.Session`), and `None` for a pool with no such record: whether it is
+    active at the time of the run is for `rhi_common.sessions` to say, not for the edge.
     """
 
     config: Pool
@@ -116,19 +121,25 @@ class PoolInputs:
     instance_heartbeats: tuple[InstanceHeartbeat, ...] = ()
     abandoned_launches: int = 0
     memory: Memory = Memory()
+    session: Session | None = None
 
 
 @dataclass(frozen=True)
 class Inputs:
-    """Everything one run decides from: the time, and every pool."""
+    """Everything one run decides from: the time, every pool, and the longest a session may last,
+    in hours, which is the bound every pool's session is read under (`rhi_common.sessions`)."""
 
     now: int
     pools: tuple[PoolInputs, ...]
+    session_max_hours: int = SESSION_MAX_HOURS
 
 
 class Reason(StrEnum):
     """Why a pool's decision is what it is. A decision names one."""
 
+    # The pool's session asks for more instances than the other rules give: the pool goes to the
+    # session's number.
+    PROVISION = "provision"
     # A held request asked a pool at zero for one instance.
     WAKE = "wake"
     # No request received and none in flight for `idle_minutes`: the pool goes to zero.
@@ -165,7 +176,10 @@ class PoolDecision:
     group's launches are to be suspended (true) or resumed (false); setting it again changes
     nothing. `memory` is what to store for the next run. `rebalance_number` is the pool's rebalance
     number, for the pool's note: one more than the memory held in a run that raises it, and the
-    same number in every other run.
+    same number in every other run. `requested` is what the pool's session asks for at the time of
+    the run (`rhi_common.sessions.requested`): its number of instances, at most the pool's
+    `max_instances`, while it is active, and 0 before its start, from its end on, and for a pool
+    with no session.
     """
 
     pool: str
@@ -175,6 +189,7 @@ class PoolDecision:
     memory: Memory
     reason: Reason
     rebalance_number: int = 0
+    requested: int = 0
 
 
 @dataclass(frozen=True)

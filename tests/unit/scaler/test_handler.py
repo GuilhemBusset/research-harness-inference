@@ -16,7 +16,7 @@ from botocore.exceptions import ClientError
 from botocore.stub import ANY, Stubber
 from moto import mock_aws
 
-from rhi_common.records import GatewayHeartbeat, SessionSwitch
+from rhi_common.records import GatewayHeartbeat, Session, SessionSwitch
 from rhi_scaler import handler as scaler
 from rhi_scaler.aws_io import Clients, memory_from_item, memory_to_item
 from rhi_scaler.metrics import DECISIONS, GAUGES, SESSION_ON, DecisionCounts, RemoteWriter, decode
@@ -210,6 +210,26 @@ def test_a_held_request_wakes_the_pool_stores_the_memory_and_emits_its_metrics(e
     assert sent[(SESSION_ON, ())] == [0.0]
     # The pool and the reason are the only labels: nothing names a student.
     assert {name for _, labels in sent for name, _ in labels} == {"pool", "reason"}
+
+
+def test_a_run_reads_the_pool_s_session_under_the_longest_session_of_its_settings(edge: Edge) -> None:
+    # Nobody asks for the pool but its session, written two hours ago to end in an hour.
+    session = Session("mock", 1, NOW - 7200, NOW + 3600, set_by="instructor", set_at=NOW - 7200)
+    edge.queue_read(desired=0, instances=[], records=[session.to_item()], heartbeats=[])
+    edge.autoscaling.add_response(
+        "set_desired_capacity", {}, {"AutoScalingGroupName": GROUP, "DesiredCapacity": 1, "HonorCooldown": False}
+    )
+    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 1, "written_at": NOW})
+    decision = scaler.run_cycle(SETTINGS, edge.clients, edge.writer, NOW, DecisionCounts())
+    assert [(pool.desired, pool.reason, pool.requested) for pool in decision.pools] == [(1, Reason.PROVISION, 1)]
+
+    # Settings whose longest session is one hour: the same record ended an hour ago, and no call
+    # to Auto Scaling is queued.
+    shorter = read_settings({**ENVIRON, "RHI_SCALER_SETTINGS": json.dumps({**json.loads(ENVIRON["RHI_SCALER_SETTINGS"]), "session_max_hours": 1})})
+    edge.queue_read(desired=0, instances=[], records=[session.to_item()], heartbeats=[])
+    edge.expect_writes({"pool": "mock", "record": "note", "capacity_asked": 0, "written_at": NOW})
+    decision = scaler.run_cycle(shorter, edge.clients, edge.writer, NOW, DecisionCounts())
+    assert [(pool.desired, pool.requested) for pool in decision.pools] == [(0, 0)]
 
 
 def test_a_switch_that_cannot_be_read_still_lets_demand_wake_the_pool_then_fails_the_run(edge: Edge) -> None:
