@@ -54,6 +54,10 @@ configuration in SSM, as the course end is, and a pool's `max_instances` from th
 function, as the commands `pool` read the deployed pools. After a write the command asks the
 scaler for a run; when one is under way it says so, and the next run is within a minute.
 
+While the endpoint is parked the pools stack keeps its table and holds no scaler, so no pool is
+deployed: `pool status` and `session status` print no pool's line, the session switch reads and
+switches as ever, and a command that needs a pool or the scaler is refused.
+
 The commands `privacy` (`rhi_admin.privacy`) reach, once one of them runs, the usage table by its
 logical ID, the gateway's log group by its logical ID in the gateway stack, and the Prometheus
 workspace by its logical ID in the observability stack, whose query address Managed Prometheus
@@ -74,6 +78,7 @@ from dataclasses import dataclass
 from typing import Any, TextIO
 
 import boto3
+from botocore.exceptions import ClientError
 
 from rhi.config import Config, ConfigError, read_ssm
 from rhi_admin import keys as admin_keys
@@ -147,10 +152,18 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
 
     def pools() -> admin_pools.Pools:
         sts = session.client("sts")
+        table = dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME))
+        try:
+            scaler = physical_id(cloudformation, SCALER_FUNCTION_LOGICAL_ID, POOLS_STACK_NAME)
+        except ClientError as error:
+            # The stack is there, since its table was found: it holds no scaler, as a parked stage's.
+            if error.response.get("Error", {}).get("Code") != "ValidationError":
+                raise
+            scaler = None
         return admin_pools.Pools(
-            table=dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME)),
+            table=table,
             functions=session.client("lambda"),
-            scaler=physical_id(cloudformation, SCALER_FUNCTION_LOGICAL_ID, POOLS_STACK_NAME),
+            scaler=scaler,
             caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
         )
 
@@ -300,6 +313,14 @@ def _booking(session: Session, sessions: admin_session.Sessions) -> str:
     return f"{session.instances} instance(s) from {starts} to {ends} ({sessions.time_zone}), set by {session.set_by}"
 
 
+def _apply(sessions: admin_session.Sessions, out: TextIO) -> None:
+    """After a write: asks the scaler for a run, and says whether it ran or one was under way."""
+    if admin_session.applied(sessions):
+        print("The scaler has run: the change applies now.", file=out)
+    else:
+        print("The scaler is already running: its next run, within a minute, applies the change.", file=out)
+
+
 def _pool_session_command(
     command: str, arguments: argparse.Namespace, sessions: admin_session.Sessions, now: int, out: TextIO
 ) -> None:
@@ -333,17 +354,24 @@ def _pool_session_command(
         return
     if command == "stop":
         if arguments.all:
-            stopped = admin_session.stop_all(sessions=sessions, now=now)
+            stops = admin_session.stop_all(sessions=sessions, now=now)
         else:
             pool = admin_session.pool_of(arguments.pool, sessions)
-            stopped = {pool: admin_session.stop(pool, sessions=sessions, now=now)}
-        for pool, session in stopped.items():
-            if session is None:
-                print(f"The pool {pool} has no session booked or active: nothing to stop.", file=out)
-            else:
-                print(f"The session of the pool {pool} is stopped, by {session.set_by}.", file=out)
-        if not any(stopped.values()):
-            return
+            stops = iter([(pool, admin_session.stop(pool, sessions=sessions, now=now))])
+        written = False
+        try:
+            for pool, session in stops:
+                if session is None:
+                    print(f"The pool {pool} has no session booked or active: nothing to stop.", file=out)
+                else:
+                    written = True
+                    print(f"The session of the pool {pool} is stopped, by {session.set_by}.", file=out)
+        finally:
+            # A stop that was written is applied, also when a later pool's failed: that failure is
+            # still the command's.
+            if written:
+                _apply(sessions, out)
+        return
     else:
         pool = admin_session.pool_of(arguments.pool, sessions)
         starts_at, until = time(arguments.starts), time(arguments.until)
@@ -370,10 +398,7 @@ def _pool_session_command(
                 length=length,
             )
             print(f"The session of the pool {pool} is changed: {_booking(session, sessions)}.", file=out)
-    if admin_session.applied(sessions):
-        print("The scaler has run: the change applies now.", file=out)
-    else:
-        print("The scaler is already running: its next run, within a minute, applies the change.", file=out)
+    _apply(sessions, out)
 
 
 def _dispatch(arguments: argparse.Namespace, admin: Admin, now: int, out: TextIO) -> None:

@@ -95,14 +95,20 @@ class Deployed:
     cloudformation: Stubber
     functions: Stubber
 
-    def run(self, *argv: str, now: int = NOW, settings: str | None = SETTINGS) -> tuple[int, str, str]:
+    def run(
+        self, *argv: str, now: int = NOW, settings: str | None = SETTINGS, parked: bool = False
+    ) -> tuple[int, str, str]:
         for logical_id, physical_id, kind in (
             (main.POOL_STATE_LOGICAL_ID, TABLE, "AWS::DynamoDB::Table"),
             (main.SCALER_FUNCTION_LOGICAL_ID, SCALER, "AWS::Lambda::Function"),
         ):
             expected = {"StackName": main.POOLS_STACK_NAME, "LogicalResourceId": logical_id}
+            if parked and physical_id == SCALER:
+                # A parked stage's stack holds no scaler: CloudFormation knows no such resource in it.
+                self.cloudformation.add_client_error("describe_stack_resource", "ValidationError", expected_params=expected)
+                continue
             self.cloudformation.add_response("describe_stack_resource", _detail(logical_id, physical_id, kind), expected)
-        if settings is not None:
+        if settings is not None and not parked:
             answer = {"FunctionName": SCALER, "Environment": {"Variables": {SETTINGS_VARIABLE: settings}}}
             self.functions.add_response("get_function_configuration", answer, {"FunctionName": SCALER})
         out, err = io.StringIO(), io.StringIO()
@@ -225,6 +231,16 @@ def test_a_pool_that_is_not_deployed_is_refused(deployed: Deployed) -> None:
     for command in ("disable", "enable", "clear-suspension"):
         status, _, err = deployed.run(command, "other")
         assert status == 1 and "no deployed pool" in err
+    assert deployed.items() == []
+
+
+def test_a_parked_stage_has_no_pool(deployed: Deployed) -> None:
+    status, out, err = deployed.run("status", parked=True)
+    assert (status, out.splitlines()[1:], err) == (0, [], "")
+    # What needs a pool or the scaler is refused, and says that none is deployed.
+    for argv in (["run"], ["disable", "mock"], ["enable", "mock"], ["clear-suspension", "mock"]):
+        status, _, err = deployed.run(*argv, parked=True)
+        assert status == 1 and "no pool is deployed" in err
     assert deployed.items() == []
 
 

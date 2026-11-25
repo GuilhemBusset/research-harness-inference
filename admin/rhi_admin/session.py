@@ -6,8 +6,9 @@ The commands write it with the rules of `rhi_common.sessions`, the same for ever
 
 - `start`: books the pool (`started`);
 - `change`, the command `set`: gives the session what it is given and keeps the rest (`changed`);
-- `stop`: ends the session now (`stopped`), and `stop_all` every deployed pool's. A pool with no
-  session booked or active has nothing to stop: nothing is written, and that is no refusal;
+- `stop`: ends the session now (`stopped`), and `stop_all` every deployed pool's, one pool at a
+  time, so that what was written is known when a later pool's write fails. A pool with no session
+  booked or active has nothing to stop: nothing is written, and that is no refusal;
 - `supply`, the pools' lines of `session status`: for each deployed pool, its session if one is
   booked or active, and what the scaler wrote in its note (`rhi_common.records.ScalerNote`): the
   instances requested, asked of AWS, waiting and since when, starting and in service, and why the
@@ -22,11 +23,15 @@ refuses a second one, which fails nothing, since the next run is within a minute
 
 The bounds come from where the running system reads them: a pool's `max_instances` from the
 settings of the scaler's function (`rhi_admin.pools.max_instances`), and `session_max_hours`, the
-`time_zone` and the default pool from the configuration in SSM.
+`time_zone` and the default pool from the configuration in SSM. A parked stage holds no scaler, so
+no pool is deployed: `supply` has no line, and `start`, `change` and `stop` are refused.
 
 **Times and lengths.** `read_time` reads a time as the command line gives it: `HH:MM` is the next
 time the clock of the configured zone shows that hour and minute, counted from the moment of the
-command, and `YYYY-MM-DDTHH:MM` is that date and time in the zone. `read_length` reads a length: a
+command, and `YYYY-MM-DDTHH:MM` is that date and time in the zone. A time is one the clock shows:
+on the day it is set back, the second 02:30 is still ahead once the first has passed, and on the
+day it is set forward there is no 02:30, so the next one is the day after's and that day's, written
+with its date, is refused. `read_length` reads a length: a
 whole number followed by `m` for minutes or `h` for hours. `show_time` writes a time back in the
 second form.
 
@@ -52,7 +57,7 @@ import dataclasses
 import datetime
 import re
 import zoneinfo
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,6 +83,8 @@ DATE_AND_TIME = "%Y-%m-%dT%H:%M"
 _TIME = re.compile(r"(\d{2}):(\d{2})")
 _DATE_AND_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
 _LENGTH = re.compile(r"(\d+)([mh])")
+# How many days `HH:MM` is looked for, from today: a clock change skips it on one day at most.
+_DAYS_AHEAD = 7
 # What compares an item with the session that was read: each attribute of the record but its key.
 _COMPARED = {"#instances": "instances", "#starts": "starts_at", "#ends": "ends_at", "#by": "set_by", "#at": "set_at"}
 
@@ -151,25 +158,51 @@ class Supply:
     note: ScalerNote
 
 
+def _shown(local: datetime.datetime, zone: zoneinfo.ZoneInfo) -> list[int]:
+    """The moments at which the clock of the zone shows `local`, in order: one, none when the clock
+    is set forward over it, or two when the clock is set back and shows it again."""
+    moments = set()
+    for fold in (0, 1):
+        at = local.replace(tzinfo=zone, fold=fold)
+        # The clock shows `local` at that moment only if the moment reads back as `local`.
+        if at.astimezone(datetime.UTC).astimezone(zone).replace(tzinfo=None, fold=0) == local:
+            moments.add(int(at.timestamp()))
+    return sorted(moments)
+
+
 def read_time(text: str, *, time_zone: str, now: int) -> int:
     """The time `text` names, in seconds since the epoch: `HH:MM`, the next time the clock of the
-    zone shows it at or after `now`, or `YYYY-MM-DDTHH:MM`, that date and time in the zone."""
+    zone shows it at or after `now`, or `YYYY-MM-DDTHH:MM`, that date and time in the zone.
+
+    Where the clock is set back and shows a time twice, the time is the first of the two that has
+    not passed. Where it is set forward, it never shows the times it skips: `HH:MM` is then the
+    next day's, and a date and time is refused."""
     zone = zoneinfo.ZoneInfo(time_zone)
+    not_a_time = AdminError(f"{text!r} is not a time: write HH:MM, or YYYY-MM-DDTHH:MM")
+    clock = _TIME.fullmatch(text)
+    if clock is None:
+        if not _DATE_AND_TIME.fullmatch(text):
+            raise not_a_time
+        try:
+            dated = datetime.datetime.strptime(text, DATE_AND_TIME)
+        except ValueError:
+            raise not_a_time from None
+        moments = _shown(dated, zone)
+        if not moments:
+            raise AdminError(f"the clock of {time_zone} never shows {text}: it is set forward over that time")
+        return next((at for at in moments if at >= now), moments[0])
     try:
-        if _DATE_AND_TIME.fullmatch(text):
-            return int(datetime.datetime.strptime(text, DATE_AND_TIME).replace(tzinfo=zone).timestamp())
-        clock = _TIME.fullmatch(text)
-        if clock is None:
-            raise ValueError
-        today = datetime.datetime.fromtimestamp(now, zone).date()
         shown = datetime.time(int(clock[1]), int(clock[2]))
     except ValueError:
-        raise AdminError(f"{text!r} is not a time: write HH:MM, or YYYY-MM-DDTHH:MM") from None
-    at = int(datetime.datetime.combine(today, shown, zone).timestamp())
-    if at >= now:
-        return at
-    # The clock has passed it today: tomorrow's.
-    return int(datetime.datetime.combine(today + datetime.timedelta(days=1), shown, zone).timestamp())
+        raise not_a_time from None
+    today = datetime.datetime.fromtimestamp(now, zone).date()
+    # Today's, tomorrow's when the clock has passed it, the day after's when tomorrow's clock skips it.
+    for ahead in range(_DAYS_AHEAD):
+        day = today + datetime.timedelta(days=ahead)
+        for at in _shown(datetime.datetime.combine(day, shown), zone):
+            if at >= now:
+                return at
+    raise AdminError(f"the clock of {time_zone} does not show {text} in the next {_DAYS_AHEAD} days")
 
 
 def read_length(text: str) -> int:
@@ -198,7 +231,7 @@ def _max_instances(pool: str, sessions: Sessions) -> int:
     """The most a session may book of the pool. A pool that is not deployed is refused."""
     deployed = admin_pools.max_instances(sessions.pools)
     if pool not in deployed:
-        raise AdminError(f"no deployed pool is named {pool!r}")
+        raise admin_pools.not_deployed(pool, sessions.pools)
     return deployed[pool]
 
 
@@ -316,9 +349,11 @@ def stop(pool: str, *, sessions: Sessions, now: int) -> Session | None:
     return _stop(pool, sessions, now)
 
 
-def stop_all(*, sessions: Sessions, now: int) -> dict[str, Session | None]:
-    """Ends every deployed pool's session now: for each pool, by name, what `stop` gives."""
-    return {pool: _stop(pool, sessions, now) for pool in sorted(admin_pools.max_instances(sessions.pools))}
+def stop_all(*, sessions: Sessions, now: int) -> Iterator[tuple[str, Session | None]]:
+    """Ends every deployed pool's session now, by name: each pool with what `stop` gives, as it is
+    done. When a pool's write fails, the pools given before it are the ones that were stopped."""
+    for pool in sorted(admin_pools.max_instances(sessions.pools)):
+        yield pool, _stop(pool, sessions, now)
 
 
 def applied(sessions: Sessions) -> bool:

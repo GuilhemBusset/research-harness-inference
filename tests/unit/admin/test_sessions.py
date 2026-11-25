@@ -8,6 +8,7 @@ resources by logical ID, the second gives the scaler's settings and counts the r
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import io
 import json
 from collections.abc import Callable, Iterator
@@ -57,11 +58,16 @@ SETTINGS = json.dumps({"pools": {name: {"entry": _entry(most)} for name, most in
 
 
 class _Stack:
-    """CloudFormation: the deployed resources by logical ID."""
+    """CloudFormation: the deployed resources by logical ID. While `parked`, the stack holds no scaler."""
+
+    def __init__(self) -> None:
+        self.parked = False
 
     def describe_stack_resource(self, **request: str) -> dict[str, Any]:
         known = {main.POOL_STATE_LOGICAL_ID: TABLE, main.SCALER_FUNCTION_LOGICAL_ID: SCALER}
         logical_id = request["LogicalResourceId"]
+        if self.parked and logical_id == main.SCALER_FUNCTION_LOGICAL_ID:
+            raise ClientError({"Error": {"Code": "ValidationError"}}, "DescribeStackResource")
         return {"StackResourceDetail": {"PhysicalResourceId": known.get(logical_id, f"deployed-{logical_id}")}}
 
 
@@ -98,6 +104,7 @@ class Deployed:
     admin: main.Admin
     table: Any
     functions: _Functions
+    stack: _Stack
 
     def run(self, *argv: str, now: int = NOW) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -135,9 +142,9 @@ def deployed(monkeypatch: pytest.MonkeyPatch) -> Iterator[Deployed]:
         example = config.load({"RHI_CONFIG": "example"})
         assert (example.default_pool, example.session_max_hours) == ("coursework", MAX_HOURS)
         config.write_ssm(dataclasses.replace(example, time_zone=ZONE), real.client("ssm"))
-        functions = _Functions()
-        stubbed = {"cloudformation": _Stack(), "lambda": functions, "dynamodb": _Tables(table)}
-        yield Deployed(main.connect(_Session(real, stubbed)), table, functions)
+        functions, stack = _Functions(), _Stack()
+        stubbed = {"cloudformation": stack, "lambda": functions, "dynamodb": _Tables(table)}
+        yield Deployed(main.connect(_Session(real, stubbed)), table, functions, stack)
 
 
 def _bounds(pool: str = "coursework", who: str = WHO) -> dict[str, Any]:
@@ -165,6 +172,29 @@ def test_times_and_lengths() -> None:
     for text in ("6", "1.5h", "h", "6 h", "2d"):
         with pytest.raises(AdminError):
             admin_session.read_length(text)
+
+
+def _utc(text: str) -> int:
+    return int(datetime.datetime.fromisoformat(f"{text}+00:00").timestamp())
+
+
+def test_a_time_is_one_the_clock_shows_on_the_days_it_changes() -> None:
+    # The clock is set back on 2027-10-31, from 03:00 to 02:00: it shows 02:30 twice, at 00:30 and
+    # at 01:30 UTC. Once the first has passed, the next is the second, not the day after's.
+    first, second = _utc("2027-10-31T00:30"), _utc("2027-10-31T01:30")
+    for now, shown in ((first - 900, first), (first + 900, second), (second + 900, _utc("2027-11-01T01:30"))):
+        assert admin_session.read_time("02:30", time_zone=ZONE, now=now) == shown
+        dated = admin_session.read_time("2027-10-31T02:30", time_zone=ZONE, now=now)
+        assert dated == (shown if shown <= second else first)
+
+    # It is set forward on 2027-03-28, from 02:00 to 03:00, and never shows that day's 02:30: the
+    # next 02:30 is the day after's, and that day's, written with its date, is refused.
+    now = _utc("2027-03-28T00:00")
+    assert admin_session.read_time("02:30", time_zone=ZONE, now=now) == _utc("2027-03-29T00:30")
+    assert admin_session.read_time("03:30", time_zone=ZONE, now=now) == _utc("2027-03-28T01:30")
+    with pytest.raises(AdminError):
+        admin_session.read_time("2027-03-28T02:30", time_zone=ZONE, now=now)
+    assert admin_session.read_time("2027-03-28T03:30", time_zone=ZONE, now=now) == _utc("2027-03-28T01:30")
 
 
 def test_start_set_and_stop_write_the_session_the_shared_rules_give(deployed: Deployed) -> None:
@@ -345,6 +375,48 @@ def test_stop_ends_one_pool_or_all_and_a_pool_with_no_session_has_nothing_to_sto
         deployed.run("stop", "--pool", "mock", "--all")
     with pytest.raises(SystemExit):
         deployed.run("start", "1")
+
+
+def test_a_stop_of_every_pool_that_fails_on_one_still_asks_for_a_run_of_what_it_stopped(
+    deployed: Deployed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deployed.run("start", "1", "--for", "2h")
+    deployed.run("start", "1", "--pool", "mock", "--for", "2h")
+    before, runs, write = deployed.session("mock"), deployed.functions.runs, deployed.table.put_item
+
+    def write_but_not_the_second_pool(**request: Any) -> Any:
+        if request["Item"]["pool"] == "mock":
+            raise ClientError({"Error": {"Code": "InternalServerError"}}, "PutItem")
+        return write(**request)
+
+    monkeypatch.setattr(deployed.table, "put_item", write_but_not_the_second_pool)
+    # The failure is still the command's.
+    with pytest.raises(ClientError):
+        deployed.run("stop", "--all", now=NOW + 60)
+
+    stopped = deployed.session()
+    assert stopped is not None and stopped.ends_at == NOW + 60
+    assert deployed.session("mock") == before
+    assert deployed.functions.runs == runs + 1
+
+
+def test_a_parked_stage_has_the_switch_and_no_pool(deployed: Deployed) -> None:
+    # Parked, the stack keeps the pool-state table and holds no scaler.
+    deployed.stack.parked = True
+
+    status, out, err = deployed.run("status")
+    assert (status, err) == (0, "")
+    lines = [line.split("\t") for line in out.splitlines()]
+    assert lines[:2] == [["session", "set_by", "set_at"], ["off", "-", "-"]]
+    # No pool is deployed: after the switch's line, the pools' header and no line.
+    assert len(lines) == 3
+
+    # A booking is refused, and there is nothing to stop.
+    status, _, err = deployed.run("start", "1", "--for", "1h")
+    assert status == 1 and "no pool is deployed" in err
+    assert deployed.run("stop", "--all") == (0, "", "")
+    assert deployed.table.scan()["Items"] == []
+    assert deployed.functions.runs == 0
 
 
 def test_status_prints_the_supply(deployed: Deployed) -> None:
