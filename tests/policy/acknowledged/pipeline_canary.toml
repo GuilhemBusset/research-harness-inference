@@ -14,11 +14,20 @@
 # - ssm:GetParameter on the release parameter of each pool the stage deploys,
 #   parameter/rhi/pools/<pool>/release, each by its name: the release the smoke tests compare with
 #   the one the pool serves, and, in its settings, the stage's workspace and heartbeats table.
-# - dynamodb:Query, and no other action of DynamoDB, on the stage's heartbeats table only, by the
+# - dynamodb:Query, and no other action on it, on the stage's heartbeats table only, by the
 #   verification's pattern table/Rhi-Pools-TablesHeartbeats613D6AB3-* of the deploying account and
 #   region, under the condition ForAllValues:StringEquals that dynamodb:LeadingKeys is coursework
 #   alone: the smoke test release-heartbeat reads the row each of the coursework pool's instances
 #   writes, with the release it serves; the canary tests that one pool, so no other pool's rows.
+#   The same rows say whether an instance was launched during the wait for the session it booked.
+# - cloudformation:DescribeStackResource on the pools stack, stack/Rhi-Pools/*, and on no other
+#   stack: the job finds the pool-state table's name by its logical ID in that stack, as the
+#   deployment hold does.
+# - dynamodb:GetItem and dynamodb:PutItem on the stage's pool-state table only, by the hold's pattern
+#   table/Rhi-Pools-TablesPoolState68A872F7-* of the deploying account and region, under the
+#   condition ForAllValues:StringEquals that dynamodb:LeadingKeys is coursework alone: the session
+#   of one instance the job books on the coursework pool when it has none, and stops after the
+#   tests. No other pool's items, the mock pool's among them.
 # - events:PutEvents on event-bus/rhi-measurements only, through `measuring_job`: the measurement
 #   gpu-canary, handed to the reporter, since a job holds no GitHub credential.
 # - codeconnections:GetConnection and codeconnections:GetConnectionToken on the pipeline's
@@ -26,8 +35,8 @@
 #   project's role.
 # - logs:CreateLogStream and logs:PutLogEvents on the job's log group, /aws/codebuild/rhi-gpu-canary,
 #   only: the job's logs.
-# Nothing of CodePipeline, Auto Scaling, EC2 or IAM, nothing else of DynamoDB, and no report group:
-# the project declares none.
+# Nothing of CodePipeline, Auto Scaling, EC2 or IAM, nothing else of DynamoDB or CloudFormation,
+# and no report group: the project declares none.
 #
 # The schedule's role, which EventBridge assumes to start the job:
 # - codebuild:StartBuild on the canary's project only. Nothing else.
@@ -43,3 +52,5 @@
 "AwsSolutions-CB4" = "The canary's project keeps no artifact and encrypts what CodeBuild stores with the key AWS manages, the default; a customer managed key would add a monthly cost and a key policy to keep for a build that holds nothing but this public repository."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "The canary queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesHeartbeats613D6AB3-*]" = "The canary queries the heartbeats table of the stage it tests, which this stack cannot refer to across assemblies and so names, as the verification does, by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, a logical ID holds no hyphen, so no other table matches, and the statement's condition admits only the coursework pool's rows."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:cloudformation:<AWS::Region>:<AWS::AccountId>:stack/Rhi-Pools/*]" = "The canary finds the pool-state table's name by its logical ID in the pools stack, which it names by the stack's name; the wildcard stands for the stack's ID, which CloudFormation generates when the stack is created, so the pattern matches that one stack."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "The canary books and stops its session in the pool-state table of the stage it tests, which this stack cannot refer to across assemblies and so names, as the hold step does, by the pools stack's name and the table's logical ID; the wildcard stands for the suffix CloudFormation generates for the table's name, a logical ID holds no hyphen, so no other table matches, and the statement's condition admits only the coursework pool's items."

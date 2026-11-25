@@ -637,19 +637,29 @@ class Launches:
         answer came too long after the one before it."""
         return self._ask() and not self._launched and not self._gap
 
+    @property
+    def launched(self) -> bool:
+        """Whether an answer held a row: an instance was launched since the booking."""
+        return self._launched
+
 
 @dataclass(frozen=True)
 class Outcome:
     """What became of a pool's run of the tests: the run's exit, `None` when no run was made;
     whether the session was stopped or was not the script's to stop; whether no run was made
     because no instance was launched during the wait, and not because the pool was not booked;
-    and the stage the script last saw, during the wait, of each instance launched in it, by
-    instance."""
+    the stage the script last saw, during the wait, of each instance launched in it, by
+    instance; the seconds the script waited for the instance of the session it booked, from the
+    booking to the reading of ready, or to the wait's end when none came, and `None` when it
+    booked nothing; and whether that wait ended on a pool that did not read ready although an
+    instance was launched since the booking: one that was launched and did not serve."""
 
     exit_code: int | None
     in_order: bool
     no_capacity: bool = False
     stages: Mapping[str, str] = field(default_factory=dict)
+    waited: float | None = None
+    unserved: bool = False
 
 
 def run_in_a_session(
@@ -663,8 +673,10 @@ def run_in_a_session(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     launched: Callable[[int], Mapping[str, str | None] | None] | None = None,
+    set_by: str = BOOKED_BY,
 ) -> Outcome:
-    """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool and
+    """Makes `run`, the run of the tests on `pool`, in a session the script books on that pool,
+    under the name `set_by`, the verification's unless another check gives its own, and
     stops after the run, whatever its result, or after its wait when no run is made. A pool that
     already has a session is neither booked nor stopped, and the run is made at once. A pool that
     cannot be booked gets no run. `status` reads the pool's state in the seconds it is given. With
@@ -686,7 +698,7 @@ def run_in_a_session(
             table,
             pool,
             minutes=minutes,
-            set_by=BOOKED_BY,
+            set_by=set_by,
             now=int(clock()),
             session_max_hours=check.session_max_hours,
         )
@@ -704,7 +716,7 @@ def run_in_a_session(
         return Outcome(run(), in_order=True)
     # Flushed: the wait that follows may be long, and the log says what the step waits for.
     print(f"{NAME}: booked the pool {pool} for {minutes} minutes", flush=True)
-    exit_code, no_capacity = None, False
+    exit_code, no_capacity, unserved, took = None, False, False, None
     launches = None if launched is None else Launches(launched, session.set_at, clock)
 
     def read(within: float) -> str | None:
@@ -716,7 +728,9 @@ def run_in_a_session(
 
     try:
         until = session.set_at + check.wait_minutes * MINUTE_SECONDS
-        if wait_until_ready(read, until=until, sleep=sleep, clock=clock):
+        ready = wait_until_ready(read, until=until, sleep=sleep, clock=clock)
+        took = max(0.0, clock() - session.set_at)
+        if ready:
             print(f"{NAME}: the pool {pool} reads ready")
             exit_code = run()
         elif launches is not None and launches.none():
@@ -725,6 +739,8 @@ def run_in_a_session(
             waited = f"no instance of the pool {pool} was launched in {check.wait_minutes} minutes"
             print(f"{NAME}: {waited}: its tests are not run, for lack of capacity")
         else:
+            # A row seen since the booking: an instance was launched, and the wait ended before it served.
+            unserved = launches is not None and launches.launched
             print(f"{NAME}: the pool {pool} did not read ready in {check.wait_minutes} minutes: the tests run")
             exit_code = run()
     finally:
@@ -741,7 +757,9 @@ def run_in_a_session(
             else:
                 print(f"{NAME}: stopped the session it booked on the pool {pool}")
     stages = {} if launches is None else launches.stages
-    return Outcome(exit_code, in_order=stopped, no_capacity=no_capacity, stages=stages)
+    return Outcome(
+        exit_code, in_order=stopped, no_capacity=no_capacity, stages=stages, waited=took, unserved=unserved
+    )
 
 
 def main(
