@@ -563,9 +563,8 @@ DEFAULTS: dict[str, object] = {
     "target_stream_median_tokens_per_second": 15,
     "target_stream_p10_tokens_per_second": 10,
     "cached_share_flag_percent": 85,
-    # The design gives no floor for spike S5's failed requests (issue E3-52): 0.5%, the share of
-    # failures that section 7.3's objective for the gateway's answers allows (99.5% answered),
-    # until the owner confirms it or names another.
+    # Sections 12 and 17: spike S5's failed requests stay at 0.5% or less, the share of failures
+    # that section 7.3's objective for the gateway's answers allows (99.5% answered).
     "target_failed_requests_percent": 0.5,
     # The design gives no period for the pipeline's events, which hold no personal data (issue
     # E4-30): 90 days, the period of every log group of the stage (section 6.6).
