@@ -22,6 +22,7 @@ RESET = 'Get "https://api.github.com/repos/o/r/issues/1": read tcp 10.0.0.2:5000
 TIMEOUT = 'Get "https://api.github.com/repos/o/r/issues/1": net/http: request canceled (Client.Timeout exceeded)'
 EOF = 'Post "https://api.github.com/repos/o/r/pulls": unexpected EOF'
 TLS = 'Get "https://api.github.com/repos/o/r/issues/1": net/http: TLS handshake timeout'
+UNREAD = "unexpected end of JSON input"   # all `gh` prints for an error answer whose JSON body is empty or cut short
 
 
 def ok(payload) -> tuple[int, str, str]:
@@ -68,7 +69,8 @@ class GhCliRetryTests(unittest.TestCase):
             gh.get_issue(1)
 
     def test_a_transient_read_failure_recovers(self):
-        for stderr in (BAD_GATEWAY, SERVER_ERROR, TOO_MANY, SECONDARY, ABUSE, NO_HOST, REFUSED, RESET, TIMEOUT, EOF, TLS):
+        for stderr in (BAD_GATEWAY, SERVER_ERROR, TOO_MANY, SECONDARY, ABUSE, NO_HOST, REFUSED, RESET, TIMEOUT, EOF, TLS,
+                       UNREAD):
             with self.subTest(stderr=stderr):
                 gh, fake, slept = self.client(fail(stderr), fail(stderr), ok({"number": 1}))
                 self.assertEqual(gh.get_issue(1), {"number": 1})
@@ -143,7 +145,7 @@ class GhCliRetryTests(unittest.TestCase):
             ("create_comment", lambda gh: gh.create_comment(1, "b")),
         )
         for name, call in creations:
-            for stderr in (BAD_GATEWAY, SERVER_ERROR, RESET, TIMEOUT, EOF):
+            for stderr in (BAD_GATEWAY, SERVER_ERROR, RESET, TIMEOUT, EOF, UNREAD):
                 with self.subTest(name, stderr=stderr):
                     gh, fake, slept = self.client(fail(stderr))
                     with self.assertRaises(GitHubUnavailable) as raised:
@@ -210,11 +212,13 @@ class TransientTests(unittest.TestCase):
         self.assertEqual(transient(TIMEOUT), "unknown")
         self.assertEqual(transient("context deadline exceeded: i/o timeout"), "unknown")
         self.assertEqual(transient(EOF), "unknown")
+        self.assertEqual(transient(UNREAD), "unknown")
         self.assertIsNone(transient(NOT_FOUND))
         self.assertIsNone(transient(UNPROCESSABLE))
         self.assertIsNone(transient(FORBIDDEN))
         self.assertIsNone(transient("gh: Conflict (HTTP 409)", '{"message": "timeout of the EOF"}'),
                           "an HTTP answer is judged by its status, not by words in its body")
+        self.assertIsNone(transient(f"{UNPROCESSABLE}\n{UNREAD}"))
         self.assertIsNone(transient(""))
 
 

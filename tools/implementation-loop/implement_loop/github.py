@@ -6,8 +6,8 @@ fixture for those tests.
 A call whose repetition is harmless (GET, PUT, PATCH, DELETE, and the POSTs that only add to a
 set) is retried on any of them. Any other POST creates something, so it is retried only when
 GitHub certainly did not act on it: the host could not be reached, or a rate limit refused the
-request. After a 5xx or a broken connection it may have taken effect, so it is not repeated; the
-engine looks up what it creates (a PR by its branch, an issue or a comment by its marker) before
+request. After a 5xx, a broken connection or an answer `gh` could not read it may have taken
+effect, so it is not repeated; the engine looks up what it creates (a PR by its branch, an issue or a comment by its marker) before
 creating it again. A transient failure that outlasts the retries raises `GitHubUnavailable`, so
 the engine can tell an outage from a real error; any other failure raises `GitHubError` at once.
 
@@ -47,6 +47,10 @@ _NOT_SENT = re.compile(r"could not resolve host|no such host|error connecting to
                        re.IGNORECASE)
 # The connection broke or timed out: the request may or may not have reached GitHub.
 _NETWORK = re.compile(r"connection reset|timeout|timed out|\bEOF\b", re.IGNORECASE)
+# `gh` could not read the answer: an error answer that says it is JSON and whose body is empty or
+# cut short. `gh` then prints only what its JSON decoder said, without the HTTP status, so the
+# request was sent and nothing says what GitHub did with it.
+_UNREAD = re.compile(r"unexpected end of JSON input")
 # A pull request's review decision, as GitHub's GraphQL API gives it: APPROVED, CHANGES_REQUESTED,
 # REVIEW_REQUIRED, or null where no review is asked for. The REST API has no such field.
 REVIEW_DECISION_QUERY = ("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) "
@@ -73,8 +77,8 @@ class RedactionUnavailable(GitHubUnavailable):
 def transient(stderr: str, stdout: str = "") -> str | None:
     """How a failed `gh api` call failed, from its output: "not-sent" when GitHub certainly did not
     act on it (the host was unreachable, or a rate limit refused it), "unknown" when it may have (a
-    5xx, a broken or timed-out connection), None when the failure is not transient (a 4xx answer,
-    an authentication problem)."""
+    5xx, a broken or timed-out connection, an answer `gh` could not read), None when the failure is
+    not transient (a 4xx answer, an authentication problem)."""
     text = f"{stderr}\n{stdout}"
     codes = _HTTP_STATUS.findall(stderr)
     if codes:
@@ -84,7 +88,7 @@ def transient(stderr: str, stdout: str = "") -> str | None:
         return "unknown" if 500 <= status <= 599 else None
     if _RATE_LIMITED.search(text) or _NOT_SENT.search(text):
         return "not-sent"
-    return "unknown" if _NETWORK.search(text) else None
+    return "unknown" if _NETWORK.search(text) or _UNREAD.search(stderr) else None
 
 
 class GitHub(Protocol):
