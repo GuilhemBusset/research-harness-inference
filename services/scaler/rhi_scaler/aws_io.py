@@ -42,7 +42,10 @@ complete in the other order. Only an abandon that completed after the later of t
 reached service and `Memory.abandons_counted_from` counts, since the group's history still holds
 the abandons that set the mark the admin cleared. A launch that failed for any other reason neither
 counts nor ends the row. The time of the last launch that found no capacity is read from the whole
-history too, whatever came after it.
+history too, whatever came after it. The history Auto Scaling retains may still hold activities of
+the stopped instances a group kept before (section 4.5): an instance moved from them into service
+is a launch that reached service, and a launch that prepared one to be stopped reached none, so it
+ends no row.
 
 The last launch that failed (section 5.4) is the launch activity that failed or was cancelled and
 completed last, by the time AWS gives and not by its whole
@@ -92,6 +95,7 @@ the notes it wrote, by pool, so that the metrics send the same numbers (`rhi_sca
 from __future__ import annotations
 
 import dataclasses
+import re
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -276,8 +280,21 @@ def _seconds(moment: datetime) -> int:
     return int(moment.timestamp())
 
 
+# Auto Scaling keeps a group's activities for weeks, so the history still holds those of the stopped
+# instances the group kept before section 4.5 dropped them. They are read as they were while the
+# history holds them: an instance moved from the stopped ones into service is a launch, and one
+# launched to be stopped reached no service. Each pattern takes the two words of AWS's name for the
+# stopped instances with any white space between them.
+_FROM_STOPPED = re.compile(r"\b(?:from|out of)\s+warm\s+pool\b")
+_TO_STOPPED = re.compile(r"to\s+warm\s+pool\b")
+
+
 def _is_launch(description: str) -> bool:
-    return description.startswith("launching")
+    return description.startswith("launching") or _FROM_STOPPED.search(description) is not None
+
+
+def _to_stopped(description: str) -> bool:
+    return _TO_STOPPED.search(description) is not None
 
 
 def _failure_cause(message: str) -> LaunchFailure:
@@ -319,7 +336,8 @@ def launch_history(activities: Iterable[Mapping[str, Any]], counted_from: int | 
         completed: datetime = activity.get("EndTime") or activity["StartTime"]
         moment = _seconds(completed)
         if status == "Successful":
-            reached_service = moment if reached_service is None else max(reached_service, moment)
+            if not _to_stopped(description):
+                reached_service = moment if reached_service is None else max(reached_service, moment)
             continue
         if status not in ("Failed", "Cancelled"):
             continue

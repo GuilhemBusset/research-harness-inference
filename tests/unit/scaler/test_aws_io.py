@@ -21,6 +21,7 @@ from rhi_scaler.aws_io import (
     Run,
     TableNames,
     apply,
+    launch_history,
     memory_from_item,
     memory_to_item,
     memory_update,
@@ -326,6 +327,23 @@ def test_what_counts_as_abandoned(aws: Aws) -> None:
     cleared = Memory(abandons_counted_from=NOW - 50)
     assert abandoned(aws, [launch("Cancelled", NOW - 100 * n, ABANDONED) for n in (1, 2, 3)], cleared) == 0
     assert abandoned(aws, [launch("Cancelled", NOW - 10, ABANDONED), *history], cleared) == 1
+
+
+def test_retained_activities_of_a_warm_pool_end_the_row_only_on_reaching_service() -> None:
+    # The group has no warm pool, but the history Auto Scaling retains still holds its activities:
+    # a launch that prepared a stopped instance reached no service, a move out of the pool did.
+    def activity(ended: int, description: str, status: str) -> dict[str, Any]:
+        return launch(status, ended, ABANDONED if status == "Cancelled" else "") | {"Description": description}
+
+    abandons = [launch("Cancelled", NOW - n, ABANDONED) for n in (300, 200, 100)]
+    prepared = activity(NOW - 150, "Launching a new EC2 instance into warm pool: instance-x", "Successful")
+    promoted = activity(NOW - 50, "Launching a new EC2 instance from warm pool: instance-x", "Successful")
+    moved = activity(NOW - 50, "Moving instance-x out of warm pool", "Successful")
+    abandoned_on_the_way = activity(NOW - 20, "Launching a new EC2 instance from warm pool: instance-x", "Cancelled")
+    assert launch_history([*abandons, prepared], None).abandoned_in_a_row == 3
+    assert launch_history([*abandons, promoted], None).abandoned_in_a_row == 0
+    assert launch_history([*abandons, moved], None).abandoned_in_a_row == 0
+    assert launch_history([*abandons, moved, abandoned_on_the_way], None).abandoned_in_a_row == 1
 
 
 def test_protection_and_resume(aws: Aws) -> None:
