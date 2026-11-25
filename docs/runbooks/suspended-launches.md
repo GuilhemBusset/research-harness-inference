@@ -8,9 +8,10 @@ the pool's group, sets the mark `launch_suspended` in the pool's record, and wai
 session asks beyond what the group had already been asked for is not passed on to AWS. Nothing
 clears the mark but the admin's command, and the scaler never sets it back by itself.
 
-A launch is **abandoned** when the instance started and did not become ready to serve: a step of
-its start failed, the release on the instance was not the pool's, or the start's deadline passed.
-A launch that found no capacity, or that the quota refused, is not abandoned: it is waited for, it
+A launch is **abandoned** when the instance started and did not enter service: a step of its start
+failed, the release on the instance was not the pool's, the start's deadline passed, or the
+instance's answer to the launch hook never reached Auto Scaling and the hook's timeout passed. A
+launch that found no capacity, or that the quota refused, is not abandoned: it is waited for, it
 suspends nothing, and it is the runbook [capacity failure](capacity-failure.md).
 
 **How the steps are written.** A command of this repository (`rhi`, `rhi_admin`, or a script of
@@ -95,11 +96,25 @@ pool, by its name in the configuration, which is also the model name `rhi status
      | `container-start` | Reads the pool's secret and starts the engine | The secret, which cannot be read, or the engine's container, which does not start |
      | `weights` | Waits for the engine's health route, while the engine loads the weights | The weights are not where the release says, a wrong prefix, or the engine does not start with them |
      | `warm-up` | Sends the engine one request | The engine started and does not answer |
+     | `hook` | Answers the launch hook, every step above having passed | Of a launch that was abandoned all the same: the answer did not reach Auto Scaling, so the hook waited out its timeout, which abandons the instance; or the instance could not record that it has served |
 
-     A launch that completes has the stage `hook` last; an abandoned one never has it. Three
-     launches that stop in the same stage point to one cause. The pool's log group,
-     `/rhi/pools/coursework` with the pool's name, holds what its instances logged around the time
-     of each launch.
+     The stage `hook` is the instance's attempt to answer the launch hook. It says that the
+     instance's own steps passed, not that the launch completed: a completed launch has it last,
+     and so has a launch abandoned at that stage. So the panel alone does not tell a completed
+     launch from an abandoned one. Two things do, for each launch:
+
+     - how its activity in the pool's group ended, below. An activity names its instance in
+       `Description`, and each series of the panel is named by an instance and a stage;
+     - the instance's own log. The pool's log group, `/rhi/pools/coursework` with the pool's name,
+       has one stream for each instance, named by the instance, with what its units logged, as far
+       as the instance shipped it before it left. The lifecycle agent, the unit `rhi-lifecycle`,
+       ends a launch with a line that says how the launch transition ended: `continued` when Auto
+       Scaling took its answer that the launch passed, `abandoned` when a step failed and the
+       agent answered so, `not-completed` when no answer of the agent reached Auto Scaling. After
+       the last of the three the instance stays as it is until the hook's timeout, 15 minutes or
+       twice the pool's measured start when that is longer, and is abandoned then.
+
+     Three launches that stop in the same stage point to one cause.
    - **Which launches were abandoned, and when.** The scaler counts them in the activities of the
      pool's group, which is named `rhi-pool-` followed by the pool's name. Its last activities, the
      newest first, each with what it was, how it ended and why:
@@ -114,12 +129,26 @@ pool, by its name in the configuration, which is also the model name `rhi status
      when its `StatusCode` is `Failed` or `Cancelled` and its `StatusMessage` says that the launch's
      lifecycle hook was abandoned. A launch that failed for lack of capacity, or that the quota
      refused, says so there instead: it was not abandoned, and is the runbook
-     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service, and
-     the scaler's count starts again after it: the launches that suspended the pool are the
-     abandoned ones that ended, `EndTime`, after the last successful one, and after the last time
-     the suspension was cleared. Their times, against those of the deployments and the rotations
-     above, say which change they followed, and are the times to read the dashboard and the pool's
-     log group at.
+     [capacity failure](capacity-failure.md). A launch that reads `Successful` reached service.
+
+     Read the activities against the time when the scaler suspended the launches, which is the
+     time of the run that counted the third abandoned launch. The alarm's e-mail gives the time
+     the alarm changed state, a minute or two after that run, and on the dashboard the pool's
+     panel of scale decisions by reason counts the reason `launch-suspended` from that run on.
+     The scaler counts by the time a launch ended, `EndTime`, and a launch that reaches service
+     starts its count again. So the launches that suspended the pool are the abandoned ones that
+     ended before that time, and after the later of two moments: the end of the last launch that
+     was successful before that time, and the last time a suspension was cleared.
+
+     Set aside what ended after that time. A launch already under way when the scaler suspended
+     the launches still runs to its end. One that is abandoned then is one more after the three.
+     One that is successful then did not undo the suspension, which only the admin's command
+     clears, and it is not where the count started: counted from it, the history holds no
+     abandoned launch at all, while the three are before it. What it does say is that the fault
+     does not fail every launch.
+
+     The times of the three, against those of the deployments and the rotations above, say which
+     change they followed, and are the times to read the dashboard and the pool's log group at.
 
 4. **Whether a session is active,** on the pool and on any other (step 2). On the pool: the scaler
    raises it at its first run after the suspension is cleared, so a suspension cleared during a

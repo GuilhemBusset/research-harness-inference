@@ -256,10 +256,17 @@ Do these the day before the class.
    rhi_admin session status
    ```
 
-   `requested` and `asked` follow once the scaler has run on the record (Act, step 2): the
-   session's instances while it is active, zero before its start and after a stop. When the command
-   said that a run was already under way, they may still read the numbers of before: read the
-   status again a minute later.
+   `requested` and `asked` follow once the scaler has run on the record (Act, step 2), and are two
+   numbers. `requested` is what the session asks for: its instances while it is active, zero before
+   its start and after a stop. `asked` is what the scaler has asked of AWS for the pool, and the
+   run sets it to `requested`, with one exception: a pool whose launches are suspended is not
+   raised. Its `asked` goes down with the session and never up, so a session that asks for more
+   than the pool's group had been asked for leaves `asked` where it was, below `requested`: at
+   zero for a pool booked after its launches were suspended. No later run changes that. It is the
+   runbook [a pool whose launches are suspended](suspended-launches.md).
+
+   When the command said that a run was already under way, both may still read the numbers of
+   before: read the status again a minute later.
 
 2. **What students see at each moment.** The gateway reads the sessions every 5 seconds, so a
    command shows here within seconds. `rhi status` lists each pool with a state and, when it is
